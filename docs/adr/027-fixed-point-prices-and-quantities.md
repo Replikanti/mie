@@ -15,15 +15,34 @@ prices inexactly, and accumulated rounding depends on evaluation order.
 
 `Price` and `Qty` are `i64` counts of `10^-8` units: one fixed scale for every
 instrument, independent of the exchange tick and step sizes (which change
-over time). Products such as notional widen to `i128`. Floating point is
-allowed only in derived statistics (ratios, percentiles, distributions),
-computed from the exact inputs in a defined order.
+over time). `Rate` — a dimensionless ratio published by the exchange, such as
+a funding rate — uses the same `i64` count of `10^-8` units. Products such as
+notional widen to `i128`. Floating point is allowed only in derived
+statistics (ratios, percentiles, distributions), computed from the exact
+inputs in a defined order.
+
+All three types parse from decimal strings with one grammar,
+`-?[0-9]+(\.[0-9]+)?` over ASCII:
+
+- Rejected as malformed: the empty string, `+`, exponents, whitespace, digit
+  separators, a missing digit on either side of the point (`.5`, `5.`) and
+  non-ASCII digits.
+- Accepted: leading zeros, and `-0`, which parses to 0. The sign is accepted
+  for every type, matching `Display`, so negative quantities (delta) round-trip.
+  Whether a given exchange field may be negative is a normalization check in
+  the adapter, not part of the grammar.
+- Exactness: digits beyond the 8th decimal place are accepted only when they
+  are all `0`, because they do not change the value. Any non-zero digit there
+  is an error, never a rounding.
+- Range: a value outside `i64` units is an overflow error. `i64::MIN` parses.
 
 ## Consequences
 
 - Sums and comparisons are exact; replay reproduces live state bit for bit.
-- Parsing must reject inputs with more than 8 decimal places instead of
-  rounding them silently.
+- Parsing rejects any input it cannot hold exactly (a non-zero digit beyond
+  the 8th decimal place, or overflow) instead of rounding it silently. Zero
+  padding beyond 8 places is lossless and does not abort ingestion.
+- `Display` and parsing round-trip for every value of every type.
 - Range: about ±9.2·10^10 whole units — far beyond any BTC price or quantity.
 - Arithmetic helpers must be explicit about overflow (checked or widened).
 

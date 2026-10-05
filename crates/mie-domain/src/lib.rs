@@ -12,6 +12,7 @@
 //! | Subsystem (design doc)               | Module                          |
 //! |--------------------------------------|---------------------------------|
 //! | Market observations (Data Plane)     | [`event`], [`num`], [`time`]    |
+//! | Canonical event order (ADR-028)      | [`order`]                       |
 //! | Market State                         | [`state`]                       |
 //! | Regime (ADR-017)                     | [`regime`]                      |
 //! | Location / auction state             | [`location`]                    |
@@ -24,6 +25,7 @@
 pub mod event;
 pub mod location;
 pub mod num;
+pub mod order;
 pub mod regime;
 pub mod state;
 pub mod strategy;

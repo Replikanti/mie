@@ -9,8 +9,8 @@ use std::fmt;
 /// Exchange event time in milliseconds since the Unix epoch (UTC).
 ///
 /// Millisecond resolution matches the timestamps Binance USDⓈ-M futures
-/// publishes. The order of distinct events that share a timestamp is defined
-/// by the market-data port contract, not by this type.
+/// publishes. The order of distinct events that share a timestamp is the
+/// canonical order of ADR-028 (`Ord for MarketEvent`), not part of this type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct EventTime(i64);
 

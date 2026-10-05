@@ -12,8 +12,20 @@ use std::fmt;
 /// A source of domain-level market observations (brief §5, Data Plane brief).
 ///
 /// Contract:
-/// - events arrive in the order the core must consume them: non-decreasing
-///   [`MarketEvent::time`], with a deterministic order among equal times;
+/// - events arrive strictly increasing in the canonical order (ADR-028,
+///   `Ord for MarketEvent`), which is built from exchange fields only.
+///   Providers sort or merge with the full comparator, not with
+///   [`MarketEvent::canonical_key`] alone;
+/// - providers dedupe by exchange id: a `Trade`, `BookSnapshot` or
+///   `BookUpdate` whose id was already delivered is dropped even when its
+///   payload differs, an id-less event only when it is an exact repeat. Ids
+///   never fall: trade ids strictly increase, and so do snapshot and update
+///   ids each among their own kind (the engine rejects violations, ADR-028);
+/// - continuity loss is delivered as a [`MarketEvent::FeedGap`], never as
+///   silence. A live event that arrives after its slot was released becomes
+///   a `LateEvent` gap and is never delivered into the past. The gap's `end`
+///   is a later millisecond than the last released event's ordering time, so
+///   the gap sorts strictly after it (ADR-028);
 /// - only domain types cross the port — never exchange SDK or wire types;
 /// - `Ok(None)` means the stream has ended (replay exhausted, feed closed).
 pub trait MarketDataProvider {
@@ -29,7 +41,9 @@ pub trait MarketDataProvider {
 /// contract as live data (ADR-019).
 ///
 /// A replay exposes only the information that was available at each decision
-/// moment and preserves the recorded event order.
+/// moment and delivers it in the canonical order (ADR-028), so it matches
+/// live processing of the same events. Recorded arrival order is capture
+/// metadata, not the replay order.
 pub trait HistoricalDataProvider {
     /// The event stream a replay yields.
     type Stream: MarketDataProvider;
