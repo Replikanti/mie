@@ -1,5 +1,5 @@
 # BTC Market Intelligence Engine — Strategy Registry & Suitability
-## Subsystem brief v2
+## Subsystem brief v4
 
 **Architectural role:** Domain service + application boundary
 

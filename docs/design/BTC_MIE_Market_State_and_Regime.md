@@ -1,5 +1,5 @@
 # BTC Market Intelligence Engine — Market State & Regime
-## Subsystem brief v2
+## Subsystem brief v4
 
 **Architectural role:** Domain core
 
@@ -10,6 +10,26 @@ Turn deterministic market observations into a canonical representation of curren
 The subsystem must not depend on Binance, TradingView, DuckDB or an LLM.
 
 ## Market State
+
+Initial features:
+
+- price, returns, velocity and range
+- ATR(14)
+- ATR percentile(200)
+- OI / ΔOI / OI velocity
+- trade delta and CVD
+- bid/ask volume
+- order-book imbalance
+- liquidity added/removed and concentration
+- absorption/exhaustion candidates
+- volume profile: POC, VAH, VAL, HVN, LVN
+- structural highs/lows
+- SFP / sweeps
+- CVD/OI/price divergences
+- effort-vs-result
+- multi-timeframe context
+
+All features require deterministic definitions so live processing and historical replay produce equivalent results.
 
 ## Order Flow / Aggression State
 
@@ -34,26 +54,6 @@ This enables deterministic candidates for absorption, exhaustion, initiative flo
 
 Bookmap-like visualization is not required; the underlying exchange data and reproducible features are.
 
-Initial features:
-
-- price, returns, velocity and range
-- ATR(14)
-- ATR percentile(200)
-- OI / ΔOI / OI velocity
-- trade delta and CVD
-- bid/ask volume
-- order-book imbalance
-- liquidity added/removed and concentration
-- absorption/exhaustion candidates
-- volume profile: POC, VAH, VAL, HVN, LVN
-- structural highs/lows
-- SFP / sweeps
-- CVD/OI/price divergences
-- effort-vs-result
-- multi-timeframe context
-
-All features require deterministic definitions so live processing and historical replay produce equivalent results.
-
 ## ATR percentile regime
 
 Canonical initial scale:
@@ -71,7 +71,7 @@ ATR percentile is contextual information, not a direct entry signal.
 
 ## Location / auction state
 
-The subsystem consumes/scorers levels including:
+The subsystem consumes/scores levels including:
 
 - POC
 - VAH / VAL

@@ -1,5 +1,5 @@
 # Architecture Decision Records — BTC Market Intelligence Engine
-## Updated baseline — v3
+## Updated baseline — v4
 
 **Scope:** BTCUSDT perpetual MVP
 

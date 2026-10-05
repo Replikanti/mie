@@ -1,5 +1,5 @@
 # BTC Market Intelligence Engine — Conditional Market Behavior
-## Subsystem brief v2
+## Subsystem brief v4
 
 **Architectural role:** Domain + application service
 
@@ -8,6 +8,11 @@
 Measure how the market behaves after particular combinations of state, regime, location and trigger without prematurely turning observations into a strategy.
 
 ## Inputs
+
+- Market State
+- Regime
+- Location / level context
+- Trigger candidates or confirmed trigger definitions
 
 ## Order-Flow Conditional Behavior
 
@@ -28,11 +33,6 @@ Example hypotheses:
 - high aggression + failure to achieve acceptance → failed-auction continuation/reversal alternatives
 
 The research layer must measure these outcomes rather than encode them as assumptions.
-
-- Market State
-- Regime
-- Location / level context
-- Trigger candidates or confirmed trigger definitions
 
 ## Outputs
 
