@@ -66,16 +66,14 @@ dataset → DuckDB replay/research → Strategy Research Lab → Telegram
 
 | Document | Content |
 |---|---|
-| [Research & Architecture Brief](docs/design/BTC_Market_Intelligence_Engine_Research_Brief_v7.md) | Vision, principles, architecture, first milestone, deferred scope |
-| [ADR-001 … ADR-024](docs/design/BTC_MIE_ADRs_v4.md) | Accepted baseline decisions |
-| [Data Plane](docs/design/BTC_MIE_Data_Plane_v4.md) | Ingestion, raw storage, replay, order-flow data contract |
-| [Market State & Regime](docs/design/BTC_MIE_Market_State_and_Regime_v4.md) | Features, order-flow state, ATR regime, location and auction state |
-| [Conditional Market Behavior](docs/design/BTC_MIE_Conditional_Behavior_v4.md) | Outcome measurement by context, counter-hypotheses |
-| [Strategy Research Lab](docs/design/BTC_MIE_Strategy_Research_Lab_v4.md) | Research loop, experiment definition, anti-overfitting |
-| [Strategy Registry & Suitability](docs/design/BTC_MIE_Strategy_Registry_and_Suitability_v4.md) | Lifecycle, runtime suitability, edge decay |
+| [Research & Architecture Brief](docs/design/BTC_Market_Intelligence_Engine_Research_Brief.md) | Vision, principles, architecture, first milestone, deferred scope |
+| [ADR-001 … ADR-024](docs/design/BTC_MIE_ADRs.md) | Accepted baseline decisions |
+| [Data Plane](docs/design/BTC_MIE_Data_Plane.md) | Ingestion, raw storage, replay, order-flow data contract |
+| [Market State & Regime](docs/design/BTC_MIE_Market_State_and_Regime.md) | Features, order-flow state, ATR regime, location and auction state |
+| [Conditional Market Behavior](docs/design/BTC_MIE_Conditional_Behavior.md) | Outcome measurement by context, counter-hypotheses |
+| [Strategy Research Lab](docs/design/BTC_MIE_Strategy_Research_Lab.md) | Research loop, experiment definition, anti-overfitting |
+| [Strategy Registry & Suitability](docs/design/BTC_MIE_Strategy_Registry_and_Suitability.md) | Lifecycle, runtime suitability, edge decay |
 | [ADR-025 onwards](docs/adr/) | Decisions made during implementation |
-
-PDF renders of the design set sit next to the Markdown sources.
 
 ## Development
 

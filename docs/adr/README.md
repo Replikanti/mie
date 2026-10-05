@@ -1,7 +1,7 @@
 # Architecture Decision Records
 
 ADR-001 … ADR-024 are the accepted baseline of the design document set and
-live together in [`../design/BTC_MIE_ADRs_v4.md`](../design/BTC_MIE_ADRs_v4.md).
+live together in [`../design/BTC_MIE_ADRs.md`](../design/BTC_MIE_ADRs.md).
 
 Decisions made during implementation get one file each here, continuing the
 numbering:
