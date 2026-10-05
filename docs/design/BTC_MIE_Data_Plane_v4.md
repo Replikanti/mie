@@ -1,5 +1,5 @@
 # BTC Market Intelligence Engine — Data Plane
-## Subsystem brief v2
+## Subsystem brief v4
 
 **Architectural role:** Hexagonal infrastructure adapter layer
 
@@ -41,6 +41,13 @@ PostgreSQL and ClickHouse remain deferred until workload proves they are needed.
 
 ## Raw data candidates
 
+- trades
+- depth/order-book events
+- klines/OHLCV
+- open interest
+- funding
+- liquidations
+
 ## Explicit Order Flow / Aggression Data Contract
 
 The Data Plane must preserve enough exchange-native information to reconstruct aggressive buy/sell flow and order-book interaction.
@@ -57,13 +64,6 @@ Required raw inputs:
 The Data Plane must preserve these raw events rather than storing only OHLCV aggregates. Derived aggressive buy/sell volume, delta, CVD, trade intensity and liquidity-response features belong above the raw storage boundary.
 
 Bookmap is a reference visualization model only; the MIE must remain independent of it.
-
-- trades
-- depth/order-book events
-- klines/OHLCV
-- open interest
-- funding
-- liquidations
 
 ## Design rules
 

@@ -1,5 +1,5 @@
 # BTC Market Intelligence Engine
-## Research & Architecture Brief — v6
+## Research & Architecture Brief — v7
 
 **Scope:** BTCUSDT perpetual MVP  
 **Status:** Architecture baseline  

@@ -1,5 +1,5 @@
 # BTC Market Intelligence Engine — Strategy Research Lab
-## Subsystem brief v2
+## Subsystem brief v4
 
 **Architectural role:** Application/research layer around the domain core
 
