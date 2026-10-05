@@ -54,6 +54,15 @@ impl MarketStateEngine {
                 self.state.last_trade_price = Some(trade.price);
                 self.state.trade_count += 1;
             }
+            // No feature consumes these yet.
+            MarketEvent::FeedGap(_)
+            | MarketEvent::BookSnapshot(_)
+            | MarketEvent::Liquidation(_)
+            | MarketEvent::BookUpdate(_)
+            | MarketEvent::MarkPrice(_)
+            | MarketEvent::FundingSettlement(_)
+            | MarketEvent::OpenInterest(_)
+            | MarketEvent::Kline(_) => {}
         }
         self.state.as_of = Some(time);
         Ok(())
