@@ -59,7 +59,11 @@ for name in $members; do
   done
 done
 
-forbidden='SystemTime::now|Instant::now|std::(fs|net|env|thread|process)\b|\b(HashMap|HashSet)\b|\basync\b|\.await\b'
+# Module paths are matched both as `std::fs` and as a bare `fs::` usage, so
+# grouped imports (`use std::{fs, env};`, also across lines) are caught where
+# the module is used.
+io='(fs|net|env|thread|process)'
+forbidden="SystemTime::now|Instant::now|UNIX_EPOCH|\.elapsed\(\)|std::${io}\b|std::\{[^}]*\b${io}\b|\b${io}::|\b(HashMap|HashSet|RandomState)\b|\basync\b|\.await\b"
 hits=$(grep -rnE "$forbidden" crates/mie-domain/src crates/mie-ports/src crates/mie-app/src \
   | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' || true)
 if [[ -n "$hits" ]]; then
