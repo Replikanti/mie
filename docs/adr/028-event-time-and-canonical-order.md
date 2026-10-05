@@ -44,14 +44,30 @@ were obtained.
    `start <= end`. It is ordered at `end` with rank 0, so it precedes the
    stream's first resumed event at that millisecond.
 5. **Enforcement**: every `MarketDataProvider` delivers a strictly
-   increasing sequence in this order. `MarketStateEngine` rejects an event
-   below the last one (`OutOfOrder`) and an event equal to it (`Duplicate`).
-   Providers sort or merge with the full comparator, not with the key alone.
+   increasing sequence in this order. Providers sort or merge with the full
+   comparator, not with the key alone, and dedupe by exchange id: an
+   id-carrying kind (Trade, BookSnapshot, BookUpdate) is a duplicate when its
+   id was already delivered, whatever the payload; an id-less kind only when
+   it is an exact repeat. `MarketStateEngine` checks both, as defense in
+   depth:
+   - an event below the last one is `OutOfOrder`, an event equal to it is
+     `Duplicate`;
+   - trade ids strictly increase. A repeated id is `Duplicate`, a lower one
+     `IdRegression`;
+   - on the order book, snapshot ids strictly increase among snapshots and
+     update ids (`u`) among updates, with the same two errors. Across the two
+     kinds the id may stay equal but never fall (`IdRegression`): an update
+     whose `u` equals the snapshot's last update id is the first diff the
+     exchange allows after it, and a snapshot may restate the book exactly
+     at the last applied update.
 6. **Late live events are never delivered into the past.** The live adapter
    reorders within a bounded hold-back (its size is chosen with the live
    adapters, #9). An event that arrives after its slot was released becomes
-   `FeedGap(LateEvent)` on its stream, with `end` at or after the last
-   released event.
+   `FeedGap(LateEvent)` on its stream. The gap must sort strictly after the
+   last released event, so its `end` is a later millisecond than that
+   event's ordering time: a gap ranks first in its millisecond, so a gap
+   ending in the same millisecond would sort before the released event and
+   be rejected as `OutOfOrder`.
 
 | Kind (rank) | Ordering time | Sequence id | Serves |
 |---|---|---|---|
@@ -94,7 +110,9 @@ indicative funding rate rides on `MarkPrice`, settled rates are
 - The field declaration order of the payload structs is part of the final
   tie-break. Reordering fields changes the canonical order and is a change to
   this decision.
-- The strict engine rejects exact duplicates loudly; providers dedupe by id.
+- The strict engine rejects duplicates loudly — exact repeats, and repeated
+  or regressing exchange ids even with a different payload; providers dedupe
+  by id before that.
   Distinct id-less events in one millisecond (two liquidations, say) remain
   valid and are ordered by payload.
 - A gap that is still open at the end of a replay window (a trailing gap) is

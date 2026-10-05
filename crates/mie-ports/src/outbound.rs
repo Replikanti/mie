@@ -15,10 +15,17 @@ use std::fmt;
 /// - events arrive strictly increasing in the canonical order (ADR-028,
 ///   `Ord for MarketEvent`), which is built from exchange fields only.
 ///   Providers sort or merge with the full comparator, not with
-///   [`MarketEvent::canonical_key`] alone, and drop exact duplicates;
+///   [`MarketEvent::canonical_key`] alone;
+/// - providers dedupe by exchange id: a `Trade`, `BookSnapshot` or
+///   `BookUpdate` whose id was already delivered is dropped even when its
+///   payload differs, an id-less event only when it is an exact repeat. Ids
+///   never fall: trade ids strictly increase, and so do snapshot and update
+///   ids each among their own kind (the engine rejects violations, ADR-028);
 /// - continuity loss is delivered as a [`MarketEvent::FeedGap`], never as
 ///   silence. A live event that arrives after its slot was released becomes
-///   a gap and is never delivered into the past (ADR-028);
+///   a `LateEvent` gap and is never delivered into the past. The gap's `end`
+///   is a later millisecond than the last released event's ordering time, so
+///   the gap sorts strictly after it (ADR-028);
 /// - only domain types cross the port — never exchange SDK or wire types;
 /// - `Ok(None)` means the stream has ended (replay exhausted, feed closed).
 pub trait MarketDataProvider {
