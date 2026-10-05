@@ -1,0 +1,20 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/Replikanti/mie"
+publish = false
+
+# Internal crates reference each other by path. Which crate may depend on
+# which is fixed by ADR-025 and enforced by tools/check-architecture.sh.
+[workspace.dependencies]
+mie-domain = { path = "crates/mie-domain" }
+mie-ports = { path = "crates/mie-ports" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
