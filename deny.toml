@@ -1,0 +1,31 @@
+# cargo-deny policy, run by the `audit` CI job.
+# Widening the license list or adding an exception is a conscious decision:
+# record the reason next to the entry, in the PR that needs it.
+
+[graph]
+# Dev-only tooling may be looser; what ships may not.
+exclude-dev = true
+
+[advisories]
+version = 2
+ignore = []
+
+[licenses]
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Workspace crates reference each other by path without a version. They are
+# private (publish = false), so path wildcards are fine.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

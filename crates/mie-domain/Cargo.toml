@@ -1,0 +1,16 @@
+[package]
+name = "mie-domain"
+description = "MIE domain core: deterministic market observations, market state, regime, location and trigger vocabulary"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# Deliberately empty: the domain core depends on no infrastructure and no
+# external crate (ADR-018, ADR-025). tools/check-architecture.sh fails CI if
+# a dependency appears here.
+[dependencies]
+
+[lints]
+workspace = true

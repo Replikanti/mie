@@ -1,0 +1,16 @@
+[package]
+name = "mie-app"
+description = "MIE application layer: use-case services orchestrating the domain through ports"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# The application layer depends on the domain and the ports only (ADR-025).
+[dependencies]
+mie-domain.workspace = true
+mie-ports.workspace = true
+
+[lints]
+workspace = true
