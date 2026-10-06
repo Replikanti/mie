@@ -1,0 +1,35 @@
+[package]
+name = "mie-adapter-binance"
+description = "MIE live market-data adapter for Binance USDⓈ-M futures: raw-first capture, shared normalization, feed gaps"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# An adapter depends on the domain, the ports and external crates, never on
+# another adapter (ADR-025). Every external crate is justified below. There
+# is no async runtime: a handful of low-rate connections run on plain
+# threads (ADR-026 allows an adapter-internal runtime, it does not need one).
+[dependencies]
+mie-domain.workspace = true
+mie-ports.workspace = true
+# Typed views over the exchange JSON in normalization. Decimal fields are
+# borrowed as strings and parsed by the domain's exact `FromStr` (ADR-027).
+serde = { version = "1", features = ["derive"] }
+# The JSON parser behind those views.
+serde_json = "1"
+# Blocking WebSocket client for the market streams. No default features: the
+# client handshake plus rustls with the operating system's root store.
+tungstenite = { version = "0.30", default-features = false, features = ["handshake", "rustls-tls-native-roots"] }
+# TLS for the WebSocket and REST clients. The `ring` provider only: aws-lc-rs
+# would add a C/CMake build. Licenses: see the exceptions in deny.toml.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# The operating system's root certificates for the REST client, so no
+# webpki-roots bundle (CDLA-Permissive-2.0) is needed.
+rustls-native-certs = "0.8"
+# Blocking HTTP client for the open-interest REST poll, on the same rustls.
+ureq = { version = "3", default-features = false, features = ["rustls-no-provider"] }
+
+[lints]
+workspace = true

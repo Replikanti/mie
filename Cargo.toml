@@ -14,6 +14,8 @@ publish = false
 [workspace.dependencies]
 mie-domain = { path = "crates/mie-domain" }
 mie-ports = { path = "crates/mie-ports" }
+mie-app = { path = "crates/mie-app" }
+mie-adapter-binance = { path = "crates/mie-adapter-binance" }
 mie-adapter-parquet = { path = "crates/mie-adapter-parquet" }
 
 [workspace.lints.rust]
