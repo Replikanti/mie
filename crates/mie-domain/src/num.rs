@@ -48,6 +48,24 @@ impl Qty {
     pub const fn units(self) -> i64 {
         self.0
     }
+
+    /// The exact sum, or `None` if it leaves the `i64` range of units
+    /// (ADR-027: arithmetic is explicit about overflow).
+    pub const fn checked_add(self, other: Self) -> Option<Self> {
+        match self.0.checked_add(other.0) {
+            Some(units) => Some(Self(units)),
+            None => None,
+        }
+    }
+
+    /// The exact difference, or `None` if it leaves the `i64` range of units
+    /// (ADR-027).
+    pub const fn checked_sub(self, other: Self) -> Option<Self> {
+        match self.0.checked_sub(other.0) {
+            Some(units) => Some(Self(units)),
+            None => None,
+        }
+    }
 }
 
 /// A dimensionless ratio, such as a funding rate, as a count of `1 / SCALE`
@@ -444,6 +462,21 @@ mod tests {
         assert_eq!(parse(&format!("0.{}", "0".repeat(9_998))), Ok(0));
         assert_eq!(parse(&format!("{}.5", "0".repeat(9_998))), Ok(50_000_000));
         assert_eq!(parse(&format!("{ones}x")), Err(Malformed));
+    }
+
+    #[test]
+    fn qty_arithmetic_is_exact_or_none() {
+        let q = Qty::from_units;
+        assert_eq!(q(1_500_000).checked_add(q(2_500_000)), Some(q(4_000_000)));
+        assert_eq!(q(1_500_000).checked_sub(q(2_500_000)), Some(q(-1_000_000)));
+        assert_eq!(q(i64::MAX).checked_add(q(0)), Some(q(i64::MAX)));
+        assert_eq!(q(i64::MAX - 1).checked_add(q(1)), Some(q(i64::MAX)));
+        assert_eq!(q(i64::MAX).checked_add(q(1)), None);
+        assert_eq!(q(i64::MIN).checked_add(q(-1)), None);
+        assert_eq!(q(i64::MIN + 1).checked_sub(q(1)), Some(q(i64::MIN)));
+        assert_eq!(q(i64::MIN).checked_sub(q(1)), None);
+        assert_eq!(q(0).checked_sub(q(i64::MIN)), None);
+        assert_eq!(q(-1).checked_sub(q(i64::MIN)), Some(q(i64::MAX)));
     }
 
     #[test]

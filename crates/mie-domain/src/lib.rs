@@ -14,6 +14,7 @@
 //! | Market observations (Data Plane)          | [`event`], [`num`], [`time`] |
 //! | Canonical event order (ADR-028)           | [`order`]                    |
 //! | Market State                              | [`state`]                    |
+//! | Event-time bars (ADR-031)                 | [`bars`]                     |
 //! | Feature identity and versioning (ADR-029) | [`feature`], [`fingerprint`] |
 //! | Regime (ADR-017)                          | [`regime`]                   |
 //! | Location / auction state                  | [`location`]                 |
@@ -23,6 +24,7 @@
 //! Conditional Market Behavior, risk and validation rules join as modules
 //! here when their issues land — never as a dependency on a port or adapter.
 
+pub mod bars;
 pub mod event;
 pub mod feature;
 pub mod fingerprint;
