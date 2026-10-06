@@ -186,3 +186,45 @@ fn the_dataset_version_pins_the_covered_files() {
     assert_eq!(both.files, after.files);
     assert_ne!(both.version, after.version);
 }
+
+#[test]
+fn stream_lines_sort_bytewise_across_sources() {
+    let dir = TempDir::new("tamper-source-order");
+    let store = ParquetRawStore::new(dir.path());
+    let um = RawStreamKey::new("binance-um", "BTCUSDT", "aggTrade").unwrap();
+    let plain = RawStreamKey::new("binance", "BTCUSDT", "aggTrade").unwrap();
+    // Field-wise the keys order `binance` first; bytewise the rendered lines
+    // order `binance-um/` first, because '-' (0x2D) < '/' (0x2F).
+    assert!(plain < um);
+    for (source, key) in [("binance", &plain), ("binance-um", &um)] {
+        let mut writer = store.writer(source, RotationPolicy::default()).unwrap();
+        writer.append(key, record(D0 + 1, 1)).unwrap();
+        writer.close().unwrap();
+    }
+    let (start, end) = (D0, D0 + DAY);
+    let dataset = store
+        .select(&selection(&[&plain, &um], start, end))
+        .unwrap();
+    assert_eq!(dataset.files.len(), 2);
+
+    // Expected text built by hand: stream lines as literals in bytewise
+    // order, file lines sorted here rather than taken in the store's order.
+    let mut file_lines: Vec<String> = dataset
+        .files
+        .iter()
+        .map(|f| format!("file {} {} {}\n", f.relative_path, f.rows, f.sha256))
+        .collect();
+    file_lines.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    assert!(file_lines[0].starts_with("file source=binance-um/"));
+    let text = format!(
+        "mie-dataset 1\nwindow {start} {end}\n\
+         stream binance-um/BTCUSDT/aggTrade\n\
+         stream binance/BTCUSDT/aggTrade\n{}",
+        file_lines.concat()
+    );
+    let expected: String = Sha256::digest(text.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert_eq!(dataset.version.as_str(), expected);
+}

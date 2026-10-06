@@ -141,7 +141,11 @@ stream <source>/<instrument>/<stream>        one line per selected stream, sorte
 file <path> <rows> <sha256>                  one line per covered file, sorted by path
 ```
 
-A sealed file is covered when it overlaps `[start, end)`:
+Both sorts are the bytewise lexicographic order of the rendered lines (the
+`<source>/<instrument>/<stream>` text and the relative path), not the
+field-wise order of the stream key. For example `binance-um/…` sorts
+before `binance/…`, because `-` (0x2D) is below `/` (0x2F). A sealed
+file is covered when it overlaps `[start, end)`:
 `min_event_time < end && max_event_time >= start`. Every line ends in `\n`.
 
 ## Consequences

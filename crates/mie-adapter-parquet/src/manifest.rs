@@ -189,8 +189,11 @@ pub(crate) fn parse(text: &str) -> Result<SealedFile, RawStoreError> {
     Ok(file)
 }
 
-/// The canonical text a dataset version hashes (ADR-030). `streams` must be
-/// sorted and `files` sorted by path.
+/// The canonical text a dataset version hashes (ADR-030). `files` must be
+/// sorted by path. Stream lines are sorted here, bytewise on the rendered
+/// `source/instrument/stream` text, which the ADR fixes. That order differs
+/// from [`RawStreamKey`]'s field-wise order: field-wise `binance` precedes
+/// `binance-um`, bytewise `binance-um/…` precedes `binance/…` (`-` < `/`).
 pub(crate) fn dataset_text<'a>(
     window: ReplayWindow,
     streams: impl IntoIterator<Item = &'a RawStreamKey>,
@@ -201,7 +204,10 @@ pub(crate) fn dataset_text<'a>(
         window.start.as_millis(),
         window.end.as_millis()
     );
-    for stream in streams {
+    let mut rendered: Vec<String> = streams.into_iter().map(ToString::to_string).collect();
+    rendered.sort_unstable();
+    rendered.dedup();
+    for stream in rendered {
         let _ = writeln!(text, "stream {stream}");
     }
     for file in files {
