@@ -37,11 +37,11 @@ historical replay drive the same domain code (ADR-019). The crate graph
 enforces the boundary (ADR-025):
 
 ```text
-                 mie-cli   (composition root, planned)
+                 mie-cli             (composition root: `mie` binary)
                 /       \
    mie-adapter-*         mie-app     (use-case services)
-   (planned)    \       /
-                 mie-ports           (inbound + outbound port traits)
+   (binance,    \       /
+    parquet)     mie-ports           (inbound + outbound port traits)
                      |
                  mie-domain          (pure, deterministic core)
 ```
@@ -52,8 +52,9 @@ enforces the boundary (ADR-025):
 | [`mie-ports`](crates/mie-ports) | Use-case (inbound) and infrastructure (outbound) contracts owned by the core. |
 | [`mie-app`](crates/mie-app) | Use-case services that drive the domain through ports. |
 | [`mie-adapter-parquet`](crates/mie-adapter-parquet) | Immutable raw store: verbatim messages in sealed Parquet files with manifests and dataset versions (ADR-030). |
-| `mie-adapter-*` *(planned)* | Binance, DuckDB, Telegram, LLM operators, backtest engine. |
-| `mie-cli` *(planned)* | Wires adapters to ports: ingest, replay, research, report. |
+| [`mie-adapter-binance`](crates/mie-adapter-binance) | Binance USDⓈ-M live capture: raw-first persistence, shared normalization, feed gaps, canonical merge (ADR-032). |
+| `mie-adapter-*` *(planned)* | DuckDB, Telegram, LLM operators, backtest engine. |
+| [`mie-cli`](crates/mie-cli) | Composition root, the `mie` binary: wires adapters to ports. Today `ingest` and `capture-report`; replay, research and report follow. |
 
 First milestone data path (brief §19):
 
@@ -84,6 +85,15 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace
 tools/check-architecture.sh   # crate graph + core purity (ADR-025)
 cargo deny check              # licenses, advisories, sources
+```
+
+Live capture (public market data, no credentials) into the raw store,
+until SIGINT/SIGTERM, and the check of a capture window:
+
+```sh
+cargo run --release -p mie-cli -- ingest --config crates/mie-cli/ingest.example.toml
+cargo run --release -p mie-cli -- capture-report \
+    --config crates/mie-cli/ingest.example.toml --from <epoch ms> --to <epoch ms>
 ```
 
 ## Out of scope for now

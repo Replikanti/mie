@@ -1,5 +1,5 @@
 //! Live capture: raw first, then the pipeline, then the core (ADR-026,
-//! ADR-030).
+//! ADR-030, ADR-032).
 //!
 //! [`start`] spawns one thread per WebSocket stream (module `ws`), one
 //! open-interest poller (module `rest`) and one capture thread. The
@@ -94,8 +94,8 @@ pub struct LiveConfig {
 }
 
 impl LiveConfig {
-    /// The defaults for `BTCUSDT` on Binance USDⓈ-M (verified 2026-10-06,
-    /// see the ADR of #9), with every stream and no seeds.
+    /// The defaults for `BTCUSDT` on Binance USDⓈ-M (endpoints verified
+    /// 2026-10-06, ADR-032), with every stream and no seeds.
     pub fn new(run_id: &str) -> Self {
         Self {
             symbol: "BTCUSDT".to_owned(),

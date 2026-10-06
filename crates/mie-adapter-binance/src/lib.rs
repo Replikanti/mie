@@ -1,5 +1,5 @@
 //! Live market-data adapter for the Binance USDⓈ-M BTCUSDT perpetual
-//! (Data Plane brief; ADR-026, ADR-028, ADR-030).
+//! (Data Plane brief; ADR-026, ADR-028, ADR-030, ADR-032).
 //!
 //! The adapter implements the outbound
 //! [`MarketDataProvider`](mie_ports::outbound::MarketDataProvider) port for
