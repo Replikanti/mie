@@ -55,6 +55,11 @@ Earlier decisions constrain the answer:
    excluded and ties count as at-or-below. The values are `k/2` for
    `k ∈ 0..=200`, so the range is [0, 100]. Known quirk: a constant ATR
    window ranks 100 (EXTREME). That only happens on synthetic or dead data.
+   The fixed-point Wilder step makes this reachable from decay too: once
+   ATR ≤ 6 units (1e-8), `round(13·ATR/14) = ATR`, so a long run of
+   identical TRs (e.g. 200+ trade-less complete hours, TR = 0) freezes ATR
+   and the percentile climbs to 100, where Pine's strictly decaying ATR
+   would rank 0. Not reachable on live BTCUSDT.
 4. **Bands**: the upper-closed bands of `RegimeLabel::from_percentile` are
    confirmed: `[0, 25]`, `(25, 50]`, `(50, 75]`, `(75, 100]`. On the
    half-steps of decision 3 they equal round-half-up followed by the
@@ -124,7 +129,8 @@ Earlier decisions constrain the answer:
 - A fresh live session shows no regime for about 9 days unless it is seeded
   by replay (out of scope here).
 - The regime changes at most once per hour.
-- A constant ATR window ranks 100 (decision 3).
+- A constant ATR window ranks 100, including an ATR frozen by fixed-point
+  rounding on dead data (decision 3).
 - Motion and ATR are on closed bars only; an intrabar (developing-bar) value
   would be a new feature.
 - `Regime` names its producing feature, so a later `@2` is visible on the
