@@ -53,6 +53,7 @@ pub fn current_set() -> FeatureSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fingerprint::Fingerprinter;
 
     #[test]
     fn catalog_is_valid() {
@@ -71,6 +72,41 @@ mod tests {
             );
         }
         assert_eq!(LOCK.len(), DEFINITIONS.len());
+    }
+
+    #[test]
+    fn every_definition_stays_computable() {
+        // ADR-029: an old version must still fit a feature set — its own
+        // dependency closure.
+        let registry = registry();
+        for definition in DEFINITIONS {
+            let closure = registry.closure(definition.key).unwrap();
+            let set = FeatureSet::new(&registry, &closure)
+                .unwrap_or_else(|error| panic!("{} is not computable: {error}", definition.key));
+            assert!(set.definitions().any(|member| member == *definition));
+        }
+    }
+
+    #[test]
+    fn lock_table_is_pinned() {
+        // LOCK is append-only. Deleting a version together with its lock
+        // line passes catalog_matches_lock, so the whole table is pinned
+        // here: appending a line updates both pins below in the same PR;
+        // any other change to them is a deleted or edited published version
+        // and must not merge.
+        let mut hasher = Fingerprinter::new();
+        hasher.write_len(LOCK.len());
+        for entry in LOCK {
+            hasher.write_str(entry.key.id.as_str());
+            hasher.write_u32(entry.key.version.get());
+            hasher.write_u64(entry.fingerprint.value());
+        }
+        assert_eq!(LOCK.len(), 1, "lock lines");
+        assert_eq!(
+            hasher.finish().to_string(),
+            "008a70255d2e2bff",
+            "lock digest"
+        );
     }
 
     #[test]

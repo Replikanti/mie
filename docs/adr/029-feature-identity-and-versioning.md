@@ -41,13 +41,20 @@ evolved:
    ever shipped stays in `mie_domain::feature::catalog::DEFINITIONS` and stays
    computable; a change ships as `id@version+1`. The registry rejects
    duplicate keys, version 0, version gaps (a deleted old version), unsorted
-   or repeated parameters, repeated inputs, unknown upstream features and
-   dependency cycles.
+   or repeated parameters, repeated inputs, unknown upstream features,
+   dependency cycles, and a definition whose dependency closure (itself and
+   its upstream features, transitively) needs one id at two versions — no
+   feature set could compute it, so it would not stay computable. A test
+   builds every catalog definition into the feature set of its own closure.
 4. **Lock.** `catalog::LOCK` is an append-only table of definition
    fingerprints, one line per `id@version`. `cargo test` checks the catalog
    against it: an edited definition fails as *changed without a version
-   bump*, a new one as *unlocked* (the message prints the line to append), a
-   deleted one as *missing*.
+   bump* (the message names the next free version), a new one as *unlocked*
+   (the message prints the line to append), a deleted one as *missing*.
+   Deleting a version together with its lock line would pass those checks,
+   so the line count and a digest of the whole `LOCK` table are pinned by a
+   test as well: appending a line updates the pins in the same PR, and any
+   other change to them is a visible, reviewable deletion or edit.
 5. **Definition encoding v1.** The fingerprint is FNV-1a 64 (offset basis
    `0xcbf29ce484222325`, prime `0x100000001b3`) over explicit writers:
    `u8`; `u32`, `u64`, `i64` little-endian, fixed width; `str` as a `u32`
@@ -104,9 +111,10 @@ evolved:
   safely, but it is identity, not tamper evidence: it does not resist a
   deliberately chosen collision.
 - The lock catches an edited definition only while its lock line stays.
-  Editing a lock line together with the definition passes the test; until a
-  CI guard keeps `LOCK` append-only against the merge base, review catches
-  that.
+  Editing or deleting a lock line together with the definition fails the
+  pinned lock digest, but a PR can update that pin too; until a CI guard
+  keeps `LOCK` append-only against the merge base, review of the pin change
+  catches that.
 - The fingerprint covers the declaration, not the computation. A change to
   the computing code without a definition change is caught only by the
   golden-output tests.
@@ -133,7 +141,8 @@ evolved:
   to the code that is edited with it, so both change together. The separate
   append-only table makes such an edit visible as a lock change in review.
 - **A CI git-diff guard keeping `LOCK` append-only.** Closes the "edit the
-  lock line too" gap; deferred until real features exist, review covers it
+  lock line and its pin too" gap; deferred until real features exist. The
+  pinned lock digest makes every such edit a visible pin change in review
   meanwhile.
 - **Two-state validity (`WarmingUp` / `Ready` only).** Rejected at plan
   review: #18 needs structural unavailability, and adding a variant later

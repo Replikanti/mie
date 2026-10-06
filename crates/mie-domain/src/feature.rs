@@ -56,12 +56,16 @@
 //! 3. Add it to [`catalog::DEFINITIONS`]. If it is computed by default, also
 //!    add it to [`catalog::CURRENT`].
 //! 4. Append its [`catalog::LOCK`] line. The failing `catalog_matches_lock`
-//!    test prints the fingerprint and the line to add.
+//!    test prints the fingerprint and the line to add; then update the line
+//!    count and digest pinned by `lock_table_is_pinned`.
 //! 5. Expose the value on [`MarketState`](crate::state::MarketState) as
 //!    [`FeatureValue<T>`]. It is ready only after its warm-up and goes back to
 //!    `WarmingUp` according to its gap policy.
 //! 6. Add a golden-output test per version on a fixed tape. It pins the
 //!    behaviour the fingerprint cannot see.
+//!    A new version is built on one version of each upstream id, so its
+//!    dependency closure fits one feature set (the registry rejects a
+//!    closure that needs two versions of one id).
 //! 7. Any change to parameters, inputs, an upstream version, the warm-up or
 //!    the outputs means a new `_V{n+1}` const and `LOCK` line. The old
 //!    version stays in `DEFINITIONS` and `LOCK`, stays computable, and keeps
@@ -72,7 +76,7 @@ pub mod catalog;
 use crate::event::Stream;
 use crate::fingerprint::{Fingerprint, Fingerprinter};
 use crate::num::{Price, Qty, Rate};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 /// Version byte of the definition and feature-set encodings (module docs).
@@ -464,7 +468,10 @@ impl FeatureRegistry {
     /// - [`RegistryError::UnknownInput`] — an upstream feature that is not
     ///   registered;
     /// - [`RegistryError::DependencyCycle`] — features that depend on each
-    ///   other, directly or through others.
+    ///   other, directly or through others;
+    /// - [`RegistryError::ConflictingVersions`] — a definition whose
+    ///   dependency closure (itself and its upstream features, transitively)
+    ///   holds one id at two versions, so no [`FeatureSet`] could compute it.
     pub fn new(definitions: &[&'static FeatureDefinition]) -> Result<Self, RegistryError> {
         let mut registered = BTreeMap::new();
         for &definition in definitions {
@@ -531,7 +538,55 @@ impl FeatureRegistry {
             definitions: registered,
         };
         registry.check_acyclic()?;
+        for &key in registry.definitions.keys() {
+            registry.check_closure(key)?;
+        }
         Ok(registry)
+    }
+
+    /// Every definition stays computable (ADR-029): its closure must fit one
+    /// [`FeatureSet`], i.e. hold each id at one version only.
+    fn check_closure(&self, feature: FeatureKey) -> Result<(), RegistryError> {
+        let closure = self.closure_of(feature);
+        // Sorted by (id, version): two versions of one id are adjacent.
+        for pair in closure.windows(2) {
+            if pair[0].id == pair[1].id {
+                return Err(RegistryError::ConflictingVersions {
+                    feature,
+                    id: pair[0].id,
+                    first: pair[0].version,
+                    second: pair[1].version,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// `key` and every upstream feature it depends on, transitively, sorted
+    /// by (id, version). Requires a validated (acyclic, closed) registry.
+    fn closure_of(&self, key: FeatureKey) -> Vec<FeatureKey> {
+        let mut closure = BTreeSet::new();
+        let mut pending = vec![key];
+        while let Some(next) = pending.pop() {
+            if closure.insert(next) {
+                for input in self.definitions[&next].inputs {
+                    if let Input::Feature(upstream) = input {
+                        pending.push(*upstream);
+                    }
+                }
+            }
+        }
+        closure.into_iter().collect()
+    }
+
+    /// The dependency closure of `key`: the key itself and every upstream
+    /// feature it depends on, transitively, sorted by (id, version) — the
+    /// smallest [`FeatureSet`] that computes it. `None` if `key` is not
+    /// registered.
+    pub fn closure(&self, key: FeatureKey) -> Option<Vec<FeatureKey>> {
+        self.definitions
+            .contains_key(&key)
+            .then(|| self.closure_of(key))
     }
 
     /// Depth-first search over the upstream edges; every upstream is
@@ -569,6 +624,19 @@ impl FeatureRegistry {
             visit(self, key, &mut marks)?;
         }
         Ok(())
+    }
+
+    /// The first unused version of `id`: one past its latest registered
+    /// version, or 1.
+    fn next_version(&self, id: FeatureId) -> u64 {
+        let latest = self
+            .definitions
+            .keys()
+            .filter(|key| key.id == id)
+            .map(|key| key.version.get())
+            .max()
+            .unwrap_or(0);
+        u64::from(latest) + 1
     }
 
     /// The definition of `key`, if registered.
@@ -635,6 +703,7 @@ impl FeatureRegistry {
                             key: entry.key,
                             locked: entry.fingerprint,
                             actual,
+                            next: self.next_version(entry.key.id),
                         });
                     }
                 }
@@ -819,6 +888,18 @@ pub enum RegistryError {
         /// A feature on the cycle.
         key: FeatureKey,
     },
+    /// A definition's dependency closure needs one id at two versions, so no
+    /// feature set can compute it.
+    ConflictingVersions {
+        /// The definition that cannot be computed.
+        feature: FeatureKey,
+        /// The id required at two versions.
+        id: FeatureId,
+        /// The lower required version.
+        first: FeatureVersion,
+        /// The higher required version.
+        second: FeatureVersion,
+    },
 }
 
 impl fmt::Display for RegistryError {
@@ -847,6 +928,16 @@ impl fmt::Display for RegistryError {
             Self::DependencyCycle { key } => {
                 write!(f, "{key} depends on itself through its upstream features")
             }
+            Self::ConflictingVersions {
+                feature,
+                id,
+                first,
+                second,
+            } => write!(
+                f,
+                "{feature} needs both {id}@{first} and {id}@{second} through its upstream features, \
+                 so no feature set can compute it; build it on one version of {id}"
+            ),
         }
     }
 }
@@ -890,6 +981,8 @@ pub enum LockError {
         locked: Fingerprint,
         /// The fingerprint of the registered definition.
         actual: Fingerprint,
+        /// The first unused version of the id, to ship the change as.
+        next: u64,
     },
     /// The definition has no lock line.
     Unlocked {
@@ -912,11 +1005,11 @@ impl fmt::Display for LockError {
                 key,
                 locked,
                 actual,
+                next,
             } => write!(
                 f,
-                "{key} changed without a version bump (locked {locked}, now {actual}): restore it and add {}@{}",
-                key.id,
-                u64::from(key.version.get()) + 1
+                "{key} changed without a version bump (locked {locked}, now {actual}): restore it and add {}@{next}",
+                key.id
             ),
             Self::Unlocked { key, actual } => write!(
                 f,
@@ -981,10 +1074,14 @@ mod tests {
     const C1: FeatureKey = FeatureKey::new("c", 1);
     const L1: FeatureKey = FeatureKey::new("l", 1);
     const R1: FeatureKey = FeatureKey::new("r", 1);
+    const T1: FeatureKey = FeatureKey::new("t", 1);
     const U7: FeatureKey = FeatureKey::new("u", 7);
     const X1: FeatureKey = FeatureKey::new("x", 1);
     const X2: FeatureKey = FeatureKey::new("x", 2);
     const X3: FeatureKey = FeatureKey::new("x", 3);
+    const W1: FeatureKey = FeatureKey::new("w", 1);
+    const Y1: FeatureKey = FeatureKey::new("y", 1);
+    const Z1: FeatureKey = FeatureKey::new("z", 1);
 
     const N14: &[Param] = &[Param {
         name: "n",
@@ -1290,12 +1387,116 @@ mod tests {
                 input: Input::Feature(X_V1.key),
             }
         );
-        // Two versions of one upstream are distinct inputs.
-        let both = leak(FeatureDefinition {
+    }
+
+    #[test]
+    fn rejects_a_closure_with_two_versions_of_one_id() {
+        // Review regression: every registered definition must stay
+        // computable, i.e. fit one feature set (ADR-029).
+        const XV1: FeatureDefinition = FeatureDefinition {
+            key: X1,
+            params: &[],
+            inputs: &[Input::Stream(Stream::Trades)],
+            warm_up: WarmUp::None,
+        };
+        const XV2: FeatureDefinition = FeatureDefinition {
+            key: X2,
+            warm_up: WarmUp::Samples(2),
+            ..XV1
+        };
+        const YV1: FeatureDefinition = FeatureDefinition {
+            key: Y1,
+            params: &[],
+            inputs: &[Input::Feature(X1)],
+            warm_up: WarmUp::None,
+        };
+        // w@1 on the old y@1 and the latest x@2: its closure needs x@1 and x@2.
+        const WV1: FeatureDefinition = FeatureDefinition {
+            key: W1,
+            params: &[],
+            inputs: &[Input::Feature(Y1), Input::Feature(X2)],
+            warm_up: WarmUp::None,
+        };
+        // z@1 directly on two versions of x.
+        const ZV1: FeatureDefinition = FeatureDefinition {
+            key: Z1,
+            params: &[],
             inputs: &[Input::Feature(X1), Input::Feature(X2)],
+            warm_up: WarmUp::None,
+        };
+        let conflict = |feature| RegistryError::ConflictingVersions {
+            feature,
+            id: FeatureId::new("x"),
+            first: FeatureVersion::new(1),
+            second: FeatureVersion::new(2),
+        };
+        assert_eq!(
+            FeatureRegistry::new(&[&XV1, &XV2, &YV1, &WV1, &ZV1]).unwrap_err(),
+            conflict(W1)
+        );
+        assert_eq!(
+            FeatureRegistry::new(&[&XV1, &XV2, &YV1, &WV1]).unwrap_err(),
+            conflict(W1)
+        );
+        assert_eq!(
+            FeatureRegistry::new(&[&XV1, &XV2, &ZV1]).unwrap_err(),
+            conflict(Z1)
+        );
+        // A version built on an older version of its own id conflicts too.
+        let x2_on_x1 = leak(FeatureDefinition {
+            inputs: &[Input::Feature(X1)],
+            ..XV2
+        });
+        assert_eq!(
+            FeatureRegistry::new(&[&XV1, x2_on_x1]).unwrap_err(),
+            RegistryError::ConflictingVersions {
+                feature: X2,
+                id: FeatureId::new("x"),
+                first: FeatureVersion::new(1),
+                second: FeatureVersion::new(2),
+            }
+        );
+        // Without the offenders the rest is valid, and every definition's
+        // closure builds a feature set.
+        let registry = registry(&[&XV1, &XV2, &YV1]);
+        for definition in registry.definitions() {
+            let closure = registry.closure(definition.key).unwrap();
+            FeatureSet::new(&registry, &closure).unwrap();
+        }
+    }
+
+    #[test]
+    fn closures_are_the_smallest_computable_sets() {
+        let registry = registry(ALL);
+        assert_eq!(registry.closure(X_V1.key), Some(vec![X_V1.key]));
+        assert_eq!(registry.closure(Y_V2.key), Some(vec![X_V2.key, Y_V2.key]));
+        assert_eq!(registry.closure(FeatureKey::new("x", 3)), None);
+        // A diamond: the shared upstream appears once.
+        let left = leak(with_key(&Y_V1, "l", 1));
+        let right = leak(with_key(&Y_V1, "r", 1));
+        let top = leak(FeatureDefinition {
+            key: T1,
+            inputs: &[Input::Feature(L1), Input::Feature(R1)],
             ..Y_V1
         });
-        FeatureRegistry::new(&[&X_V1, &X_V2, both]).unwrap();
+        let diamond = self::registry(&[top, left, right, &X_V1]);
+        assert_eq!(diamond.closure(T1), Some(vec![L1, R1, T1, X1]));
+        for registry in [&registry, &diamond] {
+            for definition in registry.definitions() {
+                let closure = registry.closure(definition.key).unwrap();
+                let set = FeatureSet::new(registry, &closure).unwrap();
+                assert!(set.definitions().any(|member| member.key == definition.key));
+                // Dropping any upstream breaks the set.
+                for dropped in closure.iter().filter(|key| **key != definition.key) {
+                    let rest: Vec<FeatureKey> = closure
+                        .iter()
+                        .copied()
+                        .filter(|key| key != dropped)
+                        .collect();
+                    assert!(FeatureSet::new(registry, &rest).is_err(), "{dropped}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -1373,6 +1574,7 @@ mod tests {
                 key: X_V1.key,
                 locked: X_V1.fingerprint(),
                 actual: X_V1_EDITED.fingerprint(),
+                next: 2,
             }]
         );
         // Shipping the change as x@2 keeps x@1 intact.
@@ -1388,8 +1590,14 @@ mod tests {
                 key: X_V1.key,
                 locked: X_V1.fingerprint(),
                 actual: X_V1_EDITED.fingerprint(),
+                next: 3,
             }]
         );
+        // The advice names the next free version, not x@2, which exists.
+        let errors = registry(&[&X_V1_EDITED, &X_V2])
+            .verify_lock(&appended)
+            .unwrap_err();
+        assert!(errors[0].to_string().ends_with("restore it and add x@3"));
     }
 
     #[test]
@@ -1457,6 +1665,7 @@ mod tests {
                     key: Y_V1.key,
                     locked: Fingerprint::from_raw(0),
                     actual: Y_V1.fingerprint(),
+                    next: 3,
                 },
                 LockError::Missing {
                     key: FeatureKey::new("gone", 1)
@@ -1485,6 +1694,7 @@ mod tests {
                 key: X_V1.key,
                 locked: X_V1.fingerprint(),
                 actual: X_V1_EDITED.fingerprint(),
+                next: 2,
             }]
         );
     }
@@ -1985,9 +2195,21 @@ mod tests {
                 key,
                 locked: Fingerprint::from_raw(1),
                 actual: Fingerprint::from_raw(2),
+                next: 2,
             }
             .to_string(),
             "x@1 changed without a version bump (locked 0000000000000001, now 0000000000000002): restore it and add x@2"
+        );
+        assert_eq!(
+            RegistryError::ConflictingVersions {
+                feature: FeatureKey::new("w", 1),
+                id: key.id,
+                first: FeatureVersion::new(1),
+                second: FeatureVersion::new(2),
+            }
+            .to_string(),
+            "w@1 needs both x@1 and x@2 through its upstream features, \
+             so no feature set can compute it; build it on one version of x"
         );
         assert_eq!(
             LockError::Unlocked {
