@@ -9,20 +9,23 @@
 //! so the same input stream always yields the same state — whether it comes
 //! from live ingestion or from historical replay.
 //!
-//! | Subsystem (design doc)               | Module                          |
-//! |--------------------------------------|---------------------------------|
-//! | Market observations (Data Plane)     | [`event`], [`num`], [`time`]    |
-//! | Canonical event order (ADR-028)      | [`order`]                       |
-//! | Market State                         | [`state`]                       |
-//! | Regime (ADR-017)                     | [`regime`]                      |
-//! | Location / auction state             | [`location`]                    |
-//! | Bias / trigger (ADR-012, ADR-024)    | [`trigger`]                     |
-//! | Strategy lifecycle / edge health     | [`strategy`]                    |
+//! | Subsystem (design doc)                    | Module                       |
+//! |-------------------------------------------|------------------------------|
+//! | Market observations (Data Plane)          | [`event`], [`num`], [`time`] |
+//! | Canonical event order (ADR-028)           | [`order`]                    |
+//! | Market State                              | [`state`]                    |
+//! | Feature identity and versioning (ADR-029) | [`feature`], [`fingerprint`] |
+//! | Regime (ADR-017)                          | [`regime`]                   |
+//! | Location / auction state                  | [`location`]                 |
+//! | Bias / trigger (ADR-012, ADR-024)         | [`trigger`]                  |
+//! | Strategy lifecycle / edge health          | [`strategy`]                 |
 //!
 //! Conditional Market Behavior, risk and validation rules join as modules
 //! here when their issues land — never as a dependency on a port or adapter.
 
 pub mod event;
+pub mod feature;
+pub mod fingerprint;
 pub mod location;
 pub mod num;
 pub mod order;

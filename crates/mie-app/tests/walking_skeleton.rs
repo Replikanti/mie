@@ -7,6 +7,7 @@ use mie_domain::event::{
     Aggressor, BookSnapshot, BookUpdate, FeedGap, FundingSettlement, GapReason, Kline, Level,
     Liquidation, MarkPrice, MarketEvent, OpenInterest, Stream, Trade,
 };
+use mie_domain::feature::{FeatureValue, catalog};
 use mie_domain::num::{Price, Qty, Rate};
 use mie_domain::state::{MarketStateEngine, StateError};
 use mie_domain::time::EventTime;
@@ -82,6 +83,8 @@ fn live_and_replay_paths_produce_identical_state() {
     assert_eq!(live_events, 4);
     assert_eq!(report.events, live_events);
     assert_eq!(&report.state, engine.state());
+    // Both paths record the feature-set version they computed with (ADR-029).
+    assert_eq!(report.state.feature_set, catalog::current_set().version());
 }
 
 #[test]
@@ -94,7 +97,7 @@ fn replay_respects_the_window() {
     assert_eq!(report.state.as_of, Some(EventTime::from_millis(1_250)));
     assert_eq!(
         report.state.last_trade_price,
-        Some(Price::from_units(6_354_190_000_000))
+        FeatureValue::Ready(Price::from_units(6_354_190_000_000))
     );
 }
 

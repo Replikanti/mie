@@ -5,9 +5,15 @@
 //! (ADR-028) and tracks only the latest trade; every other kind passes
 //! through. Feature families (volatility, order flow, order book,
 //! OI/funding, volume profile, structure) are added by the Market State
-//! issues, each as a deterministic, versioned definition.
+//! issues, each as a registered, versioned definition (ADR-029, [`feature`]).
+//! The engine computes one [`FeatureSet`] and stamps its
+//! [`FeatureSetVersion`] on every state; each feature value carries its
+//! validity ([`FeatureValue`]).
+//!
+//! [`feature`]: crate::feature
 
 use crate::event::{MarketEvent, Stream};
+use crate::feature::{FeatureSet, FeatureSetVersion, FeatureValue, catalog};
 use crate::num::Price;
 use crate::order::CanonicalKey;
 use crate::time::EventTime;
@@ -15,14 +21,20 @@ use std::cmp::Ordering;
 use std::fmt;
 
 /// The market as known after the last consumed event.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MarketState {
+    /// Version of the feature set this state was computed with (ADR-029);
+    /// experiments record it.
+    pub feature_set: FeatureSetVersion,
     /// Ordering time (ADR-028) of the last consumed event; `None` before the
     /// first one.
     pub as_of: Option<EventTime>,
-    /// Price of the last trade.
-    pub last_trade_price: Option<Price>,
-    /// Number of trades consumed.
+    /// Price of the last trade: `trade.last_price@1`
+    /// ([`catalog::TRADE_LAST_PRICE_V1`]), warming up until the first trade.
+    pub last_trade_price: FeatureValue<Price>,
+    /// Number of trades consumed. A diagnostic counter, not a feature: it
+    /// depends on where consumption started, so it is not reproducible
+    /// across replay windows.
     pub trade_count: u64,
 }
 
@@ -31,8 +43,10 @@ pub struct MarketState {
 ///
 /// Live ingestion and historical replay drive the same engine (ADR-019); the
 /// engine never knows which of them is feeding it.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct MarketStateEngine {
+    /// The features this engine computes.
+    features: FeatureSet,
     state: MarketState,
     /// The last consumed event: the lower bound for the next one.
     last: Option<MarketEvent>,
@@ -109,10 +123,39 @@ fn check_id(
     Ok(())
 }
 
+impl Default for MarketStateEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MarketStateEngine {
-    /// Creates an engine with an empty state.
+    /// Creates an engine with an empty state that computes the current
+    /// feature set ([`catalog::CURRENT`]).
     pub fn new() -> Self {
-        Self::default()
+        let features = catalog::current_set();
+        let state = MarketState {
+            feature_set: features.version(),
+            as_of: None,
+            // `trade.last_price@1` warms up on one trade.
+            last_trade_price: FeatureValue::WarmingUp {
+                observed: 0,
+                required: 1,
+            },
+            trade_count: 0,
+        };
+        Self {
+            features,
+            state,
+            last: None,
+            ids: LastIds::default(),
+        }
+    }
+
+    /// The features this engine computes; experiments record its canonical
+    /// list (`Display`) next to [`FeatureSet::version`].
+    pub fn feature_set(&self) -> &FeatureSet {
+        &self.features
     }
 
     /// Consumes the next event.
@@ -159,7 +202,7 @@ impl MarketStateEngine {
 
         match event {
             MarketEvent::Trade(trade) => {
-                self.state.last_trade_price = Some(trade.price);
+                self.state.last_trade_price = FeatureValue::Ready(trade.price);
                 self.state.trade_count += 1;
             }
             // No feature consumes these yet.
@@ -287,8 +330,9 @@ mod tests {
         assert_eq!(
             engine.state(),
             &MarketState {
+                feature_set: catalog::current_set().version(),
                 as_of: Some(t(1_500)),
-                last_trade_price: Some(Price::from_units(6_354_210_000_000)),
+                last_trade_price: FeatureValue::Ready(Price::from_units(6_354_210_000_000)),
                 trade_count: 3,
             }
         );
@@ -330,7 +374,7 @@ mod tests {
             assert_eq!(after.as_of, Some(event.time()), "{event:?}");
             if event.kind() == EventKind::Trade {
                 assert_eq!(after.trade_count, before.trade_count + 1);
-                assert!(after.last_trade_price.is_some());
+                assert!(after.last_trade_price.is_ready());
             } else {
                 assert_eq!(after.trade_count, before.trade_count, "{event:?}");
                 assert_eq!(after.last_trade_price, before.last_trade_price, "{event:?}");
@@ -339,6 +383,60 @@ mod tests {
         assert_eq!(engine.state().trade_count, 2);
         // The kline closing at 2_000 is the last event.
         assert_eq!(engine.state().as_of, Some(t(2_000)));
+    }
+
+    #[test]
+    fn stamps_the_current_feature_set() {
+        let engine = MarketStateEngine::new();
+        let current = catalog::current_set();
+        assert_eq!(engine.state().feature_set, current.version());
+        assert_eq!(engine.feature_set(), &current);
+        assert_eq!(engine.feature_set().to_string(), "trade.last_price@1");
+        // Consuming events never changes it.
+        let engine = engine_after(&one_of_each(1_000));
+        assert_eq!(engine.state().feature_set, current.version());
+        assert_eq!(
+            MarketStateEngine::default().state(),
+            MarketStateEngine::new().state()
+        );
+    }
+
+    #[test]
+    fn last_trade_price_warms_up_on_the_first_trade() {
+        let warming = FeatureValue::WarmingUp {
+            observed: 0,
+            required: 1,
+        };
+        let mut engine = MarketStateEngine::new();
+        assert_eq!(engine.state().last_trade_price, warming);
+        assert_eq!(engine.state().last_trade_price.ready(), None);
+        // Non-trade events leave it warming.
+        for event in [
+            gap(Stream::Trades, 0, 900, GapReason::MissingData),
+            snapshot(950, 10),
+            mark(960, 1),
+        ] {
+            engine.apply(&event).unwrap();
+            assert_eq!(engine.state().last_trade_price, warming, "{event:?}");
+        }
+        engine.apply(&priced_trade(1_000, 1, 42)).unwrap();
+        assert_eq!(
+            engine.state().last_trade_price,
+            FeatureValue::Ready(Price::from_units(42))
+        );
+        // Gap policy of `trade.last_price@1`: none — a gap keeps the price.
+        engine
+            .apply(&gap(Stream::Trades, 1_001, 2_000, GapReason::Disconnected))
+            .unwrap();
+        assert_eq!(
+            engine.state().last_trade_price.ready(),
+            Some(&Price::from_units(42))
+        );
+        engine.apply(&priced_trade(2_000, 2, 43)).unwrap();
+        assert_eq!(
+            engine.state().last_trade_price.ready(),
+            Some(&Price::from_units(43))
+        );
     }
 
     #[test]
