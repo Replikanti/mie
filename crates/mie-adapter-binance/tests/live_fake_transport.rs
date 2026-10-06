@@ -1117,8 +1117,9 @@ impl HttpGet for LaggedOi {
     }
 }
 
-/// A capture of mark prices plus open interest polled with `lags_ms`.
-fn lagged_oi_run(lags_ms: &[i64]) -> (Outcome, LiveConfig) {
+/// A capture of mark prices plus open interest polled with `lags_ms`, at
+/// the shipped defaults or with another re-time allowance.
+fn lagged_oi_run(lags_ms: &[i64], oi_retime_ms: Option<i64>) -> (Outcome, LiveConfig) {
     let shutdown = Arc::new(AtomicBool::new(false));
     let clock = FakeClock::new(D0 + 3_000, "mie-openInterest");
     let sent_upto = Arc::new(std::sync::atomic::AtomicI64::new(0));
@@ -1139,7 +1140,7 @@ fn lagged_oi_run(lags_ms: &[i64]) -> (Outcome, LiveConfig) {
     // The shipped defaults: 2000 ms hold-back, 10 000 ms re-time allowance.
     let mut cfg = config(&[BinanceStream::MarkPrice, BinanceStream::OpenInterest]);
     cfg.hold_back_ms = LiveConfig::new("r").hold_back_ms;
-    cfg.oi_retime_ms = LiveConfig::new("r").oi_retime_ms;
+    cfg.oi_retime_ms = oi_retime_ms.unwrap_or(LiveConfig::new("r").oi_retime_ms);
     let params = cfg.clone();
     let sink_log = Arc::new(Mutex::new(SinkLog::default()));
     let recorder = Recorder::default();
@@ -1190,7 +1191,7 @@ fn open_interest_times(events: &[MarketEvent]) -> Vec<i64> {
 #[test]
 fn open_interest_lagging_the_poll_is_delivered_at_the_defaults() {
     // The live lag range: 4 to 8 s behind the poll.
-    let (out, params) = lagged_oi_run(&[4_200, 6_000, 7_900, 5_100, 4_000, 7_000]);
+    let (out, params) = lagged_oi_run(&[4_200, 6_000, 7_900, 5_100, 4_000, 7_000], None);
     assert!(out.provider_error.is_none());
     assert_eq!(params.oi_retime_ms, 10_000);
     // Every sample reaches the core, re-timed to the first open millisecond
@@ -1231,7 +1232,41 @@ fn open_interest_lagging_the_poll_is_delivered_at_the_defaults() {
 fn open_interest_later_than_the_allowance_is_still_a_late_gap() {
     // The third sample trails its poll by 15 s: 12 s past the last
     // released event, beyond the 10 s allowance.
-    let (out, _) = lagged_oi_run(&[5_000, 6_000, 15_000, 5_000]);
+    let (out, _) = lagged_oi_run(&[5_000, 6_000, 15_000, 5_000], None);
     assert_eq!(open_interest_times(&out.events), [7_001, 17_001, 37_001]);
     assert_eq!(out.gaps(), [(Stream::OpenInterest, GapReason::LateEvent)]);
+}
+
+#[test]
+fn a_non_default_retime_allowance_is_an_input_of_the_recompute() {
+    // With 2000 ms, only samples at most 2 s past their slot are re-timed:
+    // lag - 2999 is 1201, 3001, 4901 and 1101 ms here.
+    let (out, params) = lagged_oi_run(&[4_200, 6_000, 7_900, 4_100], Some(2_000));
+    assert_eq!(params.oi_retime_ms, 2_000);
+    assert_eq!(open_interest_times(&out.events), [7_001, 37_001]);
+    assert_eq!(
+        out.gaps(),
+        [
+            (Stream::OpenInterest, GapReason::LateEvent),
+            (Stream::OpenInterest, GapReason::LateEvent)
+        ]
+    );
+    let records = out.sink.lock().unwrap().records.clone();
+    let replayed = recompute(
+        &records,
+        &params.symbol,
+        params.hold_back_ms,
+        2_000,
+        &params.seeds,
+    );
+    assert_eq!(replayed, out.events);
+    let default = recompute(
+        &records,
+        &params.symbol,
+        params.hold_back_ms,
+        LiveConfig::new("r").oi_retime_ms,
+        &params.seeds,
+    );
+    assert_ne!(default, out.events);
+    assert_eq!(open_interest_times(&default).len(), 4);
 }

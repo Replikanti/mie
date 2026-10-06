@@ -1,6 +1,7 @@
 # ADR-028: Exchange event time and the canonical multi-stream order
 
-- Status: accepted
+- Status: accepted; the live OpenInterest ordering time (table row
+  OpenInterest, "live: the response timestamp") is superseded by ADR-032 D12
 - Date: 2026-10-06
 
 ## Context

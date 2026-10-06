@@ -113,13 +113,25 @@ interest over REST only.
     small for that stream. A tolerance is a conscious choice made on the
     command line, not a default. Open interest re-timed under D12 counts as
     delivered, not late.
-12. **Open interest that arrives late is re-timed, not dropped.** The REST
-    `time` trails the poll by 4 to 8 s (see the documentation check), so
-    under D6 every live sample is late. A late `OpenInterest` whose slot
-    passed by at most `oi_retime_ms` (`last released + 1 − time`; default
-    10 000 ms, one poll interval) is delivered at `last released + 1`, the
-    first millisecond still open. Only past that allowance does it become a
-    `LateEvent` gap.
+12. **Open interest that arrives late is re-timed, not dropped.** This
+    **supersedes one clause of ADR-028**: the live OpenInterest ordering
+    time in its table ("live: the response timestamp"). ADR-028 is
+    accepted, so per the ADR process only its status line changes; it now
+    points here. All other parts of ADR-028 stand, including the archive
+    rule for open interest and "never a validity time earlier than
+    publication".
+
+    The REST `time` trails the poll by 4 to 8 s (see the documentation
+    check), so under D6 every live sample is late. A late `OpenInterest`
+    is delivered at `last released + 1`, the first millisecond still open,
+    when both of these hold:
+    - its slot passed by at most `oi_retime_ms` (`last released + 1 −
+      time`; default 10 000 ms, one poll interval);
+    - its exchange `time` is strictly newer than every open-interest
+      sample already admitted, buffered or re-timed.
+
+    Otherwise it becomes a `LateEvent` gap. A stale or repeated snapshot is
+    therefore never delivered as the current value.
     - **Why it is sound.** The state engine requires one strictly
       increasing canonical order over all streams (`MarketStateEngine::
       apply`: `OutOfOrder` and `Duplicate`). The re-timed sample sorts
@@ -140,6 +152,20 @@ interest over REST only.
       exchange `time` as its `event_time`, and replay re-times it the same
       way. Every other stream keeps the 2000 ms hold-back and the plain
       `LateEvent` rule.
+    - **Known limitation: the exchange time is not on the event.**
+      `OpenInterest` has a single `time` field. For a re-timed sample it
+      carries the delivery time, so the exchange's sampling time does not
+      reach the core. That time can be recovered from the raw record: its
+      `event_time` is the exchange `time`, and the record's `receive_seq`
+      identifies it. Carrying both times on the event would change the
+      `mie-domain` event model, and with it the payload tie-break of
+      ADR-028. That is left to a later decision, for when a feature
+      consumes open interest; today the engine passes it through.
+    - **Consequence for comparisons.** A re-timed time depends on arrival
+      within the run. Replaying the same raw records with the same run
+      parameters reproduces it exactly. Two independent captures of the
+      same market, however, can deliver the same sample at different
+      times.
 
 ### Documentation check (2026-10-06)
 

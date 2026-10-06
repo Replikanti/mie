@@ -15,7 +15,8 @@
 //! its own reason and start. The output is strictly increasing by
 //! construction.
 //!
-//! **Open-interest re-timing (ADR-032 D12).** Open interest is a sampled
+//! **Open-interest re-timing (ADR-032 D12, superseding ADR-028's live
+//! open-interest ordering time).** Open interest is a sampled
 //! state observation, and its REST `time` trails the poll by several
 //! seconds. A late `OpenInterest` whose slot passed by no more than
 //! `oi_retime_ms` (`last released + 1 − its time`) is not replaced by a gap.
@@ -23,7 +24,10 @@
 //! still open, so the order stays strictly increasing. Its value then
 //! becomes valid later than the exchange stamped it, never earlier (ADR-028:
 //! never a validity time before publication). Anything later than the
-//! allowance is a `LateEvent` gap as usual.
+//! allowance is a `LateEvent` gap as usual. So is a sample whose exchange
+//! `time` is not strictly newer than every open-interest sample already
+//! admitted: re-timing it would deliver a stale snapshot as the current
+//! value.
 
 use mie_domain::event::{FeedGap, GapReason, MarketEvent, OpenInterest};
 use mie_domain::time::EventTime;
@@ -51,6 +55,10 @@ pub struct HoldBack {
     buffer: BTreeSet<MarketEvent>,
     watermark: Option<EventTime>,
     last_released: Option<MarketEvent>,
+    /// The newest exchange `time` of an open-interest sample admitted so
+    /// far (buffered or re-timed). A late sample is re-timed only when it
+    /// is strictly newer.
+    newest_oi: Option<EventTime>,
 }
 
 impl HoldBack {
@@ -64,6 +72,7 @@ impl HoldBack {
             buffer: BTreeSet::new(),
             watermark: None,
             last_released: None,
+            newest_oi: None,
         }
     }
 
@@ -88,10 +97,14 @@ impl HoldBack {
             let time = event.time();
             self.watermark = Some(self.watermark.map_or(time, |w| w.max(time)));
         }
+        let oi_time = match &event {
+            MarketEvent::OpenInterest(oi) => Some(oi.time),
+            _ => None,
+        };
         let (admission, admitted) = match &self.last_released {
             Some(last) if event == *last => (Admission::Duplicate, None),
             Some(last) if event < *last => {
-                match retimed_open_interest(&event, last, self.oi_retime_ms) {
+                match retimed_open_interest(&event, last, self.oi_retime_ms, self.newest_oi) {
                     Some(retimed) => (Admission::Retimed, Some(retimed)),
                     None => (Admission::Late, Some(late_gap(&event, last))),
                 }
@@ -104,6 +117,9 @@ impl HoldBack {
         } else {
             admission
         };
+        if let (Some(time), Admission::Buffered | Admission::Retimed) = (oi_time, admission) {
+            self.newest_oi = Some(self.newest_oi.map_or(time, |newest| newest.max(time)));
+        }
         (admission, self.release_due())
     }
 
@@ -137,15 +153,20 @@ impl HoldBack {
 }
 
 /// `event` delivered at `last + 1 ms`, if it is open interest whose slot
-/// passed by at most `allowance_ms`.
+/// passed by at most `allowance_ms` and whose exchange time is strictly
+/// newer than `newest_oi`, the newest open interest admitted so far.
 fn retimed_open_interest(
     event: &MarketEvent,
     last: &MarketEvent,
     allowance_ms: i64,
+    newest_oi: Option<EventTime>,
 ) -> Option<MarketEvent> {
     let MarketEvent::OpenInterest(oi) = event else {
         return None;
     };
+    if newest_oi.is_some_and(|newest| oi.time <= newest) {
+        return None;
+    }
     let open = last.time().as_millis().saturating_add(1);
     (open.saturating_sub(oi.time.as_millis()) <= allowance_ms).then(|| {
         MarketEvent::OpenInterest(OpenInterest {
@@ -441,6 +462,57 @@ mod tests {
             strict.push(mark(millis));
         }
         assert_eq!(strict.push(open_interest(3_000)).0, Admission::Late);
+    }
+
+    fn open_interest_of(millis: i64, value_units: i64) -> MarketEvent {
+        MarketEvent::OpenInterest(OpenInterest {
+            time: t(millis),
+            open_interest: Qty::from_units(value_units),
+            resolution_ms: 10_000,
+        })
+    }
+
+    #[test]
+    fn a_stale_open_interest_snapshot_is_a_gap_not_the_current_value() {
+        let mut hold = HoldBack::new(2_000, 10_000);
+        let mut out = Vec::new();
+        out.extend(hold.push(mark(11_000)).1);
+        // OI 100 stamped 12001 is admitted on time.
+        out.extend(hold.push(open_interest_of(12_001, 100)).1);
+        for millis in [13_000, 14_000, 15_000] {
+            out.extend(hold.push(mark(millis)).1);
+        }
+        assert_eq!(out.last(), Some(&open_interest_of(12_001, 100)));
+        // An older snapshot (OI 200 stamped 9000) arrives late. Within the
+        // allowance, but not newer than 12001: a gap, never re-timed.
+        let (admission, released) = hold.push(open_interest_of(9_000, 200));
+        assert_eq!(admission, Admission::Late);
+        assert_eq!(
+            released,
+            vec![gap(
+                Stream::OpenInterest,
+                9_000,
+                12_002,
+                GapReason::LateEvent
+            )]
+        );
+        out.extend(released);
+        out.extend(hold.finish());
+        let current = out.iter().rev().find_map(|e| match e {
+            MarketEvent::OpenInterest(oi) => Some(*oi),
+            _ => None,
+        });
+        assert_eq!(current.map(|oi| oi.open_interest.units()), Some(100));
+        assert_engine_accepts(&out);
+
+        // An equal exchange time is not newer either.
+        let mut hold = HoldBack::new(0, 10_000);
+        hold.push(open_interest_of(5_000, 1));
+        hold.push(mark(6_000));
+        hold.push(mark(7_000));
+        assert_eq!(hold.push(open_interest_of(5_000, 2)).0, Admission::Late);
+        // A strictly newer one is re-timed.
+        assert_eq!(hold.push(open_interest_of(5_001, 3)).0, Admission::Retimed);
     }
 
     #[test]
