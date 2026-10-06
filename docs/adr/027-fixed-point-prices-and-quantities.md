@@ -57,6 +57,6 @@ All three types parse from decimal strings with one grammar,
 
 ## Accept when
 
-Raw Binance trades round-trip exactly (decimal string → `Price`/`Qty` → raw
-store → replay) and the first order-flow features (delta, CVD) are computed
-on them.
+The verbatim decimal strings in the raw store (ADR-030) normalize to the
+same `Price`/`Qty` in live processing and in replay, and the first
+order-flow features (delta, CVD) are computed on them.
