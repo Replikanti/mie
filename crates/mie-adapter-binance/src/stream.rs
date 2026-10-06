@@ -65,6 +65,12 @@ impl BinanceStream {
         }
     }
 
+    /// The captured stream whose events belong to the domain series
+    /// `stream`; `None` for series this adapter does not capture.
+    pub fn of_domain(stream: Stream) -> Option<Self> {
+        Self::ALL.into_iter().find(|s| s.domain_stream() == stream)
+    }
+
     /// The WebSocket stream path for `symbol`, appended to the configured
     /// base URL; `None` for the REST-polled open interest.
     pub fn ws_path(self, symbol: &str) -> Option<String> {
@@ -137,5 +143,12 @@ mod tests {
                 Stream::OpenInterest,
             ]
         );
+        for stream in BinanceStream::ALL {
+            assert_eq!(
+                BinanceStream::of_domain(stream.domain_stream()),
+                Some(stream)
+            );
+        }
+        assert_eq!(BinanceStream::of_domain(Stream::OrderBook), None);
     }
 }

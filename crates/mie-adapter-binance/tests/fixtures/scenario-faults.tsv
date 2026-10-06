@@ -1,0 +1,18 @@
+# Synthetic scenario: id skip, reconnect with contiguous ids, duplicate,
+# unparsable frame, late liquidation. receive_seq\tstream\tsession_id\tpayload
+1	aggTrade	20261006T070000Z/aggTrade/1	{"e":"aggTrade","E":1791271010120,"a":100,"s":"BTCUSDT","p":"85000.10","q":"0.010","f":300,"l":302,"T":1791271010000,"m":false}
+2	aggTrade	20261006T070000Z/aggTrade/1	{"e":"aggTrade","E":1791271010220,"a":101,"s":"BTCUSDT","p":"85000.10","q":"0.010","f":303,"l":305,"T":1791271010100,"m":false}
+3	markPrice	20261006T070000Z/markPrice/1	{"e":"markPriceUpdate","E":1791271010000,"s":"BTCUSDT","p":"85001.00000000","i":"85002.50000000","P":"85010.00000000","r":"0.00010000","T":1791273600000}
+4	aggTrade	20261006T070000Z/aggTrade/1	{"e":"aggTrade","E":1791271010320,"a":103,"s":"BTCUSDT","p":"85000.10","q":"0.010","f":309,"l":311,"T":1791271010200,"m":false}
+5	aggTrade	20261006T070000Z/aggTrade/1	{"e":"aggTrade","E":1791271011120,"a":104,"s":"BTCUSDT","p":"85000.10","q":"0.010","f":312,"l":314,"T":1791271011000,"m":false}
+6	markPrice	20261006T070000Z/markPrice/1	{"e":"markPriceUpdate","E":1791271011000,"s":"BTCUSDT","p":"85001.00000000","i":"85002.50000000","P":"85010.00000000","r":"0.00010000","T":1791273600000}
+7	aggTrade	20261006T070000Z/aggTrade/2	{"e":"aggTrade","E":1791271012120,"a":105,"s":"BTCUSDT","p":"85000.10","q":"0.010","f":315,"l":317,"T":1791271012000,"m":false}
+8	aggTrade	20261006T070000Z/aggTrade/2	{"e":"aggTrade","E":1791271012120,"a":105,"s":"BTCUSDT","p":"85000.10","q":"0.010","f":315,"l":317,"T":1791271012000,"m":false}
+9	aggTrade	20261006T070000Z/aggTrade/2	{"e":"aggTrade","E":
+10	markPrice	20261006T070000Z/markPrice/1	{"e":"markPriceUpdate","E":1791271012000,"s":"BTCUSDT","p":"85001.00000000","i":"85002.50000000","P":"85010.00000000","r":"0.00010000","T":1791273600000}
+11	aggTrade	20261006T070000Z/aggTrade/2	{"e":"aggTrade","E":1791271013120,"a":106,"s":"BTCUSDT","p":"85000.10","q":"0.010","f":318,"l":320,"T":1791271013000,"m":false}
+12	markPrice	20261006T070000Z/markPrice/1	{"e":"markPriceUpdate","E":1791271013000,"s":"BTCUSDT","p":"85001.00000000","i":"85002.50000000","P":"85010.00000000","r":"0.00010000","T":1791273600000}
+13	aggTrade	20261006T070000Z/aggTrade/2	{"e":"aggTrade","E":1791271014620,"a":107,"s":"BTCUSDT","p":"85000.10","q":"0.010","f":321,"l":323,"T":1791271014500,"m":false}
+14	forceOrder	20261006T070000Z/forceOrder/1	{"e":"forceOrder","E":1791271011903,"o":{"s":"BTCUSDT","S":"SELL","o":"LIMIT","f":"IOC","q":"0.014","p":"84900.0","ap":"84950.0","X":"FILLED","l":"0.014","z":"0.014","T":1791271011900}}
+15	markPrice	20261006T070000Z/markPrice/1	{"e":"markPriceUpdate","E":1791271014000,"s":"BTCUSDT","p":"85001.00000000","i":"85002.50000000","P":"85010.00000000","r":"0.00010000","T":1791273600000}
+16	aggTrade	20261006T070000Z/aggTrade/2	{"e":"aggTrade","E":1791271015120,"a":108,"s":"BTCUSDT","p":"85000.10","q":"0.010","f":324,"l":326,"T":1791271015000,"m":false}
