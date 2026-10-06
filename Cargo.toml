@@ -14,6 +14,7 @@ publish = false
 [workspace.dependencies]
 mie-domain = { path = "crates/mie-domain" }
 mie-ports = { path = "crates/mie-ports" }
+mie-adapter-parquet = { path = "crates/mie-adapter-parquet" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

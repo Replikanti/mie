@@ -1,0 +1,31 @@
+[package]
+name = "mie-adapter-parquet"
+description = "MIE raw-store adapter: immutable, verbatim Parquet files with sealed manifests and dataset versions (ADR-030)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# An adapter depends on the domain, the ports and external crates, never on
+# another adapter (ADR-025). Every external crate is justified below.
+[dependencies]
+mie-domain.workspace = true
+mie-ports.workspace = true
+# Parquet file format: ArrowWriter for sealed parts, the Arrow reader for
+# verified reads. No default features: only the Arrow bridge and the pure-Rust
+# LZ4_RAW codec (lz4_flex) are needed. ZSTD would add a C build and a
+# BSD-3-Clause license (ADR-030).
+parquet = { version = "60", default-features = false, features = ["arrow", "lz4"] }
+# In-memory columns for the envelope schema v1 (record batches).
+arrow-array = "60"
+# Field and data types of the envelope schema v1.
+arrow-schema = "60"
+# Zero-copy buffer: a sealed file is read once into memory, hashed and then
+# decoded from the same bytes (parquet's ChunkReader is implemented for it).
+bytes = "1"
+# SHA-256 of every sealed file and of the dataset version text (ADR-030).
+sha2 = "0.11"
+
+[lints]
+workspace = true

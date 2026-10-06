@@ -6,6 +6,9 @@
 //!
 //! - [`inbound`]: use cases the outside world drives (CLI, scheduler).
 //! - [`outbound`]: infrastructure the core drives (market data, stores, egress).
+//! - [`raw`]: the immutable raw record store shared by producers and replay
+//!   (ADR-030).
 
 pub mod inbound;
 pub mod outbound;
+pub mod raw;

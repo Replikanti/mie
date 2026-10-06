@@ -16,6 +16,16 @@ allow = [
     "MIT",
     "Apache-2.0",
 ]
+# Per-crate exceptions, each pulled in by the Arrow stack under
+# mie-adapter-parquet (ADR-030). The global allow list stays MIT/Apache-2.0.
+exceptions = [
+    # CC0-1.0 (public-domain dedication): ahash -> const-random ->
+    # const-random-macro -> tiny-keccak, compile-time random seed only.
+    { allow = ["CC0-1.0"], crate = "tiny-keccak" },
+    # Unicode-3.0 (permissive data license): proc-macro2 -> unicode-ident,
+    # a build-time dependency of the proc macros in the Arrow tree.
+    { allow = ["Unicode-3.0"], crate = "unicode-ident" },
+]
 
 [bans]
 multiple-versions = "warn"
