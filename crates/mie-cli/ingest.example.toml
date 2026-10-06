@@ -1,0 +1,41 @@
+# Example configuration for `mie ingest` and `mie capture-report`.
+# Public market data needs no credentials. Any future secret is read from
+# the environment, never from this file.
+
+[instrument]
+# Exchange symbol; also the raw-store instrument segment.
+symbol = "BTCUSDT"
+# Raw-store source segment.
+source = "binance-um"
+
+[paths]
+# Root of the raw Parquet store (created on first use).
+raw_root = "data/raw"
+# Capture journal, JSON Lines, appended to by every run.
+journal = "data/capture-journal.jsonl"
+
+[binance]
+# USDⓈ-M market-data streams (aggTrade, markPrice, forceOrder, kline) are
+# served on the /market route; verified 2026-10-06.
+ws_base_url = "wss://fstream.binance.com/market/ws"
+rest_base_url = "https://fapi.binance.com"
+# Default: all five.
+streams = ["aggTrade", "markPrice", "forceOrder", "kline_1m", "openInterest"]
+
+# Every key below is optional; the values shown are the defaults.
+[capture]
+# seal_all cadence: bounds the records a crash can lose (ADR-030 D5).
+seal_interval_secs = 300
+# Canonical merge hold-back in exchange milliseconds (ADR-028 D6).
+hold_back_ms = 2000
+# Planned reconnect of the first stream, before the exchange's 24 h limit;
+# each later stream rotates rotation_stagger_secs later.
+max_connection_age_secs = 82800
+rotation_stagger_secs = 300
+ping_interval_secs = 30
+liveness_timeout_secs = 90
+backoff_initial_ms = 250
+backoff_max_ms = 30000
+inbound_channel_capacity = 65536
+core_channel_capacity = 65536
+stats_interval_secs = 60
