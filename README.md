@@ -51,7 +51,8 @@ enforces the boundary (ADR-025):
 | [`mie-domain`](crates/mie-domain) | Market observations, Market State, regime, location, trigger and strategy vocabulary. No dependencies, no I/O, no clock. |
 | [`mie-ports`](crates/mie-ports) | Use-case (inbound) and infrastructure (outbound) contracts owned by the core. |
 | [`mie-app`](crates/mie-app) | Use-case services that drive the domain through ports. |
-| `mie-adapter-*` *(planned)* | Binance, raw Parquet, DuckDB, Telegram, LLM operators, backtest engine. |
+| [`mie-adapter-parquet`](crates/mie-adapter-parquet) | Immutable raw store: verbatim messages in sealed Parquet files with manifests and dataset versions (ADR-030). |
+| `mie-adapter-*` *(planned)* | Binance, DuckDB, Telegram, LLM operators, backtest engine. |
 | `mie-cli` *(planned)* | Wires adapters to ports: ingest, replay, research, report. |
 
 First milestone data path (brief §19):

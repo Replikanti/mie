@@ -30,10 +30,53 @@
 //! Files in progress are hidden (`.part-NNNNN.parquet.tmp`) and never match
 //! `*.parquet`.
 
-// Format pieces only; the writer and the reader that use them land in the
-// next commit of the same PR.
-#![allow(dead_code)]
-
 mod layout;
 mod manifest;
+mod reader;
+mod recovery;
 mod schema;
+mod writer;
+
+#[cfg(test)]
+mod testutil;
+
+pub use reader::ParquetRawStore;
+pub use recovery::RecoveryReport;
+pub use writer::{RawWriter, RotationPolicy};
+
+use mie_ports::raw::RawStoreError;
+use std::fs::{self, File};
+use std::path::Path;
+
+/// Maps an I/O failure on `path` to [`RawStoreError::Io`].
+fn io_error(action: &str, path: &Path) -> impl FnOnce(std::io::Error) -> RawStoreError {
+    let context = format!("{action} {}", path.display());
+    move |error| RawStoreError::Io(format!("{context}: {error}"))
+}
+
+/// Fsyncs a directory, making the entries created or renamed in it durable.
+fn sync_dir(dir: &Path) -> Result<(), RawStoreError> {
+    File::open(dir)
+        .and_then(|handle| handle.sync_all())
+        .map_err(io_error("sync directory", dir))
+}
+
+/// Names of the entries of `dir`, sorted, so every walk is deterministic.
+/// A missing directory has no entries. Names that are not UTF-8 are skipped:
+/// the store never creates them.
+fn sorted_entries(dir: &Path) -> Result<Vec<String>, RawStoreError> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(io_error("list", dir)(error)),
+    };
+    let mut names = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(io_error("list", dir))?;
+        if let Ok(name) = entry.file_name().into_string() {
+            names.push(name);
+        }
+    }
+    names.sort();
+    Ok(names)
+}
