@@ -57,7 +57,7 @@ Earlier decisions constrain the answer:
    window ranks 100 (EXTREME). That only happens on synthetic or dead data.
    The fixed-point Wilder step makes this reachable from decay too: once
    ATR ≤ 6 units (1e-8), `round(13·ATR/14) = ATR`, so a long run of
-   identical TRs (e.g. 200+ trade-less complete hours, TR = 0) freezes ATR
+   identical TRs (e.g. 300+ trade-less complete hours, TR = 0) freezes ATR
    and the percentile climbs to 100, where Pine's strictly decaying ATR
    would rank 0. Not reachable on live BTCUSDT.
 4. **Bands**: the upper-closed bands of `RegimeLabel::from_percentile` are
