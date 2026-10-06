@@ -1,0 +1,911 @@
+//! Live capture over scripted transports: no network anywhere.
+//!
+//! A scripted [`WsConnector`] and [`HttpGet`], a fake [`Clock`] and an
+//! in-memory [`RawRecordSink`] drive the real connection loops, the capture
+//! thread and the provider. The fake clock advances only when the scripted
+//! stream's own thread sleeps or reads, so cadences are exact.
+
+use mie_adapter_binance::live::CaptureError;
+use mie_adapter_binance::transport::{Clock, HttpGet, ReadOutcome, WsConnection, WsConnector};
+use mie_adapter_binance::{
+    BinanceStream, CaptureEvent, CaptureObserver, CaptureSummary, LiveConfig, start,
+};
+use mie_domain::event::{GapReason, MarketEvent, Stream};
+use mie_domain::time::EventTime;
+use mie_ports::outbound::{MarketDataProvider, ProviderError};
+use mie_ports::raw::{RawRecord, RawRecordSink, RawStoreError, RawStreamKey, SealedFile};
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+/// 2026-10-06T00:00:00Z in ms.
+const D0: i64 = 1_791_244_800_000;
+const MS: i64 = 1_000_000;
+
+/// A clock that only the thread named `driver` advances; other threads'
+/// sleeps are short real sleeps.
+struct FakeClock {
+    state: Mutex<(i64, u64)>,
+    driver: String,
+}
+
+impl FakeClock {
+    fn new(start_utc_ms: i64, driver: &str) -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new((start_utc_ms * MS, 0)),
+            driver: driver.to_owned(),
+        })
+    }
+
+    fn advance(&self, d: Duration) {
+        let mut state = self.state.lock().unwrap();
+        state.0 += d.as_nanos() as i64;
+        state.1 += d.as_nanos() as u64;
+    }
+
+    fn mono_secs(&self) -> f64 {
+        self.monotonic_ns() as f64 / 1e9
+    }
+}
+
+impl Clock for FakeClock {
+    fn now_utc_ns(&self) -> i64 {
+        self.state.lock().unwrap().0
+    }
+
+    fn monotonic_ns(&self) -> u64 {
+        self.state.lock().unwrap().1
+    }
+
+    fn sleep(&self, d: Duration) {
+        if std::thread::current().name() == Some(self.driver.as_str()) {
+            self.advance(d);
+        } else {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
+/// One scripted read.
+#[derive(Clone)]
+enum Step {
+    /// A text frame.
+    Frame(String),
+    /// Advance the clock, then deliver a pong.
+    Tick(Duration),
+    /// Advance the clock, then time out.
+    Silence(Duration),
+    /// The peer closes.
+    Close(&'static str),
+    /// Request shutdown, then time out.
+    Shutdown,
+    /// Wait (in real time) until the sink holds this many records, then
+    /// time out: lets the capture thread catch up with the clock.
+    AwaitRecords(usize),
+}
+
+/// One scripted connect attempt.
+enum Connect {
+    Fail,
+    Open(Vec<Step>),
+}
+
+#[derive(Default)]
+struct WsLog {
+    /// (stream path, clock seconds) of every ping.
+    pings: Vec<(String, f64)>,
+    /// (stream path, clock seconds) of every close.
+    closes: Vec<(String, f64)>,
+}
+
+struct FakeConnector {
+    scripts: Mutex<BTreeMap<String, VecDeque<Connect>>>,
+    clock: Arc<FakeClock>,
+    shutdown: Arc<AtomicBool>,
+    log: Arc<Mutex<WsLog>>,
+    /// The capture's sink, for [`Step::AwaitRecords`].
+    sink: Mutex<Option<Arc<Mutex<SinkLog>>>>,
+}
+
+impl FakeConnector {
+    fn new(
+        scripts: Vec<(&str, Vec<Connect>)>,
+        clock: &Arc<FakeClock>,
+        shutdown: &Arc<AtomicBool>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            scripts: Mutex::new(
+                scripts
+                    .into_iter()
+                    .map(|(path, s)| (path.to_owned(), s.into()))
+                    .collect(),
+            ),
+            clock: Arc::clone(clock),
+            shutdown: Arc::clone(shutdown),
+            log: Arc::default(),
+            sink: Mutex::default(),
+        })
+    }
+}
+
+impl WsConnector for FakeConnector {
+    fn connect(&self, url: &str) -> Result<Box<dyn WsConnection>, String> {
+        let path = url.rsplit('/').next().unwrap().to_owned();
+        let next = self
+            .scripts
+            .lock()
+            .unwrap()
+            .get_mut(&path)
+            .and_then(VecDeque::pop_front);
+        match next {
+            Some(Connect::Open(steps)) => Ok(Box::new(FakeConnection {
+                path,
+                steps: steps.into(),
+                clock: Arc::clone(&self.clock),
+                shutdown: Arc::clone(&self.shutdown),
+                log: Arc::clone(&self.log),
+                sink: self.sink.lock().unwrap().clone(),
+            })),
+            Some(Connect::Fail) => Err("scripted connect failure".to_owned()),
+            None => Err("script exhausted".to_owned()),
+        }
+    }
+}
+
+struct FakeConnection {
+    path: String,
+    steps: VecDeque<Step>,
+    clock: Arc<FakeClock>,
+    shutdown: Arc<AtomicBool>,
+    log: Arc<Mutex<WsLog>>,
+    sink: Option<Arc<Mutex<SinkLog>>>,
+}
+
+impl WsConnection for FakeConnection {
+    fn read(&mut self) -> ReadOutcome {
+        match self.steps.pop_front() {
+            Some(Step::Frame(text)) => ReadOutcome::Frame(text.into_bytes()),
+            Some(Step::Tick(d)) => {
+                self.clock.advance(d);
+                ReadOutcome::Control
+            }
+            Some(Step::Silence(d)) => {
+                self.clock.advance(d);
+                ReadOutcome::Timeout
+            }
+            Some(Step::Close(reason)) => ReadOutcome::Closed(reason.to_owned()),
+            Some(Step::Shutdown) => {
+                self.shutdown.store(true, Ordering::Relaxed);
+                ReadOutcome::Timeout
+            }
+            Some(Step::AwaitRecords(n)) => {
+                let sink = self.sink.as_ref().expect("sink registered");
+                while sink.lock().unwrap().records.len() < n {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                ReadOutcome::Timeout
+            }
+            // An idle but healthy connection.
+            None => {
+                std::thread::sleep(Duration::from_millis(1));
+                ReadOutcome::Control
+            }
+        }
+    }
+
+    fn ping(&mut self) -> Result<(), String> {
+        let at = self.clock.mono_secs();
+        self.log.lock().unwrap().pings.push((self.path.clone(), at));
+        Ok(())
+    }
+
+    fn close(&mut self) {
+        let at = self.clock.mono_secs();
+        self.log
+            .lock()
+            .unwrap()
+            .closes
+            .push((self.path.clone(), at));
+    }
+}
+
+/// One scripted HTTP response.
+enum Http {
+    Status(u16, String),
+    Fail,
+}
+
+struct FakeHttp {
+    script: Mutex<VecDeque<Http>>,
+    clock: Arc<FakeClock>,
+    shutdown: Arc<AtomicBool>,
+    /// Clock ms of every request.
+    requests: Mutex<Vec<i64>>,
+}
+
+impl HttpGet for FakeHttp {
+    fn get(&self, _url: &str) -> Result<(u16, Vec<u8>), String> {
+        self.requests
+            .lock()
+            .unwrap()
+            .push(self.clock.now_utc_ns() / MS);
+        // Every response takes 37 ms.
+        self.clock.advance(Duration::from_millis(37));
+        match self.script.lock().unwrap().pop_front() {
+            Some(Http::Status(status, body)) => Ok((status, body.into_bytes())),
+            Some(Http::Fail) => Err("scripted transport failure".to_owned()),
+            None => {
+                self.shutdown.store(true, Ordering::Relaxed);
+                Err("script exhausted".to_owned())
+            }
+        }
+    }
+}
+
+fn no_http(clock: &Arc<FakeClock>, shutdown: &Arc<AtomicBool>) -> Arc<FakeHttp> {
+    Arc::new(FakeHttp {
+        script: Mutex::default(),
+        clock: Arc::clone(clock),
+        shutdown: Arc::clone(shutdown),
+        requests: Mutex::default(),
+    })
+}
+
+#[derive(Debug, Default)]
+struct SinkLog {
+    records: Vec<(RawStreamKey, RawRecord)>,
+    seal_calls: u64,
+    unsealed: u64,
+}
+
+/// An in-memory sink; `fail_at` makes that append (0-based) fail.
+#[derive(Debug, Clone)]
+struct MemorySink {
+    log: Arc<Mutex<SinkLog>>,
+    fail_at: Option<usize>,
+}
+
+impl RawRecordSink for MemorySink {
+    fn append(&mut self, stream: &RawStreamKey, record: RawRecord) -> Result<(), RawStoreError> {
+        let mut log = self.log.lock().unwrap();
+        if Some(log.records.len()) == self.fail_at {
+            return Err(RawStoreError::Io("disk full".to_owned()));
+        }
+        log.records.push((stream.clone(), record));
+        log.unsealed += 1;
+        Ok(())
+    }
+
+    fn seal_all(&mut self) -> Result<Vec<SealedFile>, RawStoreError> {
+        let mut log = self.log.lock().unwrap();
+        log.seal_calls += 1;
+        if log.unsealed == 0 {
+            return Ok(Vec::new());
+        }
+        let rows = std::mem::take(&mut log.unsealed);
+        let (stream, _) = log.records.last().unwrap().clone();
+        Ok(vec![SealedFile {
+            relative_path: format!("part-{}", log.seal_calls),
+            stream,
+            date: "2026-10-06".to_owned(),
+            part: 0,
+            rows,
+            bytes: 1,
+            min_event_time: EventTime::from_millis(0),
+            max_event_time: EventTime::from_millis(0),
+            sha256: "0".repeat(64),
+        }])
+    }
+}
+
+#[derive(Clone, Default)]
+struct Recorder(Arc<Mutex<Vec<CaptureEvent>>>);
+
+impl CaptureObserver for Recorder {
+    fn on_event(&mut self, _at_utc_ns: i64, event: &CaptureEvent) {
+        self.0.lock().unwrap().push(event.clone());
+    }
+}
+
+fn agg(id: u64, time: i64) -> String {
+    format!(
+        r#"{{"e":"aggTrade","E":{},"a":{id},"s":"BTCUSDT","p":"85000.10","q":"0.010","f":1,"l":1,"T":{time},"m":false}}"#,
+        time + 100
+    )
+}
+
+fn oi(time: i64) -> String {
+    format!(r#"{{"symbol":"BTCUSDT","openInterest":"95253.475","time":{time}}}"#)
+}
+
+fn config(streams: &[BinanceStream]) -> LiveConfig {
+    let mut config = LiveConfig::new("20261006T000000Z");
+    config.ws_base_url = "wss://fake.invalid/ws".to_owned();
+    config.rest_base_url = "https://fake.invalid".to_owned();
+    config.streams = streams.to_vec();
+    config.hold_back_ms = 0;
+    config.seal_interval = Duration::from_secs(3_600);
+    config.stats_interval = Duration::from_secs(3_600);
+    config
+}
+
+struct Outcome {
+    events: Vec<MarketEvent>,
+    provider_error: Option<ProviderError>,
+    joined: Result<(MemorySink, CaptureSummary), CaptureError>,
+    observed: Vec<CaptureEvent>,
+    sink: Arc<Mutex<SinkLog>>,
+}
+
+impl Outcome {
+    fn records(&self) -> Vec<RawRecord> {
+        let log = self.sink.lock().unwrap();
+        log.records.iter().map(|(_, r)| r.clone()).collect()
+    }
+
+    fn backoffs(&self) -> Vec<u64> {
+        self.observed
+            .iter()
+            .filter_map(|e| match e {
+                CaptureEvent::Backoff { delay_ms, .. } => Some(*delay_ms),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn gaps(&self) -> Vec<(Stream, GapReason)> {
+        self.events
+            .iter()
+            .filter_map(|e| match e {
+                MarketEvent::FeedGap(g) => Some((g.stream, g.reason)),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+/// Runs a capture to completion, checking on every delivered trade that its
+/// record was appended first.
+fn run(
+    config: LiveConfig,
+    connector: Arc<FakeConnector>,
+    http: Arc<dyn HttpGet>,
+    clock: Arc<FakeClock>,
+    shutdown: Arc<AtomicBool>,
+    fail_at: Option<usize>,
+) -> Outcome {
+    let sink_log = Arc::new(Mutex::new(SinkLog::default()));
+    *connector.sink.lock().unwrap() = Some(Arc::clone(&sink_log));
+    let sink = MemorySink {
+        log: Arc::clone(&sink_log),
+        fail_at,
+    };
+    let recorder = Recorder::default();
+    let (mut provider, handle) = start(
+        config,
+        sink,
+        connector,
+        http,
+        clock,
+        Box::new(recorder.clone()),
+        shutdown,
+    )
+    .expect("start");
+    let mut events = Vec::new();
+    let provider_error = loop {
+        match provider.next_event() {
+            Ok(Some(event)) => {
+                if let MarketEvent::Trade(trade) = &event {
+                    let needle = format!(r#""a":{},"#, trade.trade_id);
+                    let log = sink_log.lock().unwrap();
+                    assert!(
+                        log.records
+                            .iter()
+                            .any(|(_, r)| String::from_utf8_lossy(&r.payload).contains(&needle)),
+                        "trade {} delivered before its record was appended",
+                        trade.trade_id
+                    );
+                }
+                events.push(event);
+            }
+            Ok(None) => break None,
+            Err(error) => break Some(error),
+        }
+    };
+    drop(provider);
+    let joined = handle.join();
+    let observed = recorder.0.lock().unwrap().clone();
+    Outcome {
+        events,
+        provider_error,
+        joined,
+        observed,
+        sink: sink_log,
+    }
+}
+
+#[test]
+fn backoff_doubles_and_resets_after_a_healthy_connection() {
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let clock = FakeClock::new(D0, "mie-aggTrade");
+    let connector = FakeConnector::new(
+        vec![(
+            "btcusdt@aggTrade",
+            vec![
+                Connect::Fail,
+                Connect::Fail,
+                Connect::Fail,
+                // Healthy for 61 s, then lost: the backoff resets.
+                Connect::Open(vec![
+                    Step::Frame(agg(1, D0 + 1_000)),
+                    Step::Tick(Duration::from_secs(61)),
+                    Step::Close("server restart"),
+                ]),
+                // Lost at once: the backoff keeps doubling.
+                Connect::Open(vec![Step::Close("flap")]),
+                Connect::Open(vec![Step::Frame(agg(2, D0 + 70_000)), Step::Shutdown]),
+            ],
+        )],
+        &clock,
+        &shutdown,
+    );
+    let http = no_http(&clock, &shutdown);
+    let out = run(
+        config(&[BinanceStream::AggTrade]),
+        connector,
+        http,
+        clock,
+        shutdown,
+        None,
+    );
+    assert_eq!(out.backoffs(), [250, 500, 1_000, 250, 500]);
+    let failed = out
+        .observed
+        .iter()
+        .filter(|e| matches!(e, CaptureEvent::ConnectFailed { .. }))
+        .count();
+    assert_eq!(failed, 3);
+    // Sessions count successful connections.
+    let sessions: Vec<_> = out
+        .observed
+        .iter()
+        .filter_map(|e| match e {
+            CaptureEvent::Connected { session_id, .. } => Some(session_id.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        sessions,
+        [
+            "20261006T000000Z/aggTrade/1",
+            "20261006T000000Z/aggTrade/2",
+            "20261006T000000Z/aggTrade/3"
+        ]
+    );
+    // Trades 1 and 2 are contiguous, but the reconnect is still a gap.
+    assert_eq!(out.gaps(), [(Stream::Trades, GapReason::Disconnected)]);
+    assert!(out.provider_error.is_none());
+    assert!(out.joined.is_ok());
+}
+
+#[test]
+fn silence_reconnects_and_pings_keep_their_cadence() {
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let clock = FakeClock::new(D0, "mie-aggTrade");
+    let mut alive = vec![Step::Frame(agg(1, D0 + 1))];
+    alive.extend(std::iter::repeat_n(Step::Tick(Duration::from_secs(10)), 10));
+    // 100 s pass without any frame: more than the 90 s liveness timeout.
+    alive.push(Step::Silence(Duration::from_secs(100)));
+    let connector = FakeConnector::new(
+        vec![(
+            "btcusdt@aggTrade",
+            vec![
+                Connect::Open(alive),
+                Connect::Open(vec![Step::Frame(agg(2, D0 + 300_000)), Step::Shutdown]),
+            ],
+        )],
+        &clock,
+        &shutdown,
+    );
+    let log = Arc::clone(&connector.log);
+    let out = run(
+        config(&[BinanceStream::AggTrade]),
+        connector,
+        no_http(&clock, &shutdown),
+        clock,
+        shutdown,
+        None,
+    );
+    let pings: Vec<f64> = log.lock().unwrap().pings.iter().map(|p| p.1).collect();
+    assert_eq!(pings, [30.0, 60.0, 90.0]);
+    let reasons: Vec<_> = out
+        .observed
+        .iter()
+        .filter_map(|e| match e {
+            CaptureEvent::Disconnected { reason, .. } => Some(reason.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(reasons, ["no frame for 90000 ms"]);
+    assert_eq!(out.gaps(), [(Stream::Trades, GapReason::Disconnected)]);
+}
+
+/// Runs one capture of `streams` in which only `driver`'s script advances
+/// the clock, and returns the clock times at which `driver` closed
+/// connections plus the observed events.
+fn rotation_run(
+    streams: &[BinanceStream],
+    driver: &str,
+    driver_path: &str,
+    first: usize,
+    second: usize,
+) -> (Vec<f64>, Vec<CaptureEvent>) {
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let clock = FakeClock::new(D0, driver);
+    let tick = Step::Tick(Duration::from_secs(10));
+    let mut last: Vec<_> = std::iter::repeat_n(tick.clone(), second).collect();
+    last.push(Step::Shutdown);
+    // Every other stream has no script: its connects keep failing without
+    // advancing the clock.
+    let connector = FakeConnector::new(
+        vec![(
+            driver_path,
+            vec![
+                Connect::Open(std::iter::repeat_n(tick, first).collect()),
+                Connect::Open(last),
+            ],
+        )],
+        &clock,
+        &shutdown,
+    );
+    let log = Arc::clone(&connector.log);
+    let mut cfg = config(streams);
+    cfg.max_connection_age = Duration::from_secs(100);
+    cfg.rotation_stagger = Duration::from_secs(50);
+    let out = run(
+        cfg,
+        connector,
+        no_http(&clock, &shutdown),
+        clock,
+        shutdown,
+        None,
+    );
+    let closes = log
+        .lock()
+        .unwrap()
+        .closes
+        .iter()
+        .filter(|c| c.0 == driver_path)
+        .map(|c| c.1)
+        .collect();
+    (closes, out.observed)
+}
+
+#[test]
+fn planned_rotation_happens_at_max_age_plus_stagger() {
+    // Index 0: rotated at the max age, then closed at shutdown 50 s later.
+    let (closes, observed) = rotation_run(
+        &[BinanceStream::AggTrade],
+        "mie-aggTrade",
+        "btcusdt@aggTrade",
+        30,
+        5,
+    );
+    assert_eq!(closes, [100.0, 150.0]);
+    assert!(observed.iter().any(|e| matches!(
+        e,
+        CaptureEvent::PlannedRotation { session_id, .. }
+            if session_id == "20261006T000000Z/aggTrade/1"
+    )));
+
+    // Index 1: 100 s + 1 × 50 s.
+    let (closes, observed) = rotation_run(
+        &[BinanceStream::AggTrade, BinanceStream::MarkPrice],
+        "mie-markPrice",
+        "btcusdt@markPrice@1s",
+        30,
+        10,
+    );
+    assert_eq!(closes, [150.0, 250.0]);
+    let mark_events: Vec<_> = observed
+        .iter()
+        .filter(|e| match e {
+            CaptureEvent::Connected { stream, .. }
+            | CaptureEvent::PlannedRotation { stream, .. }
+            | CaptureEvent::Disconnected { stream, .. }
+            | CaptureEvent::Backoff { stream, .. } => *stream == BinanceStream::MarkPrice,
+            _ => false,
+        })
+        .cloned()
+        .collect();
+    // A rotation reconnects at once: no disconnect, no backoff.
+    assert_eq!(
+        mark_events,
+        [
+            CaptureEvent::Connected {
+                stream: BinanceStream::MarkPrice,
+                session_id: "20261006T000000Z/markPrice/1".to_owned()
+            },
+            CaptureEvent::PlannedRotation {
+                stream: BinanceStream::MarkPrice,
+                session_id: "20261006T000000Z/markPrice/1".to_owned()
+            },
+            CaptureEvent::Connected {
+                stream: BinanceStream::MarkPrice,
+                session_id: "20261006T000000Z/markPrice/2".to_owned()
+            },
+        ]
+    );
+}
+
+#[test]
+fn unparsable_frames_are_persisted_and_the_stream_continues() {
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let clock = FakeClock::new(D0, "mie-aggTrade");
+    let connector = FakeConnector::new(
+        vec![(
+            "btcusdt@aggTrade",
+            vec![Connect::Open(vec![
+                Step::Frame(agg(10, D0 + 1_000)),
+                Step::Frame("not json".to_owned()),
+                Step::Frame(agg(11, D0 + 1_001)),
+                Step::Frame(agg(12, D0 + 1_002)),
+                Step::Shutdown,
+            ])],
+        )],
+        &clock,
+        &shutdown,
+    );
+    let out = run(
+        config(&[BinanceStream::AggTrade]),
+        connector,
+        no_http(&clock, &shutdown),
+        clock,
+        shutdown,
+        None,
+    );
+    let records = out.records();
+    assert_eq!(records.len(), 4);
+    assert_eq!(records[1].payload, b"not json");
+    // The unparsable frame is ordered at its receive time.
+    assert_eq!(records[1].event_time, EventTime::from_millis(D0));
+    let seqs: Vec<u64> = records
+        .iter()
+        .map(|r| r.capture.as_ref().unwrap().receive_seq)
+        .collect();
+    assert_eq!(seqs, [0, 1, 2, 3]);
+    assert!(
+        records
+            .iter()
+            .all(|r| { r.capture.as_ref().unwrap().session_id == "20261006T000000Z/aggTrade/1" })
+    );
+    let ids: Vec<u64> = out
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            MarketEvent::Trade(t) => Some(t.trade_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ids, [10, 11, 12]);
+    assert!(out.observed.iter().any(|e| matches!(
+        e,
+        CaptureEvent::NormalizeError {
+            receive_seq: 1,
+            stream: BinanceStream::AggTrade,
+            ..
+        }
+    )));
+    let (_, summary) = out.joined.expect("clean capture");
+    assert_eq!(summary.stats.records, 4);
+    assert_eq!(summary.stats.time_fallbacks, 1);
+    assert_eq!(
+        summary.stats.pipeline.streams[&BinanceStream::AggTrade].normalize_errors,
+        1
+    );
+    // Four frames and one connect event.
+    assert_eq!(summary.stats.inbound.sent, 5);
+    assert!(summary.stats.core.high_water >= 1);
+}
+
+#[test]
+fn seals_run_on_their_cadence_and_at_shutdown() {
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let clock = FakeClock::new(D0, "mie-aggTrade");
+    let mut steps = Vec::new();
+    for i in 0..4 {
+        steps.push(Step::Frame(agg(i, D0 + i as i64 * 1_000)));
+        // The capture thread processes each frame before the clock moves
+        // on by 6 s, past the 5 s seal cadence.
+        steps.push(Step::AwaitRecords(i as usize + 1));
+        steps.push(Step::Tick(Duration::from_secs(6)));
+    }
+    steps.push(Step::Frame(agg(4, D0 + 30_000)));
+    steps.push(Step::Shutdown);
+    let connector = FakeConnector::new(
+        vec![("btcusdt@aggTrade", vec![Connect::Open(steps)])],
+        &clock,
+        &shutdown,
+    );
+    let mut cfg = config(&[BinanceStream::AggTrade]);
+    cfg.seal_interval = Duration::from_secs(5);
+    cfg.stats_interval = Duration::from_secs(10);
+    let out = run(
+        cfg,
+        connector,
+        no_http(&clock, &shutdown),
+        clock,
+        shutdown,
+        None,
+    );
+    // Cadence seals after the 2nd, 3rd and 4th frame (the clock passed 6,
+    // 12 and 18 s), then the shutdown seal; the 5th frame may or may not
+    // see the 24 s mark first.
+    let seal_calls = out.sink.lock().unwrap().seal_calls;
+    assert!((4..=5).contains(&seal_calls), "{seal_calls}");
+    let sealed_rows: u64 = out
+        .observed
+        .iter()
+        .filter_map(|e| match e {
+            CaptureEvent::Sealed(files) => Some(files.iter().map(|f| f.rows).sum::<u64>()),
+            _ => None,
+        })
+        .sum();
+    // Every record ends up sealed, the last ones by the shutdown seal.
+    assert_eq!(sealed_rows, 5);
+    assert!(
+        out.observed
+            .iter()
+            .any(|e| matches!(e, CaptureEvent::Stats(_)))
+    );
+    let (_, summary) = out.joined.expect("clean capture");
+    assert_eq!(summary.stats.sealed_files, seal_files(&out.observed));
+    assert_eq!(out.events.len(), 5);
+    assert!(out.provider_error.is_none());
+}
+
+fn seal_files(observed: &[CaptureEvent]) -> u64 {
+    observed
+        .iter()
+        .map(|e| match e {
+            CaptureEvent::Sealed(files) => files.len() as u64,
+            _ => 0,
+        })
+        .sum()
+}
+
+#[test]
+fn a_failed_append_stops_the_capture_and_fails_the_provider() {
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let clock = FakeClock::new(D0, "mie-aggTrade");
+    let connector = FakeConnector::new(
+        vec![(
+            "btcusdt@aggTrade",
+            vec![Connect::Open(vec![
+                Step::Frame(agg(1, D0 + 1)),
+                Step::Frame(agg(2, D0 + 2)),
+                Step::Frame(agg(3, D0 + 3)),
+            ])],
+        )],
+        &clock,
+        &shutdown,
+    );
+    let out = run(
+        config(&[BinanceStream::AggTrade]),
+        connector,
+        no_http(&clock, &shutdown),
+        clock,
+        Arc::clone(&shutdown),
+        Some(1),
+    );
+    assert!(
+        matches!(&out.provider_error, Some(ProviderError::Source(m)) if m.contains("disk full")),
+        "{:?}",
+        out.provider_error
+    );
+    assert_eq!(out.records().len(), 1);
+    let error = out.joined.expect_err("capture failed");
+    assert!(error.message.contains("disk full"));
+    // Nothing after the failed record reached the core.
+    assert!(out.events.iter().all(|e| match e {
+        MarketEvent::Trade(t) => t.trade_id < 2,
+        _ => true,
+    }));
+    assert!(shutdown.load(Ordering::Relaxed));
+}
+
+#[test]
+fn open_interest_polls_align_back_off_and_never_persist_failures() {
+    let shutdown = Arc::new(AtomicBool::new(false));
+    // Start 3.456 s into a 10 s slot.
+    let clock = FakeClock::new(D0 + 3_456, "mie-openInterest");
+    let http = Arc::new(FakeHttp {
+        script: Mutex::new(
+            vec![
+                Http::Status(200, oi(D0 + 10_030)),
+                Http::Status(429, "{\"code\":-1003}".to_owned()),
+                Http::Status(429, "{\"code\":-1003}".to_owned()),
+                Http::Fail,
+                Http::Status(200, oi(D0 + 90_030)),
+                Http::Status(200, oi(D0 + 100_030)),
+            ]
+            .into(),
+        ),
+        clock: Arc::clone(&clock),
+        shutdown: Arc::clone(&shutdown),
+        requests: Mutex::default(),
+    });
+    let connector = FakeConnector::new(vec![], &clock, &shutdown);
+    let mut cfg = config(&[BinanceStream::OpenInterest]);
+    cfg.backoff_initial = Duration::from_secs(15);
+    cfg.backoff_max = Duration::from_secs(30);
+    let requests = Arc::clone(&http);
+    let out = run(cfg, connector, http, clock, shutdown, None);
+    let requests: Vec<i64> = requests
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|t| t - D0)
+        .collect();
+    // 10 s slots; a 429 at 20 s defers past 35 s, the next one past 70 s.
+    assert_eq!(
+        requests[..6],
+        [10_000, 20_000, 40_000, 80_000, 90_000, 100_000]
+    );
+    let polls: Vec<_> = out
+        .observed
+        .iter()
+        .filter_map(|e| match e {
+            CaptureEvent::OiPoll {
+                request_time_ns,
+                response_time_ns,
+                status,
+                persisted,
+                ..
+            } => Some((
+                (request_time_ns / MS - D0),
+                response_time_ns - request_time_ns,
+                *status,
+                *persisted,
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        polls[..6],
+        [
+            (10_000, 37 * MS, Some(200), true),
+            (20_000, 37 * MS, Some(429), false),
+            (40_000, 37 * MS, Some(429), false),
+            (80_000, 37 * MS, None, false),
+            (90_000, 37 * MS, Some(200), true),
+            (100_000, 37 * MS, Some(200), true),
+        ]
+    );
+    let records = out.records();
+    assert_eq!(records.len(), 3);
+    let sessions: Vec<_> = records
+        .iter()
+        .map(|r| r.capture.as_ref().unwrap().session_id.clone())
+        .collect();
+    assert_eq!(
+        sessions,
+        [
+            "20261006T000000Z/openInterest/1",
+            "20261006T000000Z/openInterest/4",
+            "20261006T000000Z/openInterest/4"
+        ]
+    );
+    // The receive time is the response time.
+    assert_eq!(
+        records[0].capture.as_ref().unwrap().receive_time_ns,
+        (D0 + 10_037) * MS
+    );
+    // The missed samples are a gap on the open-interest series.
+    assert_eq!(
+        out.gaps(),
+        [(Stream::OpenInterest, GapReason::Disconnected)]
+    );
+}
