@@ -14,7 +14,7 @@
 //! [`bars`]: crate::bars
 //! [`feature`]: crate::feature
 
-use crate::bars::{Bar, BarSet};
+use crate::bars::{Bar, BarError, BarSet, MAX_BARS_PER_EVENT, Timeframe};
 use crate::event::{MarketEvent, Stream};
 use crate::feature::{FeatureSet, FeatureSetVersion, FeatureValue, catalog};
 use crate::num::Price;
@@ -186,7 +186,10 @@ impl MarketStateEngine {
     /// - [`StateError::IdRegression`] if its exchange id falls below the last
     ///   accepted one of its stream;
     /// - [`StateError::Overflow`] if a bar's time or quantity arithmetic
-    ///   leaves the `i64` range.
+    ///   leaves the `i64` range;
+    /// - [`StateError::TimeJump`] if it would close more than
+    ///   [`MAX_BARS_PER_EVENT`] bars of one timeframe. Recovery: the replay
+    ///   or session stops; restart it from a fresh engine after the jump.
     ///
     /// Ordering is the market-data provider's job — the domain never
     /// reorders.
@@ -219,9 +222,22 @@ impl MarketStateEngine {
         // Bars are updated on a copy, committed only once nothing can fail.
         let mut bars = self.state.bars;
         self.pending.clear();
-        if bars.apply(event, &mut self.pending).is_err() {
-            return Err(StateError::Overflow {
-                event: event.canonical_key(),
+        if let Err(error) = bars.apply(event, &mut self.pending) {
+            // Drop any partial result; `closed` is untouched.
+            self.pending.clear();
+            let event = event.canonical_key();
+            return Err(match error {
+                BarError::Overflow => StateError::Overflow { event },
+                BarError::TooManyBars {
+                    timeframe,
+                    from,
+                    bars,
+                } => StateError::TimeJump {
+                    event,
+                    timeframe,
+                    from,
+                    bars,
+                },
             });
         }
 
@@ -301,6 +317,19 @@ pub enum StateError {
         /// Key of the rejected event.
         event: CanonicalKey,
     },
+    /// The event jumps so far ahead in event time that it would close more
+    /// than [`MAX_BARS_PER_EVENT`] bars of one timeframe (ADR-031).
+    TimeJump {
+        /// Key of the rejected event; its time is where the jump lands.
+        event: CanonicalKey,
+        /// The timeframe that exceeds the bound (the shortest one).
+        timeframe: Timeframe,
+        /// Open time of that timeframe's developing bar: where the jump
+        /// starts.
+        from: EventTime,
+        /// How many bars of `timeframe` the event would close.
+        bars: u64,
+    },
 }
 
 impl fmt::Display for StateError {
@@ -327,6 +356,16 @@ impl fmt::Display for StateError {
             Self::Overflow { event } => {
                 write!(f, "event ({event}) overflows the bar arithmetic")
             }
+            Self::TimeJump {
+                event,
+                timeframe,
+                from,
+                bars,
+            } => write!(
+                f,
+                "event ({event}) would close {bars} {timeframe} bars from {from}, \
+                 more than the {MAX_BARS_PER_EVENT} one event may close"
+            ),
         }
     }
 }
@@ -336,7 +375,6 @@ impl std::error::Error for StateError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bars::Timeframe;
     use crate::event::samples::{gap, mark, one_of_each, snapshot, t, trade, update};
     use crate::event::{GapReason, Stream};
     use crate::order::EventKind;
@@ -436,6 +474,60 @@ mod tests {
                 .last_closed(),
             &FeatureValue::Ready(engine.closed_bars()[0])
         );
+    }
+
+    #[test]
+    fn rejects_a_jump_beyond_the_bar_bound() {
+        // The reviewer's repro: a trade at the epoch, then one at a
+        // present-day millisecond timestamp (~28M 1m bars).
+        let first = trade(0, 1);
+        let jump = trade(1_700_000_000_000, 2);
+        let err = StateError::TimeJump {
+            event: jump.canonical_key(),
+            timeframe: Timeframe::M1,
+            from: t(0),
+            bars: 28_333_333,
+        };
+        assert_rejected(Some(&first), &jump, err);
+
+        // Exactly the bound closes; one more bar is rejected, for trades and
+        // for trades gaps alike, with the state and closed bars unchanged.
+        let bound = i64::try_from(MAX_BARS_PER_EVENT).unwrap();
+        let mut engine = engine_after(&[first.clone(), trade(bound * 60_000, 2)]);
+        let minutes = engine
+            .closed_bars()
+            .iter()
+            .filter(|bar| bar.timeframe == Timeframe::M1)
+            .count();
+        assert_eq!(minutes, 44_640);
+        let before = engine.state().clone();
+        let closed_before = engine.closed_bars().to_vec();
+        let from = t(bound * 60_000);
+        let far = (2 * bound + 1) * 60_000;
+        for event in [
+            trade(far, 3),
+            gap(Stream::Trades, far - 1, far, GapReason::Disconnected),
+        ] {
+            assert_eq!(
+                engine.apply(&event),
+                Err(StateError::TimeJump {
+                    event: event.canonical_key(),
+                    timeframe: Timeframe::M1,
+                    from,
+                    bars: 44_641,
+                })
+            );
+            assert_eq!(engine.state(), &before);
+            assert_eq!(engine.closed_bars(), closed_before);
+        }
+        // A microsecond timestamp read as milliseconds.
+        let mut engine = engine_after(&[trade(1_700_000_000_000, 1)]);
+        assert!(matches!(
+            engine.apply(&trade(1_700_000_000_000_000, 2)),
+            Err(StateError::TimeJump { bars, .. }) if bars > MAX_BARS_PER_EVENT
+        ));
+        // Other streams never close bars, so they never jump.
+        engine.apply(&mark(1_700_000_000_000_000, 1)).unwrap();
     }
 
     #[test]
@@ -921,6 +1013,17 @@ mod tests {
         assert_eq!(
             StateError::Overflow { event }.to_string(),
             "event (1999ms Trade seq 2) overflows the bar arithmetic"
+        );
+        assert_eq!(
+            StateError::TimeJump {
+                event,
+                timeframe: Timeframe::M1,
+                from: t(0),
+                bars: 44_641,
+            }
+            .to_string(),
+            "event (1999ms Trade seq 2) would close 44641 1m bars from 0ms, \
+             more than the 44640 one event may close"
         );
     }
 }

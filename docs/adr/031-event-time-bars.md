@@ -67,7 +67,21 @@ from bars. Several earlier decisions constrain how bars are built:
 10. **Arithmetic**: volume, delta, trade count and bar times use checked
     operations. An event that would overflow any of them is rejected
     (`StateError::Overflow`) and leaves the state unchanged.
-11. **Kline cross-check**: a complete bar matches the exchange kline of its
+11. **Bounded jumps**: one event may close at most `MAX_BARS_PER_EVENT` =
+    44 640 bars of one timeframe — 31 days of 1m bars. Before any bar is
+    built, the number of bars a trade or trades gap would close is computed
+    in constant time from the developing bar's end and the event's ordering
+    time (`gap.end` for a gap); above the bound the event is rejected with
+    `StateError::TimeJump { event, timeframe, from, bars }` and the state is
+    unchanged. The 1m series closes the most bars, so it is the one
+    reported. Rationale: a week-long outage (10 080 1m bars) stays well
+    inside, while a corrupt timestamp — a microsecond value read as
+    milliseconds, or a first trade far from the next — would otherwise
+    materialize millions to billions of empty bars and exhaust memory
+    instead of failing as a typed error. Recovery: the error halts the drive
+    like any other rejection; a dataset with a genuine longer hole is
+    replayed as two runs, each from a fresh engine.
+12. **Kline cross-check**: a complete bar matches the exchange kline of its
     interval when the interval (open time, and close time = end − 1 ms),
     open, high, low, close, volume and taker-buy volume are equal. An empty
     bar is compared on the two volumes only. The trade count is not
@@ -90,9 +104,10 @@ from bars. Several earlier decisions constrain how bars are built:
   then miss the late trade without being marked; live hold-back misses are
   the only source of this.
 - A long gap materializes one empty bar per elapsed interval: a 7-day gap
-  closes 10 080 1m bars in one event. A far-future timestamp from a faulty
-  provider would materialize very many; the provider contract bounds that,
-  and there is no extra guard.
+  closes 10 080 1m bars in one event. The `MarketDataProvider` contract
+  sets no bound on timestamps, so the domain bounds the jump itself
+  (decision 11): a hole longer than 31 days cannot be replayed in one run
+  and must be split at the hole.
 - Higher-timeframe bars equal the fold of their 1m bars (OHLC, volumes,
   delta, count, OR of coverage); a property test pins it although nothing is
   rolled up.

@@ -22,12 +22,24 @@
 //!   reaching back before them marks only bars that are still open.
 //! - **No look-ahead**: a closed bar is never revised, and the developing
 //!   bar holds exactly the trades consumed in its interval so far.
+//! - **Bounded jumps**: one event closes at most [`MAX_BARS_PER_EVENT`] bars
+//!   per series; a longer jump in event time is rejected before any bar is
+//!   built.
 
 use crate::event::{Aggressor, FeedGap, Kline, MarketEvent, Stream, Trade};
 use crate::feature::{FeatureKey, FeatureValue, catalog};
 use crate::num::{Price, Qty};
 use crate::time::EventTime;
 use std::fmt;
+
+/// The most bars one event may close in one series: 31 days of 1m bars
+/// (ADR-031).
+///
+/// A week-long trades outage (10 080 1m bars) stays well inside. A longer
+/// jump in event time — such as a microsecond timestamp read as
+/// milliseconds — is rejected before any bar is built, instead of
+/// materializing millions of empty bars.
+pub const MAX_BARS_PER_EVENT: u64 = 44_640;
 
 /// A bar timeframe (ADR-031).
 ///
@@ -331,11 +343,11 @@ impl BarSeries {
     /// Updates the series with `event`, appending the bars it closes to
     /// `closed` in close order. On error the series and `closed` are
     /// unspecified and must be discarded.
-    fn apply(&mut self, event: &MarketEvent, closed: &mut Vec<Bar>) -> Result<(), BarOverflow> {
+    fn apply(&mut self, event: &MarketEvent, closed: &mut Vec<Bar>) -> Result<(), BarError> {
         match event {
             MarketEvent::Trade(trade) => {
                 let mut bar = self.advance(trade.time, None, closed)?;
-                bar.add_trade(trade).ok_or(BarOverflow)?;
+                bar.add_trade(trade).ok_or(BarError::Overflow)?;
                 self.developing = FeatureValue::Ready(bar);
             }
             MarketEvent::FeedGap(gap) if gap.stream == Stream::Trades => {
@@ -358,27 +370,39 @@ impl BarSeries {
     /// Closes every bar that ends at or before `time` and returns the bar
     /// containing it, marking each open bar that overlaps `gap`. Opens the
     /// first bar (`partial_start`) on the first trades-stream event.
+    ///
+    /// The number of bars to close is checked against
+    /// [`MAX_BARS_PER_EVENT`] first, in constant time, so a too-long jump
+    /// builds nothing.
     fn advance(
         &mut self,
         time: EventTime,
         gap: Option<&FeedGap>,
         closed: &mut Vec<Bar>,
-    ) -> Result<Bar, BarOverflow> {
+    ) -> Result<Bar, BarError> {
         let timeframe = self.timeframe;
         let mut bar = match self.developing {
             FeatureValue::Ready(bar) => bar,
             FeatureValue::WarmingUp { .. } | FeatureValue::Unavailable { .. } => {
-                let open = timeframe.open_of(time).ok_or(BarOverflow)?;
-                timeframe.end_of(open).ok_or(BarOverflow)?;
+                let open = timeframe.open_of(time).ok_or(BarError::Overflow)?;
+                timeframe.end_of(open).ok_or(BarError::Overflow)?;
                 let mut first = Bar::empty(timeframe, open);
                 first.coverage.partial_start = true;
                 first
             }
         };
+        let bars = bars_to_close(&bar, time);
+        if bars > MAX_BARS_PER_EVENT {
+            return Err(BarError::TooManyBars {
+                timeframe,
+                from: bar.open_time,
+                bars,
+            });
+        }
         bar.mark(gap);
         while bar.end() <= time {
             let open = bar.end();
-            timeframe.end_of(open).ok_or(BarOverflow)?;
+            timeframe.end_of(open).ok_or(BarError::Overflow)?;
             closed.push(bar);
             self.last_closed = FeatureValue::Ready(bar);
             bar = Bar::empty(timeframe, open);
@@ -386,6 +410,20 @@ impl BarSeries {
         }
         Ok(bar)
     }
+}
+
+/// How many bars reaching `time` closes, starting with `developing`:
+/// `0` if `time` is inside it, else one per elapsed interval. Saturates at
+/// `u64::MAX` for a span beyond the `i64` range, which exceeds any bound.
+fn bars_to_close(developing: &Bar, time: EventTime) -> u64 {
+    let Some(span) = time.as_millis().checked_sub(developing.end().as_millis()) else {
+        return u64::MAX;
+    };
+    if span < 0 {
+        return 0;
+    }
+    let elapsed = span / developing.timeframe.millis();
+    u64::try_from(elapsed).map_or(u64::MAX, |elapsed| elapsed.saturating_add(1))
 }
 
 /// The bar series of every timeframe, in [`Timeframe::ALL`] order: the
@@ -424,12 +462,14 @@ impl BarSet {
 
     /// Updates every series with `event` and appends the bars it closes to
     /// `closed`, sorted by `(end, timeframe)`. On error `self` and `closed`
-    /// are unspecified: the caller works on a copy and discards it.
+    /// are unspecified: the caller works on a copy and discards it. Series
+    /// are applied shortest first, so a too-long jump is reported for the
+    /// series that closes the most bars, before any is built.
     pub(crate) fn apply(
         &mut self,
         event: &MarketEvent,
         closed: &mut Vec<Bar>,
-    ) -> Result<(), BarOverflow> {
+    ) -> Result<(), BarError> {
         let first = closed.len();
         for series in &mut self.series {
             series.apply(event, closed)?;
@@ -439,9 +479,22 @@ impl BarSet {
     }
 }
 
-/// A bar's time or quantity arithmetic left the `i64` range.
+/// Why bars could not take an event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct BarOverflow;
+pub(crate) enum BarError {
+    /// A bar's time or quantity arithmetic left the `i64` range.
+    Overflow,
+    /// The event would close more than [`MAX_BARS_PER_EVENT`] bars of one
+    /// series.
+    TooManyBars {
+        /// The series.
+        timeframe: Timeframe,
+        /// Open time of its developing bar.
+        from: EventTime,
+        /// How many bars the event would close.
+        bars: u64,
+    },
+}
 
 /// A field in which a bar and an exchange kline disagree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -884,14 +937,14 @@ mod tests {
         let mut bars = BarSet::new();
         assert_eq!(
             bars.apply(&buy(i64::MAX, 1), &mut Vec::new()),
-            Err(BarOverflow)
+            Err(BarError::Overflow)
         );
         let mut bars = BarSet::new();
         bars.apply(&trade(0, 1, 1, i64::MAX, Aggressor::Sell), &mut Vec::new())
             .unwrap();
         assert_eq!(
             bars.apply(&trade(1, 2, 1, 1, Aggressor::Sell), &mut Vec::new()),
-            Err(BarOverflow)
+            Err(BarError::Overflow)
         );
         // Delta overflows although both volumes fit.
         let mut bars = BarSet::new();
@@ -899,8 +952,60 @@ mod tests {
             .unwrap();
         assert_eq!(
             bars.apply(&trade(1, 2, 1, 1, Aggressor::Sell), &mut Vec::new()),
-            Err(BarOverflow)
+            Err(BarError::Overflow)
         );
+    }
+
+    #[test]
+    fn one_event_closes_at_most_the_bound() {
+        let bound = i64::try_from(MAX_BARS_PER_EVENT).unwrap();
+        // 31 days after a trade at 0: exactly the bound of 1m bars closes.
+        for last in [bound * 60_000, (bound + 1) * 60_000 - 1] {
+            let (_, closed) = run(&[buy(0, 1), buy(last, 2)]);
+            assert_eq!(of(&closed[1], Timeframe::M1).len(), 44_640);
+        }
+        let mut bars = BarSet::new();
+        bars.apply(&buy(0, 1), &mut Vec::new()).unwrap();
+        let before = bars;
+        let too_far = (bound + 1) * 60_000;
+        let too_many = Err(BarError::TooManyBars {
+            timeframe: Timeframe::M1,
+            from: t(0),
+            bars: 44_641,
+        });
+        assert_eq!(bars.apply(&buy(too_far, 2), &mut Vec::new()), too_many);
+        let mut bars = before;
+        let gap = gap(Stream::Trades, 1, too_far, GapReason::Disconnected);
+        assert_eq!(bars.apply(&gap, &mut Vec::new()), too_many);
+        // Nothing was built for the rejected events.
+        let mut bars = before;
+        let mut closed = Vec::new();
+        bars.apply(&buy(too_far, 2), &mut closed).unwrap_err();
+        assert!(closed.is_empty());
+    }
+
+    #[test]
+    fn far_jumps_are_rejected_without_building_bars() {
+        for (from, to) in [
+            // A plausible ms timestamp after a trade at the epoch.
+            (0, 1_700_000_000_000),
+            // A microsecond timestamp read as milliseconds.
+            (1_700_000_000_000, 1_700_000_000_000_000),
+            (-4_000_000_000_000_000_000, i64::MAX - DAY),
+        ] {
+            let mut bars = BarSet::new();
+            bars.apply(&buy(from, 1), &mut Vec::new()).unwrap();
+            let mut closed = Vec::new();
+            let result = bars.apply(&buy(to, 2), &mut closed);
+            assert!(
+                matches!(result, Err(BarError::TooManyBars { timeframe: Timeframe::M1, bars, .. }) if bars > MAX_BARS_PER_EVENT),
+                "{from} -> {to}: {result:?}"
+            );
+            assert!(closed.is_empty());
+        }
+        let bar = Bar::empty(Timeframe::M1, t(i64::MIN + 60_000));
+        assert_eq!(bars_to_close(&bar, t(i64::MAX)), u64::MAX);
+        assert_eq!(bars_to_close(&bar, t(i64::MIN + 60_000)), 0);
     }
 
     /// Deterministic 64-bit LCG (Knuth's MMIX constants) for test tapes.
