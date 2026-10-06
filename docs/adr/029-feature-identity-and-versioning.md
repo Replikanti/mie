@@ -1,6 +1,6 @@
 # ADR-029: Feature identity, versioning and the feature-set version
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-10-06
 
 ## Context

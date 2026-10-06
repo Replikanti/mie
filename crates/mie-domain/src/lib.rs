@@ -16,7 +16,8 @@
 //! | Market State                              | [`state`]                    |
 //! | Event-time bars (ADR-031)                 | [`bars`]                     |
 //! | Feature identity and versioning (ADR-029) | [`feature`], [`fingerprint`] |
-//! | Regime (ADR-017)                          | [`regime`]                   |
+//! | Motion, ATR and regime (ADR-033)          | [`volatility`]               |
+//! | Regime (ADR-017, ADR-033)                 | [`regime`]                   |
 //! | Location / auction state                  | [`location`]                 |
 //! | Bias / trigger (ADR-012, ADR-024)         | [`trigger`]                  |
 //! | Strategy lifecycle / edge health          | [`strategy`]                 |
@@ -36,3 +37,4 @@ pub mod state;
 pub mod strategy;
 pub mod time;
 pub mod trigger;
+pub mod volatility;
