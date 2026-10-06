@@ -622,10 +622,7 @@ fn an_interrupted_file_resumes_without_duplicates() {
     writer.close().unwrap();
     assert_eq!(
         reports,
-        [
-            "resumed BTCUSDT-aggTrades-2026-09-30.zip: 10 rows sealed, 14 appended",
-            "skipped BTCUSDT-aggTrades-2026-09-30.zip",
-        ]
+        ["resumed BTCUSDT-aggTrades-2026-09-30.zip: 10 rows sealed, 14 appended"]
     );
     assert_eq!(summary.resumed, 1);
     assert!(!config.paths.import_ledger.join("PENDING").exists());
@@ -868,4 +865,181 @@ fn the_kline_check_matches_consistent_days_and_counts_an_altered_kline() {
     assert!(!matched);
     assert!(text.contains("mismatched: 1"), "{text}");
     assert!(text.contains("mismatch: 1m"), "{text}");
+}
+
+/// Imports one metrics day; the tests then set up a crash window by hand.
+fn imported_day(tag: &str) -> (TempDir, ArchiveConfig, Arc<FakeArchive>, i64) {
+    let dir = TempDir::new(tag);
+    let config = config(dir.path(), r#"["metrics"]"#);
+    let archive = Arc::new(FakeArchive::default());
+    let d = day("2026-09-30");
+    publish_all(&archive, d, d, 3_600_000);
+    let (summary, _) = run_import(&config, &archive, d, d, false);
+    assert_eq!(summary.imported, 1);
+    (dir, config, archive, d)
+}
+
+fn pending_for(archive: &FakeArchive, stream: ArchiveStream, period: Period) -> Pending {
+    let path = stream.archive_path(SYMBOL, period);
+    Pending {
+        sha256: sha256(&archive.zips.lock().unwrap()[&format!("{BASE}/{path}")]),
+        archive: path,
+        stream: key(stream),
+        period,
+    }
+}
+
+#[test]
+fn a_crash_after_the_ledger_write_only_clears_the_pending_marker() {
+    let (_dir, config, archive, d) = imported_day("archive-crash-ledger");
+    let ledgers = LedgerDir::new(&config.paths.import_ledger);
+    // The crash came between the ledger write and the PENDING removal.
+    ledgers
+        .set_pending(&pending_for(
+            &archive,
+            ArchiveStream::Metrics,
+            Period::Day(d),
+        ))
+        .unwrap();
+    let manifests = count_files(&config.paths.raw_root, ".manifest");
+    let downloads = archive.downloads();
+
+    let (summary, out) = run_import(&config, &archive, d, d, false);
+    assert_eq!(
+        out.lines().next(),
+        Some("skipped BTCUSDT-metrics-2026-09-30.zip")
+    );
+    assert_eq!(
+        (summary.skipped, summary.imported, summary.resumed),
+        (1, 0, 0),
+        "{out}"
+    );
+    assert_eq!(summary.exit_code(), 0);
+    assert!(!config.paths.import_ledger.join("PENDING").exists());
+    assert_eq!(archive.downloads(), downloads);
+    assert_eq!(count_files(&config.paths.raw_root, ".manifest"), manifests);
+}
+
+#[test]
+fn a_crash_after_sealing_but_before_the_ledger_resumes_from_the_orphans_alone() {
+    let (_dir, config, archive, d) = imported_day("archive-crash-sealed");
+    let ledgers = LedgerDir::new(&config.paths.import_ledger);
+    let name = "BTCUSDT-metrics-2026-09-30.zip";
+    let original = ledgers.read(ArchiveStream::Metrics, name).unwrap().unwrap();
+    // Every row is sealed (two partitions: the 23:55 sample is filed under
+    // the next day), but the ledger was never written.
+    assert_eq!(original.files.len(), 2);
+    std::fs::remove_file(ledgers.ledger_path(ArchiveStream::Metrics, name)).unwrap();
+    ledgers
+        .set_pending(&pending_for(
+            &archive,
+            ArchiveStream::Metrics,
+            Period::Day(d),
+        ))
+        .unwrap();
+    let manifests = count_files(&config.paths.raw_root, ".manifest");
+
+    let (summary, out) = run_import(&config, &archive, d, d, false);
+    assert_eq!(
+        out.lines().next(),
+        Some("resumed BTCUSDT-metrics-2026-09-30.zip: 25 rows sealed, 0 appended")
+    );
+    assert_eq!(
+        (summary.resumed, summary.skipped, summary.imported),
+        (1, 0, 0),
+        "{out}"
+    );
+    assert!(!config.paths.import_ledger.join("PENDING").exists());
+    assert_eq!(count_files(&config.paths.raw_root, ".manifest"), manifests);
+    // The rebuilt ledger lists exactly the orphans.
+    assert_eq!(
+        ledgers.read(ArchiveStream::Metrics, name).unwrap(),
+        Some(original)
+    );
+    let mut out = Vec::new();
+    assert!(
+        archive::verify(&config, d, d, &mut out).unwrap(),
+        "{}",
+        String::from_utf8_lossy(&out)
+    );
+}
+
+#[test]
+fn verify_fails_on_a_range_that_was_not_fully_imported() {
+    let dir = TempDir::new("archive-verify-gaps");
+    let config = config(dir.path(), r#"["aggTrades", "fundingRate"]"#);
+    let (from, to) = (day("2026-09-28"), day("2026-09-30"));
+
+    // Nothing imported: no evidence, no PASS.
+    let mut out = Vec::new();
+    assert!(!archive::verify(&config, from, to, &mut out).unwrap());
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        text.contains("not imported: BTCUSDT-aggTrades-2026-09-28.zip"),
+        "{text}"
+    );
+    assert!(
+        text.contains("not imported: BTCUSDT-fundingRate-2026-09.zip"),
+        "{text}"
+    );
+    assert!(text.ends_with("FAIL\n"), "{text}");
+
+    // The middle day was never published upstream (404, `missing`).
+    let archive = Arc::new(FakeArchive::default());
+    publish_all(&archive, from, from, 3_600_000);
+    publish_all(&archive, to, to, 3_600_000);
+    let (summary, _) = run_import(&config, &archive, from, to, false);
+    assert_eq!((summary.imported, summary.missing), (3, 1));
+    let mut out = Vec::new();
+    assert!(!archive::verify(&config, from, to, &mut out).unwrap());
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains("stream aggTrades: FAIL files 2"), "{text}");
+    assert!(
+        text.contains("not imported: BTCUSDT-aggTrades-2026-09-29.zip"),
+        "{text}"
+    );
+    assert!(text.contains("stream fundingRate: OK"), "{text}");
+    // The days that were imported verify on their own.
+    let mut out = Vec::new();
+    assert!(
+        archive::verify(&config, to, to, &mut out).unwrap(),
+        "{}",
+        String::from_utf8_lossy(&out)
+    );
+}
+
+#[test]
+fn the_kline_check_fails_when_no_bar_was_compared() {
+    let dir = TempDir::new("archive-klines-empty");
+    let config = config(dir.path(), r#"["aggTrades", "klines"]"#);
+    let archive = Arc::new(FakeArchive::default());
+    let (from, to) = (day("2026-09-28"), day("2026-09-30"));
+    publish_all(&archive, from, to, 60_000);
+    run_import(&config, &archive, from, to, false);
+    let middle = day("2026-09-29");
+
+    // `trades` is opt-in and was never imported.
+    let mut out = Vec::new();
+    let matched =
+        archive::kline_check(&config, middle, middle, ArchiveStream::Trades, &mut out).unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(!matched, "{text}");
+    assert!(text.contains("complete bars compared: 0"), "{text}");
+    assert!(
+        text.contains("FAIL: no complete bar was compared"),
+        "{text}"
+    );
+
+    // A day outside the import has no trades and no klines either.
+    let mut out = Vec::new();
+    let empty = day("2026-10-05");
+    assert!(
+        !archive::kline_check(&config, empty, empty, ArchiveStream::AggTrades, &mut out).unwrap()
+    );
+
+    let mut out = Vec::new();
+    assert!(
+        archive::kline_check(&config, middle, middle, ArchiveStream::AggTrades, &mut out).unwrap()
+    );
+    assert!(String::from_utf8(out).unwrap().ends_with("PASS\n"));
 }

@@ -49,13 +49,15 @@ USAGE:
         Re-read every imported file of the range (hash-verified), normalize
         every record, check ledger <-> store consistency, list trade-id
         breaks and holes over 60 s, print the dataset version per stream.
-        Prints PASS or FAIL; exits 0 on PASS, 1 on FAIL.
+        A configured stream without an imported file for a period of the
+        range fails. Prints PASS or FAIL; exits 0 on PASS, 1 on FAIL.
 
     mie archive-kline-check --config <path> --from <YYYY-MM-DD> --to <YYYY-MM-DD>
                             [--trade-source aggTrades|trades]
         Build bars from archive trades (default aggTrades) through the
         domain and compare every complete bar with the archive klines
-        (ADR-031). Exits 0 only when every compared bar matched.
+        (ADR-031). Exits 0 only when at least one complete bar was compared
+        and every compared bar matched.
 
     mie --help
 ";

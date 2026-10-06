@@ -68,7 +68,9 @@ The archive as checked on 2026-10-06 (first and last month of the window,
    checksum-verified file is one raw record, payload = the row bytes without
    its line terminator, `capture` null, under the source `binance-archive`.
    The source is a constant in code, not configuration, so archive
-   provenance can never land in the live source. Header lines are not
+   provenance can never land in the live source; the ingest configuration
+   rejects it as a live source, so live capture can never write to or lock
+   it either. Header lines are not
    records; the ledger keeps them. The importer lives in
    `mie-adapter-binance` (`archive` module), reusing its HTTP/TLS stack and
    decimal parsing; it writes only through the raw-store ports.
@@ -123,13 +125,17 @@ The archive as checked on 2026-10-06 (first and last month of the window,
 8. **Replayable (D7).** Until #11's `HistoricalDataProvider` exists,
    "replayable via #11" means: `mie archive-verify` re-reads every imported
    file (hash-verified), checks every record is filed at its ordering time
-   and normalizes it with zero errors; and `mie archive-kline-check` drives
+   and normalizes it with zero errors — and fails when any configured
+   stream has no imported file for a period of the range, so a partial or
+   empty backfill never passes; and `mie archive-kline-check` drives
    real archive days through `MarketStateEngine` with a temporary window
    provider (`archive::window`, superseded by #11). The full `mie replay` of
    the backfill is #11's acceptance.
 9. **Kline cross-check (D8).** `mie archive-kline-check --trade-source
    aggTrades|trades` runs the ADR-031 harness on archive days with either
-   trade source. A run on individual trades with zero mismatches explains
+   trade source. A check that compares no complete bar (for example
+   `trades` never imported) fails: it is no evidence. A run on individual
+   trades with zero mismatches explains
    every aggTrades mismatch as an aggregation-boundary effect with the same
    bar code. Whether ADR-031 is then accepted with that mismatch class
    documented, or amended (for example bars from individual trades), is

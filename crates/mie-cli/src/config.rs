@@ -6,7 +6,7 @@
 //! data needs no secrets; a future secret is read from the environment,
 //! never from this file.
 
-use mie_adapter_binance::archive::ArchiveStream;
+use mie_adapter_binance::archive::{ARCHIVE_SOURCE, ArchiveStream};
 use mie_adapter_binance::{BinanceStream, LiveConfig, OI_POLL_INTERVAL_MS};
 use mie_domain::bars::Timeframe;
 use mie_domain::time::EventTime;
@@ -166,6 +166,12 @@ impl IngestConfig {
         };
         segment("instrument.symbol", &self.instrument.symbol)?;
         segment("instrument.source", &self.instrument.source)?;
+        if self.instrument.source == ARCHIVE_SOURCE {
+            return Err(ConfigError(format!(
+                "instrument.source {ARCHIVE_SOURCE:?} is reserved for the archive backfill \
+                 (ADR-034): live capture may never write to or lock it"
+            )));
+        }
         let streams = self.streams()?;
         if streams.is_empty() {
             return Err(ConfigError("binance.streams is empty".to_owned()));

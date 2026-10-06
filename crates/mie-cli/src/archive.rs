@@ -225,9 +225,12 @@ struct StreamCheck {
 /// Runs `archive-verify` over the inclusive day range, printing a report to
 /// `out`. Returns whether it passed: every ledgered file is in the store,
 /// hash-verified on read, with the ledger's row count, every record is
-/// filed at its ordering time and normalizes, and no sealed file is
-/// missing from the ledgers. Id breaks and holes are listed, not failed:
-/// they feed the availability matrix.
+/// filed at its ordering time and normalizes, no sealed file is missing
+/// from the ledgers, and every configured stream has a ledger for every
+/// period of the range — a range that was not (fully) imported, an archive
+/// file that was never published included, is no evidence and fails. Id
+/// breaks and holes are listed, not failed: they feed the availability
+/// matrix.
 ///
 /// # Errors
 ///
@@ -256,9 +259,19 @@ pub fn verify(
             continue;
         }
         let key = key(config, stream)?;
-        let check = check_stream(
+        let mut check = check_stream(
             config, &store, stream, &key, &all, &in_range, from_day, to_day,
         )?;
+        if configured.contains(&stream) {
+            for period in stream.period_kind().periods(from_day, to_day) {
+                if !all.iter().any(|ledger| ledger.period == period) {
+                    check.failures.push(format!(
+                        "not imported: {}",
+                        stream.file_name(&config.instrument.symbol, period)
+                    ));
+                }
+            }
+        }
         let selection = RawSelection::new(BTreeSet::from([key]), day_window(from_day, to_day))
             .map_err(|e| e.to_string())?;
         let version = store.select(&selection).map_err(|e| e.to_string())?.version;
@@ -428,7 +441,9 @@ fn check_stream(
 
 /// Runs `archive-kline-check` over the inclusive day range with trades from
 /// `trade_stream`, printing the report and the dataset versions to `out`.
-/// Returns whether every compared bar matched its kline.
+/// Returns whether at least one complete bar was compared and every
+/// compared bar matched its kline: a window without the trade stream or
+/// without klines is no evidence and fails.
 ///
 /// # Errors
 ///
@@ -460,5 +475,15 @@ pub fn kline_check(
         let _ = writeln!(out, "dataset {name} {version}");
     }
     let _ = writeln!(out, "{report}");
-    Ok(report.all_matched())
+    let pass = report.compared > 0 && report.all_matched();
+    if report.compared == 0 {
+        let _ = writeln!(
+            out,
+            "FAIL: no complete bar was compared; import {trade_stream} and klines for the \
+             window and the minute around it"
+        );
+    } else {
+        let _ = writeln!(out, "{}", if pass { "PASS" } else { "FAIL" });
+    }
+    Ok(pass)
 }

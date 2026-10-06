@@ -54,6 +54,17 @@ fn unknown_keys_are_rejected() {
 }
 
 #[test]
+fn live_capture_may_not_use_the_archive_source() {
+    let text = REQUIRED.replace("source = \"binance-um\"", "source = \"binance-archive\"");
+    assert_ne!(text, REQUIRED);
+    let error = IngestConfig::parse(&text).expect_err("reserved source").0;
+    assert!(
+        error.contains("reserved for the archive backfill"),
+        "{error}"
+    );
+}
+
+#[test]
 fn missing_keys_are_rejected() {
     for key in ["raw_root = ", "journal = ", "ws_base_url = ", "symbol = "] {
         let text: String = REQUIRED

@@ -2,8 +2,8 @@
 //!
 //! Live capture and replay (#11) normalize the same persisted bytes with
 //! this code (ADR-019, ADR-030). Archive rows have their own normalizer in
-//! [`crate::archive::normalize`], built on the same decimal parsing. Everything here is a pure function of the
-//! payload: no clock, no state.
+//! [`crate::archive::normalize`], built on the same decimal parsing.
+//! Everything here is a pure function of the payload: no clock, no state.
 //!
 //! - Decimals are borrowed as strings and parsed only through the exact
 //!   `FromStr` of [`Price`], [`Qty`] and [`Rate`] (ADR-027). A decimal sent

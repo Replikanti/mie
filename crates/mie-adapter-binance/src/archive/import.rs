@@ -406,10 +406,13 @@ impl<'a> Importer<'a> {
         observer: &mut dyn FnMut(&FileReport),
         summary: &mut ImportSummary,
     ) -> Result<(), ImportError> {
+        // The file a pending import was completed for is reported once.
+        let mut resolved = None;
         if !self.options.dry_run
             && let Some(pending) = self.ledgers.pending()?
         {
             let report = self.resume(&pending)?;
+            resolved = Some((report.stream, report.period));
             summary.count(&report);
             observer(&report);
         }
@@ -427,6 +430,9 @@ impl<'a> Importer<'a> {
         }
         jobs.sort();
         for (_, _, stream, period) in jobs {
+            if resolved == Some((stream, period)) {
+                continue;
+            }
             if self.shutdown.load(Ordering::Relaxed) {
                 summary.stopped = true;
                 break;
