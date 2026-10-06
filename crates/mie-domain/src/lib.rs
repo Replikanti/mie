@@ -17,6 +17,7 @@
 //! | Event-time bars (ADR-031)                 | [`bars`]                     |
 //! | Feature identity and versioning (ADR-029) | [`feature`], [`fingerprint`] |
 //! | Motion, ATR and regime (ADR-033)          | [`volatility`]               |
+//! | Order flow / aggression (ADR-035)         | [`flow`]                     |
 //! | Regime (ADR-017, ADR-033)                 | [`regime`]                   |
 //! | Location / auction state                  | [`location`]                 |
 //! | Bias / trigger (ADR-012, ADR-024)         | [`trigger`]                  |
@@ -29,6 +30,7 @@ pub mod bars;
 pub mod event;
 pub mod feature;
 pub mod fingerprint;
+pub mod flow;
 pub mod location;
 pub mod num;
 pub mod order;

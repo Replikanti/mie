@@ -3,23 +3,25 @@
 //!
 //! The engine enforces the canonical event order (ADR-028), tracks the
 //! latest trade, builds event-time bars on every timeframe (ADR-031,
-//! [`bars`]) and computes bar motion, ATR(14) and the volatility regime from
-//! the bars each event closes (ADR-033, [`volatility`]); every other kind
-//! passes through. Further feature families (order flow, order book,
-//! OI/funding, volume profile, structure) are added by the Market State
-//! issues, each as a registered, versioned definition (ADR-029,
-//! [`feature`]).
+//! [`bars`]), computes bar motion, ATR(14) and the volatility regime from
+//! the bars each event closes (ADR-033, [`volatility`]), and the order flow:
+//! CVD and rolling aggression windows (ADR-035, [`flow`]); every other kind
+//! passes through. Further feature families (order book, OI/funding, volume
+//! profile, structure) are added by the Market State issues, each as a
+//! registered, versioned definition (ADR-029, [`feature`]).
 //! The engine computes one [`FeatureSet`] and stamps its
 //! [`FeatureSetVersion`] on every state; each feature value carries its
 //! validity ([`FeatureValue`]).
 //!
 //! [`bars`]: crate::bars
 //! [`feature`]: crate::feature
+//! [`flow`]: crate::flow
 //! [`volatility`]: crate::volatility
 
 use crate::bars::{Bar, BarError, BarSet, MAX_BARS_PER_EVENT, Timeframe};
 use crate::event::{MarketEvent, Stream};
 use crate::feature::{FeatureSet, FeatureSetVersion, FeatureValue, catalog};
+use crate::flow::{FlowError, FlowTracker, OrderFlow};
 use crate::num::Price;
 use crate::order::CanonicalKey;
 use crate::regime::Regime;
@@ -55,6 +57,11 @@ pub struct MarketState {
     /// label plus raw percentile. Context, never an entry signal (brief §9,
     /// ADR-012).
     pub regime: FeatureValue<Regime>,
+    /// Order flow (ADR-035): `flow.cvd.continuous@1`, `flow.cvd.utc_day@1`
+    /// and `flow.window.<5m|15m|1h>@1` ([`catalog::FLOW_WINDOWS`]) — CVD and
+    /// rolling aggression over closed minutes. Aggression, not direction
+    /// (ADR-023).
+    pub flow: OrderFlow,
     /// Number of trades consumed. A diagnostic counter, not a feature: it
     /// depends on where consumption started, so it is not reproducible
     /// across replay windows.
@@ -84,6 +91,8 @@ pub struct MarketStateEngine {
     anchors: MotionAnchors,
     /// ATR and regime of the regime timeframe.
     volatility: AtrRegimeSeries,
+    /// CVD, the developing minute's large prints and the recent minutes.
+    flow: FlowTracker,
 }
 
 /// Volatility state after the bars an event closed, committed with them.
@@ -175,6 +184,7 @@ impl MarketStateEngine {
     pub fn new() -> Self {
         let features = catalog::current_set();
         let volatility = AtrRegimeSeries::new();
+        let flow = FlowTracker::new();
         let state = MarketState {
             feature_set: features.version(),
             as_of: None,
@@ -187,6 +197,7 @@ impl MarketStateEngine {
             motion: MotionSet::new(),
             atr: volatility.atr(),
             regime: volatility.regime(),
+            flow: flow.flow(),
             trade_count: 0,
         };
         Self {
@@ -198,6 +209,7 @@ impl MarketStateEngine {
             pending: Vec::new(),
             anchors: MotionAnchors::default(),
             volatility,
+            flow,
         }
     }
 
@@ -219,8 +231,9 @@ impl MarketStateEngine {
     ///   repeats the exchange id of the last trade, snapshot or update;
     /// - [`StateError::IdRegression`] if its exchange id falls below the last
     ///   accepted one of its stream;
-    /// - [`StateError::Overflow`] if a bar's time or quantity arithmetic, or
-    ///   a closed bar's true range, change or range, leaves the `i64` range;
+    /// - [`StateError::Overflow`] if a bar's time or quantity arithmetic, a
+    ///   closed bar's true range, change or range, or an order-flow sum
+    ///   (CVD, window) leaves the `i64` range;
     /// - [`StateError::TimeJump`] if it would close more than
     ///   [`MAX_BARS_PER_EVENT`] bars of one timeframe. Recovery: the replay
     ///   or session stops; restart it from a fresh engine after the jump.
@@ -283,6 +296,15 @@ impl MarketStateEngine {
                 });
             }
         };
+        let flow = match self.flow.step(event, &self.pending, &bars) {
+            Ok(flow) => flow,
+            Err(FlowError::Overflow) => {
+                self.pending.clear();
+                return Err(StateError::Overflow {
+                    event: event.canonical_key(),
+                });
+            }
+        };
 
         match event {
             MarketEvent::Trade(trade) => {
@@ -309,6 +331,8 @@ impl MarketStateEngine {
                 self.volatility = volatility;
             }
         }
+        self.flow.commit(flow);
+        self.state.flow = self.flow.flow();
         self.state.as_of = Some(event.time());
         self.last = Some(event.clone());
         self.ids = ids;
@@ -390,9 +414,9 @@ pub enum StateError {
         /// End of the rejected gap.
         end: EventTime,
     },
-    /// The event would push a bar's time or quantity arithmetic, or a
-    /// volatility value, out of the `i64` range (ADR-027, ADR-031,
-    /// ADR-033).
+    /// The event would push a bar's time or quantity arithmetic, a
+    /// volatility value or an order-flow sum out of the `i64` range
+    /// (ADR-027, ADR-031, ADR-033, ADR-035).
     Overflow {
         /// Key of the rejected event.
         event: CanonicalKey,
@@ -436,7 +460,7 @@ impl fmt::Display for StateError {
             Self::Overflow { event } => {
                 write!(
                     f,
-                    "event ({event}) overflows the bar or volatility arithmetic"
+                    "event ({event}) overflows the bar, volatility or order-flow arithmetic"
                 )
             }
             Self::TimeJump {
@@ -458,8 +482,11 @@ impl std::error::Error for StateError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::samples::{gap, mark, one_of_each, snapshot, t, trade, update};
+    use crate::bars::Coverage;
+    use crate::event::samples::{gap, kline, mark, one_of_each, snapshot, t, trade, update};
     use crate::event::{GapReason, Stream};
+    use crate::flow::{AggressionWindows, Cvd, DayCvd};
+    use crate::num::Qty;
     use crate::order::EventKind;
 
     fn engine_after(events: &[MarketEvent]) -> MarketStateEngine {
@@ -512,6 +539,25 @@ mod tests {
                 regime: FeatureValue::WarmingUp {
                     observed: 0,
                     required: 214,
+                },
+                flow: OrderFlow {
+                    // Three buys of 0.015 BTC.
+                    cvd: FeatureValue::Ready(Cvd {
+                        feature: catalog::FLOW_CVD_CONTINUOUS_V1.key,
+                        cvd: Qty::from_units(4_500_000),
+                        anchor: t(1_000),
+                        gaps: 0,
+                    }),
+                    cvd_utc_day: FeatureValue::Ready(DayCvd {
+                        feature: catalog::FLOW_CVD_UTC_DAY_V1.key,
+                        day_open: t(0),
+                        cvd: Qty::from_units(4_500_000),
+                        coverage: Coverage {
+                            partial_start: true,
+                            feed_gap: false,
+                        },
+                    }),
+                    windows: AggressionWindows::new(),
                 },
                 trade_count: 3,
             }
@@ -712,7 +758,9 @@ mod tests {
             "bars.motion.15m@1,bars.motion.1d@1,bars.motion.1h@1,bars.motion.1m@1,\
              bars.motion.4h@1,bars.motion.5m@1,bars.time.15m@1,bars.time.1d@1,\
              bars.time.1h@1,bars.time.1m@1,bars.time.4h@1,bars.time.5m@1,\
-             trade.last_price@1,volatility.atr.1h@1,volatility.regime.1h@1"
+             flow.cvd.continuous@1,flow.cvd.utc_day@1,flow.window.15m@1,\
+             flow.window.1h@1,flow.window.5m@1,trade.last_price@1,\
+             volatility.atr.1h@1,volatility.regime.1h@1"
         );
         // Consuming events never changes it.
         let engine = engine_after(&one_of_each(1_000));
@@ -843,6 +891,65 @@ mod tests {
         assert_eq!(engine.state().regime, before.regime);
         // Events that close no bar still pass.
         engine.apply(&mark(120_000, 1)).unwrap();
+    }
+
+    #[test]
+    fn rejects_an_event_that_overflows_the_cvd() {
+        // The first day's bars hold `i64::MAX` units; the next day's bars
+        // and every window fit, but the continuous CVD does not.
+        let mut engine = engine_after(&[sized_trade(500, 1, i64::MAX)]);
+        let before = engine.state().clone();
+        let closed_before = engine.closed_bars().to_vec();
+        let overflow = sized_trade(86_400_000, 2, 1);
+        assert_eq!(
+            engine.apply(&overflow),
+            Err(StateError::Overflow {
+                event: overflow.canonical_key()
+            })
+        );
+        assert_eq!(engine.state(), &before);
+        assert_eq!(engine.closed_bars(), closed_before);
+        assert_eq!(engine.state().flow, before.flow);
+        // The ordering bound did not move: the accepted trade is still the
+        // last one, and an event on another stream passes.
+        assert_eq!(
+            engine.apply(&sized_trade(500, 1, i64::MAX)),
+            Err(StateError::Duplicate {
+                key: sized_trade(500, 1, i64::MAX).canonical_key()
+            })
+        );
+        engine.apply(&mark(86_400_000, 1)).unwrap();
+        // The same trade with the other aggressor fits: only the CVD
+        // overflowed.
+        let MarketEvent::Trade(base) = overflow else {
+            unreachable!("sized_trade builds a trade")
+        };
+        engine
+            .apply(&MarketEvent::Trade(crate::event::Trade {
+                time: t(86_400_001),
+                aggressor: crate::event::Aggressor::Sell,
+                ..base
+            }))
+            .unwrap();
+        let cvd = engine.state().flow.cvd.ready().unwrap().cvd;
+        assert_eq!(cvd, Qty::from_units(i64::MAX - 1));
+    }
+
+    #[test]
+    fn other_streams_leave_the_order_flow_unchanged() {
+        let mut engine = engine_after(&[trade(1_000, 1), trade(400_000, 2)]);
+        let flow = engine.state().flow;
+        assert!(flow.windows.get(Timeframe::M5).unwrap().is_ready());
+        for event in [
+            mark(400_001, 1),
+            snapshot(400_002, 10),
+            gap(Stream::OrderBook, 400_000, 400_003, GapReason::Disconnected),
+            update(400_004, 11, 12, 10),
+            kline(340_005, 400_004),
+        ] {
+            engine.apply(&event).unwrap();
+            assert_eq!(engine.state().flow, flow, "{event:?}");
+        }
     }
 
     #[test]
@@ -1190,7 +1297,7 @@ mod tests {
         );
         assert_eq!(
             StateError::Overflow { event }.to_string(),
-            "event (1999ms Trade seq 2) overflows the bar or volatility arithmetic"
+            "event (1999ms Trade seq 2) overflows the bar, volatility or order-flow arithmetic"
         );
         assert_eq!(
             StateError::TimeJump {
