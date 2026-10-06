@@ -1,17 +1,20 @@
 //! Market State: the canonical deterministic representation of current
 //! conditions (brief §8, Market State & Regime brief).
 //!
-//! Walking-skeleton stage: the engine enforces the canonical event order
-//! (ADR-028) and tracks only the latest trade; every other kind passes
-//! through. Feature families (volatility, order flow, order book,
-//! OI/funding, volume profile, structure) are added by the Market State
-//! issues, each as a registered, versioned definition (ADR-029, [`feature`]).
+//! The engine enforces the canonical event order (ADR-028), tracks the
+//! latest trade and builds event-time bars on every timeframe (ADR-031,
+//! [`bars`]); every other kind passes through. Further feature families
+//! (volatility, order flow, order book, OI/funding, volume profile,
+//! structure) are added by the Market State issues, each as a registered,
+//! versioned definition (ADR-029, [`feature`]).
 //! The engine computes one [`FeatureSet`] and stamps its
 //! [`FeatureSetVersion`] on every state; each feature value carries its
 //! validity ([`FeatureValue`]).
 //!
+//! [`bars`]: crate::bars
 //! [`feature`]: crate::feature
 
+use crate::bars::{Bar, BarError, BarSet, MAX_BARS_PER_EVENT, Timeframe};
 use crate::event::{MarketEvent, Stream};
 use crate::feature::{FeatureSet, FeatureSetVersion, FeatureValue, catalog};
 use crate::num::Price;
@@ -32,6 +35,10 @@ pub struct MarketState {
     /// Price of the last trade: `trade.last_price@1`
     /// ([`catalog::TRADE_LAST_PRICE_V1`]), warming up until the first trade.
     pub last_trade_price: FeatureValue<Price>,
+    /// Event-time bars: `bars.time.<tf>@1` ([`catalog::BARS_TIME`]), the
+    /// last closed and the developing bar of every timeframe. History is
+    /// kept by consumers, from [`MarketStateEngine::closed_bars`].
+    pub bars: BarSet,
     /// Number of trades consumed. A diagnostic counter, not a feature: it
     /// depends on where consumption started, so it is not reproducible
     /// across replay windows.
@@ -52,6 +59,11 @@ pub struct MarketStateEngine {
     last: Option<MarketEvent>,
     /// Last accepted exchange id of each id-carrying kind.
     ids: LastIds,
+    /// The bars closed by the last accepted event.
+    closed: Vec<Bar>,
+    /// Scratch buffer for the bars an event closes, swapped with `closed`
+    /// once the event is accepted.
+    pending: Vec<Bar>,
 }
 
 /// Last accepted exchange ids (ADR-028): the canonical order alone lets the
@@ -142,6 +154,7 @@ impl MarketStateEngine {
                 observed: 0,
                 required: 1,
             },
+            bars: BarSet::new(),
             trade_count: 0,
         };
         Self {
@@ -149,6 +162,8 @@ impl MarketStateEngine {
             state,
             last: None,
             ids: LastIds::default(),
+            closed: Vec::new(),
+            pending: Vec::new(),
         }
     }
 
@@ -169,7 +184,12 @@ impl MarketStateEngine {
     /// - [`StateError::Duplicate`] if it equals the last consumed one, or
     ///   repeats the exchange id of the last trade, snapshot or update;
     /// - [`StateError::IdRegression`] if its exchange id falls below the last
-    ///   accepted one of its stream.
+    ///   accepted one of its stream;
+    /// - [`StateError::Overflow`] if a bar's time or quantity arithmetic
+    ///   leaves the `i64` range;
+    /// - [`StateError::TimeJump`] if it would close more than
+    ///   [`MAX_BARS_PER_EVENT`] bars of one timeframe. Recovery: the replay
+    ///   or session stops; restart it from a fresh engine after the jump.
     ///
     /// Ordering is the market-data provider's job — the domain never
     /// reorders.
@@ -199,6 +219,27 @@ impl MarketStateEngine {
             }
         }
         let ids = self.ids.check(event)?;
+        // Bars are updated on a copy, committed only once nothing can fail.
+        let mut bars = self.state.bars;
+        self.pending.clear();
+        if let Err(error) = bars.apply(event, &mut self.pending) {
+            // Drop any partial result; `closed` is untouched.
+            self.pending.clear();
+            let event = event.canonical_key();
+            return Err(match error {
+                BarError::Overflow => StateError::Overflow { event },
+                BarError::TooManyBars {
+                    timeframe,
+                    from,
+                    bars,
+                } => StateError::TimeJump {
+                    event,
+                    timeframe,
+                    from,
+                    bars,
+                },
+            });
+        }
 
         match event {
             MarketEvent::Trade(trade) => {
@@ -215,15 +256,24 @@ impl MarketStateEngine {
             | MarketEvent::OpenInterest(_)
             | MarketEvent::Kline(_) => {}
         }
+        self.state.bars = bars;
         self.state.as_of = Some(event.time());
         self.last = Some(event.clone());
         self.ids = ids;
+        std::mem::swap(&mut self.closed, &mut self.pending);
         Ok(())
     }
 
     /// The current state.
     pub fn state(&self) -> &MarketState {
         &self.state
+    }
+
+    /// The bars the last accepted event closed, in `(end, timeframe)` order
+    /// (ADR-031); empty when it closed none, as after every event that is
+    /// not on the trades stream. A rejected event leaves it unchanged.
+    pub fn closed_bars(&self) -> &[Bar] {
+        &self.closed
     }
 }
 
@@ -261,6 +311,25 @@ pub enum StateError {
         /// End of the rejected gap.
         end: EventTime,
     },
+    /// The event would push a bar's time or quantity arithmetic out of the
+    /// `i64` range (ADR-027, ADR-031).
+    Overflow {
+        /// Key of the rejected event.
+        event: CanonicalKey,
+    },
+    /// The event jumps so far ahead in event time that it would close more
+    /// than [`MAX_BARS_PER_EVENT`] bars of one timeframe (ADR-031).
+    TimeJump {
+        /// Key of the rejected event; its time is where the jump lands.
+        event: CanonicalKey,
+        /// The timeframe that exceeds the bound (the shortest one).
+        timeframe: Timeframe,
+        /// Open time of that timeframe's developing bar: where the jump
+        /// starts.
+        from: EventTime,
+        /// How many bars of `timeframe` the event would close.
+        bars: u64,
+    },
 }
 
 impl fmt::Display for StateError {
@@ -284,6 +353,19 @@ impl fmt::Display for StateError {
             Self::InvalidGap { start, end } => {
                 write!(f, "feed gap starts at {start}, after its end at {end}")
             }
+            Self::Overflow { event } => {
+                write!(f, "event ({event}) overflows the bar arithmetic")
+            }
+            Self::TimeJump {
+                event,
+                timeframe,
+                from,
+                bars,
+            } => write!(
+                f,
+                "event ({event}) would close {bars} {timeframe} bars from {from}, \
+                 more than the {MAX_BARS_PER_EVENT} one event may close"
+            ),
         }
     }
 }
@@ -326,16 +408,158 @@ mod tests {
 
     #[test]
     fn tracks_latest_trade() {
-        let engine = engine_after(&[trade(1_000, 1), trade(1_000, 2), trade(1_500, 3)]);
+        let events = [trade(1_000, 1), trade(1_000, 2), trade(1_500, 3)];
+        let engine = engine_after(&events);
+        let mut bars = BarSet::new();
+        for event in &events {
+            bars.apply(event, &mut Vec::new()).unwrap();
+        }
         assert_eq!(
             engine.state(),
             &MarketState {
                 feature_set: catalog::current_set().version(),
                 as_of: Some(t(1_500)),
                 last_trade_price: FeatureValue::Ready(Price::from_units(6_354_210_000_000)),
+                bars,
                 trade_count: 3,
             }
         );
+        assert!(engine.state().bars.iter().all(|series| {
+            series
+                .developing()
+                .ready()
+                .is_some_and(|bar| bar.trade_count == 3)
+        }));
+    }
+
+    #[test]
+    fn closed_bars_hold_what_the_last_event_closed() {
+        let mut engine = MarketStateEngine::new();
+        assert!(engine.closed_bars().is_empty());
+        engine.apply(&trade(30_000, 1)).unwrap();
+        assert!(engine.closed_bars().is_empty());
+        engine.apply(&trade(300_000, 2)).unwrap();
+        let closed: Vec<_> = engine
+            .closed_bars()
+            .iter()
+            .map(|bar| (bar.end().as_millis(), bar.timeframe))
+            .collect();
+        assert_eq!(
+            closed,
+            [
+                (60_000, Timeframe::M1),
+                (120_000, Timeframe::M1),
+                (180_000, Timeframe::M1),
+                (240_000, Timeframe::M1),
+                (300_000, Timeframe::M1),
+                (300_000, Timeframe::M5),
+            ]
+        );
+        // A rejected event leaves them; an event on another stream clears
+        // them.
+        engine.apply(&trade(299_999, 3)).unwrap_err();
+        assert_eq!(engine.closed_bars().len(), 6);
+        engine.apply(&mark(400_000, 1)).unwrap();
+        assert!(engine.closed_bars().is_empty());
+        // The mark price did not close the 1m bar of 300_000; the next trade
+        // does.
+        engine.apply(&trade(400_001, 4)).unwrap();
+        assert_eq!(engine.closed_bars().len(), 1);
+        assert_eq!(
+            engine
+                .state()
+                .bars
+                .get(Timeframe::M1)
+                .unwrap()
+                .last_closed(),
+            &FeatureValue::Ready(engine.closed_bars()[0])
+        );
+    }
+
+    #[test]
+    fn rejects_a_jump_beyond_the_bar_bound() {
+        // The reviewer's repro: a trade at the epoch, then one at a
+        // present-day millisecond timestamp (~28M 1m bars).
+        let first = trade(0, 1);
+        let jump = trade(1_700_000_000_000, 2);
+        let err = StateError::TimeJump {
+            event: jump.canonical_key(),
+            timeframe: Timeframe::M1,
+            from: t(0),
+            bars: 28_333_333,
+        };
+        assert_rejected(Some(&first), &jump, err);
+
+        // Exactly the bound closes; one more bar is rejected, for trades and
+        // for trades gaps alike, with the state and closed bars unchanged.
+        let bound = i64::try_from(MAX_BARS_PER_EVENT).unwrap();
+        let mut engine = engine_after(&[first.clone(), trade(bound * 60_000, 2)]);
+        let minutes = engine
+            .closed_bars()
+            .iter()
+            .filter(|bar| bar.timeframe == Timeframe::M1)
+            .count();
+        assert_eq!(minutes, 44_640);
+        let before = engine.state().clone();
+        let closed_before = engine.closed_bars().to_vec();
+        let from = t(bound * 60_000);
+        let far = (2 * bound + 1) * 60_000;
+        for event in [
+            trade(far, 3),
+            gap(Stream::Trades, far - 1, far, GapReason::Disconnected),
+        ] {
+            assert_eq!(
+                engine.apply(&event),
+                Err(StateError::TimeJump {
+                    event: event.canonical_key(),
+                    timeframe: Timeframe::M1,
+                    from,
+                    bars: 44_641,
+                })
+            );
+            assert_eq!(engine.state(), &before);
+            assert_eq!(engine.closed_bars(), closed_before);
+        }
+        // A microsecond timestamp read as milliseconds.
+        let mut engine = engine_after(&[trade(1_700_000_000_000, 1)]);
+        assert!(matches!(
+            engine.apply(&trade(1_700_000_000_000_000, 2)),
+            Err(StateError::TimeJump { bars, .. }) if bars > MAX_BARS_PER_EVENT
+        ));
+        // Other streams never close bars, so they never jump.
+        engine.apply(&mark(1_700_000_000_000_000, 1)).unwrap();
+    }
+
+    #[test]
+    fn rejects_an_event_that_overflows_a_bar() {
+        // A trade whose bar would end past the last representable instant.
+        let far = trade(i64::MAX, 1);
+        assert_rejected(
+            None,
+            &far,
+            StateError::Overflow {
+                event: far.canonical_key(),
+            },
+        );
+        // Volume overflow: the state, the bars and the closed bars stay put.
+        // The 5m bar reaches exactly `i64::MAX` units; the 1m bar holds
+        // `huge` alone, closing the first minute.
+        let huge = sized_trade(60_000, 2, i64::MAX - 1_500_000);
+        let mut engine = engine_after(&[trade(500, 1), huge]);
+        let before = engine.state().clone();
+        let closed_before = engine.closed_bars().to_vec();
+        assert_eq!(closed_before.len(), 1);
+        let overflow = sized_trade(60_001, 3, 1);
+        assert_eq!(
+            engine.apply(&overflow),
+            Err(StateError::Overflow {
+                event: overflow.canonical_key()
+            })
+        );
+        assert_eq!(engine.state(), &before);
+        assert_eq!(engine.closed_bars(), closed_before);
+        engine.apply(&trade(60_001, 3)).unwrap_err();
+        engine.apply(&mark(60_001, 1)).unwrap();
     }
 
     #[test]
@@ -391,7 +615,11 @@ mod tests {
         let current = catalog::current_set();
         assert_eq!(engine.state().feature_set, current.version());
         assert_eq!(engine.feature_set(), &current);
-        assert_eq!(engine.feature_set().to_string(), "trade.last_price@1");
+        assert_eq!(
+            engine.feature_set().to_string(),
+            "bars.time.15m@1,bars.time.1d@1,bars.time.1h@1,bars.time.1m@1,\
+             bars.time.4h@1,bars.time.5m@1,trade.last_price@1"
+        );
         // Consuming events never changes it.
         let engine = engine_after(&one_of_each(1_000));
         assert_eq!(engine.state().feature_set, current.version());
@@ -561,6 +789,17 @@ mod tests {
         ]);
         assert_eq!(engine.state().as_of, Some(t(2_000)));
         assert_eq!(engine.state().trade_count, 2);
+    }
+
+    /// A trade with `trade_id` at `millis` and a quantity of `qty_units`.
+    fn sized_trade(millis: i64, trade_id: u64, qty_units: i64) -> MarketEvent {
+        let MarketEvent::Trade(base) = trade(millis, trade_id) else {
+            unreachable!("samples::trade builds a trade")
+        };
+        MarketEvent::Trade(crate::event::Trade {
+            qty: crate::num::Qty::from_units(qty_units),
+            ..base
+        })
     }
 
     /// A trade with `trade_id` at `millis` and a price of `price_units`.
@@ -770,6 +1009,21 @@ mod tests {
             }
             .to_string(),
             "feed gap starts at 5ms, after its end at 4ms"
+        );
+        assert_eq!(
+            StateError::Overflow { event }.to_string(),
+            "event (1999ms Trade seq 2) overflows the bar arithmetic"
+        );
+        assert_eq!(
+            StateError::TimeJump {
+                event,
+                timeframe: Timeframe::M1,
+                from: t(0),
+                bars: 44_641,
+            }
+            .to_string(),
+            "event (1999ms Trade seq 2) would close 44641 1m bars from 0ms, \
+             more than the 44640 one event may close"
         );
     }
 }

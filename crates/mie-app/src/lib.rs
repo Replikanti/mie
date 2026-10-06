@@ -1,10 +1,14 @@
 //! MIE application layer: use-case services that orchestrate the domain
 //! through ports without owning any infrastructure (brief §3).
 //!
-//! [`drive`] is the single place where market data meets the domain. Live
-//! analysis and historical replay both go through it — replay is an input
+//! [`drive_observed`] is the single place where market data meets the
+//! domain; [`drive`] and the [`kline_check`] harness go through it. Live
+//! analysis and historical replay both use it — replay is an input
 //! difference, not a second implementation (ADR-019).
 
+pub mod kline_check;
+
+use mie_domain::event::MarketEvent;
 use mie_domain::state::MarketStateEngine;
 use mie_ports::inbound::{ReplayMarket, ReplayReport, UseCaseError};
 use mie_ports::outbound::{HistoricalDataProvider, MarketDataProvider, ReplayWindow};
@@ -20,9 +24,28 @@ pub fn drive<P>(provider: &mut P, engine: &mut MarketStateEngine) -> Result<u64,
 where
     P: MarketDataProvider + ?Sized,
 {
+    drive_observed(provider, engine, |_, _| {})
+}
+
+/// [`drive`], calling `observe` with each event right after `engine`
+/// accepted it, so an observer sees the state — and the bars the event
+/// closed — exactly as of that event, never later.
+///
+/// # Errors
+///
+/// As [`drive`]; `observe` is not called for the event that failed.
+pub fn drive_observed<P>(
+    provider: &mut P,
+    engine: &mut MarketStateEngine,
+    mut observe: impl FnMut(&MarketEvent, &MarketStateEngine),
+) -> Result<u64, UseCaseError>
+where
+    P: MarketDataProvider + ?Sized,
+{
     let mut events = 0;
     while let Some(event) = provider.next_event()? {
         engine.apply(&event)?;
+        observe(&event, engine);
         events += 1;
     }
     Ok(events)
