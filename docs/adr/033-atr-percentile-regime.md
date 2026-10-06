@@ -1,6 +1,6 @@
 # ADR-033: ATR-percentile regime on 1h bars, and bar motion
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-10-06
 
 ## Context
@@ -161,10 +161,19 @@ Earlier decisions constrain the answer:
 ## Accept when
 
 The CI cross-check passes, and a manual TradingView spot check matches:
-`tools/reference/atr_regime.pine` on the BINANCE:BTCUSDT.P 1h chart agrees
-with the fixture to 1e-6 relative on ATR and exactly on the percentile, at
-≥ 20 fixture rows past row 400. TradingView's series starts years earlier;
-its seed difference there is (13/14)^400 ≈ 1e-13.
+the Pine Script v5 definitions (`tools/reference/atr_regime.pine`) on the
+BINANCE:BTCUSDT.P 1h chart agree with `tools/reference/atr_regime_reference.py`
+to 1e-6 relative on ATR and exactly on the percentile, at ≥ 20 rows past
+row 400 of the reference window. Any window of consecutive 1h bars from the
+Binance USD-M futures archive qualifies: TradingView's history depth depends
+on the plan, so the window need not be the CI fixture's. TradingView's
+series starts earlier; its seed difference at row 400 is (13/14)^400 ≈ 1e-13.
+
+Met 2026-10-07: the reference script on the August–September 2026 archive
+(`BTCUSDT-1h-2026-08.zip`, `BTCUSDT-1h-2026-09.zip`, checksums verified,
+1 464 bars) was checked in TradingView on 100 rows (every 10th hour from
+2026-08-17 16:00 UTC, rows 401–1391): 100/100 ATR within 1e-6 relative and
+100/100 percentile exact.
 
 References: ADR-012, ADR-013, ADR-017, ADR-019, ADR-027, ADR-029, ADR-031,
 ADR-032. This PR also accepts ADR-029: #15 registered bars and #16 a
