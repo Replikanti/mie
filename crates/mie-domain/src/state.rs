@@ -2,24 +2,29 @@
 //! conditions (brief §8, Market State & Regime brief).
 //!
 //! The engine enforces the canonical event order (ADR-028), tracks the
-//! latest trade and builds event-time bars on every timeframe (ADR-031,
-//! [`bars`]); every other kind passes through. Further feature families
-//! (volatility, order flow, order book, OI/funding, volume profile,
-//! structure) are added by the Market State issues, each as a registered,
-//! versioned definition (ADR-029, [`feature`]).
+//! latest trade, builds event-time bars on every timeframe (ADR-031,
+//! [`bars`]) and computes bar motion, ATR(14) and the volatility regime from
+//! the bars each event closes (ADR-033, [`volatility`]); every other kind
+//! passes through. Further feature families (order flow, order book,
+//! OI/funding, volume profile, structure) are added by the Market State
+//! issues, each as a registered, versioned definition (ADR-029,
+//! [`feature`]).
 //! The engine computes one [`FeatureSet`] and stamps its
 //! [`FeatureSetVersion`] on every state; each feature value carries its
 //! validity ([`FeatureValue`]).
 //!
 //! [`bars`]: crate::bars
 //! [`feature`]: crate::feature
+//! [`volatility`]: crate::volatility
 
 use crate::bars::{Bar, BarError, BarSet, MAX_BARS_PER_EVENT, Timeframe};
 use crate::event::{MarketEvent, Stream};
 use crate::feature::{FeatureSet, FeatureSetVersion, FeatureValue, catalog};
 use crate::num::Price;
 use crate::order::CanonicalKey;
+use crate::regime::Regime;
 use crate::time::EventTime;
+use crate::volatility::{AtrRegimeSeries, MotionAnchors, MotionSet, VolatilityError};
 use std::cmp::Ordering;
 use std::fmt;
 
@@ -39,6 +44,17 @@ pub struct MarketState {
     /// last closed and the developing bar of every timeframe. History is
     /// kept by consumers, from [`MarketStateEngine::closed_bars`].
     pub bars: BarSet,
+    /// Motion of the last closed bar of every timeframe: `bars.motion.<tf>@1`
+    /// ([`catalog::BARS_MOTION`]).
+    pub motion: MotionSet,
+    /// ATR(14) of 1h bars after the last closed one: `volatility.atr.1h@1`
+    /// ([`catalog::VOLATILITY_ATR_1H_V1`]).
+    pub atr: FeatureValue<Price>,
+    /// The ATR-percentile regime after the last closed 1h bar:
+    /// `volatility.regime.1h@1` ([`catalog::VOLATILITY_REGIME_1H_V1`]),
+    /// label plus raw percentile. Context, never an entry signal (brief §9,
+    /// ADR-012).
+    pub regime: FeatureValue<Regime>,
     /// Number of trades consumed. A diagnostic counter, not a feature: it
     /// depends on where consumption started, so it is not reproducible
     /// across replay windows.
@@ -64,6 +80,18 @@ pub struct MarketStateEngine {
     /// Scratch buffer for the bars an event closes, swapped with `closed`
     /// once the event is accepted.
     pending: Vec<Bar>,
+    /// The previous close of every motion series.
+    anchors: MotionAnchors,
+    /// ATR and regime of the regime timeframe.
+    volatility: AtrRegimeSeries,
+}
+
+/// Volatility state after the bars an event closed, committed with them.
+struct Stepped {
+    motion: MotionSet,
+    anchors: MotionAnchors,
+    /// `None` when no bar of the regime timeframe closed.
+    volatility: Option<AtrRegimeSeries>,
 }
 
 /// Last accepted exchange ids (ADR-028): the canonical order alone lets the
@@ -146,6 +174,7 @@ impl MarketStateEngine {
     /// feature set ([`catalog::CURRENT`]).
     pub fn new() -> Self {
         let features = catalog::current_set();
+        let volatility = AtrRegimeSeries::new();
         let state = MarketState {
             feature_set: features.version(),
             as_of: None,
@@ -155,6 +184,9 @@ impl MarketStateEngine {
                 required: 1,
             },
             bars: BarSet::new(),
+            motion: MotionSet::new(),
+            atr: volatility.atr(),
+            regime: volatility.regime(),
             trade_count: 0,
         };
         Self {
@@ -164,6 +196,8 @@ impl MarketStateEngine {
             ids: LastIds::default(),
             closed: Vec::new(),
             pending: Vec::new(),
+            anchors: MotionAnchors::default(),
+            volatility,
         }
     }
 
@@ -185,8 +219,8 @@ impl MarketStateEngine {
     ///   repeats the exchange id of the last trade, snapshot or update;
     /// - [`StateError::IdRegression`] if its exchange id falls below the last
     ///   accepted one of its stream;
-    /// - [`StateError::Overflow`] if a bar's time or quantity arithmetic
-    ///   leaves the `i64` range;
+    /// - [`StateError::Overflow`] if a bar's time or quantity arithmetic, or
+    ///   a closed bar's true range, change or range, leaves the `i64` range;
     /// - [`StateError::TimeJump`] if it would close more than
     ///   [`MAX_BARS_PER_EVENT`] bars of one timeframe. Recovery: the replay
     ///   or session stops; restart it from a fresh engine after the jump.
@@ -240,6 +274,15 @@ impl MarketStateEngine {
                 },
             });
         }
+        let stepped = match self.step_volatility() {
+            Ok(stepped) => stepped,
+            Err(VolatilityError::Overflow) => {
+                self.pending.clear();
+                return Err(StateError::Overflow {
+                    event: event.canonical_key(),
+                });
+            }
+        };
 
         match event {
             MarketEvent::Trade(trade) => {
@@ -257,11 +300,47 @@ impl MarketStateEngine {
             | MarketEvent::Kline(_) => {}
         }
         self.state.bars = bars;
+        if let Some(stepped) = stepped {
+            self.state.motion = stepped.motion;
+            self.anchors = stepped.anchors;
+            if let Some(volatility) = stepped.volatility {
+                self.state.atr = volatility.atr();
+                self.state.regime = volatility.regime();
+                self.volatility = volatility;
+            }
+        }
         self.state.as_of = Some(event.time());
         self.last = Some(event.clone());
         self.ids = ids;
         std::mem::swap(&mut self.closed, &mut self.pending);
         Ok(())
+    }
+
+    /// Steps motion, ATR and regime through the bars in `pending`, in close
+    /// order, on copies (ADR-033); `None` when no bar closed. The ATR series
+    /// is copied only when a bar of its timeframe closed.
+    fn step_volatility(&self) -> Result<Option<Stepped>, VolatilityError> {
+        if self.pending.is_empty() {
+            return Ok(None);
+        }
+        let mut motion = self.state.motion;
+        let mut anchors = self.anchors;
+        let mut volatility = self
+            .pending
+            .iter()
+            .any(|bar| bar.timeframe == catalog::REGIME_TIMEFRAME)
+            .then(|| self.volatility.clone());
+        for bar in &self.pending {
+            anchors.apply(bar, &mut motion)?;
+            if let Some(volatility) = &mut volatility {
+                volatility.push(bar)?;
+            }
+        }
+        Ok(Some(Stepped {
+            motion,
+            anchors,
+            volatility,
+        }))
     }
 
     /// The current state.
@@ -311,8 +390,9 @@ pub enum StateError {
         /// End of the rejected gap.
         end: EventTime,
     },
-    /// The event would push a bar's time or quantity arithmetic out of the
-    /// `i64` range (ADR-027, ADR-031).
+    /// The event would push a bar's time or quantity arithmetic, or a
+    /// volatility value, out of the `i64` range (ADR-027, ADR-031,
+    /// ADR-033).
     Overflow {
         /// Key of the rejected event.
         event: CanonicalKey,
@@ -354,7 +434,10 @@ impl fmt::Display for StateError {
                 write!(f, "feed gap starts at {start}, after its end at {end}")
             }
             Self::Overflow { event } => {
-                write!(f, "event ({event}) overflows the bar arithmetic")
+                write!(
+                    f,
+                    "event ({event}) overflows the bar or volatility arithmetic"
+                )
             }
             Self::TimeJump {
                 event,
@@ -421,6 +504,15 @@ mod tests {
                 as_of: Some(t(1_500)),
                 last_trade_price: FeatureValue::Ready(Price::from_units(6_354_210_000_000)),
                 bars,
+                motion: MotionSet::new(),
+                atr: FeatureValue::WarmingUp {
+                    observed: 0,
+                    required: 14,
+                },
+                regime: FeatureValue::WarmingUp {
+                    observed: 0,
+                    required: 214,
+                },
                 trade_count: 3,
             }
         );
@@ -617,8 +709,10 @@ mod tests {
         assert_eq!(engine.feature_set(), &current);
         assert_eq!(
             engine.feature_set().to_string(),
-            "bars.time.15m@1,bars.time.1d@1,bars.time.1h@1,bars.time.1m@1,\
-             bars.time.4h@1,bars.time.5m@1,trade.last_price@1"
+            "bars.motion.15m@1,bars.motion.1d@1,bars.motion.1h@1,bars.motion.1m@1,\
+             bars.motion.4h@1,bars.motion.5m@1,bars.time.15m@1,bars.time.1d@1,\
+             bars.time.1h@1,bars.time.1m@1,bars.time.4h@1,bars.time.5m@1,\
+             trade.last_price@1,volatility.atr.1h@1,volatility.regime.1h@1"
         );
         // Consuming events never changes it.
         let engine = engine_after(&one_of_each(1_000));
@@ -665,6 +759,90 @@ mod tests {
             engine.state().last_trade_price.ready(),
             Some(&Price::from_units(43))
         );
+    }
+
+    #[test]
+    fn exposes_motion_atr_and_regime_of_the_last_closed_bars() {
+        const HOUR: i64 = 3_600_000;
+        let mut engine = MarketStateEngine::new();
+        fn warming<T>(required: u64) -> FeatureValue<T> {
+            FeatureValue::WarmingUp {
+                observed: 0,
+                required,
+            }
+        }
+        assert_eq!(engine.state().motion, MotionSet::new());
+        assert_eq!(engine.state().atr, warming(14));
+        assert_eq!(engine.state().regime, warming(214));
+        // Hour 0 is the partial start: it only anchors (ADR-033, decision 6).
+        engine.apply(&priced_trade(1_800_000, 1, 100)).unwrap();
+        engine.apply(&priced_trade(HOUR + 600_000, 2, 130)).unwrap();
+        let motion = engine.state().motion;
+        assert_eq!(motion.get(Timeframe::H1), Some(&warming(1)));
+        assert_eq!(engine.state().atr, warming(14));
+        // Hour 1 is a sample against hour 0's close.
+        engine
+            .apply(&priced_trade(2 * HOUR + 600_000, 3, 120))
+            .unwrap();
+        let state = engine.state();
+        let hour = *state.motion.get(Timeframe::H1).unwrap().ready().unwrap();
+        assert_eq!(
+            (hour.previous_close, hour.close, hour.change),
+            (
+                Price::from_units(100),
+                Price::from_units(130),
+                Price::from_units(30)
+            )
+        );
+        assert_eq!(
+            state.atr,
+            FeatureValue::WarmingUp {
+                observed: 1,
+                required: 14
+            }
+        );
+        assert_eq!(
+            state.regime,
+            FeatureValue::WarmingUp {
+                observed: 1,
+                required: 214
+            }
+        );
+        // The 1m motion is that of the last closed minute, an empty one.
+        let minute = *state.motion.get(Timeframe::M1).unwrap().ready().unwrap();
+        assert_eq!(minute.open_time, t(2 * HOUR + 540_000));
+        assert_eq!(minute.change, Price::from_units(0));
+        // Other streams change none of them.
+        let before = engine.state().clone();
+        engine.apply(&mark(2 * HOUR + 700_000, 1)).unwrap();
+        assert_eq!(engine.state().motion, before.motion);
+        assert_eq!(engine.state().atr, before.atr);
+    }
+
+    #[test]
+    fn rejects_an_event_that_overflows_a_volatility_value() {
+        // Minute 0 anchors at -10 units; minute 1 closes at `i64::MAX`, so
+        // its change leaves the price range when minute 2 closes it.
+        let mut engine =
+            engine_after(&[priced_trade(0, 1, -10), priced_trade(60_000, 2, i64::MAX)]);
+        let before = engine.state().clone();
+        let closed_before = engine.closed_bars().to_vec();
+        let overflow = priced_trade(120_000, 3, 1);
+        assert_eq!(
+            engine.apply(&overflow),
+            Err(StateError::Overflow {
+                event: overflow.canonical_key()
+            })
+        );
+        assert_eq!(engine.state(), &before);
+        assert_eq!(engine.closed_bars(), closed_before);
+        // Bars, motion, ATR and regime all stayed where they were.
+        assert_eq!(engine.state().bars, before.bars);
+        assert_eq!(engine.state().motion, before.motion);
+        assert_eq!(engine.state().atr, before.atr);
+        assert_eq!(engine.state().regime, before.regime);
+        // Events that close no bar still pass.
+        engine.apply(&mark(120_000, 1)).unwrap();
     }
 
     #[test]
@@ -1012,7 +1190,7 @@ mod tests {
         );
         assert_eq!(
             StateError::Overflow { event }.to_string(),
-            "event (1999ms Trade seq 2) overflows the bar arithmetic"
+            "event (1999ms Trade seq 2) overflows the bar or volatility arithmetic"
         );
         assert_eq!(
             StateError::TimeJump {

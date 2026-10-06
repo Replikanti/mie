@@ -1,0 +1,17 @@
+//@version=5
+// Manual spot check for volatility.atr.1h@1 and volatility.regime.1h@1
+// (ADR-033, "Accept when"). Apply to the BINANCE:BTCUSDT.P chart on the 1h
+// timeframe and compare the data-window values with
+// crates/mie-domain/tests/fixtures/atr-regime-reference.tsv at rows past 400
+// of the fixture: ATR within 1e-6 relative, percentile exactly.
+indicator("MIE ATR(14) percentile(200) regime", overlay = false, precision = 8)
+
+atr = ta.atr(14)
+percentile = ta.percentrank(atr, 200)
+// ADR-017 bands, upper-closed for fractional percentiles: 0 LOW, 1 MEDIUM,
+// 2 HIGH, 3 EXTREME.
+band = na(percentile) ? na : percentile <= 25 ? 0 : percentile <= 50 ? 1 : percentile <= 75 ? 2 : 3
+
+plot(atr, "ATR(14)")
+plot(percentile, "ATR percentile(200)")
+plot(band, "Regime band (0 LOW .. 3 EXTREME)", display = display.data_window)

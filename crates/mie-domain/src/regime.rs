@@ -1,9 +1,12 @@
-//! Volatility regime (brief §9, ADR-017).
+//! Volatility regime (brief §9, ADR-017, ADR-033).
 //!
 //! The canonical initial regime maps the ATR percentile onto four labels. The
 //! raw percentile is always retained next to its label, and the regime is
-//! context — never an entry signal on its own.
+//! context — never an entry signal on its own. How the percentile is
+//! computed — ATR(14) on 1h bars, previous-200 at-or-below rank — is the
+//! `volatility.regime.1h@1` feature in [`volatility`](crate::volatility).
 
+use crate::feature::FeatureKey;
 use std::fmt;
 
 /// ATR percentile on the canonical 0–100 scale (ADR-017).
@@ -13,6 +16,9 @@ use std::fmt;
 /// the result and maps it to its canonical label.
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
 pub struct AtrPercentile(f64);
+
+/// Sound because every constructor rejects NaN, so `==` is reflexive.
+impl Eq for AtrPercentile {}
 
 impl AtrPercentile {
     /// Validates a percentile.
@@ -26,6 +32,18 @@ impl AtrPercentile {
         } else {
             Err(PercentileOutOfRange(value))
         }
+    }
+
+    /// The percentile of a rank: `100 * at_or_below / lookback` (ADR-033,
+    /// decision 3). Exact for a lookback of 200, whose values are the
+    /// half-steps `k / 2`.
+    ///
+    /// # Errors
+    ///
+    /// [`PercentileOutOfRange`] if `at_or_below > lookback` or `lookback`
+    /// is 0.
+    pub fn from_rank(at_or_below: u16, lookback: u16) -> Result<Self, PercentileOutOfRange> {
+        Self::new(f64::from(at_or_below) * 100.0 / f64::from(lookback))
     }
 
     /// The raw percentile.
@@ -68,24 +86,60 @@ impl RegimeLabel {
             _ => Self::Extreme,
         }
     }
+
+    /// The canonical name: `LOW`, `MEDIUM`, `HIGH` or `EXTREME`.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "LOW",
+            Self::Medium => "MEDIUM",
+            Self::High => "HIGH",
+            Self::Extreme => "EXTREME",
+        }
+    }
+}
+
+impl fmt::Display for RegimeLabel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// A regime classification: the canonical label plus the raw percentile it
-/// came from (ADR-017 requires retaining both).
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// came from (ADR-017 requires retaining both), and the feature version that
+/// produced it (ADR-029).
+///
+/// `Display` prints the canonical line the golden tests pin, such as
+/// `HIGH 57.5 volatility.regime.1h@1`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Regime {
     /// The raw ATR percentile.
     pub atr_percentile: AtrPercentile,
     /// Its canonical label.
     pub label: RegimeLabel,
+    /// The feature that computed it, such as `volatility.regime.1h@1`.
+    pub feature: FeatureKey,
 }
 
-impl From<AtrPercentile> for Regime {
-    fn from(atr_percentile: AtrPercentile) -> Self {
+impl Regime {
+    /// The regime of `atr_percentile`, as computed by `feature`.
+    pub fn new(atr_percentile: AtrPercentile, feature: FeatureKey) -> Self {
         Self {
             atr_percentile,
             label: atr_percentile.label(),
+            feature,
         }
+    }
+}
+
+impl fmt::Display for Regime {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} {} {}",
+            self.label,
+            self.atr_percentile.value(),
+            self.feature
+        )
     }
 }
 
@@ -147,9 +201,56 @@ mod tests {
     }
 
     #[test]
-    fn regime_retains_the_raw_percentile() {
-        let regime = Regime::from(AtrPercentile::new(57.0).unwrap());
+    fn regime_retains_the_raw_percentile_and_its_feature() {
+        let feature = FeatureKey::new("volatility.regime.1h", 1);
+        let regime = Regime::new(AtrPercentile::new(57.0).unwrap(), feature);
         assert_eq!(regime.atr_percentile.value(), 57.0);
         assert_eq!(regime.label, RegimeLabel::High);
+        assert_eq!(regime.feature, feature);
+        assert_eq!(regime.to_string(), "HIGH 57 volatility.regime.1h@1");
+        let half = Regime::new(AtrPercentile::from_rank(115, 200).unwrap(), feature);
+        assert_eq!(half.to_string(), "HIGH 57.5 volatility.regime.1h@1");
+    }
+
+    #[test]
+    fn ranks_on_a_200_bar_lookback_are_half_steps_in_adr_017_bands() {
+        // ADR-033 decision 4: upper-closed bands on k / 2 equal round-half-up
+        // followed by the ADR-017 whole-number bands.
+        for k in 0..=200_u16 {
+            let percentile = AtrPercentile::from_rank(k, 200).unwrap();
+            assert_eq!(percentile.value() * 2.0, f64::from(k), "k = {k}");
+            // Round half up of k / 2.
+            let rounded = k.div_ceil(2);
+            let expected = match rounded {
+                0..=25 => RegimeLabel::Low,
+                26..=50 => RegimeLabel::Medium,
+                51..=75 => RegimeLabel::High,
+                _ => RegimeLabel::Extreme,
+            };
+            assert_eq!(percentile.label(), expected, "k = {k}");
+        }
+        assert_eq!(AtrPercentile::from_rank(0, 200).unwrap().value(), 0.0);
+        assert_eq!(AtrPercentile::from_rank(200, 200).unwrap().value(), 100.0);
+    }
+
+    #[test]
+    fn from_rank_rejects_impossible_ranks() {
+        assert!(AtrPercentile::from_rank(201, 200).is_err());
+        assert!(AtrPercentile::from_rank(0, 0).is_err());
+        assert!(AtrPercentile::from_rank(1, 0).is_err());
+    }
+
+    #[test]
+    fn labels_have_canonical_names() {
+        let names: Vec<_> = [
+            RegimeLabel::Low,
+            RegimeLabel::Medium,
+            RegimeLabel::High,
+            RegimeLabel::Extreme,
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        assert_eq!(names, ["LOW", "MEDIUM", "HIGH", "EXTREME"]);
     }
 }

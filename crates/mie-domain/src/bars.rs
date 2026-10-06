@@ -564,7 +564,7 @@ pub fn kline_mismatches(bar: &Bar, kline: &Kline) -> Vec<KlineField> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::event::GapReason;
     use crate::event::samples::{gap, kline, mark, t};
@@ -1313,7 +1313,7 @@ mod tests {
     /// The golden tape, scaled to `timeframe`: in quarters `u` of a bar, a
     /// partial first bar, a trade exactly on a boundary, an empty bar, a
     /// trades gap across two bars, and a clean bar to finish.
-    fn golden_tape(timeframe: Timeframe) -> Vec<MarketEvent> {
+    pub(crate) fn golden_tape(timeframe: Timeframe) -> Vec<MarketEvent> {
         let u = timeframe.millis() / 4;
         let price = |text: &str| text.parse::<Price>().unwrap().units();
         let qty = |text: &str| text.parse::<Qty>().unwrap().units();

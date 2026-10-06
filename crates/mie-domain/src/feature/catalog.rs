@@ -124,6 +124,202 @@ pub const BARS_TIME: [(Timeframe, &FeatureDefinition); 6] = [
     (Timeframe::D1, &BARS_TIME_1D_V1),
 ];
 
+/// A `bars.motion.<label>@1` definition (ADR-033): change, range, return
+/// and velocity of each closed bar of one timeframe.
+const fn bars_motion_v1(
+    id: &'static str,
+    params: &'static [Param],
+    inputs: &'static [Input],
+) -> FeatureDefinition {
+    FeatureDefinition {
+        key: FeatureKey::new(id, 1),
+        params,
+        inputs,
+        warm_up: WarmUp::Samples(1),
+    }
+}
+
+/// `bars.motion.1m@1`: the motion of each closed 1m bar against the previous
+/// close (ADR-033, decision 7): `change = close − previous close` and
+/// `range = high − low`, exact; the simple return and the velocity (return
+/// per minute) are derived from them.
+///
+/// - Parameters: `timeframe_ms` = 60 000.
+/// - Inputs: `bars.time.1m@1`.
+/// - Warm-up: one sample, where a sample is a closed bar with a previous
+///   close (the anchor).
+/// - Gap policy (ADR-033, decision 6): a bar with trades sets the anchor;
+///   one without an anchor only anchors. An empty complete bar is a sample
+///   with change and range 0. An empty incomplete bar (`partial_start` or
+///   `feed_gap`) breaks the series: back to warming up, anchor cleared. A
+///   `feed_gap` bar with trades is a sample and carries its coverage.
+pub const BARS_MOTION_1M_V1: FeatureDefinition = bars_motion_v1(
+    "bars.motion.1m",
+    &[Param {
+        name: "timeframe_ms",
+        value: ParamValue::Int(60_000),
+    }],
+    &[Input::Feature(BARS_TIME_1M_V1.key)],
+);
+
+/// `bars.motion.5m@1`: the motion of each closed 5m bar (ADR-033).
+///
+/// Parameters: `timeframe_ms` = 300 000. Inputs: `bars.time.5m@1`. Warm-up
+/// and gap policy as [`BARS_MOTION_1M_V1`].
+pub const BARS_MOTION_5M_V1: FeatureDefinition = bars_motion_v1(
+    "bars.motion.5m",
+    &[Param {
+        name: "timeframe_ms",
+        value: ParamValue::Int(300_000),
+    }],
+    &[Input::Feature(BARS_TIME_5M_V1.key)],
+);
+
+/// `bars.motion.15m@1`: the motion of each closed 15m bar (ADR-033).
+///
+/// Parameters: `timeframe_ms` = 900 000. Inputs: `bars.time.15m@1`. Warm-up
+/// and gap policy as [`BARS_MOTION_1M_V1`].
+pub const BARS_MOTION_15M_V1: FeatureDefinition = bars_motion_v1(
+    "bars.motion.15m",
+    &[Param {
+        name: "timeframe_ms",
+        value: ParamValue::Int(900_000),
+    }],
+    &[Input::Feature(BARS_TIME_15M_V1.key)],
+);
+
+/// `bars.motion.1h@1`: the motion of each closed 1h bar (ADR-033).
+///
+/// Parameters: `timeframe_ms` = 3 600 000. Inputs: `bars.time.1h@1`.
+/// Warm-up and gap policy as [`BARS_MOTION_1M_V1`].
+pub const BARS_MOTION_1H_V1: FeatureDefinition = bars_motion_v1(
+    "bars.motion.1h",
+    &[Param {
+        name: "timeframe_ms",
+        value: ParamValue::Int(3_600_000),
+    }],
+    &[Input::Feature(BARS_TIME_1H_V1.key)],
+);
+
+/// `bars.motion.4h@1`: the motion of each closed 4h bar (ADR-033).
+///
+/// Parameters: `timeframe_ms` = 14 400 000. Inputs: `bars.time.4h@1`.
+/// Warm-up and gap policy as [`BARS_MOTION_1M_V1`].
+pub const BARS_MOTION_4H_V1: FeatureDefinition = bars_motion_v1(
+    "bars.motion.4h",
+    &[Param {
+        name: "timeframe_ms",
+        value: ParamValue::Int(14_400_000),
+    }],
+    &[Input::Feature(BARS_TIME_4H_V1.key)],
+);
+
+/// `bars.motion.1d@1`: the motion of each closed daily bar (ADR-033).
+///
+/// Parameters: `timeframe_ms` = 86 400 000. Inputs: `bars.time.1d@1`.
+/// Warm-up and gap policy as [`BARS_MOTION_1M_V1`].
+pub const BARS_MOTION_1D_V1: FeatureDefinition = bars_motion_v1(
+    "bars.motion.1d",
+    &[Param {
+        name: "timeframe_ms",
+        value: ParamValue::Int(86_400_000),
+    }],
+    &[Input::Feature(BARS_TIME_1D_V1.key)],
+);
+
+/// The motion feature of each timeframe, in [`Timeframe::ALL`] order; the
+/// Market State builds its [`MotionSet`](crate::volatility::MotionSet) from
+/// it.
+pub const BARS_MOTION: [(Timeframe, &FeatureDefinition); 6] = [
+    (Timeframe::M1, &BARS_MOTION_1M_V1),
+    (Timeframe::M5, &BARS_MOTION_5M_V1),
+    (Timeframe::M15, &BARS_MOTION_15M_V1),
+    (Timeframe::H1, &BARS_MOTION_1H_V1),
+    (Timeframe::H4, &BARS_MOTION_4H_V1),
+    (Timeframe::D1, &BARS_MOTION_1D_V1),
+];
+
+/// The timeframe whose bars feed ATR(14) and the regime (ADR-033,
+/// decision 1).
+pub const REGIME_TIMEFRAME: Timeframe = Timeframe::H1;
+
+/// `volatility.atr.1h@1`: ATR(14) of closed 1h bars, as Pine Script v5
+/// `ta.atr(14)` (ADR-033, decision 2).
+///
+/// True range is `high − low` without a previous close, else
+/// `max(high − low, |high − previous close|, |low − previous close|)`. The
+/// first ATR is the mean of the first 14 true ranges, then
+/// `ATR = (13 · ATR[1] + TR) / 14`, each rounded half to even to 1e-8.
+///
+/// - Parameters: `length` = 14, `smoothing` = `wilder_sma_seed`,
+///   `timeframe_ms` = 3 600 000.
+/// - Inputs: `bars.time.1h@1`.
+/// - Warm-up: 14 samples, where a sample is a closed 1h bar that the gap
+///   policy admits.
+/// - Gap policy (ADR-033, decision 6): a bar with trades sets the anchor
+///   (the previous close). A complete bar with trades is a sample, against
+///   the anchor if there is one. An incomplete bar with trades is a sample
+///   on its observed prices if there is an anchor, else it only anchors. An
+///   empty complete bar is a sample with true range 0 if there is an
+///   anchor, else skipped. An empty incomplete bar breaks the series: back
+///   to warming up from 0, anchor and window cleared.
+pub const VOLATILITY_ATR_1H_V1: FeatureDefinition = FeatureDefinition {
+    key: FeatureKey::new("volatility.atr.1h", 1),
+    params: &[
+        Param {
+            name: "length",
+            value: ParamValue::Int(14),
+        },
+        Param {
+            name: "smoothing",
+            value: ParamValue::Text("wilder_sma_seed"),
+        },
+        Param {
+            name: "timeframe_ms",
+            value: ParamValue::Int(3_600_000),
+        },
+    ],
+    inputs: &[Input::Feature(BARS_TIME_1H_V1.key)],
+    warm_up: WarmUp::Samples(14),
+};
+
+/// `volatility.regime.1h@1`: the ATR-percentile regime (ADR-017, ADR-033,
+/// decisions 3 and 4). The percentile is Pine Script v5
+/// `ta.percentrank(atr, 200)`: the share of the previous 200 ATR values at
+/// or below the current one, in half-steps from 0 to 100; the label uses
+/// the upper-closed ADR-017 bands. Context, never an entry signal.
+///
+/// - Parameters: `bands` = `adr017_upper_closed`, `lookback` = 200,
+///   `rank` = `previous_at_or_below`, `timeframe_ms` = 3 600 000.
+/// - Inputs: `volatility.atr.1h@1`.
+/// - Warm-up: 214 samples (14 for the ATR, then 200 previous ATR values),
+///   with samples as in [`VOLATILITY_ATR_1H_V1`].
+/// - Gap policy: that of [`VOLATILITY_ATR_1H_V1`]; a break clears the
+///   window.
+pub const VOLATILITY_REGIME_1H_V1: FeatureDefinition = FeatureDefinition {
+    key: FeatureKey::new("volatility.regime.1h", 1),
+    params: &[
+        Param {
+            name: "bands",
+            value: ParamValue::Text("adr017_upper_closed"),
+        },
+        Param {
+            name: "lookback",
+            value: ParamValue::Int(200),
+        },
+        Param {
+            name: "rank",
+            value: ParamValue::Text("previous_at_or_below"),
+        },
+        Param {
+            name: "timeframe_ms",
+            value: ParamValue::Int(3_600_000),
+        },
+    ],
+    inputs: &[Input::Feature(VOLATILITY_ATR_1H_V1.key)],
+    warm_up: WarmUp::Samples(214),
+};
+
 /// Every version of every feature. Never shrinks.
 pub const DEFINITIONS: &[&FeatureDefinition] = &[
     &TRADE_LAST_PRICE_V1,
@@ -133,6 +329,14 @@ pub const DEFINITIONS: &[&FeatureDefinition] = &[
     &BARS_TIME_1H_V1,
     &BARS_TIME_4H_V1,
     &BARS_TIME_1D_V1,
+    &BARS_MOTION_1M_V1,
+    &BARS_MOTION_5M_V1,
+    &BARS_MOTION_15M_V1,
+    &BARS_MOTION_1H_V1,
+    &BARS_MOTION_4H_V1,
+    &BARS_MOTION_1D_V1,
+    &VOLATILITY_ATR_1H_V1,
+    &VOLATILITY_REGIME_1H_V1,
 ];
 
 /// The fingerprint each published `id@version` must keep. Append-only: one
@@ -145,6 +349,14 @@ pub const LOCK: &[LockEntry] = &[
     LockEntry::new("bars.time.1h", 1, 0xefab_77d5_2069_7498),
     LockEntry::new("bars.time.4h", 1, 0x9af3_15e8_7a1e_781e),
     LockEntry::new("bars.time.1d", 1, 0x0ec3_e6ec_029e_9943),
+    LockEntry::new("bars.motion.1m", 1, 0x9573_ef81_3cc8_82db),
+    LockEntry::new("bars.motion.5m", 1, 0x36ef_9df0_dd4e_5b88),
+    LockEntry::new("bars.motion.15m", 1, 0x5c6e_04d5_9e34_0441),
+    LockEntry::new("bars.motion.1h", 1, 0x688c_da22_4281_8ae9),
+    LockEntry::new("bars.motion.4h", 1, 0x6976_2fda_d9bf_46e4),
+    LockEntry::new("bars.motion.1d", 1, 0x4629_af65_63d4_ab38),
+    LockEntry::new("volatility.atr.1h", 1, 0xc6cd_151d_59ca_3a88),
+    LockEntry::new("volatility.regime.1h", 1, 0x33ef_daf4_43c8_143a),
 ];
 
 /// The default feature set: the latest version of each computed feature.
@@ -156,6 +368,14 @@ pub const CURRENT: &[FeatureKey] = &[
     BARS_TIME_1H_V1.key,
     BARS_TIME_4H_V1.key,
     BARS_TIME_1D_V1.key,
+    BARS_MOTION_1M_V1.key,
+    BARS_MOTION_5M_V1.key,
+    BARS_MOTION_15M_V1.key,
+    BARS_MOTION_1H_V1.key,
+    BARS_MOTION_4H_V1.key,
+    BARS_MOTION_1D_V1.key,
+    VOLATILITY_ATR_1H_V1.key,
+    VOLATILITY_REGIME_1H_V1.key,
 ];
 
 /// The registry of [`DEFINITIONS`].
@@ -229,10 +449,10 @@ mod tests {
             hasher.write_u32(entry.key.version.get());
             hasher.write_u64(entry.fingerprint.value());
         }
-        assert_eq!(LOCK.len(), 7, "lock lines");
+        assert_eq!(LOCK.len(), 15, "lock lines");
         assert_eq!(
             hasher.finish().to_string(),
-            "e402c98d7d8a932c",
+            "efcd01a5831db19e",
             "lock digest"
         );
     }
@@ -272,6 +492,51 @@ mod tests {
     }
 
     #[test]
+    fn motion_features_match_their_timeframes() {
+        assert_eq!(BARS_MOTION.map(|(timeframe, _)| timeframe), Timeframe::ALL);
+        for ((timeframe, definition), (_, bars)) in BARS_MOTION.into_iter().zip(BARS_TIME) {
+            assert_eq!(
+                definition.key.id.as_str(),
+                format!("bars.motion.{}", timeframe.label()),
+                "{timeframe:?}"
+            );
+            assert_eq!(
+                definition.params,
+                &[Param {
+                    name: "timeframe_ms",
+                    value: ParamValue::Int(timeframe.millis()),
+                }],
+                "{timeframe:?}"
+            );
+            assert_eq!(definition.inputs, &[Input::Feature(bars.key)]);
+            assert!(CURRENT.contains(&definition.key), "{}", definition.key);
+        }
+    }
+
+    #[test]
+    fn volatility_features_use_the_regime_timeframe() {
+        for definition in [&VOLATILITY_ATR_1H_V1, &VOLATILITY_REGIME_1H_V1] {
+            assert!(
+                definition.params.contains(&Param {
+                    name: "timeframe_ms",
+                    value: ParamValue::Int(REGIME_TIMEFRAME.millis()),
+                }),
+                "{}",
+                definition.key
+            );
+            assert!(CURRENT.contains(&definition.key), "{}", definition.key);
+        }
+        assert_eq!(
+            VOLATILITY_ATR_1H_V1.inputs,
+            &[Input::Feature(BARS_TIME_1H_V1.key)]
+        );
+        assert_eq!(
+            VOLATILITY_REGIME_1H_V1.inputs,
+            &[Input::Feature(VOLATILITY_ATR_1H_V1.key)]
+        );
+    }
+
+    #[test]
     fn current_set_version_is_pinned() {
         // The feature-set version every experiment records (ADR-029). It may
         // change only when CURRENT does — any other change here means a
@@ -279,9 +544,11 @@ mod tests {
         let set = current_set();
         assert_eq!(
             set.to_string(),
-            "bars.time.15m@1,bars.time.1d@1,bars.time.1h@1,bars.time.1m@1,\
-             bars.time.4h@1,bars.time.5m@1,trade.last_price@1"
+            "bars.motion.15m@1,bars.motion.1d@1,bars.motion.1h@1,bars.motion.1m@1,\
+             bars.motion.4h@1,bars.motion.5m@1,bars.time.15m@1,bars.time.1d@1,\
+             bars.time.1h@1,bars.time.1m@1,bars.time.4h@1,bars.time.5m@1,\
+             trade.last_price@1,volatility.atr.1h@1,volatility.regime.1h@1"
         );
-        assert_eq!(set.version().to_string(), "828e8bb02f5d6813");
+        assert_eq!(set.version().to_string(), "14d6069e5552fd17");
     }
 }
