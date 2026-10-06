@@ -1,0 +1,34 @@
+[package]
+name = "mie-cli"
+description = "MIE composition root: wires adapters to ports (`mie ingest`, `mie capture-report`)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "mie"
+path = "src/main.rs"
+
+# The composition root may depend on every internal crate and is the only
+# crate that wires adapters (ADR-025). Every external crate is justified
+# below.
+[dependencies]
+mie-domain.workspace = true
+mie-ports.workspace = true
+mie-app.workspace = true
+mie-adapter-binance.workspace = true
+mie-adapter-parquet.workspace = true
+# Typed ingest configuration with `deny_unknown_fields`.
+serde = { version = "1", features = ["derive"] }
+# The JSON Lines capture journal (writing, and reading it back in
+# `capture-report`).
+serde_json = "1"
+# The ingest configuration file format.
+toml = "1"
+# SIGINT/SIGTERM set the shutdown flag, so a stopped capture seals cleanly.
+signal-hook = "0.4"
+
+[lints]
+workspace = true

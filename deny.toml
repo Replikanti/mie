@@ -25,6 +25,19 @@ exceptions = [
     # Unicode-3.0 (permissive data license): proc-macro2 -> unicode-ident,
     # a build-time dependency of the proc macros in the Arrow tree.
     { allow = ["Unicode-3.0"], crate = "unicode-ident" },
+    # The rustls TLS stack under mie-adapter-binance (#9), with the ring
+    # crypto provider and the operating system's root store (no
+    # webpki-roots bundle, no aws-lc-rs C build).
+    # ISC (permissive, MIT-equivalent): ring is "Apache-2.0 AND ISC", its
+    # BoringSSL-derived code carries ISC.
+    { allow = ["ISC"], crate = "ring" },
+    # ISC: ring -> untrusted, safe parsing of untrusted DER input.
+    { allow = ["ISC"], crate = "untrusted" },
+    # ISC: rustls -> rustls-webpki, certificate path validation.
+    { allow = ["ISC"], crate = "rustls-webpki" },
+    # BSD-3-Clause (permissive): rustls -> subtle, constant-time comparisons.
+    # Every rustls build depends on it, whatever the crypto provider.
+    { allow = ["BSD-3-Clause"], crate = "subtle" },
 ]
 
 [bans]
