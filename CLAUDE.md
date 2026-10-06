@@ -49,6 +49,9 @@ cargo deny check
   never push to main. The PR body carries `Closes #N` or a
   `No-Issue: <reason>` line (CI-enforced).
 - Domain items cite the design section or ADR they implement.
+- Derived features follow "Adding a feature" in
+  `crates/mie-domain/src/feature.rs` (ADR-029): `id@version`, an append-only
+  lock, validity via `FeatureValue`.
 - Every new dependency is justified in a `Cargo.toml` comment; licenses per
   `deny.toml`. Core crates take none (ADR-025).
 - Public repository: no local paths, credentials, API keys or private data.
