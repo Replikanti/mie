@@ -60,3 +60,6 @@ All three types parse from decimal strings with one grammar,
 The verbatim decimal strings in the raw store (ADR-030) normalize to the
 same `Price`/`Qty` in live processing and in replay, and the first
 order-flow features (delta, CVD) are computed on them.
+
+Progress 2026-10-07: delta and CVD are computed on fixed point by ADR-035
+(#17). The live/replay half waits for #11 and #13.

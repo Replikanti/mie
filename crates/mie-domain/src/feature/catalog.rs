@@ -320,6 +320,147 @@ pub const VOLATILITY_REGIME_1H_V1: FeatureDefinition = FeatureDefinition {
     warm_up: WarmUp::Samples(214),
 };
 
+/// `flow.cvd.continuous@1`: cumulative volume delta — the sum of signed
+/// aggressor quantity (buy `+qty`, sell `−qty`) since the first consumed
+/// trade, the run anchor (ADR-035, decision 2). Aggression, not direction
+/// (ADR-023).
+///
+/// - Parameters: `gap_policy` = `continue_counted`.
+/// - Inputs: trades (trades and trades-stream feed gaps).
+/// - Warm-up: one sample, where a sample is a consumed trade.
+/// - Gap policy: a trades gap never resets the sum; once the anchor is set,
+///   each trades gap increments the value's `gaps` count. The level is
+///   relative to the run: two values differ by the exact market delta only
+///   when they carry the same `anchor` and `gaps`.
+pub const FLOW_CVD_CONTINUOUS_V1: FeatureDefinition = FeatureDefinition {
+    key: FeatureKey::new("flow.cvd.continuous", 1),
+    params: &[Param {
+        name: "gap_policy",
+        value: ParamValue::Text("continue_counted"),
+    }],
+    inputs: &[Input::Stream(Stream::Trades)],
+    warm_up: WarmUp::Samples(1),
+};
+
+/// `flow.cvd.utc_day@1`: cumulative volume delta since 00:00 UTC — the delta
+/// of the developing `bars.time.1d@1` bar (ADR-035, decision 2).
+///
+/// - Parameters: `session_ms` = 86 400 000.
+/// - Inputs: `bars.time.1d@1`.
+/// - Warm-up: one sample, where a sample is a trades-stream event (the
+///   developing daily bar exists from the first one).
+/// - Gap policy: that of `bars.time.1d@1` — the value carries the daily
+///   bar's coverage (`partial_start`, `feed_gap`) and never goes back to
+///   warming up.
+pub const FLOW_CVD_UTC_DAY_V1: FeatureDefinition = FeatureDefinition {
+    key: FeatureKey::new("flow.cvd.utc_day", 1),
+    params: &[Param {
+        name: "session_ms",
+        value: ParamValue::Int(86_400_000),
+    }],
+    inputs: &[Input::Feature(BARS_TIME_1D_V1.key)],
+    warm_up: WarmUp::Samples(1),
+};
+
+/// A `flow.window.<label>@1` definition (ADR-035): rolling aggression over
+/// the last `minutes` closed 1m bars, with the large-print stats from
+/// trades.
+const fn flow_window_v1(
+    id: &'static str,
+    params: &'static [Param],
+    minutes: u32,
+) -> FeatureDefinition {
+    FeatureDefinition {
+        key: FeatureKey::new(id, 1),
+        params,
+        inputs: &[
+            Input::Stream(Stream::Trades),
+            Input::Feature(BARS_TIME_1M_V1.key),
+        ],
+        warm_up: WarmUp::Samples(minutes),
+    }
+}
+
+/// `flow.window.5m@1`: aggression over the last 5 closed 1m bars (ADR-035,
+/// decisions 1 and 3–6): buy and sell volume, delta, volume and trade count;
+/// large-print count and volumes; trade intensity; and the price response to
+/// the net aggression. Aggression, not direction (ADR-023).
+///
+/// - Parameters: `large_notional_usdt` = 100 000 (a print is large when
+///   `|price × qty|` is at or above it), `window_ms` = 300 000.
+/// - Inputs: trades (for the large-print classification) and
+///   `bars.time.1m@1` (for everything else).
+/// - Warm-up: 5 samples, where a sample is a closed 1m bar. The value steps
+///   once per closed 1m bar; the developing minute is never included.
+/// - Gap policy: the window never goes back to warming up. It carries the
+///   OR of its minutes' coverage; an empty incomplete minute adds zeros and
+///   its `feed_gap` flag.
+pub const FLOW_WINDOW_5M_V1: FeatureDefinition = flow_window_v1(
+    "flow.window.5m",
+    &[
+        Param {
+            name: "large_notional_usdt",
+            value: ParamValue::Int(100_000),
+        },
+        Param {
+            name: "window_ms",
+            value: ParamValue::Int(300_000),
+        },
+    ],
+    5,
+);
+
+/// `flow.window.15m@1`: aggression over the last 15 closed 1m bars
+/// (ADR-035).
+///
+/// Parameters: `large_notional_usdt` = 100 000, `window_ms` = 900 000.
+/// Warm-up: 15 samples (closed 1m bars). Inputs and gap policy as
+/// [`FLOW_WINDOW_5M_V1`].
+pub const FLOW_WINDOW_15M_V1: FeatureDefinition = flow_window_v1(
+    "flow.window.15m",
+    &[
+        Param {
+            name: "large_notional_usdt",
+            value: ParamValue::Int(100_000),
+        },
+        Param {
+            name: "window_ms",
+            value: ParamValue::Int(900_000),
+        },
+    ],
+    15,
+);
+
+/// `flow.window.1h@1`: aggression over the last 60 closed 1m bars
+/// (ADR-035).
+///
+/// Parameters: `large_notional_usdt` = 100 000, `window_ms` = 3 600 000.
+/// Warm-up: 60 samples (closed 1m bars). Inputs and gap policy as
+/// [`FLOW_WINDOW_5M_V1`].
+pub const FLOW_WINDOW_1H_V1: FeatureDefinition = flow_window_v1(
+    "flow.window.1h",
+    &[
+        Param {
+            name: "large_notional_usdt",
+            value: ParamValue::Int(100_000),
+        },
+        Param {
+            name: "window_ms",
+            value: ParamValue::Int(3_600_000),
+        },
+    ],
+    60,
+);
+
+/// The aggression window of each length, shortest first; the Market State
+/// builds its [`AggressionWindows`](crate::flow::AggressionWindows) from it.
+/// The timeframe is the window length, not a bar series.
+pub const FLOW_WINDOWS: [(Timeframe, &FeatureDefinition); 3] = [
+    (Timeframe::M5, &FLOW_WINDOW_5M_V1),
+    (Timeframe::M15, &FLOW_WINDOW_15M_V1),
+    (Timeframe::H1, &FLOW_WINDOW_1H_V1),
+];
+
 /// Every version of every feature. Never shrinks.
 pub const DEFINITIONS: &[&FeatureDefinition] = &[
     &TRADE_LAST_PRICE_V1,
@@ -337,6 +478,11 @@ pub const DEFINITIONS: &[&FeatureDefinition] = &[
     &BARS_MOTION_1D_V1,
     &VOLATILITY_ATR_1H_V1,
     &VOLATILITY_REGIME_1H_V1,
+    &FLOW_CVD_CONTINUOUS_V1,
+    &FLOW_CVD_UTC_DAY_V1,
+    &FLOW_WINDOW_5M_V1,
+    &FLOW_WINDOW_15M_V1,
+    &FLOW_WINDOW_1H_V1,
 ];
 
 /// The fingerprint each published `id@version` must keep. Append-only: one
@@ -357,6 +503,11 @@ pub const LOCK: &[LockEntry] = &[
     LockEntry::new("bars.motion.1d", 1, 0x4629_af65_63d4_ab38),
     LockEntry::new("volatility.atr.1h", 1, 0xc6cd_151d_59ca_3a88),
     LockEntry::new("volatility.regime.1h", 1, 0x33ef_daf4_43c8_143a),
+    LockEntry::new("flow.cvd.continuous", 1, 0x64b2_96cc_a73a_3c27),
+    LockEntry::new("flow.cvd.utc_day", 1, 0xdafb_4466_3bdf_c2e9),
+    LockEntry::new("flow.window.5m", 1, 0xd5b8_a750_f763_4076),
+    LockEntry::new("flow.window.15m", 1, 0xd57b_f62e_9582_61a1),
+    LockEntry::new("flow.window.1h", 1, 0xdd02_bda3_c32f_83b9),
 ];
 
 /// The default feature set: the latest version of each computed feature.
@@ -376,6 +527,11 @@ pub const CURRENT: &[FeatureKey] = &[
     BARS_MOTION_1D_V1.key,
     VOLATILITY_ATR_1H_V1.key,
     VOLATILITY_REGIME_1H_V1.key,
+    FLOW_CVD_CONTINUOUS_V1.key,
+    FLOW_CVD_UTC_DAY_V1.key,
+    FLOW_WINDOW_5M_V1.key,
+    FLOW_WINDOW_15M_V1.key,
+    FLOW_WINDOW_1H_V1.key,
 ];
 
 /// The registry of [`DEFINITIONS`].
@@ -449,10 +605,10 @@ mod tests {
             hasher.write_u32(entry.key.version.get());
             hasher.write_u64(entry.fingerprint.value());
         }
-        assert_eq!(LOCK.len(), 15, "lock lines");
+        assert_eq!(LOCK.len(), 20, "lock lines");
         assert_eq!(
             hasher.finish().to_string(),
-            "efcd01a5831db19e",
+            "ebf623866d0acad6",
             "lock digest"
         );
     }
@@ -537,6 +693,74 @@ mod tests {
     }
 
     #[test]
+    fn flow_features_match_their_windows() {
+        assert_eq!(
+            FLOW_WINDOWS.map(|(timeframe, _)| timeframe),
+            [Timeframe::M5, Timeframe::M15, Timeframe::H1]
+        );
+        for (timeframe, definition) in FLOW_WINDOWS {
+            assert_eq!(
+                definition.key.id.as_str(),
+                format!("flow.window.{}", timeframe.label()),
+                "{timeframe:?}"
+            );
+            assert_eq!(
+                definition.params,
+                &[
+                    Param {
+                        name: "large_notional_usdt",
+                        value: ParamValue::Int(100_000),
+                    },
+                    Param {
+                        name: "window_ms",
+                        value: ParamValue::Int(timeframe.millis()),
+                    },
+                ],
+                "{timeframe:?}"
+            );
+            assert_eq!(
+                definition.inputs,
+                &[
+                    Input::Stream(Stream::Trades),
+                    Input::Feature(BARS_TIME_1M_V1.key)
+                ]
+            );
+            let minutes = u32::try_from(timeframe.millis() / Timeframe::M1.millis()).unwrap();
+            assert_eq!(
+                definition.warm_up,
+                WarmUp::Samples(minutes),
+                "{timeframe:?}"
+            );
+        }
+        assert_eq!(
+            FLOW_CVD_CONTINUOUS_V1.inputs,
+            &[Input::Stream(Stream::Trades)]
+        );
+        assert_eq!(
+            FLOW_CVD_UTC_DAY_V1.inputs,
+            &[Input::Feature(BARS_TIME_1D_V1.key)]
+        );
+        assert_eq!(
+            FLOW_CVD_UTC_DAY_V1.params,
+            &[Param {
+                name: "session_ms",
+                value: ParamValue::Int(Timeframe::D1.millis()),
+            }]
+        );
+        let flow = [
+            &FLOW_CVD_CONTINUOUS_V1,
+            &FLOW_CVD_UTC_DAY_V1,
+            &FLOW_WINDOW_5M_V1,
+            &FLOW_WINDOW_15M_V1,
+            &FLOW_WINDOW_1H_V1,
+        ];
+        for definition in flow {
+            assert!(definition.key.id.as_str().starts_with("flow."));
+            assert!(CURRENT.contains(&definition.key), "{}", definition.key);
+        }
+    }
+
+    #[test]
     fn current_set_version_is_pinned() {
         // The feature-set version every experiment records (ADR-029). It may
         // change only when CURRENT does — any other change here means a
@@ -547,8 +771,10 @@ mod tests {
             "bars.motion.15m@1,bars.motion.1d@1,bars.motion.1h@1,bars.motion.1m@1,\
              bars.motion.4h@1,bars.motion.5m@1,bars.time.15m@1,bars.time.1d@1,\
              bars.time.1h@1,bars.time.1m@1,bars.time.4h@1,bars.time.5m@1,\
-             trade.last_price@1,volatility.atr.1h@1,volatility.regime.1h@1"
+             flow.cvd.continuous@1,flow.cvd.utc_day@1,flow.window.15m@1,\
+             flow.window.1h@1,flow.window.5m@1,trade.last_price@1,\
+             volatility.atr.1h@1,volatility.regime.1h@1"
         );
-        assert_eq!(set.version().to_string(), "14d6069e5552fd17");
+        assert_eq!(set.version().to_string(), "dd872d0b67f43ceb");
     }
 }

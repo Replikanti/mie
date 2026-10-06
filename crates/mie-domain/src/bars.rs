@@ -1009,10 +1009,10 @@ pub(crate) mod tests {
     }
 
     /// Deterministic 64-bit LCG (Knuth's MMIX constants) for test tapes.
-    struct Lcg(u64);
+    pub(crate) struct Lcg(pub(crate) u64);
 
     impl Lcg {
-        fn next(&mut self) -> u64 {
+        pub(crate) fn next(&mut self) -> u64 {
             self.0 = self
                 .0
                 .wrapping_mul(6_364_136_223_846_793_005)
@@ -1020,14 +1020,14 @@ pub(crate) mod tests {
             self.0 >> 11
         }
 
-        fn below(&mut self, bound: u64) -> i64 {
+        pub(crate) fn below(&mut self, bound: u64) -> i64 {
             i64::try_from(self.next() % bound).unwrap()
         }
     }
 
     /// A multi-day tape: trades with jumps of up to six hours, trades gaps
     /// that never reach back before the last event, and mark prices.
-    fn random_tape(seed: u64, len: usize) -> Vec<MarketEvent> {
+    pub(crate) fn random_tape(seed: u64, len: usize) -> Vec<MarketEvent> {
         let mut lcg = Lcg(seed);
         let mut time = lcg.below(DAY as u64);
         let mut trade_id = 0;
