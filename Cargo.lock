@@ -566,8 +566,10 @@ dependencies = [
  "mie-ports",
  "serde",
  "serde_json",
+ "sha2",
  "signal-hook",
  "toml",
+ "zip",
 ]
 
 [[package]]

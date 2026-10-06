@@ -1,15 +1,18 @@
-//! The `mie ingest` configuration file (TOML).
+//! The configuration files (TOML) of `mie ingest` ([`IngestConfig`]) and of
+//! the `mie archive-*` commands ([`ArchiveConfig`]).
 //!
-//! `[instrument]`, `[paths]` and `[binance]` are required; `[capture]` and
-//! `binance.streams` have defaults. Unknown keys are rejected. Public market
+//! Ingest: `[instrument]`, `[paths]` and `[binance]` are required; `[capture]`
+//! and `binance.streams` have defaults. Unknown keys are rejected. Public market
 //! data needs no secrets; a future secret is read from the environment,
 //! never from this file.
 
+use mie_adapter_binance::archive::ArchiveStream;
 use mie_adapter_binance::{BinanceStream, LiveConfig, OI_POLL_INTERVAL_MS};
+use mie_domain::bars::Timeframe;
 use mie_domain::time::EventTime;
 use mie_ports::raw::validate_segment;
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -262,5 +265,183 @@ impl IngestConfig {
         live.stats_interval = Duration::from_secs(c.stats_interval_secs);
         live.seeds = seeds;
         Ok(live)
+    }
+}
+
+/// The `mie archive-*` configuration file (TOML).
+///
+/// `[instrument]` and `[paths]` are required, `[archive]` has defaults.
+/// Unknown keys are rejected, a `source` key among them: the archive source
+/// is fixed in code (`binance-archive`), so archive provenance can never
+/// land in the live source.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArchiveConfig {
+    /// What is imported.
+    pub instrument: ArchiveInstrument,
+    /// Where it goes.
+    pub paths: ArchivePaths,
+    /// The archive and how politely it is read.
+    #[serde(default)]
+    pub archive: ArchiveSettings,
+}
+
+/// `[instrument]` of the archive configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArchiveInstrument {
+    /// Exchange symbol, also the raw-store instrument, e.g. `BTCUSDT`.
+    pub symbol: String,
+}
+
+/// `[paths]` of the archive configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArchivePaths {
+    /// Root directory of the raw store, shared with live capture.
+    pub raw_root: PathBuf,
+    /// The import ledger directory.
+    pub import_ledger: PathBuf,
+    /// Download staging; each zip is removed once imported.
+    pub staging: PathBuf,
+}
+
+/// `[archive]`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ArchiveSettings {
+    /// Archive base URL.
+    pub base_url: String,
+    /// Datasets to import: `aggTrades`, `klines`, `fundingRate`, `metrics`,
+    /// `bookDepth`, `trades`.
+    pub streams: Vec<String>,
+    /// Kline intervals imported for `klines`.
+    pub kline_intervals: Vec<String>,
+    /// Least time between two request starts.
+    pub request_interval_ms: u64,
+    /// Most attempts per request.
+    pub max_attempts: u32,
+    /// First retry wait.
+    pub backoff_initial_ms: u64,
+    /// Longest retry wait.
+    pub backoff_max_ms: u64,
+}
+
+impl Default for ArchiveSettings {
+    fn default() -> Self {
+        Self {
+            base_url: "https://data.binance.vision".to_owned(),
+            streams: ["aggTrades", "klines", "fundingRate", "metrics", "bookDepth"]
+                .map(str::to_owned)
+                .to_vec(),
+            kline_intervals: Timeframe::ALL.map(|t| t.label().to_owned()).to_vec(),
+            request_interval_ms: 100,
+            max_attempts: 5,
+            backoff_initial_ms: 1_000,
+            backoff_max_ms: 60_000,
+        }
+    }
+}
+
+impl ArchiveConfig {
+    /// Reads and validates the file at `path`.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError`] when the file cannot be read, parsed or validated.
+    pub fn load(path: &Path) -> Result<Self, ConfigError> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| ConfigError(format!("read {}: {e}", path.display())))?;
+        Self::parse(&text)
+    }
+
+    /// Parses and validates TOML text.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError`] for unknown or missing keys and invalid values.
+    pub fn parse(text: &str) -> Result<Self, ConfigError> {
+        let config: Self = toml::from_str(text).map_err(|e| ConfigError(e.to_string()))?;
+        validate_segment(&config.instrument.symbol)
+            .map_err(|e| ConfigError(format!("instrument.symbol: {e}")))?;
+        let a = &config.archive;
+        if !a.base_url.contains("://") {
+            return Err(ConfigError(format!(
+                "archive.base_url {:?} is not a URL",
+                a.base_url
+            )));
+        }
+        if a.max_attempts == 0 || a.backoff_initial_ms == 0 {
+            return Err(ConfigError(
+                "archive.max_attempts and archive.backoff_initial_ms must be positive".to_owned(),
+            ));
+        }
+        if a.backoff_max_ms < a.backoff_initial_ms {
+            return Err(ConfigError(
+                "archive.backoff_max_ms is below backoff_initial_ms".to_owned(),
+            ));
+        }
+        if config.streams()?.is_empty() {
+            return Err(ConfigError("archive.streams is empty".to_owned()));
+        }
+        Ok(config)
+    }
+
+    /// The configured streams, in import order.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError`] for an unknown or repeated stream or interval.
+    pub fn streams(&self) -> Result<Vec<ArchiveStream>, ConfigError> {
+        Self::expand(&self.archive.streams, &self.archive.kline_intervals)
+    }
+
+    /// Expands dataset names into streams: `klines` becomes one stream per
+    /// configured interval, `klines_<interval>` names one, any other name a
+    /// raw stream name. The result is in import order.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError`] for an unknown or repeated name or interval.
+    pub fn expand(
+        names: &[String],
+        intervals: &[String],
+    ) -> Result<Vec<ArchiveStream>, ConfigError> {
+        let mut timeframes = Vec::new();
+        for label in intervals {
+            let timeframe = Timeframe::ALL
+                .into_iter()
+                .find(|t| t.label() == label)
+                .ok_or_else(|| ConfigError(format!("unknown kline interval {label:?}")))?;
+            if timeframes.contains(&timeframe) {
+                return Err(ConfigError(format!(
+                    "kline interval {label:?} listed twice"
+                )));
+            }
+            timeframes.push(timeframe);
+        }
+        let mut streams = BTreeSet::new();
+        for name in names {
+            let expanded: Vec<ArchiveStream> = if name == "klines" {
+                timeframes
+                    .iter()
+                    .map(|&t| ArchiveStream::Klines(t))
+                    .collect()
+            } else {
+                vec![
+                    ArchiveStream::from_raw_name(name)
+                        .ok_or_else(|| ConfigError(format!("unknown archive stream {name:?}")))?,
+                ]
+            };
+            for stream in expanded {
+                if !streams.insert(stream) {
+                    return Err(ConfigError(format!("stream {stream} listed twice")));
+                }
+            }
+        }
+        Ok(ArchiveStream::ALL
+            .into_iter()
+            .filter(|s| streams.contains(s))
+            .collect())
     }
 }

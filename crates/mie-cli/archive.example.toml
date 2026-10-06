@@ -1,0 +1,35 @@
+# Example configuration for `mie archive-import`, `mie archive-verify` and
+# `mie archive-kline-check` (ADR-034). The archive is public: no
+# credentials. The raw-store source is fixed in code (`binance-archive`) and
+# cannot be configured, so archive data never mixes with live capture.
+
+[instrument]
+# Exchange symbol of the USDⓈ-M perpetual; also the raw-store instrument.
+symbol = "BTCUSDT"
+
+[paths]
+# Root of the raw Parquet store, shared with `mie ingest` (separate source,
+# separate lock). Plan for >= 50 GB free for a 12-month backfill.
+raw_root = "data/raw"
+# One ledger file per imported archive file, plus the PENDING marker.
+import_ledger = "data/archive-ledger"
+# Zips are downloaded here and removed once imported.
+staging = "data/archive-staging"
+
+# Every key below is optional; the values shown are the defaults.
+[archive]
+base_url = "https://data.binance.vision"
+# Datasets: aggTrades, klines (every interval below), fundingRate (monthly
+# files), metrics (5-minute open interest), bookDepth (raw only). The
+# individual-trades dataset `trades` is opt-in: raw only, used by
+# `archive-kline-check --trade-source trades`.
+streams = ["aggTrades", "klines", "fundingRate", "metrics", "bookDepth"]
+kline_intervals = ["1m", "5m", "15m", "1h", "4h", "1d"]
+# Network etiquette (ADR-034 D6): one request at a time, at least this long
+# between request starts; 403/418/429/5xx and transport errors back off
+# exponentially from backoff_initial_ms to backoff_max_ms, max_attempts in
+# total per request.
+request_interval_ms = 100
+max_attempts = 5
+backoff_initial_ms = 1000
+backoff_max_ms = 60000

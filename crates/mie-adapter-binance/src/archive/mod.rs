@@ -13,12 +13,14 @@
 //! | [`fetch`] | Paced, retried, checksum-verified downloads and zip lines |
 //! | [`ledger`] | Per-file import ledger and the `PENDING` marker |
 //! | [`import`] | Exactly-once import: skip, conflict, validate, append, resume |
+//! | [`window`] | Temporary trades + klines provider for the kline cross-check (until #11) |
 
 pub mod catalog;
 pub mod fetch;
 pub mod import;
 pub mod ledger;
 pub mod normalize;
+pub mod window;
 
 /// The raw-store source of every archive record. Fixed in code, never
 /// configurable, so archive data can never land in the live source.

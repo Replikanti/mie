@@ -1,6 +1,6 @@
 [package]
 name = "mie-cli"
-description = "MIE composition root: wires adapters to ports (`mie ingest`, `mie capture-report`)"
+description = "MIE composition root: wires adapters to ports (`mie ingest`, `mie capture-report`, `mie archive-*`)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -20,15 +20,22 @@ mie-ports.workspace = true
 mie-app.workspace = true
 mie-adapter-binance.workspace = true
 mie-adapter-parquet.workspace = true
-# Typed ingest configuration with `deny_unknown_fields`.
+# Typed ingest and archive configuration with `deny_unknown_fields`.
 serde = { version = "1", features = ["derive"] }
 # The JSON Lines capture journal (writing, and reading it back in
 # `capture-report`).
 serde_json = "1"
-# The ingest configuration file format.
+# The configuration file format.
 toml = "1"
-# SIGINT/SIGTERM set the shutdown flag, so a stopped capture seals cleanly.
+# SIGINT/SIGTERM set the shutdown flag, so a stopped capture seals cleanly
+# and an archive import stops at a file boundary.
 signal-hook = "0.4"
+
+# Test-only: the offline archive tests build the zips a fake archive
+# serves, and their published SHA-256.
+[dev-dependencies]
+zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
+sha2 = "0.11"
 
 [lints]
 workspace = true

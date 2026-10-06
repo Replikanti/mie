@@ -1,7 +1,12 @@
 //! The `mie` command line.
 
-use mie_adapter_binance::transport::{NetTimeouts, SystemClock, TungsteniteConnector, UreqHttp};
-use mie_cli::config::IngestConfig;
+use mie_adapter_binance::archive::ArchiveStream;
+use mie_adapter_binance::archive::catalog::parse_day;
+use mie_adapter_binance::transport::{
+    DownloadTimeouts, NetTimeouts, SystemClock, TungsteniteConnector, UreqDownload, UreqHttp,
+};
+use mie_cli::archive::{self, ArchiveTransports, ImportRequest};
+use mie_cli::config::{ArchiveConfig, IngestConfig};
 use mie_cli::ingest::{self, Transports};
 use mie_cli::report;
 use std::path::PathBuf;
@@ -27,6 +32,31 @@ USAGE:
         totals, and per-stream LateEvent fraction (default limit 0: any
         late event fails). Prints PASS or FAIL; exits 0 on PASS, 1 on FAIL.
 
+    mie archive-import --config <path> --from <YYYY-MM-DD> --to <YYYY-MM-DD>
+                       [--streams <a,b,...>] [--dry-run]
+        Import the Binance public data archive (USDⓈ-M BTCUSDT) for the
+        inclusive UTC day range into the raw store under the source
+        binance-archive; monthly files cover every month the range
+        overlaps. Every file is checksum-verified; re-runs skip imported
+        files, an interrupted file is resumed. --streams replaces the
+        configured streams (aggTrades, klines, klines_1m, ..., fundingRate,
+        metrics, bookDepth, trades). --dry-run fetches checksums only and
+        reports published / missing / imported / changed files. SIGINT or
+        SIGTERM stops at the next file boundary. Exits 1 when a file failed
+        or changed upstream. See crates/mie-cli/archive.example.toml.
+
+    mie archive-verify --config <path> --from <YYYY-MM-DD> --to <YYYY-MM-DD>
+        Re-read every imported file of the range (hash-verified), normalize
+        every record, check ledger <-> store consistency, list trade-id
+        breaks and holes over 60 s, print the dataset version per stream.
+        Prints PASS or FAIL; exits 0 on PASS, 1 on FAIL.
+
+    mie archive-kline-check --config <path> --from <YYYY-MM-DD> --to <YYYY-MM-DD>
+                            [--trade-source aggTrades|trades]
+        Build bars from archive trades (default aggTrades) through the
+        domain and compare every complete bar with the archive klines
+        (ADR-031). Exits 0 only when every compared bar matched.
+
     mie --help
 ";
 
@@ -49,7 +79,7 @@ fn dispatch(args: &[String]) -> Result<ExitCode, String> {
             Ok(ExitCode::SUCCESS)
         }
         Some("ingest") => {
-            let options = Options::parse(&args[1..], &["--config"])?;
+            let options = Options::parse(&args[1..], &["--config"], &[])?;
             let config =
                 IngestConfig::load(&options.path("--config")?).map_err(|e| e.to_string())?;
             run_ingest(&config)
@@ -58,6 +88,7 @@ fn dispatch(args: &[String]) -> Result<ExitCode, String> {
             let options = Options::parse(
                 &args[1..],
                 &["--config", "--from", "--to", "--max-late-fraction"],
+                &[],
             )?;
             let config =
                 IngestConfig::load(&options.path("--config")?).map_err(|e| e.to_string())?;
@@ -73,8 +104,100 @@ fn dispatch(args: &[String]) -> Result<ExitCode, String> {
                 ExitCode::FAILURE
             })
         }
+        Some("archive-import") => {
+            let options = Options::parse(
+                &args[1..],
+                &["--config", "--from", "--to", "--streams"],
+                &["--dry-run"],
+            )?;
+            let config =
+                ArchiveConfig::load(&options.path("--config")?).map_err(|e| e.to_string())?;
+            let (from_day, to_day) = options.days()?;
+            let streams = match options.optional("--streams") {
+                Some(list) => {
+                    let names: Vec<String> = list.split(',').map(str::to_owned).collect();
+                    Some(
+                        ArchiveConfig::expand(&names, &config.archive.kline_intervals)
+                            .map_err(|e| e.to_string())?,
+                    )
+                }
+                None => None,
+            };
+            let request = ImportRequest {
+                from_day,
+                to_day,
+                streams,
+                dry_run: options.flag("--dry-run"),
+            };
+            run_archive_import(&config, &request)
+        }
+        Some("archive-verify") => {
+            let options = Options::parse(&args[1..], &["--config", "--from", "--to"], &[])?;
+            let config =
+                ArchiveConfig::load(&options.path("--config")?).map_err(|e| e.to_string())?;
+            let (from_day, to_day) = options.days()?;
+            let pass = archive::verify(&config, from_day, to_day, &mut std::io::stdout().lock())?;
+            Ok(exit(pass))
+        }
+        Some("archive-kline-check") => {
+            let options = Options::parse(
+                &args[1..],
+                &["--config", "--from", "--to", "--trade-source"],
+                &[],
+            )?;
+            let config =
+                ArchiveConfig::load(&options.path("--config")?).map_err(|e| e.to_string())?;
+            let (from_day, to_day) = options.days()?;
+            let trade_source = match options.optional("--trade-source").unwrap_or("aggTrades") {
+                "aggTrades" => ArchiveStream::AggTrades,
+                "trades" => ArchiveStream::Trades,
+                other => {
+                    return Err(format!(
+                        "--trade-source {other:?} is neither aggTrades nor trades"
+                    ));
+                }
+            };
+            let matched = archive::kline_check(
+                &config,
+                from_day,
+                to_day,
+                trade_source,
+                &mut std::io::stdout().lock(),
+            )?;
+            Ok(exit(matched))
+        }
         Some(other) => Err(format!("unknown command {other:?}")),
     }
+}
+
+fn exit(pass: bool) -> ExitCode {
+    if pass {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+fn run_archive_import(config: &ArchiveConfig, request: &ImportRequest) -> Result<ExitCode, String> {
+    let shutdown = Arc::new(AtomicBool::new(false));
+    for signal in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
+        signal_hook::flag::register(signal, Arc::clone(&shutdown))
+            .map_err(|e| format!("install the signal handler: {e}"))?;
+    }
+    let client = Arc::new(UreqDownload::new(DownloadTimeouts::default())?);
+    let transports = ArchiveTransports {
+        http: client.clone(),
+        download: client,
+        clock: Arc::new(SystemClock::new()),
+    };
+    let summary = archive::import(
+        config,
+        request,
+        &transports,
+        &shutdown,
+        &mut std::io::stdout().lock(),
+    )?;
+    Ok(exit(summary.exit_code() == 0))
 }
 
 fn run_ingest(config: &IngestConfig) -> Result<ExitCode, String> {
@@ -98,24 +221,55 @@ fn run_ingest(config: &IngestConfig) -> Result<ExitCode, String> {
     ))
 }
 
-/// `--flag value` pairs, each flag exactly once.
+/// `--flag value` pairs and valueless `--switch`es, each at most once.
 struct Options(Vec<(String, String)>);
 
 impl Options {
-    fn parse(args: &[String], allowed: &[&str]) -> Result<Self, String> {
+    fn parse(args: &[String], allowed: &[&str], switches: &[&str]) -> Result<Self, String> {
         let mut pairs: Vec<(String, String)> = Vec::new();
         let mut rest = args.iter();
         while let Some(flag) = rest.next() {
-            if !allowed.contains(&flag.as_str()) {
+            let switch = switches.contains(&flag.as_str());
+            if !switch && !allowed.contains(&flag.as_str()) {
                 return Err(format!("unexpected argument {flag:?}"));
             }
             if pairs.iter().any(|(f, _)| f == flag) {
                 return Err(format!("{flag} given twice"));
             }
-            let value = rest.next().ok_or_else(|| format!("{flag} needs a value"))?;
-            pairs.push((flag.clone(), value.clone()));
+            let value = if switch {
+                String::new()
+            } else {
+                rest.next()
+                    .ok_or_else(|| format!("{flag} needs a value"))?
+                    .clone()
+            };
+            pairs.push((flag.clone(), value));
         }
         Ok(Self(pairs))
+    }
+
+    fn flag(&self, switch: &str) -> bool {
+        self.0.iter().any(|(f, _)| f == switch)
+    }
+
+    fn optional(&self, flag: &str) -> Option<&str> {
+        self.0
+            .iter()
+            .find(|(f, _)| f == flag)
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// `--from` and `--to` as an inclusive range of UTC days.
+    fn days(&self) -> Result<(i64, i64), String> {
+        let day = |flag: &str| -> Result<i64, String> {
+            let value = self.value(flag)?;
+            parse_day(value).ok_or_else(|| format!("{flag} {value:?} is not a date YYYY-MM-DD"))
+        };
+        let (from, to) = (day("--from")?, day("--to")?);
+        if from > to {
+            return Err("--from is after --to".to_owned());
+        }
+        Ok((from, to))
     }
 
     fn value(&self, flag: &str) -> Result<&str, String> {
