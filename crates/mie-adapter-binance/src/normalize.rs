@@ -1,8 +1,9 @@
 //! Binance wire format → domain events: the only place that knows it.
 //!
 //! Live capture and replay (#11) normalize the same persisted bytes with
-//! this code (ADR-019, ADR-030). Everything here is a pure function of the
-//! payload: no clock, no state.
+//! this code (ADR-019, ADR-030). Archive rows have their own normalizer in
+//! [`crate::archive::normalize`], built on the same decimal parsing.
+//! Everything here is a pure function of the payload: no clock, no state.
 //!
 //! - Decimals are borrowed as strings and parsed only through the exact
 //!   `FromStr` of [`Price`], [`Qty`] and [`Rate`] (ADR-027). A decimal sent
@@ -128,7 +129,9 @@ fn req<T>(value: Option<T>, field: &'static str) -> Result<T, NormalizeError> {
     value.ok_or(NormalizeError::Missing(field))
 }
 
-fn decimal<T>(value: Option<&str>, field: &'static str) -> Result<T, NormalizeError>
+/// Parses a required decimal field through the domain's exact `FromStr`
+/// (ADR-027). Shared with the archive normalizer.
+pub(crate) fn decimal<T>(value: Option<&str>, field: &'static str) -> Result<T, NormalizeError>
 where
     T: FromStr<Err = ParseDecimalError>,
 {

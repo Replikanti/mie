@@ -1,9 +1,12 @@
-//! Live market-data adapter for the Binance USDⓈ-M BTCUSDT perpetual
-//! (Data Plane brief; ADR-026, ADR-028, ADR-030, ADR-032).
+//! Market-data adapter for the Binance USDⓈ-M BTCUSDT perpetual: live
+//! capture and historical backfill from the public data archive (Data Plane
+//! brief; ADR-026, ADR-028, ADR-030, ADR-032, ADR-034).
 //!
 //! The adapter implements the outbound
 //! [`MarketDataProvider`](mie_ports::outbound::MarketDataProvider) port for
-//! live data. Only `mie-cli` wires it (ADR-025).
+//! live data and imports archive files into the raw store through the
+//! [`RawRecordSink`](mie_ports::raw::RawRecordSink) port. Only `mie-cli`
+//! wires it (ADR-025).
 //!
 //! | Module | Role |
 //! |---|---|
@@ -14,6 +17,7 @@
 //! | [`pipeline`] | The three above composed: raw records → canonical events |
 //! | [`transport`] | WebSocket, HTTP and clock seams with their real implementations |
 //! | [`live`] | Capture threads, raw-first persistence and the live provider |
+//! | [`archive`] | Archive import: catalog, checksummed downloads, import ledger, archive normalization |
 //!
 //! Live capture runs on plain threads, without an async runtime (ADR-026
 //! leaves the adapter-internal model open): one per WebSocket stream (`ws`),
@@ -23,6 +27,7 @@
 //! The wall clock is used only for capture metadata (receive time) and for
 //! scheduling, never for ordering (ADR-028 D1).
 
+pub mod archive;
 pub mod holdback;
 pub mod live;
 pub mod normalize;

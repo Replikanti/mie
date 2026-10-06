@@ -52,9 +52,9 @@ enforces the boundary (ADR-025):
 | [`mie-ports`](crates/mie-ports) | Use-case (inbound) and infrastructure (outbound) contracts owned by the core. |
 | [`mie-app`](crates/mie-app) | Use-case services that drive the domain through ports. |
 | [`mie-adapter-parquet`](crates/mie-adapter-parquet) | Immutable raw store: verbatim messages in sealed Parquet files with manifests and dataset versions (ADR-030). |
-| [`mie-adapter-binance`](crates/mie-adapter-binance) | Binance USDⓈ-M live capture: raw-first persistence, shared normalization, feed gaps, canonical merge (ADR-032). |
+| [`mie-adapter-binance`](crates/mie-adapter-binance) | Binance USDⓈ-M live capture: raw-first persistence, shared normalization, feed gaps, canonical merge (ADR-032); public-archive backfill: checksum-verified, exactly-once import (ADR-034). |
 | `mie-adapter-*` *(planned)* | DuckDB, Telegram, LLM operators, backtest engine. |
-| [`mie-cli`](crates/mie-cli) | Composition root, the `mie` binary: wires adapters to ports. Today `ingest` and `capture-report`; replay, research and report follow. |
+| [`mie-cli`](crates/mie-cli) | Composition root, the `mie` binary: wires adapters to ports. Today `ingest`, `capture-report` and `archive-import` / `archive-verify` / `archive-kline-check`; replay, research and report follow. |
 
 First milestone data path (brief §19):
 
@@ -94,6 +94,23 @@ until SIGINT/SIGTERM, and the check of a capture window:
 cargo run --release -p mie-cli -- ingest --config crates/mie-cli/ingest.example.toml
 cargo run --release -p mie-cli -- capture-report \
     --config crates/mie-cli/ingest.example.toml --from <epoch ms> --to <epoch ms>
+```
+
+Historical backfill from the Binance public data archive (source
+`binance-archive`, see [data availability](docs/data-availability.md)):
+probe, import (re-runs skip imported files, an interrupted file resumes),
+verify, and cross-check bars against the archive klines:
+
+```sh
+cargo run --release -p mie-cli -- archive-import \
+    --config crates/mie-cli/archive.example.toml --from 2025-10-01 --to 2026-09-30 --dry-run
+cargo run --release -p mie-cli -- archive-import \
+    --config crates/mie-cli/archive.example.toml --from 2025-10-01 --to 2026-09-30
+cargo run --release -p mie-cli -- archive-verify \
+    --config crates/mie-cli/archive.example.toml --from 2025-10-01 --to 2026-09-30
+cargo run --release -p mie-cli -- archive-kline-check \
+    --config crates/mie-cli/archive.example.toml --from 2026-09-29 --to 2026-09-29 \
+    --trade-source trades
 ```
 
 ## Out of scope for now

@@ -1,6 +1,6 @@
 [package]
 name = "mie-adapter-binance"
-description = "MIE live market-data adapter for Binance USDⓈ-M futures: raw-first capture, shared normalization, feed gaps"
+description = "MIE market-data adapter for Binance USDⓈ-M futures: live raw-first capture, public-archive import, shared normalization, feed gaps"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -30,6 +30,16 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustls-native-certs = "0.8"
 # Blocking HTTP client for the open-interest REST poll, on the same rustls.
 ureq = { version = "3", default-features = false, features = ["rustls-no-provider"] }
+# Reads the archive's zip files (one deflated CSV entry each, CRC-checked).
+# No default features: no encryption, no bzip2/lzma/zstd/xz codecs, no time
+# crate; deflate through flate2 only (ADR-034).
+zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
+# Selects flate2's pure-Rust miniz_oxide backend for zip's deflate, so no C
+# zlib and no Zlib-licensed zlib-rs enter the tree. Not used directly.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+# SHA-256 of downloaded zips against the archive's published `.CHECKSUM`
+# (already in the tree through the raw-store adapter).
+sha2 = "0.11"
 
 [lints]
 workspace = true

@@ -1,12 +1,14 @@
-//! The I/O seams of live capture: WebSocket, HTTP and clock.
+//! The I/O seams of live capture and archive import: WebSocket, HTTP,
+//! streaming download and clock.
 //!
-//! The connection loops ([`crate::live`]) see only these traits, so tests
-//! drive them with scripted fakes and a fake clock, and never touch the
-//! network. The real implementations are blocking: [`TungsteniteConnector`]
-//! and [`UreqHttp`] over rustls (ring provider, the operating system's root
+//! The connection loops ([`crate::live`]) and the archive importer
+//! ([`crate::archive`]) see only these traits, so tests drive them with
+//! scripted fakes and a fake clock, and never touch the network. The real
+//! implementations are blocking: [`TungsteniteConnector`], [`UreqHttp`] and
+//! [`UreqDownload`] over rustls (ring provider, the operating system's root
 //! store), and [`SystemClock`].
 
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -63,6 +65,20 @@ pub trait HttpGet: Send + Sync {
     ///
     /// A description of a transport failure (DNS, connect, TLS, timeout).
     fn get(&self, url: &str) -> Result<(u16, Vec<u8>), String>;
+}
+
+/// A blocking HTTP GET whose body is streamed into a sink, for files of any
+/// size (archive zips).
+pub trait HttpDownload: Send + Sync {
+    /// Fetches `url`. A 2xx body is written to `sink` as it arrives; any
+    /// other status is returned without writing the body. Non-2xx statuses
+    /// are results, not errors.
+    ///
+    /// # Errors
+    ///
+    /// A description of a transport failure (DNS, connect, TLS, timeout, a
+    /// body cut short) or of a failed write to `sink`.
+    fn download(&self, url: &str, sink: &mut dyn Write) -> Result<u16, String>;
 }
 
 /// Time for capture metadata and scheduling, never for ordering
@@ -320,5 +336,101 @@ impl HttpGet for UreqHttp {
             .read_to_vec()
             .map_err(|e| format!("GET {url} body: {e}"))?;
         Ok((status, body))
+    }
+}
+
+/// Timeouts of the archive client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DownloadTimeouts {
+    /// TCP connect and TLS handshake.
+    pub connect: Duration,
+    /// Receiving the whole body of one response.
+    pub receive_body: Duration,
+}
+
+impl Default for DownloadTimeouts {
+    fn default() -> Self {
+        Self {
+            connect: Duration::from_secs(10),
+            receive_body: Duration::from_secs(15 * 60),
+        }
+    }
+}
+
+/// The `User-Agent` of every archive request: identifies the tool and where
+/// to reach its maintainers (ADR-034 D6).
+pub const ARCHIVE_USER_AGENT: &str = "mie-archive-import (+https://github.com/Replikanti/mie)";
+
+/// The archive client over rustls ([`ureq`]): small bodies through
+/// [`HttpGet`] (`.CHECKSUM` files) and zips of any size streamed through
+/// [`HttpDownload`].
+///
+/// Separate from [`UreqHttp`], whose 10 s global timeout and 10 MB body cap
+/// suit the open-interest poll but not a 30 MB zip.
+#[derive(Debug, Clone)]
+pub struct UreqDownload {
+    agent: ureq::Agent,
+}
+
+impl UreqDownload {
+    /// A client trusting the operating system's root certificates, sending
+    /// [`ARCHIVE_USER_AGENT`].
+    ///
+    /// # Errors
+    ///
+    /// A description of the failure when no root certificate can be loaded.
+    pub fn new(timeouts: DownloadTimeouts) -> Result<Self, String> {
+        let roots: Vec<_> = native_root_ders()?
+            .iter()
+            .map(|der| ureq::tls::Certificate::from_der(der).to_owned())
+            .collect();
+        let tls = ureq::tls::TlsConfig::builder()
+            .provider(ureq::tls::TlsProvider::Rustls)
+            .unversioned_rustls_crypto_provider(ring_provider())
+            .root_certs(ureq::tls::RootCerts::new_with_certs(&roots))
+            .build();
+        let agent = ureq::Agent::config_builder()
+            .tls_config(tls)
+            .http_status_as_error(false)
+            .user_agent(ARCHIVE_USER_AGENT)
+            .timeout_connect(Some(timeouts.connect))
+            .timeout_recv_response(Some(timeouts.connect))
+            .timeout_recv_body(Some(timeouts.receive_body))
+            .build()
+            .new_agent();
+        Ok(Self { agent })
+    }
+}
+
+impl HttpGet for UreqDownload {
+    fn get(&self, url: &str) -> Result<(u16, Vec<u8>), String> {
+        let mut response = self
+            .agent
+            .get(url)
+            .call()
+            .map_err(|e| format!("GET {url}: {e}"))?;
+        let status = response.status().as_u16();
+        let body = response
+            .body_mut()
+            .read_to_vec()
+            .map_err(|e| format!("GET {url} body: {e}"))?;
+        Ok((status, body))
+    }
+}
+
+impl HttpDownload for UreqDownload {
+    fn download(&self, url: &str, sink: &mut dyn Write) -> Result<u16, String> {
+        let mut response = self
+            .agent
+            .get(url)
+            .call()
+            .map_err(|e| format!("GET {url}: {e}"))?;
+        let status = response.status().as_u16();
+        if !(200..300).contains(&status) {
+            return Ok(status);
+        }
+        let mut reader = response.body_mut().with_config().limit(u64::MAX).reader();
+        std::io::copy(&mut reader, sink).map_err(|e| format!("GET {url} body: {e}"))?;
+        Ok(status)
     }
 }

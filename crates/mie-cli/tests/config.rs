@@ -54,6 +54,17 @@ fn unknown_keys_are_rejected() {
 }
 
 #[test]
+fn live_capture_may_not_use_the_archive_source() {
+    let text = REQUIRED.replace("source = \"binance-um\"", "source = \"binance-archive\"");
+    assert_ne!(text, REQUIRED);
+    let error = IngestConfig::parse(&text).expect_err("reserved source").0;
+    assert!(
+        error.contains("reserved for the archive backfill"),
+        "{error}"
+    );
+}
+
+#[test]
 fn missing_keys_are_rejected() {
     for key in ["raw_root = ", "journal = ", "ws_base_url = ", "symbol = "] {
         let text: String = REQUIRED
@@ -99,5 +110,71 @@ fn invalid_values_are_rejected() {
     ] {
         let text = format!("{REQUIRED}[capture]\n{capture}\n");
         assert!(IngestConfig::parse(&text).is_err(), "{capture}");
+    }
+}
+
+mod archive {
+    use mie_adapter_binance::archive::ArchiveStream;
+    use mie_cli::config::ArchiveConfig;
+    use mie_domain::bars::Timeframe;
+
+    const REQUIRED: &str = r#"
+[instrument]
+symbol = "BTCUSDT"
+[paths]
+raw_root = "data/raw"
+import_ledger = "data/archive-ledger"
+staging = "data/archive-staging"
+"#;
+
+    #[test]
+    fn the_example_file_parses_with_the_documented_defaults() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/archive.example.toml");
+        let example = ArchiveConfig::load(std::path::Path::new(path)).expect("example parses");
+        let minimal = ArchiveConfig::parse(REQUIRED).expect("required keys suffice");
+        assert_eq!(example.archive, minimal.archive);
+        assert_eq!(example.archive.base_url, "https://data.binance.vision");
+        let streams = example.streams().unwrap();
+        assert_eq!(streams.len(), 10);
+        assert!(streams.contains(&ArchiveStream::Klines(Timeframe::H4)));
+        assert!(!streams.contains(&ArchiveStream::Trades));
+    }
+
+    #[test]
+    fn unknown_keys_and_a_source_key_are_rejected() {
+        for text in [
+            REQUIRED.replace(
+                "symbol = \"BTCUSDT\"",
+                "symbol = \"BTCUSDT\"\nsource = \"binance-um\"",
+            ),
+            format!("{REQUIRED}[archive]\nconcurrency = 4\n"),
+            format!("{REQUIRED}[secrets]\napi_key = \"x\"\n"),
+        ] {
+            let error = ArchiveConfig::parse(&text).expect_err("rejected").0;
+            assert!(error.contains("unknown"), "{error}");
+        }
+    }
+
+    #[test]
+    fn unknown_or_repeated_streams_and_intervals_are_rejected() {
+        for archive in [
+            "streams = [\"bookTicker\"]",
+            "streams = [\"aggTrades\", \"aggTrades\"]",
+            "streams = [\"klines\", \"klines_1m\"]",
+            "streams = []",
+            "kline_intervals = [\"3m\"]",
+            "kline_intervals = [\"1m\", \"1m\"]",
+            "max_attempts = 0",
+            "backoff_initial_ms = 5000\nbackoff_max_ms = 100",
+            "base_url = \"data.binance.vision\"",
+        ] {
+            let text = format!("{REQUIRED}[archive]\n{archive}\n");
+            assert!(ArchiveConfig::parse(&text).is_err(), "{archive}");
+        }
+        let text = format!("{REQUIRED}[archive]\nstreams = [\"trades\", \"klines_1d\"]\n");
+        assert_eq!(
+            ArchiveConfig::parse(&text).unwrap().streams().unwrap(),
+            [ArchiveStream::Klines(Timeframe::D1), ArchiveStream::Trades]
+        );
     }
 }
