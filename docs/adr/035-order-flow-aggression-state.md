@@ -57,8 +57,10 @@ Per-bar delta therefore ships already; this decision adds what spans bars.
      when both carry the same `anchor` and `gaps`.
    - **UTC day** (`flow.cvd.utc_day@1`): the CVD since 00:00 UTC. It equals
      the delta of the developing `bars.time.1d@1` bar by construction and
-     carries that bar's coverage. It is reproducible from any replay window
-     that starts at or before the day's open.
+     carries that bar's coverage. Its value is reproducible from any replay
+     window that starts at or before the day's open; its coverage follows
+     ADR-031, so a window starting exactly at 00:00 reports `partial_start`,
+     and only an earlier start yields `complete`.
 3. **Gap policy.** Windows never go back to warming up. A window carries
    the OR of its minutes' coverage; an empty incomplete minute contributes
    zeros and its `feed_gap` flag. This is the ADR-031 bar policy, and
