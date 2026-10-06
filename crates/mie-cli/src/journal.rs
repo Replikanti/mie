@@ -5,7 +5,7 @@
 //!
 //! | `type` | Written by | Content |
 //! |---|---|---|
-//! | `run_start` | ingest | symbol, streams, hold-back, seeds per stream: the run's pipeline parameters ([`RunParameters`]) |
+//! | `run_start` | ingest | symbol, streams, hold-back, open-interest re-time allowance, seeds per stream: the run's pipeline parameters ([`RunParameters`]) |
 //! | `recovery` | ingest | parts rolled forward and discarded by the store |
 //! | `connected`, `connect_failed`, `disconnected`, `planned_rotation`, `backoff` | capture | connection lifecycle per stream |
 //! | `oi_poll` | capture | request/response time (ns), status, whether persisted |
@@ -19,8 +19,8 @@
 //! The journal is flushed on every `stats` line and at the end of a run.
 //!
 //! The raw store alone does not determine what live delivered: the
-//! pipeline's `hold_back_ms` and per-stream seeds are run parameters, kept
-//! only in `run_start`. A recompute (replay #11, equivalence harness #13)
+//! pipeline's `hold_back_ms`, `oi_retime_ms` and per-stream seeds are run
+//! parameters, kept only in `run_start`. A recompute (replay #11, equivalence harness #13)
 //! reads them with [`RunParameters::from_run_start`], never from
 //! configuration defaults (ADR-032).
 
@@ -46,6 +46,8 @@ pub struct RunParameters {
     pub symbol: String,
     /// The hold-back in exchange milliseconds.
     pub hold_back_ms: i64,
+    /// The open-interest re-time allowance in milliseconds (ADR-032 D12).
+    pub oi_retime_ms: i64,
     /// The restart seeds per stream.
     pub seeds: BTreeMap<BinanceStream, EventTime>,
 }
@@ -69,6 +71,9 @@ impl RunParameters {
         let hold_back_ms = line["hold_back_ms"]
             .as_i64()
             .ok_or("run_start without hold_back_ms")?;
+        let oi_retime_ms = line["oi_retime_ms"]
+            .as_i64()
+            .ok_or("run_start without oi_retime_ms")?;
         let mut seeds = BTreeMap::new();
         let journaled = line["seeds"].as_object().ok_or("run_start without seeds")?;
         for (name, millis) in journaled {
@@ -83,6 +88,7 @@ impl RunParameters {
             run_id: text("run_id")?,
             symbol: text("symbol")?,
             hold_back_ms,
+            oi_retime_ms,
             seeds,
         })
     }
@@ -280,6 +286,7 @@ pub fn pipeline_json(stats: &PipelineStats) -> Value {
                 "events": s.events,
                 "normalize_errors": s.normalize_errors,
                 "duplicates": s.duplicates,
+                "retimed": s.retimed,
                 "regressions": s.regressions,
                 "gaps": gaps,
                 "max_lateness_ms": s.max_lateness_ms,

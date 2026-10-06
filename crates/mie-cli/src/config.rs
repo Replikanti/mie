@@ -5,7 +5,7 @@
 //! data needs no secrets; a future secret is read from the environment,
 //! never from this file.
 
-use mie_adapter_binance::{BinanceStream, LiveConfig};
+use mie_adapter_binance::{BinanceStream, LiveConfig, OI_POLL_INTERVAL_MS};
 use mie_domain::time::EventTime;
 use mie_ports::raw::validate_segment;
 use serde::Deserialize;
@@ -80,6 +80,9 @@ pub struct CaptureSettings {
     pub seal_interval_secs: u64,
     /// Canonical merge hold-back in exchange ms (ADR-028 D6).
     pub hold_back_ms: u64,
+    /// How late an open-interest sample may be and still be delivered,
+    /// re-timed (ADR-032 D12); one poll interval by default.
+    pub oi_retime_allowance_ms: u64,
     /// Planned reconnect age of the first stream.
     pub max_connection_age_secs: u64,
     /// Added to the reconnect age per stream position.
@@ -105,6 +108,7 @@ impl Default for CaptureSettings {
         Self {
             seal_interval_secs: 300,
             hold_back_ms: 2_000,
+            oi_retime_allowance_ms: u64::from(OI_POLL_INTERVAL_MS),
             max_connection_age_secs: 82_800,
             rotation_stagger_secs: 300,
             ping_interval_secs: 30,
@@ -244,6 +248,8 @@ impl IngestConfig {
         live.streams = self.streams()?;
         live.hold_back_ms = i64::try_from(c.hold_back_ms)
             .map_err(|_| ConfigError("capture.hold_back_ms is too large".to_owned()))?;
+        live.oi_retime_ms = i64::try_from(c.oi_retime_allowance_ms)
+            .map_err(|_| ConfigError("capture.oi_retime_allowance_ms is too large".to_owned()))?;
         live.seal_interval = Duration::from_secs(c.seal_interval_secs);
         live.max_connection_age = Duration::from_secs(c.max_connection_age_secs);
         live.rotation_stagger = Duration::from_secs(c.rotation_stagger_secs);

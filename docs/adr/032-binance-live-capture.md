@@ -51,8 +51,8 @@ interest over REST only.
    sequencer → hold-back merge) is a pure function of two inputs:
    - the run's records in `receive_seq` order: stream, payload, raw
      `event_time` and `session_id`, all in the raw store;
-   - the run's parameters: `symbol`, `hold_back_ms` and the per-stream
-     seeds. They are **not** in the raw store. The journal's `run_start`
+   - the run's parameters: `symbol`, `hold_back_ms`, `oi_retime_ms` (D12)
+     and the per-stream seeds. They are **not** in the raw store. The journal's `run_start`
      line records them, and the seeds also depend on what was sealed when
      the run started.
 
@@ -111,7 +111,35 @@ interest over REST only.
     `--max-late-fraction`, which defaults to **0**. The hold-back exists
     so that nothing is late, so any late event means the hold-back is too
     small for that stream. A tolerance is a conscious choice made on the
-    command line, not a default.
+    command line, not a default. Open interest re-timed under D12 counts as
+    delivered, not late.
+12. **Open interest that arrives late is re-timed, not dropped.** The REST
+    `time` trails the poll by 4 to 8 s (see the documentation check), so
+    under D6 every live sample is late. A late `OpenInterest` whose slot
+    passed by at most `oi_retime_ms` (`last released + 1 − time`; default
+    10 000 ms, one poll interval) is delivered at `last released + 1`, the
+    first millisecond still open. Only past that allowance does it become a
+    `LateEvent` gap.
+    - **Why it is sound.** The state engine requires one strictly
+      increasing canonical order over all streams (`MarketStateEngine::
+      apply`: `OutOfOrder` and `Duplicate`). The re-timed sample sorts
+      after everything released, so that order holds by construction.
+      Open interest is a sampled state observation without an exchange
+      id. Moving it later makes the value valid later than the exchange
+      stamped it, never earlier, which keeps ADR-028's "never a validity
+      time earlier than publication" and ADR-028 D6's "never delivered
+      into the past". The value itself and `resolution_ms` are unchanged.
+    - **The allowance is one poll interval.** A sample that is staler than
+      that would overlap its successor's slot, so it stays a gap.
+    - **Determinism.** The rule depends only on the order of the records
+      and the hold-back state, so `oi_retime_ms` is a run parameter. It is
+      journaled in `run_start` and read back by `RunParameters` (D4). Tests
+      recompute it from the persisted records and check that a different
+      allowance gives different output.
+    - **Scope.** The raw format is unchanged: the raw record keeps the
+      exchange `time` as its `event_time`, and replay re-times it the same
+      way. Every other stream keeps the 2000 ms hold-back and the plain
+      `LateEvent` rule.
 
 ### Documentation check (2026-10-06)
 
@@ -139,17 +167,11 @@ probes made on 2026-10-06. The connector is `binance-connector-js`, with
   liquidation and still was never dropped: the server answered the 30 s
   client pings. The 24 h connection limit and the 3 min server pings follow
   the Binance documentation and were not re-verified against the site.
-- **Open-interest lateness (open point).** In the same capture, the
-  response `time` trailed the poll by 3.8 to 7.9 s (maximum lateness
-  7943 ms). With a 2000 ms hold-back, all 12 live samples became
-  `LateEvent` gaps. The raw samples are persisted, and replay is not
-  affected. The live core, however, sees no open interest, and
-  `mie capture-report` fails on it at its default limit. That holds until
-  the soak settles one of these options:
-  - a hold-back of at least 10 000 ms, which is a configuration change
-    (`capture.hold_back_ms`) that delays every live event;
-  - a per-stream rule for open interest, which needs a superseding ADR
-    against the ADR-028 table.
+- **Open-interest lateness.** In the same capture, the response `time`
+  trailed the poll by 3.8 to 7.9 s (maximum lateness 7943 ms). Under the
+  plain D6 rule, all 12 live samples became `LateEvent` gaps, and the
+  live core saw no open interest. D12 fixes this. The live smoke run after
+  that change is reported on #9.
 
 ## Consequences
 
@@ -162,8 +184,9 @@ probes made on 2026-10-06. The connector is `binance-connector-js`, with
 - Five connections and six threads per capture. That is fine for one
   instrument (ADR-002), and depth (#10) adds connections the same way.
 - Live delivery waits 2 s, and a later event is lost to a gap rather than
-  delivered into the past. Open interest is currently always late (see the
-  documentation check).
+  delivered into the past. The exception is open interest: it reaches the
+  core re-timed by a few seconds (D12), and its exchange `time` stays in
+  the raw record.
 - Each stream has a sub-second gap once a day at its planned reconnect.
   Every gap is visible.
 - The TLS stack (rustls with the ring provider and the operating system's
@@ -188,6 +211,13 @@ probes made on 2026-10-06. The connector is `binance-connector-js`, with
   herd to spread out. It would also need randomness.
 - **Ordering open interest by receive time.** That would make a local
   clock order domain events, against ADR-028 D1.
+- **A per-stream hold-back for open interest.** Holding only open interest
+  back longer does not work. The engine needs one strictly increasing order
+  across all streams, so no event after an outstanding open-interest slot
+  could be released until that slot closes. In effect, every stream would
+  get the longer hold-back.
+- **A global 10 s hold-back.** It would make every live event 10 s late
+  just to accommodate the slowest sampled stream.
 
 ## Accept when
 
@@ -199,6 +229,6 @@ remaining values:
 
 - messages per second per stream (p50 and p99);
 - channel high-water marks and blocked time;
-- `LateEvent` count and maximum lateness per stream. These settle the
-  hold-back, including the open-interest point above;
+- `LateEvent` count, re-timed count and maximum lateness per stream. These
+  settle the hold-back and the open-interest allowance;
 - raw bytes per day.

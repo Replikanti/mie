@@ -31,7 +31,7 @@
 use crate::normalize::record_time;
 use crate::pipeline::{Pipeline, PipelineStats};
 use crate::rest::OiTask;
-use crate::stream::BinanceStream;
+use crate::stream::{BinanceStream, OI_POLL_INTERVAL_MS};
 use crate::transport::{Clock, HttpGet, WsConnector};
 use crate::ws::WsTask;
 use mie_domain::event::{FeedGap, MarketEvent};
@@ -68,6 +68,9 @@ pub struct LiveConfig {
     pub streams: Vec<BinanceStream>,
     /// Canonical merge hold-back in exchange milliseconds (ADR-028 D6).
     pub hold_back_ms: i64,
+    /// How late an open-interest sample may be and still be delivered,
+    /// re-timed to the first open millisecond (ADR-032 D12).
+    pub oi_retime_ms: i64,
     /// Wall-clock cadence of `seal_all`.
     pub seal_interval: Duration,
     /// Age at which a connection is replaced (before the 24 h limit).
@@ -105,6 +108,7 @@ impl LiveConfig {
             rest_base_url: "https://fapi.binance.com".to_owned(),
             streams: BinanceStream::ALL.to_vec(),
             hold_back_ms: 2_000,
+            oi_retime_ms: i64::from(OI_POLL_INTERVAL_MS),
             seal_interval: Duration::from_secs(300),
             max_connection_age: Duration::from_secs(82_800),
             rotation_stagger: Duration::from_secs(300),
@@ -152,8 +156,8 @@ impl LiveConfig {
         if self.inbound_capacity == 0 || self.core_capacity == 0 {
             return invalid("channel capacities must be positive".to_owned());
         }
-        if self.hold_back_ms < 0 {
-            return invalid("hold_back_ms must not be negative".to_owned());
+        if self.hold_back_ms < 0 || self.oi_retime_ms < 0 {
+            return invalid("hold_back_ms and oi_retime_ms must not be negative".to_owned());
         }
         self.streams
             .iter()
@@ -574,7 +578,12 @@ where
     let capture = CaptureLoop {
         keys: config.streams.iter().copied().zip(keys).collect(),
         sink: Some(sink),
-        pipeline: Pipeline::new(&config.symbol, config.hold_back_ms, &config.seeds),
+        pipeline: Pipeline::new(
+            &config.symbol,
+            config.hold_back_ms,
+            config.oi_retime_ms,
+            &config.seeds,
+        ),
         observer,
         clock: Arc::clone(&clock),
         rx: inbound_rx,

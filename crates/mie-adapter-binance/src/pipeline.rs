@@ -4,8 +4,8 @@
 //! [`Pipeline`] has no clock and does no I/O. Its output is a pure function
 //! of its parameters and of the records it is given, in the order given:
 //!
-//! - the parameters of [`Pipeline::new`]: the symbol, `hold_back_ms` and
-//!   the per-stream seeds. They are **not** in the raw store: live capture
+//! - the parameters of [`Pipeline::new`]: the symbol, `hold_back_ms`,
+//!   `oi_retime_ms` (ADR-032 D12) and the per-stream seeds. They are **not** in the raw store: live capture
 //!   journals them in the run's `run_start` line, and a recompute must take
 //!   them from there, never from configuration defaults;
 //! - per record: the stream, the payload, the raw `event_time` and the
@@ -39,6 +39,9 @@ pub struct StreamStats {
     pub duplicates: u64,
     /// Trades dropped because their id fell below the last delivered one.
     pub regressions: u64,
+    /// Late samples delivered re-timed instead of as a gap (open interest,
+    /// ADR-032 D12).
+    pub retimed: u64,
     /// Delivered gaps on this stream, by reason.
     pub gaps: BTreeMap<GapReason, u64>,
     /// Largest distance in ms between the merge watermark and an event's
@@ -84,11 +87,13 @@ pub struct Pipeline {
 
 impl Pipeline {
     /// A pipeline for `symbol` with a hold-back of `hold_back_ms` exchange
-    /// milliseconds, seeded with the previous run's last persisted event time
-    /// per stream.
+    /// milliseconds, re-timing open interest that is late by at most
+    /// `oi_retime_ms` (ADR-032 D12), seeded with the previous run's last
+    /// persisted event time per stream.
     pub fn new(
         symbol: &str,
         hold_back_ms: i64,
+        oi_retime_ms: i64,
         seeds: &BTreeMap<BinanceStream, EventTime>,
     ) -> Self {
         let sequencers = BinanceStream::ALL
@@ -103,7 +108,7 @@ impl Pipeline {
         Self {
             symbol: symbol.to_owned(),
             sequencers,
-            holdback: HoldBack::new(hold_back_ms),
+            holdback: HoldBack::new(hold_back_ms, oi_retime_ms),
             stats: PipelineStats::default(),
         }
     }
@@ -146,8 +151,10 @@ impl Pipeline {
                 stats.max_lateness_ms = stats.max_lateness_ms.max(lateness);
             }
             let (admission, released) = self.holdback.push(event);
-            if admission == Admission::Duplicate {
-                self.stream_stats(stream).duplicates += 1;
+            match admission {
+                Admission::Duplicate => self.stream_stats(stream).duplicates += 1,
+                Admission::Retimed => self.stream_stats(stream).retimed += 1,
+                Admission::Buffered | Admission::Late => {}
             }
             self.count(&released);
             events.extend(released);
@@ -224,7 +231,7 @@ mod tests {
 
     #[test]
     fn normalize_errors_are_counted_and_do_not_stop_the_stream() {
-        let mut pipe = Pipeline::new("BTCUSDT", 0, &BTreeMap::new());
+        let mut pipe = Pipeline::new("BTCUSDT", 0, 0, &BTreeMap::new());
         let bad = pipe.push(BinanceStream::AggTrade, &record("s", 1, "{oops"));
         assert!(bad.error.is_some());
         // Trades get no stand-in gap: the next id break reports a loss.
@@ -256,7 +263,7 @@ mod tests {
 
     #[test]
     fn an_unparsable_idless_sample_becomes_an_in_band_missing_data_gap() {
-        let mut pipe = Pipeline::new("BTCUSDT", 0, &BTreeMap::new());
+        let mut pipe = Pipeline::new("BTCUSDT", 0, 0, &BTreeMap::new());
         let mut out = Vec::new();
         out.extend(
             pipe.push(
@@ -310,7 +317,7 @@ mod tests {
     #[test]
     fn seeds_and_sessions_become_counted_gaps() {
         let seeds = BTreeMap::from([(BinanceStream::AggTrade, EventTime::from_millis(500))]);
-        let mut pipe = Pipeline::new("BTCUSDT", 0, &seeds);
+        let mut pipe = Pipeline::new("BTCUSDT", 0, 0, &seeds);
         let mut out = Vec::new();
         for (i, (session, id, time)) in [("a", 1, 1_000), ("a", 2, 1_100), ("b", 3, 5_000)]
             .into_iter()

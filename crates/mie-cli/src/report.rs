@@ -18,7 +18,8 @@
 //! 4. **Journal totals**: no normalize errors, no domain rejections, no
 //!    time fallbacks, and every journal line parses.
 //! 5. **Lateness**: per stream, the `LateEvent` gaps against the events
-//!    delivered, from each run's final counters (`run_end`, else its last
+//!    delivered (open interest re-timed within its allowance counts as
+//!    delivered, ADR-032 D12), from each run's final counters (`run_end`, else its last
 //!    `stats` line). A stream fails when its late fraction
 //!    `late / (events + late)` exceeds `max_late_fraction` (default 0: the
 //!    hold-back is sized so that nothing is late, ADR-032).
@@ -370,6 +371,7 @@ fn check_trade_ids(run: &str, rows: &[Row], journal: &RunJournal, problems: &mut
 #[derive(Default)]
 struct Delivery {
     events: u64,
+    retimed: u64,
     gaps: BTreeMap<String, u64>,
     max_lateness_ms: i64,
 }
@@ -390,6 +392,7 @@ fn check_lateness(
         for (name, s) in counters {
             let d = streams.entry(name.clone()).or_default();
             d.events += s["events"].as_u64().unwrap_or(0);
+            d.retimed += s["retimed"].as_u64().unwrap_or(0);
             d.max_lateness_ms = d
                 .max_lateness_ms
                 .max(s["max_lateness_ms"].as_i64().unwrap_or(0));
@@ -400,8 +403,8 @@ fn check_lateness(
     }
     writeln!(
         out,
-        "{:<14} {:>10} {:>8} {:>7} {:>13}  gaps by reason",
-        "stream", "events", "late", "late%", "max_late_ms"
+        "{:<14} {:>10} {:>8} {:>8} {:>7} {:>13}  gaps by reason",
+        "stream", "events", "retimed", "late", "late%", "max_late_ms"
     )
     .map_err(io)?;
     for (name, d) in &streams {
@@ -414,8 +417,9 @@ fn check_lateness(
         let gaps: Vec<String> = d.gaps.iter().map(|(r, n)| format!("{r}={n}")).collect();
         writeln!(
             out,
-            "{name:<14} {:>10} {late:>8} {:>6.2}% {:>13}  {}",
+            "{name:<14} {:>10} {:>8} {late:>8} {:>6.2}% {:>13}  {}",
             d.events,
+            d.retimed,
             fraction * 100.0,
             d.max_lateness_ms,
             if gaps.is_empty() {

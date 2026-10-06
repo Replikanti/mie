@@ -42,7 +42,7 @@ fn load(name: &str) -> Vec<(BinanceStream, RawRecord)> {
 }
 
 fn run(records: &[(BinanceStream, RawRecord)]) -> (Vec<MarketEvent>, Pipeline) {
-    let mut pipeline = Pipeline::new("BTCUSDT", HOLD_BACK_MS, &BTreeMap::new());
+    let mut pipeline = Pipeline::new("BTCUSDT", HOLD_BACK_MS, 10_000, &BTreeMap::new());
     let mut out = Vec::new();
     for (stream, record) in records {
         out.extend(pipeline.push(*stream, record).events);

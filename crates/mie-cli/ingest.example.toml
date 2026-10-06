@@ -28,6 +28,10 @@ streams = ["aggTrade", "markPrice", "forceOrder", "kline_1m", "openInterest"]
 seal_interval_secs = 300
 # Canonical merge hold-back in exchange milliseconds (ADR-028 D6).
 hold_back_ms = 2000
+# Open interest's REST `time` trails the poll by seconds. A sample late by
+# up to this much is delivered at the first open millisecond instead of
+# becoming a LateEvent gap (ADR-032 D12). One poll interval.
+oi_retime_allowance_ms = 10000
 # Planned reconnect of the first stream, before the exchange's 24 h limit;
 # each later stream rotates rotation_stagger_secs later.
 max_connection_age_secs = 82800

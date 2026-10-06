@@ -14,8 +14,18 @@
 //! released event, so the gap sorts after it (ADR-028 D6). A late gap keeps
 //! its own reason and start. The output is strictly increasing by
 //! construction.
+//!
+//! **Open-interest re-timing (ADR-032 D12).** Open interest is a sampled
+//! state observation, and its REST `time` trails the poll by several
+//! seconds. A late `OpenInterest` whose slot passed by no more than
+//! `oi_retime_ms` (`last released + 1 − its time`) is not replaced by a gap.
+//! It is delivered at `last released + 1` instead: the first millisecond
+//! still open, so the order stays strictly increasing. Its value then
+//! becomes valid later than the exchange stamped it, never earlier (ADR-028:
+//! never a validity time before publication). Anything later than the
+//! allowance is a `LateEvent` gap as usual.
 
-use mie_domain::event::{FeedGap, GapReason, MarketEvent};
+use mie_domain::event::{FeedGap, GapReason, MarketEvent, OpenInterest};
 use mie_domain::time::EventTime;
 use std::collections::BTreeSet;
 
@@ -28,23 +38,29 @@ pub enum Admission {
     Duplicate,
     /// Replaced by a `LateEvent` gap (or, for a gap, re-timed).
     Late,
+    /// A late open-interest sample, delivered at the first open
+    /// millisecond instead (within the re-time allowance).
+    Retimed,
 }
 
 /// The canonical merge buffer.
 #[derive(Debug, Clone)]
 pub struct HoldBack {
     hold_back_ms: i64,
+    oi_retime_ms: i64,
     buffer: BTreeSet<MarketEvent>,
     watermark: Option<EventTime>,
     last_released: Option<MarketEvent>,
 }
 
 impl HoldBack {
-    /// A buffer that holds events back by `hold_back_ms` of exchange time.
+    /// A buffer that holds events back by `hold_back_ms` of exchange time
+    /// and re-times open interest that is late by at most `oi_retime_ms`.
     /// Negative values count as zero.
-    pub fn new(hold_back_ms: i64) -> Self {
+    pub fn new(hold_back_ms: i64, oi_retime_ms: i64) -> Self {
         Self {
             hold_back_ms: hold_back_ms.max(0),
+            oi_retime_ms: oi_retime_ms.max(0),
             buffer: BTreeSet::new(),
             watermark: None,
             last_released: None,
@@ -74,7 +90,12 @@ impl HoldBack {
         }
         let (admission, admitted) = match &self.last_released {
             Some(last) if event == *last => (Admission::Duplicate, None),
-            Some(last) if event < *last => (Admission::Late, Some(late_gap(&event, last))),
+            Some(last) if event < *last => {
+                match retimed_open_interest(&event, last, self.oi_retime_ms) {
+                    Some(retimed) => (Admission::Retimed, Some(retimed)),
+                    None => (Admission::Late, Some(late_gap(&event, last))),
+                }
+            }
             _ => (Admission::Buffered, Some(event)),
         };
         let inserted = admitted.is_some_and(|admitted| self.buffer.insert(admitted));
@@ -113,6 +134,25 @@ impl HoldBack {
         }
         out
     }
+}
+
+/// `event` delivered at `last + 1 ms`, if it is open interest whose slot
+/// passed by at most `allowance_ms`.
+fn retimed_open_interest(
+    event: &MarketEvent,
+    last: &MarketEvent,
+    allowance_ms: i64,
+) -> Option<MarketEvent> {
+    let MarketEvent::OpenInterest(oi) = event else {
+        return None;
+    };
+    let open = last.time().as_millis().saturating_add(1);
+    (open.saturating_sub(oi.time.as_millis()) <= allowance_ms).then(|| {
+        MarketEvent::OpenInterest(OpenInterest {
+            time: EventTime::from_millis(open),
+            ..*oi
+        })
+    })
 }
 
 /// The gap that replaces `event`, which sorts at or below `last`.
@@ -281,7 +321,7 @@ mod tests {
             // positions (about 140 ms of trades), well inside 2000 ms.
             let arrivals = jitter(&sorted, seed, 20);
             assert_ne!(arrivals, sorted, "seed {seed} permutes nothing");
-            let out = run(&mut HoldBack::new(2_000), arrivals);
+            let out = run(&mut HoldBack::new(2_000, 0), arrivals);
             assert_eq!(out, sorted, "seed {seed}");
             assert_engine_accepts(&out);
         }
@@ -289,7 +329,7 @@ mod tests {
 
     #[test]
     fn release_follows_the_exchange_time_watermark() {
-        let mut hold = HoldBack::new(1_000);
+        let mut hold = HoldBack::new(1_000, 0);
         assert_eq!(hold.push(trade(1_000, 1)), (Admission::Buffered, vec![]));
         assert_eq!(hold.push(trade(1_999, 2)).1, vec![]);
         // 1000 < 2001 - 1000: due.
@@ -307,7 +347,7 @@ mod tests {
 
     #[test]
     fn events_later_than_the_hold_back_become_late_gaps() {
-        let mut hold = HoldBack::new(1_000);
+        let mut hold = HoldBack::new(1_000, 0);
         let mut out = Vec::new();
         out.extend(hold.push(trade(1_000, 1)).1);
         out.extend(hold.push(trade(3_000, 2)).1);
@@ -330,7 +370,7 @@ mod tests {
 
     #[test]
     fn a_late_gap_keeps_its_reason() {
-        let mut hold = HoldBack::new(0);
+        let mut hold = HoldBack::new(0, 0);
         hold.push(trade(1_000, 1));
         assert_eq!(hold.push(trade(2_000, 2)).1, vec![trade(1_000, 1)]);
         let late = gap(Stream::Trades, 400, 900, GapReason::SequenceBreak);
@@ -349,7 +389,7 @@ mod tests {
         sorted.sort();
         for seed in 1..=10 {
             let arrivals = jitter(&sorted, seed, 60);
-            let out = run(&mut HoldBack::new(100), arrivals);
+            let out = run(&mut HoldBack::new(100, 0), arrivals);
             assert!(out.windows(2).all(|w| w[0] < w[1]), "seed {seed}");
             assert_engine_accepts(&out);
             let late = out
@@ -363,8 +403,49 @@ mod tests {
     }
 
     #[test]
+    fn late_open_interest_is_retimed_within_the_allowance() {
+        let mut hold = HoldBack::new(2_000, 10_000);
+        let mut out = Vec::new();
+        for millis in (0..=10_000).step_by(1_000) {
+            out.extend(hold.push(mark(millis)).1);
+        }
+        // Released up to 7000. A sample stamped 3000 (7 s behind the
+        // watermark) is delivered at 7001 rather than lost.
+        assert_eq!(out.last(), Some(&mark(7_000)));
+        let (admission, released) = hold.push(open_interest(3_000));
+        assert_eq!(admission, Admission::Retimed);
+        assert_eq!(released, vec![open_interest(7_001)]);
+        out.extend(released);
+        // Beyond the allowance: 7001 - (-5000) > 10 000 ms.
+        let (admission, released) = hold.push(open_interest(-5_000));
+        assert_eq!(admission, Admission::Late);
+        assert_eq!(
+            released,
+            vec![gap(
+                Stream::OpenInterest,
+                -5_000,
+                7_002,
+                GapReason::LateEvent
+            )]
+        );
+        out.extend(released);
+        out.extend(hold.finish());
+        assert!(out.windows(2).all(|w| w[0] < w[1]));
+        assert_engine_accepts(&out);
+        // Only open interest is re-timed; other kinds still become gaps.
+        let (admission, _) = hold.push(mark(1));
+        assert_eq!(admission, Admission::Late);
+        // With no allowance the sample is a gap.
+        let mut strict = HoldBack::new(2_000, 0);
+        for millis in (0..=10_000).step_by(1_000) {
+            strict.push(mark(millis));
+        }
+        assert_eq!(strict.push(open_interest(3_000)).0, Admission::Late);
+    }
+
+    #[test]
     fn buffered_duplicates_are_dropped() {
-        let mut hold = HoldBack::new(1_000);
+        let mut hold = HoldBack::new(1_000, 0);
         assert_eq!(hold.push(mark(1_000)).0, Admission::Buffered);
         assert_eq!(hold.push(mark(1_000)).0, Admission::Duplicate);
         assert_eq!(hold.finish(), vec![mark(1_000)]);

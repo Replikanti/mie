@@ -923,11 +923,13 @@ fn recompute(
     records: &[(RawStreamKey, RawRecord)],
     symbol: &str,
     hold_back_ms: i64,
+    oi_retime_ms: i64,
     seeds: &BTreeMap<BinanceStream, EventTime>,
 ) -> Vec<MarketEvent> {
     let mut sorted: Vec<_> = records.to_vec();
     sorted.sort_by_key(|(_, r)| r.capture.as_ref().unwrap().receive_seq);
-    let mut pipeline = mie_adapter_binance::Pipeline::new(symbol, hold_back_ms, seeds);
+    let mut pipeline =
+        mie_adapter_binance::Pipeline::new(symbol, hold_back_ms, oi_retime_ms, seeds);
     let mut out = Vec::new();
     for (key, record) in &sorted {
         let stream = BinanceStream::from_raw_name(key.stream()).unwrap();
@@ -1015,11 +1017,23 @@ fn recomputing_from_the_sink_with_the_run_parameters_reproduces_live_output() {
     );
 
     // The raw records plus the run parameters reproduce it exactly.
-    let replayed = recompute(&records, &params.symbol, params.hold_back_ms, &params.seeds);
+    let replayed = recompute(
+        &records,
+        &params.symbol,
+        params.hold_back_ms,
+        params.oi_retime_ms,
+        &params.seeds,
+    );
     assert_eq!(replayed, out.events);
 
     // The parameters are inputs: other values give other output.
-    let longer = recompute(&records, &params.symbol, 60_000, &params.seeds);
+    let longer = recompute(
+        &records,
+        &params.symbol,
+        60_000,
+        params.oi_retime_ms,
+        &params.seeds,
+    );
     assert_ne!(longer, out.events);
     assert!(
         !longer
@@ -1031,7 +1045,193 @@ fn recomputing_from_the_sink_with_the_run_parameters_reproduces_live_output() {
         &records,
         &params.symbol,
         params.hold_back_ms,
+        params.oi_retime_ms,
         &BTreeMap::new(),
     );
     assert_ne!(unseeded, out.events);
+}
+
+/// Mark prices every second, each sent once the clock reaches its `E`.
+/// `sent_upto` is the `E` of the last frame the capture has been handed.
+struct PacedMarks {
+    next: i64,
+    end: i64,
+    clock: Arc<FakeClock>,
+    sent_upto: Arc<std::sync::atomic::AtomicI64>,
+    pending: Option<i64>,
+}
+
+impl WsConnection for PacedMarks {
+    fn read(&mut self) -> ReadOutcome {
+        // The previous frame has been sent by now.
+        if let Some(sent) = self.pending.take() {
+            self.sent_upto.store(sent, Ordering::SeqCst);
+        }
+        if self.next <= self.end && self.next <= self.clock.now_utc_ns() / MS {
+            let e = self.next;
+            self.next += 1_000;
+            self.pending = Some(e);
+            return ReadOutcome::Frame(mark(e).into_bytes());
+        }
+        std::thread::sleep(Duration::from_millis(1));
+        ReadOutcome::Control
+    }
+
+    fn ping(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn close(&mut self) {}
+}
+
+struct PacedConnector(Mutex<Option<PacedMarks>>);
+
+impl WsConnector for PacedConnector {
+    fn connect(&self, _url: &str) -> Result<Box<dyn WsConnection>, String> {
+        let marks = self.0.lock().unwrap().take().ok_or("script exhausted")?;
+        Ok(Box::new(marks))
+    }
+}
+
+/// Answers each poll at slot `S` with an open-interest `time` of `S - lag`,
+/// once every mark price up to `S` was handed to the capture.
+struct LaggedOi {
+    lags_ms: Mutex<VecDeque<i64>>,
+    clock: Arc<FakeClock>,
+    sent_upto: Arc<std::sync::atomic::AtomicI64>,
+    shutdown: Arc<AtomicBool>,
+}
+
+impl HttpGet for LaggedOi {
+    fn get(&self, _url: &str) -> Result<(u16, Vec<u8>), String> {
+        let slot = self.clock.now_utc_ns() / MS;
+        let Some(lag) = self.lags_ms.lock().unwrap().pop_front() else {
+            self.shutdown.store(true, Ordering::Relaxed);
+            return Err("script exhausted".to_owned());
+        };
+        while self.sent_upto.load(Ordering::SeqCst) < slot {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        self.clock.advance(Duration::from_millis(37));
+        Ok((200, oi(slot - lag).into_bytes()))
+    }
+}
+
+/// A capture of mark prices plus open interest polled with `lags_ms`.
+fn lagged_oi_run(lags_ms: &[i64]) -> (Outcome, LiveConfig) {
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let clock = FakeClock::new(D0 + 3_000, "mie-openInterest");
+    let sent_upto = Arc::new(std::sync::atomic::AtomicI64::new(0));
+    let marks = PacedMarks {
+        next: D0 + 3_000,
+        end: D0 + 200_000,
+        clock: Arc::clone(&clock),
+        sent_upto: Arc::clone(&sent_upto),
+        pending: None,
+    };
+    let http = Arc::new(LaggedOi {
+        lags_ms: Mutex::new(lags_ms.iter().copied().collect()),
+        clock: Arc::clone(&clock),
+        sent_upto,
+        shutdown: Arc::clone(&shutdown),
+    });
+    let connector = Arc::new(PacedConnector(Mutex::new(Some(marks))));
+    // The shipped defaults: 2000 ms hold-back, 10 000 ms re-time allowance.
+    let mut cfg = config(&[BinanceStream::MarkPrice, BinanceStream::OpenInterest]);
+    cfg.hold_back_ms = LiveConfig::new("r").hold_back_ms;
+    cfg.oi_retime_ms = LiveConfig::new("r").oi_retime_ms;
+    let params = cfg.clone();
+    let sink_log = Arc::new(Mutex::new(SinkLog::default()));
+    let recorder = Recorder::default();
+    let (mut provider, handle) = start(
+        cfg,
+        MemorySink {
+            log: Arc::clone(&sink_log),
+            fail_at: None,
+        },
+        connector,
+        http,
+        clock,
+        Box::new(recorder.clone()),
+        shutdown,
+    )
+    .expect("start");
+    let mut events = Vec::new();
+    let provider_error = loop {
+        match provider.next_event() {
+            Ok(Some(event)) => events.push(event),
+            Ok(None) => break None,
+            Err(error) => break Some(error),
+        }
+    };
+    drop(provider);
+    let joined = handle.join();
+    let observed = recorder.0.lock().unwrap().clone();
+    let outcome = Outcome {
+        events,
+        provider_error,
+        joined,
+        observed,
+        sink: sink_log,
+    };
+    (outcome, params)
+}
+
+fn open_interest_times(events: &[MarketEvent]) -> Vec<i64> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            MarketEvent::OpenInterest(oi) => Some(oi.time.as_millis() - D0),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn open_interest_lagging_the_poll_is_delivered_at_the_defaults() {
+    // The live lag range: 4 to 8 s behind the poll.
+    let (out, params) = lagged_oi_run(&[4_200, 6_000, 7_900, 5_100, 4_000, 7_000]);
+    assert!(out.provider_error.is_none());
+    assert_eq!(params.oi_retime_ms, 10_000);
+    // Every sample reaches the core, re-timed to the first open millisecond
+    // after the last released event (a mark price at slot - 3000).
+    assert_eq!(
+        open_interest_times(&out.events),
+        [7_001, 17_001, 27_001, 37_001, 47_001, 57_001]
+    );
+    assert!(out.gaps().is_empty(), "{:?}", out.gaps());
+    let (_, summary) = out.joined.as_ref().expect("clean capture");
+    let oi_stats = &summary.stats.pipeline.streams[&BinanceStream::OpenInterest];
+    assert_eq!((oi_stats.events, oi_stats.retimed), (6, 6));
+    assert!(oi_stats.max_lateness_ms >= 7_900);
+
+    // The raw records plus the run parameters reproduce it; without the
+    // allowance the same records give LateEvent gaps instead.
+    let records = out.sink.lock().unwrap().records.clone();
+    let replayed = recompute(
+        &records,
+        &params.symbol,
+        params.hold_back_ms,
+        params.oi_retime_ms,
+        &params.seeds,
+    );
+    assert_eq!(replayed, out.events);
+    let strict = recompute(
+        &records,
+        &params.symbol,
+        params.hold_back_ms,
+        0,
+        &params.seeds,
+    );
+    assert_ne!(strict, out.events);
+    assert!(open_interest_times(&strict).is_empty());
+}
+
+#[test]
+fn open_interest_later_than_the_allowance_is_still_a_late_gap() {
+    // The third sample trails its poll by 15 s: 12 s past the last
+    // released event, beyond the 10 s allowance.
+    let (out, _) = lagged_oi_run(&[5_000, 6_000, 15_000, 5_000]);
+    assert_eq!(open_interest_times(&out.events), [7_001, 17_001, 37_001]);
+    assert_eq!(out.gaps(), [(Stream::OpenInterest, GapReason::LateEvent)]);
 }

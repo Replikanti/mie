@@ -142,7 +142,13 @@ fn the_raw_store_plus_run_start_reproduces_the_journaled_gaps() {
             })
             .collect();
         run.sort_by_key(|r| r.capture.as_ref().unwrap().receive_seq);
-        let mut pipeline = Pipeline::new(&params.symbol, params.hold_back_ms, &params.seeds);
+        assert_eq!(params.oi_retime_ms, 10_000);
+        let mut pipeline = Pipeline::new(
+            &params.symbol,
+            params.hold_back_ms,
+            params.oi_retime_ms,
+            &params.seeds,
+        );
         let mut events = Vec::new();
         for record in run {
             events.extend(pipeline.push(BinanceStream::AggTrade, record).events);

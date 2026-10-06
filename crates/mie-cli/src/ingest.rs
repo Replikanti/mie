@@ -127,6 +127,7 @@ pub fn run(
             "source": config.instrument.source,
             "streams": streams.iter().map(|s| s.raw_name()).collect::<Vec<_>>(),
             "hold_back_ms": config.capture.hold_back_ms,
+            "oi_retime_ms": config.capture.oi_retime_allowance_ms,
             "seal_interval_secs": config.capture.seal_interval_secs,
             "seeds": seeds
                 .iter()
