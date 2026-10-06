@@ -57,6 +57,9 @@ journal = "{}"
 ws_base_url = "wss://fake.invalid/ws"
 rest_base_url = "https://fake.invalid"
 streams = ["aggTrade"]
+
+[capture]
+hold_back_ms = 750
 "#,
         dir.join("raw").display(),
         dir.join("journal.jsonl").display()

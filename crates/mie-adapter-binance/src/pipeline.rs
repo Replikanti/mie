@@ -2,12 +2,20 @@
 //! continuity and the canonical merge, composed.
 //!
 //! [`Pipeline`] has no clock and does no I/O. Its output is a pure function
-//! of the records it is given, in the order given: the payload, the stream
-//! and the capture session of each record. Live capture feeds it records in
-//! processing order right after persisting them, so replay (#11) and the
-//! equivalence harness (#13) recompute exactly what live delivered — feed
-//! gaps and late-event gaps included — from the raw store, ordered by
-//! `receive_seq`.
+//! of its parameters and of the records it is given, in the order given:
+//!
+//! - the parameters of [`Pipeline::new`]: the symbol, `hold_back_ms` and
+//!   the per-stream seeds. They are **not** in the raw store: live capture
+//!   journals them in the run's `run_start` line, and a recompute must take
+//!   them from there, never from configuration defaults;
+//! - per record: the stream, the payload, the raw `event_time` and the
+//!   capture `session_id`.
+//!
+//! Live capture feeds it records in processing order right after persisting
+//! them. So replay (#11) and the equivalence harness (#13) recompute exactly
+//! what live delivered — feed gaps and late-event gaps included — from the
+//! raw store, ordered by `receive_seq` within a run, plus that run's
+//! `run_start` parameters.
 
 use crate::holdback::{Admission, HoldBack};
 use crate::normalize::{self, NormalizeError};
@@ -55,6 +63,16 @@ impl PipelineStats {
     }
 }
 
+/// What one [`Pipeline::push`] produced.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Pushed {
+    /// The events now due, in canonical order.
+    pub events: Vec<MarketEvent>,
+    /// Why the record did not normalize, if it did not. It is counted, and
+    /// on an id-less stream a `MissingData` gap stands in for it.
+    pub error: Option<NormalizeError>,
+}
+
 /// The deterministic core of live capture and replay.
 #[derive(Debug, Clone)]
 pub struct Pipeline {
@@ -94,36 +112,31 @@ impl Pipeline {
     /// canonical order. The session is the record's capture `session_id`
     /// (empty for archive records).
     ///
-    /// # Errors
-    ///
-    /// The [`NormalizeError`] of a record that does not normalize. It is
-    /// counted, and the pipeline stays usable: the next record continues
-    /// normally.
-    pub fn push(
-        &mut self,
-        stream: BinanceStream,
-        record: &RawRecord,
-    ) -> Result<Vec<MarketEvent>, NormalizeError> {
+    /// A record that does not normalize is counted and reported in
+    /// [`Pushed::error`]; the pipeline stays usable. On an id-less stream
+    /// (everything but trades) the lost sample becomes a `MissingData` gap
+    /// ending at the record's raw `event_time`, so the loss is visible in
+    /// band. On trades the next trade-id break reports it.
+    pub fn push(&mut self, stream: BinanceStream, record: &RawRecord) -> Pushed {
         self.stream_stats(stream).records += 1;
-        let parsed = normalize::parse(stream, &self.symbol, &record.payload);
-        let event = match parsed {
-            Ok(Some(event)) => event,
-            Ok(None) => return Ok(Vec::new()),
-            Err(error) => {
-                self.stream_stats(stream).normalize_errors += 1;
-                return Err(error);
-            }
-        };
         let session = record
             .capture
             .as_ref()
             .map_or("", |capture| capture.session_id.as_str());
-        let sequenced = self
-            .sequencers
-            .get_mut(&stream)
-            .map(|seq| seq.push(session, event))
-            .unwrap_or_default();
-        let mut out = Vec::new();
+        let Some(seq) = self.sequencers.get_mut(&stream) else {
+            return Pushed::default();
+        };
+        let (sequenced, error) = match normalize::parse(stream, &self.symbol, &record.payload) {
+            Ok(Some(event)) => (seq.push(session, event), None),
+            Ok(None) => (Vec::new(), None),
+            Err(error) => {
+                let gap =
+                    (stream != BinanceStream::AggTrade).then(|| seq.missing(record.event_time));
+                self.stream_stats(stream).normalize_errors += 1;
+                (gap.into_iter().collect(), Some(error))
+            }
+        };
+        let mut events = Vec::new();
         for event in sequenced {
             if let Some(watermark) = self.holdback.watermark() {
                 let lateness = watermark
@@ -137,9 +150,9 @@ impl Pipeline {
                 self.stream_stats(stream).duplicates += 1;
             }
             self.count(&released);
-            out.extend(released);
+            events.extend(released);
         }
-        Ok(out)
+        Pushed { events, error }
     }
 
     /// Releases every buffered event, in canonical order.
@@ -212,15 +225,14 @@ mod tests {
     #[test]
     fn normalize_errors_are_counted_and_do_not_stop_the_stream() {
         let mut pipe = Pipeline::new("BTCUSDT", 0, &BTreeMap::new());
-        assert!(
-            pipe.push(BinanceStream::AggTrade, &record("s", 1, "{oops"))
-                .is_err()
-        );
-        pipe.push(BinanceStream::AggTrade, &record("s", 2, &agg(1, 1_000)))
-            .unwrap();
+        let bad = pipe.push(BinanceStream::AggTrade, &record("s", 1, "{oops"));
+        assert!(bad.error.is_some());
+        // Trades get no stand-in gap: the next id break reports a loss.
+        assert!(bad.events.is_empty());
+        pipe.push(BinanceStream::AggTrade, &record("s", 2, &agg(1, 1_000)));
         let out = pipe
             .push(BinanceStream::AggTrade, &record("s", 3, &agg(2, 1_001)))
-            .unwrap();
+            .events;
         assert_eq!(out.len(), 1);
         let stats = pipe.stats();
         let agg_stats = &stats.streams[&BinanceStream::AggTrade];
@@ -229,6 +241,70 @@ mod tests {
         assert_eq!(pipe.buffered(), 1);
         assert_eq!(pipe.finish().len(), 1);
         assert_eq!(pipe.stats().streams[&BinanceStream::AggTrade].events, 2);
+    }
+
+    fn mark(time: i64) -> String {
+        format!(
+            r#"{{"e":"markPriceUpdate","E":{time},"s":"BTCUSDT","p":"85001.00000000","i":"85002.50000000","r":"0.00010000","T":1791273600000}}"#
+        )
+    }
+
+    fn at(mut record: RawRecord, millis: i64) -> RawRecord {
+        record.event_time = EventTime::from_millis(millis);
+        record
+    }
+
+    #[test]
+    fn an_unparsable_idless_sample_becomes_an_in_band_missing_data_gap() {
+        let mut pipe = Pipeline::new("BTCUSDT", 0, &BTreeMap::new());
+        let mut out = Vec::new();
+        out.extend(
+            pipe.push(
+                BinanceStream::MarkPrice,
+                &at(record("s", 0, &mark(1_000)), 1_000),
+            )
+            .events,
+        );
+        // A decimal sent as a number: the 2000 ms sample is lost. The raw
+        // record still carries its ordering time.
+        let broken = mark(2_000).replace(r#""p":"85001.00000000""#, r#""p":85001.0"#);
+        let pushed = pipe.push(
+            BinanceStream::MarkPrice,
+            &at(record("s", 1, &broken), 2_000),
+        );
+        assert!(matches!(pushed.error, Some(NormalizeError::Json(_))));
+        out.extend(pushed.events);
+        out.extend(
+            pipe.push(
+                BinanceStream::MarkPrice,
+                &at(record("s", 2, &mark(3_000)), 3_000),
+            )
+            .events,
+        );
+        out.extend(pipe.finish());
+        let gaps: Vec<_> = out
+            .iter()
+            .filter_map(|e| match e {
+                MarketEvent::FeedGap(g) => {
+                    Some((g.stream, g.start.as_millis(), g.end.as_millis(), g.reason))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            gaps,
+            [(Stream::MarkPrice, 1_000, 2_000, GapReason::MissingData)]
+        );
+        assert_eq!(out.len(), 3);
+        let mut engine = mie_domain::state::MarketStateEngine::new();
+        for event in &out {
+            engine.apply(event).unwrap();
+        }
+        let stats = pipe.stats();
+        let mark_stats = &stats.streams[&BinanceStream::MarkPrice];
+        assert_eq!(mark_stats.normalize_errors, 1);
+        assert_eq!(mark_stats.gaps[&GapReason::MissingData], 1);
+        assert_eq!(mark_stats.events, 2);
     }
 
     #[test]
@@ -245,7 +321,7 @@ mod tests {
                     BinanceStream::AggTrade,
                     &record(session, i as u64, &agg(id, time)),
                 )
-                .unwrap(),
+                .events,
             );
         }
         out.extend(pipe.finish());

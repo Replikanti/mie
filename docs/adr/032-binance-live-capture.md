@@ -18,7 +18,7 @@ fix most of the frame:
   (ADR-030).
 - Live and replay share one normalization (ADR-019), so replay (#11) and
   the equivalence harness (#13) must be able to recompute what live
-  delivered from the raw store alone.
+  delivered from persisted inputs.
 
 Binance closes every WebSocket connection after 24 h, throttles
 liquidation snapshots to one per second per symbol, and publishes open
@@ -48,9 +48,21 @@ interest over REST only.
    UTC start second, written `YYYYMMDDTHHMMSSZ`. For open interest, the
    ordinal grows after every failed poll. `receive_seq` orders the records
    of one run. The deterministic `Pipeline` (normalize → per-stream
-   sequencer → hold-back merge) is a pure function of the records in
-   `receive_seq` order. Their payload, stream and `session_id` determine
-   everything it delivers, gaps included.
+   sequencer → hold-back merge) is a pure function of two inputs:
+   - the run's records in `receive_seq` order: stream, payload, raw
+     `event_time` and `session_id`, all in the raw store;
+   - the run's parameters: `symbol`, `hold_back_ms` and the per-stream
+     seeds. They are **not** in the raw store. The journal's `run_start`
+     line records them, and the seeds also depend on what was sealed when
+     the run started.
+
+   A recompute of live output (replay #11, the equivalence harness #13)
+   therefore reads the raw store **plus** the run's `run_start` parameters
+   (`mie_cli::journal::RunParameters`). It never uses configuration
+   defaults: the same records with another hold-back or other seeds give
+   different output. A test recomputes the pipeline from the persisted
+   records and the run parameters and checks it against what the provider
+   delivered.
 5. **Gap rules**, per stream:
    - a session change always yields `Disconnected` [last delivered, first
      resumed], even when the trade ids happen to be contiguous;
@@ -60,7 +72,12 @@ interest over REST only.
      the last 7 days, so its first event yields `Disconnected` from there.
      This makes every restart, and the crash loss of ADR-030 D5, a gap;
    - a trade whose id is at or below the last one delivered is dropped. An
-     id-less event is dropped only when it exactly repeats the last one.
+     id-less event is dropped only when it exactly repeats the last one;
+   - a record of an id-less stream (mark price, liquidation, kline, open
+     interest) that fails normalization yields `MissingData` [last
+     delivered, the record's raw `event_time`]. The lost sample is then
+     visible in the event stream, not only in the journal. On trades, the
+     next id break already reports a lost trade.
 6. **Hold-back of 2000 ms** of exchange time. The watermark is the highest
    ordering time pushed so far, gaps excluded. It never uses the wall clock.
    An event is released once it is more than the hold-back older than the
@@ -88,7 +105,13 @@ interest over REST only.
 11. **The journal.** Lifecycle, gaps, seals, normalize errors, stats
     (channel high-water marks and blocked time), domain rejections and a
     `run_end` summary are written as JSON Lines. `mie capture-report`
-    verifies a window against it.
+    verifies a window against it. Among its checks, it reports `LateEvent`
+    count, late fraction (`late / (events + late)`) and maximum lateness
+    per stream. It fails when a stream's late fraction exceeds
+    `--max-late-fraction`, which defaults to **0**. The hold-back exists
+    so that nothing is late, so any late event means the hold-back is too
+    small for that stream. A tolerance is a conscious choice made on the
+    command line, not a default.
 
 ### Documentation check (2026-10-06)
 
@@ -120,8 +143,9 @@ probes made on 2026-10-06. The connector is `binance-connector-js`, with
   response `time` trailed the poll by 3.8 to 7.9 s (maximum lateness
   7943 ms). With a 2000 ms hold-back, all 12 live samples became
   `LateEvent` gaps. The raw samples are persisted, and replay is not
-  affected. The live core, however, sees no open interest until the soak
-  settles one of these options:
+  affected. The live core, however, sees no open interest, and
+  `mie capture-report` fails on it at its default limit. That holds until
+  the soak settles one of these options:
   - a hold-back of at least 10 000 ms, which is a configuration change
     (`capture.hold_back_ms`) that delays every live event;
   - a per-stream rule for open interest, which needs a superseding ADR
@@ -130,8 +154,9 @@ probes made on 2026-10-06. The connector is `binance-connector-js`, with
 ## Consequences
 
 - Live and replay normalize the same bytes with the same code. Replay can
-  recompute the live output, gaps included, from the raw store and its
-  `receive_seq`. One outage costs one stream, not all of them.
+  recompute the live output, gaps included, from the raw store in
+  `receive_seq` order plus the run's `run_start` parameters (D4). The raw
+  store alone is not enough. One outage costs one stream, not all of them.
 - No async runtime, no executor scheduling, no `rand`. Tests drive every
   loop with scripted transports and a fake clock.
 - Five connections and six threads per capture. That is fine for one
@@ -168,8 +193,9 @@ probes made on 2026-10-06. The connector is `binance-connector-js`, with
 
 A ≥ 24 h live soak of the merged `mie ingest` finishes. It includes the
 staggered 23 h reconnects and one deliberate restart. `mie capture-report`
-must print `PASS` over the window. The soak's numbers, posted on #9, settle
-the remaining values:
+must print `PASS` over the window with the default
+`--max-late-fraction 0`. The soak's numbers, posted on #9, settle the
+remaining values:
 
 - messages per second per stream (p50 and p99);
 - channel high-water marks and blocked time;

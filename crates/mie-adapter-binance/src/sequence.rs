@@ -16,6 +16,10 @@
 //! - **Seed**: the first event of a run is preceded by a `Disconnected` gap
 //!   from the previous run's last persisted event time, which turns any
 //!   restart (and the crash loss of ADR-030 D5) into a gap.
+//! - **Unparsable sample**: a record of an id-less stream that fails
+//!   normalization is replaced by a `MissingData` gap
+//!   ([`StreamSequencer::missing`]), so the lost sample is visible in band.
+//!   On trades the next id break already reports a lost trade.
 //!
 //! A gap is ordered at its `end`, the time of the event it precedes, and
 //! ranks first in that millisecond (ADR-028 D4). Gap starts are clamped to
@@ -132,6 +136,23 @@ impl StreamSequencer {
     /// Trades dropped because their id fell below the last delivered id.
     pub fn regressions(&self) -> u64 {
         self.regressions
+    }
+
+    /// The gap that stands in for a record of this stream that failed
+    /// normalization: `MissingData` from the last delivered event (else the
+    /// seed, else `end`) to `end`, the record's raw event time. The
+    /// sequencer's state does not change.
+    pub fn missing(&self, end: EventTime) -> MarketEvent {
+        let start = self
+            .last_time()
+            .or(self.seed.map(|seed| seed.last_event_time))
+            .unwrap_or(end);
+        MarketEvent::FeedGap(FeedGap {
+            stream: self.stream,
+            start: start.min(end),
+            end,
+            reason: GapReason::MissingData,
+        })
     }
 
     /// Ordering time of the last delivered event.
@@ -266,6 +287,40 @@ mod tests {
             gap(Stream::Klines, 1_000, 1_000, GapReason::Disconnected)
         );
         assert_eq!(seq.last_time(), Some(t(1_000)));
+    }
+
+    #[test]
+    fn a_lost_sample_is_a_missing_data_gap_from_the_last_event() {
+        let mut seq = StreamSequencer::new(Stream::Liquidations, None);
+        assert_eq!(
+            seq.missing(t(700)),
+            gap(Stream::Liquidations, 700, 700, GapReason::MissingData)
+        );
+        seq.push("s1", liquidation(1_000, 1));
+        assert_eq!(
+            seq.missing(t(4_000)),
+            gap(Stream::Liquidations, 1_000, 4_000, GapReason::MissingData)
+        );
+        // Clamped when the record's time is below the last event.
+        assert_eq!(
+            seq.missing(t(900)),
+            gap(Stream::Liquidations, 900, 900, GapReason::MissingData)
+        );
+        // The state is untouched: the next event continues normally.
+        assert_eq!(
+            seq.push("s1", liquidation(5_000, 2)),
+            [liquidation(5_000, 2)]
+        );
+        let seeded = StreamSequencer::new(
+            Stream::Klines,
+            Some(Seed {
+                last_event_time: t(100),
+            }),
+        );
+        assert_eq!(
+            seeded.missing(t(500)),
+            gap(Stream::Klines, 100, 500, GapReason::MissingData)
+        );
     }
 
     #[test]

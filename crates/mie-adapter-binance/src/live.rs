@@ -278,7 +278,8 @@ pub struct ChannelStats {
     pub capacity: usize,
     /// Messages sent.
     pub sent: u64,
-    /// Largest observed number of queued messages.
+    /// Largest observed number of queued messages, counting a sender
+    /// blocked on a full channel as queued.
     pub high_water: u64,
     /// Total time senders spent blocked on a full channel, in ns.
     pub blocked_ns: u64,
@@ -415,20 +416,30 @@ impl<T> CountedSender<T> {
     /// Sends, blocking while the channel is full. `Err` when the receiver
     /// is gone.
     pub(crate) fn send(&self, msg: T) -> Result<(), ()> {
-        match self.tx.try_send(msg) {
-            Ok(()) => {}
-            Err(TrySendError::Full(msg)) => {
-                let start = self.clock.monotonic_ns();
-                self.tx.send(msg).map_err(|_| ())?;
-                let blocked = self.clock.monotonic_ns().saturating_sub(start);
-                self.gauge.blocked_ns.fetch_add(blocked, Ordering::Relaxed);
-            }
-            Err(TrySendError::Disconnected(_)) => return Err(()),
-        }
-        self.gauge.sent.fetch_add(1, Ordering::Relaxed);
+        // Count the message before it can be received, so the receiver's
+        // decrement never runs ahead of this increment.
         let depth = self.gauge.depth.fetch_add(1, Ordering::Relaxed) + 1;
         self.gauge.high_water.fetch_max(depth, Ordering::Relaxed);
-        Ok(())
+        let sent = match self.tx.try_send(msg) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(msg)) => {
+                let start = self.clock.monotonic_ns();
+                let sent = self.tx.send(msg).map_err(|_| ());
+                let blocked = self.clock.monotonic_ns().saturating_sub(start);
+                self.gauge.blocked_ns.fetch_add(blocked, Ordering::Relaxed);
+                sent
+            }
+            Err(TrySendError::Disconnected(_)) => Err(()),
+        };
+        match sent {
+            Ok(()) => {
+                self.gauge.sent.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(()) => {
+                self.gauge.depth.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+        sent
     }
 }
 
@@ -771,14 +782,15 @@ impl<S: RawRecordSink> CaptureLoop<S> {
         sink.append(key, record.clone())
             .map_err(|e| format!("append {key} receive_seq {receive_seq}: {e}"))?;
         self.stats.records += 1;
-        match self.pipeline.push(stream, &record) {
-            Ok(events) => self.deliver(events),
-            Err(error) => self.observe(&CaptureEvent::NormalizeError {
+        let pushed = self.pipeline.push(stream, &record);
+        if let Some(error) = pushed.error {
+            self.observe(&CaptureEvent::NormalizeError {
                 stream,
                 receive_seq,
                 error: error.to_string(),
-            }),
+            });
         }
+        self.deliver(pushed.events);
         Ok(())
     }
 

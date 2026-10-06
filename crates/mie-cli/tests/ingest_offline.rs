@@ -4,7 +4,10 @@
 mod common;
 
 use common::{D0, HOUR, TempDir, agg, config, ingest, journal};
+use mie_adapter_binance::{BinanceStream, Pipeline};
 use mie_adapter_parquet::ParquetRawStore;
+use mie_cli::journal::RunParameters;
+use mie_domain::event::MarketEvent;
 use mie_domain::time::EventTime;
 use mie_ports::outbound::ReplayWindow;
 use mie_ports::raw::{RawRecordSource, RawSelection, RawStreamKey};
@@ -97,4 +100,89 @@ fn ingest_seals_raw_files_journals_and_seeds_the_next_run() {
         (Some(t1 + 60), Some(t2 + 5))
     );
     assert_eq!(second.events, 3);
+}
+
+#[test]
+fn the_raw_store_plus_run_start_reproduces_the_journaled_gaps() {
+    let dir = TempDir::new("recompute");
+    let config = config(dir.path());
+    let t1 = D0 + HOUR;
+    ingest(
+        &config,
+        t1,
+        vec![vec![agg(1, t1 + 1), agg(2, t1 + 2), agg(5, t1 + 3)]],
+    );
+    let t2 = t1 + HOUR;
+    ingest(&config, t2, vec![vec![agg(9, t2 + 1), agg(11, t2 + 2)]]);
+
+    let store = ParquetRawStore::new(&config.paths.raw_root);
+    let key = RawStreamKey::new("binance-um", "BTCUSDT", "aggTrade").unwrap();
+    let selection = RawSelection::new(
+        BTreeSet::from([key]),
+        ReplayWindow {
+            start: EventTime::from_millis(D0),
+            end: EventTime::from_millis(D0 + 24 * HOUR),
+        },
+    )
+    .unwrap();
+    let mut records = Vec::new();
+    for file in store.select(&selection).unwrap().files {
+        records.extend(store.read(&file).unwrap());
+    }
+    let lines = journal(&config);
+    for start in lines.iter().filter(|l| l["type"] == "run_start") {
+        let params = RunParameters::from_run_start(start).unwrap();
+        // Configured, not the default: the recompute must use run_start.
+        assert_eq!(params.hold_back_ms, 750);
+        let mut run: Vec<_> = records
+            .iter()
+            .filter(|r| {
+                let session = &r.capture.as_ref().unwrap().session_id;
+                session.starts_with(&format!("{}/", params.run_id))
+            })
+            .collect();
+        run.sort_by_key(|r| r.capture.as_ref().unwrap().receive_seq);
+        let mut pipeline = Pipeline::new(&params.symbol, params.hold_back_ms, &params.seeds);
+        let mut events = Vec::new();
+        for record in run {
+            events.extend(pipeline.push(BinanceStream::AggTrade, record).events);
+        }
+        events.extend(pipeline.finish());
+        let recomputed: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                MarketEvent::FeedGap(g) => Some((
+                    format!("{:?}", g.reason),
+                    g.start.as_millis(),
+                    g.end.as_millis(),
+                )),
+                _ => None,
+            })
+            .collect();
+        let journaled: Vec<_> = lines
+            .iter()
+            .filter(|l| l["type"] == "gap" && l["run_id"] == params.run_id.as_str())
+            .map(|l| {
+                (
+                    l["reason"].as_str().unwrap().to_owned(),
+                    l["start"].as_i64().unwrap(),
+                    l["end"].as_i64().unwrap(),
+                )
+            })
+            .collect();
+        assert!(!journaled.is_empty());
+        assert_eq!(recomputed, journaled, "run {}", params.run_id);
+    }
+    // Run 2 opens with the seed gap, which only run_start can reproduce.
+    let run2 = RunParameters::from_run_start(
+        lines
+            .iter()
+            .find(|l| l["type"] == "run_start" && l["run_id"] == "20261006T020000Z")
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        run2.seeds[&BinanceStream::AggTrade],
+        EventTime::from_millis(t1 + 3)
+    );
 }

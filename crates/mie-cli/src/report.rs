@@ -17,9 +17,15 @@
 //!    `.tmp` file is left in the source's directory.
 //! 4. **Journal totals**: no normalize errors, no domain rejections, no
 //!    time fallbacks, and every journal line parses.
+//! 5. **Lateness**: per stream, the `LateEvent` gaps against the events
+//!    delivered, from each run's final counters (`run_end`, else its last
+//!    `stats` line). A stream fails when its late fraction
+//!    `late / (events + late)` exceeds `max_late_fraction` (default 0: the
+//!    hold-back is sized so that nothing is late, ADR-032).
 //!
-//! It prints per-stream rows, then one line per failed check and a final
-//! `PASS` or `FAIL`.
+//! It prints per-stream rows (raw records, then delivery: events, gaps by
+//! reason, late fraction, maximum lateness), then one line per failed check
+//! and a final `PASS` or `FAIL`.
 
 use crate::config::IngestConfig;
 use mie_adapter_binance::BinanceStream;
@@ -57,6 +63,8 @@ struct Gap {
 struct RunJournal {
     started: bool,
     end: Option<Value>,
+    /// Per-stream pipeline counters of the last `stats` or `run_end` line.
+    streams: Option<Value>,
     gaps: Vec<Gap>,
     normalize_errors: u64,
     domain_rejections: u64,
@@ -73,6 +81,7 @@ pub fn run(
     config: &IngestConfig,
     from_ms: i64,
     to_ms: i64,
+    max_late_fraction: f64,
     out: &mut dyn Write,
 ) -> Result<bool, String> {
     let io = |e: std::io::Error| e.to_string();
@@ -160,6 +169,7 @@ pub fn run(
         .map_err(io)?;
         check_run_end(run, journal, &mut problems);
     }
+    check_lateness(&runs, max_late_fraction, out, &mut problems)?;
     let source_dir = config
         .paths
         .raw_root
@@ -229,7 +239,11 @@ fn read_journal(
             "normalize_error" => entry.normalize_errors += 1,
             "domain_rejection" => entry.domain_rejections += 1,
             "disconnected" | "planned_rotation" => entry.disconnects += 1,
-            "run_end" => entry.end = Some(value),
+            "stats" => entry.streams = Some(value["streams"].clone()),
+            "run_end" => {
+                entry.streams = Some(value["streams"].clone());
+                entry.end = Some(value);
+            }
             _ => {}
         }
     }
@@ -350,6 +364,78 @@ fn check_trade_ids(run: &str, rows: &[Row], journal: &RunJournal, problems: &mut
         }
         last = Some((id, row.time));
     }
+}
+
+/// Delivery counters of one stream, summed over runs.
+#[derive(Default)]
+struct Delivery {
+    events: u64,
+    gaps: BTreeMap<String, u64>,
+    max_lateness_ms: i64,
+}
+
+/// Check 5, with its table.
+fn check_lateness(
+    runs: &BTreeMap<String, RunJournal>,
+    max_late_fraction: f64,
+    out: &mut dyn Write,
+    problems: &mut Vec<String>,
+) -> Result<(), String> {
+    let io = |e: std::io::Error| e.to_string();
+    let mut streams: BTreeMap<String, Delivery> = BTreeMap::new();
+    for journal in runs.values() {
+        let Some(counters) = journal.streams.as_ref().and_then(Value::as_object) else {
+            continue;
+        };
+        for (name, s) in counters {
+            let d = streams.entry(name.clone()).or_default();
+            d.events += s["events"].as_u64().unwrap_or(0);
+            d.max_lateness_ms = d
+                .max_lateness_ms
+                .max(s["max_lateness_ms"].as_i64().unwrap_or(0));
+            for (reason, n) in s["gaps"].as_object().into_iter().flatten() {
+                *d.gaps.entry(reason.clone()).or_default() += n.as_u64().unwrap_or(0);
+            }
+        }
+    }
+    writeln!(
+        out,
+        "{:<14} {:>10} {:>8} {:>7} {:>13}  gaps by reason",
+        "stream", "events", "late", "late%", "max_late_ms"
+    )
+    .map_err(io)?;
+    for (name, d) in &streams {
+        let late = d.gaps.get("LateEvent").copied().unwrap_or(0);
+        let fraction = if d.events + late == 0 {
+            0.0
+        } else {
+            late as f64 / (d.events + late) as f64
+        };
+        let gaps: Vec<String> = d.gaps.iter().map(|(r, n)| format!("{r}={n}")).collect();
+        writeln!(
+            out,
+            "{name:<14} {:>10} {late:>8} {:>6.2}% {:>13}  {}",
+            d.events,
+            fraction * 100.0,
+            d.max_lateness_ms,
+            if gaps.is_empty() {
+                "-".to_owned()
+            } else {
+                gaps.join(" ")
+            }
+        )
+        .map_err(io)?;
+        if fraction > max_late_fraction {
+            problems.push(format!(
+                "{name}: {late} of {} samples late ({:.2} %, limit {:.2} %), max lateness {} ms",
+                d.events + late,
+                fraction * 100.0,
+                max_late_fraction * 100.0,
+                d.max_lateness_ms
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Checks 3 and 4 for one run.

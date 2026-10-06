@@ -909,3 +909,129 @@ fn open_interest_polls_align_back_off_and_never_persist_failures() {
         [(Stream::OpenInterest, GapReason::Disconnected)]
     );
 }
+
+fn mark(time: i64) -> String {
+    format!(
+        r#"{{"e":"markPriceUpdate","E":{time},"s":"BTCUSDT","p":"85001.00000000","i":"85002.50000000","r":"0.00010000","T":1791273600000}}"#
+    )
+}
+
+/// Recomputes the pipeline from the sink's records in `receive_seq` order
+/// with the given run parameters, as replay (#11) will from the raw store
+/// plus the journal's `run_start`.
+fn recompute(
+    records: &[(RawStreamKey, RawRecord)],
+    symbol: &str,
+    hold_back_ms: i64,
+    seeds: &BTreeMap<BinanceStream, EventTime>,
+) -> Vec<MarketEvent> {
+    let mut sorted: Vec<_> = records.to_vec();
+    sorted.sort_by_key(|(_, r)| r.capture.as_ref().unwrap().receive_seq);
+    let mut pipeline = mie_adapter_binance::Pipeline::new(symbol, hold_back_ms, seeds);
+    let mut out = Vec::new();
+    for (key, record) in &sorted {
+        let stream = BinanceStream::from_raw_name(key.stream()).unwrap();
+        out.extend(pipeline.push(stream, record).events);
+    }
+    out.extend(pipeline.finish());
+    out
+}
+
+#[test]
+fn recomputing_from_the_sink_with_the_run_parameters_reproduces_live_output() {
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let clock = FakeClock::new(D0 + 40_000, "mie-aggTrade");
+    let trades_1 = vec![
+        Step::Frame(agg(1, D0 + 1_000)),
+        Step::Frame(agg(2, D0 + 1_010)),
+        // Id skip.
+        Step::Frame(agg(4, D0 + 1_020)),
+        Step::Frame("garbage".to_owned()),
+        Step::Close("dropped"),
+    ];
+    let trades_2 = vec![
+        // Reconnect with an overlapping duplicate.
+        Step::Frame(agg(4, D0 + 1_020)),
+        Step::Frame(agg(5, D0 + 1_500)),
+        // Both streams' frames are persisted before shutdown.
+        Step::AwaitRecords(13),
+        Step::Shutdown,
+    ];
+    let marks = vec![
+        Step::Frame(mark(D0 + 1_000)),
+        // Disorder within the hold-back.
+        Step::Frame(mark(D0 + 1_300)),
+        Step::Frame(mark(D0 + 1_200)),
+        Step::Frame("{\"e\":\"markPriceUpdate\"".to_owned()),
+        Step::Frame(mark(D0 + 20_000)),
+        // Late: 1000 was released once the watermark reached 20000.
+        Step::Frame(mark(D0 + 500)),
+        Step::Frame(mark(D0 + 21_000)),
+    ];
+    let connector = FakeConnector::new(
+        vec![
+            (
+                "btcusdt@aggTrade",
+                vec![Connect::Open(trades_1), Connect::Open(trades_2)],
+            ),
+            ("btcusdt@markPrice@1s", vec![Connect::Open(marks)]),
+        ],
+        &clock,
+        &shutdown,
+    );
+    let mut cfg = config(&[BinanceStream::AggTrade, BinanceStream::MarkPrice]);
+    cfg.hold_back_ms = 2_000;
+    cfg.seeds = BTreeMap::from([(BinanceStream::AggTrade, EventTime::from_millis(D0 + 200))]);
+    let params = cfg.clone();
+    let out = run(
+        cfg,
+        connector,
+        no_http(&clock, &shutdown),
+        clock,
+        shutdown,
+        None,
+    );
+    assert!(out.provider_error.is_none());
+    let records = out.sink.lock().unwrap().records.clone();
+    assert_eq!(records.len(), 13);
+
+    // Every fault shows up in what live delivered.
+    let reasons: std::collections::BTreeSet<_> = out.gaps().into_iter().collect();
+    for expected in [
+        (Stream::Trades, GapReason::Disconnected),
+        (Stream::Trades, GapReason::SequenceBreak),
+        (Stream::MarkPrice, GapReason::MissingData),
+        (Stream::MarkPrice, GapReason::LateEvent),
+    ] {
+        assert!(
+            reasons.contains(&expected),
+            "{expected:?} missing in {reasons:?}"
+        );
+    }
+    let (_, summary) = out.joined.as_ref().expect("clean capture");
+    assert_eq!(
+        summary.stats.pipeline.streams[&BinanceStream::AggTrade].duplicates,
+        1
+    );
+
+    // The raw records plus the run parameters reproduce it exactly.
+    let replayed = recompute(&records, &params.symbol, params.hold_back_ms, &params.seeds);
+    assert_eq!(replayed, out.events);
+
+    // The parameters are inputs: other values give other output.
+    let longer = recompute(&records, &params.symbol, 60_000, &params.seeds);
+    assert_ne!(longer, out.events);
+    assert!(
+        !longer
+            .iter()
+            .any(|e| matches!(e, MarketEvent::FeedGap(g) if g.reason == GapReason::LateEvent)),
+        "a 60 s hold-back absorbs the late mark price"
+    );
+    let unseeded = recompute(
+        &records,
+        &params.symbol,
+        params.hold_back_ms,
+        &BTreeMap::new(),
+    );
+    assert_ne!(unseeded, out.events);
+}

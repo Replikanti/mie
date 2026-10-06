@@ -37,5 +37,5 @@ pub use live::{
     BinanceLiveProvider, CaptureEvent, CaptureHandle, CaptureObserver, CaptureSummary, LiveConfig,
     run_id, start,
 };
-pub use pipeline::{Pipeline, PipelineStats, StreamStats};
+pub use pipeline::{Pipeline, PipelineStats, Pushed, StreamStats};
 pub use stream::{BinanceStream, OI_POLL_INTERVAL_MS};

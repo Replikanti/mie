@@ -5,7 +5,7 @@
 //!
 //! | `type` | Written by | Content |
 //! |---|---|---|
-//! | `run_start` | ingest | streams, hold-back, seeds per stream |
+//! | `run_start` | ingest | symbol, streams, hold-back, seeds per stream: the run's pipeline parameters ([`RunParameters`]) |
 //! | `recovery` | ingest | parts rolled forward and discarded by the store |
 //! | `connected`, `connect_failed`, `disconnected`, `planned_rotation`, `backoff` | capture | connection lifecycle per stream |
 //! | `oi_poll` | capture | request/response time (ns), status, whether persisted |
@@ -17,15 +17,76 @@
 //! | `run_end` | ingest | totals and the exit code |
 //!
 //! The journal is flushed on every `stats` line and at the end of a run.
+//!
+//! The raw store alone does not determine what live delivered: the
+//! pipeline's `hold_back_ms` and per-stream seeds are run parameters, kept
+//! only in `run_start`. A recompute (replay #11, equivalence harness #13)
+//! reads them with [`RunParameters::from_run_start`], never from
+//! configuration defaults (ADR-032).
 
 use mie_adapter_binance::live::ChannelStats;
-use mie_adapter_binance::{CaptureEvent, CaptureObserver, PipelineStats};
+use mie_adapter_binance::{BinanceStream, CaptureEvent, CaptureObserver, PipelineStats};
+use mie_domain::time::EventTime;
 use mie_ports::raw::SealedFile;
 use serde_json::{Map, Value, json};
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+
+/// The inputs of a run's [`Pipeline`](mie_adapter_binance::Pipeline), as
+/// journaled in its `run_start` line. With the run's raw records in
+/// `receive_seq` order they determine everything live delivered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunParameters {
+    /// The run.
+    pub run_id: String,
+    /// The exchange symbol.
+    pub symbol: String,
+    /// The hold-back in exchange milliseconds.
+    pub hold_back_ms: i64,
+    /// The restart seeds per stream.
+    pub seeds: BTreeMap<BinanceStream, EventTime>,
+}
+
+impl RunParameters {
+    /// Reads the parameters from a `run_start` journal line.
+    ///
+    /// # Errors
+    ///
+    /// A description of a missing or malformed field.
+    pub fn from_run_start(line: &Value) -> Result<Self, String> {
+        if line["type"] != "run_start" {
+            return Err(format!("not a run_start line: {line}"));
+        }
+        let text = |name: &str| {
+            line[name]
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| format!("run_start without {name}"))
+        };
+        let hold_back_ms = line["hold_back_ms"]
+            .as_i64()
+            .ok_or("run_start without hold_back_ms")?;
+        let mut seeds = BTreeMap::new();
+        let journaled = line["seeds"].as_object().ok_or("run_start without seeds")?;
+        for (name, millis) in journaled {
+            let stream = BinanceStream::from_raw_name(name)
+                .ok_or_else(|| format!("run_start seed of unknown stream {name:?}"))?;
+            let millis = millis
+                .as_i64()
+                .ok_or_else(|| format!("run_start seed of {name} is not an integer"))?;
+            seeds.insert(stream, EventTime::from_millis(millis));
+        }
+        Ok(Self {
+            run_id: text("run_id")?,
+            symbol: text("symbol")?,
+            hold_back_ms,
+            seeds,
+        })
+    }
+}
 
 /// An open journal for one run.
 #[derive(Debug)]

@@ -8,7 +8,7 @@ use mie_cli::report;
 
 fn report(config: &IngestConfig) -> (bool, String) {
     let mut out = Vec::new();
-    let pass = report::run(config, D0, D0 + 24 * HOUR, &mut out).expect("report runs");
+    let pass = report::run(config, D0, D0 + 24 * HOUR, 0.0, &mut out).expect("report runs");
     (pass, String::from_utf8(out).unwrap())
 }
 
@@ -125,4 +125,73 @@ fn ingest_with_reconnect(
         clock: common::FakeClock::new(start_ms, "mie-aggTrade"),
     };
     mie_cli::ingest::run(config, transports, shutdown).expect("ingest starts")
+}
+
+/// A journal of one clean run whose final counters carry `streams`.
+fn journal_with(config: &IngestConfig, streams: serde_json::Value) {
+    let run = "20261006T010000Z";
+    let at = D0 + HOUR;
+    let lines = [
+        serde_json::json!({"type": "run_start", "run_id": run, "at_ms": at, "symbol": "BTCUSDT",
+            "hold_back_ms": 2000, "seeds": {}}),
+        serde_json::json!({"type": "run_end", "run_id": run, "at_ms": at + 60_000, "exit_code": 0,
+            "error": null, "normalize_errors": 0, "domain_rejections": 0, "time_fallbacks": 0,
+            "streams": streams}),
+    ];
+    let text: String = lines.iter().map(|l| format!("{l}\n")).collect();
+    std::fs::create_dir_all(config.paths.journal.parent().unwrap()).unwrap();
+    std::fs::write(&config.paths.journal, text).unwrap();
+}
+
+fn report_with_limit(config: &IngestConfig, limit: f64) -> (bool, String) {
+    let mut out = Vec::new();
+    let pass = report::run(config, D0, D0 + 24 * HOUR, limit, &mut out).expect("report runs");
+    (pass, String::from_utf8(out).unwrap())
+}
+
+#[test]
+fn open_interest_that_is_always_late_fails() {
+    let dir = TempDir::new("all-late");
+    let config = config(dir.path());
+    journal_with(
+        &config,
+        serde_json::json!({
+            "markPrice": {"events": 115, "gaps": {}, "max_lateness_ms": 0},
+            "openInterest": {"events": 0, "gaps": {"LateEvent": 12}, "max_lateness_ms": 7943},
+        }),
+    );
+    let (pass, text) = report_with_limit(&config, 0.0);
+    assert!(!pass, "{text}");
+    assert!(
+        text.contains(
+            "openInterest: 12 of 12 samples late (100.00 %, limit 0.00 %), max lateness 7943 ms"
+        ),
+        "{text}"
+    );
+    assert!(text.contains("LateEvent=12"), "{text}");
+    assert!(text.trim_end().ends_with("FAIL (1 problem(s))"), "{text}");
+    // Even a generous limit below 100 % fails it.
+    assert!(!report_with_limit(&config, 0.99).0);
+    assert!(report_with_limit(&config, 1.0).0);
+}
+
+#[test]
+fn the_late_fraction_is_judged_against_the_limit() {
+    let dir = TempDir::new("some-late");
+    let config = config(dir.path());
+    journal_with(
+        &config,
+        serde_json::json!({
+            "forceOrder": {"events": 9, "gaps": {"LateEvent": 1, "Disconnected": 2}, "max_lateness_ms": 2500},
+        }),
+    );
+    let (pass, text) = report_with_limit(&config, 0.0);
+    assert!(!pass, "{text}");
+    assert!(
+        text.contains("forceOrder: 1 of 10 samples late (10.00 %"),
+        "{text}"
+    );
+    assert!(text.contains("Disconnected=2 LateEvent=1"), "{text}");
+    let (pass, text) = report_with_limit(&config, 0.1);
+    assert!(pass, "{text}");
 }

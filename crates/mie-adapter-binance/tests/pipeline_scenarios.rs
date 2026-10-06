@@ -45,9 +45,7 @@ fn run(records: &[(BinanceStream, RawRecord)]) -> (Vec<MarketEvent>, Pipeline) {
     let mut pipeline = Pipeline::new("BTCUSDT", HOLD_BACK_MS, &BTreeMap::new());
     let mut out = Vec::new();
     for (stream, record) in records {
-        if let Ok(events) = pipeline.push(*stream, record) {
-            out.extend(events);
-        }
+        out.extend(pipeline.push(*stream, record).events);
     }
     out.extend(pipeline.finish());
     (out, pipeline)

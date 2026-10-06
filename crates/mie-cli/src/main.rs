@@ -21,9 +21,11 @@ USAGE:
         opened. See crates/mie-cli/ingest.example.toml.
 
     mie capture-report --config <path> --from <ms> --to <ms>
+                       [--max-late-fraction <0..1>]
         Verify the capture runs started in [from, to) (UTC epoch ms):
         trade-id continuity, disconnects as gaps, clean shutdown, journal
-        totals. Prints PASS or FAIL; exits 0 on PASS, 1 on FAIL.
+        totals, and per-stream LateEvent fraction (default limit 0: any
+        late event fails). Prints PASS or FAIL; exits 0 on PASS, 1 on FAIL.
 
     mie --help
 ";
@@ -53,14 +55,18 @@ fn dispatch(args: &[String]) -> Result<ExitCode, String> {
             run_ingest(&config)
         }
         Some("capture-report") => {
-            let options = Options::parse(&args[1..], &["--config", "--from", "--to"])?;
+            let options = Options::parse(
+                &args[1..],
+                &["--config", "--from", "--to", "--max-late-fraction"],
+            )?;
             let config =
                 IngestConfig::load(&options.path("--config")?).map_err(|e| e.to_string())?;
             let (from, to) = (options.millis("--from")?, options.millis("--to")?);
             if from >= to {
                 return Err(format!("--from {from} must be below --to {to}"));
             }
-            let pass = report::run(&config, from, to, &mut std::io::stdout().lock())?;
+            let max_late = options.fraction("--max-late-fraction", 0.0)?;
+            let pass = report::run(&config, from, to, max_late, &mut std::io::stdout().lock())?;
             Ok(if pass {
                 ExitCode::SUCCESS
             } else {
@@ -122,6 +128,17 @@ impl Options {
 
     fn path(&self, flag: &str) -> Result<PathBuf, String> {
         self.value(flag).map(PathBuf::from)
+    }
+
+    fn fraction(&self, flag: &str, default: f64) -> Result<f64, String> {
+        if !self.0.iter().any(|(f, _)| f == flag) {
+            return Ok(default);
+        }
+        let value = self.value(flag)?;
+        match value.parse::<f64>() {
+            Ok(f) if (0.0..=1.0).contains(&f) => Ok(f),
+            _ => Err(format!("{flag} {value:?} is not a fraction in [0, 1]")),
+        }
     }
 
     fn millis(&self, flag: &str) -> Result<i64, String> {
