@@ -2,7 +2,10 @@
 
 mod common;
 
-use common::{D0, HOUR, TempDir, agg, config, ingest};
+use common::{
+    D0, DepthConnection, HOUR, TempDir, agg, config, config_with, depth, depth_snapshot, ingest,
+    ingest_depth,
+};
 use mie_cli::config::IngestConfig;
 use mie_cli::report;
 
@@ -194,4 +197,122 @@ fn the_late_fraction_is_judged_against_the_limit() {
     assert!(text.contains("Disconnected=2 LateEvent=1"), "{text}");
     let (pass, text) = report_with_limit(&config, 0.1);
     assert!(pass, "{text}");
+}
+
+/// A depth capture that reconnects once: synced on the first snapshot,
+/// resynced behind a `Disconnected` gap on the second.
+fn depth_capture_with_reconnect(config: &IngestConfig) -> mie_cli::ingest::IngestOutcome {
+    let t1 = D0 + HOUR;
+    ingest_depth(
+        config,
+        t1,
+        vec![
+            DepthConnection {
+                frames: vec![depth(11, 20, 10, t1), depth(21, 30, 20, t1 + 100)],
+                await_served: 1,
+            },
+            DepthConnection {
+                frames: vec![depth(41, 50, 40, t1 + 5_000), depth(51, 60, 50, t1 + 5_100)],
+                await_served: 2,
+            },
+        ],
+        vec![depth_snapshot(15, t1 - 50), depth_snapshot(45, t1 + 4_950)],
+        vec![],
+    )
+}
+
+/// The journal plus `extra` lines.
+fn append_lines(config: &IngestConfig, extra: &[serde_json::Value]) {
+    let mut journal = std::fs::read_to_string(&config.paths.journal).unwrap();
+    for line in extra {
+        journal.push_str(&format!("{line}\n"));
+    }
+    std::fs::write(&config.paths.journal, journal).unwrap();
+}
+
+#[test]
+fn a_clean_depth_capture_passes_and_its_reconnect_needs_the_book_gap() {
+    let dir = TempDir::new("depth-report");
+    let config = config_with(dir.path(), &["depth", "depthSnapshot"]);
+    let outcome = depth_capture_with_reconnect(&config);
+    assert_eq!(outcome.exit_code(), 0, "{:?}", outcome.error);
+    assert_eq!(outcome.domain_rejections, 0);
+
+    let (pass, text) = report(&config);
+    assert!(pass, "{text}");
+    assert!(
+        text.contains("order book: syncs 2 | desyncs Disconnected=2"),
+        "{text}"
+    );
+
+    // A mismatched checkpoint fails the run.
+    let journal = std::fs::read_to_string(&config.paths.journal).unwrap();
+    append_lines(
+        &config,
+        &[
+            serde_json::json!({"type": "book_checkpoint", "run_id": "20261006T010000Z",
+            "at_ms": D0 + HOUR + 6_000, "result": "mismatched", "levels": 40, "mismatches": 1,
+            "examples": []}),
+        ],
+    );
+    let (pass, text) = report(&config);
+    assert!(!pass, "{text}");
+    assert!(text.contains("book checkpoint mismatched"), "{text}");
+    assert!(text.trim_end().ends_with("FAIL (1 problem(s))"), "{text}");
+
+    // Without its OrderBook gap the reconnect is uncovered.
+    let tampered = drop_gaps(&journal, "20261006T010000Z", "Disconnected");
+    assert_ne!(tampered, journal);
+    std::fs::write(&config.paths.journal, tampered).unwrap();
+    let (pass, text) = report(&config);
+    assert!(!pass, "{text}");
+    assert!(text.contains("has no OrderBook Disconnected gap"), "{text}");
+}
+
+#[test]
+fn a_long_depth_run_needs_a_matched_checkpoint() {
+    let dir = TempDir::new("depth-long");
+    let config = config_with(dir.path(), &["depth", "depthSnapshot"]);
+    let t1 = D0 + HOUR;
+    // Diffs over 130 s of exchange time, more than twice the 60 s default
+    // checkpoint interval; the fake clock never reaches a checkpoint.
+    let frames: Vec<String> = (0..14)
+        .map(|i| {
+            depth(
+                10 * i + 11,
+                10 * i + 20,
+                10 * i + 10,
+                t1 + 10_000 * i as i64,
+            )
+        })
+        .collect();
+    let outcome = ingest_depth(
+        &config,
+        t1,
+        vec![DepthConnection {
+            frames,
+            await_served: 1,
+        }],
+        vec![depth_snapshot(15, t1 - 50)],
+        vec![],
+    );
+    assert_eq!(outcome.exit_code(), 0, "{:?}", outcome.error);
+    let (pass, text) = report(&config);
+    assert!(!pass, "{text}");
+    assert!(text.contains("without a matched checkpoint"), "{text}");
+
+    append_lines(
+        &config,
+        &[
+            serde_json::json!({"type": "book_checkpoint", "run_id": "20261006T010000Z",
+            "at_ms": t1 + 70_000, "result": "matched", "levels": 40,
+            "window_bid_bps": 12, "window_ask_bps": 9}),
+        ],
+    );
+    let (pass, text) = report(&config);
+    assert!(pass, "{text}");
+    assert!(
+        text.contains("matched 1, unverifiable 0 | window min 9 bps, median 9 bps"),
+        "{text}"
+    );
 }

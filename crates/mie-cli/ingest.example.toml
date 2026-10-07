@@ -18,9 +18,16 @@ journal = "data/capture-journal.jsonl"
 # USDⓈ-M market-data streams (aggTrade, markPrice, forceOrder, kline) are
 # served on the /market route; verified 2026-10-06.
 ws_base_url = "wss://fstream.binance.com/market/ws"
+# The depth diff stream (btcusdt@depth@100ms) is served on the /public
+# route; verified 2026-10-07 (ADR-038).
+ws_public_base_url = "wss://fstream.binance.com/public/ws"
 rest_base_url = "https://fapi.binance.com"
-# Default: all five.
-streams = ["aggTrade", "markPrice", "forceOrder", "kline_1m", "openInterest"]
+# Default: all seven. depth (WebSocket diffs) and depthSnapshot (REST
+# /fapi/v1/depth) go together: the diffs need snapshots to sync.
+streams = [
+  "aggTrade", "markPrice", "forceOrder", "kline_1m", "openInterest",
+  "depth", "depthSnapshot",
+]
 
 # Every key below is optional; the values shown are the defaults.
 [capture]
@@ -43,3 +50,10 @@ backoff_max_ms = 30000
 inbound_channel_capacity = 65536
 core_channel_capacity = 65536
 stats_interval_secs = 60
+# Order-book snapshots (ADR-038). A limit=1000 snapshot costs 20 of the
+# 2400 REST weight per minute; the spacing caps it at 600/min even while
+# resyncs repeat. Checkpoints audit the rebuilt book against a fresh
+# snapshot and re-anchor it.
+depth_snapshot_limit = 1000
+depth_checkpoint_interval_secs = 60
+depth_snapshot_min_spacing_ms = 2000

@@ -32,8 +32,53 @@ fn the_example_file_parses_with_the_documented_defaults() {
         .live_config("20261006T000000Z", BTreeMap::new())
         .unwrap();
     assert_eq!(live.ws_base_url, "wss://fstream.binance.com/market/ws");
+    assert_eq!(
+        live.ws_public_base_url,
+        "wss://fstream.binance.com/public/ws"
+    );
     assert_eq!(live.max_connection_age, Duration::from_secs(82_800));
     assert_eq!(live.rotation_stagger, Duration::from_secs(300));
+    assert_eq!(live.depth_snapshot_limit, 1_000);
+    assert_eq!(live.depth_checkpoint_interval, Duration::from_secs(60));
+    assert_eq!(live.depth_snapshot_min_spacing, Duration::from_secs(2));
+    // Every stream by default, depth included.
+    assert_eq!(live.streams.len(), 7);
+    assert!(live.streams.contains(&BinanceStream::Depth));
+}
+
+#[test]
+fn depth_settings_are_mapped_and_validated() {
+    let text = format!(
+        "{REQUIRED}ws_public_base_url = \"wss://example.invalid/public/ws\"\n\
+         [capture]\ndepth_snapshot_limit = 100\ndepth_checkpoint_interval_secs = 30\n\
+         depth_snapshot_min_spacing_ms = 500\n"
+    );
+    let config = IngestConfig::parse(&text).expect("valid");
+    let live = config.live_config("r", BTreeMap::new()).unwrap();
+    assert_eq!(live.ws_public_base_url, "wss://example.invalid/public/ws");
+    assert_eq!(live.depth_snapshot_limit, 100);
+    assert_eq!(live.depth_checkpoint_interval, Duration::from_secs(30));
+    assert_eq!(live.depth_snapshot_min_spacing, Duration::from_millis(500));
+
+    for capture in [
+        "depth_snapshot_limit = 200",
+        "depth_snapshot_limit = 0",
+        "depth_checkpoint_interval_secs = 0",
+        "depth_snapshot_min_spacing_ms = 0",
+    ] {
+        let text = format!("{REQUIRED}[capture]\n{capture}\n");
+        assert!(IngestConfig::parse(&text).is_err(), "{capture}");
+    }
+    // depth and depthSnapshot go together.
+    for streams in [r#"["depth"]"#, r#"["aggTrade", "depthSnapshot"]"#] {
+        let text = format!("{REQUIRED}streams = {streams}\n");
+        let error = IngestConfig::parse(&text).expect_err(streams).0;
+        assert!(error.contains("go together"), "{error}");
+    }
+    let text = format!("{REQUIRED}streams = [\"depth\", \"depthSnapshot\"]\n");
+    assert!(IngestConfig::parse(&text).is_ok());
+    let text = format!("{REQUIRED}ws_public_base_url = \"public\"\n");
+    assert!(IngestConfig::parse(&text).is_err());
 }
 
 #[test]
@@ -105,7 +150,7 @@ fn invalid_values_are_rejected() {
     for capture in [
         "seal_interval_secs = 0",
         "backoff_initial_ms = 5000\nbackoff_max_ms = 100",
-        // The fifth stream would rotate at 85 500 + 4 × 300 s, past 24 h.
+        // The seventh stream would rotate at 85 500 + 6 × 300 s, past 24 h.
         "max_connection_age_secs = 85500",
     ] {
         let text = format!("{REQUIRED}[capture]\n{capture}\n");

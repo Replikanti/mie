@@ -7,7 +7,7 @@
 //! never from this file.
 
 use mie_adapter_binance::archive::{ARCHIVE_SOURCE, ArchiveStream};
-use mie_adapter_binance::{BinanceStream, LiveConfig, OI_POLL_INTERVAL_MS};
+use mie_adapter_binance::{BinanceStream, DEPTH_SNAPSHOT_LIMITS, LiveConfig, OI_POLL_INTERVAL_MS};
 use mie_domain::bars::Timeframe;
 use mie_domain::time::EventTime;
 use mie_ports::raw::validate_segment;
@@ -59,13 +59,23 @@ pub struct Paths {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Binance {
-    /// WebSocket base URL; the stream path is appended.
+    /// WebSocket base URL of the `/market` route; the stream path is
+    /// appended.
     pub ws_base_url: String,
+    /// WebSocket base URL of the `/public` route, which serves depth
+    /// (ADR-038).
+    #[serde(default = "public_ws_base_url")]
+    pub ws_public_base_url: String,
     /// REST base URL.
     pub rest_base_url: String,
-    /// Raw stream names to capture; default: all five.
+    /// Raw stream names to capture; default: all seven. `depth` and
+    /// `depthSnapshot` go together.
     #[serde(default = "all_streams")]
     pub streams: Vec<String>,
+}
+
+fn public_ws_base_url() -> String {
+    "wss://fstream.binance.com/public/ws".to_owned()
 }
 
 fn all_streams() -> Vec<String> {
@@ -104,6 +114,13 @@ pub struct CaptureSettings {
     pub core_channel_capacity: usize,
     /// Journal stats cadence.
     pub stats_interval_secs: u64,
+    /// `limit` of the REST depth snapshot (ADR-038): 5, 10, 20, 50, 100, 500
+    /// or 1000.
+    pub depth_snapshot_limit: u16,
+    /// Checkpoint snapshot cadence after the last successful fetch.
+    pub depth_checkpoint_interval_secs: u64,
+    /// Least time between two depth snapshot requests.
+    pub depth_snapshot_min_spacing_ms: u64,
 }
 
 impl Default for CaptureSettings {
@@ -121,6 +138,9 @@ impl Default for CaptureSettings {
             inbound_channel_capacity: 65_536,
             core_channel_capacity: 65_536,
             stats_interval_secs: 60,
+            depth_snapshot_limit: 1_000,
+            depth_checkpoint_interval_secs: 60,
+            depth_snapshot_min_spacing_ms: 2_000,
         }
     }
 }
@@ -176,8 +196,19 @@ impl IngestConfig {
         if streams.is_empty() {
             return Err(ConfigError("binance.streams is empty".to_owned()));
         }
+        if streams.contains(&BinanceStream::Depth)
+            != streams.contains(&BinanceStream::DepthSnapshot)
+        {
+            return Err(ConfigError(
+                "binance.streams: depth and depthSnapshot go together (ADR-038)".to_owned(),
+            ));
+        }
         for (name, url) in [
             ("binance.ws_base_url", &self.binance.ws_base_url),
+            (
+                "binance.ws_public_base_url",
+                &self.binance.ws_public_base_url,
+            ),
             ("binance.rest_base_url", &self.binance.rest_base_url),
         ] {
             if !url.contains("://") {
@@ -198,6 +229,14 @@ impl IngestConfig {
                 c.inbound_channel_capacity as u64,
             ),
             ("core_channel_capacity", c.core_channel_capacity as u64),
+            (
+                "depth_checkpoint_interval_secs",
+                c.depth_checkpoint_interval_secs,
+            ),
+            (
+                "depth_snapshot_min_spacing_ms",
+                c.depth_snapshot_min_spacing_ms,
+            ),
         ];
         if let Some((name, _)) = positive.iter().find(|(_, v)| *v == 0) {
             return Err(ConfigError(format!("capture.{name} must be positive")));
@@ -206,6 +245,12 @@ impl IngestConfig {
             return Err(ConfigError(
                 "capture.backoff_max_ms is below backoff_initial_ms".to_owned(),
             ));
+        }
+        if !DEPTH_SNAPSHOT_LIMITS.contains(&c.depth_snapshot_limit) {
+            return Err(ConfigError(format!(
+                "capture.depth_snapshot_limit {} is not one of {DEPTH_SNAPSHOT_LIMITS:?}",
+                c.depth_snapshot_limit
+            )));
         }
         let last_rotation = c.max_connection_age_secs.saturating_add(
             c.rotation_stagger_secs
@@ -253,6 +298,7 @@ impl IngestConfig {
         live.symbol = self.instrument.symbol.clone();
         live.source = self.instrument.source.clone();
         live.ws_base_url = self.binance.ws_base_url.clone();
+        live.ws_public_base_url = self.binance.ws_public_base_url.clone();
         live.rest_base_url = self.binance.rest_base_url.clone();
         live.streams = self.streams()?;
         live.hold_back_ms = i64::try_from(c.hold_back_ms)
@@ -269,6 +315,9 @@ impl IngestConfig {
         live.inbound_capacity = c.inbound_channel_capacity;
         live.core_capacity = c.core_channel_capacity;
         live.stats_interval = Duration::from_secs(c.stats_interval_secs);
+        live.depth_snapshot_limit = c.depth_snapshot_limit;
+        live.depth_checkpoint_interval = Duration::from_secs(c.depth_checkpoint_interval_secs);
+        live.depth_snapshot_min_spacing = Duration::from_millis(c.depth_snapshot_min_spacing_ms);
         live.seeds = seeds;
         Ok(live)
     }
