@@ -4,11 +4,13 @@
 //! The engine enforces the canonical event order (ADR-028), tracks the
 //! latest trade, builds event-time bars on every timeframe (ADR-031,
 //! [`bars`]), computes bar motion, ATR(14) and the volatility regime from
-//! the bars each event closes (ADR-033, [`volatility`]), and the order flow:
-//! CVD and rolling aggression windows (ADR-035, [`flow`]); every other kind
-//! passes through. Further feature families (order book, OI/funding, volume
-//! profile, structure) are added by the Market State issues, each as a
-//! registered, versioned definition (ADR-029, [`feature`]).
+//! the bars each event closes (ADR-033, [`volatility`]), the order flow:
+//! CVD and rolling aggression windows (ADR-035, [`flow`]), and the volume
+//! profiles: developing UTC day, prior day and 5-day composite (ADR-036,
+//! [`profile`]); every other kind passes through. Further feature families
+//! (order book, OI/funding, structure) are added by the Market State
+//! issues, each as a registered, versioned definition (ADR-029,
+//! [`feature`]).
 //! The engine computes one [`FeatureSet`] and stamps its
 //! [`FeatureSetVersion`] on every state; each feature value carries its
 //! validity ([`FeatureValue`]).
@@ -16,6 +18,7 @@
 //! [`bars`]: crate::bars
 //! [`feature`]: crate::feature
 //! [`flow`]: crate::flow
+//! [`profile`]: crate::profile
 //! [`volatility`]: crate::volatility
 
 use crate::bars::{Bar, BarError, BarSet, MAX_BARS_PER_EVENT, Timeframe};
@@ -24,6 +27,7 @@ use crate::feature::{FeatureSet, FeatureSetVersion, FeatureValue, catalog};
 use crate::flow::{FlowError, FlowTracker, OrderFlow};
 use crate::num::Price;
 use crate::order::CanonicalKey;
+use crate::profile::{ProfileError, ProfileTracker, VolumeProfiles};
 use crate::regime::Regime;
 use crate::time::EventTime;
 use crate::volatility::{AtrRegimeSeries, MotionAnchors, MotionSet, VolatilityError};
@@ -62,6 +66,10 @@ pub struct MarketState {
     /// rolling aggression over closed minutes. Aggression, not direction
     /// (ADR-023).
     pub flow: OrderFlow,
+    /// Volume profiles (ADR-036): `profile.volume.utc_day@1`,
+    /// `profile.volume.prior_day@1` and `profile.volume.composite_5d@1` —
+    /// exact volume per 10 USDT bin with POC, value area, HVNs and LVNs.
+    pub profile: VolumeProfiles,
     /// Number of trades consumed. A diagnostic counter, not a feature: it
     /// depends on where consumption started, so it is not reproducible
     /// across replay windows.
@@ -93,6 +101,8 @@ pub struct MarketStateEngine {
     volatility: AtrRegimeSeries,
     /// CVD, the developing minute's large prints and the recent minutes.
     flow: FlowTracker,
+    /// The developing day's volume per bin and the recent completed days.
+    profile: ProfileTracker,
 }
 
 /// Volatility state after the bars an event closed, committed with them.
@@ -198,6 +208,7 @@ impl MarketStateEngine {
             atr: volatility.atr(),
             regime: volatility.regime(),
             flow: flow.flow(),
+            profile: VolumeProfiles::new(),
             trade_count: 0,
         };
         Self {
@@ -210,6 +221,7 @@ impl MarketStateEngine {
             anchors: MotionAnchors::default(),
             volatility,
             flow,
+            profile: ProfileTracker::new(),
         }
     }
 
@@ -232,8 +244,9 @@ impl MarketStateEngine {
     /// - [`StateError::IdRegression`] if its exchange id falls below the last
     ///   accepted one of its stream;
     /// - [`StateError::Overflow`] if a bar's time or quantity arithmetic, a
-    ///   closed bar's true range, change or range, or an order-flow sum
-    ///   (CVD, window) leaves the `i64` range;
+    ///   closed bar's true range, change or range, an order-flow sum (CVD,
+    ///   window) or a volume-profile sum (bin, total, composite) leaves the
+    ///   `i64` range;
     /// - [`StateError::TimeJump`] if it would close more than
     ///   [`MAX_BARS_PER_EVENT`] bars of one timeframe. Recovery: the replay
     ///   or session stops; restart it from a fresh engine after the jump.
@@ -305,6 +318,15 @@ impl MarketStateEngine {
                 });
             }
         };
+        let profile = match self.profile.step(event, &self.pending) {
+            Ok(profile) => profile,
+            Err(ProfileError::Overflow) => {
+                self.pending.clear();
+                return Err(StateError::Overflow {
+                    event: event.canonical_key(),
+                });
+            }
+        };
 
         match event {
             MarketEvent::Trade(trade) => {
@@ -333,6 +355,7 @@ impl MarketStateEngine {
         }
         self.flow.commit(flow);
         self.state.flow = self.flow.flow();
+        self.profile.commit(profile, &mut self.state.profile);
         self.state.as_of = Some(event.time());
         self.last = Some(event.clone());
         self.ids = ids;
@@ -415,8 +438,8 @@ pub enum StateError {
         end: EventTime,
     },
     /// The event would push a bar's time or quantity arithmetic, a
-    /// volatility value or an order-flow sum out of the `i64` range
-    /// (ADR-027, ADR-031, ADR-033, ADR-035).
+    /// volatility value, an order-flow sum or a volume-profile sum out of
+    /// the `i64` range (ADR-027, ADR-031, ADR-033, ADR-035, ADR-036).
     Overflow {
         /// Key of the rejected event.
         event: CanonicalKey,
@@ -460,7 +483,8 @@ impl fmt::Display for StateError {
             Self::Overflow { event } => {
                 write!(
                     f,
-                    "event ({event}) overflows the bar, volatility or order-flow arithmetic"
+                    "event ({event}) overflows the bar, volatility, order-flow or \
+                     volume-profile arithmetic"
                 )
             }
             Self::TimeJump {
@@ -559,6 +583,7 @@ mod tests {
                     }),
                     windows: AggressionWindows::new(),
                 },
+                profile: VolumeProfiles::new(),
                 trade_count: 3,
             }
         );
@@ -759,7 +784,8 @@ mod tests {
              bars.motion.4h@1,bars.motion.5m@1,bars.time.15m@1,bars.time.1d@1,\
              bars.time.1h@1,bars.time.1m@1,bars.time.4h@1,bars.time.5m@1,\
              flow.cvd.continuous@1,flow.cvd.utc_day@1,flow.window.15m@1,\
-             flow.window.1h@1,flow.window.5m@1,trade.last_price@1,\
+             flow.window.1h@1,flow.window.5m@1,profile.volume.composite_5d@1,\
+             profile.volume.prior_day@1,profile.volume.utc_day@1,trade.last_price@1,\
              volatility.atr.1h@1,volatility.regime.1h@1"
         );
         // Consuming events never changes it.
@@ -933,6 +959,59 @@ mod tests {
             .unwrap();
         let cvd = engine.state().flow.cvd.ready().unwrap().cvd;
         assert_eq!(cvd, Qty::from_units(i64::MAX - 1));
+    }
+
+    #[test]
+    fn rejects_an_event_that_overflows_a_volume_profile() {
+        // One trade a day at one price, sides alternating so the CVD stays
+        // small: every bar, window and day fits, but five days in one bin
+        // leave the composite's `i64` range when day 4 closes.
+        const DAY: i64 = 86_400_000;
+        let big = i64::MAX / 5 + 1;
+        let day_trade = |day: i64, aggressor| {
+            let MarketEvent::Trade(base) = sized_trade(day * DAY + 1_000, 0, big) else {
+                unreachable!("sized_trade builds a trade")
+            };
+            MarketEvent::Trade(crate::event::Trade {
+                trade_id: u64::try_from(day).unwrap() + 1,
+                aggressor,
+                ..base
+            })
+        };
+        let events: Vec<MarketEvent> = (0..5)
+            .map(|day| {
+                let aggressor = if day % 2 == 0 {
+                    crate::event::Aggressor::Buy
+                } else {
+                    crate::event::Aggressor::Sell
+                };
+                day_trade(day, aggressor)
+            })
+            .collect();
+        let mut engine = engine_after(&events);
+        assert_eq!(
+            engine.state().profile.composite_5d,
+            FeatureValue::WarmingUp {
+                observed: 4,
+                required: 5
+            }
+        );
+        let before = engine.state().clone();
+        let tracker = engine.profile.clone();
+        let closed_before = engine.closed_bars().to_vec();
+        let overflow = sized_trade(5 * DAY + 1_000, 6, 1);
+        assert_eq!(
+            engine.apply(&overflow),
+            Err(StateError::Overflow {
+                event: overflow.canonical_key()
+            })
+        );
+        assert_eq!(engine.state(), &before);
+        assert_eq!(engine.state().profile, before.profile);
+        assert_eq!(engine.profile, tracker);
+        assert_eq!(engine.closed_bars(), closed_before);
+        // Events that close no bar still pass.
+        engine.apply(&mark(5 * DAY + 1_000, 1)).unwrap();
     }
 
     #[test]
@@ -1297,7 +1376,8 @@ mod tests {
         );
         assert_eq!(
             StateError::Overflow { event }.to_string(),
-            "event (1999ms Trade seq 2) overflows the bar, volatility or order-flow arithmetic"
+            "event (1999ms Trade seq 2) overflows the bar, volatility, order-flow or \
+             volume-profile arithmetic"
         );
         assert_eq!(
             StateError::TimeJump {

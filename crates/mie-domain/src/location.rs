@@ -3,22 +3,30 @@
 //! Location answers "where is price relative to meaningful levels?". It is
 //! monitored continuously, whether or not any trade is authorized.
 //!
-//! These enums are the design vocabulary. The measurable definition of each
-//! level and auction state (windows, thresholds, what counts as acceptance) is
-//! owned by the location issue and must be deterministic.
+//! These enums are the design vocabulary. The volume-profile levels (POC,
+//! VAH, VAL, HVN, LVN) are defined by [`crate::profile`] (ADR-036), which
+//! hands them over as [`ProfileLevel`](crate::profile::ProfileLevel)s. The
+//! measurable definition of every other level and of each auction state
+//! (windows, thresholds, what counts as acceptance) is owned by the location
+//! issue and must be deterministic.
 
 /// Kinds of levels the location subsystem maintains and scores.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LevelKind {
-    /// Volume-profile point of control.
+    /// Volume-profile point of control: the bin with the most volume
+    /// ([`crate::profile`], ADR-036, decision 4).
     Poc,
-    /// Value-area high.
+    /// Value-area high: the upper (exclusive) edge of the value area
+    /// ([`crate::profile`], ADR-036, decision 5).
     Vah,
-    /// Value-area low.
+    /// Value-area low: the lower edge of the value area
+    /// ([`crate::profile`], ADR-036, decision 5).
     Val,
-    /// High-volume node.
+    /// High-volume node: a prominent peak of the smoothed profile
+    /// ([`crate::profile`], ADR-036, decision 6).
     Hvn,
-    /// Low-volume node.
+    /// Low-volume node: a prominent interior valley of the smoothed profile
+    /// ([`crate::profile`], ADR-036, decision 6).
     Lvn,
     /// Structural swing high.
     StructuralHigh,
