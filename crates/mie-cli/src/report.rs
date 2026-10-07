@@ -14,9 +14,11 @@
 //!    journaled `Disconnected` gap on its series, unless no event of that
 //!    stream followed in the run (a reconnect right before shutdown). On
 //!    `depth` the gap is announced at the resync (ADR-038): a change is
-//!    covered by an `OrderBook` `Disconnected` gap with `start <= t <= end`,
-//!    `t` the last record time of the old session, and is exempt when no
-//!    `book` sync line follows it in the run. `depthSnapshot` sessions are
+//!    covered by an `OrderBook` gap of any reason with `start <= t <= end`,
+//!    `t` the last record time of the old session (the first cause of an
+//!    unsynced period names the gap, rule 9, so a reconnect inside a
+//!    period opened by a `pu` break is covered by its `SequenceBreak` gap),
+//!    and is exempt when no `book` sync line follows it in the run. `depthSnapshot` sessions are
 //!    REST fetch ordinals, not connections, and are not checked.
 //! 3. **Clean shutdown**: every run has a `run_end` with exit code 0, and no
 //!    `.tmp` file is left in the source's directory.
@@ -399,16 +401,15 @@ fn check_depth_sessions(
             continue;
         }
         let last_old = pair[0].time;
-        let covered = journal.gaps.iter().any(|g| {
-            g.stream == "OrderBook"
-                && g.reason == "Disconnected"
-                && g.start <= last_old
-                && last_old <= g.end
-        });
+        // Any reason: the first cause of the unsynced period names the gap.
+        let covered = journal
+            .gaps
+            .iter()
+            .any(|g| g.stream == "OrderBook" && g.start <= last_old && last_old <= g.end);
         if !covered {
             problems.push(format!(
                 "depth run {run}: session change {} -> {} (last old record at {last_old} ms) \
-                 has no OrderBook Disconnected gap",
+                 has no covering OrderBook gap",
                 pair[0].session, pair[1].session
             ));
         }

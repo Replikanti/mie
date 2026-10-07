@@ -124,6 +124,10 @@ with `u < lastUpdateId`, require the first applied diff to straddle
    `mismatched` or `invalidated` checkpoint, and on a run whose depth spans
    more than twice its checkpoint interval without a `matched` one. This is
    #10's acceptance check; it needs no offline re-read of the raw depth.
+   A `depth` reconnect counts as covered by any `OrderBook` gap spanning the
+   old session's last record: by rule 9 a reconnect inside a period opened
+   by a `pu` break or a malformed diff is announced as `SequenceBreak` or
+   `MissingData`, not `Disconnected`.
 9. **Recompute.** A recompute of a whole run (#11, #13) reads its records
    in `receive_seq` order plus `run_start`. A recompute that starts mid-run
    syncs at its first snapshot record; replay windows are #11's.

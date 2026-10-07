@@ -266,7 +266,7 @@ fn a_clean_depth_capture_passes_and_its_reconnect_needs_the_book_gap() {
     std::fs::write(&config.paths.journal, tampered).unwrap();
     let (pass, text) = report(&config);
     assert!(!pass, "{text}");
-    assert!(text.contains("has no OrderBook Disconnected gap"), "{text}");
+    assert!(text.contains("has no covering OrderBook gap"), "{text}");
 }
 
 #[test]
@@ -315,4 +315,31 @@ fn a_long_depth_run_needs_a_matched_checkpoint() {
         text.contains("matched 1, unverifiable 0 | window min 9 bps, median 9 bps"),
         "{text}"
     );
+}
+
+#[test]
+fn a_depth_reconnect_covered_by_a_gap_of_another_cause_passes() {
+    // Rule 9 of ADR-038: when a pu break opened the unsynced period, the
+    // reconnect inside it is announced by that period's SequenceBreak gap.
+    let dir = TempDir::new("depth-cause");
+    let config = config_with(dir.path(), &["depth", "depthSnapshot"]);
+    let outcome = depth_capture_with_reconnect(&config);
+    assert_eq!(outcome.exit_code(), 0, "{:?}", outcome.error);
+    let journal = std::fs::read_to_string(&config.paths.journal).unwrap();
+    for cause in ["SequenceBreak", "MissingData"] {
+        let renamed: String = journal
+            .lines()
+            .map(|line| {
+                let mut value: serde_json::Value = serde_json::from_str(line).unwrap();
+                if value["type"] == "gap" && value["stream"] == "OrderBook" {
+                    value["reason"] = serde_json::json!(cause);
+                }
+                format!("{value}\n")
+            })
+            .collect();
+        assert!(renamed.contains(&format!(r#""reason":"{cause}""#)));
+        std::fs::write(&config.paths.journal, renamed).unwrap();
+        let (pass, text) = report(&config);
+        assert!(pass, "{cause}: {text}");
+    }
 }

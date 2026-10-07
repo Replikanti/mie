@@ -589,4 +589,79 @@ mod tests {
         assert_eq!(stats.streams[&BinanceStream::Depth].normalize_errors, 1);
         assert_eq!(stats.book.desyncs[&GapReason::Disconnected], 1);
     }
+
+    #[test]
+    fn a_reconnect_inside_an_unsynced_period_keeps_the_first_cause() {
+        let mut pipe = Pipeline::new("BTCUSDT", 0, 0, &BTreeMap::new());
+        let mut events = Vec::new();
+        let mut transitions = Vec::new();
+        let records = [
+            (
+                BinanceStream::Depth,
+                record("d/1", 1, &depth(1, 10, 0, 1_000)),
+            ),
+            (
+                BinanceStream::DepthSnapshot,
+                record("r/1", 2, &depth_snapshot(5, 990)),
+            ),
+            (
+                BinanceStream::Depth,
+                record("d/1", 3, &depth(11, 20, 10, 1_100)),
+            ),
+            // 21..=30 missing: a pu break opens the unsynced period.
+            (
+                BinanceStream::Depth,
+                record("d/1", 4, &depth(31, 40, 30, 1_300)),
+            ),
+            // The socket reconnects before the resync.
+            (
+                BinanceStream::Depth,
+                record("d/2", 5, &depth(51, 60, 50, 1_500)),
+            ),
+            (
+                BinanceStream::DepthSnapshot,
+                record("r/2", 6, &depth_snapshot(55, 1_450)),
+            ),
+        ];
+        for (stream, record) in &records {
+            let pushed = pipe.push(*stream, record);
+            events.extend(pushed.events);
+            transitions.extend(pushed.book);
+        }
+        events.extend(pipe.finish());
+        // One unsynced period, one gap, named by its first cause; it spans
+        // the old session's last record (1300).
+        let desyncs: Vec<_> = transitions
+            .iter()
+            .filter(|t| matches!(t, BookTransition::Desynced(_)))
+            .collect();
+        assert_eq!(
+            desyncs,
+            [
+                &BookTransition::Desynced(GapReason::Disconnected),
+                &BookTransition::Desynced(GapReason::SequenceBreak)
+            ]
+        );
+        let gaps: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                MarketEvent::FeedGap(g) => {
+                    Some((g.stream, g.start.as_millis(), g.end.as_millis(), g.reason))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            gaps,
+            [(Stream::OrderBook, 1_100, 1_450, GapReason::SequenceBreak)]
+        );
+        let mut engine = mie_domain::state::MarketStateEngine::new();
+        for event in &events {
+            engine.apply(event).unwrap();
+        }
+        assert_eq!(
+            pipe.stats().book.desyncs.get(&GapReason::Disconnected),
+            Some(&1)
+        );
+    }
 }
