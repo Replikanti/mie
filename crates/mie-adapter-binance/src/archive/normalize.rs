@@ -7,6 +7,10 @@
 //! must carry exactly its dataset's column count. Decimals go only through
 //! the domain's exact `FromStr` (ADR-027): the archive's trailing zeros
 //! beyond eight places are accepted, a ninth significant decimal is not.
+//! Unlike live payloads, an archive decimal may carry an exponent: the
+//! funding files write rates below 10⁻⁶ as `-1.8E-7` or `9.0E-7` (ADR-034).
+//! Such a value is first rewritten exactly into the plain grammar
+//! (`expand_exponent`), so both spellings of a value yield the same units.
 //! Booleans are `true` / `false` exactly, as published; integers are plain
 //! ASCII digits.
 //!
@@ -27,7 +31,7 @@
 use super::catalog::{ArchiveStream, DAY_MS, digits};
 use crate::normalize::{NormalizeError, decimal};
 use mie_domain::event::{Aggressor, FundingSettlement, Kline, MarketEvent, OpenInterest, Trade};
-use mie_domain::num::{Price, Qty, Rate};
+use mie_domain::num::{DECIMALS, ParseDecimalError, Price, Qty, Rate};
 use mie_domain::time::EventTime;
 
 /// Sampling resolution of the archive's open interest (`metrics`), in
@@ -67,7 +71,11 @@ impl<'a> Row<'a> {
         T: std::str::FromStr<Err = mie_domain::num::ParseDecimalError>,
     {
         let (value, name) = self.get(index);
-        decimal(Some(value), name)
+        if value.bytes().any(|b| matches!(b, b'e' | b'E')) {
+            decimal(Some(&expand_exponent(value, name)?), name)
+        } else {
+            decimal(Some(value), name)
+        }
     }
 
     fn integer(&self, index: usize) -> Result<u64, NormalizeError> {
@@ -107,6 +115,114 @@ impl<'a> Row<'a> {
 
 fn unexpected(name: &str, value: &str, expected: &str) -> NormalizeError {
     NormalizeError::Unexpected(format!("{name} {value:?}, expected {expected}"))
+}
+
+/// Rewrites an archive decimal with an exponent, `m[eE][+-]?x` with `m` in
+/// the domain grammar `-?[0-9]+(.[0-9]+)?`, into that plain grammar by
+/// moving the decimal point. The rewrite is exact: digit strings and integer
+/// exponent arithmetic only, never a float, and the result then goes through
+/// the same domain `FromStr` as every plain value, so `-1.8E-7` and
+/// `-0.00000018` yield the same units.
+///
+/// # Errors
+///
+/// [`NormalizeError::Unexpected`] when the mantissa or the exponent is
+/// malformed; [`NormalizeError::Decimal`] with
+/// [`ParseDecimalError::TooManyDecimals`] when a non-zero digit lands beyond
+/// the eighth decimal place, or [`ParseDecimalError::Overflow`] when the
+/// value is too large for the fixed scale (the domain parser reports
+/// overflows the bound here lets through).
+fn expand_exponent(value: &str, name: &'static str) -> Result<String, NormalizeError> {
+    let malformed = || {
+        unexpected(
+            name,
+            value,
+            "a decimal -?[0-9]+(.[0-9]+)?([eE][+-]?[0-9]+)?",
+        )
+    };
+    let is_digits = |part: &[u8]| !part.is_empty() && part.iter().all(u8::is_ascii_digit);
+    let bytes = value.as_bytes();
+    let split = bytes
+        .iter()
+        .position(|&b| matches!(b, b'e' | b'E'))
+        .ok_or_else(malformed)?;
+    let (mantissa, exponent) = (&bytes[..split], &bytes[split + 1..]);
+
+    let (negative, mantissa) = match mantissa.split_first() {
+        Some((b'-', rest)) => (true, rest),
+        _ => (false, mantissa),
+    };
+    let (int, frac) = match mantissa.iter().position(|&b| b == b'.') {
+        Some(point) => (&mantissa[..point], Some(&mantissa[point + 1..])),
+        None => (mantissa, None),
+    };
+    if !is_digits(int) || frac.is_some_and(|frac| !is_digits(frac)) {
+        return Err(malformed());
+    }
+    let frac = frac.unwrap_or_default();
+    let (exponent_negative, exponent) = match exponent.split_first() {
+        Some((b'-', rest)) => (true, rest),
+        Some((b'+', rest)) => (false, rest),
+        _ => (false, exponent),
+    };
+    if !is_digits(exponent) {
+        return Err(malformed());
+    }
+
+    // An all-zero mantissa (`0E-8`) is zero at any exponent.
+    let digits: Vec<u8> = int.iter().chain(frac).copied().collect();
+    let (Some(first), Some(last)) = (
+        digits.iter().position(|&b| b != b'0'),
+        digits.iter().rposition(|&b| b != b'0'),
+    ) else {
+        return Ok("0".to_owned());
+    };
+    let significant = &digits[first..=last];
+
+    // value = significant × 10^shift. Exponents beyond the i64 range
+    // saturate: such a value is too small or too large either way.
+    let exponent = exponent
+        .iter()
+        .try_fold(0_i64, |acc, &d| {
+            acc.checked_mul(10)?.checked_add(i64::from(d - b'0'))
+        })
+        .unwrap_or(i64::MAX);
+    let exponent = if exponent_negative {
+        -exponent
+    } else {
+        exponent
+    };
+    let below = i64::try_from(digits.len() - 1 - last).unwrap_or(i64::MAX);
+    let above = i64::try_from(frac.len()).unwrap_or(i64::MAX);
+    let shift = exponent.saturating_add(below).saturating_sub(above);
+    let len = i64::try_from(significant.len()).unwrap_or(i64::MAX);
+
+    // The last significant digit is non-zero and sits `-shift` places after
+    // the point.
+    let decimal_error = |error| NormalizeError::Decimal { field: name, error };
+    if shift < -i64::from(DECIMALS) {
+        return Err(decimal_error(ParseDecimalError::TooManyDecimals));
+    }
+    // A whole part of more than 20 digits exceeds every 64-bit fixed-point
+    // value. The bound only keeps the rewrite small; the domain parser
+    // decides the exact range.
+    if len.saturating_add(shift) > 20 {
+        return Err(decimal_error(ParseDecimalError::Overflow));
+    }
+
+    // From here -8 <= shift <= 19 and len + shift <= 20.
+    let significant = std::str::from_utf8(significant).map_err(|_| malformed())?;
+    let zeros = |count: i64| "0".repeat(usize::try_from(count).unwrap_or_default());
+    let sign = if negative { "-" } else { "" };
+    let point = len + shift;
+    Ok(if shift >= 0 {
+        format!("{sign}{significant}{}", zeros(shift))
+    } else if point > 0 {
+        let (whole, fraction) = significant.split_at(usize::try_from(point).unwrap_or_default());
+        format!("{sign}{whole}.{fraction}")
+    } else {
+        format!("{sign}0.{}{significant}", zeros(-point))
+    })
 }
 
 const AGG_TRADES: &[&str] = &[
@@ -359,5 +475,121 @@ mod tests {
                 "{time} {maker}"
             );
         }
+    }
+
+    /// The funding rate of a `fundingRate` row carrying `rate`.
+    fn funding_rate(rate: &str) -> Result<Rate, NormalizeError> {
+        let row = format!("1760976000000,8,{rate}");
+        match parse(ArchiveStream::FundingRate, "BTCUSDT", row.as_bytes())? {
+            Some(MarketEvent::FundingSettlement(settlement)) => Ok(settlement.rate),
+            other => panic!("{rate}: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn exponents_expand_exactly_to_the_plain_grammar() {
+        for (exponent, plain, units) in [
+            ("-1.8E-7", "-0.00000018", -18),
+            ("-6E-8", "-0.00000006", -6),
+            ("9.0E-7", "0.0000009", 90),
+            ("6.8E-7", "0.00000068", 68),
+            ("6.8e-7", "0.00000068", 68),
+            ("1E-8", "0.00000001", 1),
+            ("1.0E-8", "0.00000001", 1),
+            ("123.456E-2", "1.23456", 123_456_000),
+            ("1.25E+2", "125", 12_500_000_000),
+            ("1.25E2", "125", 12_500_000_000),
+            ("1e+0", "1", 100_000_000),
+            ("-0.0005E+3", "-0.5", -50_000_000),
+            ("00012E-1", "1.2", 120_000_000),
+            ("1E10", "10000000000", 1_000_000_000_000_000_000),
+            ("92233720368.54775807E0", "92233720368.54775807", i64::MAX),
+            (
+                "-92233720368.54775808e+0",
+                "-92233720368.54775808",
+                i64::MIN,
+            ),
+            ("0E-8", "0", 0),
+            ("-0E-8", "0", 0),
+            ("0.000E+99999999999999999999", "0", 0),
+        ] {
+            assert_eq!(
+                expand_exponent(exponent, "last_funding_rate").as_deref(),
+                Ok(plain),
+                "{exponent}"
+            );
+            assert_eq!(
+                funding_rate(exponent),
+                Ok(Rate::from_units(units)),
+                "{exponent}"
+            );
+        }
+    }
+
+    #[test]
+    fn exponents_out_of_the_fixed_scale_are_rejected() {
+        for (value, error) in [
+            ("1E-9", ParseDecimalError::TooManyDecimals),
+            ("-1.5E-8", ParseDecimalError::TooManyDecimals),
+            ("1.000000001E0", ParseDecimalError::TooManyDecimals),
+            (
+                "1E-99999999999999999999",
+                ParseDecimalError::TooManyDecimals,
+            ),
+            ("1E11", ParseDecimalError::Overflow),
+            ("-1E11", ParseDecimalError::Overflow),
+            ("92233720368.54775808E0", ParseDecimalError::Overflow),
+            ("1E21", ParseDecimalError::Overflow),
+            ("1E+99999999999999999999", ParseDecimalError::Overflow),
+        ] {
+            assert_eq!(
+                funding_rate(value),
+                Err(NormalizeError::Decimal {
+                    field: "last_funding_rate",
+                    error,
+                }),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_exponents_are_rejected() {
+        for bad in [
+            "1E",
+            "1E+",
+            "1E-",
+            "1E+-7",
+            "1E--7",
+            "1EE7",
+            "1E7.5",
+            "1E 7",
+            "1E7 ",
+            "E-7",
+            "-E-7",
+            ".5E-7",
+            "1.E-7",
+            "+1E-7",
+            "--1E-7",
+            "1_5E-7",
+            "1E0x7",
+            "1E\u{2212}7",
+            "1e-7e",
+        ] {
+            let error = funding_rate(bad).expect_err(bad);
+            assert!(
+                matches!(&error, NormalizeError::Unexpected(detail)
+                    if detail.contains("[eE][+-]?[0-9]+")),
+                "{bad}: {error}"
+            );
+        }
+        // Without an exponent the domain's own error stays.
+        assert_eq!(
+            funding_rate("1.5x"),
+            Err(NormalizeError::Decimal {
+                field: "last_funding_rate",
+                error: ParseDecimalError::Malformed,
+            })
+        );
     }
 }
