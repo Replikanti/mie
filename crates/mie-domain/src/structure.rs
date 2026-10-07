@@ -1809,6 +1809,15 @@ mod tests {
             .unwrap();
         assert_eq!(zone.kind, LevelKind::SfpRejectionZone);
         assert_eq!((zone.known_at, zone.age_ms(t(15 * M15))), (t(15 * M15), 0));
+        // The prior sweep took its kind at the sweeping trade, not at the
+        // resolution's emission.
+        let prior: Vec<StructureLevel> = registry_of(&engine, Timeframe::M15)
+            .levels()
+            .filter(|level| level.kind == LevelKind::PriorSweep)
+            .collect();
+        assert_eq!(prior.len(), 1);
+        assert_eq!(prior[0].outcome, Some(SweepOutcome::Sfp));
+        assert_eq!(prior[0].known_at, t(11 * M15 + 2_000));
     }
 
     #[test]
