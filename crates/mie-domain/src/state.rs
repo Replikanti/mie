@@ -7,10 +7,11 @@
 //! the bars each event closes (ADR-033, [`volatility`]), the order flow:
 //! CVD and rolling aggression windows (ADR-035, [`flow`]), and the volume
 //! profiles: developing UTC day, prior day and 5-day composite (ADR-036,
-//! [`profile`]); every other kind passes through. Further feature families
-//! (order book, OI/funding, structure) are added by the Market State
-//! issues, each as a registered, versioned definition (ADR-029,
-//! [`feature`]).
+//! [`profile`]), and the market structure: swings, structural levels,
+//! sweeps and SFPs on 15m, 1h, 4h and 1d (ADR-037, [`structure`]); every
+//! other kind passes through. Further feature families (order book,
+//! OI/funding) are added by the Market State issues, each as a registered,
+//! versioned definition (ADR-029, [`feature`]).
 //! The engine computes one [`FeatureSet`] and stamps its
 //! [`FeatureSetVersion`] on every state; each feature value carries its
 //! validity ([`FeatureValue`]).
@@ -19,6 +20,7 @@
 //! [`feature`]: crate::feature
 //! [`flow`]: crate::flow
 //! [`profile`]: crate::profile
+//! [`structure`]: crate::structure
 //! [`volatility`]: crate::volatility
 
 use crate::bars::{Bar, BarError, BarSet, MAX_BARS_PER_EVENT, Timeframe};
@@ -29,6 +31,7 @@ use crate::num::Price;
 use crate::order::CanonicalKey;
 use crate::profile::{ProfileError, ProfileTracker, VolumeProfiles};
 use crate::regime::Regime;
+use crate::structure::{StructureError, StructureEvent, StructureSet, StructureTracker};
 use crate::time::EventTime;
 use crate::volatility::{AtrRegimeSeries, MotionAnchors, MotionSet, VolatilityError};
 use std::cmp::Ordering;
@@ -70,6 +73,12 @@ pub struct MarketState {
     /// `profile.volume.prior_day@1` and `profile.volume.composite_5d@1` —
     /// exact volume per 10 USDT bin with POC, value area, HVNs and LVNs.
     pub profile: VolumeProfiles,
+    /// Market structure (ADR-037): `structure.swing.<tf>@1` and
+    /// `structure.levels.<tf>@1` ([`catalog::STRUCTURE_SWING`],
+    /// [`catalog::STRUCTURE_LEVELS`]) for 15m, 1h, 4h and 1d — the last
+    /// swings and the structural level registry with touches, sweeps and
+    /// SFPs. Structure facts, never signals (ADR-012).
+    pub structure: StructureSet,
     /// Number of trades consumed. A diagnostic counter, not a feature: it
     /// depends on where consumption started, so it is not reproducible
     /// across replay windows.
@@ -103,6 +112,13 @@ pub struct MarketStateEngine {
     flow: FlowTracker,
     /// The developing day's volume per bin and the recent completed days.
     profile: ProfileTracker,
+    /// The bar windows, swings and level registries of the structure.
+    structure: StructureTracker,
+    /// The structure facts of the last accepted event.
+    structure_events: Vec<StructureEvent>,
+    /// Scratch buffer for an event's structure facts, swapped with
+    /// `structure_events` once the event is accepted.
+    structure_pending: Vec<StructureEvent>,
 }
 
 /// Volatility state after the bars an event closed, committed with them.
@@ -209,6 +225,7 @@ impl MarketStateEngine {
             regime: volatility.regime(),
             flow: flow.flow(),
             profile: VolumeProfiles::new(),
+            structure: StructureSet::new(),
             trade_count: 0,
         };
         Self {
@@ -222,6 +239,9 @@ impl MarketStateEngine {
             volatility,
             flow,
             profile: ProfileTracker::new(),
+            structure: StructureTracker::new(),
+            structure_events: Vec::new(),
+            structure_pending: Vec::new(),
         }
     }
 
@@ -245,8 +265,8 @@ impl MarketStateEngine {
     ///   accepted one of its stream;
     /// - [`StateError::Overflow`] if a bar's time or quantity arithmetic, a
     ///   closed bar's true range, change or range, an order-flow sum (CVD,
-    ///   window) or a volume-profile sum (bin, total, composite) leaves the
-    ///   `i64` range;
+    ///   window), a volume-profile sum (bin, total, composite) or a
+    ///   structure count (touches, window bars) leaves its integer range;
     /// - [`StateError::TimeJump`] if it would close more than
     ///   [`MAX_BARS_PER_EVENT`] bars of one timeframe. Recovery: the replay
     ///   or session stops; restart it from a fresh engine after the jump.
@@ -327,6 +347,15 @@ impl MarketStateEngine {
                 });
             }
         };
+        let structure = match self.structure.step(event, &self.pending) {
+            Ok(structure) => structure,
+            Err(StructureError::Overflow) => {
+                self.pending.clear();
+                return Err(StateError::Overflow {
+                    event: event.canonical_key(),
+                });
+            }
+        };
 
         match event {
             MarketEvent::Trade(trade) => {
@@ -356,6 +385,15 @@ impl MarketStateEngine {
         self.flow.commit(flow);
         self.state.flow = self.flow.flow();
         self.profile.commit(profile, &mut self.state.profile);
+        self.structure_pending.clear();
+        if let Some(structure) = structure {
+            self.structure.commit(
+                structure,
+                &mut self.state.structure,
+                &mut self.structure_pending,
+            );
+        }
+        std::mem::swap(&mut self.structure_events, &mut self.structure_pending);
         self.state.as_of = Some(event.time());
         self.last = Some(event.clone());
         self.ids = ids;
@@ -401,6 +439,13 @@ impl MarketStateEngine {
     pub fn closed_bars(&self) -> &[Bar] {
         &self.closed
     }
+
+    /// The structure facts of the last accepted event, in processing order
+    /// (ADR-037, decision 8); empty when it produced none. A rejected event
+    /// leaves them unchanged.
+    pub fn structure_events(&self) -> &[StructureEvent] {
+        &self.structure_events
+    }
 }
 
 /// Why the engine rejected an event.
@@ -438,8 +483,9 @@ pub enum StateError {
         end: EventTime,
     },
     /// The event would push a bar's time or quantity arithmetic, a
-    /// volatility value, an order-flow sum or a volume-profile sum out of
-    /// the `i64` range (ADR-027, ADR-031, ADR-033, ADR-035, ADR-036).
+    /// volatility value, an order-flow sum, a volume-profile sum or a
+    /// structure count out of its integer range (ADR-027, ADR-031, ADR-033,
+    /// ADR-035, ADR-036, ADR-037).
     Overflow {
         /// Key of the rejected event.
         event: CanonicalKey,
@@ -483,8 +529,8 @@ impl fmt::Display for StateError {
             Self::Overflow { event } => {
                 write!(
                     f,
-                    "event ({event}) overflows the bar, volatility, order-flow or \
-                     volume-profile arithmetic"
+                    "event ({event}) overflows the bar, volatility, order-flow, \
+                     volume-profile or structure arithmetic"
                 )
             }
             Self::TimeJump {
@@ -584,6 +630,7 @@ mod tests {
                     windows: AggressionWindows::new(),
                 },
                 profile: VolumeProfiles::new(),
+                structure: StructureSet::new(),
                 trade_count: 3,
             }
         );
@@ -785,7 +832,10 @@ mod tests {
              bars.time.1h@1,bars.time.1m@1,bars.time.4h@1,bars.time.5m@1,\
              flow.cvd.continuous@1,flow.cvd.utc_day@1,flow.window.15m@1,\
              flow.window.1h@1,flow.window.5m@1,profile.volume.composite_5d@1,\
-             profile.volume.prior_day@1,profile.volume.utc_day@1,trade.last_price@1,\
+             profile.volume.prior_day@1,profile.volume.utc_day@1,\
+             structure.levels.15m@1,structure.levels.1d@1,structure.levels.1h@1,\
+             structure.levels.4h@1,structure.swing.15m@1,structure.swing.1d@1,\
+             structure.swing.1h@1,structure.swing.4h@1,trade.last_price@1,\
              volatility.atr.1h@1,volatility.regime.1h@1"
         );
         // Consuming events never changes it.
@@ -1012,6 +1062,63 @@ mod tests {
         assert_eq!(engine.closed_bars(), closed_before);
         // Events that close no bar still pass.
         engine.apply(&mark(5 * DAY + 1_000, 1)).unwrap();
+    }
+
+    #[test]
+    fn exposes_structure_and_its_events() {
+        const M15: i64 = 900_000;
+        let usdt = |whole: i64| whole * crate::num::SCALE;
+        // Four rising 15m bars, then a swing high at 60 015 on bar 7.
+        let mut events = Vec::new();
+        for (index, high) in (0..).zip([
+            59_990, 59_992, 59_994, 59_996, 60_010, 60_011, 60_012, 60_015, 60_012, 60_011, 60_010,
+        ]) {
+            let id = u64::try_from(index).unwrap() * 2;
+            events.push(priced_trade(index * M15 + 1_000, id + 1, usdt(high)));
+            events.push(priced_trade(index * M15 + 2_000, id + 2, usdt(high - 5)));
+        }
+        let mut engine = engine_after(&events);
+        assert!(engine.structure_events().is_empty());
+        let warm = engine.state().structure.get(Timeframe::M15).unwrap();
+        assert!(warm.levels.ready().unwrap().highs().is_empty());
+        // The trade that closes bar 10 confirms it.
+        engine
+            .apply(&priced_trade(11 * M15 + 1_000, 100, usdt(60_008)))
+            .unwrap();
+        let facts = engine.structure_events().to_vec();
+        assert!(
+            matches!(
+                facts.as_slice(),
+                [StructureEvent::Swing(swing)] if swing.price == Price::from_units(usdt(60_015))
+            ),
+            "{facts:?}"
+        );
+        let structure = engine.state().structure.get(Timeframe::M15).unwrap();
+        assert_eq!(structure.levels.ready().unwrap().highs().len(), 1);
+        assert!(structure.swings.ready().unwrap().high.is_some());
+        // A rejected event changes neither the structure nor its facts.
+        let before = engine.state().clone();
+        engine
+            .apply(&priced_trade(11 * M15, 101, usdt(70_000)))
+            .unwrap_err();
+        assert_eq!(engine.structure_events(), facts);
+        assert_eq!(engine.state(), &before);
+        // An event that emits nothing clears the facts, not the structure.
+        engine.apply(&mark(11 * M15 + 2_000, 1)).unwrap();
+        assert!(engine.structure_events().is_empty());
+        assert_eq!(engine.state().structure, before.structure);
+        // A trade one unit beyond the level sweeps it.
+        engine
+            .apply(&priced_trade(11 * M15 + 3_000, 102, usdt(60_015) + 1))
+            .unwrap();
+        assert!(
+            matches!(engine.structure_events(), [StructureEvent::Sweep(_)]),
+            "{:?}",
+            engine.structure_events()
+        );
+        let swept = engine.state().structure.get(Timeframe::M15).unwrap();
+        assert!(swept.levels.ready().unwrap().highs().is_empty());
+        assert_eq!(swept.levels.ready().unwrap().pending().len(), 1);
     }
 
     #[test]
@@ -1376,8 +1483,8 @@ mod tests {
         );
         assert_eq!(
             StateError::Overflow { event }.to_string(),
-            "event (1999ms Trade seq 2) overflows the bar, volatility, order-flow or \
-             volume-profile arithmetic"
+            "event (1999ms Trade seq 2) overflows the bar, volatility, order-flow, \
+             volume-profile or structure arithmetic"
         );
         assert_eq!(
             StateError::TimeJump {

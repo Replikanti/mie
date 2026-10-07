@@ -19,6 +19,7 @@
 //! | Motion, ATR and regime (ADR-033)          | [`volatility`]               |
 //! | Order flow / aggression (ADR-035)         | [`flow`]                     |
 //! | Volume profile (ADR-036)                  | [`profile`]                  |
+//! | Market structure (ADR-037)                | [`structure`]                |
 //! | Regime (ADR-017, ADR-033)                 | [`regime`]                   |
 //! | Location / auction state                  | [`location`]                 |
 //! | Bias / trigger (ADR-012, ADR-024)         | [`trigger`]                  |
@@ -39,6 +40,7 @@ pub mod profile;
 pub mod regime;
 pub mod state;
 pub mod strategy;
+pub mod structure;
 pub mod time;
 pub mod trigger;
 pub mod volatility;

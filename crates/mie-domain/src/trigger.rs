@@ -15,6 +15,10 @@ pub enum TriggerFamily {
     /// Failed auction: a probe beyond value rejected back inside.
     FailedAuction,
     /// Swing failure pattern: a sweep of a swing level followed by rejection.
+    ///
+    /// The structure fact is [`StructureEvent::Sfp`](crate::structure::StructureEvent::Sfp)
+    /// (ADR-037); the trigger rule — location, bias, parameter version — is
+    /// owned by the bias/trigger issue.
     Sfp,
     /// Aggression absorbed by passive liquidity.
     Absorption,

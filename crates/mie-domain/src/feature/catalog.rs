@@ -636,6 +636,326 @@ pub const PROFILE_VOLUME_COMPOSITE_5D_V1: FeatureDefinition = FeatureDefinition 
     warm_up: WarmUp::Samples(5),
 };
 
+/// A `structure.swing.<label>@1` or `structure.levels.<label>@1`
+/// definition (ADR-037): both warm up over seven closed bars of their
+/// timeframe, the window of one swing.
+const fn structure_v1(
+    id: &'static str,
+    params: &'static [Param],
+    inputs: &'static [Input],
+) -> FeatureDefinition {
+    FeatureDefinition {
+        key: FeatureKey::new(id, 1),
+        params,
+        inputs,
+        warm_up: WarmUp::Samples(7),
+    }
+}
+
+/// `structure.swing.15m@1`: the last confirmed swing high and swing low of
+/// the closed 15m bars (ADR-037, decisions 2–4).
+///
+/// - Parameters: `swing_bars` = 3 (a swing is a fractal with 3 bars on each
+///   side), `tie_rule` = `strict_left_weak_right` (a plateau of equal
+///   extremes yields one swing, at its first bar), `timeframe_ms` =
+///   900 000.
+/// - Inputs: `bars.time.15m@1`.
+/// - Warm-up: 7 samples, where a sample is a closed 15m bar. A swing is
+///   confirmed, and only then visible, when the third bar after it closes.
+/// - Gap policy: nothing resets on a gap. A swing carries the OR of the
+///   coverage of its seven window bars; empty bars never qualify or
+///   disqualify a swing.
+pub const STRUCTURE_SWING_15M_V1: FeatureDefinition = structure_v1(
+    "structure.swing.15m",
+    &[
+        Param {
+            name: "swing_bars",
+            value: ParamValue::Int(3),
+        },
+        Param {
+            name: "tie_rule",
+            value: ParamValue::Text("strict_left_weak_right"),
+        },
+        Param {
+            name: "timeframe_ms",
+            value: ParamValue::Int(900_000),
+        },
+    ],
+    &[Input::Feature(BARS_TIME_15M_V1.key)],
+);
+
+/// `structure.swing.1h@1`: the last confirmed swing high and swing low of
+/// the closed 1h bars (ADR-037).
+///
+/// Parameters: `swing_bars` = 3, `tie_rule` = `strict_left_weak_right`,
+/// `timeframe_ms` = 3 600 000. Input `bars.time.1h@1`. Warm-up (7 closed 1h
+/// bars) and gap policy as [`STRUCTURE_SWING_15M_V1`].
+pub const STRUCTURE_SWING_1H_V1: FeatureDefinition = structure_v1(
+    "structure.swing.1h",
+    &[
+        Param {
+            name: "swing_bars",
+            value: ParamValue::Int(3),
+        },
+        Param {
+            name: "tie_rule",
+            value: ParamValue::Text("strict_left_weak_right"),
+        },
+        Param {
+            name: "timeframe_ms",
+            value: ParamValue::Int(3_600_000),
+        },
+    ],
+    &[Input::Feature(BARS_TIME_1H_V1.key)],
+);
+
+/// `structure.swing.4h@1`: the last confirmed swing high and swing low of
+/// the closed 4h bars (ADR-037).
+///
+/// Parameters: `swing_bars` = 3, `tie_rule` = `strict_left_weak_right`,
+/// `timeframe_ms` = 14 400 000. Input `bars.time.4h@1`. Warm-up (7 closed 4h
+/// bars) and gap policy as [`STRUCTURE_SWING_15M_V1`].
+pub const STRUCTURE_SWING_4H_V1: FeatureDefinition = structure_v1(
+    "structure.swing.4h",
+    &[
+        Param {
+            name: "swing_bars",
+            value: ParamValue::Int(3),
+        },
+        Param {
+            name: "tie_rule",
+            value: ParamValue::Text("strict_left_weak_right"),
+        },
+        Param {
+            name: "timeframe_ms",
+            value: ParamValue::Int(14_400_000),
+        },
+    ],
+    &[Input::Feature(BARS_TIME_4H_V1.key)],
+);
+
+/// `structure.swing.1d@1`: the last confirmed swing high and swing low of
+/// the closed 1d bars (ADR-037).
+///
+/// Parameters: `swing_bars` = 3, `tie_rule` = `strict_left_weak_right`,
+/// `timeframe_ms` = 86 400 000. Input `bars.time.1d@1`. Warm-up (7 closed 1d
+/// bars) and gap policy as [`STRUCTURE_SWING_15M_V1`].
+pub const STRUCTURE_SWING_1D_V1: FeatureDefinition = structure_v1(
+    "structure.swing.1d",
+    &[
+        Param {
+            name: "swing_bars",
+            value: ParamValue::Int(3),
+        },
+        Param {
+            name: "tie_rule",
+            value: ParamValue::Text("strict_left_weak_right"),
+        },
+        Param {
+            name: "timeframe_ms",
+            value: ParamValue::Int(86_400_000),
+        },
+    ],
+    &[Input::Feature(BARS_TIME_1D_V1.key)],
+);
+
+/// `structure.levels.15m@1`: the structural level registry of the 15m
+/// bars (ADR-037, decisions 5–8): the active swing highs and lows with
+/// their touches, the levels swept by a trade, and whether each sweep
+/// turned into a swing-failure pattern (SFP) or a clean break. An SFP is a
+/// structure fact, never a signal (ADR-012, ADR-024).
+///
+/// - Parameters: `max_levels` = 20 (per list: active highs, active lows,
+///   resolved sweeps; the oldest is evicted), `sfp_rule` =
+///   `close_at_or_inside`, `sfp_window_bars` = 2 (bars of this timeframe
+///   from the one containing the sweep trade), `sweep_rule` =
+///   `trade_through_strict` (a trade strictly beyond the level),
+///   `timeframe_ms` = 900 000, `touch_tolerance_bps` = 5.
+/// - Inputs: trades (the sweeps), `bars.time.15m@1` (touches and SFP
+///   windows) and `structure.swing.15m@1` (the levels).
+/// - Warm-up: 7 samples, where a sample is a closed 15m bar, as the swings.
+/// - Gap policy: nothing resets on a gap. A trade-through inside a trades
+///   gap is unobservable; sweeps and resolutions carry the OR of the
+///   coverage of the bars they read.
+pub const STRUCTURE_LEVELS_15M_V1: FeatureDefinition = structure_v1(
+    "structure.levels.15m",
+    &[
+        Param {
+            name: "max_levels",
+            value: ParamValue::Int(20),
+        },
+        Param {
+            name: "sfp_rule",
+            value: ParamValue::Text("close_at_or_inside"),
+        },
+        Param {
+            name: "sfp_window_bars",
+            value: ParamValue::Int(2),
+        },
+        Param {
+            name: "sweep_rule",
+            value: ParamValue::Text("trade_through_strict"),
+        },
+        Param {
+            name: "timeframe_ms",
+            value: ParamValue::Int(900_000),
+        },
+        Param {
+            name: "touch_tolerance_bps",
+            value: ParamValue::Int(5),
+        },
+    ],
+    &[
+        Input::Stream(Stream::Trades),
+        Input::Feature(BARS_TIME_15M_V1.key),
+        Input::Feature(STRUCTURE_SWING_15M_V1.key),
+    ],
+);
+
+/// `structure.levels.1h@1`: the structural level registry of the 1h
+/// bars, with touches, sweeps and SFPs (ADR-037).
+///
+/// Parameters: as [`STRUCTURE_LEVELS_15M_V1`] with `timeframe_ms` =
+/// 3 600 000. Inputs trades, `bars.time.1h@1` and `structure.swing.1h@1`.
+/// Warm-up (7 closed 1h bars) and gap policy as
+/// [`STRUCTURE_LEVELS_15M_V1`].
+pub const STRUCTURE_LEVELS_1H_V1: FeatureDefinition = structure_v1(
+    "structure.levels.1h",
+    &[
+        Param {
+            name: "max_levels",
+            value: ParamValue::Int(20),
+        },
+        Param {
+            name: "sfp_rule",
+            value: ParamValue::Text("close_at_or_inside"),
+        },
+        Param {
+            name: "sfp_window_bars",
+            value: ParamValue::Int(2),
+        },
+        Param {
+            name: "sweep_rule",
+            value: ParamValue::Text("trade_through_strict"),
+        },
+        Param {
+            name: "timeframe_ms",
+            value: ParamValue::Int(3_600_000),
+        },
+        Param {
+            name: "touch_tolerance_bps",
+            value: ParamValue::Int(5),
+        },
+    ],
+    &[
+        Input::Stream(Stream::Trades),
+        Input::Feature(BARS_TIME_1H_V1.key),
+        Input::Feature(STRUCTURE_SWING_1H_V1.key),
+    ],
+);
+
+/// `structure.levels.4h@1`: the structural level registry of the 4h
+/// bars, with touches, sweeps and SFPs (ADR-037).
+///
+/// Parameters: as [`STRUCTURE_LEVELS_15M_V1`] with `timeframe_ms` =
+/// 14 400 000. Inputs trades, `bars.time.4h@1` and `structure.swing.4h@1`.
+/// Warm-up (7 closed 4h bars) and gap policy as
+/// [`STRUCTURE_LEVELS_15M_V1`].
+pub const STRUCTURE_LEVELS_4H_V1: FeatureDefinition = structure_v1(
+    "structure.levels.4h",
+    &[
+        Param {
+            name: "max_levels",
+            value: ParamValue::Int(20),
+        },
+        Param {
+            name: "sfp_rule",
+            value: ParamValue::Text("close_at_or_inside"),
+        },
+        Param {
+            name: "sfp_window_bars",
+            value: ParamValue::Int(2),
+        },
+        Param {
+            name: "sweep_rule",
+            value: ParamValue::Text("trade_through_strict"),
+        },
+        Param {
+            name: "timeframe_ms",
+            value: ParamValue::Int(14_400_000),
+        },
+        Param {
+            name: "touch_tolerance_bps",
+            value: ParamValue::Int(5),
+        },
+    ],
+    &[
+        Input::Stream(Stream::Trades),
+        Input::Feature(BARS_TIME_4H_V1.key),
+        Input::Feature(STRUCTURE_SWING_4H_V1.key),
+    ],
+);
+
+/// `structure.levels.1d@1`: the structural level registry of the 1d
+/// bars, with touches, sweeps and SFPs (ADR-037).
+///
+/// Parameters: as [`STRUCTURE_LEVELS_15M_V1`] with `timeframe_ms` =
+/// 86 400 000. Inputs trades, `bars.time.1d@1` and `structure.swing.1d@1`.
+/// Warm-up (7 closed 1d bars) and gap policy as
+/// [`STRUCTURE_LEVELS_15M_V1`].
+pub const STRUCTURE_LEVELS_1D_V1: FeatureDefinition = structure_v1(
+    "structure.levels.1d",
+    &[
+        Param {
+            name: "max_levels",
+            value: ParamValue::Int(20),
+        },
+        Param {
+            name: "sfp_rule",
+            value: ParamValue::Text("close_at_or_inside"),
+        },
+        Param {
+            name: "sfp_window_bars",
+            value: ParamValue::Int(2),
+        },
+        Param {
+            name: "sweep_rule",
+            value: ParamValue::Text("trade_through_strict"),
+        },
+        Param {
+            name: "timeframe_ms",
+            value: ParamValue::Int(86_400_000),
+        },
+        Param {
+            name: "touch_tolerance_bps",
+            value: ParamValue::Int(5),
+        },
+    ],
+    &[
+        Input::Stream(Stream::Trades),
+        Input::Feature(BARS_TIME_1D_V1.key),
+        Input::Feature(STRUCTURE_SWING_1D_V1.key),
+    ],
+);
+
+/// The swing feature of each structure timeframe, shortest first; the
+/// Market State builds its [`StructureSet`](crate::structure::StructureSet)
+/// from it with [`STRUCTURE_LEVELS`].
+pub const STRUCTURE_SWING: [(Timeframe, &FeatureDefinition); 4] = [
+    (Timeframe::M15, &STRUCTURE_SWING_15M_V1),
+    (Timeframe::H1, &STRUCTURE_SWING_1H_V1),
+    (Timeframe::H4, &STRUCTURE_SWING_4H_V1),
+    (Timeframe::D1, &STRUCTURE_SWING_1D_V1),
+];
+
+/// The level-registry feature of each structure timeframe, shortest first.
+pub const STRUCTURE_LEVELS: [(Timeframe, &FeatureDefinition); 4] = [
+    (Timeframe::M15, &STRUCTURE_LEVELS_15M_V1),
+    (Timeframe::H1, &STRUCTURE_LEVELS_1H_V1),
+    (Timeframe::H4, &STRUCTURE_LEVELS_4H_V1),
+    (Timeframe::D1, &STRUCTURE_LEVELS_1D_V1),
+];
+
 /// Every version of every feature. Never shrinks.
 pub const DEFINITIONS: &[&FeatureDefinition] = &[
     &TRADE_LAST_PRICE_V1,
@@ -661,6 +981,14 @@ pub const DEFINITIONS: &[&FeatureDefinition] = &[
     &PROFILE_VOLUME_UTC_DAY_V1,
     &PROFILE_VOLUME_PRIOR_DAY_V1,
     &PROFILE_VOLUME_COMPOSITE_5D_V1,
+    &STRUCTURE_SWING_15M_V1,
+    &STRUCTURE_SWING_1H_V1,
+    &STRUCTURE_SWING_4H_V1,
+    &STRUCTURE_SWING_1D_V1,
+    &STRUCTURE_LEVELS_15M_V1,
+    &STRUCTURE_LEVELS_1H_V1,
+    &STRUCTURE_LEVELS_4H_V1,
+    &STRUCTURE_LEVELS_1D_V1,
 ];
 
 /// The fingerprint each published `id@version` must keep. Append-only: one
@@ -689,6 +1017,14 @@ pub const LOCK: &[LockEntry] = &[
     LockEntry::new("profile.volume.utc_day", 1, 0x664c_8237_3b35_4b5a),
     LockEntry::new("profile.volume.prior_day", 1, 0x8cec_f1e9_1a0a_2d6f),
     LockEntry::new("profile.volume.composite_5d", 1, 0x9c8a_e4da_061a_e2b4),
+    LockEntry::new("structure.swing.15m", 1, 0x0c13_e804_592f_2c14),
+    LockEntry::new("structure.swing.1h", 1, 0x8ede_32da_52d7_b4f0),
+    LockEntry::new("structure.swing.4h", 1, 0x3d95_0ad1_de6d_6fdd),
+    LockEntry::new("structure.swing.1d", 1, 0xfdb7_ceac_b72a_1f5d),
+    LockEntry::new("structure.levels.15m", 1, 0xdbcd_67b3_c804_62e6),
+    LockEntry::new("structure.levels.1h", 1, 0x8dca_ac85_b01e_2e17),
+    LockEntry::new("structure.levels.4h", 1, 0x9e80_e15b_4382_0c99),
+    LockEntry::new("structure.levels.1d", 1, 0xb81f_aa9e_a38e_5d88),
 ];
 
 /// The default feature set: the latest version of each computed feature.
@@ -716,6 +1052,14 @@ pub const CURRENT: &[FeatureKey] = &[
     PROFILE_VOLUME_UTC_DAY_V1.key,
     PROFILE_VOLUME_PRIOR_DAY_V1.key,
     PROFILE_VOLUME_COMPOSITE_5D_V1.key,
+    STRUCTURE_SWING_15M_V1.key,
+    STRUCTURE_SWING_1H_V1.key,
+    STRUCTURE_SWING_4H_V1.key,
+    STRUCTURE_SWING_1D_V1.key,
+    STRUCTURE_LEVELS_15M_V1.key,
+    STRUCTURE_LEVELS_1H_V1.key,
+    STRUCTURE_LEVELS_4H_V1.key,
+    STRUCTURE_LEVELS_1D_V1.key,
 ];
 
 /// The registry of [`DEFINITIONS`].
@@ -789,10 +1133,10 @@ mod tests {
             hasher.write_u32(entry.key.version.get());
             hasher.write_u64(entry.fingerprint.value());
         }
-        assert_eq!(LOCK.len(), 23, "lock lines");
+        assert_eq!(LOCK.len(), 31, "lock lines");
         assert_eq!(
             hasher.finish().to_string(),
-            "7115052d525501db",
+            "087dddb089e9bf7e",
             "lock digest"
         );
     }
@@ -945,6 +1289,98 @@ mod tests {
     }
 
     #[test]
+    fn structure_features_match_their_timeframes() {
+        use crate::structure::{
+            MAX_LEVELS, SFP_WINDOW_BARS, STRUCTURE_TIMEFRAMES, SWING_BARS, SWING_WINDOW,
+            TOUCH_TOLERANCE_BPS,
+        };
+        let int = |value: usize| ParamValue::Int(i64::try_from(value).unwrap());
+        assert_eq!(
+            STRUCTURE_SWING.map(|(timeframe, _)| timeframe),
+            STRUCTURE_TIMEFRAMES
+        );
+        assert_eq!(
+            STRUCTURE_LEVELS.map(|(timeframe, _)| timeframe),
+            STRUCTURE_TIMEFRAMES
+        );
+        let warm_up = WarmUp::Samples(u32::try_from(SWING_WINDOW).unwrap());
+        for ((timeframe, swing), (_, levels)) in STRUCTURE_SWING.into_iter().zip(STRUCTURE_LEVELS) {
+            let bars = BARS_TIME
+                .iter()
+                .find(|(bars, _)| *bars == timeframe)
+                .unwrap()
+                .1;
+            let timeframe_ms = Param {
+                name: "timeframe_ms",
+                value: ParamValue::Int(timeframe.millis()),
+            };
+            assert_eq!(
+                swing.key.id.as_str(),
+                format!("structure.swing.{}", timeframe.label())
+            );
+            assert_eq!(
+                swing.params,
+                &[
+                    Param {
+                        name: "swing_bars",
+                        value: int(SWING_BARS),
+                    },
+                    Param {
+                        name: "tie_rule",
+                        value: ParamValue::Text("strict_left_weak_right"),
+                    },
+                    timeframe_ms,
+                ],
+                "{timeframe:?}"
+            );
+            assert_eq!(swing.inputs, &[Input::Feature(bars.key)]);
+            assert_eq!(swing.warm_up, warm_up);
+            assert_eq!(
+                levels.key.id.as_str(),
+                format!("structure.levels.{}", timeframe.label())
+            );
+            assert_eq!(
+                levels.params,
+                &[
+                    Param {
+                        name: "max_levels",
+                        value: int(MAX_LEVELS),
+                    },
+                    Param {
+                        name: "sfp_rule",
+                        value: ParamValue::Text("close_at_or_inside"),
+                    },
+                    Param {
+                        name: "sfp_window_bars",
+                        value: ParamValue::Int(i64::from(SFP_WINDOW_BARS)),
+                    },
+                    Param {
+                        name: "sweep_rule",
+                        value: ParamValue::Text("trade_through_strict"),
+                    },
+                    timeframe_ms,
+                    Param {
+                        name: "touch_tolerance_bps",
+                        value: ParamValue::Int(TOUCH_TOLERANCE_BPS),
+                    },
+                ],
+                "{timeframe:?}"
+            );
+            assert_eq!(
+                levels.inputs,
+                &[
+                    Input::Stream(Stream::Trades),
+                    Input::Feature(bars.key),
+                    Input::Feature(swing.key),
+                ]
+            );
+            assert_eq!(levels.warm_up, warm_up);
+            assert!(CURRENT.contains(&swing.key), "{}", swing.key);
+            assert!(CURRENT.contains(&levels.key), "{}", levels.key);
+        }
+    }
+
+    #[test]
     fn current_set_version_is_pinned() {
         // The feature-set version every experiment records (ADR-029). It may
         // change only when CURRENT does — any other change here means a
@@ -957,9 +1393,12 @@ mod tests {
              bars.time.1h@1,bars.time.1m@1,bars.time.4h@1,bars.time.5m@1,\
              flow.cvd.continuous@1,flow.cvd.utc_day@1,flow.window.15m@1,\
              flow.window.1h@1,flow.window.5m@1,profile.volume.composite_5d@1,\
-             profile.volume.prior_day@1,profile.volume.utc_day@1,trade.last_price@1,\
+             profile.volume.prior_day@1,profile.volume.utc_day@1,\
+             structure.levels.15m@1,structure.levels.1d@1,structure.levels.1h@1,\
+             structure.levels.4h@1,structure.swing.15m@1,structure.swing.1d@1,\
+             structure.swing.1h@1,structure.swing.4h@1,trade.last_price@1,\
              volatility.atr.1h@1,volatility.regime.1h@1"
         );
-        assert_eq!(set.version().to_string(), "cdad39bf5282bd8a");
+        assert_eq!(set.version().to_string(), "faac613e2a5ebbab");
     }
 }
