@@ -1,6 +1,6 @@
 # ADR-031: Event-time bars on a fixed timeframe set
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-10-06
 
 ## Context
@@ -137,6 +137,22 @@ from bars. Several earlier decisions constrain how bars are built:
 
 The kline cross-check on a backfilled day (run with the archive backfill,
 #12) matches every complete bar, or explains each mismatch.
+
+## Acceptance
+
+Accepted 2026-10-07 on the archive backfill of #12 (ADR-034 D8), which is
+the backfilled-day run this criterion names; no live-capture comparison is
+part of it. Bars built from individual trades match the archive klines bar
+for bar on a clean 3-day window (2026-02-05 … 02-07: 5565/5565). Bars built
+from aggTrades differ at aggregation boundaries on the same bars (1658 of
+5565 there), as expected: an aggregate's constituent trades can fall in a
+minute other than its `transact_time`; the same bar code on individual
+trades explains every one of them. The other window (2025-10-09 … 10-11)
+matches except 153 bars on 2025-10-10 22:03 – 24:00 UTC, an upstream defect
+of `BTCUSDT-trades-2025-10-10.zip`: from 22:03 the individual-trades dump
+omits trades that both the aggTrades file and the klines contain. Single
+skipped trade ids are skipped by the klines too and cause no mismatch.
+Results: <https://github.com/Replikanti/mie/issues/12#issuecomment-6032650398>.
 
 References: ADR-019, ADR-022, ADR-023, ADR-027, ADR-028, ADR-029. ADR-029
 stays proposed: its *Accept when* also needs a volatility feature (#16).
