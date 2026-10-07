@@ -52,7 +52,7 @@ enforces the boundary (ADR-025):
 | [`mie-ports`](crates/mie-ports) | Use-case (inbound) and infrastructure (outbound) contracts owned by the core. |
 | [`mie-app`](crates/mie-app) | Use-case services that drive the domain through ports. |
 | [`mie-adapter-parquet`](crates/mie-adapter-parquet) | Immutable raw store: verbatim messages in sealed Parquet files with manifests and dataset versions (ADR-030). |
-| [`mie-adapter-binance`](crates/mie-adapter-binance) | Binance USDⓈ-M live capture: raw-first persistence, shared normalization, feed gaps, canonical merge (ADR-032); public-archive backfill: checksum-verified, exactly-once import (ADR-034); replay of both from the raw store (ADR-039). |
+| [`mie-adapter-binance`](crates/mie-adapter-binance) | Binance USDⓈ-M live capture: raw-first persistence, shared normalization, feed gaps, canonical merge (ADR-032); order-book sync from depth diffs and REST snapshots with audited checkpoints (ADR-038); public-archive backfill: checksum-verified, exactly-once import (ADR-034); replay of both from the raw store (ADR-039). |
 | `mie-adapter-*` *(planned)* | DuckDB, Telegram, LLM operators, backtest engine. |
 | [`mie-cli`](crates/mie-cli) | Composition root, the `mie` binary: wires adapters to ports. Today `ingest`, `capture-report`, `archive-import` / `archive-verify` / `archive-kline-check` and `replay`; research and report follow. |
 
