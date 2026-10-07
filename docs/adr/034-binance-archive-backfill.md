@@ -1,6 +1,6 @@
 # ADR-034: Binance archive backfill — verbatim rows, per-file ledger, end-of-interval open interest
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-10-06
 
 ## Context
@@ -200,3 +200,16 @@ The acceptance run of #12 passes: a 12-month dry run, import, a deliberate
 re-run (no download, unchanged manifest list and dataset versions),
 `archive-verify` PASS, and the kline cross-check on three consecutive days
 with `--trade-source trades` matching every complete bar.
+
+## Acceptance
+
+Accepted 2026-10-07 after the acceptance run of #12 (window 2025-10-01 …
+2026-09-30): dry run 3297 published, 0 missing; import with a deliberate
+`kill -9` mid-file resumed without duplicates; idempotent re-run with 0
+downloads and unchanged manifest list and dataset versions; `archive-verify`
+PASS (after the exact fix for exponent-notation fundingRate rows, #55); the
+kline cross-check with `--trade-source trades` matched 5565/5565 bars on
+2026-02-05 … 02-07. One upstream defect is documented:
+`BTCUSDT-trades-2025-10-10.zip` omits trades from 22:03 UTC to the end of the
+file. Full results:
+<https://github.com/Replikanti/mie/issues/12#issuecomment-6032650398>.

@@ -5,20 +5,23 @@ resolution, and which features can be computed for which period. Sources:
 live capture (`mie ingest`, source `binance-um`, ADR-032) and the public
 archive backfill (`mie archive-import`, source `binance-archive`, ADR-034).
 
-**Gaps** are filled by the acceptance run of #12 (`mie archive-verify`
-lists trade-id breaks and holes over 60 s per stream); until then the
-column says so.
+**Gaps** come from the acceptance run of #12 (`mie archive-verify` lists
+trade-id breaks and holes over 60 s per stream), window 2025-10-01 …
+2026-09-30. The archive bucket listing is stale, so availability was
+checked per file (ADR-034): all 9 daily streams for each of the 365 days
+and the 12 monthly `fundingRate` files were published, **0 missing**
+([results](https://github.com/Replikanti/mie/issues/12#issuecomment-6032650398)).
 
 ## Archive datasets (`data.binance.vision/data/futures/um/`)
 
 | Dataset | Archive path | Raw stream | Resolution | Archive history start | Imported window | Normalized to | Gaps / caveats |
 |---|---|---|---|---|---|---|---|
-| Aggregate trades | `daily/aggTrades/BTCUSDT/` | `aggTrades` | per aggregate, ms | 2019-12-31 | 2025-10-01 … 2026-09-30 (planned) | `Trade` (`is_buyer_maker` ⇒ sell aggressor) | Filled by the acceptance run. An aggregate's constituents can fall in another minute than its `transact_time`, so aggTrades bars differ from klines at minute boundaries (ADR-034 D8) |
-| Klines 1m, 5m, 15m, 1h, 4h, 1d | `daily/klines/BTCUSDT/<interval>/` | `klines_1m` … `klines_1d` | the interval | 2019-12-31 | as above | `Kline` (cross-check only, never a bar source) | Filled by the acceptance run |
-| Funding rate | `monthly/fundingRate/BTCUSDT/` | `fundingRate` | per settlement (8 h) | 2020-01 | months overlapping the window | `FundingSettlement` at `calc_time` | Monthly files only; `calc_time` has ms jitter |
+| Aggregate trades | `daily/aggTrades/BTCUSDT/` | `aggTrades` | per aggregate, ms | 2019-12-31 | 2025-10-01 … 2026-09-30 | `Trade` (`is_buyer_maker` ⇒ sell aggressor) | 0 id breaks, 0 holes over 60 s across the whole year (780 files, 603 218 226 rows). An aggregate's constituents can fall in another minute than its `transact_time`, so aggTrades bars differ from klines at minute boundaries (ADR-034 D8) |
+| Klines 1m, 5m, 15m, 1h, 4h, 1d | `daily/klines/BTCUSDT/<interval>/` | `klines_1m` … `klines_1d` | the interval | 2019-12-31 | as above | `Kline` (cross-check only, never a bar source) | 365 files per interval, 0 missing, 0 integrity errors |
+| Funding rate | `monthly/fundingRate/BTCUSDT/` | `fundingRate` | per settlement (8 h) | 2020-01 | months overlapping the window | `FundingSettlement` at `calc_time` | Monthly files only; `calc_time` has ms jitter. 12 months, 0 missing; 12 rows use exponent notation (`-1.8E-7`), parsed exactly since #55 |
 | Metrics (open interest, ratios) | `daily/metrics/BTCUSDT/` | `metrics` | 5 min | 2021-12-01 | as above | `OpenInterest`, `resolution_ms` 300 000, ordered at `create_time` + 5 min (ADR-034 D3) | Rows unsorted in the file; the 23:55 sample is filed under the next day. Ratio columns stored raw only |
 | Book depth bands | `daily/bookDepth/BTCUSDT/` | `bookDepth` | ~30 s, ±1–5 % bands | 2023-01-01 | as above | none (raw only, DuckDB research) | Percentage bands, not a book; band labels `-5` vs `-5.00` differ across the window |
-| Individual trades | `daily/trades/BTCUSDT/` | `trades` (opt-in) | per trade, ms | 2019-12-31 | days of the kline cross-check only | `Trade` with the raw id, cross-check only | Not a replay stream |
+| Individual trades | `daily/trades/BTCUSDT/` | `trades` (opt-in) | per trade, ms | 2019-12-31 | days of the kline cross-check only | `Trade` with the raw id, cross-check only | Not a replay stream. Imported for 10 days, including the two cross-check windows (2025-10-09 … 10-11, 2026-02-05 … 02-07). Single skipped trade ids (the klines skip them too, so bars are unaffected). **Upstream defect:** `BTCUSDT-trades-2025-10-10.zip` omits trades from 22:03 UTC to the end of the file; the aggTrades file and the klines contain them (ADR-031) |
 | Book ticker | `daily/bookTicker/` | — | — | — | not imported | — | Ends 2024-03-30 |
 | Liquidations | — | — | — | — | — | — | No USD-M archive dataset |
 
