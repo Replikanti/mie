@@ -8,6 +8,9 @@
 //! - Decimals are borrowed as strings and parsed only through the exact
 //!   `FromStr` of [`Price`], [`Qty`] and [`Rate`] (ADR-027). A decimal sent
 //!   as a JSON number is rejected, never coerced through `f64`.
+//! - A trade quantity that is not positive is an error
+//!   ([`NormalizeError::Unexpected`]): it is not an execution, and every
+//!   downstream sum (bars, flow, profile) assumes positive volume.
 //! - Unknown fields are ignored, so additive exchange changes do not break
 //!   capture. A missing field, a wrong event type or a symbol mismatch is an
 //!   error; the raw message is kept either way.
@@ -140,6 +143,19 @@ where
         .map_err(|error| NormalizeError::Decimal { field, error })
 }
 
+/// Accepts a trade quantity only when it is positive: a zero or negative
+/// quantity is not an execution (issue #54). Shared with the archive
+/// normalizer, so both trade paths enforce the same rule.
+pub(crate) fn positive_trade_qty(qty: Qty, field: &'static str) -> Result<Qty, NormalizeError> {
+    if qty.units() > 0 {
+        Ok(qty)
+    } else {
+        Err(NormalizeError::Unexpected(format!(
+            "{field}: trade quantity must be positive, got {qty}"
+        )))
+    }
+}
+
 fn expect_event_type(value: Option<&str>, expected: &str) -> Result<(), NormalizeError> {
     match req(value, "e")? {
         e if e == expected => Ok(()),
@@ -196,7 +212,7 @@ fn parse_agg_trade(symbol: &str, payload: &[u8]) -> Result<MarketEvent, Normaliz
         time: time(msg.trade_time, "T")?,
         trade_id: req(msg.a, "a")?,
         price: decimal::<Price>(msg.p, "p")?,
-        qty: decimal::<Qty>(msg.q, "q")?,
+        qty: positive_trade_qty(decimal::<Qty>(msg.q, "q")?, "q")?,
         aggressor,
     }))
 }
@@ -555,6 +571,25 @@ mod tests {
             parse_err(BinanceStream::Kline1m, &no_close),
             NormalizeError::Missing("k.x")
         );
+    }
+
+    #[test]
+    fn non_positive_trade_quantities_are_rejected() {
+        for qty in ["0", "0.00000000", "-0", "-0.004"] {
+            let payload = AGG.replace(r#""q":"0.004""#, &format!(r#""q":"{qty}""#));
+            match parse_err(BinanceStream::AggTrade, &payload) {
+                NormalizeError::Unexpected(detail) => {
+                    assert!(detail.starts_with("q: "), "{qty}: {detail}");
+                }
+                other => panic!("{qty}: {other:?}"),
+            }
+        }
+        // The smallest positive unit still parses.
+        let smallest = AGG.replace(r#""q":"0.004""#, r#""q":"0.00000001""#);
+        let MarketEvent::Trade(trade) = parse_ok(BinanceStream::AggTrade, &smallest) else {
+            panic!("not a trade");
+        };
+        assert_eq!(trade.qty, Qty::from_units(1));
     }
 
     #[test]

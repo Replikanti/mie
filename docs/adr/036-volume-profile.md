@@ -42,7 +42,9 @@ Earlier decisions constrain the answer:
    even count, so bin midpoints are exact). The bin of a price is
    `k = units.div_euclid(bin_units)` and covers `[k·b, (k+1)·b)`. Every
    trade with a positive quantity adds its exact `Qty` to its bin; a
-   zero-quantity trade adds nothing. The profile range is `[min k, max k]`
+   zero-quantity trade adds nothing. Trades with `qty <= 0` are rejected at
+   ingestion by the Binance normalizers (issue #54), so the zero rule stays
+   only as defence in depth. The profile range is `[min k, max k]`
    over bins with volume; zero-volume bins inside the range are part of the
    dense histogram. Range guard `max_bins` = 10 000: a profile whose range
    spans more bins, or whose bin edges do not fit a `Price`, is

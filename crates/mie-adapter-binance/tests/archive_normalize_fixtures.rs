@@ -344,3 +344,28 @@ fn an_exponent_in_any_archive_decimal_column_equals_its_plain_form() {
         );
     }
 }
+
+#[test]
+fn non_positive_trade_quantities_are_rejected_on_both_trade_streams() {
+    let agg = &rows(ArchiveStream::AggTrades)[0];
+    let trade = "8131311698,83624.5,0.006,501.747,1790726400003,false";
+    for (stream, row, column, plain) in [
+        (ArchiveStream::AggTrades, agg.as_str(), "quantity", ",0.03,"),
+        (ArchiveStream::Trades, trade, "qty", ",0.006,"),
+    ] {
+        assert!(parse(stream, SYMBOL, row.as_bytes()).is_ok(), "{row}");
+        for qty in ["0", "0.00000000", "-0", "-0.006", "-6E-3", "0E0"] {
+            let bad = row.replacen(plain, &format!(",{qty},"), 1);
+            assert_ne!(bad, row, "{plain} not in {row}");
+            match parse(stream, SYMBOL, bad.as_bytes()) {
+                Err(NormalizeError::Unexpected(detail)) => {
+                    assert!(
+                        detail.starts_with(&format!("{column}: ")),
+                        "{bad}: {detail}"
+                    );
+                }
+                other => panic!("{stream} {bad}: {other:?}"),
+            }
+        }
+    }
+}

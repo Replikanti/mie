@@ -12,7 +12,8 @@
 //! Such a value is first rewritten exactly into the plain grammar
 //! (`expand_exponent`), so both spellings of a value yield the same units.
 //! Booleans are `true` / `false` exactly, as published; integers are plain
-//! ASCII digits.
+//! ASCII digits. A trade quantity that is not positive is an error, as on
+//! the live path.
 //!
 //! | Stream | Event | Ordering time (ADR-028) |
 //! |---|---|---|
@@ -29,7 +30,7 @@
 //! known.
 
 use super::catalog::{ArchiveStream, DAY_MS, digits};
-use crate::normalize::{NormalizeError, decimal};
+use crate::normalize::{NormalizeError, decimal, positive_trade_qty};
 use mie_domain::event::{Aggressor, FundingSettlement, Kline, MarketEvent, OpenInterest, Trade};
 use mie_domain::num::{DECIMALS, ParseDecimalError, Price, Qty, Rate};
 use mie_domain::time::EventTime;
@@ -397,7 +398,7 @@ fn trade(
         time: row.millis(time)?,
         trade_id: row.integer(id)?,
         price: row.decimal::<Price>(price)?,
-        qty: row.decimal::<Qty>(qty)?,
+        qty: positive_trade_qty(row.decimal::<Qty>(qty)?, row.get(qty).1)?,
         aggressor,
     }))
 }
