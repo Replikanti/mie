@@ -42,7 +42,12 @@ The archive as checked on 2026-10-06 (first and last month of the window,
 - **klines/<interval>** (daily): 12 columns with `close_time`, `count`,
   `taker_buy_volume`.
 - **fundingRate**: monthly files only; `calc_time` in ms with jitter
-  (`…001`).
+  (`…001`). Rates are plain eight-place decimals (`0.00003355`), except
+  those below 10⁻⁶ in magnitude, which carry an exponent (`-1.8E-7`,
+  `-6E-8`, `9.0E-7`): 12 of 1095 rows in 2025-10 … 2026-09. No decimal
+  column the other streams normalize carried one in that window (0
+  normalize errors in `archive-verify`), and the live streams send plain
+  decimals (`"r":"0.00000016"`).
 - **metrics** (daily, 288 rows): `create_time` is the text
   `YYYY-MM-DD HH:MM:SS`, rows are not in time order, no publication time.
 - **bookDepth** (daily): `timestamp,percentage,depth,notional`, text times
@@ -73,7 +78,13 @@ The archive as checked on 2026-10-06 (first and last month of the window,
    it either. Header lines are not
    records; the ledger keeps them. The importer lives in
    `mie-adapter-binance` (`archive` module), reusing its HTTP/TLS stack and
-   decimal parsing; it writes only through the raw-store ports.
+   decimal parsing; it writes only through the raw-store ports. An archive
+   decimal may carry an exponent (`[eE][+-]?[0-9]+`, any decimal column):
+   the archive normalizer rewrites it exactly into the ADR-027 plain grammar
+   by moving the point (digit strings, never a float) before the shared
+   domain parser, so `-1.8E-7` and `-0.00000018` give the same units and the
+   eight-place and range limits stay the domain's. The live normalizer keeps
+   rejecting exponents.
 2. **Streams (D2).** Default: `aggTrades` (→ `Trade`), `klines` on the six
    ADR-031 intervals (→ `Kline`, raw names `klines_1m` … `klines_1d`),
    `fundingRate` (→ `FundingSettlement`), `metrics` (→ `OpenInterest`,

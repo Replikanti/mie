@@ -1,6 +1,7 @@
 //! Normalization of real archive rows (`tests/fixtures/archive/*.csv`, see
 //! the README there for provenance): the first 20 and last 5 data rows of
-//! each 2026-09-30 file and of the 2026-08 funding file.
+//! each 2026-09-30 file and of the 2026-08 funding file, plus every funding
+//! row of 2025-10 … 2026-09 that the archive wrote with an exponent.
 
 use mie_adapter_binance::archive::ArchiveStream;
 use mie_adapter_binance::archive::normalize::{METRICS_RESOLUTION_MS, parse, record_time};
@@ -262,4 +263,84 @@ fn individual_trades_carry_the_raw_trade_id() {
         ArchiveStream::Trades.expected_header(),
         "id,price,qty,quote_qty,time,is_buyer_maker"
     );
+}
+
+/// Every `fundingRate` row of 2025-10 … 2026-09 whose rate the archive wrote
+/// with an exponent, and the same rate in the files' plain eight-place form.
+const EXPONENT_RATES: [(&str, &str, i64); 12] = [
+    ("-1.8E-7", "-0.00000018", -18),
+    ("-3.2E-7", "-0.00000032", -32),
+    ("-6E-8", "-0.00000006", -6),
+    ("-3.6E-7", "-0.00000036", -36),
+    ("6.8E-7", "0.00000068", 68),
+    ("4.2E-7", "0.00000042", 42),
+    ("3.3E-7", "0.00000033", 33),
+    ("-1.2E-7", "-0.00000012", -12),
+    ("9.0E-7", "0.00000090", 90),
+    ("4.8E-7", "0.00000048", 48),
+    ("6.0E-7", "0.00000060", 60),
+    ("2.7E-7", "0.00000027", 27),
+];
+
+#[test]
+fn funding_rates_with_an_exponent_equal_their_plain_form() {
+    let (header, rows) = fixture("BTCUSDT-fundingRate-exponent");
+    assert_eq!(header, ArchiveStream::FundingRate.expected_header());
+    assert_eq!(rows.len(), EXPONENT_RATES.len());
+    for (row, (exponent, plain, units)) in rows.iter().zip(EXPONENT_RATES) {
+        let (time, rate) = row.split_once(",8,").expect("calc_time,8,rate");
+        assert_eq!(rate, exponent, "{row}");
+        let expected = MarketEvent::FundingSettlement(FundingSettlement {
+            time: t(time.parse().unwrap()),
+            rate: Rate::from_units(units),
+        });
+        assert_eq!(event(ArchiveStream::FundingRate, row), expected, "{row}");
+        assert_eq!(
+            event(ArchiveStream::FundingRate, &format!("{time},8,{plain}")),
+            expected,
+            "{plain}"
+        );
+        assert_eq!(
+            record_time(ArchiveStream::FundingRate, row.as_bytes()),
+            Ok(t(time.parse().unwrap()))
+        );
+    }
+}
+
+#[test]
+fn an_exponent_in_any_archive_decimal_column_equals_its_plain_form() {
+    // Only the funding files are seen to write exponents; every decimal
+    // column shares one parser, so the other streams accept them exactly
+    // the same way.
+    let agg = &rows(ArchiveStream::AggTrades)[0];
+    let daily = ArchiveStream::Klines(Timeframe::D1);
+    let kline = &rows(daily)[0];
+    let metrics = &rows(ArchiveStream::Metrics)[0];
+    let trade = "8131311698,83624.5,0.006,501.747,1790726400003,false";
+    for (stream, plain, (from, to)) in [
+        (
+            ArchiveStream::AggTrades,
+            agg.as_str(),
+            (",83624.5,", ",8.36245E4,"),
+        ),
+        (ArchiveStream::AggTrades, agg, (",0.03,", ",3E-2,")),
+        (daily, kline, (",83624.50,", ",8.362450e+4,")),
+        (daily, kline, (",176848.755,", ",1.76848755E5,")),
+        (
+            ArchiveStream::Metrics,
+            metrics,
+            (",92849.1660000000000000,", ",9.28491660000000E+4,"),
+        ),
+        (ArchiveStream::Trades, trade, (",0.006,", ",6.0e-3,")),
+    ] {
+        let exponent = plain.replacen(from, to, 1);
+        assert_ne!(exponent, plain, "{from} not in {plain}");
+        let expected = parse(stream, SYMBOL, plain.as_bytes()).expect(plain);
+        assert!(expected.is_some(), "{plain}");
+        assert_eq!(
+            parse(stream, SYMBOL, exponent.as_bytes()),
+            Ok(expected),
+            "{exponent}"
+        );
+    }
 }

@@ -579,6 +579,20 @@ mod tests {
     }
 
     #[test]
+    fn exponent_decimals_stay_rejected_on_the_live_path() {
+        // The live streams send plain decimals (`"r":"0.00000016"`); only
+        // the archive normalizer accepts an exponent (ADR-034).
+        let exponent = MARK.replace(r#""r":"0.00000523""#, r#""r":"5.23E-6""#);
+        assert_eq!(
+            parse_err(BinanceStream::MarkPrice, &exponent),
+            NormalizeError::Decimal {
+                field: "r",
+                error: ParseDecimalError::Malformed
+            }
+        );
+    }
+
+    #[test]
     fn wrong_symbol_or_event_type_is_rejected() {
         let eth = AGG.replace(r#""s":"BTCUSDT""#, r#""s":"ETHUSDT""#);
         assert!(matches!(

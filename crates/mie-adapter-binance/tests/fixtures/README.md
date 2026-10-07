@@ -14,6 +14,7 @@ data. One verbatim payload per line (`*.jsonl`, and archive data rows in
 | `archive/BTCUSDT-{aggTrades,1m,metrics,bookDepth}-2026-09-30.csv` | Archive: the header, the first 20 and the last 5 data rows of each file from `data.binance.vision/data/futures/um/daily/…`, unzipped after its `.CHECKSUM` verified (2026-10-06). Metrics rows keep the file's own, unsorted order |
 | `archive/BTCUSDT-1d-2026-09-30.csv` | Archive: the whole file (header and one bar) |
 | `archive/BTCUSDT-fundingRate-2026-08.csv` | Archive: the header, the first 20 and the last 5 rows of `data/futures/um/monthly/fundingRate/…` |
+| `archive/BTCUSDT-fundingRate-exponent.csv` | Archive: the header and all 12 rows of the monthly `fundingRate` files 2025-10 … 2026-09 whose rate is written with an exponent (`-1.8E-7`, `-6E-8`, `9.0E-7`, …), in file order, each file's `.CHECKSUM` verified (2026-10-07) |
 | `scenario-*.tsv` | **Synthetic** arrival sequences for `tests/pipeline_scenarios.rs`: `receive_seq \t stream \t session_id \t payload` |
 
 The live frames carry fields this adapter ignores (`nq`, `st`, `ap`, …) and
