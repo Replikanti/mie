@@ -76,6 +76,26 @@ impl HoldBack {
         }
     }
 
+    /// A zero hold-back buffer that continues after `last_released`, the
+    /// last event already delivered by an earlier pipeline, with
+    /// `newest_oi` as the newest open-interest time delivered so far.
+    ///
+    /// Replay chains capture runs through it (ADR-038 D3): an event of the
+    /// next run that is not above `last_released` becomes a `LateEvent` gap
+    /// or re-timed open interest under the usual rules, never an event
+    /// delivered into the past. Events above it pass through in order.
+    pub(crate) fn after(
+        last_released: MarketEvent,
+        newest_oi: Option<EventTime>,
+        oi_retime_ms: i64,
+    ) -> Self {
+        Self {
+            last_released: Some(last_released),
+            newest_oi,
+            ..Self::new(0, oi_retime_ms)
+        }
+    }
+
     /// The highest ordering time pushed so far, gaps excluded.
     pub fn watermark(&self) -> Option<EventTime> {
         self.watermark
@@ -513,6 +533,30 @@ mod tests {
         assert_eq!(hold.push(open_interest_of(5_000, 2)).0, Admission::Late);
         // A strictly newer one is re-timed.
         assert_eq!(hold.push(open_interest_of(5_001, 3)).0, Admission::Retimed);
+    }
+
+    #[test]
+    fn a_chained_buffer_continues_after_the_last_released_event() {
+        let mut hold = HoldBack::after(mark(5_000), Some(t(4_000)), 10_000);
+        let mut out = Vec::new();
+        // In order: passes through unchanged.
+        out.extend(hold.push(mark(6_000)).1);
+        // Not above the last released event: a gap, never the past.
+        let (admission, released) = hold.push(trade(4_500, 9));
+        assert_eq!(admission, Admission::Late);
+        assert_eq!(
+            released,
+            vec![gap(Stream::Trades, 4_500, 5_001, GapReason::LateEvent)]
+        );
+        out.extend(released);
+        // Open interest older than the newest delivered one is a gap; a newer
+        // one within the allowance is re-timed.
+        assert_eq!(hold.push(open_interest(3_000)).0, Admission::Late);
+        assert_eq!(hold.push(open_interest(4_200)).0, Admission::Retimed);
+        out.extend(hold.finish());
+        assert!(out.windows(2).all(|w| w[0] < w[1]), "{out:?}");
+        assert!(out.iter().all(|e| *e > mark(5_000)));
+        assert_eq!(out.last(), Some(&mark(6_000)));
     }
 
     #[test]

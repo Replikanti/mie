@@ -17,7 +17,8 @@
 //! | [`pipeline`] | The three above composed: raw records → canonical events |
 //! | [`transport`] | WebSocket, HTTP and clock seams with their real implementations |
 //! | [`live`] | Capture threads, raw-first persistence and the live provider |
-//! | [`archive`] | Archive import: catalog, checksummed downloads, import ledger, archive normalization |
+//! | [`replay`] | Replay of live capture runs: per-run recompute from the raw store (#11) |
+//! | [`archive`] | Archive import and replay: catalog, checksummed downloads, import ledger, archive normalization, canonical merge |
 //!
 //! Live capture runs on plain threads, without an async runtime (ADR-026
 //! leaves the adapter-internal model open): one per WebSocket stream (`ws`),
@@ -32,9 +33,12 @@ pub mod holdback;
 pub mod live;
 pub mod normalize;
 pub mod pipeline;
+pub mod replay;
 mod rest;
 pub mod sequence;
 pub mod stream;
+#[cfg(test)]
+mod testing;
 pub mod transport;
 mod ws;
 
@@ -43,4 +47,5 @@ pub use live::{
     run_id, start,
 };
 pub use pipeline::{Pipeline, PipelineStats, Pushed, StreamStats};
+pub use replay::{LiveReplay, LiveReplayStream, LiveRun, RUN_MARGIN_MS, RunStats};
 pub use stream::{BinanceStream, OI_POLL_INTERVAL_MS};
