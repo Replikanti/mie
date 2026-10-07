@@ -26,11 +26,12 @@
 //!   from 0 without repeats. A run that ended cleanly must be complete: a
 //!   hole, or a count other than its `run_end` record count, is an error. A
 //!   crashed run is recomputed over its contiguous prefix; the records after
-//!   its first hole are counted as ignored. Every capture record read must
-//!   belong to a run the journal knows, and every capture record in the
-//!   window must belong to a recomputed run: records of a run whose
-//!   `run_start` was lost — they cannot be recomputed without its
-//!   parameters — fail the replay instead of vanishing from it.
+//!   its first hole are counted as ignored. Every capture record in the
+//!   window must belong to a recomputed run: in-window records of a run
+//!   whose `run_start` was lost — they cannot be recomputed without its
+//!   parameters — fail the replay instead of vanishing from it. Such records
+//!   read outside the window cannot affect it; they are counted
+//!   ([`unattributed_outside`](LiveReplayStream::unattributed_outside)).
 //! - **Run chaining** (D3). Each run's output continues after the last
 //!   event delivered before it through a zero hold-back
 //!   [`HoldBack`](crate::holdback::HoldBack): in-order events pass
@@ -239,6 +240,7 @@ impl<'a> HistoricalDataProvider for LiveReplay<'a> {
             selected: selected.iter().map(|(run, _)| run.run_id.clone()).collect(),
             read_paths: BTreeSet::new(),
             unattributed_checked: false,
+            unattributed_outside: BTreeMap::new(),
             pending: selected.into(),
             out: VecDeque::new(),
             last: None,
@@ -267,6 +269,8 @@ pub struct LiveReplayStream<'a> {
     /// Files the runs read.
     read_paths: BTreeSet<String>,
     unattributed_checked: bool,
+    /// Records of runs the journal does not know, outside the window.
+    unattributed_outside: BTreeMap<String, u64>,
     pending: VecDeque<(LiveRun, (i64, i64))>,
     out: VecDeque<MarketEvent>,
     /// The last event of the chained output, delivered or not.
@@ -292,6 +296,13 @@ impl LiveReplayStream<'_> {
     /// What the replay did with each run loaded so far, in start order.
     pub fn runs(&self) -> &[RunStats] {
         &self.stats
+    }
+
+    /// Capture records of runs the journal does not know that the replay
+    /// read outside the window, per run id: they cannot affect it, so they
+    /// are reported, not replayed (module docs).
+    pub fn unattributed_outside(&self) -> &BTreeMap<String, u64> {
+        &self.unattributed_outside
     }
 
     /// Gaps still open at the window's end: not delivered (module docs).
@@ -383,7 +394,8 @@ impl LiveReplayStream<'_> {
 
     /// The run's records from the files of its streams that overlap its
     /// extent, sorted by `receive_seq`, which must not repeat. A record of a
-    /// run the journal does not know fails the replay (D2).
+    /// run the journal does not know fails the replay when it lies in the
+    /// window; outside the window it is counted (D2).
     fn read_run(
         &mut self,
         run: &LiveRun,
@@ -391,7 +403,7 @@ impl LiveReplayStream<'_> {
     ) -> Result<Vec<(u64, BinanceStream, RawRecord)>, ProviderError> {
         let prefix = format!("{}/", run.run_id);
         let mut records = Vec::new();
-        let mut unknown = BTreeMap::new();
+        let mut unknown = Unknown::new();
         for file in &self.files {
             let Some(stream) = BinanceStream::from_raw_name(file.stream.stream()) else {
                 return Err(ProviderError::Contract(format!(
@@ -404,7 +416,8 @@ impl LiveReplayStream<'_> {
             if !run.streams.contains(&stream) || !overlaps {
                 continue;
             }
-            self.read_paths.insert(file.relative_path.clone());
+            // Adjacent runs share files; count each file's records once.
+            let first_read = self.read_paths.insert(file.relative_path.clone());
             for record in self.source.read(file).map_err(source_error)? {
                 let Some(capture) = &record.capture else {
                     return Err(ProviderError::Contract(format!(
@@ -414,19 +427,26 @@ impl LiveReplayStream<'_> {
                 };
                 if capture.session_id.starts_with(&prefix) {
                     records.push((capture.receive_seq, stream, record));
-                } else {
-                    let owner = run_of(&capture.session_id);
-                    if !self.journaled.contains(owner) {
-                        *unknown.entry(owner.to_owned()).or_insert(0_u64) += 1;
-                    }
+                    continue;
+                }
+                let owner = run_of(&capture.session_id);
+                if self.journaled.contains(owner) {
+                    continue;
+                }
+                if self.window.contains(record.event_time) {
+                    let (count, paths) = unknown.entry(owner.to_owned()).or_default();
+                    *count += 1;
+                    paths.insert(file.relative_path.clone());
+                } else if first_read {
+                    *self
+                        .unattributed_outside
+                        .entry(owner.to_owned())
+                        .or_default() += 1;
                 }
             }
         }
         if !unknown.is_empty() {
-            return Err(unattributed(
-                &unknown,
-                &format!("run {}'s files", run.run_id),
-            ));
+            return Err(unattributed(&unknown));
         }
         records.sort_by_key(|(seq, _, _)| *seq);
         if let Some(pair) = records.windows(2).find(|pair| pair[0].0 == pair[1].0) {
@@ -444,7 +464,7 @@ impl LiveReplayStream<'_> {
     /// record outside its run's extent (D2).
     fn check_unread_files(&mut self) -> Result<(), ProviderError> {
         self.unattributed_checked = true;
-        let mut unknown = BTreeMap::new();
+        let mut unknown = Unknown::new();
         let mut outside = BTreeMap::new();
         for file in &self.files {
             let overlaps =
@@ -453,9 +473,6 @@ impl LiveReplayStream<'_> {
                 continue;
             }
             for record in self.source.read(file).map_err(source_error)? {
-                if !self.window.contains(record.event_time) {
-                    continue;
-                }
                 let Some(capture) = &record.capture else {
                     return Err(ProviderError::Contract(format!(
                         "{}: a live record at {} has no capture metadata",
@@ -463,15 +480,27 @@ impl LiveReplayStream<'_> {
                     )));
                 };
                 let owner = run_of(&capture.session_id);
-                if !self.journaled.contains(owner) {
-                    *unknown.entry(owner.to_owned()).or_insert(0_u64) += 1;
+                let known = self.journaled.contains(owner);
+                if !self.window.contains(record.event_time) {
+                    if !known {
+                        *self
+                            .unattributed_outside
+                            .entry(owner.to_owned())
+                            .or_default() += 1;
+                    }
+                    continue;
+                }
+                if !known {
+                    let (count, paths) = unknown.entry(owner.to_owned()).or_default();
+                    *count += 1;
+                    paths.insert(file.relative_path.clone());
                 } else if !self.selected.contains(owner) {
                     *outside.entry(owner.to_owned()).or_insert(0_u64) += 1;
                 }
             }
         }
         if !unknown.is_empty() {
-            return Err(unattributed(&unknown, "the window"));
+            return Err(unattributed(&unknown));
         }
         if let Some((run, count)) = outside.first_key_value() {
             return Err(ProviderError::Source(format!(
@@ -488,16 +517,24 @@ fn run_of(session_id: &str) -> &str {
     session_id.split('/').next().unwrap_or_default()
 }
 
-/// The error for capture records of runs the journal does not know.
-fn unattributed(unknown: &BTreeMap<String, u64>, place: &str) -> ProviderError {
+/// In-window capture records of runs the journal does not know: count and
+/// files, per run id.
+type Unknown = BTreeMap<String, (u64, BTreeSet<String>)>;
+
+/// The error for in-window capture records of runs the journal does not
+/// know.
+fn unattributed(unknown: &Unknown) -> ProviderError {
     let runs: Vec<String> = unknown
         .iter()
-        .map(|(run, count)| format!("{count} of run {run:?}"))
+        .map(|(run, (count, paths))| {
+            let paths: Vec<&str> = paths.iter().map(String::as_str).collect();
+            format!("{count} of run {run:?} in {}", paths.join(", "))
+        })
         .collect();
     ProviderError::Source(format!(
-        "{place} hold capture records of runs without a run_start in the journal ({}); \
-         without their run parameters they cannot be replayed as live delivered them",
-        runs.join(", ")
+        "the window holds capture records of runs without a run_start in the journal \
+         ({}); without their run parameters they cannot be replayed as live delivered them",
+        runs.join("; ")
     ))
 }
 
@@ -1080,5 +1117,66 @@ mod tests {
                 "hour {hour}"
             );
         }
+    }
+
+    #[test]
+    fn an_unjournaled_neighbour_fails_only_the_windows_holding_its_records() {
+        // Run R0's journal was lost (say the journal was rotated at the
+        // restart); it ended 60 s before the journaled two-hour run R1.
+        let mut lost = RunBuilder::new("20261006T005800Z");
+        for i in 0..10_u64 {
+            lost.push(
+                BinanceStream::AggTrade,
+                1,
+                agg(1 + i, T0 - 70_000 + 1_000 * i as i64),
+            );
+        }
+        let mut run = RunBuilder::new("20261006T010000Z");
+        for i in 0..120_u64 {
+            run.push(
+                BinanceStream::AggTrade,
+                1,
+                agg(100 + i, T0 + 60_000 * i as i64),
+            );
+        }
+        let mut source = MemorySource::default();
+        // R0's records share R1's first one-hour part.
+        let mut first_part = lost.of(BinanceStream::AggTrade, &[]);
+        let r1 = run.of(BinanceStream::AggTrade, &[]);
+        first_part.extend(r1[..60].iter().cloned());
+        source.seal(SOURCE, "aggTrade", first_part);
+        source.seal(SOURCE, "aggTrade", r1[60..].to_vec());
+        let runs = vec![run.run(T0, Some(T0 + 7_200_000), Some(120))];
+        let live = LiveReplay::new(&source, SOURCE, "BTCUSDT", runs.clone());
+
+        // An hour into R1: R0's records cannot affect it.
+        let inner = window(T0 + 3_600_000, T0 + 4_200_000);
+        let mut stream = live.replay(inner).unwrap().stream;
+        let out = drain(&mut stream);
+        assert_eq!(out.len(), 10);
+        let expected: Vec<_> = run
+            .live(&runs[0])
+            .into_iter()
+            .filter(|e| inner.contains(e.time()))
+            .collect();
+        assert_eq!(out, expected);
+        assert_eq!(
+            stream.unattributed_outside(),
+            &BTreeMap::from([("20261006T005800Z".to_owned(), 10)])
+        );
+
+        // A window holding R0's records still fails, naming R0 and its file.
+        let err = drain_err(
+            &mut live
+                .replay(window(T0 - 120_000, T0 + 60_000))
+                .unwrap()
+                .stream,
+        );
+        assert!(
+            matches!(&err, ProviderError::Source(d)
+                if d.contains("10 of run \"20261006T005800Z\" in binance-um/BTCUSDT/aggTrade/date=")
+                    && !d.contains("20261006T010000Z")),
+            "{err}"
+        );
     }
 }

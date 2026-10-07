@@ -59,12 +59,15 @@ ADR-028 left one point open: a gap still open at the end of a replay window
    `run_end`, or a non-zero exit) is recomputed over its contiguous prefix;
    the records after its first hole are counted as ignored. Two `run_start`
    lines with one run id — a restart within one second, whose session
-   prefixes would be ambiguous — are an error. Every capture record the
-   replay reads must belong to a run the journal knows, and every capture
-   record in the window must belong to a recomputed run; otherwise the replay
-   fails, naming the runs and record counts. Records of a run whose
+   prefixes would be ambiguous — are an error. Every capture record in the
+   window must belong to a recomputed run; otherwise the replay fails,
+   naming the runs, record counts and files. Records of a run whose
    `run_start` was lost cannot be recomputed without its parameters, and they
-   never vanish silently from a replay. `mie ingest` syncs the journal to
+   never vanish silently from a replay. Outside the window they cannot affect
+   its output — live gave every run a fresh pipeline, and chaining (D3)
+   reaches only the restart's first seconds — so the replay counts and
+   reports them (`mie replay` prints one line per such run) instead of
+   failing: a lost journal line must not make an adjacent run unreplayable. `mie ingest` syncs the journal to
    stable storage right after `run_start` and at the end of a run, before the
    first record can be sealed. An open run (no `run_end`, no successor) is
    read only up to the window's end plus the margin: later records cannot

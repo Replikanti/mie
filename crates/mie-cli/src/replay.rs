@@ -307,6 +307,15 @@ fn describe_live(stream: &LiveReplayStream<'_>, report: &mut Vec<u8>) {
             ),
         );
     }
+    for (run, count) in stream.unattributed_outside() {
+        line(
+            report,
+            format!(
+                "unjournaled run {run}: {count} record(s) outside the window, not replayed \
+                 (no run_start in the journal)"
+            ),
+        );
+    }
     trailing(report, stream.trailing_gaps());
 }
 
