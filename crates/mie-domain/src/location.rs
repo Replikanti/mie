@@ -6,9 +6,12 @@
 //! These enums are the design vocabulary. The volume-profile levels (POC,
 //! VAH, VAL, HVN, LVN) are defined by [`crate::profile`] (ADR-036), which
 //! hands them over as [`ProfileLevel`](crate::profile::ProfileLevel)s. The
-//! measurable definition of every other level and of each auction state
-//! (windows, thresholds, what counts as acceptance) is owned by the location
-//! issue and must be deterministic.
+//! structural highs and lows, prior sweeps and SFP rejection zones are
+//! defined by [`crate::structure`] (ADR-037), which hands them over as
+//! [`StructureLevel`](crate::structure::StructureLevel)s. The measurable
+//! definition of every other level and of each auction state (windows,
+//! thresholds, what counts as acceptance) is owned by the location issue
+//! and must be deterministic.
 
 /// Kinds of levels the location subsystem maintains and scores.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -28,15 +31,20 @@ pub enum LevelKind {
     /// Low-volume node: a prominent interior valley of the smoothed profile
     /// ([`crate::profile`], ADR-036, decision 6).
     Lvn,
-    /// Structural swing high.
+    /// Structural swing high: a confirmed swing high no trade has gone
+    /// beyond yet ([`crate::structure`], ADR-037, decisions 2–5).
     StructuralHigh,
-    /// Structural swing low.
+    /// Structural swing low: a confirmed swing low no trade has gone below
+    /// yet ([`crate::structure`], ADR-037, decisions 2–5).
     StructuralLow,
     /// Cluster of resting liquidity.
     LiquidityCluster,
-    /// Level of a prior liquidity sweep.
+    /// Level of a prior liquidity sweep: a structural level a trade went
+    /// beyond ([`crate::structure`], ADR-037, decision 6).
     PriorSweep,
-    /// Swing-failure-pattern / rejection zone.
+    /// Swing-failure-pattern / rejection zone: from a swept level to the
+    /// sweep's extreme, after a close back inside ([`crate::structure`],
+    /// ADR-037, decision 7).
     SfpRejectionZone,
     /// Volume-weighted average price.
     Vwap,
