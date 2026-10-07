@@ -1,0 +1,14 @@
+# Synthetic scenario: stale diffs below a snapshot are dropped, a checkpoint
+# not newer than the anchor stays raw, and an old snapshot arriving during a
+# later resync is rejected as stale. receive_seq\tstream\tsession_id\tpayload
+1	depth	20261006T070000Z/depth/1	{"e":"depthUpdate","E":1791272000004,"T":1791272000000,"s":"BTCUSDT","ps":"BTCUSDT","U":100,"u":110,"pu":90,"b":[["85000.00","1.000"]],"a":[["85000.10","5.000"]]}
+2	depth	20261006T070000Z/depth/1	{"e":"depthUpdate","E":1791272000104,"T":1791272000100,"s":"BTCUSDT","ps":"BTCUSDT","U":111,"u":120,"pu":110,"b":[["85000.00","1.000"]],"a":[["85000.10","1.000"]]}
+3	depth	20261006T070000Z/depth/1	{"e":"depthUpdate","E":1791272000204,"T":1791272000200,"s":"BTCUSDT","ps":"BTCUSDT","U":121,"u":130,"pu":120,"b":[["85000.00","1.000"]],"a":[["85000.10","4.000"]]}
+4	depthSnapshot	20261006T070000Z/depthSnapshot/1	{"lastUpdateId":125,"E":1791272000153,"T":1791272000150,"bids":[["85000.00","2.000"],["84999.90","3.000"]],"asks":[["85000.10","1.000"],["85000.20","4.000"]]}
+5	depthSnapshot	20261006T070000Z/depthSnapshot/2	{"lastUpdateId":118,"E":1791272000093,"T":1791272000090,"bids":[["85000.00","2.000"],["84999.90","3.000"]],"asks":[["85000.10","1.000"],["85000.20","4.000"]]}
+6	depth	20261006T070000Z/depth/1	{"e":"depthUpdate","E":1791272000304,"T":1791272000300,"s":"BTCUSDT","ps":"BTCUSDT","U":131,"u":140,"pu":130,"b":[["85000.00","1.000"]],"a":[["85000.10","0.000"]]}
+7	depth	20261006T070000Z/depth/1	{"e":"depthUpdate","E":1791272000504,"T":1791272000500,"s":"BTCUSDT","ps":"BTCUSDT","U":151,"u":160,"pu":150,"b":[["85000.00","1.000"]],"a":[["85000.10","6.000"]]}
+8	depthSnapshot	20261006T070000Z/depthSnapshot/3	{"lastUpdateId":125,"E":1791272000153,"T":1791272000150,"bids":[["85000.00","2.000"],["84999.90","3.000"]],"asks":[["85000.10","1.000"],["85000.20","4.000"]]}
+9	depthSnapshot	20261006T070000Z/depthSnapshot/4	{"lastUpdateId":155,"E":1791272000453,"T":1791272000450,"bids":[["85000.00","2.000"],["84999.90","3.000"]],"asks":[["85000.10","1.000"],["85000.20","4.000"]]}
+10	depth	20261006T070000Z/depth/1	{"e":"depthUpdate","E":1791272000604,"T":1791272000600,"s":"BTCUSDT","ps":"BTCUSDT","U":161,"u":170,"pu":160,"b":[["85000.00","1.000"]],"a":[["85000.10","2.000"]]}
+11	markPrice	20261006T070000Z/markPrice/1	{"e":"markPriceUpdate","E":1791272003000,"s":"BTCUSDT","p":"85001.00000000","i":"85002.50000000","P":"85010.00000000","r":"0.00010000","T":1791273600000}

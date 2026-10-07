@@ -1,0 +1,12 @@
+# Synthetic scenario: the sync procedure on a clean feed. Two diffs are
+# buffered, the snapshot drops the one below its lastUpdateId, the next
+# straddles it and the rest chain. receive_seq\tstream\tsession_id\tpayload
+1	depth	20261006T070000Z/depth/1	{"e":"depthUpdate","E":1791272000004,"T":1791272000000,"s":"BTCUSDT","ps":"BTCUSDT","U":100,"u":110,"pu":90,"b":[["85000.00","1.000"]],"a":[["85000.10","5.000"]]}
+2	markPrice	20261006T070000Z/markPrice/1	{"e":"markPriceUpdate","E":1791272000000,"s":"BTCUSDT","p":"85001.00000000","i":"85002.50000000","P":"85010.00000000","r":"0.00010000","T":1791273600000}
+3	depth	20261006T070000Z/depth/1	{"e":"depthUpdate","E":1791272000104,"T":1791272000100,"s":"BTCUSDT","ps":"BTCUSDT","U":111,"u":120,"pu":110,"b":[["85000.00","1.000"]],"a":[["85000.10","1.000"]]}
+4	depthSnapshot	20261006T070000Z/depthSnapshot/1	{"lastUpdateId":115,"E":1791272000053,"T":1791272000050,"bids":[["85000.00","2.000"],["84999.90","3.000"]],"asks":[["85000.10","1.000"],["85000.20","4.000"]]}
+5	depth	20261006T070000Z/depth/1	{"e":"depthUpdate","E":1791272000204,"T":1791272000200,"s":"BTCUSDT","ps":"BTCUSDT","U":121,"u":130,"pu":120,"b":[["84999.90","0"]],"a":[["85000.10","4.000"]]}
+6	markPrice	20261006T070000Z/markPrice/1	{"e":"markPriceUpdate","E":1791272001000,"s":"BTCUSDT","p":"85001.00000000","i":"85002.50000000","P":"85010.00000000","r":"0.00010000","T":1791273600000}
+7	depth	20261006T070000Z/depth/1	{"e":"depthUpdate","E":1791272000304,"T":1791272000300,"s":"BTCUSDT","ps":"BTCUSDT","U":131,"u":140,"pu":130,"b":[["84999.80","0.500"]],"a":[["85000.10","0.000"]]}
+8	markPrice	20261006T070000Z/markPrice/1	{"e":"markPriceUpdate","E":1791272002000,"s":"BTCUSDT","p":"85001.00000000","i":"85002.50000000","P":"85010.00000000","r":"0.00010000","T":1791273600000}
+9	markPrice	20261006T070000Z/markPrice/1	{"e":"markPriceUpdate","E":1791272003000,"s":"BTCUSDT","p":"85001.00000000","i":"85002.50000000","P":"85010.00000000","r":"0.00010000","T":1791273600000}

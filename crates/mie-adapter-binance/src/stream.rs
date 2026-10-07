@@ -10,6 +10,20 @@ use mie_domain::event::Stream;
 /// normalization a pure function of the payload.
 pub const OI_POLL_INTERVAL_MS: u32 = 10_000;
 
+/// The `limit` values `GET /fapi/v1/depth` accepts (ADR-038). The REST
+/// weight grows with the limit: 2 up to 50, 5 at 100, 10 at 500, 20 at 1000.
+pub const DEPTH_SNAPSHOT_LIMITS: [u16; 7] = [5, 10, 20, 50, 100, 500, 1000];
+
+/// The WebSocket route a stream is served on (ADR-032 documentation check,
+/// ADR-038): `/market` for the market-data streams, `/public` for depth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum WsRoute {
+    /// `wss://fstream.binance.com/market/ws`.
+    Market,
+    /// `wss://fstream.binance.com/public/ws`.
+    Public,
+}
+
 /// One captured Binance feed.
 ///
 /// Ordered by declaration, which is also the index used to stagger planned
@@ -26,16 +40,22 @@ pub enum BinanceStream {
     Kline1m,
     /// Open interest, polled over REST (`/fapi/v1/openInterest`).
     OpenInterest,
+    /// Order-book diffs (`<symbol>@depth@100ms`, ADR-038).
+    Depth,
+    /// Order-book snapshots, fetched over REST (`/fapi/v1/depth`, ADR-038).
+    DepthSnapshot,
 }
 
 impl BinanceStream {
     /// Every stream, in declaration order.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 7] = [
         Self::AggTrade,
         Self::MarkPrice,
         Self::ForceOrder,
         Self::Kline1m,
         Self::OpenInterest,
+        Self::Depth,
+        Self::DepthSnapshot,
     ];
 
     /// The raw stream name, a valid ADR-030 path segment.
@@ -46,6 +66,8 @@ impl BinanceStream {
             Self::ForceOrder => "forceOrder",
             Self::Kline1m => "kline_1m",
             Self::OpenInterest => "openInterest",
+            Self::Depth => "depth",
+            Self::DepthSnapshot => "depthSnapshot",
         }
     }
 
@@ -62,17 +84,20 @@ impl BinanceStream {
             Self::ForceOrder => Stream::Liquidations,
             Self::Kline1m => Stream::Klines,
             Self::OpenInterest => Stream::OpenInterest,
+            Self::Depth | Self::DepthSnapshot => Stream::OrderBook,
         }
     }
 
     /// The captured stream whose events belong to the domain series
-    /// `stream`; `None` for series this adapter does not capture.
+    /// `stream`; `None` for series this adapter does not capture. Both
+    /// depth streams feed [`Stream::OrderBook`]; the diff stream stands for
+    /// it.
     pub fn of_domain(stream: Stream) -> Option<Self> {
         Self::ALL.into_iter().find(|s| s.domain_stream() == stream)
     }
 
-    /// The WebSocket stream path for `symbol`, appended to the configured
-    /// base URL; `None` for the REST-polled open interest.
+    /// The WebSocket stream path for `symbol`, appended to the base URL of
+    /// its [`ws_route`](Self::ws_route); `None` for the REST streams.
     pub fn ws_path(self, symbol: &str) -> Option<String> {
         let symbol = symbol.to_ascii_lowercase();
         let suffix = match self {
@@ -80,9 +105,22 @@ impl BinanceStream {
             Self::MarkPrice => "markPrice@1s",
             Self::ForceOrder => "forceOrder",
             Self::Kline1m => "kline_1m",
-            Self::OpenInterest => return None,
+            Self::Depth => "depth@100ms",
+            Self::OpenInterest | Self::DepthSnapshot => return None,
         };
         Some(format!("{symbol}@{suffix}"))
+    }
+
+    /// The WebSocket route the stream is served on; `None` for the REST
+    /// streams.
+    pub const fn ws_route(self) -> Option<WsRoute> {
+        match self {
+            Self::AggTrade | Self::MarkPrice | Self::ForceOrder | Self::Kline1m => {
+                Some(WsRoute::Market)
+            }
+            Self::Depth => Some(WsRoute::Public),
+            Self::OpenInterest | Self::DepthSnapshot => None,
+        }
     }
 
     /// Position in [`ALL`](Self::ALL).
@@ -106,7 +144,7 @@ mod tests {
             );
             assert_eq!(BinanceStream::ALL[stream.index()], stream);
         }
-        assert_eq!(BinanceStream::from_raw_name("depth"), None);
+        assert_eq!(BinanceStream::from_raw_name("bookTicker"), None);
     }
 
     #[test]
@@ -123,12 +161,33 @@ mod tests {
                 Some("btcusdt@forceOrder".to_owned()),
                 Some("btcusdt@kline_1m".to_owned()),
                 None,
+                Some("btcusdt@depth@100ms".to_owned()),
+                None,
             ]
         );
+        let routes: Vec<_> = BinanceStream::ALL.iter().map(|s| s.ws_route()).collect();
+        assert_eq!(
+            routes,
+            [
+                Some(WsRoute::Market),
+                Some(WsRoute::Market),
+                Some(WsRoute::Market),
+                Some(WsRoute::Market),
+                None,
+                Some(WsRoute::Public),
+                None,
+            ]
+        );
+        for stream in BinanceStream::ALL {
+            assert_eq!(
+                stream.ws_path("BTCUSDT").is_some(),
+                stream.ws_route().is_some()
+            );
+        }
     }
 
     #[test]
-    fn streams_map_to_distinct_domain_series() {
+    fn both_depth_streams_map_to_order_book() {
         let series: Vec<_> = BinanceStream::ALL
             .iter()
             .map(|s| s.domain_stream())
@@ -141,14 +200,24 @@ mod tests {
                 Stream::Liquidations,
                 Stream::Klines,
                 Stream::OpenInterest,
+                Stream::OrderBook,
+                Stream::OrderBook,
             ]
         );
-        for stream in BinanceStream::ALL {
+        for stream in &BinanceStream::ALL[..5] {
             assert_eq!(
                 BinanceStream::of_domain(stream.domain_stream()),
-                Some(stream)
+                Some(*stream)
             );
         }
-        assert_eq!(BinanceStream::of_domain(Stream::OrderBook), None);
+        assert_eq!(
+            BinanceStream::of_domain(Stream::OrderBook),
+            Some(BinanceStream::Depth)
+        );
+        assert_eq!(BinanceStream::of_domain(Stream::Funding), None);
+        // Appending kept every earlier index.
+        assert_eq!(BinanceStream::OpenInterest.index(), 4);
+        assert_eq!(BinanceStream::DepthSnapshot.index(), 6);
+        assert!(DEPTH_SNAPSHOT_LIMITS.contains(&1000));
     }
 }

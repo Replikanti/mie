@@ -11,9 +11,15 @@
 //! - A trade quantity that is not positive is an error
 //!   ([`NormalizeError::Unexpected`]): it is not an execution, and every
 //!   downstream sum (bars, flow, profile) assumes positive volume.
+//! - Book levels arrive as `[price, quantity]` string pairs and keep their
+//!   source order. A diff level's quantity is the resting quantity after the
+//!   change: zero removes the level, a negative one is an error. A snapshot
+//!   level must be positive; every price must be positive.
 //! - Unknown fields are ignored, so additive exchange changes do not break
 //!   capture. A missing field, a wrong event type or a symbol mismatch is an
 //!   error; the raw message is kept either way.
+//! - The REST depth snapshot carries no symbol: the raw stream key
+//!   (`<source>/<symbol>/depthSnapshot`) is its only instrument binding.
 //!
 //! | Stream | Event | Ordering field (ADR-028) |
 //! |---|---|---|
@@ -22,10 +28,13 @@
 //! | `forceOrder` | `Liquidation` | `o.T` |
 //! | `kline_1m` | `Kline`, closed bars (`x = true`) only | `k.T` |
 //! | `openInterest` | `OpenInterest`, resolution [`OI_POLL_INTERVAL_MS`] | `time` |
+//! | `depth` | `BookUpdate` (`U`, `u`, `pu`, `b`, `a`), ADR-038 | `T` |
+//! | `depthSnapshot` | `BookSnapshot` (`lastUpdateId`, `bids`, `asks`), ADR-038 | `T` |
 
 use crate::stream::{BinanceStream, OI_POLL_INTERVAL_MS};
 use mie_domain::event::{
-    Aggressor, Kline, Liquidation, MarkPrice, MarketEvent, OpenInterest, Trade,
+    Aggressor, BookSnapshot, BookUpdate, Kline, Level, Liquidation, MarkPrice, MarketEvent,
+    OpenInterest, Trade,
 };
 use mie_domain::num::{ParseDecimalError, Price, Qty, Rate};
 use mie_domain::time::EventTime;
@@ -87,12 +96,15 @@ struct NestedTime {
 /// The ADR-028 ordering time of a payload, used as the raw record's
 /// `event_time` (ADR-030): aggTrade `T`, markPrice `E`, forceOrder `o.T`,
 /// kline `k.T` (the bar's close time, also for open bars), open interest
-/// `time`. When that field is missing it falls back to the push time `E`;
+/// `time`, depth and depth snapshot `T` (the transaction time, ADR-038).
+/// When that field is missing it falls back to the push time `E`;
 /// `None` when neither is present or the payload is not JSON.
 pub fn record_time(stream: BinanceStream, payload: &[u8]) -> Option<EventTime> {
     let fields: TimeFields = serde_json::from_slice(payload).ok()?;
     let primary = match stream {
-        BinanceStream::AggTrade => fields.trade,
+        BinanceStream::AggTrade | BinanceStream::Depth | BinanceStream::DepthSnapshot => {
+            fields.trade
+        }
         BinanceStream::MarkPrice => fields.event,
         BinanceStream::ForceOrder => fields.o.and_then(|o| o.time),
         BinanceStream::Kline1m => fields.k.and_then(|k| k.time),
@@ -121,6 +133,8 @@ pub fn parse(
         BinanceStream::ForceOrder => parse_force_order(symbol, payload).map(Some),
         BinanceStream::Kline1m => parse_kline(symbol, payload),
         BinanceStream::OpenInterest => parse_open_interest(symbol, payload).map(Some),
+        BinanceStream::Depth => parse_depth(symbol, payload).map(Some),
+        BinanceStream::DepthSnapshot => parse_depth_snapshot(payload).map(Some),
     }
 }
 
@@ -378,6 +392,109 @@ fn parse_open_interest(symbol: &str, payload: &[u8]) -> Result<MarketEvent, Norm
     }))
 }
 
+/// One `[price, quantity]` pair as the wire sends it.
+type WireLevel<'a> = [&'a str; 2];
+
+#[derive(Deserialize)]
+struct DepthMsg<'a> {
+    #[serde(borrow)]
+    e: Option<&'a str>,
+    #[serde(borrow)]
+    s: Option<&'a str>,
+    #[serde(rename = "T")]
+    transaction_time: Option<i64>,
+    #[serde(rename = "U")]
+    first_update_id: Option<u64>,
+    u: Option<u64>,
+    pu: Option<u64>,
+    #[serde(borrow)]
+    b: Option<Vec<WireLevel<'a>>>,
+    #[serde(borrow)]
+    a: Option<Vec<WireLevel<'a>>>,
+}
+
+fn parse_depth(symbol: &str, payload: &[u8]) -> Result<MarketEvent, NormalizeError> {
+    let msg: DepthMsg<'_> = from_json(payload)?;
+    expect_event_type(msg.e, "depthUpdate")?;
+    expect_symbol(msg.s, "s", symbol)?;
+    let first_update_id = req(msg.first_update_id, "U")?;
+    let last_update_id = req(msg.u, "u")?;
+    if first_update_id > last_update_id {
+        return Err(NormalizeError::Unexpected(format!(
+            "first update id U {first_update_id} above last update id u {last_update_id}"
+        )));
+    }
+    Ok(MarketEvent::BookUpdate(BookUpdate {
+        time: time(msg.transaction_time, "T")?,
+        first_update_id,
+        last_update_id,
+        prev_update_id: req(msg.pu, "pu")?,
+        bids: levels(req(msg.b, "b")?, "b", QtyRule::NonNegative)?,
+        asks: levels(req(msg.a, "a")?, "a", QtyRule::NonNegative)?,
+    }))
+}
+
+#[derive(Deserialize)]
+struct DepthSnapshotMsg<'a> {
+    #[serde(rename = "lastUpdateId")]
+    last_update_id: Option<u64>,
+    #[serde(rename = "T")]
+    transaction_time: Option<i64>,
+    #[serde(borrow)]
+    bids: Option<Vec<WireLevel<'a>>>,
+    #[serde(borrow)]
+    asks: Option<Vec<WireLevel<'a>>>,
+}
+
+fn parse_depth_snapshot(payload: &[u8]) -> Result<MarketEvent, NormalizeError> {
+    let msg: DepthSnapshotMsg<'_> = from_json(payload)?;
+    Ok(MarketEvent::BookSnapshot(BookSnapshot {
+        time: time(msg.transaction_time, "T")?,
+        last_update_id: req(msg.last_update_id, "lastUpdateId")?,
+        bids: levels(req(msg.bids, "bids")?, "bids", QtyRule::Positive)?,
+        asks: levels(req(msg.asks, "asks")?, "asks", QtyRule::Positive)?,
+    }))
+}
+
+/// What a book level's quantity may be.
+#[derive(Clone, Copy)]
+enum QtyRule {
+    /// A diff: zero removes the level.
+    NonNegative,
+    /// A snapshot: only resting levels.
+    Positive,
+}
+
+/// Parses wire levels in source order: the price must be positive, the
+/// quantity per `rule`.
+fn levels(
+    wire: Vec<WireLevel<'_>>,
+    field: &'static str,
+    rule: QtyRule,
+) -> Result<Vec<Level>, NormalizeError> {
+    wire.into_iter()
+        .map(|[price, qty]| {
+            let price = decimal::<Price>(Some(price), field)?;
+            let qty = decimal::<Qty>(Some(qty), field)?;
+            if price.units() <= 0 {
+                return Err(NormalizeError::Unexpected(format!(
+                    "{field}: level price must be positive, got {price}"
+                )));
+            }
+            let accepted = match rule {
+                QtyRule::NonNegative => qty.units() >= 0,
+                QtyRule::Positive => qty.units() > 0,
+            };
+            if !accepted {
+                return Err(NormalizeError::Unexpected(format!(
+                    "{field}: level quantity {qty} at {price} is not allowed here"
+                )));
+            }
+            Ok(Level { price, qty })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -390,6 +507,8 @@ mod tests {
     const FORCE: &str = r#"{"e":"forceOrder","E":1791269900123,"o":{"s":"BTCUSDT","S":"SELL","o":"LIMIT","f":"IOC","q":"0.014","p":"85100.0","ap":"85150.5","X":"FILLED","l":"0.014","z":"0.014","T":1791269900120}}"#;
     const KLINE_OPEN: &str = r#"{"e":"kline","E":1791269859051,"s":"BTCUSDT","k":{"t":1791269820000, "T":1791269879999, "s":"BTCUSDT", "i":"1m", "f":8149080204, "L":8149080532, "o":"85300.00", "c":"85296.00", "h":"85300.00", "l":"85296.00", "v":"8.410", "n":321, "x":false, "q":"717368.32060", "V":"4.732", "Q":"403639.25130", "B":"0"}}"#;
     const OI: &str = r#"{"symbol":"BTCUSDT","openInterest":"95253.475","time":1791269771665}"#;
+    const DEPTH: &str = r#"{"e":"depthUpdate","E":1791399961205,"T":1791399961201,"s":"BTCUSDT","ps":"BTCUSDT","U":11759030886305,"u":11759030896477,"pu":11759030885985,"b":[["1000.00","115.863"],["66715.00","0.000"],["83373.10","2.082"]],"a":[["83402.00","3.480"]]}"#;
+    const DEPTH_SNAPSHOT: &str = r#"{"lastUpdateId":11759031561498,"E":1791399966500,"T":1791399966493,"bids":[["83401.90","8.843"],["83401.80","1.610"]],"asks":[["83402.00","3.480"],["83402.10","0.031"]]}"#;
 
     fn closed_kline() -> String {
         KLINE_OPEN.replace(r#""x":false"#, r#""x":true"#)
@@ -653,5 +772,186 @@ mod tests {
             parse_err(BinanceStream::AggTrade, "[1,2]"),
             NormalizeError::Json(_)
         ));
+    }
+
+    fn level(price: i64, qty: i64) -> Level {
+        Level {
+            price: Price::from_units(price),
+            qty: Qty::from_units(qty),
+        }
+    }
+
+    #[test]
+    fn depth_maps_ids_and_levels_in_source_order() {
+        assert_eq!(
+            parse_ok(BinanceStream::Depth, DEPTH),
+            MarketEvent::BookUpdate(BookUpdate {
+                time: EventTime::from_millis(1_791_399_961_201),
+                first_update_id: 11_759_030_886_305,
+                last_update_id: 11_759_030_896_477,
+                prev_update_id: 11_759_030_885_985,
+                bids: vec![
+                    level(100_000_000_000, 11_586_300_000),
+                    // Zero removes the level.
+                    level(6_671_500_000_000, 0),
+                    level(8_337_310_000_000, 208_200_000),
+                ],
+                asks: vec![level(8_340_200_000_000, 348_000_000)],
+            })
+        );
+        // Empty sides are valid.
+        let empty = DEPTH
+            .replace(r#""a":[["83402.00","3.480"]]"#, r#""a":[]"#)
+            .replace(r#""U":11759030886305"#, r#""U":11759030896477"#);
+        let MarketEvent::BookUpdate(update) = parse_ok(BinanceStream::Depth, &empty) else {
+            panic!("not an update");
+        };
+        assert!(update.asks.is_empty());
+        assert_eq!(update.first_update_id, update.last_update_id);
+    }
+
+    #[test]
+    fn depth_snapshot_maps_levels_and_needs_no_symbol() {
+        let event = parse_ok(BinanceStream::DepthSnapshot, DEPTH_SNAPSHOT);
+        assert_eq!(
+            event,
+            MarketEvent::BookSnapshot(BookSnapshot {
+                time: EventTime::from_millis(1_791_399_966_493),
+                last_update_id: 11_759_031_561_498,
+                bids: vec![
+                    level(8_340_190_000_000, 884_300_000),
+                    level(8_340_180_000_000, 161_000_000),
+                ],
+                asks: vec![
+                    level(8_340_200_000_000, 348_000_000),
+                    level(8_340_210_000_000, 3_100_000),
+                ],
+            })
+        );
+        assert_eq!(event.stream(), Stream::OrderBook);
+        // The symbol argument does not bind a REST snapshot.
+        assert!(
+            parse(
+                BinanceStream::DepthSnapshot,
+                "ETHUSDT",
+                DEPTH_SNAPSHOT.as_bytes()
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn depth_records_are_ordered_by_transaction_time() {
+        for (stream, payload, expected) in [
+            (BinanceStream::Depth, DEPTH, 1_791_399_961_201),
+            (
+                BinanceStream::DepthSnapshot,
+                DEPTH_SNAPSHOT,
+                1_791_399_966_493,
+            ),
+        ] {
+            assert_eq!(
+                record_time(stream, payload.as_bytes()),
+                Some(EventTime::from_millis(expected)),
+                "{stream:?}"
+            );
+        }
+        let no_t = DEPTH.replace(r#""T":1791399961201,"#, "");
+        assert_eq!(
+            record_time(BinanceStream::Depth, no_t.as_bytes()),
+            Some(EventTime::from_millis(1_791_399_961_205))
+        );
+        assert_eq!(
+            parse_err(BinanceStream::Depth, &no_t),
+            NormalizeError::Missing("T")
+        );
+        let no_t = DEPTH_SNAPSHOT.replace(r#""T":1791399966493,"#, "");
+        assert_eq!(
+            record_time(BinanceStream::DepthSnapshot, no_t.as_bytes()),
+            Some(EventTime::from_millis(1_791_399_966_500))
+        );
+    }
+
+    #[test]
+    fn malformed_depth_is_rejected() {
+        let unexpected = |stream, payload: &str| {
+            assert!(
+                matches!(parse_err(stream, payload), NormalizeError::Unexpected(_)),
+                "{payload}"
+            );
+        };
+        // A decimal sent as a number.
+        let number = DEPTH.replace(r#"["83402.00","3.480"]"#, r#"["83402.00",3.48]"#);
+        assert!(matches!(
+            parse_err(BinanceStream::Depth, &number),
+            NormalizeError::Json(_)
+        ));
+        let number = DEPTH_SNAPSHOT.replace(r#"["83401.90","8.843"]"#, r#"[83401.9,"8.843"]"#);
+        assert!(matches!(
+            parse_err(BinanceStream::DepthSnapshot, &number),
+            NormalizeError::Json(_)
+        ));
+        unexpected(
+            BinanceStream::Depth,
+            &DEPTH.replace(r#"["83402.00","3.480"]"#, r#"["83402.00","-3.480"]"#),
+        );
+        for price in ["0.00", "-1.00"] {
+            unexpected(
+                BinanceStream::Depth,
+                &DEPTH.replace(r#"["1000.00","115.863"]"#, &format!(r#"["{price}","1.0"]"#)),
+            );
+        }
+        // U above u.
+        unexpected(
+            BinanceStream::Depth,
+            &DEPTH.replace(r#""U":11759030886305"#, r#""U":11759030896478"#),
+        );
+        unexpected(
+            BinanceStream::Depth,
+            &DEPTH.replace(r#""e":"depthUpdate""#, r#""e":"bookTicker""#),
+        );
+        unexpected(
+            BinanceStream::Depth,
+            &DEPTH.replace(r#""s":"BTCUSDT""#, r#""s":"ETHUSDT""#),
+        );
+        // A snapshot holds resting levels only.
+        unexpected(
+            BinanceStream::DepthSnapshot,
+            &DEPTH_SNAPSHOT.replace(r#"["83402.10","0.031"]"#, r#"["83402.10","0.000"]"#),
+        );
+        unexpected(
+            BinanceStream::DepthSnapshot,
+            &DEPTH_SNAPSHOT.replace(r#"["83401.80","1.610"]"#, r#"["0","1.610"]"#),
+        );
+        assert_eq!(
+            parse_err(
+                BinanceStream::Depth,
+                &DEPTH.replace(r#""pu":11759030885985,"#, "")
+            ),
+            NormalizeError::Missing("pu")
+        );
+        assert_eq!(
+            parse_err(
+                BinanceStream::DepthSnapshot,
+                &DEPTH_SNAPSHOT.replace(r#""lastUpdateId":11759031561498,"#, "")
+            ),
+            NormalizeError::Missing("lastUpdateId")
+        );
+        // A three-element level is not a level.
+        let triple = DEPTH.replace(r#"["83402.00","3.480"]"#, r#"["83402.00","3.480","x"]"#);
+        assert!(matches!(
+            parse_err(BinanceStream::Depth, &triple),
+            NormalizeError::Json(_)
+        ));
+        assert_eq!(
+            parse_err(
+                BinanceStream::Depth,
+                &DEPTH.replace(r#"["83402.00","3.480"]"#, r#"["83402.000000001","3.480"]"#)
+            ),
+            NormalizeError::Decimal {
+                field: "a",
+                error: ParseDecimalError::TooManyDecimals
+            }
+        );
     }
 }

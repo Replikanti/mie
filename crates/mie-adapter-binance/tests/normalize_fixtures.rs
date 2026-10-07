@@ -4,7 +4,8 @@
 use mie_adapter_binance::BinanceStream;
 use mie_adapter_binance::normalize::{parse, record_time};
 use mie_domain::event::{
-    Aggressor, Kline, Liquidation, MarkPrice, MarketEvent, OpenInterest, Trade,
+    Aggressor, BookSnapshot, BookUpdate, Kline, Level, Liquidation, MarkPrice, MarketEvent,
+    OpenInterest, Trade,
 };
 use mie_domain::num::{Price, Qty, Rate};
 use mie_domain::time::EventTime;
@@ -162,4 +163,72 @@ fn liquidation_sides_map_from_the_order_side() {
             ..
         }))
     ));
+}
+
+fn level(price: i64, qty: i64) -> Level {
+    Level {
+        price: Price::from_units(price),
+        qty: Qty::from_units(qty),
+    }
+}
+
+#[test]
+fn recorded_depth_diffs_map_exactly_and_chain() {
+    let updates: Vec<BookUpdate> = events(BinanceStream::Depth)
+        .into_iter()
+        .map(|e| match e {
+            Some(MarketEvent::BookUpdate(update)) => update,
+            other => panic!("not a book update: {other:?}"),
+        })
+        .collect();
+    assert_eq!(updates.len(), 29);
+    let first = &updates[0];
+    assert_eq!(first.time, t(1_791_400_658_578));
+    assert_eq!(
+        (
+            first.first_update_id,
+            first.last_update_id,
+            first.prev_update_id
+        ),
+        (11_759_094_651_167, 11_759_094_663_893, 11_759_094_651_009)
+    );
+    assert_eq!((first.bids.len(), first.asks.len()), (174, 179));
+    // Diffs reach far beyond the top of the book.
+    assert_eq!(first.bids[0], level(3_289_740_000_000, 82_800_000));
+    assert_eq!(first.asks[0], level(8_339_750_000_000, 130_600_000));
+    // One connection: every diff chains on the previous one.
+    assert!(
+        updates
+            .windows(2)
+            .all(|w| w[1].prev_update_id == w[0].last_update_id)
+    );
+    // Removals are zero quantities, kept in source order.
+    let removals = updates
+        .iter()
+        .flat_map(|u| u.bids.iter().chain(&u.asks))
+        .filter(|l| l.qty.units() == 0)
+        .count();
+    assert_eq!(removals, 924);
+}
+
+#[test]
+fn recorded_depth_snapshots_map_exactly() {
+    let snapshots: Vec<BookSnapshot> = events(BinanceStream::DepthSnapshot)
+        .into_iter()
+        .map(|e| match e {
+            Some(MarketEvent::BookSnapshot(snapshot)) => snapshot,
+            other => panic!("not a book snapshot: {other:?}"),
+        })
+        .collect();
+    assert_eq!(snapshots.len(), 2);
+    let first = &snapshots[0];
+    assert_eq!(first.time, t(1_791_400_659_048));
+    assert_eq!(first.last_update_id, 11_759_094_709_820);
+    // limit=100: one hundred levels per side, best first.
+    assert_eq!((first.bids.len(), first.asks.len()), (100, 100));
+    assert_eq!(first.bids[0], level(8_339_740_000_000, 913_200_000));
+    assert_eq!(first.asks[0], level(8_339_750_000_000, 125_000_000));
+    assert_eq!(first.bids[99].price, Price::from_units(8_338_460_000_000));
+    assert_eq!(first.asks[99].price, Price::from_units(8_341_140_000_000));
+    assert_eq!(snapshots[1].last_update_id, 11_759_095_019_149);
 }
