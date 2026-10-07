@@ -5,9 +5,12 @@
 //! output must be deterministic, carry the expected gaps at the expected
 //! positions, and be accepted by the domain engine as a whole.
 
-use mie_adapter_binance::normalize::record_time;
+use mie_adapter_binance::normalize::{NormalizeError, record_time};
 use mie_adapter_binance::{BinanceStream, Pipeline};
+use mie_domain::bars::Timeframe;
 use mie_domain::event::{FeedGap, GapReason, MarketEvent, Stream};
+use mie_domain::feature::FeatureValue;
+use mie_domain::num::Qty;
 use mie_domain::state::MarketStateEngine;
 use mie_domain::time::EventTime;
 use mie_ports::raw::{Capture, RawRecord};
@@ -157,4 +160,139 @@ fn faults_become_gaps_at_their_positions() {
     );
     assert_eq!(stats.streams[&BinanceStream::ForceOrder].events, 0);
     assert!(stats.streams[&BinanceStream::ForceOrder].max_lateness_ms >= 2_600);
+}
+
+/// A live `aggTrade` record (the `tests/fixtures/aggTrade.jsonl` shape) in
+/// arrival order `seq`.
+fn agg_trade(seq: u64, id: u64, time: i64, qty: &str) -> (BinanceStream, RawRecord) {
+    let payload = format!(
+        r#"{{"e":"aggTrade","E":{time},"a":{id},"s":"BTCUSDT","p":"85299.90","q":"{qty}","nq":"{qty}","f":{id},"l":{id},"T":{time},"m":true,"st":1}}"#
+    );
+    let record = RawRecord {
+        event_time: record_time(BinanceStream::AggTrade, payload.as_bytes()).expect("record time"),
+        capture: Some(Capture {
+            receive_time_ns: 0,
+            receive_seq: seq,
+            session_id: "s1".to_owned(),
+        }),
+        payload: payload.into_bytes(),
+    };
+    (BinanceStream::AggTrade, record)
+}
+
+/// 2026-10-06T07:17:00Z: a minute boundary well inside one UTC day.
+const MINUTE: i64 = 1_791_271_020_000;
+
+#[test]
+fn a_non_positive_trade_quantity_is_a_counted_error_and_a_trade_id_gap() {
+    let records = [
+        agg_trade(1, 100, MINUTE + 1_000, "0.004"),
+        agg_trade(2, 101, MINUTE + 2_000, "0"),
+        agg_trade(3, 102, MINUTE + 3_000, "0.010"),
+    ];
+    let mut pipeline = Pipeline::new("BTCUSDT", HOLD_BACK_MS, 10_000, &BTreeMap::new());
+    let mut out = Vec::new();
+    for (i, (stream, record)) in records.iter().enumerate() {
+        let pushed = pipeline.push(*stream, record);
+        if i == 1 {
+            assert!(
+                matches!(pushed.error, Some(NormalizeError::Unexpected(_))),
+                "{:?}",
+                pushed.error
+            );
+            assert!(pushed.events.is_empty(), "{:?}", pushed.events);
+        } else {
+            assert_eq!(pushed.error, None);
+        }
+        out.extend(pushed.events);
+    }
+    out.extend(pipeline.finish());
+    assert_engine_accepts(&out);
+
+    // The rejected trade never becomes an event; the id break reports it.
+    let ids: Vec<u64> = out
+        .iter()
+        .filter_map(|e| match e {
+            MarketEvent::Trade(trade) => Some(trade.trade_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ids, [100, 102]);
+    let found = gaps(&out);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].1.reason, GapReason::SequenceBreak);
+    assert!(matches!(&out[found[0].0 + 1], MarketEvent::Trade(t) if t.trade_id == 102));
+
+    let agg = &pipeline.stats().streams[&BinanceStream::AggTrade];
+    assert_eq!((agg.records, agg.normalize_errors, agg.events), (3, 1, 2));
+    assert_eq!(agg.gaps[&GapReason::SequenceBreak], 1);
+}
+
+#[test]
+fn rejected_quantities_keep_bars_and_the_profile_consistent() {
+    // (record, valid quantity in units if the record is a valid trade in a
+    // minute that closes). The valid ids 1000..=1004 are contiguous; the two
+    // rejected records carry their own ids, so no gap muddies the sums.
+    let records = [
+        (agg_trade(1, 1000, MINUTE + 1_000, "0.004"), Some(400_000)),
+        (agg_trade(2, 5001, MINUTE + 2_000, "0"), None),
+        (agg_trade(3, 1001, MINUTE + 3_000, "0.010"), Some(1_000_000)),
+        (
+            agg_trade(4, 1002, MINUTE + 61_000, "0.250"),
+            Some(25_000_000),
+        ),
+        (agg_trade(5, 5002, MINUTE + 62_000, "-0.004"), None),
+        (
+            agg_trade(6, 1003, MINUTE + 63_000, "1.5"),
+            Some(150_000_000),
+        ),
+        // The developing minute: it closes the first two and stays out of
+        // the profile.
+        (agg_trade(7, 1004, MINUTE + 121_000, "0.002"), None),
+    ];
+    let mut pipeline = Pipeline::new("BTCUSDT", HOLD_BACK_MS, 10_000, &BTreeMap::new());
+    let mut out = Vec::new();
+    let mut errors = 0;
+    for ((stream, record), _) in &records {
+        let pushed = pipeline.push(*stream, record);
+        if let Some(error) = pushed.error {
+            assert!(matches!(error, NormalizeError::Unexpected(_)), "{error}");
+            errors += 1;
+        }
+        out.extend(pushed.events);
+    }
+    out.extend(pipeline.finish());
+    assert_eq!(errors, 2);
+    assert_eq!(
+        pipeline.stats().streams[&BinanceStream::AggTrade].normalize_errors,
+        2
+    );
+    assert!(gaps(&out).is_empty(), "unexpected gaps: {:?}", gaps(&out));
+
+    let mut engine = MarketStateEngine::new();
+    let mut closed_volume = 0;
+    let mut closed_minutes = 0;
+    for (i, event) in out.iter().enumerate() {
+        engine
+            .apply(event)
+            .unwrap_or_else(|e| panic!("event {i} rejected: {e}"));
+        for bar in engine.closed_bars() {
+            if bar.timeframe == Timeframe::M1 {
+                closed_volume += bar.volume.units();
+                closed_minutes += 1;
+            }
+        }
+    }
+    assert_eq!(closed_minutes, 2);
+
+    let expected: i64 = records.iter().filter_map(|(_, units)| *units).sum();
+    assert_eq!(expected, 176_400_000);
+    assert_eq!(closed_volume, expected);
+    let FeatureValue::Ready(profile) = &engine.state().profile.utc_day else {
+        panic!(
+            "profile still warming up: {:?}",
+            engine.state().profile.utc_day
+        );
+    };
+    assert_eq!(profile.total_volume, Qty::from_units(expected));
 }
