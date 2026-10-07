@@ -59,8 +59,8 @@ Earlier decisions constrain the answer:
    and ADR-036 (the daily reconnect gap of ADR-032).
 5. **Registry.** Each timeframe keeps the active (unswept) structural highs
    and lows, each with `swing_time` (the swing bar's open),
-   `confirmed_bar_end`, `touches` and `coverage`. Age is derived on demand
-   (`now - confirmed_bar_end`), never stored.
+   `confirmed_bar_end`, the swing's `known_at`, `touches` and `coverage`.
+   Age is derived on demand (`now - known_at`), never stored.
    - **Touch**: a closed bar of the level's timeframe that opens at or after
      `confirmed_bar_end`, while the level is still active, whose extreme
      comes within `touch_tolerance_bps` = 5 of the level. For a high `L`:
@@ -133,7 +133,12 @@ Earlier decisions constrain the answer:
     per timeframe; they are stepped on the same atomic path as bars,
     volatility, order flow and the volume profile. The engine exposes the
     events of the last accepted event. Each registry hands its levels to
-    location (#23) as `StructureLevel`s.
+    location (#23) as `StructureLevel`s, each timed by `known_at` with one
+    meaning for every kind: the visibility time (decision 8) of the fact
+    that gave the level its kind — the swing for a structural level, the
+    sweep for a prior sweep, the SFP for a rejection zone. Its age is
+    `now - known_at`; no bar end is handed over, so levels the engine
+    learned of together have the same age.
 
 An SFP here is a structure fact, never a signal: the `TriggerFamily::Sfp`
 trigger rule, with location, bias and its own parameter version, belongs to

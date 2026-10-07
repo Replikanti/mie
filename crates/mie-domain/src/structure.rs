@@ -162,6 +162,9 @@ pub struct Level {
     pub swing_time: EventTime,
     /// End of the bar that confirmed the swing (decision 3).
     pub confirmed_bar_end: EventTime,
+    /// The swing's [`Swing::known_at`]: when the level became active, as a
+    /// visibility time (decision 8).
+    pub known_at: EventTime,
     /// Closed bars that came within [`TOUCH_TOLERANCE_BPS`] of the level
     /// while it was active.
     pub touches: u32,
@@ -249,10 +252,11 @@ pub struct StructureLevel {
     pub side: Side,
     /// Open time of the swing bar.
     pub swing_time: EventTime,
-    /// When the level took its kind: the confirming bar's end for a
-    /// structural level, the sweeping trade for a prior sweep, the resolving
-    /// bar's end for an SFP rejection zone.
-    pub created_at: EventTime,
+    /// When the level took its kind, as a visibility time (decision 8): the
+    /// time of the event that emitted the fact behind it — the swing for a
+    /// structural level, the sweep (the sweeping trade) for a prior sweep,
+    /// the SFP for a rejection zone. Never a bar end.
+    pub known_at: EventTime,
     /// Touches while the level was active.
     pub touches: u32,
     /// The sweep's outcome; `None` for an active structural level.
@@ -262,11 +266,10 @@ pub struct StructureLevel {
 }
 
 impl StructureLevel {
-    /// Milliseconds from `created_at` to `now`, derived on demand
-    /// (decision 5); negative if `now` comes first, saturating at the `i64`
-    /// range.
+    /// Milliseconds from `known_at` to `now`, derived on demand (decision
+    /// 5); negative if `now` comes first, saturating at the `i64` range.
     pub fn age_ms(&self, now: EventTime) -> i64 {
-        now.as_millis().saturating_sub(self.created_at.as_millis())
+        now.as_millis().saturating_sub(self.known_at.as_millis())
     }
 }
 
@@ -347,9 +350,9 @@ impl LevelRegistry {
             .iter()
             .filter(|sweep| sweep.outcome == SweepOutcome::Sfp)
             .collect();
-        zones.sort_by_key(|sweep| (sweep.level.price, sweep.resolved_bar_end));
+        zones.sort_by_key(|sweep| (sweep.level.price, sweep.known_at));
         let level =
-            move |kind, level: &Level, low, high, created_at, outcome, coverage| StructureLevel {
+            move |kind, level: &Level, low, high, known_at, outcome, coverage| StructureLevel {
                 kind,
                 price: level.price,
                 low,
@@ -358,7 +361,7 @@ impl LevelRegistry {
                 timeframe: self.timeframe,
                 side: level.side,
                 swing_time: level.swing_time,
-                created_at,
+                known_at,
                 touches: level.touches,
                 outcome,
                 coverage,
@@ -373,7 +376,7 @@ impl LevelRegistry {
                 active,
                 active.price,
                 active.price,
-                active.confirmed_bar_end,
+                active.known_at,
                 None,
                 active.coverage,
             )
@@ -400,7 +403,8 @@ impl LevelRegistry {
                 &sweep.level,
                 low,
                 high,
-                sweep.resolved_bar_end.unwrap_or(sweep.time),
+                // A resolved sweep's `known_at` is its resolution's.
+                sweep.known_at,
                 Some(sweep.outcome),
                 sweep.coverage,
             )
@@ -818,6 +822,7 @@ impl TimeframeTracker {
                 price,
                 swing_time: swing.swing_time,
                 confirmed_bar_end: swing.confirmed_bar_end,
+                known_at,
                 touches: 0,
                 coverage,
             });
@@ -1229,6 +1234,7 @@ mod tests {
                 price: swing_level(),
                 swing_time: t(7 * M15),
                 confirmed_bar_end: t(11 * M15),
+                known_at: t(11 * M15 + 1_000),
                 touches: 0,
                 coverage: COMPLETE,
             }]
@@ -1499,7 +1505,7 @@ mod tests {
             let handed: Vec<_> = registry.levels().collect();
             assert_eq!(handed.len(), 1);
             assert_eq!(
-                (handed[0].kind, handed[0].created_at, handed[0].outcome),
+                (handed[0].kind, handed[0].known_at, handed[0].outcome),
                 (LevelKind::PriorSweep, t(at), Some(SweepOutcome::Pending))
             );
         }
@@ -1545,7 +1551,7 @@ mod tests {
                 (usdt(60_015), usdt(60_020))
             };
             assert_eq!(
-                (zone.low, zone.high, zone.created_at),
+                (zone.low, zone.high, zone.known_at),
                 (low, high, t(12 * M15))
             );
             assert_eq!(zone.age_ms(t(12 * M15 + 5)), 5);
@@ -1722,6 +1728,29 @@ mod tests {
                 .high,
             Some(swing)
         );
+        // The engine learned of both levels at once: they are handed to
+        // location with the same time and the same age, though their bars
+        // end 45 minutes apart.
+        let handed: Vec<StructureLevel> = registry_of(&engine, Timeframe::M15).levels().collect();
+        let level_kinds: Vec<LevelKind> = handed.iter().map(|level| level.kind).collect();
+        assert_eq!(
+            level_kinds,
+            [LevelKind::StructuralHigh, LevelKind::StructuralLow]
+        );
+        let later = t(14 * M15 + 60_000);
+        for level in &handed {
+            assert_eq!(level.known_at, t(14 * M15), "{level:?}");
+            assert_eq!(level.age_ms(later), 60_000, "{level:?}");
+        }
+        let lows = registry_of(&engine, Timeframe::M15).lows();
+        assert_eq!(
+            (lows[0].confirmed_bar_end, lows[0].known_at),
+            (t(14 * M15), t(14 * M15))
+        );
+        assert_eq!(
+            registry_of(&engine, Timeframe::M15).highs()[0].confirmed_bar_end,
+            t(11 * M15)
+        );
 
         // A sweep in bar 11, then silence: bar 11 closes beyond and bar 12
         // is empty, a break at 11 700 000 ms that only the next trade, 45
@@ -1756,6 +1785,30 @@ mod tests {
         let registry = registry_of(&engine, Timeframe::M15);
         assert!(registry.resolved().is_empty());
         assert_eq!(registry.pending().len(), 1);
+
+        // Bar 11 sweeps and closes back inside, then silence: the SFP at
+        // 10 800 000 ms is emitted 45 minutes later, and its rejection zone
+        // is timed and aged from then.
+        let (engine, facts) = after_swing(
+            usdt(60_008),
+            |tape| {
+                tape.trade(11 * M15 + 2_000, usdt(60_020))
+                    .trade(11 * M15 + 3_000, usdt(60_014))
+                    .trade(15 * M15, usdt(60_010));
+            },
+            false,
+        );
+        assert_eq!(
+            kinds(&facts),
+            [("sweep", t(11 * M15 + 2_000)), ("sfp", t(12 * M15))]
+        );
+        assert_eq!(facts[1].1.time(), t(15 * M15));
+        let zone = registry_of(&engine, Timeframe::M15)
+            .levels()
+            .last()
+            .unwrap();
+        assert_eq!(zone.kind, LevelKind::SfpRejectionZone);
+        assert_eq!((zone.known_at, zone.age_ms(t(15 * M15))), (t(15 * M15), 0));
     }
 
     #[test]
@@ -1829,6 +1882,7 @@ mod tests {
             price: swing_level(),
             swing_time: t(0),
             confirmed_bar_end: t(0),
+            known_at: t(0),
             touches: 0,
             coverage: COMPLETE,
         };
@@ -1885,6 +1939,7 @@ mod tests {
             price: usdt(whole),
             swing_time: t(0),
             confirmed_bar_end: t(confirmed),
+            known_at: t(confirmed),
             touches: 0,
             coverage: COMPLETE,
         }
@@ -2229,6 +2284,7 @@ mod tests {
                 price: swing.price,
                 swing_time: swing.swing_time,
                 confirmed_bar_end: swing.confirmed_bar_end,
+                known_at: swing.known_at,
                 touches: reference_touches(&bars, known, swing),
                 coverage: swing.coverage,
             };
@@ -2598,7 +2654,7 @@ mod tests {
                             }
                         }
                         for level in registry.levels() {
-                            assert!(level.created_at <= as_of, "{level:?}");
+                            assert!(level.known_at <= as_of, "{level:?}");
                             assert!(level.age_ms(as_of) >= 0);
                         }
                     }
