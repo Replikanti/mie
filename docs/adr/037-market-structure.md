@@ -50,26 +50,27 @@ Earlier decisions constrain the answer:
    and never qualify or disqualify a swing: no price is invented
    (ADR-031). An outside bar can be both a swing high and a swing low; the
    high is emitted first.
-3. **Confirmation.** A swing at bar `i` has `confirmed_at` = the end of bar
-   `i+N`. It is emitted by the event that closes bar `i+N`, never earlier.
+3. **Confirmation.** A swing at bar `i` has `confirmed_bar_end` = the end
+   of bar `i+N`. It is emitted by the event that closes bar `i+N`, never
+   earlier; that event's time is the swing's `known_at` (decision 8).
    Warm-up: `2N+1` = 7 closed bars of the timeframe.
 4. **Coverage and gaps.** A swing carries the OR of the coverage of its
    `2N+1` window bars. Nothing resets on a gap, following ADR-033, ADR-035
    and ADR-036 (the daily reconnect gap of ADR-032).
 5. **Registry.** Each timeframe keeps the active (unswept) structural highs
-   and lows, each with `swing_time` (the swing bar's open), `confirmed_at`,
-   `touches` and `coverage`. Age is derived on demand
-   (`now - confirmed_at`), never stored.
+   and lows, each with `swing_time` (the swing bar's open),
+   `confirmed_bar_end`, `touches` and `coverage`. Age is derived on demand
+   (`now - confirmed_bar_end`), never stored.
    - **Touch**: a closed bar of the level's timeframe that opens at or after
-     `confirmed_at`, while the level is still active, whose extreme comes
-     within `touch_tolerance_bps` = 5 of the level. For a high `L`:
+     `confirmed_bar_end`, while the level is still active, whose extreme
+     comes within `touch_tolerance_bps` = 5 of the level. For a high `L`:
      `high <= L && (L - high) · 10 000 <= |L| · 5`, exact in `i128`. Lows
      mirror this. The sweep bar never touches: the level is no longer
      active when it closes.
    - **Cap**: `max_levels` = 20 for each list — active highs, active lows
      and resolved swept levels — per timeframe. When a list is full, its
-     oldest entry is evicted (by `confirmed_at` for active levels, by sweep
-     time for resolved ones, then by price). Pending sweeps are never
+     oldest entry is evicted (by `confirmed_bar_end` for active levels, by
+     sweep time for resolved ones, then by price). Pending sweeps are never
      evicted.
 6. **Sweep** (`sweep_rule` = `trade_through_strict`): the first trade with
    `price > L` on an active high (`< L` on an active low). A trade at
@@ -77,7 +78,7 @@ Earlier decisions constrain the answer:
    set and becomes a `PriorSweep` with outcome `Pending`. One trade can
    sweep several levels on several timeframes; the order is timeframe
    ascending, then the level price crosses first (highs by price
-   ascending, lows by price descending), then `confirmed_at`.
+   ascending, lows by price descending), then `confirmed_bar_end`.
 7. **SFP or clean break.** The window is `K` = `sfp_window_bars` = 2 bars
    of the level's timeframe, starting with the bar that contains the sweep
    trade.
@@ -100,9 +101,16 @@ Earlier decisions constrain the answer:
    processing order: first the closed bars of the event, in `(end,
    timeframe)` order — for each bar, its resolutions, then its touches,
    then its swing confirmations — and then the trade's sweeps. Each event
-   carries its timeframe, its feature key and its visibility time:
-   `confirmed_at` for a swing, the trade time for a sweep, the end of the
-   resolving bar for an SFP or a break.
+   carries its timeframe, its feature key and its visibility time
+   `known_at`, the time of the event that emitted it, which
+   `StructureEvent::time` returns: the sweeping trade for a sweep; for a
+   swing, an SFP or a break, the trade or trades gap that closed the
+   confirming or resolving bar (ADR-031). The bar end stays a separate
+   field — `confirmed_bar_end` for a swing, `resolved_bar_end` for an SFP
+   or a break — and is never a visibility time: a closed bar becomes
+   visible only at the next trades-stream event, so across a silent trades
+   outage `known_at` trails the bar end by the outage's length. Labels,
+   triggers and research joins key on `known_at`.
 9. **Exactness.** Prices are compared exactly. Tolerance and window
    arithmetic use `i128` or checked `i64`, and `touches` is a checked
    `u32`. No float is computed or stored. An overflow rejects the event as

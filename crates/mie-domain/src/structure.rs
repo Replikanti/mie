@@ -91,9 +91,15 @@ pub struct Swing {
     pub price: Price,
     /// Open time of the swing bar.
     pub swing_time: EventTime,
-    /// End of the [`SWING_BARS`]-th bar after the swing bar: when the swing
-    /// becomes known (decision 3).
-    pub confirmed_at: EventTime,
+    /// End of the [`SWING_BARS`]-th bar after the swing bar, the bar that
+    /// confirms the swing (decision 3). A bar time, not a visibility time:
+    /// the swing is known only from [`Self::known_at`] on.
+    pub confirmed_bar_end: EventTime,
+    /// Time of the event that emitted the swing: the trades-stream event
+    /// that closed the confirming bar (ADR-031), at or after
+    /// `confirmed_bar_end` — later by a whole outage across a silent trades
+    /// gap. The swing's visibility time (decision 8).
+    pub known_at: EventTime,
     /// The OR of the coverage of the [`SWING_WINDOW`] bars it read.
     pub coverage: Coverage,
 }
@@ -103,7 +109,12 @@ impl fmt::Display for Swing {
         write!(
             f,
             "{} price={} bar={} confirmed={} {} {}",
-            self.side, self.price, self.swing_time, self.confirmed_at, self.coverage, self.feature
+            self.side,
+            self.price,
+            self.swing_time,
+            self.confirmed_bar_end,
+            self.coverage,
+            self.feature
         )
     }
 }
@@ -149,8 +160,8 @@ pub struct Level {
     pub price: Price,
     /// Open time of the swing bar.
     pub swing_time: EventTime,
-    /// When the swing was confirmed and the level became active.
-    pub confirmed_at: EventTime,
+    /// End of the bar that confirmed the swing (decision 3).
+    pub confirmed_bar_end: EventTime,
     /// Closed bars that came within [`TOUCH_TOLERANCE_BPS`] of the level
     /// while it was active.
     pub touches: u32,
@@ -180,8 +191,14 @@ pub struct Sweep {
     pub window_bars: u32,
     /// The outcome.
     pub outcome: SweepOutcome,
-    /// End of the resolving bar; `None` while pending.
-    pub resolved_at: Option<EventTime>,
+    /// End of the resolving bar; `None` while pending. A bar time, not a
+    /// visibility time.
+    pub resolved_bar_end: Option<EventTime>,
+    /// Time of the event that emitted the sweep's latest fact, its
+    /// visibility time (decision 8): the sweeping trade while pending; once
+    /// resolved, the trades-stream event that closed the resolving bar
+    /// (ADR-031), at or after `resolved_bar_end`.
+    pub known_at: EventTime,
     /// The level's coverage OR that of the window bars read.
     pub coverage: Coverage,
 }
@@ -195,7 +212,7 @@ impl fmt::Display for Sweep {
             level.side,
             level.price,
             level.swing_time,
-            level.confirmed_at,
+            level.confirmed_bar_end,
             level.touches,
             self.time,
             self.price,
@@ -203,7 +220,7 @@ impl fmt::Display for Sweep {
             self.window_bars,
             self.outcome
         )?;
-        if let Some(resolved) = self.resolved_at {
+        if let Some(resolved) = self.resolved_bar_end {
             write!(f, " resolved={resolved}")?;
         }
         write!(f, " {} {}", self.coverage, self.feature)
@@ -232,9 +249,9 @@ pub struct StructureLevel {
     pub side: Side,
     /// Open time of the swing bar.
     pub swing_time: EventTime,
-    /// When the level took its kind: the confirmation for a structural
-    /// level, the sweeping trade for a prior sweep, the resolving bar's end
-    /// for an SFP rejection zone.
+    /// When the level took its kind: the confirming bar's end for a
+    /// structural level, the sweeping trade for a prior sweep, the resolving
+    /// bar's end for an SFP rejection zone.
     pub created_at: EventTime,
     /// Touches while the level was active.
     pub touches: u32,
@@ -263,9 +280,9 @@ impl StructureLevel {
 pub struct LevelRegistry {
     feature: FeatureKey,
     timeframe: Timeframe,
-    /// Active highs by `(price, confirmed_at)`.
+    /// Active highs by `(price, confirmed_bar_end)`.
     highs: Vec<Level>,
-    /// Active lows by `(price, confirmed_at)`.
+    /// Active lows by `(price, confirmed_bar_end)`.
     lows: Vec<Level>,
     /// Sweeps whose window is open, in sweep order.
     pending: Vec<Sweep>,
@@ -330,7 +347,7 @@ impl LevelRegistry {
             .iter()
             .filter(|sweep| sweep.outcome == SweepOutcome::Sfp)
             .collect();
-        zones.sort_by_key(|sweep| (sweep.level.price, sweep.resolved_at));
+        zones.sort_by_key(|sweep| (sweep.level.price, sweep.resolved_bar_end));
         let level =
             move |kind, level: &Level, low, high, created_at, outcome, coverage| StructureLevel {
                 kind,
@@ -356,7 +373,7 @@ impl LevelRegistry {
                 active,
                 active.price,
                 active.price,
-                active.confirmed_at,
+                active.confirmed_bar_end,
                 None,
                 active.coverage,
             )
@@ -383,7 +400,7 @@ impl LevelRegistry {
                 &sweep.level,
                 low,
                 high,
-                sweep.resolved_at.unwrap_or(sweep.time),
+                sweep.resolved_bar_end.unwrap_or(sweep.time),
                 Some(sweep.outcome),
                 sweep.coverage,
             )
@@ -405,12 +422,12 @@ impl LevelRegistry {
             Side::Low => &mut self.lows,
         };
         if list.len() >= MAX_LEVELS
-            && let Some(oldest) = oldest(list, |level| (level.confirmed_at, level.price))
+            && let Some(oldest) = oldest(list, |level| (level.confirmed_bar_end, level.price))
         {
             list.remove(oldest);
         }
-        let key = (level.price, level.confirmed_at);
-        let at = list.partition_point(|other| (other.price, other.confirmed_at) <= key);
+        let key = (level.price, level.confirmed_bar_end);
+        let at = list.partition_point(|other| (other.price, other.confirmed_bar_end) <= key);
         list.insert(at, level);
     }
 
@@ -493,14 +510,14 @@ pub enum StructureEvent {
 }
 
 impl StructureEvent {
-    /// When the fact became visible: the confirmation of a swing, the
-    /// sweeping trade's time, or the end of the bar that resolved a sweep.
+    /// When the fact became visible (decision 8): its `known_at`, the time
+    /// of the event that emitted it — the sweeping trade for a sweep, the
+    /// event that closed the confirming or resolving bar otherwise. Never
+    /// the bar end, which can precede emission by a whole trades outage.
     pub fn time(&self) -> EventTime {
         match self {
-            Self::Swing(swing) => swing.confirmed_at,
-            Self::Sweep(sweep) => sweep.time,
-            // A resolved sweep always has its resolution time.
-            Self::Sfp(sweep) | Self::Break(sweep) => sweep.resolved_at.unwrap_or(sweep.time),
+            Self::Swing(swing) => swing.known_at,
+            Self::Sweep(sweep) | Self::Sfp(sweep) | Self::Break(sweep) => sweep.known_at,
         }
     }
 
@@ -655,12 +672,18 @@ impl TimeframeTracker {
         }
     }
 
-    /// Takes one closed bar of the timeframe: resolutions, then touches,
-    /// then swing confirmations (decision 8).
-    fn close(&mut self, bar: &Bar, events: &mut Vec<StructureEvent>) -> Result<(), StructureError> {
-        self.resolve(bar, events)?;
+    /// Takes one closed bar of the timeframe, closed by an event at
+    /// `known_at`: resolutions, then touches, then swing confirmations
+    /// (decision 8).
+    fn close(
+        &mut self,
+        bar: &Bar,
+        known_at: EventTime,
+        events: &mut Vec<StructureEvent>,
+    ) -> Result<(), StructureError> {
+        self.resolve(bar, known_at, events)?;
         self.touch(bar)?;
-        self.confirm(bar, events)
+        self.confirm(bar, known_at, events)
     }
 
     /// Steps every pending sweep's SFP window with `bar` (decision 7), in
@@ -668,6 +691,7 @@ impl TimeframeTracker {
     fn resolve(
         &mut self,
         bar: &Bar,
+        known_at: EventTime,
         events: &mut Vec<StructureEvent>,
     ) -> Result<(), StructureError> {
         if self.registry.pending.is_empty() {
@@ -697,7 +721,8 @@ impl TimeframeTracker {
                 self.registry.pending.push(sweep);
                 continue;
             }
-            sweep.resolved_at = Some(bar.end());
+            sweep.resolved_bar_end = Some(bar.end());
+            sweep.known_at = known_at;
             let event = if inside {
                 sweep.outcome = SweepOutcome::Sfp;
                 StructureEvent::Sfp(sweep)
@@ -719,7 +744,7 @@ impl TimeframeTracker {
         };
         let registry = &mut self.registry;
         for level in registry.highs.iter_mut().chain(registry.lows.iter_mut()) {
-            if bar.open_time >= level.confirmed_at && touches(level, ohlc) {
+            if bar.open_time >= level.confirmed_bar_end && touches(level, ohlc) {
                 level.touches = level
                     .touches
                     .checked_add(1)
@@ -734,6 +759,7 @@ impl TimeframeTracker {
     fn confirm(
         &mut self,
         bar: &Bar,
+        known_at: EventTime,
         events: &mut Vec<StructureEvent>,
     ) -> Result<(), StructureError> {
         self.closed_bars = self
@@ -779,7 +805,8 @@ impl TimeframeTracker {
                 side,
                 price,
                 swing_time: candidate.open_time,
-                confirmed_at: bar.end(),
+                confirmed_bar_end: bar.end(),
+                known_at,
                 coverage,
             };
             match side {
@@ -790,7 +817,7 @@ impl TimeframeTracker {
                 side,
                 price,
                 swing_time: swing.swing_time,
-                confirmed_at: swing.confirmed_at,
+                confirmed_bar_end: swing.confirmed_bar_end,
                 touches: 0,
                 coverage,
             });
@@ -814,7 +841,7 @@ impl TimeframeTracker {
         lows.sort_by(|a, b| {
             b.price
                 .cmp(&a.price)
-                .then(a.confirmed_at.cmp(&b.confirmed_at))
+                .then(a.confirmed_bar_end.cmp(&b.confirmed_bar_end))
         });
         swept.extend(lows);
         for level in swept {
@@ -827,7 +854,8 @@ impl TimeframeTracker {
                 extreme: price,
                 window_bars: 0,
                 outcome: SweepOutcome::Pending,
-                resolved_at: None,
+                resolved_bar_end: None,
+                known_at: time,
                 coverage: level.coverage,
             };
             registry.pending.push(sweep);
@@ -922,7 +950,7 @@ impl StructureTracker {
                 .iter_mut()
                 .find(|(_, tracker)| tracker.timeframe() == bar.timeframe)
             {
-                tracker.close(bar, &mut events)?;
+                tracker.close(bar, event.time(), &mut events)?;
             }
         }
         if let Some(trade) = trade {
@@ -1125,6 +1153,8 @@ mod tests {
         structure(engine, timeframe).levels.ready().unwrap()
     }
 
+    /// A 15m swing at bar `bar`, confirmed by the close of bar `bar + 3`
+    /// and emitted by the trade 1 s into bar `bar + 4`.
     fn swing_15m(side: Side, price: Price, bar: i64, coverage: Coverage) -> Swing {
         Swing {
             feature: catalog::STRUCTURE_SWING_15M_V1.key,
@@ -1132,7 +1162,8 @@ mod tests {
             side,
             price,
             swing_time: t(bar * M15),
-            confirmed_at: t((bar + 4) * M15),
+            confirmed_bar_end: t((bar + 4) * M15),
+            known_at: t((bar + 4) * M15 + 1_000),
             coverage,
         }
     }
@@ -1169,7 +1200,7 @@ mod tests {
             facts_of(&facts, Timeframe::M15),
             [(33, StructureEvent::Swing(swing))]
         );
-        assert_eq!(swing.confirmed_at, t(11 * M15));
+        assert_eq!(swing.confirmed_bar_end, t(11 * M15));
         // After the event that closes bar 9 the structure is ready, without
         // the swing.
         let mut before = MarketStateEngine::new();
@@ -1197,7 +1228,7 @@ mod tests {
                 side: Side::High,
                 price: swing_level(),
                 swing_time: t(7 * M15),
-                confirmed_at: t(11 * M15),
+                confirmed_bar_end: t(11 * M15),
                 touches: 0,
                 coverage: COMPLETE,
             }]
@@ -1380,6 +1411,20 @@ mod tests {
         (engine, facts)
     }
 
+    /// The time a fact is defined at: the confirming bar's end for a swing,
+    /// the sweeping trade for a sweep, the resolving bar's end for an SFP or
+    /// a break. Its emission, [`StructureEvent::time`], can come later.
+    fn bar_time(fact: &StructureEvent) -> EventTime {
+        match fact {
+            StructureEvent::Swing(swing) => swing.confirmed_bar_end,
+            StructureEvent::Sweep(sweep) => sweep.time,
+            StructureEvent::Sfp(sweep) | StructureEvent::Break(sweep) => {
+                sweep.resolved_bar_end.unwrap()
+            }
+        }
+    }
+
+    /// Each fact's kind and [`bar_time`].
     fn kinds(facts: &[(usize, StructureEvent)]) -> Vec<(&'static str, EventTime)> {
         facts
             .iter()
@@ -1390,7 +1435,7 @@ mod tests {
                     StructureEvent::Sfp(_) => "sfp",
                     StructureEvent::Break(_) => "break",
                 };
-                (kind, fact.time())
+                (kind, bar_time(fact))
             })
             .collect()
     }
@@ -1445,7 +1490,7 @@ mod tests {
                 )
             );
             assert_eq!(
-                (sweep.outcome, sweep.resolved_at, sweep.window_bars),
+                (sweep.outcome, sweep.resolved_bar_end, sweep.window_bars),
                 (SweepOutcome::Pending, None, 0)
             );
             let registry = registry_of(&engine, Timeframe::M15);
@@ -1623,6 +1668,97 @@ mod tests {
     }
 
     #[test]
+    fn facts_are_timed_at_their_emission_across_a_silent_trades_outage() {
+        // The swing of `Tape::swing_high`, whose confirming bar 10 ends at
+        // 9 900 000 ms, then 45 minutes without trades or a gap event: only
+        // mark prices.
+        let mut tape = Tape::default();
+        for (index, high) in (0..).zip([
+            59_990, 59_992, 59_994, 59_996, 60_010, 60_011, 60_012, 60_015, 60_012, 60_011, 60_010,
+        ]) {
+            tape.bar(index, high, high - 5, high - 2);
+        }
+        tape.events.push(mark(11 * M15 + 600_000, 1));
+        tape.trade(14 * M15, usdt(60_008));
+        let mut engine = MarketStateEngine::new();
+        for event in &tape.events[..=33] {
+            engine.apply(event).unwrap();
+        }
+        // Ten minutes past the bar end, the engine has not seen the swing.
+        assert!(engine.state().as_of.unwrap() > t(11 * M15));
+        assert!(engine.structure_events().is_empty());
+        assert_eq!(
+            structure(&engine, Timeframe::M15).swings,
+            FeatureValue::Ready(LastSwings {
+                high: None,
+                low: None
+            })
+        );
+        // The trade that ends the outage emits it, timed at that trade —
+        // with the low of bar 10, which the outage's empty bars confirm.
+        engine.apply(&tape.events[34]).unwrap();
+        let swing = Swing {
+            known_at: t(14 * M15),
+            ..swing_15m(Side::High, swing_level(), 7, COMPLETE)
+        };
+        assert_eq!(swing.confirmed_bar_end, t(11 * M15));
+        let fact = StructureEvent::Swing(swing);
+        assert_eq!(engine.structure_events()[0], fact);
+        assert_eq!(engine.structure_events().len(), 2);
+        assert!(
+            engine
+                .structure_events()
+                .iter()
+                .all(|fact| fact.time() == t(14 * M15))
+        );
+        // A mark at `time()` sees it.
+        engine.apply(&mark(14 * M15, 2)).unwrap();
+        assert_eq!(engine.state().as_of, Some(fact.time()));
+        assert_eq!(
+            structure(&engine, Timeframe::M15)
+                .swings
+                .ready()
+                .unwrap()
+                .high,
+            Some(swing)
+        );
+
+        // A sweep in bar 11, then silence: bar 11 closes beyond and bar 12
+        // is empty, a break at 11 700 000 ms that only the next trade, 45
+        // minutes later, emits.
+        let silent = |tape: &mut Tape| {
+            tape.trade(11 * M15 + 2_000, usdt(60_020));
+            tape.events.push(mark(13 * M15 + 600_000, 1));
+            tape.trade(16 * M15, usdt(60_010));
+        };
+        let (engine, facts) = after_swing(usdt(60_008), silent, false);
+        assert_eq!(
+            kinds(&facts),
+            [("sweep", t(11 * M15 + 2_000)), ("break", t(13 * M15))]
+        );
+        let times: Vec<(usize, EventTime)> = facts
+            .iter()
+            .map(|(index, fact)| (*index, fact.time()))
+            .collect();
+        assert_eq!(times, [(34, t(11 * M15 + 2_000)), (36, t(16 * M15))]);
+        assert_eq!(sweep_of(&facts[1].1).known_at, t(16 * M15));
+        assert_eq!(
+            registry_of(&engine, Timeframe::M15).resolved()[0].known_at,
+            t(16 * M15)
+        );
+        // At the mark, past the break's bar end, the sweep is still pending.
+        let mut tape = Tape::swing_high(usdt(60_008));
+        silent(&mut tape);
+        let mut engine = MarketStateEngine::new();
+        for event in &tape.events[..=35] {
+            engine.apply(event).unwrap();
+        }
+        let registry = registry_of(&engine, Timeframe::M15);
+        assert!(registry.resolved().is_empty());
+        assert_eq!(registry.pending().len(), 1);
+    }
+
+    #[test]
     fn touches_count_bars_within_the_tolerance_after_confirmation() {
         // 5 bps of 60 015 is 30.0075 USDT, exactly 3 000 750 000 units; of
         // the mirrored low at 59 985, 29.9925 USDT. The tapes are mirrored
@@ -1692,7 +1828,7 @@ mod tests {
             side: Side::High,
             price: swing_level(),
             swing_time: t(0),
-            confirmed_at: t(0),
+            confirmed_bar_end: t(0),
             touches: 0,
             coverage: COMPLETE,
         };
@@ -1748,7 +1884,7 @@ mod tests {
             side,
             price: usdt(whole),
             swing_time: t(0),
-            confirmed_at: t(confirmed),
+            confirmed_bar_end: t(confirmed),
             touches: 0,
             coverage: COMPLETE,
         }
@@ -1771,7 +1907,11 @@ mod tests {
             .iter()
             .map(|fact| {
                 let sweep = sweep_of(fact);
-                (sweep.timeframe, sweep.level.price, sweep.level.confirmed_at)
+                (
+                    sweep.timeframe,
+                    sweep.level.price,
+                    sweep.level.confirmed_bar_end,
+                )
             })
             .collect();
         assert_eq!(
@@ -1799,7 +1939,11 @@ mod tests {
             .iter()
             .map(|fact| {
                 let sweep = sweep_of(fact);
-                (sweep.timeframe, sweep.level.price, sweep.level.confirmed_at)
+                (
+                    sweep.timeframe,
+                    sweep.level.price,
+                    sweep.level.confirmed_bar_end,
+                )
             })
             .collect();
         assert_eq!(
@@ -1824,23 +1968,45 @@ mod tests {
     #[test]
     fn full_lists_evict_their_oldest_entry_but_never_a_pending_sweep() {
         let mut registry = LevelRegistry::new(catalog::STRUCTURE_LEVELS_15M_V1.key, Timeframe::M15);
-        // The oldest, confirmed at 0, is in the middle of the price order.
+        // 21 highs at distinct prices 60 000..=60 020, confirmed at their
+        // index: the oldest (index 0, 60 010) is in the middle of the price
+        // order, the newest (index 20, 60 002) too, the lowest is index 4
+        // and the highest index 17. Only eviction by age drops index 0.
+        let whole = |index: i64| 60_000 + (index * 8 + 10) % 21;
+        assert_eq!(
+            (whole(0), whole(20), whole(4), whole(17)),
+            (60_010, 60_002, 60_000, 60_020)
+        );
         for index in 0..=20 {
-            let whole = 60_000 + (index * 7) % 21;
-            registry.add(active(Side::High, whole, index));
+            registry.add(active(Side::High, whole(index), index));
         }
-        assert_eq!(registry.highs().len(), MAX_LEVELS);
+        let mut kept: Vec<Level> = (1..=20)
+            .map(|index| active(Side::High, whole(index), index))
+            .collect();
+        kept.sort_by_key(|level| level.price);
+        assert_eq!(registry.highs(), kept);
+        // On a tie in age, the lower price goes first, whatever the
+        // insertion order: lows too.
+        for (whole, confirmed) in [(59_990, 0), (59_980, 0)]
+            .into_iter()
+            .chain((1..=18).map(|index| (59_900 + index, index)))
+        {
+            registry.add(active(Side::Low, whole, confirmed));
+        }
+        assert_eq!(registry.lows().len(), MAX_LEVELS);
+        registry.add(active(Side::Low, 59_800, 19));
+        assert_eq!(registry.lows().len(), MAX_LEVELS);
         assert!(
             registry
-                .highs()
+                .lows()
                 .iter()
-                .all(|level| level.confirmed_at != t(0))
+                .all(|level| level.price != usdt(59_980))
         );
         assert!(
             registry
-                .highs()
-                .windows(2)
-                .all(|pair| pair[0].price <= pair[1].price)
+                .lows()
+                .iter()
+                .any(|level| level.price == usdt(59_990))
         );
         // Resolved sweeps: the oldest by sweep time, then the lower price.
         let sweep = |whole: i64, time: i64| Sweep {
@@ -1852,7 +2018,8 @@ mod tests {
             extreme: usdt(whole + 1),
             window_bars: 1,
             outcome: SweepOutcome::Break,
-            resolved_at: Some(t(time + M15)),
+            resolved_bar_end: Some(t(time + M15)),
+            known_at: t(time + M15),
             coverage: COMPLETE,
         };
         registry.push_resolved(sweep(60_002, 1));
@@ -1962,8 +2129,13 @@ mod tests {
     }
 
     /// Decisions 2–4 over the whole bar list: every swing, keyed by the
-    /// bar that confirms it.
-    fn reference_swings(bars: &[(usize, Bar)], feature: FeatureKey) -> Vec<(usize, Swing)> {
+    /// bar that confirms it and known at the event of `events` that closed
+    /// that bar.
+    fn reference_swings(
+        events: &[MarketEvent],
+        bars: &[(usize, Bar)],
+        feature: FeatureKey,
+    ) -> Vec<(usize, Swing)> {
         let n = SWING_BARS;
         let mut swings = Vec::new();
         for i in n..bars.len().saturating_sub(n) {
@@ -2002,7 +2174,8 @@ mod tests {
                             side,
                             price,
                             swing_time: bar.open_time,
-                            confirmed_at: bars[i + n].1.end(),
+                            confirmed_bar_end: bars[i + n].1.end(),
+                            known_at: events[bars[i + n].0].time(),
                             coverage,
                         },
                     ));
@@ -2018,7 +2191,7 @@ mod tests {
         let tolerance = i128::from(level.price.units()).abs() * 5;
         let count = bars[..known]
             .iter()
-            .filter(|(_, bar)| bar.open_time >= level.confirmed_at)
+            .filter(|(_, bar)| bar.open_time >= level.confirmed_bar_end)
             .filter_map(|(_, bar)| bar.ohlc)
             .filter(|ohlc| {
                 let price = i128::from(level.price.units());
@@ -2046,7 +2219,7 @@ mod tests {
             let (timeframe, swing_def) = swing_def;
             let feature = levels_def.1.key;
             let bars = bars_of(closed, timeframe);
-            let swings = reference_swings(&bars, swing_def.key);
+            let swings = reference_swings(events, &bars, swing_def.key);
             // Active levels, as the swings that made them.
             let mut active: Vec<Swing> = Vec::new();
             let mut pending: Vec<RefSweep> = Vec::new();
@@ -2055,7 +2228,7 @@ mod tests {
                 side: swing.side,
                 price: swing.price,
                 swing_time: swing.swing_time,
-                confirmed_at: swing.confirmed_at,
+                confirmed_bar_end: swing.confirmed_bar_end,
                 touches: reference_touches(&bars, known, swing),
                 coverage: swing.coverage,
             };
@@ -2112,7 +2285,8 @@ mod tests {
                             extreme,
                             window_bars: u32::try_from(k).unwrap(),
                             outcome,
-                            resolved_at: Some(bar.end()),
+                            resolved_bar_end: Some(bar.end()),
+                            known_at: event.time(),
                             coverage,
                         };
                         let fact = if inside {
@@ -2138,7 +2312,7 @@ mod tests {
                         if same.len() == MAX_LEVELS {
                             let oldest = *same
                                 .iter()
-                                .min_by_key(|&&i| (active[i].confirmed_at, active[i].price))
+                                .min_by_key(|&&i| (active[i].confirmed_bar_end, active[i].price))
                                 .unwrap();
                             active.remove(oldest);
                         }
@@ -2174,7 +2348,7 @@ mod tests {
                         Side::High => level.price.units(),
                         Side::Low => -level.price.units(),
                     };
-                    (crossing, level.confirmed_at)
+                    (crossing, level.confirmed_bar_end)
                 });
                 for level in swept {
                     let sweep = RefSweep {
@@ -2192,7 +2366,8 @@ mod tests {
                         extreme: trade.price,
                         window_bars: 0,
                         outcome: SweepOutcome::Pending,
-                        resolved_at: None,
+                        resolved_bar_end: None,
+                        known_at: trade.time,
                         coverage: sweep.level.coverage,
                     });
                     facts.push((index, timeframe, trade.time, facts.len(), fact.to_string()));
@@ -2207,7 +2382,7 @@ mod tests {
                     Side::Low => &mut registry.lows,
                 };
                 list.push(level);
-                list.sort_by_key(|level| (level.price, level.confirmed_at));
+                list.sort_by_key(|level| (level.price, level.confirmed_bar_end));
             }
             registry.pending = pending
                 .iter()
@@ -2220,7 +2395,8 @@ mod tests {
                     extreme: sweep.price,
                     window_bars: 0,
                     outcome: SweepOutcome::Pending,
-                    resolved_at: None,
+                    resolved_bar_end: None,
+                    known_at: sweep.time,
                     coverage: sweep.level.coverage,
                 })
                 .collect();
@@ -2360,8 +2536,8 @@ mod tests {
     }
 
     #[test]
-    fn no_structure_event_is_visible_before_its_confirmation_time() {
-        // Facts visible by X but emitted by a re-priced event, over all tapes.
+    fn no_structure_event_is_visible_before_the_event_that_emits_it() {
+        // Facts defined by X but emitted by a re-priced event, over all tapes.
         let mut emitted_after = 0;
         for (tape_index, tape) in random_tapes().iter().enumerate() {
             let mut engine = MarketStateEngine::new();
@@ -2370,15 +2546,17 @@ mod tests {
                 let now = event.time();
                 let closed = engine.closed_bars();
                 for fact in engine.structure_events() {
-                    // 1. Emitted at or after its visibility time…
-                    assert!(fact.time() <= now, "tape {tape_index}: {fact}");
+                    // 1. Visible from the event that emitted it on, never
+                    // earlier, and defined at or before it…
+                    assert_eq!(fact.time(), now, "tape {tape_index}: {fact}");
+                    assert!(bar_time(fact) <= now, "tape {tape_index}: {fact}");
                     let timeframe = fact.timeframe();
                     let closing = || {
                         closed
                             .iter()
-                            .find(|bar| bar.timeframe == timeframe && bar.end() == fact.time())
+                            .find(|bar| bar.timeframe == timeframe && bar.end() == bar_time(fact))
                     };
-                    // 2. …which is the end of the N-th bar after a swing, the
+                    // 2. …at the end of the N-th bar after a swing, the
                     // sweeping trade, or the end of the resolving bar.
                     match fact {
                         StructureEvent::Swing(swing) => {
@@ -2394,11 +2572,11 @@ mod tests {
                                 panic!("{fact} without a trade")
                             };
                             assert_eq!((sweep.time, sweep.price), (trade.time, trade.price));
-                            assert!(sweep.level.confirmed_at <= sweep.time);
+                            assert!(sweep.level.confirmed_bar_end <= sweep.time);
                         }
                         StructureEvent::Sfp(sweep) | StructureEvent::Break(sweep) => {
                             assert!(closing().is_some(), "{fact}");
-                            assert!(sweep.time < fact.time());
+                            assert!(sweep.time < bar_time(fact));
                             assert!(sweep.window_bars <= SFP_WINDOW_BARS);
                         }
                     }
@@ -2408,10 +2586,17 @@ mod tests {
                 for (_, structure) in engine.state().structure.iter() {
                     if let FeatureValue::Ready(swings) = &structure.swings {
                         for swing in [swings.high, swings.low].into_iter().flatten() {
-                            assert!(swing.confirmed_at <= as_of);
+                            assert!(swing.confirmed_bar_end <= swing.known_at);
+                            assert!(swing.known_at <= as_of);
                         }
                     }
                     if let FeatureValue::Ready(registry) = &structure.levels {
+                        for sweep in registry.pending().iter().chain(registry.resolved()) {
+                            assert!(sweep.known_at <= as_of);
+                            if let Some(end) = sweep.resolved_bar_end {
+                                assert!(end <= sweep.known_at);
+                            }
+                        }
                         for level in registry.levels() {
                             assert!(level.created_at <= as_of, "{level:?}");
                             assert!(level.age_ms(as_of) >= 0);
@@ -2420,8 +2605,8 @@ mod tests {
                 }
             }
             // 4. Re-pricing every trade from a bar boundary X on changes no
-            // swing, SFP or break visible by X, and no sweep before X — the
-            // swings emitted by a re-priced event included.
+            // swing, SFP or break whose bar ends by X, and no sweep before
+            // X — those emitted by a re-priced event included.
             let boundary = Timeframe::M15.open_of(tape[tape.len() / 2].time()).unwrap();
             let mut lcg = Lcg(0x6d69_6500_0000_0021 + tape_index as u64);
             let mutated: Vec<MarketEvent> = tape
@@ -2446,7 +2631,7 @@ mod tests {
                             .iter()
                             .filter(|fact| match fact {
                                 StructureEvent::Sweep(sweep) => sweep.time < boundary,
-                                _ => fact.time() <= boundary,
+                                _ => bar_time(fact) <= boundary,
                             })
                             .map(move |fact| (index, fact.to_string()))
                     })
