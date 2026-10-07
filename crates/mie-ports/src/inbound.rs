@@ -16,7 +16,7 @@ pub trait ReplayMarket {
     ///
     /// An event the domain rejects is counted in
     /// [`ReplayReport::domain_rejections`] and the replay continues, exactly
-    /// as live ingestion does (ADR-038 D9).
+    /// as live ingestion does (ADR-039 D9).
     ///
     /// # Errors
     ///
@@ -29,9 +29,9 @@ pub trait ReplayMarket {
 pub struct ReplayReport {
     /// Number of events delivered, rejected ones included.
     pub events: u64,
-    /// The raw data the replay read (ADR-030, ADR-038 D8).
+    /// The raw data the replay read (ADR-030, ADR-039 D8).
     pub dataset: DatasetVersion,
-    /// The hash of the delivered event sequence (ADR-038 D7).
+    /// The hash of the delivered event sequence (ADR-039 D7).
     pub stream_hash: EventStreamHash,
     /// Delivered events the domain rejected.
     pub domain_rejections: u64,

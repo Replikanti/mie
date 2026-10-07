@@ -24,7 +24,7 @@
 //! reads them with [`RunParameters::from_run_start`], never from
 //! configuration defaults (ADR-032). [`read_runs`] joins every run's
 //! `run_start` with its `run_end` into the [`LiveRun`]s `mie replay`
-//! recomputes (ADR-038 D1).
+//! recomputes (ADR-039 D1).
 
 use mie_adapter_binance::live::ChannelStats;
 use mie_adapter_binance::{BinanceStream, CaptureEvent, CaptureObserver, LiveRun, PipelineStats};

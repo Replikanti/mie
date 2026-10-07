@@ -8,8 +8,8 @@
 //!
 //! [`drive_tolerant`] is the one rejection policy of long runs: live
 //! ingestion and [`ReplayService`] both count a domain rejection and keep
-//! driving (ADR-038 D9). [`HashingProvider`] identifies what a provider
-//! delivered (ADR-038 D7).
+//! driving (ADR-039 D9). [`HashingProvider`] identifies what a provider
+//! delivered (ADR-039 D7).
 
 pub mod kline_check;
 
@@ -66,7 +66,7 @@ where
 /// number of events delivered, rejected ones included.
 ///
 /// This is the rejection policy of live ingestion and of replay alike
-/// (ADR-019, ADR-038 D9): a long run must not stop on one bad event, and the
+/// (ADR-019, ADR-039 D9): a long run must not stop on one bad event, and the
 /// count makes every rejection visible.
 ///
 /// # Errors
@@ -92,7 +92,7 @@ where
 }
 
 /// A [`MarketDataProvider`] that hashes and counts every event it passes
-/// on, in delivery order (ADR-038 D7).
+/// on, in delivery order (ADR-039 D7).
 #[derive(Debug)]
 pub struct HashingProvider<P> {
     inner: P,

@@ -6,7 +6,7 @@
 //!    7 days, so the run opens with a restart gap per stream.
 //! 3. Start the live capture and drive the core on this thread through
 //!    [`mie_app::drive_tolerant`], the drive replay uses too (ADR-019,
-//!    ADR-038 D9). An event the engine rejects is journaled and counted,
+//!    ADR-039 D9). An event the engine rejects is journaled and counted,
 //!    and driving resumes: the engine leaves its state untouched on a
 //!    rejection, and a soak must not stop on one. A provider failure ends
 //!    the run.

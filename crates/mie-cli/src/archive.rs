@@ -447,7 +447,7 @@ fn check_stream(
 /// Runs `archive-kline-check` over the inclusive day range with trades from
 /// `trade_stream`, printing the report and the dataset versions to `out`.
 ///
-/// It replays the archive (ADR-038 D5) with trades over
+/// It replays the archive (ADR-039 D5) with trades over
 /// `[start − 60 s, end + 60 s)` and the six kline streams over the window,
 /// so every in-window bar of every timeframe can close complete. The replay
 /// delivers trade-id breaks and missing days as gaps, which leave the bars

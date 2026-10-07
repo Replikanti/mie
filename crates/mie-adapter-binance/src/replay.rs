@@ -1,4 +1,4 @@
-//! Replay of live capture runs from the raw store (#11, ADR-038 D1–D4).
+//! Replay of live capture runs from the raw store (#11, ADR-039 D1–D4).
 //!
 //! What live delivered is a function of each run's raw records in
 //! `receive_seq` order plus the run's journaled pipeline parameters

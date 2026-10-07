@@ -1,5 +1,5 @@
 //! The event-stream hash: one stable identity for a delivered sequence of
-//! market events (ADR-038 D7).
+//! market events (ADR-039 D7).
 //!
 //! Replaying the same window twice must yield the same sequence (#11), and
 //! the equivalence harness (#13) compares live and replay deliveries. Both

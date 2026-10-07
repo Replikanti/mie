@@ -12,7 +12,7 @@
 //! | Subsystem (design doc)                    | Module                       |
 //! |-------------------------------------------|------------------------------|
 //! | Market observations (Data Plane)          | [`event`], [`num`], [`time`] |
-//! | Event-stream hash (ADR-038)               | [`event_hash`]               |
+//! | Event-stream hash (ADR-039)               | [`event_hash`]               |
 //! | Canonical event order (ADR-028)           | [`order`]                    |
 //! | Market State                              | [`state`]                    |
 //! | Event-time bars (ADR-031)                 | [`bars`]                     |

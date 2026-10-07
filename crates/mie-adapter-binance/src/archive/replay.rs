@@ -1,4 +1,4 @@
-//! Replay of the archive backfill from the raw store (#11, ADR-038 D5).
+//! Replay of the archive backfill from the raw store (#11, ADR-039 D5).
 //!
 //! Archive rows carry exchange fields only, and every row is filed at its
 //! ADR-028 ordering time (ADR-034 D3), so an archive replay is a streaming

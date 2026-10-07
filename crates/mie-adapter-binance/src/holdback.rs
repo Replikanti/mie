@@ -80,7 +80,7 @@ impl HoldBack {
     /// last event already delivered by an earlier pipeline, with
     /// `newest_oi` as the newest open-interest time delivered so far.
     ///
-    /// Replay chains capture runs through it (ADR-038 D3): an event of the
+    /// Replay chains capture runs through it (ADR-039 D3): an event of the
     /// next run that is not above `last_released` becomes a `LateEvent` gap
     /// or re-timed open interest under the usual rules, never an event
     /// delivered into the past. Events above it pass through in order.

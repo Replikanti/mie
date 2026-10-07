@@ -46,7 +46,7 @@ pub trait MarketDataProvider {
 /// live processing of the same events. Recorded arrival order is capture
 /// metadata, not the replay order.
 ///
-/// Contract (ADR-038):
+/// Contract (ADR-039):
 /// - every replay names the exact raw data it reads: [`Replay::dataset`] is
 ///   the [`DatasetVersion`] of the selection behind the stream (Data Plane
 ///   rule 6), so no replay can omit its provenance;
@@ -73,7 +73,7 @@ pub trait HistoricalDataProvider {
 }
 
 /// An opened replay: the event stream and the version of the raw data
-/// behind it (ADR-038 D8).
+/// behind it (ADR-039 D8).
 #[derive(Debug)]
 pub struct Replay<S> {
     /// The events, in the canonical order.
