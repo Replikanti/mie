@@ -24,18 +24,20 @@
 //!
 //! Live capture runs on plain threads, without an async runtime (ADR-026
 //! leaves the adapter-internal model open): one per WebSocket stream (`ws`),
-//! one open-interest poller (`rest`) and one capture thread, the only writer.
+//! one open-interest poller (`rest`), one order-book snapshot fetcher
+//! (`depth_rest`) and one capture thread, the only writer.
 //!
 //! Determinism: normalization is a pure function of the persisted payload,
 //! and the pipeline — order-book sync included — of the persisted records
 //! in `receive_seq` order plus the run parameters. The wall clock is used
 //! only for capture metadata (receive time) and for scheduling (reconnects,
-//! polls), never for ordering (ADR-028 D1) or for what the pipeline does
-//! with a record (ADR-038).
+//! polls, when a depth snapshot is fetched), never for ordering (ADR-028
+//! D1) or for what the pipeline does with a record (ADR-038).
 
 pub mod archive;
 pub mod book_audit;
 pub mod book_sync;
+mod depth_rest;
 pub mod holdback;
 pub mod live;
 pub mod normalize;
@@ -53,7 +55,7 @@ pub use book_audit::{BookAudit, CheckpointResult};
 pub use book_sync::{BookSequencer, BookStats, BookTransition};
 pub use live::{
     BinanceLiveProvider, CaptureEvent, CaptureHandle, CaptureObserver, CaptureSummary, LiveConfig,
-    run_id, start,
+    SnapshotTrigger, run_id, start,
 };
 pub use pipeline::{Pipeline, PipelineStats, Pushed, StreamStats};
 pub use replay::{LiveReplay, LiveReplayStream, LiveRun, RUN_MARGIN_MS, RunStats};
