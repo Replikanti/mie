@@ -101,6 +101,12 @@ impl HoldBack {
         self.watermark
     }
 
+    /// The last event released, the floor below which nothing can be
+    /// delivered any more.
+    pub fn last_released(&self) -> Option<&MarketEvent> {
+        self.last_released.as_ref()
+    }
+
     /// Number of buffered events.
     pub fn len(&self) -> usize {
         self.buffer.len()
