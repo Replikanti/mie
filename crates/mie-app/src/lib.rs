@@ -5,13 +5,21 @@
 //! domain; [`drive`] and the [`kline_check`] harness go through it. Live
 //! analysis and historical replay both use it — replay is an input
 //! difference, not a second implementation (ADR-019).
+//!
+//! [`drive_tolerant`] is the one rejection policy of long runs: live
+//! ingestion and [`ReplayService`] both count a domain rejection and keep
+//! driving (ADR-038 D9). [`HashingProvider`] identifies what a provider
+//! delivered (ADR-038 D7).
 
 pub mod kline_check;
 
 use mie_domain::event::MarketEvent;
-use mie_domain::state::MarketStateEngine;
+use mie_domain::event_hash::{EventStreamHash, EventStreamHasher};
+use mie_domain::state::{MarketStateEngine, StateError};
 use mie_ports::inbound::{ReplayMarket, ReplayReport, UseCaseError};
-use mie_ports::outbound::{HistoricalDataProvider, MarketDataProvider, ReplayWindow};
+use mie_ports::outbound::{
+    HistoricalDataProvider, MarketDataProvider, ProviderError, Replay, ReplayWindow,
+};
 
 /// Feeds every event from `provider` into `engine` until the stream ends and
 /// returns the number of events consumed.
@@ -51,6 +59,81 @@ where
     Ok(events)
 }
 
+/// Feeds every event from `provider` into `engine` until the stream ends,
+/// like [`drive`], but a domain rejection does not stop it: `on_rejection`
+/// gets the error and driving resumes. The engine leaves its state untouched
+/// on a rejection, so the next event applies to the same state. Returns the
+/// number of events delivered, rejected ones included.
+///
+/// This is the rejection policy of live ingestion and of replay alike
+/// (ADR-019, ADR-038 D9): a long run must not stop on one bad event, and the
+/// count makes every rejection visible.
+///
+/// # Errors
+///
+/// The first provider failure. Events consumed before it stay applied to
+/// `engine`.
+pub fn drive_tolerant<P>(
+    provider: &mut P,
+    engine: &mut MarketStateEngine,
+    mut on_rejection: impl FnMut(&StateError),
+) -> Result<u64, ProviderError>
+where
+    P: MarketDataProvider + ?Sized,
+{
+    let mut events = 0;
+    while let Some(event) = provider.next_event()? {
+        events += 1;
+        if let Err(rejected) = engine.apply(&event) {
+            on_rejection(&rejected);
+        }
+    }
+    Ok(events)
+}
+
+/// A [`MarketDataProvider`] that hashes and counts every event it passes
+/// on, in delivery order (ADR-038 D7).
+#[derive(Debug)]
+pub struct HashingProvider<P> {
+    inner: P,
+    hasher: EventStreamHasher,
+}
+
+impl<P> HashingProvider<P> {
+    /// Wraps `inner`.
+    pub fn new(inner: P) -> Self {
+        Self {
+            inner,
+            hasher: EventStreamHasher::new(),
+        }
+    }
+
+    /// The hash of the events delivered so far.
+    pub fn hash(&self) -> EventStreamHash {
+        self.hasher.finish()
+    }
+
+    /// The wrapped provider.
+    pub fn inner(&self) -> &P {
+        &self.inner
+    }
+
+    /// Unwraps the provider.
+    pub fn into_inner(self) -> P {
+        self.inner
+    }
+}
+
+impl<P: MarketDataProvider> MarketDataProvider for HashingProvider<P> {
+    fn next_event(&mut self) -> Result<Option<MarketEvent>, ProviderError> {
+        let event = self.inner.next_event()?;
+        if let Some(event) = &event {
+            self.hasher.push(event);
+        }
+        Ok(event)
+    }
+}
+
 /// [`ReplayMarket`] over any [`HistoricalDataProvider`].
 #[derive(Debug)]
 pub struct ReplayService<H> {
@@ -66,11 +149,16 @@ impl<H: HistoricalDataProvider> ReplayService<H> {
 
 impl<H: HistoricalDataProvider> ReplayMarket for ReplayService<H> {
     fn replay(&self, window: ReplayWindow) -> Result<ReplayReport, UseCaseError> {
-        let mut stream = self.history.replay(window)?;
+        let Replay { stream, dataset } = self.history.replay(window)?;
+        let mut stream = HashingProvider::new(stream);
         let mut engine = MarketStateEngine::new();
-        let events = drive(&mut stream, &mut engine)?;
+        let mut domain_rejections = 0;
+        let events = drive_tolerant(&mut stream, &mut engine, |_| domain_rejections += 1)?;
         Ok(ReplayReport {
             events,
+            dataset,
+            stream_hash: stream.hash(),
+            domain_rejections,
             state: engine.state().clone(),
         })
     }

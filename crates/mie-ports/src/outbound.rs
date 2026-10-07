@@ -5,6 +5,7 @@
 //! `BacktestEngine`, `ResearchResultStore`, `AlertGateway`. There is
 //! deliberately no `ExecutionGateway`: the MVP is informational (ADR-010).
 
+use crate::raw::DatasetVersion;
 use mie_domain::event::MarketEvent;
 use mie_domain::time::EventTime;
 use std::fmt;
@@ -44,6 +45,21 @@ pub trait MarketDataProvider {
 /// moment and delivers it in the canonical order (ADR-028), so it matches
 /// live processing of the same events. Recorded arrival order is capture
 /// metadata, not the replay order.
+///
+/// Contract (ADR-038):
+/// - every replay names the exact raw data it reads: [`Replay::dataset`] is
+///   the [`DatasetVersion`] of the selection behind the stream (Data Plane
+///   rule 6), so no replay can omit its provenance;
+/// - a recompute of live capture runs each capture run's pipeline from the
+///   run's first record, with the run's journaled parameters, and restricts
+///   the output to the window afterwards. Starting mid-run would change what
+///   the hold-back released, so a window inside a run delivers exactly the
+///   full run's events that fall into it;
+/// - an event is delivered when its ordering time (`MarketEvent::time`, a
+///   gap's `end`) lies in the window. A gap that is still open at the
+///   window's end (its `end` at or after `window.end`) is not delivered:
+///   live announced it only when the stream resumed, which is after the
+///   window. Providers report such trailing gaps out of band.
 pub trait HistoricalDataProvider {
     /// The event stream a replay yields.
     type Stream: MarketDataProvider;
@@ -53,7 +69,17 @@ pub trait HistoricalDataProvider {
     /// # Errors
     ///
     /// [`ProviderError`] when the requested data cannot be opened.
-    fn replay(&self, window: ReplayWindow) -> Result<Self::Stream, ProviderError>;
+    fn replay(&self, window: ReplayWindow) -> Result<Replay<Self::Stream>, ProviderError>;
+}
+
+/// An opened replay: the event stream and the version of the raw data
+/// behind it (ADR-038 D8).
+#[derive(Debug)]
+pub struct Replay<S> {
+    /// The events, in the canonical order.
+    pub stream: S,
+    /// Identifies the raw data the stream reads (ADR-030).
+    pub dataset: DatasetVersion,
 }
 
 /// A half-open event-time window `[start, end)`.
