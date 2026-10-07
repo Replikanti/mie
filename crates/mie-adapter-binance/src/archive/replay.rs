@@ -6,10 +6,19 @@
 //! recompute:
 //!
 //! - **Selection.** Each requested stream is selected over its window
-//!   widened to whole UTC days; the date partitions present tell which days
-//!   the store holds. Only events inside the requested window are
+//!   widened to whole UTC days. Only events inside the requested window are
 //!   delivered. One dataset version per distinct window identifies the
 //!   files.
+//! - **Source days.** Which archive days the store holds is read from the
+//!   sealed files' manifests, by **source day**: the UTC day of the archive
+//!   file a row comes from, which is the day of its ordering time minus the
+//!   stream's [`source_offset_ms`] (one five-minute step for `metrics`,
+//!   whose rows are ordered at the end of their interval, ADR-034 D3; zero
+//!   for every other stream). A file's smallest and largest event time give
+//!   the source days it holds. Partition dates alone would not do: a
+//!   metrics file's 23:55 row is ordered at 00:00 of the next day and lands
+//!   in that day's partition, which would make a never-imported next day
+//!   look present.
 //! - **Merge.** Files are opened in `(min_event_time, path)` order, each
 //!   once its smallest event time is at or below the smallest head of the
 //!   files already open, so about one file per stream is in memory. A file
@@ -22,8 +31,8 @@
 //!   repeats (overlapping files, exact duplicate rows) and turns a trade-id
 //!   jump into a `SequenceBreak` gap; one zero hold-back
 //!   [`HoldBack`] then places same-millisecond gaps in the canonical order.
-//! - **Missing partitions.** A UTC day of a requested window without a
-//!   sealed file of the stream is a `MissingData` gap from the stream's
+//! - **Missing days.** A source day of a requested window that no sealed
+//!   file of the stream holds is a `MissingData` gap from the stream's
 //!   previous event (or the window start) to its first event after the
 //!   missing days, delivered right before that event in place of any
 //!   sequence-break gap. Missing days with no later event in the window are
@@ -31,8 +40,8 @@
 //!   only, as a live gap still open at the window's end would be.
 
 use super::ARCHIVE_SOURCE;
-use super::catalog::{ArchiveStream, DAY_MS, parse_day};
-use super::normalize::parse;
+use super::catalog::{ArchiveStream, DAY_MS};
+use super::normalize::{METRICS_RESOLUTION_MS, parse};
 use crate::holdback::HoldBack;
 use crate::sequence::StreamSequencer;
 use mie_domain::event::{FeedGap, GapReason, MarketEvent};
@@ -111,8 +120,8 @@ pub struct ArchiveStreamStats {
     pub files: u64,
     /// Rows inside the window, normalized.
     pub events: u64,
-    /// UTC days (since 1970-01-01) of the widened window without a sealed
-    /// file.
+    /// Source days (UTC days since 1970-01-01, module docs) of the widened
+    /// window that no sealed file holds.
     pub missing_days: Vec<i64>,
 }
 
@@ -133,6 +142,21 @@ struct Cursor {
 
 fn source_error(detail: impl fmt::Display) -> ProviderError {
     ProviderError::Source(detail.to_string())
+}
+
+/// How far a row's ordering time lies after the start of the archive day
+/// it comes from, at most: one resolution step for `metrics` (ordered at
+/// the end of its five-minute interval, ADR-034 D3), zero otherwise.
+pub fn source_offset_ms(stream: ArchiveStream) -> i64 {
+    match stream {
+        ArchiveStream::Metrics => i64::from(METRICS_RESOLUTION_MS),
+        _ => 0,
+    }
+}
+
+/// The source day of a row of `stream` ordered at `time` (module docs).
+fn source_day(stream: ArchiveStream, time: EventTime) -> i64 {
+    (time.as_millis() - source_offset_ms(stream)).div_euclid(DAY_MS)
 }
 
 /// The whole UTC days `[first, end)` a window touches.
@@ -208,9 +232,11 @@ pub fn open_requests<'a>(
         for file in dataset.files {
             let stream = ArchiveStream::from_raw_name(file.stream.stream())
                 .ok_or_else(|| source_error(format!("unknown archive stream {}", file.stream)))?;
-            if let Some(day) = parse_day(&file.date) {
-                present.entry(stream).or_default().insert(day);
-            }
+            // A sealed file lies in one date partition, so it holds at most
+            // two source days: those of its first and its last row.
+            let held = present.entry(stream).or_default();
+            held.insert(source_day(stream, file.min_event_time));
+            held.insert(source_day(stream, file.max_event_time));
             let overlaps = file.min_event_time < window.end && file.max_event_time >= window.start;
             if overlaps {
                 planned.push(Planned {
@@ -392,7 +418,7 @@ impl ArchiveReplayStream<'_> {
         if sequenced.is_empty() {
             return;
         }
-        let day = end.as_millis().div_euclid(DAY_MS);
+        let day = source_day(stream, end);
         let missing = self.missing.entry(stream).or_default();
         let mut skipped = false;
         while missing.front().is_some_and(|&d| d < day) {
@@ -427,7 +453,9 @@ impl ArchiveReplayStream<'_> {
             };
             let window = self.windows[&stream];
             let start = self.sequencers[&stream].last_time().unwrap_or(window.start);
-            let end = EventTime::from_millis(((last + 1) * DAY_MS).min(window.end.as_millis()));
+            let end = EventTime::from_millis(
+                ((last + 1) * DAY_MS + source_offset_ms(stream)).min(window.end.as_millis()),
+            );
             self.trailing.push(FeedGap {
                 stream: stream.domain_stream().expect("checked at open"),
                 start: start.min(end),
@@ -473,7 +501,7 @@ mod tests {
     use mie_ports::raw::RawRecord;
 
     fn day(label: &str) -> i64 {
-        parse_day(label).unwrap()
+        crate::archive::catalog::parse_day(label).unwrap()
     }
 
     fn record(stream: ArchiveStream, row: &str) -> RawRecord {
@@ -656,6 +684,97 @@ mod tests {
                 first_d2,
                 GapReason::MissingData
             )]
+        );
+    }
+
+    /// Seals day `d`'s metrics file as the Parquet writer files it: the
+    /// rows up to 23:50 in partition `d`, the 23:55 row (ordered at 00:00 of
+    /// the next day) in partition `d + 1`.
+    fn metrics_day(source: &mut MemorySource, d: i64) {
+        let civil =
+            |h: i64, m: i64| format!("{} {h:02}:{m:02}:00", crate::archive::catalog::day_label(d));
+        let in_day = (0..24)
+            .map(|h| {
+                record(
+                    ArchiveStream::Metrics,
+                    &metrics_row(&civil(h, 0), "93000.0000000000000000"),
+                )
+            })
+            .collect();
+        source.seal(ARCHIVE_SOURCE, "metrics", in_day);
+        let spill = record(
+            ArchiveStream::Metrics,
+            &metrics_row(&civil(23, 55), "93001.0000000000000000"),
+        );
+        assert_eq!(spill.event_time.as_millis(), (d + 1) * DAY_MS);
+        source.seal(ARCHIVE_SOURCE, "metrics", vec![spill]);
+    }
+
+    #[test]
+    fn a_never_imported_metrics_day_is_missing_despite_the_spilled_row() {
+        let (d0, d1, d2) = (day("2026-09-28"), day("2026-09-29"), day("2026-09-30"));
+        let mut source = MemorySource::default();
+        metrics_day(&mut source, d0);
+        // Day d1 was never imported, yet its partition holds d0's 23:55 row.
+        metrics_day(&mut source, d2);
+        let replay = ArchiveReplay::new(&source, "BTCUSDT", &[ArchiveStream::Metrics]);
+        let mut stream = replay
+            .replay(window(d0 * DAY_MS, (d2 + 1) * DAY_MS))
+            .unwrap()
+            .stream;
+        let out = drain(&mut stream);
+        assert_eq!(
+            stream.stream_stats()[&ArchiveStream::Metrics].missing_days,
+            [d1]
+        );
+        // From d0's last row (its 23:55 sample, at d1 00:00) to d2's first.
+        assert_eq!(
+            gaps(&out),
+            [(
+                Stream::OpenInterest,
+                d1 * DAY_MS,
+                d2 * DAY_MS + 300_000,
+                GapReason::MissingData
+            )]
+        );
+        assert_eq!(out.len(), 2 * 25 - 1 + 1);
+        assert!(stream.trailing_gaps().is_empty());
+
+        // All three days imported: nothing missing, no gap.
+        metrics_day(&mut source, d1);
+        let replay = ArchiveReplay::new(&source, "BTCUSDT", &[ArchiveStream::Metrics]);
+        let mut stream = replay
+            .replay(window(d0 * DAY_MS, (d2 + 1) * DAY_MS))
+            .unwrap()
+            .stream;
+        let out = drain(&mut stream);
+        assert!(
+            stream.stream_stats()[&ArchiveStream::Metrics]
+                .missing_days
+                .is_empty()
+        );
+        assert!(gaps(&out).is_empty(), "{:?}", gaps(&out));
+        assert!(out.windows(2).all(|w| w[0] < w[1]));
+
+        // A never-imported last day: trailing only, ending one step into the
+        // next day, clamped to the window.
+        let mut source = MemorySource::default();
+        metrics_day(&mut source, d0);
+        let replay = ArchiveReplay::new(&source, "BTCUSDT", &[ArchiveStream::Metrics]);
+        let mut stream = replay
+            .replay(window(d0 * DAY_MS, (d1 + 1) * DAY_MS))
+            .unwrap()
+            .stream;
+        let out = drain(&mut stream);
+        assert!(gaps(&out).is_empty());
+        let trailing = stream.trailing_gaps();
+        assert_eq!(
+            (
+                trailing.len(),
+                trailing[0].start.as_millis(),
+                trailing[0].end.as_millis()
+            ),
+            (1, d1 * DAY_MS, (d1 + 1) * DAY_MS)
         );
     }
 

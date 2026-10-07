@@ -59,7 +59,20 @@ ADR-028 left one point open: a gap still open at the end of a replay window
    `run_end`, or a non-zero exit) is recomputed over its contiguous prefix;
    the records after its first hole are counted as ignored. Two `run_start`
    lines with one run id — a restart within one second, whose session
-   prefixes would be ambiguous — are an error.
+   prefixes would be ambiguous — are an error. Every capture record the
+   replay reads must belong to a run the journal knows, and every capture
+   record in the window must belong to a recomputed run; otherwise the replay
+   fails, naming the runs and record counts. Records of a run whose
+   `run_start` was lost cannot be recomputed without its parameters, and they
+   never vanish silently from a replay. `mie ingest` syncs the journal to
+   stable storage right after `run_start` and at the end of a run, before the
+   first record can be sealed. An open run (no `run_end`, no successor) is
+   read only up to the window's end plus the margin: later records cannot
+   change the window's output (the margin bounds lateness, as for the
+   extent). So the dataset version of a closed window depends only on files
+   that can affect it, and stays the same while a later run goes on
+   capturing, once that run has sealed past the window's end plus the margin
+   (about one seal interval later).
 3. **Run chaining (D3).** Each run's output continues after the last event
    delivered before it through a zero hold-back buffer that knows that event
    and the newest delivered open-interest time. In-order output passes
@@ -88,8 +101,15 @@ ADR-028 left one point open: a gap still open at the end of a replay window
    and a row that does not normalize fails the replay with its file and
    time. Per raw stream the live `StreamSequencer` drops repeats and turns a
    trade-id jump into `SequenceBreak`; one zero hold-back buffer places
-   same-millisecond gaps. A UTC day of the widened window without a sealed
-   partition of a stream is a `MissingData` gap from the stream's previous
+   same-millisecond gaps. Which archive days the store holds is read from
+   the sealed files' manifests by **source day**, the UTC day of the archive
+   file a row comes from: the day of its ordering time minus one five-minute
+   step for `metrics` (ordered at the end of its interval, ADR-034 D3), of
+   its ordering time otherwise. A file holds the source days of its first
+   and last row. Partition dates would not do, because a metrics file's
+   23:55 row is filed in the next day's partition and would make a
+   never-imported next day look present. A source day of the widened window
+   that no sealed file of a stream holds is a `MissingData` gap from the stream's previous
    event (or the window start) to its first event after the missing days,
    delivered right before that event in place of any sequence-break gap;
    missing days with no later event are trailing (D4). Default streams are
@@ -130,8 +150,9 @@ ADR-028 left one point open: a gap still open at the end of a replay window
 - Live replay reproduces what live delivered — gaps, late events and
   re-timed open interest included — and #13 can compare live and replay
   event by event with the hash of D7.
-- Live replay needs the journal; a lost journal makes live data
-  unreplayable as live delivered it (the raw records remain).
+- Live replay needs the journal; a lost journal (or a lost `run_start`)
+  makes that live data unreplayable as live delivered it — the replay fails
+  loudly, and the raw records remain.
 - Memory: one run's records and output at a time (about 1.5 M records for a
   24 h run); the archive merge holds about one file per stream.
 - A record outside its run's extent would silently change the recompute;
@@ -142,9 +163,10 @@ ADR-028 left one point open: a gap still open at the end of a replay window
   leave the bars they touch incomplete; a re-run of the accepted three-day
   check confirms the numbers after merge.
 - The hash encoding becomes a contract that #13 depends on.
-- Replaying a run that is still capturing treats it as crashed (no
-  `run_end`): its sealed prefix is replayed, and a later replay of the same
-  window can differ until the run ends.
+- Replaying a window that a still-capturing run overlaps treats the run as
+  crashed (no `run_end`): its sealed prefix up to the window's end plus the
+  margin is replayed, and a later replay of the same window can differ until
+  the run has sealed past that point.
 
 ## Alternatives considered
 

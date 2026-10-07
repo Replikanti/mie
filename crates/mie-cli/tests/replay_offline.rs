@@ -469,6 +469,25 @@ fn the_same_window_replays_to_the_same_bytes_and_matches_the_journal() {
     assert!(!empty.pass);
     assert_eq!(empty.exit_code(), 1);
     assert!(text.ends_with("FAIL: no event in the window\n"), "{text}");
+
+    // Run 2's journal lines are lost (say its buffered run_start never
+    // reached the disk): its sealed records fail the replay, loudly.
+    let kept: Vec<String> = std::fs::read_to_string(&config.paths.journal)
+        .unwrap()
+        .lines()
+        .filter(|l| !l.contains("20261006T020000Z"))
+        .map(str::to_owned)
+        .collect();
+    std::fs::write(&config.paths.journal, kept.join("\n") + "\n").unwrap();
+    for w in [all, window(t2 - HOUR / 2, t2 + HOUR)] {
+        let (lost, text) = run_replay(&request(w));
+        assert_eq!(lost.exit_code(), 1, "{text}");
+        assert!(
+            text.contains("without a run_start in the journal")
+                && text.contains("20261006T020000Z"),
+            "{text}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -15,14 +15,22 @@
 //!   run's end, else the next run's start (a crash), else open. The replay
 //!   recomputes the runs whose extent overlaps the window, one at a time and
 //!   in start order, each from the files of its streams that overlap its
-//!   extent. One selection over the runs' streams and the union of their
-//!   extents with the window gives the reported dataset version.
+//!   extent. An open run is read only up to the window's end plus the
+//!   margin, which bounds what can still affect the window's output. One
+//!   selection over the runs' streams and the union of their extents with
+//!   the window gives the reported dataset version, so the version of a
+//!   closed window stays the same while a later run goes on capturing, once
+//!   that run has sealed past the window's end plus the margin.
 //! - **Integrity** (D2). A run's records are those whose `session_id`
 //!   starts with `<run_id>/`, sorted by `receive_seq`, which must count up
 //!   from 0 without repeats. A run that ended cleanly must be complete: a
 //!   hole, or a count other than its `run_end` record count, is an error. A
 //!   crashed run is recomputed over its contiguous prefix; the records after
-//!   its first hole are counted as ignored.
+//!   its first hole are counted as ignored. Every capture record read must
+//!   belong to a run the journal knows, and every capture record in the
+//!   window must belong to a recomputed run: records of a run whose
+//!   `run_start` was lost — they cannot be recomputed without its
+//!   parameters — fail the replay instead of vanishing from it.
 //! - **Run chaining** (D3). Each run's output continues after the last
 //!   event delivered before it through a zero hold-back
 //!   [`HoldBack`](crate::holdback::HoldBack): in-order events pass
@@ -181,6 +189,18 @@ impl<'a> HistoricalDataProvider for LiveReplay<'a> {
             .filter(|(_, (start, end))| {
                 *start < window.end.as_millis() && window.start.as_millis() < *end
             })
+            .map(|(run, (start, end))| {
+                // An open run (no end, no successor) is read only up to the
+                // window's end plus the margin: nothing it seals later can
+                // change the window's output, so a closed window keeps its
+                // dataset version while the run goes on capturing (D2).
+                let end = if end == i64::MAX && run.clean_records.is_none() {
+                    window.end.as_millis().saturating_add(RUN_MARGIN_MS)
+                } else {
+                    end
+                };
+                (run, (start, end))
+            })
             .collect();
         let mut streams: BTreeSet<BinanceStream> = selected
             .iter()
@@ -215,6 +235,10 @@ impl<'a> HistoricalDataProvider for LiveReplay<'a> {
             source: self.source,
             window,
             files: dataset.files,
+            journaled: self.runs.iter().map(|run| run.run_id.clone()).collect(),
+            selected: selected.iter().map(|(run, _)| run.run_id.clone()).collect(),
+            read_paths: BTreeSet::new(),
+            unattributed_checked: false,
             pending: selected.into(),
             out: VecDeque::new(),
             last: None,
@@ -236,6 +260,13 @@ pub struct LiveReplayStream<'a> {
     source: &'a dyn RawRecordSource,
     window: ReplayWindow,
     files: Vec<SealedFile>,
+    /// Every run of the journal.
+    journaled: BTreeSet<String>,
+    /// The runs this replay recomputes.
+    selected: BTreeSet<String>,
+    /// Files the runs read.
+    read_paths: BTreeSet<String>,
+    unattributed_checked: bool,
     pending: VecDeque<(LiveRun, (i64, i64))>,
     out: VecDeque<MarketEvent>,
     /// The last event of the chained output, delivered or not.
@@ -351,14 +382,16 @@ impl LiveReplayStream<'_> {
     }
 
     /// The run's records from the files of its streams that overlap its
-    /// extent, sorted by `receive_seq`, which must not repeat.
+    /// extent, sorted by `receive_seq`, which must not repeat. A record of a
+    /// run the journal does not know fails the replay (D2).
     fn read_run(
-        &self,
+        &mut self,
         run: &LiveRun,
         (start, end): (i64, i64),
     ) -> Result<Vec<(u64, BinanceStream, RawRecord)>, ProviderError> {
         let prefix = format!("{}/", run.run_id);
         let mut records = Vec::new();
+        let mut unknown = BTreeMap::new();
         for file in &self.files {
             let Some(stream) = BinanceStream::from_raw_name(file.stream.stream()) else {
                 return Err(ProviderError::Contract(format!(
@@ -371,6 +404,7 @@ impl LiveReplayStream<'_> {
             if !run.streams.contains(&stream) || !overlaps {
                 continue;
             }
+            self.read_paths.insert(file.relative_path.clone());
             for record in self.source.read(file).map_err(source_error)? {
                 let Some(capture) = &record.capture else {
                     return Err(ProviderError::Contract(format!(
@@ -380,8 +414,19 @@ impl LiveReplayStream<'_> {
                 };
                 if capture.session_id.starts_with(&prefix) {
                     records.push((capture.receive_seq, stream, record));
+                } else {
+                    let owner = run_of(&capture.session_id);
+                    if !self.journaled.contains(owner) {
+                        *unknown.entry(owner.to_owned()).or_insert(0_u64) += 1;
+                    }
                 }
             }
+        }
+        if !unknown.is_empty() {
+            return Err(unattributed(
+                &unknown,
+                &format!("run {}'s files", run.run_id),
+            ));
         }
         records.sort_by_key(|(seq, _, _)| *seq);
         if let Some(pair) = records.windows(2).find(|pair| pair[0].0 == pair[1].0) {
@@ -392,6 +437,68 @@ impl LiveReplayStream<'_> {
         }
         Ok(records)
     }
+
+    /// After the last run: the selected files overlapping the window that
+    /// no run read must not hold a capture record in the window that no
+    /// selected run claims — a run whose `run_start` the journal lost, or a
+    /// record outside its run's extent (D2).
+    fn check_unread_files(&mut self) -> Result<(), ProviderError> {
+        self.unattributed_checked = true;
+        let mut unknown = BTreeMap::new();
+        let mut outside = BTreeMap::new();
+        for file in &self.files {
+            let overlaps =
+                file.min_event_time < self.window.end && file.max_event_time >= self.window.start;
+            if !overlaps || self.read_paths.contains(&file.relative_path) {
+                continue;
+            }
+            for record in self.source.read(file).map_err(source_error)? {
+                if !self.window.contains(record.event_time) {
+                    continue;
+                }
+                let Some(capture) = &record.capture else {
+                    return Err(ProviderError::Contract(format!(
+                        "{}: a live record at {} has no capture metadata",
+                        file.relative_path, record.event_time
+                    )));
+                };
+                let owner = run_of(&capture.session_id);
+                if !self.journaled.contains(owner) {
+                    *unknown.entry(owner.to_owned()).or_insert(0_u64) += 1;
+                } else if !self.selected.contains(owner) {
+                    *outside.entry(owner.to_owned()).or_insert(0_u64) += 1;
+                }
+            }
+        }
+        if !unknown.is_empty() {
+            return Err(unattributed(&unknown, "the window"));
+        }
+        if let Some((run, count)) = outside.first_key_value() {
+            return Err(ProviderError::Source(format!(
+                "{count} record(s) of run {run} lie in the window, more than \
+                 {RUN_MARGIN_MS} ms outside the run's span"
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// The run id of a capture session: the part before the first `/`.
+fn run_of(session_id: &str) -> &str {
+    session_id.split('/').next().unwrap_or_default()
+}
+
+/// The error for capture records of runs the journal does not know.
+fn unattributed(unknown: &BTreeMap<String, u64>, place: &str) -> ProviderError {
+    let runs: Vec<String> = unknown
+        .iter()
+        .map(|(run, count)| format!("{count} of run {run:?}"))
+        .collect();
+    ProviderError::Source(format!(
+        "{place} hold capture records of runs without a run_start in the journal ({}); \
+         without their run parameters they cannot be replayed as live delivered them",
+        runs.join(", ")
+    ))
 }
 
 impl MarketDataProvider for LiveReplayStream<'_> {
@@ -404,6 +511,12 @@ impl MarketDataProvider for LiveReplayStream<'_> {
                 return Err(failed.clone());
             }
             let Some((run, extent)) = self.pending.pop_front() else {
+                if !self.unattributed_checked
+                    && let Err(failed) = self.check_unread_files()
+                {
+                    self.failed = Some(failed.clone());
+                    return Err(failed);
+                }
                 return Ok(None);
             };
             if let Err(failed) = self.load(&run, extent) {
@@ -843,5 +956,129 @@ mod tests {
             live.replay(window(T0, T0)),
             Err(ProviderError::Contract(_))
         ));
+    }
+
+    #[test]
+    fn records_of_a_run_without_run_start_fail_the_replay() {
+        let mut journaled = RunBuilder::new("20261006T010000Z");
+        for i in 0..10_u64 {
+            journaled.push(
+                BinanceStream::AggTrade,
+                1,
+                agg(1 + i, T0 + 1_000 * i as i64),
+            );
+        }
+        // The next run's run_start never reached the journal.
+        let mut lost = RunBuilder::new("20261006T010030Z");
+        for i in 0..10_u64 {
+            lost.push(
+                BinanceStream::AggTrade,
+                1,
+                agg(100 + i, T0 + 31_000 + 1_000 * i as i64),
+            );
+        }
+        let mut late = RunBuilder::new("20261006T020000Z");
+        late.push(BinanceStream::AggTrade, 1, agg(500, T0 + 3_600_000));
+        let mut source = MemorySource::default();
+        let mut records = journaled.of(BinanceStream::AggTrade, &[]);
+        records.extend(lost.of(BinanceStream::AggTrade, &[]));
+        source.seal(SOURCE, "aggTrade", records);
+        late.seal(&mut source, &[]);
+        let runs = vec![
+            journaled.run(T0, Some(T0 + 10_000), Some(10)),
+            late.run(T0 + 3_600_000, Some(T0 + 3_601_000), Some(1)),
+        ];
+        let live = LiveReplay::new(&source, SOURCE, "BTCUSDT", runs);
+
+        // Read along with the journaled run's files.
+        let err = drain_err(&mut live.replay(window(T0, T0 + 60_000)).unwrap().stream);
+        assert!(
+            matches!(&err, ProviderError::Source(d)
+                if d.contains("without a run_start") && d.contains("10 of run \"20261006T010030Z\"")),
+            "{err}"
+        );
+        // A window holding the lost run alone: an error, not "no event".
+        let lone = window(T0 + 320_000, T0 + 600_000);
+        let mut source_lone = MemorySource::default();
+        source_lone.seal(
+            SOURCE,
+            "aggTrade",
+            lost.of(BinanceStream::AggTrade, &[])
+                .into_iter()
+                .map(|mut r| {
+                    r.event_time = EventTime::from_millis(r.event_time.as_millis() + 300_000);
+                    r
+                })
+                .collect(),
+        );
+        let live_lone = LiveReplay::new(&source_lone, SOURCE, "BTCUSDT", Vec::new());
+        let err = drain_err(&mut live_lone.replay(lone).unwrap().stream);
+        assert!(
+            matches!(&err, ProviderError::Source(d) if d.contains("the window hold")),
+            "{err}"
+        );
+        // Windows away from the lost run still replay.
+        assert_eq!(
+            replay(
+                &source,
+                live.runs().to_vec(),
+                window(T0 + 3_000_000, T0 + 4_000_000)
+            )
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_closed_window_keeps_its_dataset_version_while_a_later_run_captures() {
+        let mut first = RunBuilder::new("20261006T010000Z");
+        for i in 0..20_u64 {
+            first.push(
+                BinanceStream::AggTrade,
+                1,
+                agg(1 + i, T0 + 1_000 * i as i64),
+            );
+        }
+        // A run started 60 s after the window's end, still capturing.
+        let mut running = RunBuilder::new("20261006T010121Z");
+        for i in 0..10_u64 {
+            running.push(
+                BinanceStream::AggTrade,
+                1,
+                agg(100 + i, T0 + 81_000 + 1_000 * i as i64),
+            );
+        }
+        let mut source = MemorySource::default();
+        first.seal(&mut source, &[]);
+        source.seal(SOURCE, "aggTrade", running.of(BinanceStream::AggTrade, &[]));
+        let runs = vec![
+            first.run(T0, Some(T0 + 21_000), Some(20)),
+            running.run(T0 + 81_000, None, None),
+        ];
+        let w = window(T0, T0 + 21_000);
+        let open = |source: &MemorySource| {
+            let live = LiveReplay::new(source, SOURCE, "BTCUSDT", runs.clone());
+            let opened = live.replay(w).unwrap();
+            let mut stream = opened.stream;
+            (opened.dataset, drain(&mut stream))
+        };
+        let (version, events) = open(&source);
+        assert_eq!(events.len(), 20);
+        // The running run seals more files, beyond the window's end plus the
+        // margin: the closed window's version and events stay.
+        for hour in 1..4_i64 {
+            let mut more = RunBuilder::new("20261006T010121Z");
+            more.push(
+                BinanceStream::AggTrade,
+                1,
+                agg(1_000 + hour as u64, T0 + hour * 3_600_000),
+            );
+            source.seal(SOURCE, "aggTrade", more.of(BinanceStream::AggTrade, &[]));
+            assert_eq!(
+                open(&source),
+                (version.clone(), events.clone()),
+                "hour {hour}"
+            );
+        }
     }
 }

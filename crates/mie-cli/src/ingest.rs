@@ -136,6 +136,10 @@ pub fn run(
         }),
     );
 
+    // Durable before the first record is sealed: replay needs the run's
+    // parameters for every record it seals (ADR-039 D2).
+    journal.lock().unwrap_or_else(|p| p.into_inner()).sync();
+
     let live = config
         .live_config(&run_id, seeds)
         .map_err(|e| e.to_string())?;
@@ -214,7 +218,7 @@ pub fn run(
         }),
     );
     let mut journal = journal.lock().unwrap_or_else(|p| p.into_inner());
-    journal.flush();
+    journal.sync();
     if let Some(write_error) = journal.write_error() {
         eprintln!("mie ingest: journal write failed: {write_error}");
     }

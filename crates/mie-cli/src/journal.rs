@@ -16,7 +16,10 @@
 //! | `domain_rejection` | ingest | an event the engine rejected |
 //! | `run_end` | ingest | totals and the exit code |
 //!
-//! The journal is flushed on every `stats` line and at the end of a run.
+//! The journal is flushed on every `stats` line and at the end of a run, and
+//! synced to stable storage right after `run_start` and at the end of a run:
+//! replay needs a run's `run_start` for every record the run seals
+//! (ADR-039 D2).
 //!
 //! The raw store alone does not determine what live delivered: the
 //! pipeline's `hold_back_ms`, `oi_retime_ms` and per-stream seeds are run
@@ -281,6 +284,16 @@ impl Journal {
     /// Flushes buffered lines.
     pub fn flush(&mut self) {
         if let Err(error) = self.out.flush() {
+            self.write_error.get_or_insert(error.to_string());
+        }
+    }
+
+    /// Flushes buffered lines and forces them to stable storage. `run_start`
+    /// is synced: without it a run's sealed records cannot be replayed as
+    /// live delivered them (ADR-039 D2).
+    pub fn sync(&mut self) {
+        self.flush();
+        if let Err(error) = self.out.get_ref().sync_data() {
             self.write_error.get_or_insert(error.to_string());
         }
     }
