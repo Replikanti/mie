@@ -11,6 +11,7 @@ use super::{
 };
 use crate::bars::Timeframe;
 use crate::event::Stream;
+use crate::num::{Price, SCALE};
 
 /// `trade.last_price@1`: the price of the last trade.
 ///
@@ -461,6 +462,180 @@ pub const FLOW_WINDOWS: [(Timeframe, &FeatureDefinition); 3] = [
     (Timeframe::H1, &FLOW_WINDOW_1H_V1),
 ];
 
+/// `profile.volume.utc_day@1`: the developing volume profile of the current
+/// UTC day (ADR-036): exact volume per 10 USDT price bin from trades, with
+/// POC, value area (VAL, VAH), HVNs and LVNs.
+///
+/// - Parameters: `bin_size` = 10 USDT, `max_bins` = 10 000 (a wider range
+///   is `Unavailable(OutOfRange)`), `node_prominence_pct` = 10,
+///   `node_smoothing` = `triangular_5`, `poc_rule` =
+///   `max_volume_center_lower`, `session_ms` = 86 400 000 (the day opens at
+///   00:00 UTC), `value_area_pct` = 70, `value_area_rule` =
+///   `single_bin_ties_both`.
+/// - Inputs: trades (the volume per bin) and `bars.time.1m@1` (when the
+///   levels step, and the coverage).
+/// - Warm-up: one sample, where a sample is a closed minute of the current
+///   UTC day with volume. The levels step once per closed 1m bar, from the
+///   trades of closed minutes only; the developing minute is never
+///   included. Every UTC day open restarts the warm-up.
+/// - Gap policy: a trades gap never resets the profile. The value carries
+///   the OR of the day's closed minutes' coverage.
+pub const PROFILE_VOLUME_UTC_DAY_V1: FeatureDefinition = FeatureDefinition {
+    key: FeatureKey::new("profile.volume.utc_day", 1),
+    params: &[
+        Param {
+            name: "bin_size",
+            value: ParamValue::Price(Price::from_units(10 * SCALE)),
+        },
+        Param {
+            name: "max_bins",
+            value: ParamValue::Int(10_000),
+        },
+        Param {
+            name: "node_prominence_pct",
+            value: ParamValue::Int(10),
+        },
+        Param {
+            name: "node_smoothing",
+            value: ParamValue::Text("triangular_5"),
+        },
+        Param {
+            name: "poc_rule",
+            value: ParamValue::Text("max_volume_center_lower"),
+        },
+        Param {
+            name: "session_ms",
+            value: ParamValue::Int(86_400_000),
+        },
+        Param {
+            name: "value_area_pct",
+            value: ParamValue::Int(70),
+        },
+        Param {
+            name: "value_area_rule",
+            value: ParamValue::Text("single_bin_ties_both"),
+        },
+    ],
+    inputs: &[
+        Input::Stream(Stream::Trades),
+        Input::Feature(BARS_TIME_1M_V1.key),
+    ],
+    warm_up: WarmUp::Samples(1),
+};
+
+/// `profile.volume.prior_day@1`: the completed volume profile of the last
+/// closed UTC day (ADR-036), fixed when its daily bar closes.
+///
+/// - Parameters: those of [`PROFILE_VOLUME_UTC_DAY_V1`] and `sessions` = 1.
+/// - Inputs: trades (the volume per bin) and `bars.time.1d@1` (when the day
+///   closes, and the coverage).
+/// - Warm-up: one sample, where a sample is a closed UTC day. A day without
+///   volume is `Unavailable(InputInvalid)`.
+/// - Gap policy: a trades gap never resets the profile. The value carries
+///   the closed daily bar's coverage.
+pub const PROFILE_VOLUME_PRIOR_DAY_V1: FeatureDefinition = FeatureDefinition {
+    key: FeatureKey::new("profile.volume.prior_day", 1),
+    params: &[
+        Param {
+            name: "bin_size",
+            value: ParamValue::Price(Price::from_units(10 * SCALE)),
+        },
+        Param {
+            name: "max_bins",
+            value: ParamValue::Int(10_000),
+        },
+        Param {
+            name: "node_prominence_pct",
+            value: ParamValue::Int(10),
+        },
+        Param {
+            name: "node_smoothing",
+            value: ParamValue::Text("triangular_5"),
+        },
+        Param {
+            name: "poc_rule",
+            value: ParamValue::Text("max_volume_center_lower"),
+        },
+        Param {
+            name: "session_ms",
+            value: ParamValue::Int(86_400_000),
+        },
+        Param {
+            name: "sessions",
+            value: ParamValue::Int(1),
+        },
+        Param {
+            name: "value_area_pct",
+            value: ParamValue::Int(70),
+        },
+        Param {
+            name: "value_area_rule",
+            value: ParamValue::Text("single_bin_ties_both"),
+        },
+    ],
+    inputs: &[
+        Input::Stream(Stream::Trades),
+        Input::Feature(BARS_TIME_1D_V1.key),
+    ],
+    warm_up: WarmUp::Samples(1),
+};
+
+/// `profile.volume.composite_5d@1`: the bin-wise sum of the last 5
+/// completed UTC days (ADR-036), recomputed once per day close.
+///
+/// - Parameters: those of [`PROFILE_VOLUME_UTC_DAY_V1`] and `sessions` = 5.
+/// - Inputs: as [`PROFILE_VOLUME_PRIOR_DAY_V1`].
+/// - Warm-up: 5 samples, where a sample is a closed UTC day. Empty days
+///   count; five days without volume are `Unavailable(InputInvalid)`.
+/// - Gap policy: a trades gap never resets the profile. The value carries
+///   the OR of the five closed daily bars' coverage.
+pub const PROFILE_VOLUME_COMPOSITE_5D_V1: FeatureDefinition = FeatureDefinition {
+    key: FeatureKey::new("profile.volume.composite_5d", 1),
+    params: &[
+        Param {
+            name: "bin_size",
+            value: ParamValue::Price(Price::from_units(10 * SCALE)),
+        },
+        Param {
+            name: "max_bins",
+            value: ParamValue::Int(10_000),
+        },
+        Param {
+            name: "node_prominence_pct",
+            value: ParamValue::Int(10),
+        },
+        Param {
+            name: "node_smoothing",
+            value: ParamValue::Text("triangular_5"),
+        },
+        Param {
+            name: "poc_rule",
+            value: ParamValue::Text("max_volume_center_lower"),
+        },
+        Param {
+            name: "session_ms",
+            value: ParamValue::Int(86_400_000),
+        },
+        Param {
+            name: "sessions",
+            value: ParamValue::Int(5),
+        },
+        Param {
+            name: "value_area_pct",
+            value: ParamValue::Int(70),
+        },
+        Param {
+            name: "value_area_rule",
+            value: ParamValue::Text("single_bin_ties_both"),
+        },
+    ],
+    inputs: &[
+        Input::Stream(Stream::Trades),
+        Input::Feature(BARS_TIME_1D_V1.key),
+    ],
+    warm_up: WarmUp::Samples(5),
+};
+
 /// Every version of every feature. Never shrinks.
 pub const DEFINITIONS: &[&FeatureDefinition] = &[
     &TRADE_LAST_PRICE_V1,
@@ -483,6 +658,9 @@ pub const DEFINITIONS: &[&FeatureDefinition] = &[
     &FLOW_WINDOW_5M_V1,
     &FLOW_WINDOW_15M_V1,
     &FLOW_WINDOW_1H_V1,
+    &PROFILE_VOLUME_UTC_DAY_V1,
+    &PROFILE_VOLUME_PRIOR_DAY_V1,
+    &PROFILE_VOLUME_COMPOSITE_5D_V1,
 ];
 
 /// The fingerprint each published `id@version` must keep. Append-only: one
@@ -508,6 +686,9 @@ pub const LOCK: &[LockEntry] = &[
     LockEntry::new("flow.window.5m", 1, 0xd5b8_a750_f763_4076),
     LockEntry::new("flow.window.15m", 1, 0xd57b_f62e_9582_61a1),
     LockEntry::new("flow.window.1h", 1, 0xdd02_bda3_c32f_83b9),
+    LockEntry::new("profile.volume.utc_day", 1, 0x664c_8237_3b35_4b5a),
+    LockEntry::new("profile.volume.prior_day", 1, 0x8cec_f1e9_1a0a_2d6f),
+    LockEntry::new("profile.volume.composite_5d", 1, 0x9c8a_e4da_061a_e2b4),
 ];
 
 /// The default feature set: the latest version of each computed feature.
@@ -532,6 +713,9 @@ pub const CURRENT: &[FeatureKey] = &[
     FLOW_WINDOW_5M_V1.key,
     FLOW_WINDOW_15M_V1.key,
     FLOW_WINDOW_1H_V1.key,
+    PROFILE_VOLUME_UTC_DAY_V1.key,
+    PROFILE_VOLUME_PRIOR_DAY_V1.key,
+    PROFILE_VOLUME_COMPOSITE_5D_V1.key,
 ];
 
 /// The registry of [`DEFINITIONS`].
@@ -605,10 +789,10 @@ mod tests {
             hasher.write_u32(entry.key.version.get());
             hasher.write_u64(entry.fingerprint.value());
         }
-        assert_eq!(LOCK.len(), 20, "lock lines");
+        assert_eq!(LOCK.len(), 23, "lock lines");
         assert_eq!(
             hasher.finish().to_string(),
-            "ebf623866d0acad6",
+            "7115052d525501db",
             "lock digest"
         );
     }
@@ -772,9 +956,10 @@ mod tests {
              bars.motion.4h@1,bars.motion.5m@1,bars.time.15m@1,bars.time.1d@1,\
              bars.time.1h@1,bars.time.1m@1,bars.time.4h@1,bars.time.5m@1,\
              flow.cvd.continuous@1,flow.cvd.utc_day@1,flow.window.15m@1,\
-             flow.window.1h@1,flow.window.5m@1,trade.last_price@1,\
+             flow.window.1h@1,flow.window.5m@1,profile.volume.composite_5d@1,\
+             profile.volume.prior_day@1,profile.volume.utc_day@1,trade.last_price@1,\
              volatility.atr.1h@1,volatility.regime.1h@1"
         );
-        assert_eq!(set.version().to_string(), "dd872d0b67f43ceb");
+        assert_eq!(set.version().to_string(), "cdad39bf5282bd8a");
     }
 }

@@ -18,6 +18,7 @@
 //! | Feature identity and versioning (ADR-029) | [`feature`], [`fingerprint`] |
 //! | Motion, ATR and regime (ADR-033)          | [`volatility`]               |
 //! | Order flow / aggression (ADR-035)         | [`flow`]                     |
+//! | Volume profile (ADR-036)                  | [`profile`]                  |
 //! | Regime (ADR-017, ADR-033)                 | [`regime`]                   |
 //! | Location / auction state                  | [`location`]                 |
 //! | Bias / trigger (ADR-012, ADR-024)         | [`trigger`]                  |
@@ -34,6 +35,7 @@ pub mod flow;
 pub mod location;
 pub mod num;
 pub mod order;
+pub mod profile;
 pub mod regime;
 pub mod state;
 pub mod strategy;
