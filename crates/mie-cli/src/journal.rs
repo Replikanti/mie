@@ -16,16 +16,21 @@
 //! | `domain_rejection` | ingest | an event the engine rejected |
 //! | `run_end` | ingest | totals and the exit code |
 //!
-//! The journal is flushed on every `stats` line and at the end of a run.
+//! The journal is flushed on every `stats` line and at the end of a run, and
+//! synced to stable storage right after `run_start` and at the end of a run:
+//! replay needs a run's `run_start` for every record the run seals
+//! (ADR-039 D2).
 //!
 //! The raw store alone does not determine what live delivered: the
 //! pipeline's `hold_back_ms`, `oi_retime_ms` and per-stream seeds are run
 //! parameters, kept only in `run_start`. A recompute (replay #11, equivalence harness #13)
 //! reads them with [`RunParameters::from_run_start`], never from
-//! configuration defaults (ADR-032).
+//! configuration defaults (ADR-032). [`read_runs`] joins every run's
+//! `run_start` with its `run_end` into the [`LiveRun`]s `mie replay`
+//! recomputes (ADR-039 D1).
 
 use mie_adapter_binance::live::ChannelStats;
-use mie_adapter_binance::{BinanceStream, CaptureEvent, CaptureObserver, PipelineStats};
+use mie_adapter_binance::{BinanceStream, CaptureEvent, CaptureObserver, LiveRun, PipelineStats};
 use mie_domain::time::EventTime;
 use mie_ports::raw::SealedFile;
 use serde_json::{Map, Value, json};
@@ -94,6 +99,141 @@ impl RunParameters {
     }
 }
 
+/// One run of the journal: its `run_start` joined with its `run_end`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JournaledRun {
+    /// The pipeline parameters of `run_start`.
+    pub parameters: RunParameters,
+    /// The raw-store source the run wrote to.
+    pub source: String,
+    /// The captured streams.
+    pub streams: Vec<BinanceStream>,
+    /// Wall clock of `run_start`, UTC ms.
+    pub started_at_ms: i64,
+    /// The run's `run_end`, if it has one (a crashed run has none).
+    pub end: Option<RunEnd>,
+}
+
+/// What `run_end` says about a run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunEnd {
+    /// Wall clock of `run_end`, UTC ms.
+    pub at_ms: i64,
+    /// The run's exit code; 0 for a clean run.
+    pub exit_code: i64,
+    /// Records the run appended to the raw store.
+    pub records: u64,
+}
+
+impl JournaledRun {
+    /// The run as the live replay takes it: a clean end (exit code 0)
+    /// carries the record count the replay checks.
+    pub fn live_run(&self) -> LiveRun {
+        LiveRun {
+            run_id: self.parameters.run_id.clone(),
+            symbol: self.parameters.symbol.clone(),
+            hold_back_ms: self.parameters.hold_back_ms,
+            oi_retime_ms: self.parameters.oi_retime_ms,
+            seeds: self.parameters.seeds.clone(),
+            streams: self.streams.clone(),
+            started_at_ms: self.started_at_ms,
+            ended_at_ms: self.end.map(|end| end.at_ms),
+            clean_records: self
+                .end
+                .filter(|end| end.exit_code == 0)
+                .map(|end| end.records),
+        }
+    }
+}
+
+/// Reads every run of `source` from the journal at `path`, in journal
+/// order.
+///
+/// A line that is not JSON is skipped: a crash can leave a partial line,
+/// which the next run's first line then follows. A `run_start` or `run_end`
+/// that does not carry its fields is an error, and so are two `run_start`s
+/// of one run id — a restart within the same second, whose records the
+/// session prefix could not tell apart (ADR-032) — a second `run_end`, and a
+/// `run_end` without a `run_start`.
+///
+/// # Errors
+///
+/// A description naming the line.
+pub fn read_runs(path: &Path, source: &str) -> Result<Vec<JournaledRun>, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("read journal {}: {e}", path.display()))?;
+    let mut runs: Vec<JournaledRun> = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        let at = |detail: String| format!("journal line {}: {detail}", index + 1);
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        match value["type"].as_str() {
+            Some("run_start") => {
+                let parameters = RunParameters::from_run_start(&value).map_err(at)?;
+                if runs
+                    .iter()
+                    .any(|r| r.parameters.run_id == parameters.run_id)
+                {
+                    return Err(at(format!(
+                        "run {} started twice (a restart within one second)",
+                        parameters.run_id
+                    )));
+                }
+                let run_source = value["source"]
+                    .as_str()
+                    .ok_or_else(|| at("run_start without source".to_owned()))?;
+                let streams = value["streams"]
+                    .as_array()
+                    .ok_or_else(|| at("run_start without streams".to_owned()))?
+                    .iter()
+                    .map(|name| {
+                        name.as_str()
+                            .and_then(BinanceStream::from_raw_name)
+                            .ok_or_else(|| at(format!("run_start with unknown stream {name}")))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let started_at_ms = value["at_ms"]
+                    .as_i64()
+                    .ok_or_else(|| at("run_start without at_ms".to_owned()))?;
+                runs.push(JournaledRun {
+                    parameters,
+                    source: run_source.to_owned(),
+                    streams,
+                    started_at_ms,
+                    end: None,
+                });
+            }
+            Some("run_end") => {
+                let field = |name: &str| {
+                    value[name]
+                        .as_i64()
+                        .ok_or_else(|| at(format!("run_end without {name}")))
+                };
+                let end = RunEnd {
+                    at_ms: field("at_ms")?,
+                    exit_code: field("exit_code")?,
+                    records: value["records"]
+                        .as_u64()
+                        .ok_or_else(|| at("run_end without records".to_owned()))?,
+                };
+                let run_id = value["run_id"].as_str().unwrap_or_default();
+                let run = runs
+                    .iter_mut()
+                    .find(|r| r.parameters.run_id == run_id)
+                    .ok_or_else(|| at(format!("run_end of run {run_id:?} without run_start")))?;
+                if run.end.is_some() {
+                    return Err(at(format!("run {run_id} ended twice")));
+                }
+                run.end = Some(end);
+            }
+            _ => {}
+        }
+    }
+    runs.retain(|run| run.source == source);
+    Ok(runs)
+}
+
 /// An open journal for one run.
 #[derive(Debug)]
 pub struct Journal {
@@ -144,6 +284,16 @@ impl Journal {
     /// Flushes buffered lines.
     pub fn flush(&mut self) {
         if let Err(error) = self.out.flush() {
+            self.write_error.get_or_insert(error.to_string());
+        }
+    }
+
+    /// Flushes buffered lines and forces them to stable storage. `run_start`
+    /// is synced: without it a run's sealed records cannot be replayed as
+    /// live delivered them (ADR-039 D2).
+    pub fn sync(&mut self) {
+        self.flush();
+        if let Err(error) = self.out.get_ref().sync_data() {
             self.write_error.get_or_insert(error.to_string());
         }
     }
@@ -295,4 +445,104 @@ pub fn pipeline_json(stats: &PipelineStats) -> Value {
         })
         .collect();
     Value::Object(streams)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn start(run_id: &str, at_ms: i64, source: &str) -> String {
+        json!({
+            "type": "run_start", "run_id": run_id, "at_ms": at_ms, "symbol": "BTCUSDT",
+            "source": source, "streams": ["aggTrade", "openInterest"], "hold_back_ms": 750,
+            "oi_retime_ms": 10_000, "seal_interval_secs": 300, "seeds": {"aggTrade": 5},
+        })
+        .to_string()
+    }
+
+    fn end(run_id: &str, at_ms: i64, exit_code: i64, records: u64) -> String {
+        json!({
+            "type": "run_end", "run_id": run_id, "at_ms": at_ms, "exit_code": exit_code,
+            "records": records,
+        })
+        .to_string()
+    }
+
+    fn read(lines: &[String]) -> Result<Vec<JournaledRun>, String> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "mie-journal-read-runs-{}-{n}.jsonl",
+            std::process::id()
+        ));
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        let runs = read_runs(&path, "binance-um");
+        std::fs::remove_file(&path).unwrap();
+        runs
+    }
+
+    #[test]
+    fn runs_join_their_start_and_end_and_crashes_have_no_end() {
+        let runs = read(&[
+            start("A", 1_000, "binance-um"),
+            r#"{"type":"gap","run_id":"A"}"#.to_owned(),
+            end("A", 2_000, 0, 42),
+            start("X", 2_500, "other-source"),
+            end("X", 2_600, 0, 1),
+            // A crash leaves a partial line; the next run follows it.
+            start("B", 3_000, "binance-um"),
+            r#"{"type":"stats","run_id":"B","reco"#.to_owned(),
+            start("C", 4_000, "binance-um"),
+            end("C", 5_000, 1, 7),
+        ])
+        .unwrap();
+        let ids: Vec<_> = runs.iter().map(|r| r.parameters.run_id.as_str()).collect();
+        assert_eq!(ids, ["A", "B", "C"]);
+        let a = runs[0].live_run();
+        assert_eq!(
+            (a.started_at_ms, a.ended_at_ms, a.clean_records),
+            (1_000, Some(2_000), Some(42))
+        );
+        assert_eq!(
+            a.streams,
+            [BinanceStream::AggTrade, BinanceStream::OpenInterest]
+        );
+        assert_eq!(a.seeds[&BinanceStream::AggTrade], EventTime::from_millis(5));
+        assert_eq!((a.hold_back_ms, a.oi_retime_ms), (750, 10_000));
+        let b = runs[1].live_run();
+        assert_eq!((b.ended_at_ms, b.clean_records), (None, None));
+        // A non-zero exit is not clean: the replay takes its prefix.
+        let c = runs[2].live_run();
+        assert_eq!((c.ended_at_ms, c.clean_records), (Some(5_000), None));
+    }
+
+    #[test]
+    fn ambiguous_or_malformed_runs_are_errors() {
+        let twice = read(&[
+            start("A", 1_000, "binance-um"),
+            start("A", 1_500, "binance-um"),
+        ]);
+        assert!(twice.unwrap_err().contains("started twice"));
+        let orphan = read(&[end("A", 2_000, 0, 1)]);
+        assert!(orphan.unwrap_err().contains("without run_start"));
+        let ended_twice = read(&[
+            start("A", 1_000, "binance-um"),
+            end("A", 2_000, 0, 1),
+            end("A", 2_001, 0, 1),
+        ]);
+        assert!(ended_twice.unwrap_err().contains("ended twice"));
+        let mut broken: Value = serde_json::from_str(&start("A", 1_000, "binance-um")).unwrap();
+        broken["streams"] = json!(["depth"]);
+        let unknown = read(&[broken.to_string()]);
+        assert!(
+            unknown
+                .unwrap_err()
+                .starts_with("journal line 1: run_start with unknown stream")
+        );
+        let no_records = read(&[
+            start("A", 1_000, "binance-um"),
+            json!({"type": "run_end", "run_id": "A", "at_ms": 2, "exit_code": 0}).to_string(),
+        ]);
+        assert!(no_records.unwrap_err().contains("run_end without records"));
+    }
 }

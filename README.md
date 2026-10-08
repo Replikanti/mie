@@ -52,9 +52,9 @@ enforces the boundary (ADR-025):
 | [`mie-ports`](crates/mie-ports) | Use-case (inbound) and infrastructure (outbound) contracts owned by the core. |
 | [`mie-app`](crates/mie-app) | Use-case services that drive the domain through ports. |
 | [`mie-adapter-parquet`](crates/mie-adapter-parquet) | Immutable raw store: verbatim messages in sealed Parquet files with manifests and dataset versions (ADR-030). |
-| [`mie-adapter-binance`](crates/mie-adapter-binance) | Binance USDⓈ-M live capture: raw-first persistence, shared normalization, feed gaps, canonical merge (ADR-032); public-archive backfill: checksum-verified, exactly-once import (ADR-034). |
+| [`mie-adapter-binance`](crates/mie-adapter-binance) | Binance USDⓈ-M live capture: raw-first persistence, shared normalization, feed gaps, canonical merge (ADR-032); public-archive backfill: checksum-verified, exactly-once import (ADR-034); replay of both from the raw store (ADR-039). |
 | `mie-adapter-*` *(planned)* | DuckDB, Telegram, LLM operators, backtest engine. |
-| [`mie-cli`](crates/mie-cli) | Composition root, the `mie` binary: wires adapters to ports. Today `ingest`, `capture-report` and `archive-import` / `archive-verify` / `archive-kline-check`; replay, research and report follow. |
+| [`mie-cli`](crates/mie-cli) | Composition root, the `mie` binary: wires adapters to ports. Today `ingest`, `capture-report`, `archive-import` / `archive-verify` / `archive-kline-check` and `replay`; research and report follow. |
 
 First milestone data path (brief §19):
 
@@ -111,6 +111,18 @@ cargo run --release -p mie-cli -- archive-verify \
 cargo run --release -p mie-cli -- archive-kline-check \
     --config crates/mie-cli/archive.example.toml --from 2026-09-29 --to 2026-09-29 \
     --trade-source trades
+```
+
+Replay a window of the raw store through the core (ADR-039): live capture
+runs are recomputed from the journal, the archive is merged canonically.
+The report carries the dataset version and the event-stream hash; the same
+window prints the same bytes:
+
+```sh
+cargo run --release -p mie-cli -- replay \
+    --config crates/mie-cli/ingest.example.toml --from <epoch ms> --to <epoch ms>
+cargo run --release -p mie-cli -- replay --source archive \
+    --config crates/mie-cli/archive.example.toml --from 2025-10-01 --to 2026-09-30
 ```
 
 ## Out of scope for now

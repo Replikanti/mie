@@ -1,4 +1,4 @@
-//! Fixed-point prices, quantities and rates (ADR-027, proposed).
+//! Fixed-point prices, quantities and rates (ADR-027).
 //!
 //! Exchange values arrive as decimal strings. Holding them as integers at one
 //! fixed scale keeps sums (delta, CVD, volume at price) exact and makes price

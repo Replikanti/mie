@@ -5,10 +5,11 @@
 //! 2. Seed each stream with the largest event time sealed in the last
 //!    7 days, so the run opens with a restart gap per stream.
 //! 3. Start the live capture and drive the core on this thread through
-//!    [`mie_app::drive`] (ADR-019). An event the engine rejects is
-//!    journaled and counted, and driving resumes: the engine leaves its
-//!    state untouched on a rejection, and a soak must not stop on one. A
-//!    provider failure ends the run.
+//!    [`mie_app::drive_tolerant`], the drive replay uses too (ADR-019,
+//!    ADR-039 D9). An event the engine rejects is journaled and counted,
+//!    and driving resumes: the engine leaves its state untouched on a
+//!    rejection, and a soak must not stop on one. A provider failure ends
+//!    the run.
 //! 4. On shutdown (SIGINT/SIGTERM sets the flag), join the capture, close
 //!    the writer (sealing everything) and journal a `run_end` summary.
 
@@ -20,7 +21,6 @@ use mie_adapter_parquet::{ParquetRawStore, RotationPolicy};
 use mie_domain::event::MarketEvent;
 use mie_domain::state::MarketStateEngine;
 use mie_domain::time::EventTime;
-use mie_ports::inbound::UseCaseError;
 use mie_ports::outbound::{MarketDataProvider, ProviderError, ReplayWindow};
 use mie_ports::raw::{RawRecordSource, RawSelection, RawStreamKey};
 use serde_json::{Value, json};
@@ -136,6 +136,10 @@ pub fn run(
         }),
     );
 
+    // Durable before the first record is sealed: replay needs the run's
+    // parameters for every record it seals (ADR-039 D2).
+    journal.lock().unwrap_or_else(|p| p.into_inner()).sync();
+
     let live = config
         .live_config(&run_id, seeds)
         .map_err(|e| e.to_string())?;
@@ -157,20 +161,11 @@ pub fn run(
         events: 0,
     };
     let mut domain_rejections = 0_u64;
-    let mut error = None;
-    loop {
-        match mie_app::drive(&mut counting, &mut engine) {
-            Ok(_) => break,
-            Err(UseCaseError::Domain(rejected)) => {
-                domain_rejections += 1;
-                log("domain_rejection", json!({"error": rejected.to_string()}));
-            }
-            Err(UseCaseError::Provider(failed)) => {
-                error = Some(failed.to_string());
-                break;
-            }
-        }
-    }
+    let driven = mie_app::drive_tolerant(&mut counting, &mut engine, |rejected| {
+        domain_rejections += 1;
+        log("domain_rejection", json!({"error": rejected.to_string()}));
+    });
+    let mut error = driven.err().map(|failed| failed.to_string());
     let events = counting.events;
     drop(provider);
     shutdown.store(true, Ordering::Relaxed);
@@ -223,7 +218,7 @@ pub fn run(
         }),
     );
     let mut journal = journal.lock().unwrap_or_else(|p| p.into_inner());
-    journal.flush();
+    journal.sync();
     if let Some(write_error) = journal.write_error() {
         eprintln!("mie ingest: journal write failed: {write_error}");
     }

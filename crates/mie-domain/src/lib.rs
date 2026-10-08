@@ -12,6 +12,7 @@
 //! | Subsystem (design doc)                    | Module                       |
 //! |-------------------------------------------|------------------------------|
 //! | Market observations (Data Plane)          | [`event`], [`num`], [`time`] |
+//! | Event-stream hash (ADR-039)               | [`event_hash`]               |
 //! | Canonical event order (ADR-028)           | [`order`]                    |
 //! | Market State                              | [`state`]                    |
 //! | Event-time bars (ADR-031)                 | [`bars`]                     |
@@ -30,6 +31,7 @@
 
 pub mod bars;
 pub mod event;
+pub mod event_hash;
 pub mod feature;
 pub mod fingerprint;
 pub mod flow;

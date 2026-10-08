@@ -2,19 +2,21 @@
 //! replay (ADR-019), in the canonical event order (ADR-028). The in-memory
 //! providers stand in for the Binance and raw-Parquet adapters.
 
-use mie_app::{ReplayService, drive};
+use mie_app::{HashingProvider, ReplayService, drive, drive_tolerant};
 use mie_domain::event::{
     Aggressor, BookSnapshot, BookUpdate, FeedGap, FundingSettlement, GapReason, Kline, Level,
     Liquidation, MarkPrice, MarketEvent, OpenInterest, Stream, Trade,
 };
+use mie_domain::event_hash::EventStreamHasher;
 use mie_domain::feature::{FeatureValue, catalog};
 use mie_domain::num::{Price, Qty, Rate};
 use mie_domain::state::{MarketStateEngine, StateError};
 use mie_domain::time::EventTime;
 use mie_ports::inbound::{ReplayMarket, UseCaseError};
 use mie_ports::outbound::{
-    HistoricalDataProvider, MarketDataProvider, ProviderError, ReplayWindow,
+    HistoricalDataProvider, MarketDataProvider, ProviderError, Replay, ReplayWindow,
 };
+use mie_ports::raw::DatasetVersion;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, VecDeque};
 
@@ -33,15 +35,23 @@ impl MarketDataProvider for Feed {
     }
 }
 
+/// A fixed dataset version for the in-memory providers.
+fn fixture_dataset() -> DatasetVersion {
+    DatasetVersion::from_hex(&"0f".repeat(32)).unwrap()
+}
+
 /// Stand-in for the raw-data replay adapter.
 struct Recorded(Vec<MarketEvent>);
 
 impl HistoricalDataProvider for Recorded {
     type Stream = Feed;
 
-    fn replay(&self, window: ReplayWindow) -> Result<Feed, ProviderError> {
+    fn replay(&self, window: ReplayWindow) -> Result<Replay<Feed>, ProviderError> {
         let in_window = self.0.iter().filter(|e| window.contains(e.time()));
-        Ok(Feed::of(in_window.cloned().collect()))
+        Ok(Replay {
+            stream: Feed::of(in_window.cloned().collect()),
+            dataset: fixture_dataset(),
+        })
     }
 }
 
@@ -220,7 +230,7 @@ impl MarketDataProvider for Merge {
 impl HistoricalDataProvider for PerStream {
     type Stream = Merge;
 
-    fn replay(&self, window: ReplayWindow) -> Result<Merge, ProviderError> {
+    fn replay(&self, window: ReplayWindow) -> Result<Replay<Merge>, ProviderError> {
         let in_window = self
             .0
             .iter()
@@ -236,7 +246,10 @@ impl HistoricalDataProvider for PerStream {
                 events
             })
             .collect();
-        Ok(Merge::new(in_window))
+        Ok(Replay {
+            stream: Merge::new(in_window),
+            dataset: fixture_dataset(),
+        })
     }
 }
 
@@ -378,7 +391,7 @@ fn multi_stream_live_and_replay_deliver_one_sequence_and_state() {
     let total: usize = recordings.iter().map(Vec::len).sum();
     let all = window(0, 10_000);
 
-    let mut replay = Recording::new(PerStream(recordings.clone()).replay(all).unwrap());
+    let mut replay = Recording::new(PerStream(recordings.clone()).replay(all).unwrap().stream);
     let mut replay_engine = MarketStateEngine::new();
     let replayed = drive(&mut replay, &mut replay_engine).unwrap();
     assert_eq!(replayed, u64::try_from(total).unwrap());
@@ -430,5 +443,65 @@ fn provider_failure_stops_the_drive() {
     let err = drive(&mut feed, &mut engine).unwrap_err();
 
     assert_eq!(err, UseCaseError::Provider(failure));
+    assert_eq!(engine.state().trade_count, 1);
+}
+
+#[test]
+fn replay_reports_the_dataset_and_the_hash_of_what_it_delivered() {
+    let report = ReplayService::new(Recorded(tape()))
+        .replay(window(0, 10_000))
+        .unwrap();
+    let mut hasher = EventStreamHasher::new();
+    for event in &tape() {
+        hasher.push(event);
+    }
+    assert_eq!(report.dataset, fixture_dataset());
+    assert_eq!(report.stream_hash, hasher.finish());
+    assert_eq!(report.stream_hash.events, report.events);
+    assert_eq!(report.domain_rejections, 0);
+
+    // The same window twice: the same hash.
+    let again = ReplayService::new(Recorded(tape()))
+        .replay(window(0, 10_000))
+        .unwrap();
+    assert_eq!(again, report);
+}
+
+#[test]
+fn replay_counts_a_domain_rejection_and_continues_like_ingest() {
+    // A trade that repeats an id is rejected; the next one still applies.
+    let mut events = tape();
+    events.insert(2, trade(1_100, 2, 6_354_000_000_000, Aggressor::Buy));
+    let report = ReplayService::new(Recorded(events.clone()))
+        .replay(window(0, 10_000))
+        .unwrap();
+    assert_eq!(report.events, 5);
+    assert_eq!(report.domain_rejections, 1);
+    assert_eq!(report.state.trade_count, 4);
+
+    let mut rejected = Vec::new();
+    let mut engine = MarketStateEngine::new();
+    let mut hashing = HashingProvider::new(Feed::of(events));
+    let delivered = drive_tolerant(&mut hashing, &mut engine, |e| rejected.push(*e)).unwrap();
+    assert_eq!(delivered, 5);
+    assert_eq!(hashing.hash(), report.stream_hash);
+    assert!(matches!(
+        rejected[..],
+        [StateError::IdRegression { .. } | StateError::Duplicate { .. }]
+    ));
+    assert_eq!(engine.state(), &report.state);
+}
+
+#[test]
+fn a_provider_failure_stops_the_tolerant_drive() {
+    let failure = ProviderError::Source("connection reset".into());
+    let mut feed = Feed(VecDeque::from([
+        Ok(trade(1_000, 1, 1, Aggressor::Buy)),
+        Err(failure.clone()),
+        Ok(trade(2_000, 2, 2, Aggressor::Buy)),
+    ]));
+    let mut engine = MarketStateEngine::new();
+    let err = drive_tolerant(&mut feed, &mut engine, |_| {}).unwrap_err();
+    assert_eq!(err, failure);
     assert_eq!(engine.state().trade_count, 1);
 }

@@ -6,7 +6,10 @@
 //! - `mie capture-report --config <path> --from <ms> --to <ms>`
 //!   ([`report`]): verifies a capture window (the soak acceptance of #9);
 //! - `mie archive-import`, `mie archive-verify`, `mie archive-kline-check`
-//!   ([`archive`]): backfill from the Binance public data archive (#12).
+//!   ([`archive`]): backfill from the Binance public data archive (#12);
+//! - `mie replay --config <path> --from … --to … [--source live|archive]`
+//!   ([`replay`]): replays a window of raw data through the core with a
+//!   deterministic report (#11).
 //!
 //! The real network connectors are constructed in `main.rs` and nowhere
 //! else; tests drive [`ingest::run`] with fakes.
@@ -15,4 +18,5 @@ pub mod archive;
 pub mod config;
 pub mod ingest;
 pub mod journal;
+pub mod replay;
 pub mod report;

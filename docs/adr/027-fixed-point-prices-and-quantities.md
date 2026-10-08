@@ -1,6 +1,6 @@
 # ADR-027: Fixed-point integer prices and quantities
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-10-05
 
 ## Context
@@ -63,3 +63,16 @@ order-flow features (delta, CVD) are computed on them.
 
 Progress 2026-10-07: delta and CVD are computed on fixed point by ADR-035
 (#17). The live/replay half waits for #11 and #13.
+
+## Acceptance
+
+Accepted 2026-10-07 with the replay of #11 (ADR-039). The round-trip test
+`a_replay_of_the_store_equals_what_the_live_capture_delivered`
+(`crates/mie-cli/tests/replay_offline.rs`) captures scripted live frames
+into a real Parquet raw store — decimal literals with trailing zeros beyond
+eight places (`0.0100000000`), eight significant places (`123456.12345678`)
+and short forms (`85000.3`, `2`) — and replays the store: the replayed
+events equal the delivered ones event for event, and every trade's units
+equal the domain parse of its literal. The archive replay test does the same
+for an exponent funding row (`-1.8E-7` → `-0.00000018`). Delta and CVD are
+computed on fixed point by ADR-035 (#17).

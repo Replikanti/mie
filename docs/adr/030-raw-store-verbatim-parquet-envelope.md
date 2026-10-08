@@ -188,3 +188,7 @@ file is covered when it overlaps `[start, end)`:
 
 The #9 24 h live soak seals files in this format, and #11 replays them with
 a stable dataset version.
+
+Progress 2026-10-07: #11 replays sealed files of both sources with a
+dataset version that is stable across repeated replays of a fixture store
+(ADR-039). Acceptance waits for the #9 soak.

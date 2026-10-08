@@ -5,6 +5,8 @@
 //! `ValidateCandidate`, `GenerateMarketReport`.
 
 use crate::outbound::{ProviderError, ReplayWindow};
+use crate::raw::DatasetVersion;
+use mie_domain::event_hash::EventStreamHash;
 use mie_domain::state::{MarketState, StateError};
 use std::fmt;
 
@@ -12,18 +14,27 @@ use std::fmt;
 pub trait ReplayMarket {
     /// Replays `window` and reports the resulting market state.
     ///
+    /// An event the domain rejects is counted in
+    /// [`ReplayReport::domain_rejections`] and the replay continues, exactly
+    /// as live ingestion does (ADR-039 D9).
+    ///
     /// # Errors
     ///
-    /// [`UseCaseError`] when the data source fails or the domain rejects an
-    /// event.
+    /// [`UseCaseError::Provider`] when the data source fails.
     fn replay(&self, window: ReplayWindow) -> Result<ReplayReport, UseCaseError>;
 }
 
 /// Outcome of a replay.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplayReport {
-    /// Number of events consumed.
+    /// Number of events delivered, rejected ones included.
     pub events: u64,
+    /// The raw data the replay read (ADR-030, ADR-039 D8).
+    pub dataset: DatasetVersion,
+    /// The hash of the delivered event sequence (ADR-039 D7).
+    pub stream_hash: EventStreamHash,
+    /// Delivered events the domain rejected.
+    pub domain_rejections: u64,
     /// Market state after the last event.
     pub state: MarketState,
 }

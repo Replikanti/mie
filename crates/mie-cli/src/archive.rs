@@ -13,10 +13,11 @@ use mie_adapter_binance::archive::fetch::{FetchPolicy, Fetcher};
 use mie_adapter_binance::archive::import::{ImportOptions, ImportSummary, Importer};
 use mie_adapter_binance::archive::ledger::{ImportLedger, LedgerDir};
 use mie_adapter_binance::archive::normalize::{parse, record_time};
-use mie_adapter_binance::archive::window::ArchiveWindowProvider;
+use mie_adapter_binance::archive::replay::open_requests;
 use mie_adapter_binance::archive::{ARCHIVE_SOURCE, ArchiveStream};
 use mie_adapter_binance::transport::{Clock, HttpDownload, HttpGet};
 use mie_adapter_parquet::{ParquetRawStore, RotationPolicy};
+use mie_domain::bars::Timeframe;
 use mie_domain::event::MarketEvent;
 use mie_domain::state::MarketStateEngine;
 use mie_domain::time::EventTime;
@@ -37,6 +38,10 @@ pub const HOLE_MS: i64 = 60_000;
 
 /// Normalize-error samples printed per stream.
 const MAX_SAMPLES: usize = 10;
+
+/// How far the kline check's trade window reaches beyond the requested
+/// window, so every in-window bar can close complete.
+pub const TRADE_MARGIN_MS: i64 = 60_000;
 
 /// The writer policy of the archive source (ADR-034 D4): day-span parts.
 pub fn rotation_policy() -> RotationPolicy {
@@ -441,6 +446,12 @@ fn check_stream(
 
 /// Runs `archive-kline-check` over the inclusive day range with trades from
 /// `trade_stream`, printing the report and the dataset versions to `out`.
+///
+/// It replays the archive (ADR-039 D5) with trades over
+/// `[start − 60 s, end + 60 s)` and the six kline streams over the window,
+/// so every in-window bar of every timeframe can close complete. The replay
+/// delivers trade-id breaks and missing days as gaps, which leave the bars
+/// they touch incomplete.
 /// Returns whether at least one complete bar was compared and every
 /// compared bar matched its kline: a window without the trade stream or
 /// without klines is no evidence and fails.
@@ -456,12 +467,38 @@ pub fn kline_check(
     trade_stream: ArchiveStream,
     out: &mut dyn Write,
 ) -> Result<bool, String> {
+    if !matches!(
+        trade_stream,
+        ArchiveStream::AggTrades | ArchiveStream::Trades
+    ) {
+        return Err(format!("{trade_stream} is not a trade stream"));
+    }
     let store = ParquetRawStore::new(&config.paths.raw_root);
     let window = day_window(from_day, to_day);
+    let trades_window = ReplayWindow {
+        start: EventTime::from_millis(window.start.as_millis() - TRADE_MARGIN_MS),
+        end: EventTime::from_millis(window.end.as_millis() + TRADE_MARGIN_MS),
+    };
+    let mut requests = vec![(trade_stream, trades_window)];
+    requests.extend(
+        Timeframe::ALL
+            .into_iter()
+            .map(|timeframe| (ArchiveStream::Klines(timeframe), window)),
+    );
     let mut provider =
-        ArchiveWindowProvider::open(&store, &config.instrument.symbol, trade_stream, window)
-            .map_err(|e| e.to_string())?;
-    let versions = provider.dataset_versions().to_vec();
+        open_requests(&store, &config.instrument.symbol, &requests).map_err(|e| e.to_string())?;
+    let versions: Vec<(String, _)> = provider
+        .dataset_versions()
+        .iter()
+        .map(|(streams, version)| {
+            let name = if streams.contains(&trade_stream) {
+                trade_stream.raw_name()
+            } else {
+                "klines"
+            };
+            (name.to_owned(), version.clone())
+        })
+        .collect();
     let mut engine = MarketStateEngine::new();
     let report = mie_app::kline_check::cross_check_klines(&mut provider, &mut engine)
         .map_err(|e| e.to_string())?;
