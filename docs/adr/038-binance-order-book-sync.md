@@ -207,7 +207,8 @@ A ≥ 24 h live soak of the merged `mie ingest` with all seven streams
 finishes, including the staggered 23 h rotations and one deliberate
 restart. `mie capture-report` must print `PASS` over the window: no
 mismatched or invalidated checkpoint, a matched checkpoint in every long
-run, no domain rejection, late fraction 0. The soak's numbers, posted on
+run, no domain rejection, late fraction at most 0.02 per stream
+(`--max-late-fraction 0.02`, ADR-032 D11). The soak's numbers, posted on
 #10, settle the remaining values:
 
 - depth messages per second (p50, p99) and raw bytes per day for `depth`
