@@ -12,8 +12,9 @@ publish.workspace = true
 [dependencies]
 mie-domain.workspace = true
 mie-ports.workspace = true
-# SHA-256 trailer of every result file: tamper evidence that the 64-bit
-# experiment id does not give. Already in the tree (mie-adapter-parquet).
+# SHA-256 trailer of every result file: an integrity checksum against
+# accidental corruption, which the 64-bit experiment id does not give (not
+# tamper evidence: it is unkeyed). Already in the tree (mie-adapter-parquet).
 sha2 = "0.11"
 
 [lints]

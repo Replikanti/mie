@@ -222,6 +222,14 @@ pub enum SpecError {
         /// The feature.
         feature: FeatureKey,
     },
+    /// A second `regime-filter` line names a feature that another line
+    /// already filters: every admitted label of a feature goes on one line.
+    RegimeFeatureRepeated {
+        /// The later line.
+        line: usize,
+        /// The feature.
+        feature: FeatureKey,
+    },
     /// `none` appears next to filter lines of the same field.
     NoneWithFilters {
         /// The `none` line.
@@ -244,6 +252,7 @@ impl SpecError {
             | Self::FeatureSetVersionMismatch { line, .. }
             | Self::FeatureNotInSet { line, .. }
             | Self::NotARegimeFeature { line, .. }
+            | Self::RegimeFeatureRepeated { line, .. }
             | Self::NoneWithFilters { line, .. } => Some(*line),
         }
     }
@@ -302,6 +311,11 @@ impl fmt::Display for SpecError {
                 f,
                 "line {line}: regime-filter: {feature} is not a volatility.regime.* feature"
             ),
+            Self::RegimeFeatureRepeated { line, feature } => write!(
+                f,
+                "line {line}: regime-filter: {feature} is already filtered; list every admitted \
+                 label on one line (`regime-filter {feature} LABEL,...`)"
+            ),
             Self::NoneWithFilters { line, field } => write!(
                 f,
                 "line {line}: {field} none next to {field} lines; use either none or filters"
@@ -342,7 +356,8 @@ pub struct FeeSchedule {
 }
 
 /// A regime filter: the experiment admits only the listed labels of one
-/// `volatility.regime.*` feature (ADR-017, ADR-033).
+/// `volatility.regime.*` feature (ADR-017, ADR-033). A spec has at most one
+/// filter per feature, and all of its filters must admit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegimeFilter {
     /// The regime feature.
@@ -447,8 +462,9 @@ impl ExperimentSpec {
         &self.state_filters
     }
 
-    /// The regime filters, sorted by canonical line; empty means explicitly
-    /// unfiltered.
+    /// The regime filters, sorted by canonical line, at most one per
+    /// feature; an event passes when every filter admits its label. Empty
+    /// means explicitly unfiltered.
     pub fn regime_filters(&self) -> &[RegimeFilter] {
         &self.regime_filters
     }
@@ -796,6 +812,21 @@ impl Draft {
             self.regime_filters,
             &mut self.errors,
         );
+        // One line per regime feature, so filters on one feature never need
+        // an AND/OR reading: the later lines of a feature are errors.
+        let mut by_line: Vec<_> = self
+            .regime_filters
+            .iter()
+            .map(|(line, filter)| (*line, filter.feature))
+            .collect();
+        by_line.sort();
+        let mut filtered = BTreeSet::new();
+        for (line, feature) in by_line {
+            if !filtered.insert(feature) {
+                self.errors
+                    .push(SpecError::RegimeFeatureRepeated { line, feature });
+            }
+        }
         for (&field, &line) in &self.nones {
             let has_filters = match field {
                 SpecField::StateFilter => !self.state_filters.is_empty(),
@@ -1567,6 +1598,41 @@ pub(crate) mod tests {
                 field: SpecField::RegimeFilter
             }
         );
+    }
+
+    #[test]
+    fn a_regime_feature_is_filtered_on_one_line_only() {
+        // Two lines on one feature would need an AND/OR reading that ids
+        // would freeze: `HIGH` + `EXTREME` must be written `HIGH,EXTREME`,
+        // and a contradictory `LOW` + `EXTREME` never validates.
+        for (first, second) in [("HIGH", "EXTREME"), ("EXTREME", "HIGH"), ("LOW", "EXTREME")] {
+            let text = with_line(
+                "regime-filter",
+                &format!(
+                    "regime-filter volatility.regime.1h@1 {first}\n\
+                     regime-filter volatility.regime.1h@1 {second}"
+                ),
+            );
+            let error = one_error(&text);
+            assert_eq!(
+                error,
+                SpecError::RegimeFeatureRepeated {
+                    line: 8,
+                    feature: FeatureKey::new("volatility.regime.1h", 1)
+                },
+                "{first} + {second}"
+            );
+            assert_eq!(
+                error.to_string(),
+                "line 8: regime-filter: volatility.regime.1h@1 is already filtered; list every \
+                 admitted label on one line (`regime-filter volatility.regime.1h@1 LABEL,...`)"
+            );
+        }
+        let merged = with_line(
+            "regime-filter",
+            "regime-filter volatility.regime.1h@1 EXTREME,HIGH",
+        );
+        assert_eq!(parse(&merged).unwrap().id().to_string(), "3f902847001e1998");
     }
 
     #[test]

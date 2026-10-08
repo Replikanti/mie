@@ -1,5 +1,5 @@
 //! The append-only result store (ADR-040) on a real filesystem: layout,
-//! read-only files, no overwrite, verified reads.
+//! read-only files, no overwrite, concurrent writers, verified reads.
 
 use mie_adapter_fs::FsResultStore;
 use mie_domain::event_hash::EventStreamHash;
@@ -12,6 +12,8 @@ use mie_ports::outbound::{ResearchResultReader, ResearchResultStore, ResultStore
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Barrier};
+use std::thread;
 
 /// A fresh directory under the system temp dir, removed on drop.
 struct TempDir(PathBuf);
@@ -156,6 +158,69 @@ fn a_stored_result_is_never_overwritten() {
 }
 
 #[test]
+fn of_concurrent_writers_of_one_key_exactly_one_wins() {
+    const WRITERS: u64 = 16;
+    for round in 0..20 {
+        let dir = TempDir::new(&format!("race-{round}"));
+        let barrier = Arc::new(Barrier::new(WRITERS as usize));
+        let writers: Vec<_> = (0..WRITERS)
+            .map(|writer| {
+                let root = dir.path().to_owned();
+                let barrier = Arc::clone(&barrier);
+                // Each writer offers a different outcome under the same key.
+                thread::spawn(move || {
+                    let mut store = FsResultStore::open(root).unwrap();
+                    let result = result(writer + 1);
+                    barrier.wait();
+                    (writer, store.append(&result))
+                })
+            })
+            .collect();
+        let outcomes: Vec<_> = writers.into_iter().map(|w| w.join().unwrap()).collect();
+
+        let winners: Vec<u64> = outcomes
+            .iter()
+            .filter_map(|(writer, outcome)| outcome.is_ok().then_some(*writer))
+            .collect();
+        assert_eq!(winners.len(), 1, "round {round}: {outcomes:?}");
+        let key = result(1).key();
+        for (writer, outcome) in &outcomes {
+            if *writer != winners[0] {
+                assert_eq!(
+                    outcome,
+                    &Err(ResultStoreError::AlreadyStored {
+                        key: key.clone(),
+                        identical: false
+                    }),
+                    "round {round}, writer {writer}"
+                );
+            }
+        }
+        let store = FsResultStore::open(dir.path()).unwrap();
+        assert_eq!(store.get(&key), Ok(Some(result(winners[0] + 1))));
+        // No temporary file is left behind.
+        let names: Vec<_> = fs::read_dir(store.path_of(&key).parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["research.replay_summary@1.result"], "round {round}");
+    }
+}
+
+#[test]
+fn open_creates_a_nested_root() {
+    let dir = TempDir::new("nested");
+    let root = dir.path().join("a").join("b").join("results");
+    let mut store = FsResultStore::open(&root).unwrap();
+    assert!(root.is_dir());
+    let key = store.append(&result(4)).unwrap();
+    assert_eq!(
+        FsResultStore::open(&root).unwrap().get(&key),
+        Ok(Some(result(4)))
+    );
+}
+
+#[test]
 fn another_pipeline_stores_alongside() {
     let dir = TempDir::new("pipelines");
     let mut store = FsResultStore::open(dir.path()).unwrap();
@@ -278,7 +343,7 @@ fn listing_by_hypothesis_is_sorted_and_filtered() {
     );
 }
 
-/// Replaces a read-only file's content, as tampering would.
+/// Replaces a read-only file's content, as corruption or an edit would.
 fn replace(path: &Path, bytes: &[u8]) {
     fs::remove_file(path).unwrap();
     fs::write(path, bytes).unwrap();

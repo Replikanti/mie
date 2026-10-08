@@ -9,15 +9,25 @@
 //!
 //! A file holds the result text v1 ([`mie_domain::research`]) followed by
 //! the trailer line `sha256 <64 hex>`: the SHA-256 of every byte before it.
+//! The trailer is an unkeyed checksum: it detects accidental corruption
+//! (a torn write, bit rot, a bad copy), not deliberate edits — whoever can
+//! rewrite the file can rewrite the trailer. A forged result is caught by
+//! re-running its spec, which reports the stored result as diverged.
 //!
 //! - **Append only.** A result is written to a dot-prefixed temporary file
 //!   (`create_new`), synced, made read-only and then hard-linked to its
 //!   final name. A link never replaces an existing name, so two writers of
 //!   one key cannot both win and a stored result is never overwritten: the
 //!   loser gets [`ResultStoreError::AlreadyStored`]. The temporary name is
-//!   removed and the directory synced. There is deliberately no
-//!   check-then-rename fallback, which would race; a filesystem without hard
-//!   links fails with [`ResultStoreError::Io`].
+//!   removed. There is deliberately no check-then-rename fallback, which
+//!   would race; a filesystem without hard links fails with
+//!   [`ResultStoreError::Io`].
+//! - **Durable acknowledgements.** Every append that stores or finds its key
+//!   syncs the experiment directory and the root before it returns, and
+//!   [`FsResultStore::open`] syncs the directories that hold the root, so
+//!   no acknowledged result hangs on a directory entry that a crash could
+//!   still lose. When a sync fails after the link, the result is stored but
+//!   unconfirmed: [`ResultStoreError::NotDurable`].
 //! - **Collisions.** An append whose spec differs from a stored spec of the
 //!   same experiment id fails with [`ResultStoreError::Collision`].
 //! - **Verified reads.** A read checks the trailer
@@ -54,15 +64,22 @@ pub struct FsResultStore {
 }
 
 impl FsResultStore {
-    /// Opens the store at `root`, creating the directory if needed. Stored
-    /// specs resolve their features through the catalog registry.
+    /// Opens the store at `root`, creating the directory if needed, and
+    /// syncs the parent directories up to the nearest one that existed, so
+    /// the root's own entry is durable. Stored specs resolve their features
+    /// through the catalog registry.
     ///
     /// # Errors
     ///
-    /// [`ResultStoreError::Io`] when the directory cannot be created.
+    /// [`ResultStoreError::Io`] when the directory cannot be created or
+    /// synced.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, ResultStoreError> {
         let root = root.into();
+        let parents = parents_to_sync(&root);
         fs::create_dir_all(&root).map_err(|e| io(&root, &e))?;
+        for parent in &parents {
+            sync_dir(parent)?;
+        }
         Ok(Self {
             root,
             registry: catalog::registry(),
@@ -97,6 +114,20 @@ impl FsResultStore {
             .collect();
         keys.sort();
         Ok(keys)
+    }
+
+    /// Syncs the experiment directory `dir` and the root, so the result's
+    /// entry and the directory's own entry both survive a crash. Every
+    /// append that returns `Ok` or finds its key stored calls it: another
+    /// writer may have created `dir` or linked the file and not synced yet.
+    /// The error is the I/O detail.
+    fn sync_key_dirs(&self, dir: &Path) -> Result<(), String> {
+        for dir in [dir, &self.root] {
+            File::open(dir)
+                .and_then(|d| d.sync_all())
+                .map_err(|e| format!("{}: {e}", dir.display()))?;
+        }
+        Ok(())
     }
 
     /// Writes `bytes` to a new read-only temporary file in `dir`, synced.
@@ -180,10 +211,9 @@ impl ResearchResultStore for FsResultStore {
     fn append(&mut self, result: &ExperimentResult) -> Result<ResultKey, ResultStoreError> {
         let key = result.key();
         let dir = self.root.join(key.experiment.to_string());
-        if !dir.is_dir() {
-            fs::create_dir_all(&dir).map_err(|e| io(&dir, &e))?;
-            sync_dir(&self.root)?;
-        }
+        // Its entry in the root becomes durable with the sync after the
+        // link.
+        fs::create_dir_all(&dir).map_err(|e| io(&dir, &e))?;
         for stored_key in self.keys_of(key.experiment)? {
             if let Some(stored) = self.get(&stored_key)?
                 && stored.spec.canonical_text() != result.spec.canonical_text()
@@ -203,11 +233,16 @@ impl ResearchResultStore for FsResultStore {
         // ignores; the outcome of the link is what counts.
         let _ = fs::remove_file(&tmp);
         match linked {
-            Ok(()) => {
-                sync_dir(&dir)?;
-                Ok(key)
-            }
+            // The result is stored now; a failed sync cannot undo that, only
+            // leave it unconfirmed.
+            Ok(()) => match self.sync_key_dirs(&dir) {
+                Ok(()) => Ok(key),
+                Err(detail) => Err(ResultStoreError::NotDurable { key, detail }),
+            },
             Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                // The caller may take an identical stored result as its own
+                // (reproduced), so it must be as durable as a fresh one.
+                self.sync_key_dirs(&dir).map_err(ResultStoreError::Io)?;
                 let stored = self.get(&key)?.ok_or_else(|| {
                     ResultStoreError::Io(format!("{} exists but cannot be read", path.display()))
                 })?;
@@ -271,6 +306,25 @@ fn sorted_names(dir: &Path) -> Result<Vec<String>, ResultStoreError> {
     }
     names.sort();
     Ok(names)
+}
+
+/// The directories whose entries a new `root` adds: each parent up to and
+/// including the nearest one that exists already. A relative root's last
+/// parent is the current directory.
+fn parents_to_sync(root: &Path) -> Vec<PathBuf> {
+    let mut parents = Vec::new();
+    for parent in root.ancestors().skip(1) {
+        let parent = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        parents.push(parent.to_path_buf());
+        if parent.is_dir() {
+            break;
+        }
+    }
+    parents
 }
 
 fn sync_dir(dir: &Path) -> Result<(), ResultStoreError> {

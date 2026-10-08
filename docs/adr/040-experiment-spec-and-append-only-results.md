@@ -41,7 +41,12 @@ deciding them.
    `trigger`, `entry`, `invalidation`, `target`, `fees`, `slippage`,
    `funding`, `latency`. `state-filter` and `regime-filter` are required at
    least once; `none` alone means "explicitly unfiltered", `none` next to
-   filters and a repeated filter line are errors. The parser reports every
+   filters and a repeated filter line are errors. A regime feature is
+   filtered on one line only (`regime-filter <id@N> <LABEL,...>` lists every
+   admitted label of it); a second line on the same feature is an error, so
+   no id freezes an AND/OR reading of two lines and no contradictory pair
+   (`LOW` + `EXTREME`) validates. An event passes the regime filters when
+   every line admits its label. The parser reports every
    error in line order, then every missing field; an error names the field
    and its category (a missing `fees`, `slippage` or `funding` is a missing
    *cost assumption*, a missing `latency` a missing *latency assumption*).
@@ -96,7 +101,10 @@ deciding them.
    ports; `RunResearchExperiment` is the inbound port. The store contract:
    never replace, never delete; a second append of a key is
    `AlreadyStored { identical }`, a different spec under a stored
-   experiment id is `Collision`. ADR-020 holds structurally: only `mie-cli`
+   experiment id is `Collision`. `Ok` means stored and durable.
+   `NotDurable { key }` means stored and readable but not confirmed to
+   survive a crash (a sync failed after the result became visible); on
+   every other error nothing stored is changed. ADR-020 holds structurally: only `mie-cli`
    hands the writable store to `ExperimentService`; readers get
    `ResearchResultReader` only.
 9. **Append-only file adapter (D9).** `mie-adapter-fs` stores
@@ -104,7 +112,12 @@ deciding them.
    the trailer line `sha256 <64 hex>` over every byte before it. A write
    goes to a dot-prefixed temporary file (`create_new`, synced, made
    read-only) that is hard-linked to the final name; a link never replaces
-   a name, so of two writers of one key exactly one wins. Reads verify the
+   a name, so of two writers of one key exactly one wins. Every append that
+   links or finds its key syncs the experiment directory and the root before
+   it returns, and opening the store syncs the directories that hold the
+   root, so an acknowledged result never hangs on a directory entry another
+   writer has not synced yet. The trailer is an unkeyed integrity checksum
+   against accidental corruption, not tamper evidence. Reads verify the
    trailer (`Integrity`), parse the text and check that the file sits at
    its own key's path (`Corrupt`). Dot-files and unknown names are ignored,
    never deleted.
@@ -125,8 +138,12 @@ deciding them.
   types or line kinds without touching v1; anything that needs to change
   existing lines is a spec text v2.
 - FNV-1a 64 can collide. The store compares the stored spec text and
-  returns `Collision`; it never overwrites. The SHA-256 trailer, not the
-  id, is the tamper evidence.
+  returns `Collision`; it never overwrites.
+- The SHA-256 trailer detects accidental corruption (a torn write, bit rot,
+  a bad copy). It is unkeyed, so whoever can rewrite a result file can
+  rewrite its trailer: it is not tamper evidence. A forged result is caught
+  by re-running its spec, which reports `Diverged`; a keyed or signed
+  trailer is left to a later ADR if results ever cross a trust boundary.
 - A feature version bump of a used feature cannot be re-run until
   `MarketStateEngine::with_features` lands; the error names the feature.
 - Results are not type-sealed across crates: the ADR-020 guarantee is the

@@ -149,13 +149,16 @@ pub trait ResearchResultReader {
 /// append under a stored key fails with [`ResultStoreError::AlreadyStored`]
 /// and leaves the stored result untouched; so does an append whose spec
 /// differs from a stored spec with the same experiment id
-/// ([`ResultStoreError::Collision`]).
+/// ([`ResultStoreError::Collision`]). `Ok` means the result is stored and
+/// durable: it survives a crash or power loss.
 pub trait ResearchResultStore: ResearchResultReader {
     /// Stores `result` under [`ExperimentResult::key`] and returns the key.
     ///
     /// # Errors
     ///
-    /// [`ResultStoreError`]; nothing stored is changed on any error.
+    /// [`ResultStoreError`]. [`ResultStoreError::NotDurable`] means the
+    /// result is stored and readable but may not survive a crash; on every
+    /// other error nothing stored is changed.
     fn append(&mut self, result: &ExperimentResult) -> Result<ResultKey, ResultStoreError>;
 }
 
@@ -180,6 +183,16 @@ pub enum ResultStoreError {
     /// A stored result is intact but not where its key says it belongs, or
     /// does not parse.
     Corrupt(String),
+    /// The result was stored and is readable, but the store could not make
+    /// it durable (for example, a directory sync failed), so it may not
+    /// survive a crash. It is not rewritten; a later run of the key finds it
+    /// stored or, after a crash, appends it again.
+    NotDurable {
+        /// The key.
+        key: ResultKey,
+        /// What failed.
+        detail: String,
+    },
     /// The store cannot be read or written.
     Io(String),
 }
@@ -206,6 +219,10 @@ impl fmt::Display for ResultStoreError {
             ),
             Self::Integrity(detail) => write!(f, "stored result failed verification: {detail}"),
             Self::Corrupt(detail) => write!(f, "stored result is corrupt: {detail}"),
+            Self::NotDurable { key, detail } => write!(
+                f,
+                "result {key} is stored, but it may not survive a crash: {detail}"
+            ),
             Self::Io(detail) => write!(f, "result store I/O failed: {detail}"),
         }
     }
@@ -236,7 +253,7 @@ mod tests {
             ),
             (
                 ResultStoreError::AlreadyStored {
-                    key,
+                    key: key.clone(),
                     identical: false,
                 },
                 "result 00000000000000ab/research.replay_summary@1 is already stored with a \
@@ -254,6 +271,14 @@ mod tests {
             (
                 ResultStoreError::Corrupt("misplaced".to_owned()),
                 "stored result is corrupt: misplaced",
+            ),
+            (
+                ResultStoreError::NotDurable {
+                    key,
+                    detail: "fsync failed".to_owned(),
+                },
+                "result 00000000000000ab/research.replay_summary@1 is stored, but it may not \
+                 survive a crash: fsync failed",
             ),
             (
                 ResultStoreError::Io("disk full".to_owned()),

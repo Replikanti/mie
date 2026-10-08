@@ -56,7 +56,10 @@
 //! `slippage`, `funding`, `latency`. Required at least once: `state-filter`
 //! and `regime-filter`; `none` as the only line of its kind means
 //! "explicitly unfiltered", `none` mixed with filters is an error, and a
-//! filter line given twice is a duplicate.
+//! filter line given twice is a duplicate. A regime feature is filtered on
+//! one line only: every admitted label of it goes on that line, and a
+//! second line on the same feature is an error. An event passes the regime
+//! filters when every line admits its label.
 //!
 //! | Key | Arguments |
 //! |---|---|
@@ -65,7 +68,7 @@
 //! | `data` | the dataset version, 64 lowercase hex |
 //! | `features` | `<16 hex> <id@N,…\|none>`: the list resolves through the [`FeatureRegistry`](crate::feature::FeatureRegistry) into a [`FeatureSet`](crate::feature::FeatureSet), so it is closed over its upstream features; the hex must equal its [`FeatureSetVersion`](crate::feature::FeatureSetVersion) |
 //! | `state-filter` | a rule reference, or `none` |
-//! | `regime-filter` | `<id@N> <LABEL,…>` or `none`: a `volatility.regime.*` feature of the spec's set and ADR-017 labels, non-empty, without repeats |
+//! | `regime-filter` | `<id@N> <LABEL,…>` or `none`: a `volatility.regime.*` feature of the spec's set and ADR-017 labels, non-empty, without repeats; one line per feature |
 //! | `location`, `trigger`, `entry`, `invalidation`, `target`, `slippage`, `funding` | a rule reference |
 //! | `fees` | `maker=<decimal> taker=<decimal>`, fractions of notional, `0 <= fee < 1` |
 //! | `latency` | milliseconds, an integer from 0 to 3 600 000 |
