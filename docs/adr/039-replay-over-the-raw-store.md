@@ -1,6 +1,6 @@
 # ADR-039: Replay over the raw store — per-run recompute for live data, canonical merge for the archive
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-10-07
 
 ## Context
@@ -192,3 +192,17 @@ ADR-028 left one point open: a gap still open at the end of a replay window
 The #9 soak window replays twice with the same event-stream hash and
 dataset version, and the 12-month archive backfill replays end to end twice
 with the same hash and version.
+
+## Acceptance
+
+Accepted 2026-10-08 after the acceptance runs of #11 (binary from main
+`0ed4ba0`). The 12-month archive backfill (2025-10-01 … 2026-09-30) replayed
+twice end to end with byte-identical reports: 604 001 515 events, 0 missing
+days, 0 gaps, 0 domain rejections, event-stream `604001515:20929b98dfd17a44`,
+dataset `fa73cb88…`. The #9 soak window (two runs, about 30 h, including the
+deliberate restart and an unplanned network outage) replayed twice with
+byte-identical reports: both runs clean with every record replayed,
+event-stream `2112594:f3c4c547bf93d2e0`, dataset `437e2790…`. Its per-stream
+event, late-event and gap counts match `mie capture-report` on the same
+window exactly. Full results:
+https://github.com/Replikanti/mie/issues/11#issuecomment-6053915512
