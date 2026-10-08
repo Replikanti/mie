@@ -535,6 +535,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mie-adapter-fs"
+version = "0.1.0"
+dependencies = [
+ "mie-domain",
+ "mie-ports",
+ "sha2",
+]
+
+[[package]]
 name = "mie-adapter-parquet"
 version = "0.1.0"
 dependencies = [
@@ -560,6 +569,7 @@ name = "mie-cli"
 version = "0.1.0"
 dependencies = [
  "mie-adapter-binance",
+ "mie-adapter-fs",
  "mie-adapter-parquet",
  "mie-app",
  "mie-domain",

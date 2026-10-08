@@ -20,6 +20,7 @@ mie-ports.workspace = true
 mie-app.workspace = true
 mie-adapter-binance.workspace = true
 mie-adapter-parquet.workspace = true
+mie-adapter-fs.workspace = true
 # Typed ingest and archive configuration with `deny_unknown_fields`.
 serde = { version = "1", features = ["derive"] }
 # The JSON Lines capture journal (writing, and reading it back in

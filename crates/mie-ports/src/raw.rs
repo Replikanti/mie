@@ -16,6 +16,7 @@
 //! [`DatasetVersion`] identifies exactly the files it covers.
 
 use crate::outbound::ReplayWindow;
+use mie_domain::research::DataVersion;
 use mie_domain::time::EventTime;
 use std::collections::BTreeSet;
 use std::fmt;
@@ -227,6 +228,16 @@ impl fmt::Display for DatasetVersion {
     }
 }
 
+/// The domain's mirror of a dataset version, as experiments record it
+/// (ADR-040). ADR-030 keeps [`DatasetVersion`] in the ports; the domain
+/// cannot depend on them.
+impl From<&DatasetVersion> for DataVersion {
+    fn from(version: &DatasetVersion) -> Self {
+        DataVersion::from_hex(version.as_str())
+            .expect("a dataset version is 64 lowercase hex characters")
+    }
+}
+
 /// Whether `text` is a SHA-256 digest in the store's notation: exactly 64
 /// lowercase hex characters.
 pub fn is_sha256_hex(text: &str) -> bool {
@@ -321,6 +332,15 @@ impl std::error::Error for RawStoreError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_dataset_version_converts_to_the_domain_mirror() {
+        let hex = "0f".repeat(32);
+        let dataset = DatasetVersion::from_hex(&hex).unwrap();
+        let mirror = DataVersion::from(&dataset);
+        assert_eq!(mirror.as_str(), dataset.as_str());
+        assert_eq!(mirror, DataVersion::from_hex(&hex).unwrap());
+    }
 
     fn window(start: i64, end: i64) -> ReplayWindow {
         ReplayWindow {

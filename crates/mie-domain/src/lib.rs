@@ -26,6 +26,7 @@
 //! | Location / auction state                  | [`location`]                 |
 //! | Bias / trigger (ADR-012, ADR-024)         | [`trigger`]                  |
 //! | Strategy lifecycle / edge health          | [`strategy`]                 |
+//! | Experiments and results (ADR-040)         | [`research`]                 |
 //!
 //! Conditional Market Behavior, risk and validation rules join as modules
 //! here when their issues land — never as a dependency on a port or adapter.
@@ -42,6 +43,7 @@ pub mod num;
 pub mod order;
 pub mod profile;
 pub mod regime;
+pub mod research;
 pub mod state;
 pub mod strategy;
 pub mod structure;

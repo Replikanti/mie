@@ -1,12 +1,14 @@
 //! Driving (inbound) ports: the use cases the outside world invokes.
 //!
-//! Present: [`ReplayMarket`]. Planned, each landing with its issue:
-//! `AnalyzeMarket`, `RunResearchExperiment`, `EvaluateStrategy`,
-//! `ValidateCandidate`, `GenerateMarketReport`.
+//! Present: [`ReplayMarket`], [`RunResearchExperiment`] (ADR-040).
+//! Planned, each landing with its issue: `AnalyzeMarket`,
+//! `EvaluateStrategy`, `ValidateCandidate`, `GenerateMarketReport`.
 
-use crate::outbound::{ProviderError, ReplayWindow};
+use crate::outbound::{ProviderError, ReplayWindow, ResultStoreError};
 use crate::raw::DatasetVersion;
 use mie_domain::event_hash::EventStreamHash;
+use mie_domain::feature::FeatureKey;
+use mie_domain::research::{DataVersion, ExperimentResult, ExperimentSpec, ResultKey};
 use mie_domain::state::{MarketState, StateError};
 use std::fmt;
 
@@ -74,6 +76,110 @@ impl std::error::Error for UseCaseError {
         match self {
             Self::Provider(err) => Some(err),
             Self::Domain(err) => Some(err),
+        }
+    }
+}
+
+/// Runs an experiment through the deterministic research pipeline and
+/// records its result (ADR-040). The pipeline is the only writer of results
+/// (ADR-020).
+pub trait RunResearchExperiment {
+    /// Runs `spec` and records the result, or confirms the stored one.
+    ///
+    /// # Errors
+    ///
+    /// [`ResearchError`]; nothing is stored on any error.
+    fn run(&mut self, spec: &ExperimentSpec) -> Result<ExperimentRun, ResearchError>;
+}
+
+/// What a run of an experiment did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExperimentRun {
+    /// The result was new and is now stored.
+    Recorded(ExperimentResult),
+    /// The same result was already stored: the run reproduced it exactly.
+    Reproduced(ExperimentResult),
+}
+
+impl ExperimentRun {
+    /// The result, recorded or reproduced.
+    pub fn result(&self) -> &ExperimentResult {
+        match self {
+            Self::Recorded(result) | Self::Reproduced(result) => result,
+        }
+    }
+}
+
+/// Why an experiment run failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResearchError {
+    /// The market-data source failed.
+    Provider(ProviderError),
+    /// The replay opened other raw data than the spec names.
+    DataVersionMismatch {
+        /// The spec's data version.
+        declared: DataVersion,
+        /// The version the replay opened.
+        opened: DataVersion,
+    },
+    /// The engine does not compute this member of the spec's feature set at
+    /// its exact definition.
+    FeatureUnavailable {
+        /// The feature.
+        feature: FeatureKey,
+    },
+    /// The sample period holds no event.
+    EmptySample,
+    /// The run produced another result than the one stored under its key:
+    /// the run is not reproducible, and the stored result stays.
+    Diverged {
+        /// The key.
+        key: ResultKey,
+    },
+    /// The result store failed.
+    Store(ResultStoreError),
+}
+
+impl From<ProviderError> for ResearchError {
+    fn from(err: ProviderError) -> Self {
+        Self::Provider(err)
+    }
+}
+
+impl From<ResultStoreError> for ResearchError {
+    fn from(err: ResultStoreError) -> Self {
+        Self::Store(err)
+    }
+}
+
+impl fmt::Display for ResearchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Provider(err) => write!(f, "{err}"),
+            Self::DataVersionMismatch { declared, opened } => write!(
+                f,
+                "data version mismatch: the spec names {declared}, the sample opened {opened}"
+            ),
+            Self::FeatureUnavailable { feature } => write!(
+                f,
+                "feature {feature} is not computed by this build of the engine"
+            ),
+            Self::EmptySample => f.write_str("the sample period holds no event"),
+            Self::Diverged { key } => write!(
+                f,
+                "result {key} diverged: the run differs from the stored result, which stays"
+            ),
+            Self::Store(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl std::error::Error for ResearchError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Provider(err) => Some(err),
+            Self::Store(err) => Some(err),
+            _ => None,
         }
     }
 }
