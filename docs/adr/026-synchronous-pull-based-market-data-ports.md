@@ -37,3 +37,9 @@ the ports and the application services contain no async code.
 
 The Binance live adapter feeds the core through this port at full BTCUSDT
 trade and depth rates without dropped events or unbounded buffering.
+
+Progress 2026-10-09: the #9 soak (about 30 h, trades without depth) fed the
+core with channel blocked time 0 ms and high-water at most 753 of 65 536,
+with no dropped events. Trade rates are therefore covered. Depth rates are
+not yet: they need the #10 soak with all seven streams, and ADR-038 reports
+them.
