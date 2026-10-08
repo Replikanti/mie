@@ -345,16 +345,15 @@ impl WsConnection for DepthScripted {
     fn close(&mut self) {}
 }
 
-/// Runs one offline ingest of depth (and, if configured, open interest) at
-/// `start_ms`: the depth connections play their frames, snapshots and
-/// open-interest bodies are served by URL.
-pub fn ingest_depth(
-    config: &IngestConfig,
+/// The transports of an offline depth capture at `start_ms` and the
+/// shutdown flag the last depth connection sets: the depth connections play
+/// their frames, snapshots and open-interest bodies are served by URL.
+pub fn depth_transports(
     start_ms: i64,
     connections: Vec<DepthConnection>,
     snapshots: Vec<String>,
     open_interest: Vec<String>,
-) -> mie_cli::ingest::IngestOutcome {
+) -> (Transports, Arc<AtomicBool>) {
     let shutdown = Arc::new(AtomicBool::new(false));
     let http = RoutedHttp::new(snapshots, open_interest);
     let transports = Transports {
@@ -366,5 +365,18 @@ pub fn ingest_depth(
         http,
         clock: FakeClock::new(start_ms, "mie-depth"),
     };
+    (transports, shutdown)
+}
+
+/// Runs one offline ingest of depth (and, if configured, open interest) at
+/// `start_ms` over [`depth_transports`].
+pub fn ingest_depth(
+    config: &IngestConfig,
+    start_ms: i64,
+    connections: Vec<DepthConnection>,
+    snapshots: Vec<String>,
+    open_interest: Vec<String>,
+) -> mie_cli::ingest::IngestOutcome {
+    let (transports, shutdown) = depth_transports(start_ms, connections, snapshots, open_interest);
     mie_cli::ingest::run(config, transports, shutdown).expect("ingest starts")
 }

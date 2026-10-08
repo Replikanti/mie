@@ -130,7 +130,9 @@ with `u < lastUpdateId`, require the first applied diff to straddle
    `MissingData`, not `Disconnected`.
 9. **Recompute.** A recompute of a whole run (#11, #13) reads its records
    in `receive_seq` order plus `run_start`. A recompute that starts mid-run
-   syncs at its first snapshot record; replay windows are #11's.
+   syncs at its first snapshot record. `mie replay` recomputes whole runs
+   this way (ADR-039 D1), so book events, resync gaps and restart seed gaps
+   replay with the other streams, and its window restricts the output.
 
 ### Documentation check (2026-10-07)
 
