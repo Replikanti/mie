@@ -2,10 +2,10 @@
 //! ADR-030, ADR-032).
 //!
 //! [`start`] spawns one thread per WebSocket stream (module `ws`), one
-//! open-interest poller (module `rest`) and one capture thread. The
-//! producers hand frames and lifecycle events to the capture thread through
-//! a bounded channel. The capture thread is the only writer, and for every
-//! frame it
+//! open-interest poller (module `rest`), one order-book snapshot fetcher
+//! (module `depth_rest`, ADR-038) and one capture thread. The producers hand
+//! frames and lifecycle events to the capture thread through a bounded
+//! channel. The capture thread is the only writer, and for every frame it
 //!
 //! 1. assigns `receive_seq`, a per-run counter over all streams in
 //!    processing order;
@@ -16,6 +16,12 @@
 //! 4. pushes it through the [`Pipeline`];
 //! 5. sends the released events into the bounded core channel, which
 //!    [`BinanceLiveProvider`] drains.
+//!
+//! Around step 4 it also journals the order-book sync transitions, asks the
+//! snapshot fetcher for a snapshot when the book is unsynced (once per want
+//! id), and feeds the released events to a [`BookAudit`], which judges every
+//! checkpoint ([`CaptureEvent::BookCheckpoint`]). None of that changes what
+//! the core receives.
 //!
 //! So an event reaches the core only after its record was appended, and a
 //! frame that fails to normalize is still persisted. The sink is sealed every
@@ -28,10 +34,13 @@
 //! marker; the provider then returns `Ok(None)`. [`CaptureHandle::join`]
 //! hands the sink back.
 
+use crate::book_audit::{BookAudit, CheckpointResult};
+use crate::book_sync::BookTransition;
+use crate::depth_rest::DepthSnapshotTask;
 use crate::normalize::record_time;
 use crate::pipeline::{Pipeline, PipelineStats};
 use crate::rest::OiTask;
-use crate::stream::{BinanceStream, OI_POLL_INTERVAL_MS};
+use crate::stream::{BinanceStream, DEPTH_SNAPSHOT_LIMITS, OI_POLL_INTERVAL_MS, WsRoute};
 use crate::transport::{Clock, HttpGet, WsConnector};
 use crate::ws::WsTask;
 use mie_domain::event::{FeedGap, MarketEvent};
@@ -59,8 +68,11 @@ pub struct LiveConfig {
     pub source: String,
     /// Identifies the run in session ids, see [`run_id`].
     pub run_id: String,
-    /// WebSocket base URL; the stream path is appended after a `/`.
+    /// WebSocket base URL of the `/market` route; the stream path is
+    /// appended after a `/`.
     pub ws_base_url: String,
+    /// WebSocket base URL of the `/public` route (depth, ADR-038).
+    pub ws_public_base_url: String,
     /// REST base URL, without a trailing path.
     pub rest_base_url: String,
     /// The captured streams, each at most once. Their position staggers the
@@ -94,6 +106,13 @@ pub struct LiveConfig {
     /// Last persisted event time per stream from the previous run; the
     /// first event of each seeded stream opens with a restart gap.
     pub seeds: BTreeMap<BinanceStream, EventTime>,
+    /// `limit` of the REST depth snapshot, one of
+    /// [`DEPTH_SNAPSHOT_LIMITS`].
+    pub depth_snapshot_limit: u16,
+    /// Checkpoint snapshot cadence after the last successful fetch.
+    pub depth_checkpoint_interval: Duration,
+    /// Least time between two depth snapshot requests.
+    pub depth_snapshot_min_spacing: Duration,
 }
 
 impl LiveConfig {
@@ -105,6 +124,7 @@ impl LiveConfig {
             source: "binance-um".to_owned(),
             run_id: run_id.to_owned(),
             ws_base_url: "wss://fstream.binance.com/market/ws".to_owned(),
+            ws_public_base_url: "wss://fstream.binance.com/public/ws".to_owned(),
             rest_base_url: "https://fapi.binance.com".to_owned(),
             streams: BinanceStream::ALL.to_vec(),
             hold_back_ms: 2_000,
@@ -120,6 +140,9 @@ impl LiveConfig {
             core_capacity: 65_536,
             stats_interval: Duration::from_secs(60),
             seeds: BTreeMap::new(),
+            depth_snapshot_limit: 1_000,
+            depth_checkpoint_interval: Duration::from_secs(60),
+            depth_snapshot_min_spacing: Duration::from_secs(2),
         }
     }
 
@@ -149,6 +172,11 @@ impl LiveConfig {
             ("backoff_initial", self.backoff_initial),
             ("backoff_max", self.backoff_max),
             ("stats_interval", self.stats_interval),
+            ("depth_checkpoint_interval", self.depth_checkpoint_interval),
+            (
+                "depth_snapshot_min_spacing",
+                self.depth_snapshot_min_spacing,
+            ),
         ];
         if let Some((name, _)) = durations.iter().find(|(_, d)| d.is_zero()) {
             return invalid(format!("{name} must be positive"));
@@ -158,6 +186,19 @@ impl LiveConfig {
         }
         if self.hold_back_ms < 0 || self.oi_retime_ms < 0 {
             return invalid("hold_back_ms and oi_retime_ms must not be negative".to_owned());
+        }
+        if seen.contains(&BinanceStream::Depth) != seen.contains(&BinanceStream::DepthSnapshot) {
+            return invalid(
+                "depth and depthSnapshot are configured together: the diffs need snapshots \
+                 to sync, and snapshots alone are no book"
+                    .to_owned(),
+            );
+        }
+        if !DEPTH_SNAPSHOT_LIMITS.contains(&self.depth_snapshot_limit) {
+            return invalid(format!(
+                "depth_snapshot_limit {} is not one of {DEPTH_SNAPSHOT_LIMITS:?}",
+                self.depth_snapshot_limit
+            ));
         }
         self.streams
             .iter()
@@ -238,6 +279,30 @@ pub enum CaptureEvent {
         /// The wait.
         delay_ms: u64,
     },
+    /// One order-book snapshot fetch (ADR-038).
+    DepthSnapshotFetch {
+        /// Why it was fetched.
+        trigger: SnapshotTrigger,
+        /// When the request was sent, UTC ns.
+        request_ns: i64,
+        /// When the response (or failure) arrived, UTC ns.
+        response_ns: i64,
+        /// HTTP status; `None` on a transport failure.
+        status: Option<u16>,
+        /// Failure detail.
+        error: Option<String>,
+        /// Whether the body was persisted (2xx only).
+        persisted: bool,
+    },
+    /// An order-book sync-state change (ADR-038).
+    Book {
+        /// The change.
+        transition: BookTransition,
+        /// The `receive_seq` of the record that caused it.
+        receive_seq: u64,
+    },
+    /// The verdict on an order-book checkpoint (ADR-038).
+    BookCheckpoint(CheckpointResult),
     /// One open-interest poll.
     OiPoll {
         /// When the request was sent, UTC ns.
@@ -266,6 +331,15 @@ pub enum CaptureEvent {
     },
     /// Periodic counters.
     Stats(CaptureStats),
+}
+
+/// Why an order-book snapshot was fetched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotTrigger {
+    /// The book is unsynced and asked for one.
+    Sync,
+    /// The checkpoint cadence.
+    Checkpoint,
 }
 
 /// Receives capture events on the capture thread.
@@ -575,6 +649,13 @@ where
     let (core_tx, core_rx, core_gauge) = channel(config.core_capacity, &clock);
     let spawn_error = |e: std::io::Error| StartError(format!("spawn thread: {e}"));
 
+    let (snapshot_requests, mut snapshot_request_rx) =
+        if config.streams.contains(&BinanceStream::DepthSnapshot) {
+            let (tx, rx) = mpsc::sync_channel(1);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
     let capture = CaptureLoop {
         keys: config.streams.iter().copied().zip(keys).collect(),
         sink: Some(sink),
@@ -585,6 +666,9 @@ where
             &config.seeds,
         ),
         observer,
+        snapshot_requests,
+        requested_want: None,
+        audit: BookAudit::new(),
         clock: Arc::clone(&clock),
         rx: inbound_rx,
         inbound_gauge,
@@ -608,14 +692,19 @@ where
         let task_shutdown = Arc::clone(&shutdown);
         let clock = Arc::clone(&clock);
         let name = format!("mie-{}", stream.raw_name());
-        let handle = match stream.ws_path(&config.symbol) {
-            Some(path) => {
+        let rest = config.rest_base_url.trim_end_matches('/');
+        let handle = match (stream.ws_route(), stream.ws_path(&config.symbol)) {
+            (Some(route), Some(path)) => {
+                let base = match route {
+                    WsRoute::Market => &config.ws_base_url,
+                    WsRoute::Public => &config.ws_public_base_url,
+                };
                 let stagger = config
                     .rotation_stagger
                     .saturating_mul(u32::try_from(index).unwrap_or(u32::MAX));
                 let task = WsTask {
                     stream,
-                    url: format!("{}/{path}", config.ws_base_url.trim_end_matches('/')),
+                    url: format!("{}/{path}", base.trim_end_matches('/')),
                     run_id: config.run_id.clone(),
                     ping_interval: config.ping_interval,
                     liveness_timeout: config.liveness_timeout,
@@ -629,13 +718,32 @@ where
                 };
                 thread::Builder::new().name(name).spawn(move || task.run())
             }
-            None => {
-                let task = OiTask {
+            _ if stream == BinanceStream::DepthSnapshot => {
+                let Some(requests) = snapshot_request_rx.take() else {
+                    shutdown.store(true, Ordering::Relaxed);
+                    return Err(StartError("depthSnapshot configured twice".to_owned()));
+                };
+                let task = DepthSnapshotTask {
                     url: format!(
-                        "{}/fapi/v1/openInterest?symbol={}",
-                        config.rest_base_url.trim_end_matches('/'),
-                        config.symbol
+                        "{rest}/fapi/v1/depth?symbol={}&limit={}",
+                        config.symbol, config.depth_snapshot_limit
                     ),
+                    run_id: config.run_id.clone(),
+                    checkpoint_interval: config.depth_checkpoint_interval,
+                    min_spacing: config.depth_snapshot_min_spacing,
+                    backoff_initial: config.backoff_initial,
+                    backoff_max: config.backoff_max,
+                    http: Arc::clone(&http),
+                    clock,
+                    tx,
+                    requests,
+                    shutdown: task_shutdown,
+                };
+                thread::Builder::new().name(name).spawn(move || task.run())
+            }
+            _ if stream == BinanceStream::OpenInterest => {
+                let task = OiTask {
+                    url: format!("{rest}/fapi/v1/openInterest?symbol={}", config.symbol),
                     run_id: config.run_id.clone(),
                     backoff_initial: config.backoff_initial,
                     backoff_max: config.backoff_max,
@@ -645,6 +753,13 @@ where
                     shutdown: task_shutdown,
                 };
                 thread::Builder::new().name(name).spawn(move || task.run())
+            }
+            _ => {
+                shutdown.store(true, Ordering::Relaxed);
+                return Err(StartError(format!(
+                    "stream {} has no transport",
+                    stream.raw_name()
+                )));
             }
         };
         match handle {
@@ -678,6 +793,12 @@ struct CaptureLoop<S> {
     sink: Option<S>,
     pipeline: Pipeline,
     observer: Box<dyn CaptureObserver>,
+    /// Sync requests to the snapshot fetcher; `None` without depth.
+    snapshot_requests: Option<SyncSender<u64>>,
+    /// The last want id requested.
+    requested_want: Option<u64>,
+    /// Judges the book checkpoints in the released events.
+    audit: BookAudit,
     clock: Arc<dyn Clock>,
     rx: Receiver<Inbound>,
     inbound_gauge: Arc<Gauge>,
@@ -799,14 +920,42 @@ impl<S: RawRecordSink> CaptureLoop<S> {
                 error: error.to_string(),
             });
         }
+        for transition in pushed.book {
+            self.observe(&CaptureEvent::Book {
+                transition,
+                receive_seq,
+            });
+        }
+        self.request_snapshot();
         self.deliver(pushed.events);
         Ok(())
+    }
+
+    /// Asks the snapshot fetcher for a snapshot, once per want id. A full
+    /// channel already holds a request, which serves this id too.
+    fn request_snapshot(&mut self) {
+        let Some(tx) = &self.snapshot_requests else {
+            return;
+        };
+        let Some(want) = self.pipeline.book_snapshot_wanted() else {
+            return;
+        };
+        if self.requested_want != Some(want) {
+            match tx.try_send(want) {
+                Ok(()) | Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
+                    self.requested_want = Some(want);
+                }
+            }
+        }
     }
 
     fn deliver(&mut self, events: Vec<MarketEvent>) {
         for event in events {
             if let MarketEvent::FeedGap(gap) = &event {
                 self.observe(&CaptureEvent::Gap(*gap));
+            }
+            if let Some(result) = self.audit.apply(&event) {
+                self.observe(&CaptureEvent::BookCheckpoint(result));
             }
             if !self.core_gone && self.core_tx.send(CoreMsg::Event(event)).is_err() {
                 // The core stopped consuming: keep persisting until the
@@ -888,5 +1037,19 @@ mod tests {
         let mut bad_symbol = LiveConfig::new("r");
         bad_symbol.symbol = "BTC/USDT".to_owned();
         assert!(bad_symbol.validate().is_err());
+        for streams in [
+            vec![BinanceStream::Depth],
+            vec![BinanceStream::DepthSnapshot, BinanceStream::AggTrade],
+        ] {
+            let mut unpaired = LiveConfig::new("r");
+            unpaired.streams = streams;
+            assert!(unpaired.validate().is_err());
+        }
+        let mut limit = LiveConfig::new("r");
+        limit.depth_snapshot_limit = 999;
+        assert!(limit.validate().is_err());
+        let mut spacing = LiveConfig::new("r");
+        spacing.depth_snapshot_min_spacing = Duration::ZERO;
+        assert!(spacing.validate().is_err());
     }
 }

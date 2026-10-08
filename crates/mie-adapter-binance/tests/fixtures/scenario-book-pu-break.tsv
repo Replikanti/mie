@@ -1,0 +1,13 @@
+# Synthetic scenario: a pu break (ids 121..130 missing) desyncs the book;
+# nothing is delivered until a snapshot resyncs it behind one SequenceBreak
+# gap. receive_seq\tstream\tsession_id\tpayload
+1	depth	20261006T070000Z/depth/1	{"e":"depthUpdate","E":1791272000004,"T":1791272000000,"s":"BTCUSDT","ps":"BTCUSDT","U":100,"u":110,"pu":90,"b":[["85000.00","1.000"]],"a":[["85000.10","5.000"]]}
+2	depthSnapshot	20261006T070000Z/depthSnapshot/1	{"lastUpdateId":105,"E":1791271999983,"T":1791271999980,"bids":[["85000.00","2.000"],["84999.90","3.000"]],"asks":[["85000.10","1.000"],["85000.20","4.000"]]}
+3	depth	20261006T070000Z/depth/1	{"e":"depthUpdate","E":1791272000104,"T":1791272000100,"s":"BTCUSDT","ps":"BTCUSDT","U":111,"u":120,"pu":110,"b":[["85000.00","1.000"]],"a":[["85000.10","1.000"]]}
+4	markPrice	20261006T070000Z/markPrice/1	{"e":"markPriceUpdate","E":1791272000150,"s":"BTCUSDT","p":"85001.00000000","i":"85002.50000000","P":"85010.00000000","r":"0.00010000","T":1791273600000}
+5	depth	20261006T070000Z/depth/1	{"e":"depthUpdate","E":1791272000304,"T":1791272000300,"s":"BTCUSDT","ps":"BTCUSDT","U":131,"u":140,"pu":130,"b":[["85000.00","1.000"]],"a":[["85000.10","0.000"]]}
+6	depth	20261006T070000Z/depth/1	{"e":"depthUpdate","E":1791272000404,"T":1791272000400,"s":"BTCUSDT","ps":"BTCUSDT","U":141,"u":150,"pu":140,"b":[["85000.00","1.000"]],"a":[["85000.10","3.000"]]}
+7	depthSnapshot	20261006T070000Z/depthSnapshot/2	{"lastUpdateId":145,"E":1791272000353,"T":1791272000350,"bids":[["85000.00","2.000"],["84999.90","3.000"]],"asks":[["85000.10","1.000"],["85000.20","4.000"]]}
+8	depth	20261006T070000Z/depth/1	{"e":"depthUpdate","E":1791272000504,"T":1791272000500,"s":"BTCUSDT","ps":"BTCUSDT","U":151,"u":160,"pu":150,"b":[["85000.00","1.000"]],"a":[["85000.10","6.000"]]}
+9	markPrice	20261006T070000Z/markPrice/1	{"e":"markPriceUpdate","E":1791272001000,"s":"BTCUSDT","p":"85001.00000000","i":"85002.50000000","P":"85010.00000000","r":"0.00010000","T":1791273600000}
+10	markPrice	20261006T070000Z/markPrice/1	{"e":"markPriceUpdate","E":1791272003000,"s":"BTCUSDT","p":"85001.00000000","i":"85002.50000000","P":"85010.00000000","r":"0.00010000","T":1791273600000}

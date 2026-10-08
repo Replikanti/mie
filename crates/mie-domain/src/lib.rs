@@ -16,6 +16,7 @@
 //! | Canonical event order (ADR-028)           | [`order`]                    |
 //! | Market State                              | [`state`]                    |
 //! | Event-time bars (ADR-031)                 | [`bars`]                     |
+//! | L2 order book (ADR-038)                   | [`book`]                     |
 //! | Feature identity and versioning (ADR-029) | [`feature`], [`fingerprint`] |
 //! | Motion, ATR and regime (ADR-033)          | [`volatility`]               |
 //! | Order flow / aggression (ADR-035)         | [`flow`]                     |
@@ -30,6 +31,7 @@
 //! here when their issues land — never as a dependency on a port or adapter.
 
 pub mod bars;
+pub mod book;
 pub mod event;
 pub mod event_hash;
 pub mod feature;

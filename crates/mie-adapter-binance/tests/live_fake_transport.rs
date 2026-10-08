@@ -5,10 +5,12 @@
 //! thread and the provider. The fake clock advances only when the scripted
 //! stream's own thread sleeps or reads, so cadences are exact.
 
+use mie_adapter_binance::book_sync::{BookTransition, SnapshotRejection};
 use mie_adapter_binance::live::CaptureError;
 use mie_adapter_binance::transport::{Clock, HttpGet, ReadOutcome, WsConnection, WsConnector};
 use mie_adapter_binance::{
-    BinanceStream, CaptureEvent, CaptureObserver, CaptureSummary, LiveConfig, start,
+    BinanceStream, CaptureEvent, CaptureObserver, CaptureSummary, CheckpointResult, LiveConfig,
+    SnapshotTrigger, start,
 };
 use mie_domain::event::{GapReason, MarketEvent, Stream};
 use mie_domain::time::EventTime;
@@ -93,6 +95,8 @@ enum Connect {
 
 #[derive(Default)]
 struct WsLog {
+    /// Every URL connected to, in order.
+    urls: Vec<String>,
     /// (stream path, clock seconds) of every ping.
     pings: Vec<(String, f64)>,
     /// (stream path, clock seconds) of every close.
@@ -131,6 +135,7 @@ impl FakeConnector {
 
 impl WsConnector for FakeConnector {
     fn connect(&self, url: &str) -> Result<Box<dyn WsConnection>, String> {
+        self.log.lock().unwrap().urls.push(url.to_owned());
         let path = url.rsplit('/').next().unwrap().to_owned();
         let next = self
             .scripts
@@ -322,6 +327,7 @@ fn oi(time: i64) -> String {
 fn config(streams: &[BinanceStream]) -> LiveConfig {
     let mut config = LiveConfig::new("20261006T000000Z");
     config.ws_base_url = "wss://fake.invalid/ws".to_owned();
+    config.ws_public_base_url = "wss://fake.invalid/public/ws".to_owned();
     config.rest_base_url = "https://fake.invalid".to_owned();
     config.streams = streams.to_vec();
     config.hold_back_ms = 0;
@@ -396,6 +402,17 @@ fn run(
     let provider_error = loop {
         match provider.next_event() {
             Ok(Some(event)) => {
+                if let MarketEvent::BookSnapshot(snapshot) = &event {
+                    let needle = format!(r#""lastUpdateId":{},"#, snapshot.last_update_id);
+                    let log = sink_log.lock().unwrap();
+                    assert!(
+                        log.records
+                            .iter()
+                            .any(|(_, r)| String::from_utf8_lossy(&r.payload).contains(&needle)),
+                        "snapshot {} delivered before its record was appended",
+                        snapshot.last_update_id
+                    );
+                }
                 if let MarketEvent::Trade(trade) = &event {
                     let needle = format!(r#""a":{},"#, trade.trade_id);
                     let log = sink_log.lock().unwrap();
@@ -1269,4 +1286,321 @@ fn a_non_default_retime_allowance_is_an_input_of_the_recompute() {
     );
     assert_ne!(default, out.events);
     assert_eq!(open_interest_times(&default).len(), 4);
+}
+
+/// A depth diff setting `bids` and `asks` (price, quantity) levels.
+fn depth(first: u64, last: u64, prev: u64, time: i64, bids: &str, asks: &str) -> String {
+    format!(
+        r#"{{"e":"depthUpdate","E":{},"T":{time},"s":"BTCUSDT","ps":"BTCUSDT","U":{first},"u":{last},"pu":{prev},"b":[{bids}],"a":[{asks}]}}"#,
+        time + 4
+    )
+}
+
+/// A REST depth snapshot body.
+fn depth_snapshot(last: u64, time: i64, bids: &str, asks: &str) -> String {
+    format!(
+        r#"{{"lastUpdateId":{last},"E":{},"T":{time},"bids":[{bids}],"asks":[{asks}]}}"#,
+        time + 3
+    )
+}
+
+/// Answers depth snapshot requests from a script and records each URL and
+/// clock ms; asks for shutdown once the script is exhausted.
+struct DepthHttp {
+    script: Mutex<VecDeque<Http>>,
+    clock: Arc<FakeClock>,
+    shutdown: Arc<AtomicBool>,
+    requests: Mutex<Vec<(String, i64)>>,
+}
+
+impl DepthHttp {
+    fn new(script: Vec<Http>, clock: &Arc<FakeClock>, shutdown: &Arc<AtomicBool>) -> Arc<Self> {
+        Arc::new(Self {
+            script: Mutex::new(script.into()),
+            clock: Arc::clone(clock),
+            shutdown: Arc::clone(shutdown),
+            requests: Mutex::default(),
+        })
+    }
+
+    fn request_ms(&self) -> Vec<i64> {
+        let requests = self.requests.lock().unwrap();
+        requests.iter().map(|(_, ms)| ms - D0).collect()
+    }
+}
+
+impl HttpGet for DepthHttp {
+    fn get(&self, url: &str) -> Result<(u16, Vec<u8>), String> {
+        self.requests
+            .lock()
+            .unwrap()
+            .push((url.to_owned(), self.clock.now_utc_ns() / MS));
+        self.clock.advance(Duration::from_millis(37));
+        match self.script.lock().unwrap().pop_front() {
+            Some(Http::Status(status, body)) => Ok((status, body.into_bytes())),
+            Some(Http::Fail) => Err("scripted transport failure".to_owned()),
+            None => {
+                self.shutdown.store(true, Ordering::Relaxed);
+                Err("script exhausted".to_owned())
+            }
+        }
+    }
+}
+
+fn fetches(observed: &[CaptureEvent]) -> Vec<(SnapshotTrigger, i64, Option<u16>, bool)> {
+    observed
+        .iter()
+        .filter_map(|e| match e {
+            CaptureEvent::DepthSnapshotFetch {
+                trigger,
+                request_ns,
+                status,
+                persisted,
+                ..
+            } => Some((*trigger, request_ns / MS - D0, *status, *persisted)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn book_transitions(observed: &[CaptureEvent]) -> Vec<BookTransition> {
+    observed
+        .iter()
+        .filter_map(|e| match e {
+            CaptureEvent::Book { transition, .. } => Some(*transition),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn depth_syncs_on_requested_snapshots_and_audits_a_checkpoint() {
+    let shutdown = Arc::new(AtomicBool::new(false));
+    // The depth connection drives the clock.
+    let clock = FakeClock::new(D0, "mie-depth");
+    let bid = |p: &str, q: &str| format!(r#"["{p}","{q}"]"#);
+    let both = |a: String, b: String| format!("{a},{b}");
+    let script = vec![
+        Step::Frame(depth(11, 20, 10, D0, &bid("100.00", "1.000"), "")),
+        // A snapshot before the buffered diffs: rejected, asked again.
+        Step::AwaitRecords(2),
+        Step::AwaitRecords(3),
+        Step::Frame(depth(21, 30, 20, D0 + 100, &bid("99.00", "2.000"), "")),
+        // 31..=40 never arrive: the book desyncs and asks again.
+        Step::Frame(depth(41, 50, 40, D0 + 300, "", &bid("101.00", "3.000"))),
+        Step::AwaitRecords(6),
+        Step::Frame(depth(51, 60, 50, D0 + 400, &bid("100.00", "4.000"), "")),
+        // The checkpoint cadence.
+        Step::Tick(Duration::from_secs(6)),
+        Step::AwaitRecords(8),
+        Step::Shutdown,
+    ];
+    let connector = FakeConnector::new(
+        vec![("btcusdt@depth@100ms", vec![Connect::Open(script)])],
+        &clock,
+        &shutdown,
+    );
+    let http = DepthHttp::new(
+        vec![
+            Http::Status(
+                200,
+                depth_snapshot(
+                    5,
+                    D0 - 100,
+                    &bid("100.00", "9.000"),
+                    &bid("101.00", "5.000"),
+                ),
+            ),
+            Http::Status(
+                200,
+                depth_snapshot(
+                    15,
+                    D0 - 50,
+                    &bid("100.00", "1.000"),
+                    &bid("101.00", "5.000"),
+                ),
+            ),
+            Http::Status(
+                200,
+                depth_snapshot(
+                    45,
+                    D0 + 250,
+                    &both(bid("100.00", "1.000"), bid("99.00", "2.000")),
+                    &bid("101.00", "5.000"),
+                ),
+            ),
+            Http::Status(
+                200,
+                depth_snapshot(
+                    55,
+                    D0 + 350,
+                    &both(bid("100.00", "1.000"), bid("99.00", "2.000")),
+                    &bid("101.00", "3.000"),
+                ),
+            ),
+        ],
+        &clock,
+        &shutdown,
+    );
+    let mut cfg = config(&[BinanceStream::Depth, BinanceStream::DepthSnapshot]);
+    cfg.depth_checkpoint_interval = Duration::from_secs(5);
+    cfg.depth_snapshot_min_spacing = Duration::from_millis(1);
+    let log = Arc::clone(&connector.log);
+    let requests = Arc::clone(&http);
+    let out = run(cfg, connector, http, clock, shutdown, None);
+    assert!(out.provider_error.is_none());
+
+    // Depth is served on the public route.
+    assert_eq!(
+        log.lock().unwrap().urls,
+        ["wss://fake.invalid/public/ws/btcusdt@depth@100ms"]
+    );
+    let urls: Vec<String> = requests
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(url, _)| url.clone())
+        .collect();
+    assert_eq!(
+        urls.len(),
+        4,
+        "one request per want id, then the checkpoint"
+    );
+    assert!(
+        urls.iter()
+            .all(|u| u == "https://fake.invalid/fapi/v1/depth?symbol=BTCUSDT&limit=1000")
+    );
+    let triggers: Vec<SnapshotTrigger> = fetches(&out.observed).iter().map(|f| f.0).collect();
+    assert_eq!(
+        triggers,
+        [
+            SnapshotTrigger::Sync,
+            SnapshotTrigger::Sync,
+            SnapshotTrigger::Sync,
+            SnapshotTrigger::Checkpoint
+        ]
+    );
+    let transitions = book_transitions(&out.observed);
+    assert_eq!(
+        transitions[..5],
+        [
+            BookTransition::Desynced(GapReason::Disconnected),
+            BookTransition::SnapshotRejected(SnapshotRejection::TooOld),
+            BookTransition::Synced {
+                last_update_id: 15,
+                time: EventTime::from_millis(D0 - 50)
+            },
+            BookTransition::Desynced(GapReason::SequenceBreak),
+            BookTransition::Synced {
+                last_update_id: 45,
+                time: EventTime::from_millis(D0 + 250)
+            },
+        ]
+    );
+    assert!(matches!(
+        transitions[5],
+        BookTransition::CheckpointEmitted {
+            last_update_id: 55,
+            ..
+        }
+    ));
+    let checkpoints: Vec<&CheckpointResult> = out
+        .observed
+        .iter()
+        .filter_map(|e| match e {
+            CaptureEvent::BookCheckpoint(result) => Some(result),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        checkpoints,
+        [&CheckpointResult::Matched {
+            levels: 3,
+            window_bid_bps: Some(100),
+            window_ask_bps: Some(0),
+        }]
+    );
+    assert_eq!(out.gaps(), [(Stream::OrderBook, GapReason::SequenceBreak)]);
+    // Four snapshots persisted, sessions by fetch ordinal.
+    let records = out.records();
+    let snapshot_sessions: Vec<String> = records
+        .iter()
+        .map(|r| r.capture.as_ref().unwrap().session_id.clone())
+        .filter(|s| s.contains("depthSnapshot"))
+        .collect();
+    assert_eq!(snapshot_sessions.len(), 4);
+    assert!(
+        snapshot_sessions
+            .iter()
+            .all(|s| s == "20261006T000000Z/depthSnapshot/1")
+    );
+}
+
+#[test]
+fn depth_checkpoints_keep_their_cadence_spacing_and_backoff() {
+    let shutdown = Arc::new(AtomicBool::new(false));
+    // The snapshot fetcher drives the clock; no diff ever arrives.
+    let clock = FakeClock::new(D0, "mie-depthSnapshot");
+    let body = |id: u64| depth_snapshot(id, D0, r#"["100.00","1.000"]"#, "");
+    let http = DepthHttp::new(
+        vec![
+            Http::Status(200, body(1)),
+            Http::Status(429, "{\"code\":-1003}".to_owned()),
+            Http::Status(503, "unavailable".to_owned()),
+            Http::Status(200, body(2)),
+            Http::Fail,
+            Http::Status(200, body(3)),
+        ],
+        &clock,
+        &shutdown,
+    );
+    let connector = FakeConnector::new(
+        vec![("btcusdt@depth@100ms", vec![Connect::Open(vec![])])],
+        &clock,
+        &shutdown,
+    );
+    let mut cfg = config(&[BinanceStream::Depth, BinanceStream::DepthSnapshot]);
+    cfg.depth_checkpoint_interval = Duration::from_secs(10);
+    cfg.depth_snapshot_min_spacing = Duration::from_secs(2);
+    cfg.backoff_initial = Duration::from_secs(5);
+    cfg.backoff_max = Duration::from_secs(20);
+    let requests = Arc::clone(&http);
+    let out = run(cfg, connector, http, clock, shutdown, None);
+    // 10 s after the start; 10 s after the success (10 037); a 429 defers
+    // past 20 074 + 5 000; a 503 only waits the 2 s spacing between request
+    // starts; a transport failure too; 10 s after the last success the
+    // script ends.
+    assert_eq!(
+        requests.request_ms(),
+        [10_000, 20_037, 25_074, 27_074, 37_111, 39_111, 49_148]
+    );
+    assert_eq!(
+        fetches(&out.observed),
+        [
+            (SnapshotTrigger::Checkpoint, 10_000, Some(200), true),
+            (SnapshotTrigger::Checkpoint, 20_037, Some(429), false),
+            (SnapshotTrigger::Checkpoint, 25_074, Some(503), false),
+            (SnapshotTrigger::Checkpoint, 27_074, Some(200), true),
+            (SnapshotTrigger::Checkpoint, 37_111, None, false),
+            (SnapshotTrigger::Checkpoint, 39_111, Some(200), true),
+            (SnapshotTrigger::Checkpoint, 49_148, None, false),
+        ]
+    );
+    // Failures are never persisted; the ordinal grows after each.
+    let sessions: Vec<String> = out
+        .records()
+        .iter()
+        .map(|r| r.capture.as_ref().unwrap().session_id.clone())
+        .collect();
+    assert_eq!(
+        sessions,
+        [
+            "20261006T000000Z/depthSnapshot/1",
+            "20261006T000000Z/depthSnapshot/3",
+            "20261006T000000Z/depthSnapshot/4",
+        ]
+    );
+    // Without diffs nothing reaches the core.
+    assert!(out.events.is_empty(), "{:?}", out.events);
 }

@@ -5,14 +5,17 @@
 //!
 //! | `type` | Written by | Content |
 //! |---|---|---|
-//! | `run_start` | ingest | symbol, streams, hold-back, open-interest re-time allowance, seeds per stream: the run's pipeline parameters ([`RunParameters`]) |
+//! | `run_start` | ingest | symbol, streams, hold-back, open-interest re-time allowance, seeds per stream: the run's pipeline parameters ([`RunParameters`]); depth snapshot limit and checkpoint interval (informational) |
 //! | `recovery` | ingest | parts rolled forward and discarded by the store |
 //! | `connected`, `connect_failed`, `disconnected`, `planned_rotation`, `backoff` | capture | connection lifecycle per stream |
 //! | `oi_poll` | capture | request/response time (ns), status, whether persisted |
+//! | `depth_snapshot_fetch` | capture | `trigger` (sync, checkpoint), request/response time (ns), status, whether persisted |
+//! | `book` | capture | an order-book sync change: `event` = desync, sync, snapshot_rejected, checkpoint_emitted, checkpoint_skipped; its cause, reason or id; the `receive_seq` of the record that caused it |
+//! | `book_checkpoint` | capture | the audit of a checkpoint: `result` = matched, mismatched, unverifiable, invalidated, with levels compared, window in bps or mismatch examples |
 //! | `gap` | capture | `stream`, `start`, `end` (ms), `reason`, as delivered to the core |
 //! | `sealed` | capture | the files sealed |
 //! | `normalize_error` | capture | stream, `receive_seq`, error |
-//! | `stats` | capture | counters, channel high-water marks and blocked time |
+//! | `stats` | capture | counters (the order-book sync counters under `streams.depth.book`), channel high-water marks and blocked time |
 //! | `domain_rejection` | ingest | an event the engine rejected |
 //! | `run_end` | ingest | totals and the exit code |
 //!
@@ -30,7 +33,11 @@
 //! recomputes (ADR-039 D1).
 
 use mie_adapter_binance::live::ChannelStats;
-use mie_adapter_binance::{BinanceStream, CaptureEvent, CaptureObserver, LiveRun, PipelineStats};
+use mie_adapter_binance::{
+    BinanceStream, BookStats, BookTransition, CaptureEvent, CaptureObserver, CheckpointResult,
+    LiveRun, PipelineStats, SnapshotTrigger,
+};
+use mie_domain::book::{Invalidation, Side};
 use mie_domain::time::EventTime;
 use mie_ports::raw::SealedFile;
 use serde_json::{Map, Value, json};
@@ -362,6 +369,32 @@ fn describe(event: &CaptureEvent) -> (&'static str, Value) {
                 "persisted": persisted,
             }),
         ),
+        CaptureEvent::DepthSnapshotFetch {
+            trigger,
+            request_ns,
+            response_ns,
+            status,
+            error,
+            persisted,
+        } => (
+            "depth_snapshot_fetch",
+            json!({
+                "trigger": match trigger {
+                    SnapshotTrigger::Sync => "sync",
+                    SnapshotTrigger::Checkpoint => "checkpoint",
+                },
+                "request_time_ns": request_ns,
+                "response_time_ns": response_ns,
+                "status": status,
+                "error": error,
+                "persisted": persisted,
+            }),
+        ),
+        CaptureEvent::Book {
+            transition,
+            receive_seq,
+        } => ("book", book_json(transition, *receive_seq)),
+        CaptureEvent::BookCheckpoint(result) => ("book_checkpoint", checkpoint_json(result)),
         CaptureEvent::Gap(gap) => (
             "gap",
             json!({
@@ -395,6 +428,98 @@ fn describe(event: &CaptureEvent) -> (&'static str, Value) {
     }
 }
 
+/// An order-book sync change as journal JSON.
+fn book_json(transition: &BookTransition, receive_seq: u64) -> Value {
+    let mut value = match transition {
+        BookTransition::Desynced(cause) => {
+            json!({"event": "desync", "cause": format!("{cause:?}")})
+        }
+        BookTransition::Synced {
+            last_update_id,
+            time,
+        } => json!({"event": "sync", "last_update_id": last_update_id, "time": time.as_millis()}),
+        BookTransition::SnapshotRejected(reason) => {
+            json!({"event": "snapshot_rejected", "reason": format!("{reason:?}")})
+        }
+        BookTransition::CheckpointEmitted {
+            last_update_id,
+            time,
+        } => json!({
+            "event": "checkpoint_emitted",
+            "last_update_id": last_update_id,
+            "time": time.as_millis(),
+        }),
+        BookTransition::CheckpointSkipped(reason) => {
+            json!({"event": "checkpoint_skipped", "reason": format!("{reason:?}")})
+        }
+    };
+    value["receive_seq"] = json!(receive_seq);
+    value
+}
+
+/// A checkpoint verdict as journal JSON.
+fn checkpoint_json(result: &CheckpointResult) -> Value {
+    match result {
+        CheckpointResult::Matched {
+            levels,
+            window_bid_bps,
+            window_ask_bps,
+        } => json!({
+            "result": "matched",
+            "levels": levels,
+            "window_bid_bps": window_bid_bps,
+            "window_ask_bps": window_ask_bps,
+        }),
+        CheckpointResult::Mismatched {
+            levels,
+            mismatches,
+            examples,
+        } => json!({
+            "result": "mismatched",
+            "levels": levels,
+            "mismatches": mismatches,
+            "examples": examples
+                .iter()
+                .map(|m| json!({
+                    "side": side(m.side),
+                    "price": m.price.to_string(),
+                    "ours": m.ours.map(|q| q.to_string()),
+                    "theirs": m.theirs.map(|q| q.to_string()),
+                }))
+                .collect::<Vec<_>>(),
+        }),
+        CheckpointResult::Unverifiable(reason) => {
+            json!({"result": "unverifiable", "reason": format!("{reason:?}")})
+        }
+        CheckpointResult::Invalidated(why) => json!({
+            "result": "invalidated",
+            "reason": match why {
+                Invalidation::Gap(reason) => format!("Gap({reason:?})"),
+                Invalidation::MissedStraddle {
+                    snapshot_id,
+                    first_update_id,
+                    last_update_id,
+                } => format!(
+                    "MissedStraddle(snapshot {snapshot_id}, update {first_update_id}..={last_update_id})"
+                ),
+                Invalidation::ChainBreak { expected, found } => {
+                    format!("ChainBreak(expected {expected}, found {found})")
+                }
+                Invalidation::NegativeQty { side: s, price } => {
+                    format!("NegativeQty({} {price})", side(*s))
+                }
+            },
+        }),
+    }
+}
+
+fn side(side: Side) -> &'static str {
+    match side {
+        Side::Bid => "bid",
+        Side::Ask => "ask",
+    }
+}
+
 /// Sealed files as journal JSON.
 pub fn files_json(files: &[SealedFile]) -> Value {
     files
@@ -420,9 +545,10 @@ fn channel_json(channel: &ChannelStats) -> Value {
     })
 }
 
-/// Per-stream pipeline counters as journal JSON.
+/// Per-stream pipeline counters as journal JSON. The order-book sync
+/// counters ride on the `depth` stream, under `book`.
 pub fn pipeline_json(stats: &PipelineStats) -> Value {
-    let streams: Map<String, Value> = stats
+    let mut streams: Map<String, Value> = stats
         .streams
         .iter()
         .map(|(stream, s)| {
@@ -444,7 +570,34 @@ pub fn pipeline_json(stats: &PipelineStats) -> Value {
             (stream.raw_name().to_owned(), value)
         })
         .collect();
+    if stats.book != BookStats::default() {
+        let depth = streams
+            .entry(BinanceStream::Depth.raw_name())
+            .or_insert_with(|| json!({}));
+        depth["book"] = book_stats_json(&stats.book);
+    }
     Value::Object(streams)
+}
+
+/// The order-book sync counters as journal JSON.
+fn book_stats_json(book: &BookStats) -> Value {
+    let by = |map: Vec<(String, u64)>| -> Map<String, Value> {
+        map.into_iter().map(|(k, n)| (k, json!(n))).collect()
+    };
+    json!({
+        "syncs": book.syncs,
+        "desyncs": by(book.desyncs.iter().map(|(k, n)| (format!("{k:?}"), *n)).collect()),
+        "stale_diffs": book.stale_diffs,
+        "buffer_drops": book.buffer_drops,
+        "snapshots_rejected": by(
+            book.snapshots_rejected.iter().map(|(k, n)| (format!("{k:?}"), *n)).collect()
+        ),
+        "snapshot_errors": book.snapshot_errors,
+        "checkpoints_emitted": book.checkpoints_emitted,
+        "checkpoints_skipped": by(
+            book.checkpoints_skipped.iter().map(|(k, n)| (format!("{k:?}"), *n)).collect()
+        ),
+    })
 }
 
 #[cfg(test)]
@@ -532,7 +685,7 @@ mod tests {
         ]);
         assert!(ended_twice.unwrap_err().contains("ended twice"));
         let mut broken: Value = serde_json::from_str(&start("A", 1_000, "binance-um")).unwrap();
-        broken["streams"] = json!(["depth"]);
+        broken["streams"] = json!(["bookTicker"]);
         let unknown = read(&[broken.to_string()]);
         assert!(
             unknown

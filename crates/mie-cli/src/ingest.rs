@@ -129,6 +129,11 @@ pub fn run(
             "hold_back_ms": config.capture.hold_back_ms,
             "oi_retime_ms": config.capture.oi_retime_allowance_ms,
             "seal_interval_secs": config.capture.seal_interval_secs,
+            "depth_snapshot_limit": config.capture.depth_snapshot_limit,
+            "depth_checkpoint_interval_ms": config
+                .capture
+                .depth_checkpoint_interval_secs
+                .saturating_mul(1_000),
             "seeds": seeds
                 .iter()
                 .map(|(s, t)| (s.raw_name().to_owned(), json!(t.as_millis())))

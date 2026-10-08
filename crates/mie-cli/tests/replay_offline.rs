@@ -6,10 +6,15 @@
 //! - Determinism: the same window prints the same report and hash.
 //! - Look-ahead: the sequence is strictly increasing, and open interest is
 //!   never delivered before its exchange time.
+//! - Order book (ADR-038): a depth capture replays to the book events live
+//!   delivered, resyncs and restart seed gaps included.
 
 mod common;
 
-use common::{D0, HOUR, TempDir, agg, config, ingest, journal};
+use common::{
+    D0, DepthConnection, HOUR, TempDir, agg, config, config_with, depth, depth_snapshot,
+    depth_transports, ingest, ingest_depth, journal,
+};
 use mie_adapter_binance::archive::catalog::{DAY_MS, parse_day};
 use mie_adapter_binance::archive::normalize::record_time as archive_record_time;
 use mie_adapter_binance::archive::{ARCHIVE_SOURCE, ArchiveStream};
@@ -21,6 +26,7 @@ use mie_adapter_parquet::{ParquetRawStore, RotationPolicy};
 use mie_cli::config::ArchiveConfig;
 use mie_cli::journal::read_runs;
 use mie_cli::replay::{self, ReplayOutcome, ReplayRequest, ReplaySource};
+use mie_domain::book::{BookStep, Invalidation, OrderBook};
 use mie_domain::event::{GapReason, MarketEvent, Stream};
 use mie_domain::num::{Price, Qty, Rate};
 use mie_domain::state::MarketStateEngine;
@@ -488,6 +494,188 @@ fn the_same_window_replays_to_the_same_bytes_and_matches_the_journal() {
             "{text}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// The order book through the replay (ADR-038, ADR-039).
+
+/// A depth capture at `t`: a sync, a reconnect, and a resync from the
+/// second snapshot.
+fn depth_script(t: i64) -> (Vec<DepthConnection>, Vec<String>) {
+    (
+        vec![
+            DepthConnection {
+                frames: vec![depth(11, 20, 10, t), depth(21, 30, 20, t + 100)],
+                await_served: 1,
+            },
+            DepthConnection {
+                frames: vec![depth(41, 50, 40, t + 5_000)],
+                await_served: 2,
+            },
+        ],
+        vec![depth_snapshot(15, t - 50), depth_snapshot(45, t + 4_950)],
+    )
+}
+
+/// The book `events` rebuild and its steps, unrelated events left out.
+fn book_steps(events: &[MarketEvent]) -> (OrderBook, Vec<BookStep>) {
+    let mut book = OrderBook::new();
+    let steps = events
+        .iter()
+        .map(|e| book.apply(e))
+        .filter(|step| *step != BookStep::Unrelated)
+        .collect();
+    (book, steps)
+}
+
+#[test]
+fn a_replay_of_a_depth_capture_equals_the_book_live_delivered() {
+    let dir = TempDir::new("replay-depth-round-trip");
+    let config = config_with(dir.path(), &["depth", "depthSnapshot"]);
+    let t = D0 + HOUR;
+    let (connections, snapshots) = depth_script(t);
+    let (transports, shutdown) = depth_transports(t, connections, snapshots, vec![]);
+    let clock = Arc::clone(&transports.clock);
+    let live = config
+        .live_config("20261006T010000Z", BTreeMap::new())
+        .unwrap();
+    let store = ParquetRawStore::new(&config.paths.raw_root);
+    let writer = store
+        .writer("binance-um", RotationPolicy::default())
+        .unwrap();
+    let (mut provider, handle) = start(
+        live.clone(),
+        writer,
+        transports.connector,
+        transports.http,
+        transports.clock,
+        Box::new(Silent),
+        shutdown,
+    )
+    .unwrap();
+    let delivered = drain(&mut provider);
+    drop(provider);
+    let (writer, summary) = handle.join().unwrap();
+    writer.close().unwrap();
+    assert_eq!(summary.stats.records, 3 + 2);
+
+    let run = LiveRun {
+        run_id: live.run_id.clone(),
+        symbol: live.symbol.clone(),
+        hold_back_ms: live.hold_back_ms,
+        oi_retime_ms: live.oi_retime_ms,
+        seeds: BTreeMap::new(),
+        streams: live.streams.clone(),
+        started_at_ms: t,
+        ended_at_ms: Some(clock.now_utc_ns() / 1_000_000),
+        clean_records: Some(summary.stats.records),
+    };
+    let replay = LiveReplay::new(&store, "binance-um", "BTCUSDT", vec![run]);
+    let replayed = drain(&mut replay.replay(window(D0, D0 + DAY_MS)).unwrap().stream);
+    assert_eq!(replayed, delivered);
+    assert_no_look_ahead(&replayed);
+
+    // Sync, the reconnect's gap, resync: the replayed book ends valid.
+    let (book, steps) = book_steps(&replayed);
+    assert_eq!(
+        steps,
+        [
+            BookStep::Reset,
+            BookStep::Applied,
+            BookStep::Applied,
+            BookStep::Invalidated(Invalidation::Gap(GapReason::Disconnected)),
+            BookStep::Reset,
+            BookStep::Applied,
+        ]
+    );
+    assert!(book.is_valid());
+    assert_eq!(book.last_update_id(), Some(50));
+}
+
+#[test]
+fn mie_replay_carries_the_book_across_restarts_as_journaled() {
+    let dir = TempDir::new("replay-depth-runs");
+    let config = config_with(dir.path(), &["depth", "depthSnapshot"]);
+    let t1 = D0 + HOUR;
+    let (connections, snapshots) = depth_script(t1);
+    let first = ingest_depth(&config, t1, connections, snapshots, vec![]);
+    let t2 = t1 + HOUR;
+    let second = ingest_depth(
+        &config,
+        t2,
+        vec![DepthConnection {
+            frames: vec![depth(911, 920, 910, t2 + 10)],
+            await_served: 1,
+        }],
+        vec![depth_snapshot(915, t2 + 5)],
+        vec![],
+    );
+    assert_eq!((first.exit_code(), second.exit_code()), (0, 0));
+
+    let all = window(D0, D0 + DAY_MS);
+    let (outcome, text) = run_replay(&ReplayRequest {
+        source: ReplaySource::Live(config.clone()),
+        window: all,
+    });
+    assert!(outcome.pass, "{text}");
+    assert_eq!(outcome.events, first.events + second.events);
+    assert_eq!(outcome.domain_rejections, 0);
+    assert!(
+        text.contains("delivered OrderBook: events 7, gaps Disconnected 2"),
+        "{text}"
+    );
+
+    // The replayed book gaps are the journaled ones, the restart's seed gap
+    // included, and the book resyncs after each.
+    let runs: Vec<LiveRun> = read_runs(&config.paths.journal, "binance-um")
+        .unwrap()
+        .iter()
+        .map(|r| r.live_run())
+        .collect();
+    assert!(
+        runs.iter()
+            .all(|r| r.streams.contains(&BinanceStream::Depth))
+    );
+    let store = ParquetRawStore::new(&config.paths.raw_root);
+    let replayed = drain(
+        &mut LiveReplay::new(&store, "binance-um", "BTCUSDT", runs)
+            .replay(all)
+            .unwrap()
+            .stream,
+    );
+    let replayed_gaps: Vec<(String, i64, i64)> = replayed
+        .iter()
+        .filter_map(|e| match e {
+            MarketEvent::FeedGap(g) => Some((
+                format!("{:?}", g.reason),
+                g.start.as_millis(),
+                g.end.as_millis(),
+            )),
+            _ => None,
+        })
+        .collect();
+    let journaled: Vec<(String, i64, i64)> = journal(&config)
+        .iter()
+        .filter(|l| l["type"] == "gap")
+        .map(|l| {
+            (
+                l["reason"].as_str().unwrap().to_owned(),
+                l["start"].as_i64().unwrap(),
+                l["end"].as_i64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        replayed_gaps,
+        [
+            ("Disconnected".to_owned(), t1 + 100, t1 + 4_950),
+            ("Disconnected".to_owned(), t1 + 5_000, t2 + 5),
+        ]
+    );
+    assert_eq!(replayed_gaps, journaled);
+    let (book, _) = book_steps(&replayed);
+    assert!(book.is_valid());
+    assert_eq!(book.last_update_id(), Some(920));
 }
 
 // ---------------------------------------------------------------------------

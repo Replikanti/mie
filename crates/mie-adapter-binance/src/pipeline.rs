@@ -1,11 +1,19 @@
 //! Raw records → canonical domain events: normalization, per-stream
-//! continuity and the canonical merge, composed.
+//! continuity, order-book sync and the canonical merge, composed.
+//!
+//! The `depth` and `depthSnapshot` records go through one
+//! [`BookSequencer`] (ADR-038); every other stream through its own
+//! [`StreamSequencer`]. If the hold-back turns a book event into a
+//! `LateEvent` gap, the book desyncs (`SequenceBreak`) and the rest of that
+//! record's book events are dropped: the next resync announces the period.
 //!
 //! [`Pipeline`] has no clock and does no I/O. Its output is a pure function
 //! of its parameters and of the records it is given, in the order given:
 //!
 //! - the parameters of [`Pipeline::new`]: the symbol, `hold_back_ms`,
-//!   `oi_retime_ms` (ADR-032 D12) and the per-stream seeds. They are **not** in the raw store: live capture
+//!   `oi_retime_ms` (ADR-032 D12) and the per-stream seeds (the book is
+//!   seeded with the later of the `depth` and `depthSnapshot` seeds). They
+//!   are **not** in the raw store: live capture
 //!   journals them in the run's `run_start` line, and a recompute must take
 //!   them from there, never from configuration defaults;
 //! - per record: the stream, the payload, the raw `event_time` and the
@@ -17,6 +25,7 @@
 //! raw store, ordered by `receive_seq` within a run, plus that run's
 //! `run_start` parameters.
 
+use crate::book_sync::{BookSequencer, BookStats, BookTransition};
 use crate::holdback::{Admission, HoldBack};
 use crate::normalize::{self, NormalizeError};
 use crate::sequence::{Seed, StreamSequencer};
@@ -50,10 +59,15 @@ pub struct StreamStats {
 }
 
 /// Counters of every stream that saw a record or a gap.
+///
+/// Book events count on `depth` (updates and gaps) and on `depthSnapshot`
+/// (snapshots).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PipelineStats {
     /// Per-stream counters.
     pub streams: BTreeMap<BinanceStream, StreamStats>,
+    /// Order-book sync counters (ADR-038).
+    pub book: BookStats,
 }
 
 impl PipelineStats {
@@ -72,8 +86,11 @@ pub struct Pushed {
     /// The events now due, in canonical order.
     pub events: Vec<MarketEvent>,
     /// Why the record did not normalize, if it did not. It is counted, and
-    /// on an id-less stream a `MissingData` gap stands in for it.
+    /// on an id-less stream a `MissingData` gap stands in for it; a book
+    /// record desyncs the book instead (ADR-038).
     pub error: Option<NormalizeError>,
+    /// Order-book sync-state changes the record caused, in order.
+    pub book: Vec<BookTransition>,
 }
 
 /// The deterministic core of live capture and replay.
@@ -81,6 +98,7 @@ pub struct Pushed {
 pub struct Pipeline {
     symbol: String,
     sequencers: BTreeMap<BinanceStream, StreamSequencer>,
+    book: BookSequencer,
     holdback: HoldBack,
     stats: PipelineStats,
 }
@@ -98,6 +116,7 @@ impl Pipeline {
     ) -> Self {
         let sequencers = BinanceStream::ALL
             .into_iter()
+            .filter(|stream| !is_book(*stream))
             .map(|stream| {
                 let seed = seeds
                     .get(&stream)
@@ -105,9 +124,14 @@ impl Pipeline {
                 (stream, StreamSequencer::new(stream.domain_stream(), seed))
             })
             .collect();
+        let book_seed = [BinanceStream::Depth, BinanceStream::DepthSnapshot]
+            .iter()
+            .filter_map(|stream| seeds.get(stream).copied())
+            .max();
         Self {
             symbol: symbol.to_owned(),
             sequencers,
+            book: BookSequencer::new(book_seed),
             holdback: HoldBack::new(hold_back_ms, oi_retime_ms),
             stats: PipelineStats::default(),
         }
@@ -128,6 +152,9 @@ impl Pipeline {
             .capture
             .as_ref()
             .map_or("", |capture| capture.session_id.as_str());
+        if is_book(stream) {
+            return self.push_book(stream, session, record);
+        }
         let Some(seq) = self.sequencers.get_mut(&stream) else {
             return Pushed::default();
         };
@@ -143,13 +170,7 @@ impl Pipeline {
         };
         let mut events = Vec::new();
         for event in sequenced {
-            if let Some(watermark) = self.holdback.watermark() {
-                let lateness = watermark
-                    .as_millis()
-                    .saturating_sub(event.time().as_millis());
-                let stats = self.stream_stats(stream);
-                stats.max_lateness_ms = stats.max_lateness_ms.max(lateness);
-            }
+            self.note_lateness(stream, &event);
             let (admission, released) = self.holdback.push(event);
             match admission {
                 Admission::Duplicate => self.stream_stats(stream).duplicates += 1,
@@ -159,7 +180,76 @@ impl Pipeline {
             self.count(&released);
             events.extend(released);
         }
-        Pushed { events, error }
+        Pushed {
+            events,
+            error,
+            book: Vec::new(),
+        }
+    }
+
+    /// A `depth` or `depthSnapshot` record through the book sequencer.
+    fn push_book(&mut self, stream: BinanceStream, session: &str, record: &RawRecord) -> Pushed {
+        let parsed = normalize::parse(stream, &self.symbol, &record.payload);
+        let error = parsed.as_ref().err().cloned();
+        if error.is_some() {
+            self.stream_stats(stream).normalize_errors += 1;
+        }
+        let floor = self.holdback.last_released();
+        let output = match stream {
+            BinanceStream::DepthSnapshot => {
+                let snapshot = parsed.and_then(|event| match event {
+                    Some(MarketEvent::BookSnapshot(snapshot)) => Ok(snapshot),
+                    other => Err(not_book(other.as_ref())),
+                });
+                self.book.push_snapshot(snapshot, floor)
+            }
+            _ => {
+                let diff = parsed.and_then(|event| match event {
+                    Some(MarketEvent::BookUpdate(update)) => Ok(update),
+                    other => Err(not_book(other.as_ref())),
+                });
+                self.book.push_diff(session, diff, floor)
+            }
+        };
+        let mut transitions = output.transitions;
+        let mut events = Vec::new();
+        for event in output.events {
+            self.note_lateness(stream, &event);
+            let (admission, released) = self.holdback.push(event);
+            self.count(&released);
+            events.extend(released);
+            match admission {
+                Admission::Late => {
+                    // The book missed a slot: resync instead of delivering
+                    // the rest of this record's book events.
+                    transitions.extend(self.book.desync(GapReason::SequenceBreak));
+                    break;
+                }
+                Admission::Duplicate => self.stream_stats(stream).duplicates += 1,
+                Admission::Buffered | Admission::Retimed => {}
+            }
+        }
+        Pushed {
+            events,
+            error,
+            book: transitions,
+        }
+    }
+
+    /// `Some(want id)` while the order book needs a snapshot; each id is
+    /// requested once (ADR-038).
+    pub fn book_snapshot_wanted(&self) -> Option<u64> {
+        self.book.snapshot_wanted()
+    }
+
+    fn note_lateness(&mut self, stream: BinanceStream, event: &MarketEvent) {
+        if let Some(watermark) = self.holdback.watermark() {
+            let lateness = watermark
+                .as_millis()
+                .saturating_sub(event.time().as_millis());
+            let stats = self.stream_stats(stream);
+            stats.max_lateness_ms = stats.max_lateness_ms.max(lateness);
+        }
     }
 
     /// Releases every buffered event, in canonical order.
@@ -172,6 +262,7 @@ impl Pipeline {
     /// The counters so far.
     pub fn stats(&self) -> PipelineStats {
         let mut stats = self.stats.clone();
+        stats.book = self.book.stats().clone();
         for (&stream, seq) in &self.sequencers {
             if seq.duplicates() > 0 || seq.regressions() > 0 {
                 let s = stats.streams.entry(stream).or_default();
@@ -193,8 +284,12 @@ impl Pipeline {
 
     fn count(&mut self, released: &[MarketEvent]) {
         for event in released {
-            let Some(stream) = BinanceStream::of_domain(event.stream()) else {
-                continue;
+            let stream = match event {
+                MarketEvent::BookSnapshot(_) => BinanceStream::DepthSnapshot,
+                _ => match BinanceStream::of_domain(event.stream()) {
+                    Some(stream) => stream,
+                    None => continue,
+                },
             };
             let stats = self.stream_stats(stream);
             match event {
@@ -205,9 +300,21 @@ impl Pipeline {
     }
 }
 
+/// Whether `stream` feeds the order book.
+fn is_book(stream: BinanceStream) -> bool {
+    matches!(stream, BinanceStream::Depth | BinanceStream::DepthSnapshot)
+}
+
+/// A book stream normalized to something else: impossible by construction
+/// of [`normalize::parse`], reported as an error all the same.
+fn not_book(event: Option<&MarketEvent>) -> NormalizeError {
+    NormalizeError::Unexpected(format!("not an order-book event: {event:?}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::book_sync::BookTransition;
     use mie_domain::event::Stream;
     use mie_ports::raw::Capture;
 
@@ -344,5 +451,217 @@ mod tests {
             [(Stream::Trades, 500, 1_000), (Stream::Trades, 1_100, 5_000)]
         );
         assert_eq!(pipe.stats().gaps(GapReason::Disconnected), 2);
+    }
+
+    fn depth(first: u64, last: u64, prev: u64, time: i64) -> String {
+        format!(
+            r#"{{"e":"depthUpdate","E":{},"T":{time},"s":"BTCUSDT","ps":"BTCUSDT","U":{first},"u":{last},"pu":{prev},"b":[["85000.10","{last}.000"]],"a":[]}}"#,
+            time + 4
+        )
+    }
+
+    fn depth_snapshot(last: u64, time: i64) -> String {
+        format!(
+            r#"{{"lastUpdateId":{last},"E":{},"T":{time},"bids":[["85000.10","1.000"]],"asks":[["85000.20","2.000"]]}}"#,
+            time + 3
+        )
+    }
+
+    /// Depth sync, a late diff and its resync, with mark prices moving the
+    /// watermark; hold-back 0.
+    fn late_book_records() -> Vec<(BinanceStream, RawRecord)> {
+        let depth_rec = |seq, payload: String| (BinanceStream::Depth, record("d", seq, &payload));
+        vec![
+            depth_rec(1, depth(1, 10, 0, 1_000)),
+            (
+                BinanceStream::DepthSnapshot,
+                record("r/1", 2, &depth_snapshot(5, 990)),
+            ),
+            (BinanceStream::MarkPrice, record("m", 3, &mark(2_000))),
+            (BinanceStream::MarkPrice, record("m", 4, &mark(3_000))),
+            // Chains, but its slot (1500) was released with the 2000 mark.
+            depth_rec(5, depth(11, 20, 10, 1_500)),
+            depth_rec(6, depth(21, 30, 20, 3_100)),
+            (
+                BinanceStream::DepthSnapshot,
+                record("r/2", 7, &depth_snapshot(25, 3_050)),
+            ),
+            depth_rec(8, depth(31, 40, 30, 3_200)),
+        ]
+    }
+
+    fn run_book(
+        records: &[(BinanceStream, RawRecord)],
+    ) -> (Vec<MarketEvent>, Vec<BookTransition>, Pipeline) {
+        let mut pipe = Pipeline::new("BTCUSDT", 0, 0, &BTreeMap::new());
+        let (mut events, mut transitions) = (Vec::new(), Vec::new());
+        for (stream, record) in records {
+            let pushed = pipe.push(*stream, record);
+            assert_eq!(pushed.error, None);
+            events.extend(pushed.events);
+            transitions.extend(pushed.book);
+        }
+        events.extend(pipe.finish());
+        (events, transitions, pipe)
+    }
+
+    #[test]
+    fn a_late_book_update_desyncs_and_resyncs_once() {
+        let records = late_book_records();
+        let (out, transitions, pipe) = run_book(&records);
+        let gaps: Vec<_> = out
+            .iter()
+            .filter_map(|e| match e {
+                MarketEvent::FeedGap(g) => {
+                    Some((g.stream, g.start.as_millis(), g.end.as_millis(), g.reason))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            gaps,
+            [
+                (Stream::OrderBook, 1_500, 2_001, GapReason::LateEvent),
+                (Stream::OrderBook, 1_500, 3_050, GapReason::SequenceBreak),
+            ]
+        );
+        assert_eq!(
+            transitions,
+            [
+                BookTransition::Desynced(GapReason::Disconnected),
+                BookTransition::Synced {
+                    last_update_id: 5,
+                    time: EventTime::from_millis(990)
+                },
+                BookTransition::Desynced(GapReason::SequenceBreak),
+                BookTransition::Synced {
+                    last_update_id: 25,
+                    time: EventTime::from_millis(3_050)
+                },
+            ]
+        );
+        let mut engine = mie_domain::state::MarketStateEngine::new();
+        let mut book = mie_domain::book::OrderBook::new();
+        for (i, event) in out.iter().enumerate() {
+            engine
+                .apply(event)
+                .unwrap_or_else(|e| panic!("event {i} rejected: {e}"));
+            book.apply(event);
+        }
+        assert!(book.is_valid());
+        assert_eq!(book.last_update_id(), Some(40));
+        let stats = pipe.stats();
+        assert_eq!(stats.book.syncs, 2);
+        assert_eq!(stats.book.desyncs[&GapReason::SequenceBreak], 1);
+        let depth_stats = &stats.streams[&BinanceStream::Depth];
+        assert_eq!(depth_stats.records, 4);
+        // Updates 10, 30, 40; the late one became a gap.
+        assert_eq!(depth_stats.events, 3);
+        assert_eq!(depth_stats.gaps[&GapReason::LateEvent], 1);
+        assert_eq!(depth_stats.gaps[&GapReason::SequenceBreak], 1);
+        assert_eq!(stats.streams[&BinanceStream::DepthSnapshot].events, 2);
+        assert_eq!(pipe.book_snapshot_wanted(), None);
+
+        // The same records give the same output.
+        assert_eq!(run_book(&records).0, out);
+    }
+
+    #[test]
+    fn a_book_normalize_error_is_counted_and_desyncs() {
+        let mut pipe = Pipeline::new("BTCUSDT", 0, 0, &BTreeMap::new());
+        pipe.push(
+            BinanceStream::Depth,
+            &record("d", 1, &depth(1, 10, 0, 1_000)),
+        );
+        let pushed = pipe.push(
+            BinanceStream::Depth,
+            &record("d", 2, r#"{"e":"depthUpdate"}"#),
+        );
+        assert!(pushed.error.is_some());
+        assert!(pushed.events.is_empty());
+        assert_eq!(pipe.book_snapshot_wanted(), None);
+        pipe.push(
+            BinanceStream::Depth,
+            &record("d", 3, &depth(11, 20, 10, 1_100)),
+        );
+        assert!(pipe.book_snapshot_wanted().is_some());
+        let stats = pipe.stats();
+        assert_eq!(stats.streams[&BinanceStream::Depth].normalize_errors, 1);
+        assert_eq!(stats.book.desyncs[&GapReason::Disconnected], 1);
+    }
+
+    #[test]
+    fn a_reconnect_inside_an_unsynced_period_keeps_the_first_cause() {
+        let mut pipe = Pipeline::new("BTCUSDT", 0, 0, &BTreeMap::new());
+        let mut events = Vec::new();
+        let mut transitions = Vec::new();
+        let records = [
+            (
+                BinanceStream::Depth,
+                record("d/1", 1, &depth(1, 10, 0, 1_000)),
+            ),
+            (
+                BinanceStream::DepthSnapshot,
+                record("r/1", 2, &depth_snapshot(5, 990)),
+            ),
+            (
+                BinanceStream::Depth,
+                record("d/1", 3, &depth(11, 20, 10, 1_100)),
+            ),
+            // 21..=30 missing: a pu break opens the unsynced period.
+            (
+                BinanceStream::Depth,
+                record("d/1", 4, &depth(31, 40, 30, 1_300)),
+            ),
+            // The socket reconnects before the resync.
+            (
+                BinanceStream::Depth,
+                record("d/2", 5, &depth(51, 60, 50, 1_500)),
+            ),
+            (
+                BinanceStream::DepthSnapshot,
+                record("r/2", 6, &depth_snapshot(55, 1_450)),
+            ),
+        ];
+        for (stream, record) in &records {
+            let pushed = pipe.push(*stream, record);
+            events.extend(pushed.events);
+            transitions.extend(pushed.book);
+        }
+        events.extend(pipe.finish());
+        // One unsynced period, one gap, named by its first cause; it spans
+        // the old session's last record (1300).
+        let desyncs: Vec<_> = transitions
+            .iter()
+            .filter(|t| matches!(t, BookTransition::Desynced(_)))
+            .collect();
+        assert_eq!(
+            desyncs,
+            [
+                &BookTransition::Desynced(GapReason::Disconnected),
+                &BookTransition::Desynced(GapReason::SequenceBreak)
+            ]
+        );
+        let gaps: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                MarketEvent::FeedGap(g) => {
+                    Some((g.stream, g.start.as_millis(), g.end.as_millis(), g.reason))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            gaps,
+            [(Stream::OrderBook, 1_100, 1_450, GapReason::SequenceBreak)]
+        );
+        let mut engine = mie_domain::state::MarketStateEngine::new();
+        for event in &events {
+            engine.apply(event).unwrap();
+        }
+        assert_eq!(
+            pipe.stats().book.desyncs.get(&GapReason::Disconnected),
+            Some(&1)
+        );
     }
 }
