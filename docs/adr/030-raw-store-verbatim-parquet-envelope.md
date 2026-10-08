@@ -1,6 +1,6 @@
 # ADR-030: Raw store keeps verbatim messages in a Parquet envelope
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-10-06
 
 ## Context
@@ -192,3 +192,11 @@ a stable dataset version.
 Progress 2026-10-07: #11 replays sealed files of both sources with a
 dataset version that is stable across repeated replays of a fixture store
 (ADR-039). Acceptance waits for the #9 soak.
+
+## Acceptance
+
+Accepted 2026-10-08. The #9 live soak (about 30 h over two runs) sealed its
+files in this format, and #11 replayed that window twice with the same
+dataset version (`437e2790…`) and event-stream hash; the 12-month archive
+backfill replayed twice with the same dataset version (`fa73cb88…`).
+Results: <https://github.com/Replikanti/mie/issues/11#issuecomment-6053915512>.
