@@ -136,7 +136,12 @@ deciding them.
   version and a new ADR.
 - The rule language may be too thin for #30. It can grow by new parameter
   types or line kinds without touching v1; anything that needs to change
-  existing lines is a spec text v2.
+  existing lines is a spec text v2. #30's own acceptance therefore either
+  records its results through this store with spec text v1 or lands the
+  spec-text-v2 ADR. That is not a gate on this ADR: the provenance
+  pipeline exercises every decision D1–D10, and whether v1 suffices for a
+  later consumer is a claim about that consumer, which the D2 extension
+  rule already covers.
 - FNV-1a 64 can collide. The store compares the stored spec text and
   returns `Collision`; it never overwrites.
 - The SHA-256 trailer detects accidental corruption (a torn write, bit rot,
@@ -172,7 +177,32 @@ deciding them.
 
 ## Accept when
 
-The backtest pipeline (#30) records its results through this store with an
-unchanged spec text v1, and a spec run twice on the 12-month archive
-backfill prints `recorded` then `reproduced` with a byte-identical result
-file.
+A spec run twice reproduces its result, and the result matches a value an
+accepted ADR fixed before this one. It passes when all four hold:
+
+1. The spec's `sample` is `1759276800000 1790812800000` (2025-10-01 up to
+   2026-10-01, the 12-month archive backfill of #12), and its `data` is the
+   dataset version `mie replay --source archive` prints for that window.
+2. `mie experiment run <spec> --config <archive config> --results <empty
+   dir> --source archive`, without `--streams`, prints `recorded <key>` and
+   exits 0. The default streams are aggTrades, the six klines, fundingRate
+   and metrics: the nine streams of the ADR-039 run.
+3. The stored result carries `stream 604001515:20929b98dfd17a44` and
+   `rejections 0`, the event-stream hash and rejection count that the
+   ADR-039 acceptance recorded for the same window and streams.
+4. The same command, run again, prints `reproduced <key>` and exits 0, and
+   the result file's SHA-256 is the same before and after it.
+
+Anything else fails: a `FAIL: …` line, a `Diverged` result, another hash or
+count, or a changed file.
+
+Why the 12-month window: it is the only one whose event-stream hash an
+accepted ADR already pins (ADR-039), so step 3 checks the pipeline against
+an independent value, not only against itself. A shorter window (two days,
+say) reproduces just as well, but an error both runs share (the wrong
+streams, a dropped day, a hash over something other than the delivered
+events) would still print `reproduced`. The price is two replays of about
+20 min each (ADR-039 Acceptance: 20.5 and 18.5 min, peak RSS 362 MB). The
+dataset version is not compared with ADR-039's `fa73cb88…`: the archive
+gained metrics days after 2026-09-30 since that run (#69), which can change
+the version of a day-widened selection without changing a delivered event.

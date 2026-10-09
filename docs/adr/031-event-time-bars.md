@@ -2,6 +2,7 @@
 
 - Status: accepted
 - Date: 2026-10-06
+- Amended: 2026-10-10 (#76)
 
 ## Context
 
@@ -156,3 +157,146 @@ Results: <https://github.com/Replikanti/mie/issues/12#issuecomment-6032650398>.
 
 References: ADR-019, ADR-022, ADR-023, ADR-027, ADR-028, ADR-029. ADR-029
 stays proposed: its *Accept when* also needs a volatility feature (#16).
+
+## Justification addendum (2026-10-10)
+
+Added for #76 (audit #70). It explains where the numbers and the
+acceptance above come from. It changes no value, criterion or decision.
+
+### Decision 11: `MAX_BARS_PER_EVENT` = 44 640
+
+History: the bound came in the #46 review round (commit 4e1ad5d), after
+the review showed that one event could build an unbounded number of bars.
+The one-week-outage sentence in decision 11 was its only stated reason.
+
+The bound has two jobs, and neither forces 31 days:
+
+- **Turn a corrupt timestamp into a typed error before it allocates.** The
+  #46 review measured two classes. A defaulted `t = 0` followed by a real
+  trade (about 1.7 × 10¹² ms later) is 28 M 1m bars, about 36 M over the
+  six timeframes: 3.5 GB at 96 B per `Bar`, a process abort under a 2 GB
+  limit. A microsecond value read as milliseconds is about 2.8 × 10¹⁰ 1m
+  bars. Even a 365-day bound (525 600 1m bars) stays more than 50× below
+  the smaller of the two, so any value from 8 to 365 days detects both.
+- **Let a genuine hole through in one run.** The holes known inside one
+  source are short. `archive-verify` reports 0 holes over 60 s on every
+  stream of the 12-month backfill (#12). The #9 soak ran about 30 h inside
+  a 30.2 h span, so its restart and its network outage lasted minutes
+  together (ADR-032 Acceptance). The longest hole in the data, about
+  6.7 days between the archive's end (2026-09-30) and the start of live
+  capture (2026-10-07 15:50 UTC), spans two sources, and a replay reads
+  only one (ADR-039 D6).
+
+The cost per event is small at either end. At the bound one event builds
+57 505 bars over the six timeframes (44 640 + 8 928 + 2 976 + 744 + 186 +
+31), about 5.5 MB. A 365-day bound would allow 677 075 bars in one event,
+about 65 MB and 0.28 s (measured in the #46 review).
+
+So 31 days is one calendar month: a round margin over a one-week hole,
+not a derived limit. What another value breaks:
+
+- **8 days**: a host outage longer than 8 days inside one source no longer
+  replays in one run and must be split at the hole (decision 11,
+  Recovery). For the ATR regime the split costs nothing extra: a hole that
+  long already yields empty incomplete 1h bars, which break the series
+  back to warm-up (ADR-033 decision 6). Other consumers lose the windows
+  they held across the hole, as with any fresh engine.
+- **365 days**: corruption is still caught, but one event may allocate
+  65 MB and stall for 0.28 s before the domain decides.
+
+### Accept when: "matches every complete bar, or explains each mismatch"
+
+History: the criterion did not say what counts as an explanation. The
+approved #12 plan (step 5, 2026-10-06) fixed it before the run: an
+aggTrades mismatch is explained (aggregation boundary) when the same bar
+matches under `--trade-source trades`; any mismatch under `trades` is
+unexplained and blocks the acceptance of this ADR.
+
+Applied to the two windows of the run
+(<https://github.com/Replikanti/mie/issues/12#issuecomment-6032650398>):
+
+- **2026-02-05 … 02-07**: 1658 aggTrades mismatches, 0 under `trades`
+  (5565/5565), so 0 unexplained. This window alone meets the
+  pre-registered rule, and with it "a backfilled day".
+- **2025-10-09 … 10-11**: 153 mismatches under `trades`, every one a bar
+  that overlaps 2025-10-10 22:03 – 24:00 UTC. Under the pre-registered
+  rule they are unexplained. The acceptance counted them as an upstream
+  defect of `BTCUSDT-trades-2025-10-10.zip` on different evidence:
+  trade ids that lie inside aggTrades `first_trade_id..last_trade_id` and
+  that the klines count are missing from the trades file (minute 22:03:
+  id range 20 276, kline count 20 269, trades file 20 266). That was a
+  departure from the pre-registered rule, disclosed here.
+
+The run used the temporary window provider (ADR-034 decision 8). ADR-039
+replaced it, and `archive-kline-check` now replays through the shared
+sequencer, which turns every skipped trade id into a `SequenceBreak` gap.
+A re-run on 2026-10-10 over the February window: `--trade-source
+aggTrades` reproduces the #12 report exactly (5565 bars compared, the same
+1658 mismatches); `--trade-source trades` compares 5 complete bars, skips
+5566 as incomplete and still prints `PASS`. The trades-source evidence of
+this acceptance therefore cannot be regenerated with the command as it
+stands; the #12 output is the record.
+
+### Bars from aggregate trades (the choice ADR-034 decision 9 left open)
+
+ADR-034 decision 9 left open whether this ADR is accepted with the
+aggregation-boundary mismatch class documented, or amended (for example
+to bars from individual trades). The acceptance took the first branch
+without naming it. The bar code is source-agnostic (decision 3: bars are
+built from the trade sequence). The bars consumers see come from
+aggregate trades: live capture reads `aggTrade` (ADR-032), and an archive
+replay leaves out `trades` by default and refuses it next to `aggTrades`
+(ADR-039 D5).
+
+Why aggregate trades:
+
+- **Live source.** ADR-032 keeps `aggTrade` as the live trade source
+  because its `a` is the ADR-028 sequence id. ADR-019 allows one domain
+  path for live and replay, so replay feeds the same kind of trade.
+- **Continuity.** The archive aggTrades have 0 id breaks over the
+  12 months (603 218 226 rows, `archive-verify`, #12). The individual-trades
+  files have 155 464 skipped ids over the 10 imported days, plus the
+  2025-10-10 defect. Through the shared sequencer every skipped id is a
+  `SequenceBreak` gap (in the re-run above, 5566 of 5571 bars came out
+  incomplete). Bars from individual trades would need their own continuity
+  rule for that id space, which is an ADR-028/ADR-032 change, not a
+  switch.
+- **Cost.** On the same 10 days, trades hold 2.15× the rows of aggTrades
+  (85.2 M against 39.7 M, import ledger rows) and 1.63× the stored bytes
+  (1 532 MiB against 940 MiB, per-day ratio 1.49–1.80). Over a year that
+  is an estimated 22–26 GiB more storage, and the year's replay (604 M
+  events in about 20 min, ADR-039 Acceptance, nearly all of them
+  aggTrades) would roughly double.
+
+The measured price of this choice, from the aggTrades runs of #12 (bars
+compared per window: 5565):
+
+| Bars that differ from the kline | 2025-10-09 … 10-11 | 2026-02-05 … 02-07 |
+|---|---|---|
+| any field | 1039 (18.7 %) | 1658 (29.8 %) |
+| close | 0 | 0 |
+| high or low | 25 (0.45 %), all 1m or 5m | 47 (0.84 %), all 1m or 5m |
+| open | 368 | 713 |
+| volume | 1038 | 1651 |
+| taker-buy volume | 536 | 884 |
+| 1d bars | 3 of 3 (volume) | 3 of 3 (volume) |
+
+The cause is the one the acceptance names: an aggregate's volume is booked
+to the minute of its `transact_time`, while some of its trades fall in
+another minute. Any consumer that checks its output against exchange
+klines, or against a chart or profile built from them, inherits this
+class. Highs and lows of 15m and longer bars matched in both windows, so
+the ADR-037 chart spot check on 1h and 4h is unaffected; volumes are not,
+so the ADR-036 comparison with an external session volume profile is.
+
+Rejected: bars from individual trades, for the three reasons above.
+Changing this takes a superseding ADR.
+
+### Three days instead of one
+
+The criterion names one backfilled day. The run compared three consecutive
+days because ADR-034's acceptance names three; why three is explained in
+the ADR-034 justification addendum. Each day contributes all 1855 of its
+bars (1440 + 288 + 96 + 24 + 6 + 1), 5565 per window. The 6 bars skipped
+per run are the `partial_start` bars that open at the start of the 60 s
+trade margin before the window (`TRADE_MARGIN_MS`), outside the window.
