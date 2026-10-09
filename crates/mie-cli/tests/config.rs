@@ -41,6 +41,8 @@ fn the_example_file_parses_with_the_documented_defaults() {
     assert_eq!(live.depth_snapshot_limit, 1_000);
     assert_eq!(live.depth_checkpoint_interval, Duration::from_secs(60));
     assert_eq!(live.depth_snapshot_min_spacing, Duration::from_secs(2));
+    assert_eq!(example.capture.state_checkpoint_interval_secs, 60);
+    assert_eq!(example.state_checkpoint_interval_ms(), Ok(60_000));
     // Every stream by default, depth included.
     assert_eq!(live.streams.len(), 7);
     assert!(live.streams.contains(&BinanceStream::Depth));
@@ -149,6 +151,8 @@ fn invalid_values_are_rejected() {
     }
     for capture in [
         "seal_interval_secs = 0",
+        "state_checkpoint_interval_secs = 0",
+        "state_checkpoint_interval_secs = 18446744073709551",
         "backoff_initial_ms = 5000\nbackoff_max_ms = 100",
         // The seventh stream would rotate at 85 500 + 6 × 300 s, past 24 h.
         "max_connection_age_secs = 85500",

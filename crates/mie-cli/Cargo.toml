@@ -1,6 +1,6 @@
 [package]
 name = "mie-cli"
-description = "MIE composition root: wires adapters to ports (`mie ingest`, `mie capture-report`, `mie archive-*`)"
+description = "MIE composition root: wires adapters to ports (`mie ingest`, `mie capture-report`, `mie archive-*`, `mie replay`, `mie equivalence`)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

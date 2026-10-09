@@ -10,6 +10,9 @@
 //! - `mie replay --config <path> --from … --to … [--source live|archive]`
 //!   ([`replay`]): replays a window of raw data through the core with a
 //!   deterministic report (#11);
+//! - `mie equivalence --config <path> --from … --to …` ([`equivalence`]):
+//!   recomputes each cleanly ended live run of the window and compares its
+//!   state checkpoints with the ones live journaled (#13, ADR-041);
 //! - `mie experiment validate <spec>` and `mie experiment run <spec> …`
 //!   ([`experiment`]): validates an experiment spec, or runs it and records
 //!   its result in the append-only result store (#29, ADR-040).
@@ -19,6 +22,7 @@
 
 pub mod archive;
 pub mod config;
+pub mod equivalence;
 pub mod experiment;
 pub mod ingest;
 pub mod journal;

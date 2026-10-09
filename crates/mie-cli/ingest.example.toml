@@ -57,3 +57,7 @@ stats_interval_secs = 60
 depth_snapshot_limit = 1000
 depth_checkpoint_interval_secs = 60
 depth_snapshot_min_spacing_ms = 2000
+# Event-time cadence of the state checkpoints journaled for the live/replay
+# equivalence harness (`mie equivalence`, ADR-041): ordinal, event-stream
+# hash and Market State hash, about 1440 lines per day.
+state_checkpoint_interval_secs = 60

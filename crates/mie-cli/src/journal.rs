@@ -5,7 +5,7 @@
 //!
 //! | `type` | Written by | Content |
 //! |---|---|---|
-//! | `run_start` | ingest | symbol, streams, hold-back, open-interest re-time allowance, seeds per stream: the run's pipeline parameters ([`RunParameters`]); depth snapshot limit and checkpoint interval (informational) |
+//! | `run_start` | ingest | symbol, streams, hold-back, open-interest re-time allowance, seeds per stream: the run's pipeline parameters ([`RunParameters`]); depth snapshot limit and checkpoint interval (informational); the state checkpoint interval (`state_checkpoint_interval_ms`), the state and event-stream hash encodings and the engine's feature set (16 hex digits): the comparability keys of the equivalence harness ([`Checkpointing`], ADR-041) |
 //! | `recovery` | ingest | parts rolled forward and discarded by the store |
 //! | `connected`, `connect_failed`, `disconnected`, `planned_rotation`, `backoff` | capture | connection lifecycle per stream |
 //! | `oi_poll` | capture | request/response time (ns), status, whether persisted |
@@ -17,7 +17,8 @@
 //! | `normalize_error` | capture | stream, `receive_seq`, error |
 //! | `stats` | capture | counters (the order-book sync counters under `streams.depth.book`), channel high-water marks and blocked time |
 //! | `domain_rejection` | ingest | an event the engine rejected |
-//! | `run_end` | ingest | totals and the exit code |
+//! | `state_checkpoint` | ingest | `ordinal` (events delivered so far, rejections included), `as_of` (ms or null), `event_hash` and `state_hash` (16 hex digits), `last`: a checkpoint of the core (ADR-041) |
+//! | `run_end` | ingest | totals (`events`, `domain_rejections`, `records`) and the exit code |
 //!
 //! The journal is flushed on every `stats` line and at the end of a run, and
 //! synced to stable storage right after `run_start` and at the end of a run:
@@ -30,14 +31,20 @@
 //! reads them with [`RunParameters::from_run_start`], never from
 //! configuration defaults (ADR-032). [`read_runs`] joins every run's
 //! `run_start` with its `run_end` into the [`LiveRun`]s `mie replay`
-//! recomputes (ADR-039 D1).
+//! recomputes (ADR-039 D1), and collects the run's `state_checkpoint`
+//! lines for `mie equivalence` (ADR-041).
 
 use mie_adapter_binance::live::ChannelStats;
 use mie_adapter_binance::{
     BinanceStream, BookStats, BookTransition, CaptureEvent, CaptureObserver, CheckpointResult,
     LiveRun, PipelineStats, SnapshotTrigger,
 };
+use mie_app::equivalence::StateCheckpoint;
 use mie_domain::book::{Invalidation, Side};
+use mie_domain::event_hash::EventStreamHash;
+use mie_domain::feature::FeatureSetVersion;
+use mie_domain::fingerprint::Fingerprint;
+use mie_domain::state_hash::StateHash;
 use mie_domain::time::EventTime;
 use mie_ports::raw::SealedFile;
 use serde_json::{Map, Value, json};
@@ -106,7 +113,8 @@ impl RunParameters {
     }
 }
 
-/// One run of the journal: its `run_start` joined with its `run_end`.
+/// One run of the journal: its `run_start` joined with its `run_end` and
+/// its state checkpoints.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JournaledRun {
     /// The pipeline parameters of `run_start`.
@@ -119,6 +127,60 @@ pub struct JournaledRun {
     pub started_at_ms: i64,
     /// The run's `run_end`, if it has one (a crashed run has none).
     pub end: Option<RunEnd>,
+    /// How the run recorded state checkpoints; `None` for a run journaled
+    /// before checkpoints existed (#13).
+    pub checkpointing: Option<Checkpointing>,
+    /// The run's `state_checkpoint` lines, in journal order.
+    pub checkpoints: Vec<StateCheckpoint>,
+}
+
+/// The comparability keys of a run's state checkpoints, from `run_start`
+/// (ADR-041).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Checkpointing {
+    /// The event-time cadence.
+    pub interval_ms: i64,
+    /// The Market State hash encoding.
+    pub state_encoding: u32,
+    /// The event-stream hash encoding.
+    pub event_encoding: u32,
+    /// The feature set of the run's engine.
+    pub feature_set: FeatureSetVersion,
+}
+
+impl Checkpointing {
+    /// Reads the keys from a `run_start` line: `None` when it has none.
+    ///
+    /// # Errors
+    ///
+    /// A description of a missing or malformed key.
+    pub fn from_run_start(line: &Value) -> Result<Option<Self>, String> {
+        if line.get("state_checkpoint_interval_ms").is_none() {
+            return Ok(None);
+        }
+        let interval_ms = line["state_checkpoint_interval_ms"]
+            .as_i64()
+            .filter(|ms| *ms > 0)
+            .ok_or("run_start with a malformed state_checkpoint_interval_ms")?;
+        let encoding = |name: &str| {
+            line[name]
+                .as_u64()
+                .and_then(|v| u32::try_from(v).ok())
+                .ok_or_else(|| format!("run_start without {name}"))
+        };
+        let state_encoding = encoding("state_hash_encoding")?;
+        let event_encoding = encoding("event_hash_encoding")?;
+        let feature_set = line["feature_set"]
+            .as_str()
+            .and_then(parse_hex)
+            .ok_or("run_start without a feature_set of 16 hex digits")?;
+        Ok(Some(Self {
+            interval_ms,
+            state_encoding,
+            event_encoding,
+            feature_set: FeatureSetVersion::from_fingerprint(feature_set),
+        }))
+    }
 }
 
 /// What `run_end` says about a run.
@@ -130,6 +192,72 @@ pub struct RunEnd {
     pub exit_code: i64,
     /// Records the run appended to the raw store.
     pub records: u64,
+    /// Events the core consumed, rejections included; `None` when the line
+    /// lacks it.
+    pub events: Option<u64>,
+    /// Events the engine rejected; `None` when the line lacks it.
+    pub domain_rejections: Option<u64>,
+}
+
+/// A `state_checkpoint` journal line as JSON fields (module docs).
+pub fn state_checkpoint_json(checkpoint: &StateCheckpoint) -> Value {
+    json!({
+        "ordinal": checkpoint.ordinal,
+        "as_of": checkpoint.as_of.map(EventTime::as_millis),
+        "event_hash": checkpoint.events.fingerprint.to_string(),
+        "state_hash": checkpoint.state.to_string(),
+        "last": checkpoint.last,
+    })
+}
+
+/// Reads a `state_checkpoint` journal line.
+///
+/// # Errors
+///
+/// A description of a missing or malformed field.
+pub fn state_checkpoint_from_json(line: &Value) -> Result<StateCheckpoint, String> {
+    let ordinal = line["ordinal"]
+        .as_u64()
+        .ok_or("state_checkpoint without ordinal")?;
+    let as_of = match &line["as_of"] {
+        Value::Null => None,
+        value => Some(EventTime::from_millis(
+            value
+                .as_i64()
+                .ok_or("state_checkpoint with a malformed as_of")?,
+        )),
+    };
+    let hash = |name: &str| {
+        line[name]
+            .as_str()
+            .and_then(parse_hex)
+            .ok_or_else(|| format!("state_checkpoint without a {name} of 16 hex digits"))
+    };
+    Ok(StateCheckpoint {
+        ordinal,
+        as_of,
+        events: EventStreamHash {
+            events: ordinal,
+            fingerprint: hash("event_hash")?,
+        },
+        state: StateHash::from_fingerprint(hash("state_hash")?),
+        last: line["last"]
+            .as_bool()
+            .ok_or("state_checkpoint without last")?,
+    })
+}
+
+/// Exactly 16 lowercase hex digits, as a [`Fingerprint`] displays.
+fn parse_hex(text: &str) -> Option<Fingerprint> {
+    let lower_hex = text
+        .bytes()
+        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    if text.len() != 16 || !lower_hex {
+        return None;
+    }
+    u64::from_str_radix(text, 16)
+        .ok()
+        .map(Fingerprint::from_raw)
 }
 
 impl JournaledRun {
@@ -157,8 +285,9 @@ impl JournaledRun {
 /// order.
 ///
 /// A line that is not JSON is skipped: a crash can leave a partial line,
-/// which the next run's first line then follows. A `run_start` or `run_end`
-/// that does not carry its fields is an error, and so are two `run_start`s
+/// which the next run's first line then follows. A `run_start`, `run_end`
+/// or `state_checkpoint` that does not carry its fields is an error, and so
+/// is one without its run's `run_start`, and so are two `run_start`s
 /// of one run id — a restart within the same second, whose records the
 /// session prefix could not tell apart (ADR-032) — a second `run_end`, and a
 /// `run_end` without a `run_start`.
@@ -203,13 +332,29 @@ pub fn read_runs(path: &Path, source: &str) -> Result<Vec<JournaledRun>, String>
                 let started_at_ms = value["at_ms"]
                     .as_i64()
                     .ok_or_else(|| at("run_start without at_ms".to_owned()))?;
+                let checkpointing = Checkpointing::from_run_start(&value).map_err(at)?;
                 runs.push(JournaledRun {
                     parameters,
                     source: run_source.to_owned(),
                     streams,
                     started_at_ms,
                     end: None,
+                    checkpointing,
+                    checkpoints: Vec::new(),
                 });
+            }
+            Some("state_checkpoint") => {
+                let checkpoint = state_checkpoint_from_json(&value).map_err(at)?;
+                let run_id = value["run_id"].as_str().unwrap_or_default();
+                let run = runs
+                    .iter_mut()
+                    .find(|r| r.parameters.run_id == run_id)
+                    .ok_or_else(|| {
+                        at(format!(
+                            "state_checkpoint of run {run_id:?} without run_start"
+                        ))
+                    })?;
+                run.checkpoints.push(checkpoint);
             }
             Some("run_end") => {
                 let field = |name: &str| {
@@ -223,6 +368,8 @@ pub fn read_runs(path: &Path, source: &str) -> Result<Vec<JournaledRun>, String>
                     records: value["records"]
                         .as_u64()
                         .ok_or_else(|| at("run_end without records".to_owned()))?,
+                    events: value["events"].as_u64(),
+                    domain_rejections: value["domain_rejections"].as_u64(),
                 };
                 let run_id = value["run_id"].as_str().unwrap_or_default();
                 let run = runs
@@ -667,6 +814,111 @@ mod tests {
         // A non-zero exit is not clean: the replay takes its prefix.
         let c = runs[2].live_run();
         assert_eq!((c.ended_at_ms, c.clean_records), (Some(5_000), None));
+    }
+
+    fn checkpoint(ordinal: u64, last: bool) -> StateCheckpoint {
+        StateCheckpoint {
+            ordinal,
+            as_of: Some(EventTime::from_millis(1_000 + ordinal as i64)),
+            events: EventStreamHash {
+                events: ordinal,
+                fingerprint: Fingerprint::from_raw(0xabc0 + ordinal),
+            },
+            state: StateHash::from_fingerprint(Fingerprint::from_raw(u64::MAX - ordinal)),
+            last,
+        }
+    }
+
+    fn checkpoint_line(run_id: &str, c: &StateCheckpoint) -> String {
+        let mut value = state_checkpoint_json(c);
+        value["type"] = json!("state_checkpoint");
+        value["run_id"] = json!(run_id);
+        value["at_ms"] = json!(1_500);
+        value.to_string()
+    }
+
+    #[test]
+    fn state_checkpoints_and_their_keys_join_their_run() {
+        let mut checkpointed: Value =
+            serde_json::from_str(&start("B", 3_000, "binance-um")).unwrap();
+        checkpointed["state_checkpoint_interval_ms"] = json!(60_000);
+        checkpointed["state_hash_encoding"] = json!(1);
+        checkpointed["event_hash_encoding"] = json!(1);
+        checkpointed["feature_set"] = json!("00000000000000ff");
+        let mut first = checkpoint(10, false);
+        first.as_of = None;
+        let runs = read(&[
+            start("A", 1_000, "binance-um"),
+            end("A", 2_000, 0, 42),
+            checkpointed.to_string(),
+            checkpoint_line("B", &first),
+            checkpoint_line("B", &checkpoint(25, true)),
+            json!({
+                "type": "run_end", "run_id": "B", "at_ms": 4_000, "exit_code": 0,
+                "records": 30, "events": 25, "domain_rejections": 2,
+            })
+            .to_string(),
+        ])
+        .unwrap();
+        // A run journaled before #13 has neither.
+        assert_eq!(runs[0].checkpointing, None);
+        assert!(runs[0].checkpoints.is_empty());
+        assert_eq!(
+            (
+                runs[0].end.unwrap().events,
+                runs[0].end.unwrap().domain_rejections
+            ),
+            (None, None)
+        );
+        let b = &runs[1];
+        assert_eq!(
+            b.checkpointing,
+            Some(Checkpointing {
+                interval_ms: 60_000,
+                state_encoding: 1,
+                event_encoding: 1,
+                feature_set: FeatureSetVersion::from_fingerprint(Fingerprint::from_raw(0xff)),
+            })
+        );
+        assert_eq!(b.checkpoints, [first, checkpoint(25, true)]);
+        assert_eq!(
+            (b.end.unwrap().events, b.end.unwrap().domain_rejections),
+            (Some(25), Some(2))
+        );
+        let shown = state_checkpoint_json(&checkpoint(25, true));
+        assert_eq!(shown["event_hash"], "000000000000abd9");
+        assert_eq!(shown["state_hash"], "ffffffffffffffe6");
+        assert_eq!(shown["as_of"], 1_025);
+    }
+
+    #[test]
+    fn malformed_state_checkpoints_are_errors() {
+        let good: Value =
+            serde_json::from_str(&checkpoint_line("A", &checkpoint(3, false))).unwrap();
+        for (field, value) in [
+            ("ordinal", json!(-1)),
+            ("as_of", json!("soon")),
+            ("event_hash", json!("abc")),
+            ("state_hash", json!("FFFFFFFFFFFFFFFF")),
+            ("last", json!(1)),
+        ] {
+            let mut bad = good.clone();
+            bad[field] = value;
+            let error = read(&[start("A", 1_000, "binance-um"), bad.to_string()]).unwrap_err();
+            assert!(
+                error.starts_with("journal line 2: state_checkpoint "),
+                "{field}: {error}"
+            );
+        }
+        let orphan = read(&[good.to_string()]).unwrap_err();
+        assert!(orphan.contains("without run_start"), "{orphan}");
+        let mut keys: Value = serde_json::from_str(&start("A", 1_000, "binance-um")).unwrap();
+        keys["state_checkpoint_interval_ms"] = json!(0);
+        let error = read(&[keys.to_string()]).unwrap_err();
+        assert!(error.contains("state_checkpoint_interval_ms"), "{error}");
+        keys["state_checkpoint_interval_ms"] = json!(10_000);
+        let error = read(&[keys.to_string()]).unwrap_err();
+        assert!(error.contains("state_hash_encoding"), "{error}");
     }
 
     #[test]

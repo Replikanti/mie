@@ -7,6 +7,7 @@ use mie_adapter_binance::transport::{
 };
 use mie_cli::archive::{self, ArchiveTransports, ImportRequest};
 use mie_cli::config::{ArchiveConfig, IngestConfig};
+use mie_cli::equivalence::{self, EquivalenceRequest};
 use mie_cli::experiment::{self, ExperimentRequest};
 use mie_cli::ingest::{self, Transports};
 use mie_cli::replay::{self, ReplayRequest, ReplaySource};
@@ -76,6 +77,19 @@ USAGE:
         the event-stream hash; the same window prints the same bytes. Exits
         0 on PASS; 1 when the replay failed, the domain rejected an event or
         the window holds no event.
+
+    mie equivalence --config <path> --from <ms|YYYY-MM-DD> --to <ms|YYYY-MM-DD>
+        Live/replay equivalence (ADR-041): for every capture run of the
+        ingest config that started in [from, to) (UTC wall clock of its
+        run_start; a date is a UTC day, as for mie replay), recompute the
+        run alone from the raw store into a fresh engine and compare its
+        state checkpoints (ordinal, event-stream hash, Market State hash)
+        with the ones the run journaled. Prints one line per run —
+        EQUIVALENT, DIVERGED with the first divergent checkpoint, EVENTS
+        EQUIVALENT / STATE NOT COMPARABLE (another feature set), or NOT
+        COMPARABLE (crashed, no checkpoints, replay error) — then PASS or
+        FAIL; the same request prints the same bytes. Exits 0 only when at
+        least one run was compared and every run is EQUIVALENT.
 
     mie experiment validate <spec>
         Validate an experiment spec (spec text v1, ADR-040). Prints the
@@ -223,6 +237,23 @@ fn dispatch(args: &[String]) -> Result<ExitCode, String> {
                 },
             };
             let outcome = replay::run(&request, &mut std::io::stdout().lock())?;
+            Ok(exit(outcome.pass))
+        }
+        Some("equivalence") => {
+            let options = Options::parse(&args[1..], &["--config", "--from", "--to"], &[])?;
+            let config =
+                IngestConfig::load(&options.path("--config")?).map_err(|e| e.to_string())?;
+            let from_ms = replay::parse_bound("--from", options.value("--from")?, false)?;
+            let to_ms = replay::parse_bound("--to", options.value("--to")?, true)?;
+            if from_ms >= to_ms {
+                return Err(format!("--from {from_ms} must be below --to {to_ms}"));
+            }
+            let request = EquivalenceRequest {
+                config,
+                from_ms,
+                to_ms,
+            };
+            let outcome = equivalence::run(&request, &mut std::io::stdout().lock())?;
             Ok(exit(outcome.pass))
         }
         Some("experiment") => match (args.get(1).map(String::as_str), args.get(2)) {
