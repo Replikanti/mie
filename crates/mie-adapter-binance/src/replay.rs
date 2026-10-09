@@ -44,6 +44,12 @@
 //!   stream resumed — and is listed in
 //!   [`trailing_gaps`](LiveReplayStream::trailing_gaps) instead.
 //!
+//! - **One run as live delivered it** (#13, ADR-041).
+//!   [`LiveReplay::run_replay`] recomputes one cleanly ended run with the
+//!   same read, integrity checks and recompute, but without chaining and
+//!   without a window: exactly what that run's live provider delivered to
+//!   its fresh engine, for the equivalence harness.
+//!
 //! Memory: one run's records and output at a time (about 1.5 M records for
 //! a 24 h run).
 
@@ -55,7 +61,9 @@ use mie_domain::time::EventTime;
 use mie_ports::outbound::{
     HistoricalDataProvider, MarketDataProvider, ProviderError, Replay, ReplayWindow,
 };
-use mie_ports::raw::{RawRecord, RawRecordSource, RawSelection, RawStreamKey, SealedFile};
+use mie_ports::raw::{
+    DatasetVersion, RawRecord, RawRecordSource, RawSelection, RawStreamKey, SealedFile,
+};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 
@@ -150,6 +158,88 @@ impl<'a> LiveReplay<'a> {
         &self.runs
     }
 
+    /// Exactly what one cleanly ended run's live provider delivered, for the
+    /// equivalence harness (#13, ADR-041): the run's records over its extent
+    /// recomputed with its pipeline from its first record, **without run
+    /// chaining (D3) and without a window (D4)**. Live gave every run a
+    /// fresh pipeline and a fresh engine, so its output is the run's
+    /// recompute alone. The integrity rules of D2 apply; records of other
+    /// runs in shared files are skipped, journaled or not, because they
+    /// cannot affect this run.
+    ///
+    /// The run is recomputed when this is called; the provider then holds
+    /// its events (one run in memory, as for [`replay`](Self::replay)).
+    ///
+    /// # Errors
+    ///
+    /// - [`ProviderError::Contract`] for a run id that is not among the
+    ///   runs, for a run that did not end cleanly — a crashed run's sealed
+    ///   prefix is not what live delivered before the crash — for a record
+    ///   without capture metadata and for a `receive_seq` stored twice;
+    /// - [`ProviderError::Source`] when the store fails or the clean run is
+    ///   incomplete.
+    pub fn run_replay(&self, run_id: &str) -> Result<RunReplay, ProviderError> {
+        let (run, (start, end)) = self
+            .runs
+            .iter()
+            .zip(self.extents())
+            .find(|(run, _)| run.run_id == run_id)
+            .ok_or_else(|| {
+                ProviderError::Contract(format!(
+                    "run {run_id} is not a journaled run of {}/{}",
+                    self.raw_source, self.symbol
+                ))
+            })?;
+        if run.clean_records.is_none() {
+            return Err(ProviderError::Contract(format!(
+                "run {run_id} did not end cleanly: its sealed records are not what live \
+                 delivered, so it cannot be compared"
+            )));
+        }
+        let keys = run
+            .streams
+            .iter()
+            .map(|s| RawStreamKey::new(&self.raw_source, &self.symbol, s.raw_name()))
+            .collect::<Result<BTreeSet<_>, _>>()
+            .map_err(source_error)?;
+        let selection = RawSelection::new(
+            keys,
+            ReplayWindow {
+                start: EventTime::from_millis(start),
+                end: EventTime::from_millis(end),
+            },
+        )
+        .map_err(source_error)?;
+        let dataset = self.source.select(&selection).map_err(source_error)?;
+        let prefix = format!("{run_id}/");
+        let mut records = Vec::new();
+        for file in &dataset.files {
+            let Some(stream) = BinanceStream::from_raw_name(file.stream.stream()) else {
+                return Err(ProviderError::Contract(format!(
+                    "{}: unknown live stream {}",
+                    file.relative_path, file.stream
+                )));
+            };
+            for record in self.source.read(file).map_err(source_error)? {
+                let Some(capture) = &record.capture else {
+                    return Err(ProviderError::Contract(format!(
+                        "{}: a live record at {} has no capture metadata",
+                        file.relative_path, record.event_time
+                    )));
+                };
+                if capture.session_id.starts_with(&prefix) {
+                    records.push((capture.receive_seq, stream, record));
+                }
+            }
+        }
+        let (events, stats) = recompute(run, sorted(run, records)?)?;
+        Ok(RunReplay {
+            events: events.into(),
+            stats,
+            dataset: dataset.version,
+        })
+    }
+
     /// Each run's extent `[start, end)` in exchange ms (module docs).
     fn extents(&self) -> Vec<(i64, i64)> {
         self.runs
@@ -165,6 +255,34 @@ impl<'a> LiveReplay<'a> {
                 )
             })
             .collect()
+    }
+}
+
+/// One cleanly ended run as its live provider delivered it
+/// ([`LiveReplay::run_replay`]).
+#[derive(Debug)]
+pub struct RunReplay {
+    events: VecDeque<MarketEvent>,
+    stats: RunStats,
+    dataset: DatasetVersion,
+}
+
+impl RunReplay {
+    /// What the recompute did with the run.
+    pub fn stats(&self) -> &RunStats {
+        &self.stats
+    }
+
+    /// The version of the files the run was read from: its streams over its
+    /// extent.
+    pub fn dataset(&self) -> &DatasetVersion {
+        &self.dataset
+    }
+}
+
+impl MarketDataProvider for RunReplay {
+    fn next_event(&mut self) -> Result<Option<MarketEvent>, ProviderError> {
+        Ok(self.events.pop_front())
     }
 }
 
@@ -314,41 +432,7 @@ impl LiveReplayStream<'_> {
     /// events.
     fn load(&mut self, run: &LiveRun, extent: (i64, i64)) -> Result<(), ProviderError> {
         let records = self.read_run(run, extent)?;
-        let found = records.len();
-        let prefix = records
-            .iter()
-            .enumerate()
-            .take_while(|(i, (seq, _, _))| *seq == *i as u64)
-            .count();
-        if let Some(expected) = run.clean_records {
-            if let Some((next, _, _)) = records.get(prefix) {
-                return Err(ProviderError::Source(format!(
-                    "run {} ended cleanly but receive_seq [{prefix}, {next}) is missing from \
-                     the raw store",
-                    run.run_id
-                )));
-            }
-            if found as u64 != expected {
-                let detail = if (found as u64) < expected {
-                    format!("receive_seq [{found}, {expected}) is missing from the raw store")
-                } else {
-                    format!("the raw store holds {found} records, run_end says {expected}")
-                };
-                return Err(ProviderError::Source(format!(
-                    "run {} ended cleanly but {detail}",
-                    run.run_id
-                )));
-            }
-        }
-
-        let mut pipeline =
-            Pipeline::new(&run.symbol, run.hold_back_ms, run.oi_retime_ms, &run.seeds);
-        let mut events = Vec::new();
-        for (_, stream, record) in &records[..prefix] {
-            events.extend(pipeline.push(*stream, record).events);
-        }
-        events.extend(pipeline.finish());
-        drop(records);
+        let (events, stats) = recompute(run, records)?;
 
         let events = match &self.last {
             Some(last) => {
@@ -381,14 +465,7 @@ impl LiveReplayStream<'_> {
                 self.out.push_back(event);
             }
         }
-        self.stats.push(RunStats {
-            run_id: run.run_id.clone(),
-            records: found as u64,
-            replayed: prefix as u64,
-            ignored: (found - prefix) as u64,
-            clean: run.clean_records.is_some(),
-            pipeline: pipeline.stats(),
-        });
+        self.stats.push(stats);
         Ok(())
     }
 
@@ -400,7 +477,7 @@ impl LiveReplayStream<'_> {
         &mut self,
         run: &LiveRun,
         (start, end): (i64, i64),
-    ) -> Result<Vec<(u64, BinanceStream, RawRecord)>, ProviderError> {
+    ) -> Result<RunRecords, ProviderError> {
         let prefix = format!("{}/", run.run_id);
         let mut records = Vec::new();
         let mut unknown = Unknown::new();
@@ -448,14 +525,7 @@ impl LiveReplayStream<'_> {
         if !unknown.is_empty() {
             return Err(unattributed(&unknown));
         }
-        records.sort_by_key(|(seq, _, _)| *seq);
-        if let Some(pair) = records.windows(2).find(|pair| pair[0].0 == pair[1].0) {
-            return Err(ProviderError::Contract(format!(
-                "run {}: receive_seq {} is stored twice",
-                run.run_id, pair[0].0
-            )));
-        }
-        Ok(records)
+        sorted(run, records)
     }
 
     /// After the last run: the selected files overlapping the window that
@@ -510,6 +580,74 @@ impl LiveReplayStream<'_> {
         }
         Ok(())
     }
+}
+
+/// A run's records with their stream, keyed by `receive_seq`.
+type RunRecords = Vec<(u64, BinanceStream, RawRecord)>;
+
+/// The run's records sorted by `receive_seq`, which must not repeat (D2).
+fn sorted(run: &LiveRun, mut records: RunRecords) -> Result<RunRecords, ProviderError> {
+    records.sort_by_key(|(seq, _, _)| *seq);
+    if let Some(pair) = records.windows(2).find(|pair| pair[0].0 == pair[1].0) {
+        return Err(ProviderError::Contract(format!(
+            "run {}: receive_seq {} is stored twice",
+            run.run_id, pair[0].0
+        )));
+    }
+    Ok(records)
+}
+
+/// Checks a run's sorted records and recomputes them with the run's
+/// pipeline: the one recompute of [`LiveReplay::replay`] and
+/// [`LiveReplay::run_replay`] (module docs, D2). A run that ended cleanly
+/// must be complete; a crashed run is recomputed over its contiguous
+/// `receive_seq` prefix.
+fn recompute(
+    run: &LiveRun,
+    records: RunRecords,
+) -> Result<(Vec<MarketEvent>, RunStats), ProviderError> {
+    let found = records.len();
+    let prefix = records
+        .iter()
+        .enumerate()
+        .take_while(|(i, (seq, _, _))| *seq == *i as u64)
+        .count();
+    if let Some(expected) = run.clean_records {
+        if let Some((next, _, _)) = records.get(prefix) {
+            return Err(ProviderError::Source(format!(
+                "run {} ended cleanly but receive_seq [{prefix}, {next}) is missing from \
+                 the raw store",
+                run.run_id
+            )));
+        }
+        if found as u64 != expected {
+            let detail = if (found as u64) < expected {
+                format!("receive_seq [{found}, {expected}) is missing from the raw store")
+            } else {
+                format!("the raw store holds {found} records, run_end says {expected}")
+            };
+            return Err(ProviderError::Source(format!(
+                "run {} ended cleanly but {detail}",
+                run.run_id
+            )));
+        }
+    }
+
+    let mut pipeline = Pipeline::new(&run.symbol, run.hold_back_ms, run.oi_retime_ms, &run.seeds);
+    let mut events = Vec::new();
+    for (_, stream, record) in &records[..prefix] {
+        events.extend(pipeline.push(*stream, record).events);
+    }
+    events.extend(pipeline.finish());
+    let stats = RunStats {
+        run_id: run.run_id.clone(),
+        records: found as u64,
+        replayed: prefix as u64,
+        ignored: (found - prefix) as u64,
+        clean: run.clean_records.is_some(),
+        pipeline: pipeline.stats(),
+    };
+    Ok((events, stats))
 }
 
 /// The run id of a capture session: the part before the first `/`.
@@ -934,6 +1072,115 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn drain_run(run: RunReplay) -> Vec<MarketEvent> {
+        let mut run = run;
+        let mut out = Vec::new();
+        while let Some(event) = run.next_event().unwrap() {
+            out.push(event);
+        }
+        out
+    }
+
+    #[test]
+    fn a_lone_run_replays_as_a_window_that_covers_it() {
+        let b = busy_run();
+        let mut source = MemorySource::default();
+        b.seal(&mut source, &[]);
+        let n = b.records.len() as u64;
+        let run = b.run(T0, Some(T0 + 21_000), Some(n));
+        let live = LiveReplay::new(&source, SOURCE, "BTCUSDT", vec![run.clone()]);
+        let one = live.run_replay(&run.run_id).unwrap();
+        let stats = one.stats().clone();
+        assert_eq!(
+            (stats.records, stats.replayed, stats.ignored, stats.clean),
+            (n, n, 0, true)
+        );
+        // A window equal to the run's extent selects the same files.
+        let covering = live
+            .replay(window(T0 - RUN_MARGIN_MS, T0 + 21_000 + RUN_MARGIN_MS))
+            .unwrap();
+        assert_eq!(one.dataset(), &covering.dataset);
+        let events = drain_run(one);
+        assert_eq!(events, drain(&mut { covering }.stream));
+        assert_eq!(events, b.live(&run));
+    }
+
+    #[test]
+    fn a_run_replays_without_its_neighbour_and_without_chaining() {
+        // As in the fast restart: run 2 starts within a second of run 1's
+        // end and both share one file per stream.
+        let mut first = RunBuilder::new("20261006T010000Z");
+        for i in 0..100_u64 {
+            first.push(BinanceStream::AggTrade, 1, agg(1 + i, T0 + 200 * i as i64));
+            if i % 5 == 0 {
+                first.push(BinanceStream::MarkPrice, 1, mark(T0 + 200 * i as i64 + 1));
+            }
+        }
+        let mut second = RunBuilder::new("20261006T010021Z");
+        second.push(BinanceStream::MarkPrice, 1, mark(T0 + 19_000));
+        for i in 0..20_u64 {
+            second.push(
+                BinanceStream::AggTrade,
+                1,
+                agg(101 + i, T0 + 20_100 + 100 * i as i64),
+            );
+        }
+        let mut source = MemorySource::default();
+        for stream in BinanceStream::ALL {
+            let mut records = first.of(stream, &[]);
+            records.extend(second.of(stream, &[]));
+            if !records.is_empty() {
+                source.seal(SOURCE, stream.raw_name(), records);
+            }
+        }
+        let run1 = first.run(T0, Some(T0 + 20_500), Some(first.records.len() as u64));
+        let run2 = second.run(
+            T0 + 21_000,
+            Some(T0 + 30_000),
+            Some(second.records.len() as u64),
+        );
+        let live = LiveReplay::new(&source, SOURCE, "BTCUSDT", vec![run1.clone(), run2.clone()]);
+        assert_eq!(
+            drain_run(live.run_replay(&run1.run_id).unwrap()),
+            first.live(&run1)
+        );
+        let alone = drain_run(live.run_replay(&run2.run_id).unwrap());
+        assert_eq!(alone, second.live(&run2));
+        // The chained replay turns run 2's first mark price into a late gap;
+        // the run alone delivers it, as live did.
+        let chained = replay(&source, vec![run1, run2], window(T0, T0 + 60_000));
+        assert!(!chained.ends_with(&alone));
+        assert!(matches!(alone[0], MarketEvent::MarkPrice(_)), "{alone:?}");
+    }
+
+    #[test]
+    fn only_a_known_clean_complete_run_replays_alone() {
+        let b = busy_run();
+        let n = b.records.len() as u64;
+        let mut holed = MemorySource::default();
+        b.seal(&mut holed, &[3]);
+        let clean = b.run(T0, Some(T0 + 21_000), Some(n));
+        let live = LiveReplay::new(&holed, SOURCE, "BTCUSDT", vec![clean]);
+        let err = live.run_replay("20261006T010000Z").unwrap_err();
+        assert!(
+            matches!(&err, ProviderError::Source(d) if d.contains("receive_seq [3, 4) is missing")),
+            "{err}"
+        );
+        let err = live.run_replay("20261006T020000Z").unwrap_err();
+        assert!(
+            matches!(&err, ProviderError::Contract(d) if d.contains("not a journaled run")),
+            "{err}"
+        );
+        let mut complete = MemorySource::default();
+        b.seal(&mut complete, &[]);
+        let crashed = LiveReplay::new(&complete, SOURCE, "BTCUSDT", vec![b.run(T0, None, None)]);
+        let err = crashed.run_replay("20261006T010000Z").unwrap_err();
+        assert!(
+            matches!(&err, ProviderError::Contract(d) if d.contains("did not end cleanly")),
+            "{err}"
+        );
     }
 
     #[test]
