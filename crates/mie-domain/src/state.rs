@@ -13,7 +13,8 @@
 //! liquidation windows (ADR-042, [`derivatives`]), and the order book: the
 //! L2 book itself, banded depth and imbalance, liquidity flow windows and
 //! concentration (ADR-043, [`liquidity`]), and location: the UTC-day VWAP
-//! and the level registry with its zone events (ADR-044, [`location`]);
+//! the level registry with its zone events, and the auction state against
+//! the prior day's value (ADR-044, [`location`]);
 //! every other kind passes through.
 //! Further feature families are added by the Market State issues, each as a
 //! registered, versioned definition (ADR-029, [`feature`]).
@@ -115,8 +116,9 @@ pub struct MarketState {
     /// Location (ADR-044): `location.vwap.utc_day@1`, the volume-weighted
     /// average price of the current UTC day over its closed minutes, and
     /// `location.levels@1`, the level registry with score components and
-    /// in-zone flags, rebuilt at each closed 1m bar with trades. Location
-    /// facts, never signals (ADR-012).
+    /// in-zone flags, rebuilt at each closed 1m bar with trades; and
+    /// `location.auction.prior_day@1`, the auction state against the prior
+    /// day's value area. Location facts, never signals (ADR-012).
     pub location: LocationState,
     /// Number of trades consumed. A diagnostic counter, not a feature: it
     /// depends on where consumption started, so it is not reproducible
@@ -965,8 +967,8 @@ mod tests {
              derivatives.liq.window.1h@1,derivatives.liq.window.5m@1,\
              derivatives.mark@1,derivatives.oi.5m@1,derivatives.oi.sample@1,\
              flow.cvd.continuous@1,flow.cvd.utc_day@1,flow.window.15m@1,\
-             flow.window.1h@1,flow.window.5m@1,location.levels@1,\
-             location.vwap.utc_day@1,profile.volume.composite_5d@1,\
+             flow.window.1h@1,flow.window.5m@1,location.auction.prior_day@1,\
+             location.levels@1,location.vwap.utc_day@1,profile.volume.composite_5d@1,\
              profile.volume.prior_day@1,profile.volume.utc_day@1,\
              structure.levels.15m@1,structure.levels.1d@1,structure.levels.1h@1,\
              structure.levels.4h@1,structure.swing.15m@1,structure.swing.1d@1,\

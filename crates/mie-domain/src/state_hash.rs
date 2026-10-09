@@ -236,11 +236,11 @@ mod tests {
         // docs).
         assert_eq!(
             MarketStateEngine::new().state().state_hash().to_string(),
-            "1bdd19fbf691b4e4"
+            "07d751789d32107b"
         );
         assert_eq!(
             engine_after(&tape()).state().state_hash().to_string(),
-            "db2cde4fdab54da5"
+            "eb546bdf353a938e"
         );
     }
 
@@ -463,6 +463,16 @@ mod tests {
                 s.location.levels = FeatureValue::WarmingUp {
                     observed: 0,
                     required: 1,
+                };
+            }),
+        ));
+        // The tape closes no day: the auction state is still warming up.
+        assert!(!base.location.auction.is_ready());
+        edits.push((
+            "location auction",
+            Box::new(|s| {
+                s.location.auction = FeatureValue::Unavailable {
+                    reason: Unavailability::InputInvalid,
                 };
             }),
         ));

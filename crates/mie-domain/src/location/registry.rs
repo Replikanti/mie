@@ -991,6 +991,10 @@ mod tests {
                 let (level, entered, bar_end) = match fact {
                     LocationEvent::Entered { level, bar_end, .. } => (level, true, bar_end),
                     LocationEvent::Left { level, bar_end, .. } => (level, false, bar_end),
+                    LocationEvent::Auction { bar_end, .. } => {
+                        assert!(*bar_end <= event.time());
+                        continue;
+                    }
                 };
                 assert!(*bar_end <= event.time());
                 assert!(level.is_monitored(), "{fact}");
@@ -1023,6 +1027,7 @@ mod tests {
                 .filter(|(_, fact)| match fact {
                     LocationEvent::Entered { cause, .. } => Some(*cause) == entered,
                     LocationEvent::Left { cause, .. } => Some(*cause) == left,
+                    LocationEvent::Auction { .. } => false,
                 })
                 .count()
         };
@@ -1111,6 +1116,9 @@ mod tests {
         for event in walk_tape(0x6d69_6500_0000_0044, 7) {
             engine.apply(&event).unwrap();
             for fact in engine.location_events() {
+                if matches!(fact, LocationEvent::Auction { .. }) {
+                    continue;
+                }
                 facts.write_str(&format!("{} {fact}", fact.time()));
                 fact_count += 1;
             }

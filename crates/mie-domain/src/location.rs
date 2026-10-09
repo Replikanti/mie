@@ -19,6 +19,12 @@
 //!   [`LocationEvent`]s, exposed by
 //!   [`MarketStateEngine::location_events`](crate::state::MarketStateEngine::location_events).
 //!   Liquidity clusters are scored but not monitored.
+//! - `location.auction.prior_day@1` ([`AuctionStatus`], decisions 8 and 9):
+//!   the auction state of each closed 1m bar with trades against the prior
+//!   day's value area — [`AuctionState`] from a measurable definition: a
+//!   region or an edge band per close, probes that count closes beyond an
+//!   edge, failure on a close back, acceptance at [`ACCEPTANCE_CLOSES`]
+//!   counted closes. Its transitions are [`LocationEvent::Auction`] facts.
 //!
 //! Location is the last stage of an event (decision 2): the VWAP steps with
 //! the other trackers and can fail; the registry runs after every family
@@ -33,9 +39,14 @@
 //! [`crate::structure`] (ADR-037), which hands them over as
 //! [`StructureLevel`](crate::structure::StructureLevel)s.
 
+mod auction;
 mod registry;
 mod vwap;
 
+pub use auction::{
+    ACCEPTANCE_CLOSES, AuctionClassifier, AuctionStatus, Classified, Failure, Origin, Position,
+    Probe, Region,
+};
 pub use registry::{ClusterStrength, EnterCause, LeaveCause, LevelSet, LevelSide, LocationLevel};
 pub use vwap::Vwap;
 pub(crate) use vwap::{VwapStep, VwapTracker};
@@ -177,6 +188,49 @@ pub enum AuctionState {
     Acceptance,
 }
 
+impl AuctionState {
+    /// Every state, in declaration order.
+    pub const ALL: [Self; 7] = [
+        Self::InsideValue,
+        Self::AtValueEdge,
+        Self::OutsideValue,
+        Self::Breakout,
+        Self::FailedBreakout,
+        Self::FailedReclaim,
+        Self::Acceptance,
+    ];
+}
+
+impl StateEncode for AuctionState {
+    /// `write_u8` in declaration order: InsideValue 0 … Acceptance 6
+    /// (ADR-041).
+    fn encode(&self, f: &mut Fingerprinter) {
+        f.write_u8(match self {
+            Self::InsideValue => 0,
+            Self::AtValueEdge => 1,
+            Self::OutsideValue => 2,
+            Self::Breakout => 3,
+            Self::FailedBreakout => 4,
+            Self::FailedReclaim => 5,
+            Self::Acceptance => 6,
+        });
+    }
+}
+
+impl fmt::Display for AuctionState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::InsideValue => "inside_value",
+            Self::AtValueEdge => "at_value_edge",
+            Self::OutsideValue => "outside_value",
+            Self::Breakout => "breakout",
+            Self::FailedBreakout => "failed_breakout",
+            Self::FailedReclaim => "failed_reclaim",
+            Self::Acceptance => "acceptance",
+        })
+    }
+}
+
 /// The location features of the Market State (ADR-044).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocationState {
@@ -186,13 +240,24 @@ pub struct LocationState {
     /// `location.levels@1`, warming up until the first closed 1m bar with
     /// trades.
     pub levels: FeatureValue<LevelSet>,
+    /// `location.auction.prior_day@1`, warming up until the first closed 1m
+    /// bar with trades under a ready prior day, and again from each new
+    /// prior day until its first close; `Unavailable(InputInvalid)` while
+    /// the prior day is unavailable or its value area is not wider than
+    /// both edge bands.
+    pub auction: FeatureValue<AuctionStatus>,
 }
 
 impl StateEncode for LocationState {
     fn encode(&self, f: &mut Fingerprinter) {
-        let Self { vwap, levels } = self;
+        let Self {
+            vwap,
+            levels,
+            auction,
+        } = self;
         vwap.encode(f);
         levels.encode(f);
+        auction.encode(f);
     }
 }
 
@@ -211,15 +276,20 @@ impl LocationState {
                 observed: 0,
                 required: 1,
             },
+            auction: FeatureValue::WarmingUp {
+                observed: 0,
+                required: 1,
+            },
         }
     }
 }
 
-/// A monitored-location fact, in emission order per closed bar: every
-/// [`Left`](Self::Left), then every [`Entered`](Self::Entered), each in
-/// registry order (decision 7).
+/// A monitored-location fact, in emission order per closed bar: the
+/// auction transition, then every [`Left`](Self::Left), then every
+/// [`Entered`](Self::Entered), each in registry order (decision 7).
 ///
-/// Not hashed: the in-zone flags they follow from are part of the state.
+/// Not hashed: the in-zone flags and the auction state they follow from are
+/// part of the state.
 /// `Display` prints the canonical line the golden tests pin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LocationEvent {
@@ -245,6 +315,18 @@ pub enum LocationEvent {
         /// End of the bar.
         bar_end: EventTime,
     },
+    /// The auction state changed with a close (decision 8).
+    Auction {
+        /// The previous close's state under the same prior day; `None` for
+        /// the first close under it.
+        from: Option<AuctionState>,
+        /// The state after the close.
+        to: AuctionState,
+        /// Time of the event that closed the bar.
+        known_at: EventTime,
+        /// End of the bar.
+        bar_end: EventTime,
+    },
 }
 
 impl LocationEvent {
@@ -252,7 +334,9 @@ impl LocationEvent {
     /// bar, never the bar end (decision 2).
     pub fn time(&self) -> EventTime {
         match self {
-            Self::Entered { known_at, .. } | Self::Left { known_at, .. } => *known_at,
+            Self::Entered { known_at, .. }
+            | Self::Left { known_at, .. }
+            | Self::Auction { known_at, .. } => *known_at,
         }
     }
 }
@@ -272,15 +356,29 @@ impl fmt::Display for LocationEvent {
                 bar_end,
                 ..
             } => write!(f, "left {cause:?} bar={bar_end} {level}"),
+            Self::Auction {
+                from, to, bar_end, ..
+            } => match from {
+                Some(from) => write!(f, "auction {from}->{to} bar={bar_end}"),
+                None => write!(f, "auction ->{to} bar={bar_end}"),
+            },
         }
     }
 }
 
-/// The location engine state (ADR-044): the VWAP sums. Engine state; the
-/// Market State exposes only [`LocationState`].
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// The location engine state (ADR-044): the VWAP sums and the auction
+/// classifier. Engine state; the Market State exposes only
+/// [`LocationState`].
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LocationTracker {
     pub(crate) vwap: VwapTracker,
+    auction: AuctionClassifier,
+}
+
+impl Default for LocationTracker {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// The fallible part of one event's location step, committed with the other
@@ -292,7 +390,10 @@ pub(crate) struct LocationStep {
 impl LocationTracker {
     /// An empty tracker.
     pub(crate) fn new() -> Self {
-        Self::default()
+        Self {
+            vwap: VwapTracker::default(),
+            auction: AuctionClassifier::new(TOLERANCE_BPS, ACCEPTANCE_CLOSES),
+        }
     }
 
     /// Steps the VWAP with `event`, given the bars it closed, without
@@ -319,8 +420,10 @@ impl LocationTracker {
     }
 
     /// The infallible stage (decision 2): after every family has committed
-    /// `event`, rebuilds the level registry at the closed 1m bar with
-    /// trades among `closed` and appends its zone events to `events`.
+    /// `event`, steps the auction classifier through `closed` — the old
+    /// day's closes against the old reference, then the new prior day —
+    /// and rebuilds the level registry at the closed 1m bar with trades,
+    /// appending the auction transition and the zone events to `events`.
     /// Empty bars neither count nor fail anything.
     pub(crate) fn locate(
         &mut self,
@@ -331,6 +434,22 @@ impl LocationTracker {
         events: &mut Vec<LocationEvent>,
     ) {
         let known_at = event.time();
+        if closed.is_empty() {
+            return;
+        }
+        self.auction
+            .step(closed, &inputs.profile.prior_day, known_at, |classified| {
+                let to = classified.status.state;
+                if classified.from != Some(to) {
+                    events.push(LocationEvent::Auction {
+                        from: classified.from,
+                        to,
+                        known_at,
+                        bar_end: classified.status.bar_end,
+                    });
+                }
+            });
+        state.auction = *self.auction.status();
         // At most one: a bar with trades is closed by the next trades-stream
         // event, before any later minute could fill.
         let minute = closed.iter().rev().find_map(|bar| match bar.ohlc {

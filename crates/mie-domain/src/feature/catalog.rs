@@ -1418,6 +1418,47 @@ pub const LOCATION_LEVELS_V1: FeatureDefinition = FeatureDefinition {
     warm_up: WarmUp::Samples(1),
 };
 
+/// `location.auction.prior_day@1`: the auction state of each closed 1m bar
+/// with trades against the prior UTC day's value area `[VAL, VAH)` (ADR-044
+/// D8, D9). With `w` = 5 bps of the edge, a close lies Above (`c > VAH + w`),
+/// Below (`c < VAL − w`), In (`VAL + w < c < VAH − w`) or in an edge band.
+/// The first close sets the accepted region; a close in another region
+/// starts a probe, which counts closes beyond the edge itself, fails on a
+/// close back in the accepted region, and is accepted at 60 counted closes.
+/// A failure's label holds until 60 closes count back or a new probe
+/// starts. Labels: `Breakout` (a probe out of value), `FailedBreakout`,
+/// `FailedReclaim`, `Acceptance` / `OutsideValue` (accepted outside value by
+/// a probe / by the first close), `AtValueEdge` / `InsideValue`.
+///
+/// - Parameters: `acceptance_closes` = 60, `tolerance` = 0.0005 (`Rate`).
+/// - Inputs: `profile.volume.prior_day@1` (the reference) and
+///   `bars.time.1m@1` (the closes).
+/// - Warm-up: one sample, where a sample is a closed 1m bar with trades
+///   under a ready prior day. The classifier resets at each new prior day
+///   and warms up again until its first close.
+/// - Gap policy: an empty bar neither counts nor fails anything. While the
+///   prior day is unavailable, or `VAH − VAL` is at most both edge bands,
+///   the value is `Unavailable(InputInvalid)`. The value carries the
+///   prior day's coverage OR that of every bar classified under it.
+pub const LOCATION_AUCTION_PRIOR_DAY_V1: FeatureDefinition = FeatureDefinition {
+    key: FeatureKey::new("location.auction.prior_day", 1),
+    params: &[
+        Param {
+            name: "acceptance_closes",
+            value: ParamValue::Int(60),
+        },
+        Param {
+            name: "tolerance",
+            value: ParamValue::Rate(LOCATION_TOLERANCE),
+        },
+    ],
+    inputs: &[
+        Input::Feature(PROFILE_VOLUME_PRIOR_DAY_V1.key),
+        Input::Feature(BARS_TIME_1M_V1.key),
+    ],
+    warm_up: WarmUp::Samples(1),
+};
+
 /// Every version of every feature. Never shrinks.
 pub const DEFINITIONS: &[&FeatureDefinition] = &[
     &TRADE_LAST_PRICE_V1,
@@ -1466,6 +1507,7 @@ pub const DEFINITIONS: &[&FeatureDefinition] = &[
     &BOOK_LIQUIDITY_WINDOW_1H_V1,
     &LOCATION_VWAP_UTC_DAY_V1,
     &LOCATION_LEVELS_V1,
+    &LOCATION_AUCTION_PRIOR_DAY_V1,
 ];
 
 /// The fingerprint each published `id@version` must keep. Append-only: one
@@ -1517,6 +1559,7 @@ pub const LOCK: &[LockEntry] = &[
     LockEntry::new("book.liquidity.window.1h", 1, 0xd4a5_f617_f61e_8388),
     LockEntry::new("location.vwap.utc_day", 1, 0x03e9_3688_148e_d1ac),
     LockEntry::new("location.levels", 1, 0x0fb0_3473_902a_b08b),
+    LockEntry::new("location.auction.prior_day", 1, 0xc08e_5f83_47a7_0a0b),
 ];
 
 /// The default feature set: the latest version of each computed feature.
@@ -1567,6 +1610,7 @@ pub const CURRENT: &[FeatureKey] = &[
     BOOK_LIQUIDITY_WINDOW_1H_V1.key,
     LOCATION_VWAP_UTC_DAY_V1.key,
     LOCATION_LEVELS_V1.key,
+    LOCATION_AUCTION_PRIOR_DAY_V1.key,
 ];
 
 /// The registry of [`DEFINITIONS`].
@@ -1640,10 +1684,10 @@ mod tests {
             hasher.write_u32(entry.key.version.get());
             hasher.write_u64(entry.fingerprint.value());
         }
-        assert_eq!(LOCK.len(), 46, "lock lines");
+        assert_eq!(LOCK.len(), 47, "lock lines");
         assert_eq!(
             hasher.finish().to_string(),
-            "f95a4ff310b2a6cc",
+            "02ab8182cad14cc6",
             "lock digest"
         );
     }
@@ -2124,7 +2168,31 @@ mod tests {
                     .contains(&Input::Feature(levels.key))
             );
         }
-        let location = [&LOCATION_VWAP_UTC_DAY_V1, &LOCATION_LEVELS_V1];
+        assert_eq!(
+            LOCATION_AUCTION_PRIOR_DAY_V1.params,
+            &[
+                Param {
+                    name: "acceptance_closes",
+                    value: ParamValue::Int(i64::from(crate::location::ACCEPTANCE_CLOSES)),
+                },
+                Param {
+                    name: "tolerance",
+                    value: ParamValue::Rate(LOCATION_TOLERANCE),
+                },
+            ]
+        );
+        assert_eq!(
+            LOCATION_AUCTION_PRIOR_DAY_V1.inputs,
+            &[
+                Input::Feature(PROFILE_VOLUME_PRIOR_DAY_V1.key),
+                Input::Feature(BARS_TIME_1M_V1.key),
+            ]
+        );
+        let location = [
+            &LOCATION_VWAP_UTC_DAY_V1,
+            &LOCATION_LEVELS_V1,
+            &LOCATION_AUCTION_PRIOR_DAY_V1,
+        ];
         for definition in location {
             assert!(definition.key.id.as_str().starts_with("location."));
             assert_eq!(definition.key.version.get(), 1);
@@ -2150,14 +2218,14 @@ mod tests {
              derivatives.liq.window.1h@1,derivatives.liq.window.5m@1,\
              derivatives.mark@1,derivatives.oi.5m@1,derivatives.oi.sample@1,\
              flow.cvd.continuous@1,flow.cvd.utc_day@1,flow.window.15m@1,\
-             flow.window.1h@1,flow.window.5m@1,location.levels@1,\
-             location.vwap.utc_day@1,profile.volume.composite_5d@1,\
+             flow.window.1h@1,flow.window.5m@1,location.auction.prior_day@1,\
+             location.levels@1,location.vwap.utc_day@1,profile.volume.composite_5d@1,\
              profile.volume.prior_day@1,profile.volume.utc_day@1,\
              structure.levels.15m@1,structure.levels.1d@1,structure.levels.1h@1,\
              structure.levels.4h@1,structure.swing.15m@1,structure.swing.1d@1,\
              structure.swing.1h@1,structure.swing.4h@1,trade.last_price@1,\
              volatility.atr.1h@1,volatility.regime.1h@1"
         );
-        assert_eq!(set.version().to_string(), "03d7fd13415653e3");
+        assert_eq!(set.version().to_string(), "02912fb2b197ce4d");
     }
 }
