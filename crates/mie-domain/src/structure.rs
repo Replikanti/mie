@@ -29,8 +29,10 @@
 use crate::bars::{Bar, Coverage, Ohlc, Timeframe};
 use crate::event::MarketEvent;
 use crate::feature::{FeatureDefinition, FeatureKey, FeatureValue, catalog};
+use crate::fingerprint::Fingerprinter;
 use crate::location::LevelKind;
 use crate::num::Price;
+use crate::state_hash::StateEncode;
 use crate::time::EventTime;
 use std::collections::VecDeque;
 use std::fmt;
@@ -65,6 +67,16 @@ pub enum Side {
     High,
     /// A swing low: a level below price.
     Low,
+}
+
+impl StateEncode for Side {
+    /// `write_u8` in declaration order: High 0, Low 1 (ADR-041).
+    fn encode(&self, f: &mut Fingerprinter) {
+        f.write_u8(match self {
+            Self::High => 0,
+            Self::Low => 1,
+        });
+    }
 }
 
 impl fmt::Display for Side {
@@ -104,6 +116,29 @@ pub struct Swing {
     pub coverage: Coverage,
 }
 
+impl StateEncode for Swing {
+    fn encode(&self, f: &mut Fingerprinter) {
+        let Self {
+            feature,
+            timeframe,
+            side,
+            price,
+            swing_time,
+            confirmed_bar_end,
+            known_at,
+            coverage,
+        } = self;
+        feature.encode(f);
+        timeframe.encode(f);
+        side.encode(f);
+        price.encode(f);
+        swing_time.encode(f);
+        confirmed_bar_end.encode(f);
+        known_at.encode(f);
+        coverage.encode(f);
+    }
+}
+
 impl fmt::Display for Swing {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -129,6 +164,14 @@ pub struct LastSwings {
     pub low: Option<Swing>,
 }
 
+impl StateEncode for LastSwings {
+    fn encode(&self, f: &mut Fingerprinter) {
+        let Self { high, low } = self;
+        high.encode(f);
+        low.encode(f);
+    }
+}
+
 /// How a sweep resolved (decision 7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SweepOutcome {
@@ -139,6 +182,17 @@ pub enum SweepOutcome {
     Sfp,
     /// The whole window closed beyond the level: a clean break.
     Break,
+}
+
+impl StateEncode for SweepOutcome {
+    /// `write_u8` in declaration order: Pending 0, Sfp 1, Break 2 (ADR-041).
+    fn encode(&self, f: &mut Fingerprinter) {
+        f.write_u8(match self {
+            Self::Pending => 0,
+            Self::Sfp => 1,
+            Self::Break => 2,
+        });
+    }
 }
 
 impl fmt::Display for SweepOutcome {
@@ -170,6 +224,27 @@ pub struct Level {
     pub touches: u32,
     /// The swing's coverage.
     pub coverage: Coverage,
+}
+
+impl StateEncode for Level {
+    fn encode(&self, f: &mut Fingerprinter) {
+        let Self {
+            side,
+            price,
+            swing_time,
+            confirmed_bar_end,
+            known_at,
+            touches,
+            coverage,
+        } = self;
+        side.encode(f);
+        price.encode(f);
+        swing_time.encode(f);
+        confirmed_bar_end.encode(f);
+        known_at.encode(f);
+        touches.encode(f);
+        coverage.encode(f);
+    }
 }
 
 /// A level a trade went beyond, and how that resolved (decisions 6 and 7).
@@ -204,6 +279,35 @@ pub struct Sweep {
     pub known_at: EventTime,
     /// The level's coverage OR that of the window bars read.
     pub coverage: Coverage,
+}
+
+impl StateEncode for Sweep {
+    fn encode(&self, f: &mut Fingerprinter) {
+        let Self {
+            feature,
+            timeframe,
+            level,
+            time,
+            price,
+            extreme,
+            window_bars,
+            outcome,
+            resolved_bar_end,
+            known_at,
+            coverage,
+        } = self;
+        feature.encode(f);
+        timeframe.encode(f);
+        level.encode(f);
+        time.encode(f);
+        price.encode(f);
+        extreme.encode(f);
+        window_bars.encode(f);
+        outcome.encode(f);
+        resolved_bar_end.encode(f);
+        known_at.encode(f);
+        coverage.encode(f);
+    }
 }
 
 impl fmt::Display for Sweep {
@@ -291,6 +395,25 @@ pub struct LevelRegistry {
     pending: Vec<Sweep>,
     /// Resolved sweeps, in resolution order.
     resolved: Vec<Sweep>,
+}
+
+impl StateEncode for LevelRegistry {
+    fn encode(&self, f: &mut Fingerprinter) {
+        let Self {
+            feature,
+            timeframe,
+            highs,
+            lows,
+            pending,
+            resolved,
+        } = self;
+        feature.encode(f);
+        timeframe.encode(f);
+        highs.encode(f);
+        lows.encode(f);
+        pending.encode(f);
+        resolved.encode(f);
+    }
 }
 
 impl LevelRegistry {
@@ -564,6 +687,14 @@ pub struct TimeframeStructure {
     pub levels: FeatureValue<LevelRegistry>,
 }
 
+impl StateEncode for TimeframeStructure {
+    fn encode(&self, f: &mut Fingerprinter) {
+        let Self { swings, levels } = self;
+        swings.encode(f);
+        levels.encode(f);
+    }
+}
+
 /// The value of a structure feature before its timeframe has closed `bars`
 /// bars.
 fn warming<T>(bars: u64) -> FeatureValue<T> {
@@ -578,6 +709,13 @@ fn warming<T>(bars: u64) -> FeatureValue<T> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StructureSet {
     timeframes: [TimeframeStructure; 4],
+}
+
+impl StateEncode for StructureSet {
+    fn encode(&self, f: &mut Fingerprinter) {
+        let Self { timeframes } = self;
+        timeframes.encode(f);
+    }
 }
 
 impl Default for StructureSet {

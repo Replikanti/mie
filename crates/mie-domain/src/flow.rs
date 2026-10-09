@@ -27,7 +27,9 @@
 use crate::bars::{Bar, BarSet, Coverage, Timeframe};
 use crate::event::{Aggressor, MarketEvent, Stream, Trade};
 use crate::feature::{FeatureKey, FeatureValue, catalog};
+use crate::fingerprint::Fingerprinter;
 use crate::num::{Price, Qty, SCALE};
+use crate::state_hash::StateEncode;
 use crate::time::EventTime;
 use std::fmt;
 
@@ -77,6 +79,21 @@ pub struct Cvd {
     pub gaps: u64,
 }
 
+impl StateEncode for Cvd {
+    fn encode(&self, f: &mut Fingerprinter) {
+        let Self {
+            feature,
+            cvd,
+            anchor,
+            gaps,
+        } = self;
+        feature.encode(f);
+        cvd.encode(f);
+        anchor.encode(f);
+        gaps.encode(f);
+    }
+}
+
 impl fmt::Display for Cvd {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -102,6 +119,21 @@ pub struct DayCvd {
     pub cvd: Qty,
     /// The daily bar's coverage: an incomplete day misses trades.
     pub coverage: Coverage,
+}
+
+impl StateEncode for DayCvd {
+    fn encode(&self, f: &mut Fingerprinter) {
+        let Self {
+            feature,
+            day_open,
+            cvd,
+            coverage,
+        } = self;
+        feature.encode(f);
+        day_open.encode(f);
+        cvd.encode(f);
+        coverage.encode(f);
+    }
 }
 
 impl fmt::Display for DayCvd {
@@ -152,6 +184,41 @@ pub struct AggressionWindow {
     pub displacement: Option<Price>,
     /// The OR of the window's minutes' coverage (decision 3).
     pub coverage: Coverage,
+}
+
+impl StateEncode for AggressionWindow {
+    fn encode(&self, f: &mut Fingerprinter) {
+        let Self {
+            feature,
+            timeframe,
+            end,
+            buy_volume,
+            sell_volume,
+            delta,
+            volume,
+            trade_count,
+            large_count,
+            large_buy_volume,
+            large_sell_volume,
+            reference_price,
+            displacement,
+            coverage,
+        } = self;
+        feature.encode(f);
+        timeframe.encode(f);
+        end.encode(f);
+        buy_volume.encode(f);
+        sell_volume.encode(f);
+        delta.encode(f);
+        volume.encode(f);
+        trade_count.encode(f);
+        large_count.encode(f);
+        large_buy_volume.encode(f);
+        large_sell_volume.encode(f);
+        reference_price.encode(f);
+        displacement.encode(f);
+        coverage.encode(f);
+    }
 }
 
 impl AggressionWindow {
@@ -238,6 +305,13 @@ pub struct AggressionWindows {
     values: [FeatureValue<AggressionWindow>; 3],
 }
 
+impl StateEncode for AggressionWindows {
+    fn encode(&self, f: &mut Fingerprinter) {
+        let Self { values } = self;
+        values.encode(f);
+    }
+}
+
 impl Default for AggressionWindows {
     fn default() -> Self {
         Self::new()
@@ -292,6 +366,19 @@ pub struct OrderFlow {
     /// `flow.window.<5m|15m|1h>@1`, each warming up until its window of
     /// closed minutes is full.
     pub windows: AggressionWindows,
+}
+
+impl StateEncode for OrderFlow {
+    fn encode(&self, f: &mut Fingerprinter) {
+        let Self {
+            cvd,
+            cvd_utc_day,
+            windows,
+        } = self;
+        cvd.encode(f);
+        cvd_utc_day.encode(f);
+        windows.encode(f);
+    }
 }
 
 impl Default for OrderFlow {

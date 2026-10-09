@@ -61,12 +61,17 @@
 //! 5. Expose the value on [`MarketState`](crate::state::MarketState) as
 //!    [`FeatureValue<T>`]. It is ready only after its warm-up and goes back to
 //!    `WarmingUp` according to its gap policy.
-//! 6. Add a golden-output test per version on a fixed tape. It pins the
+//! 6. Encode the family's state in the Market State hash
+//!    ([`state_hash`](crate::state_hash), ADR-041): an encoder next to each
+//!    new type, through exhaustive destructuring, and the new field in
+//!    `MarketState::state_hash`. Then update the pinned state-hash golden
+//!    values; a new feature set changes them.
+//! 7. Add a golden-output test per version on a fixed tape. It pins the
 //!    behaviour the fingerprint cannot see.
 //!    A new version is built on one version of each upstream id, so its
 //!    dependency closure fits one feature set (the registry rejects a
 //!    closure that needs two versions of one id).
-//! 7. Any change to parameters, inputs, an upstream version, the warm-up or
+//! 8. Any change to parameters, inputs, an upstream version, the warm-up or
 //!    the outputs means a new `_V{n+1}` const and `LOCK` line. The old
 //!    version stays in `DEFINITIONS` and `LOCK`, stays computable, and keeps
 //!    its golden test. Never edit or delete a `LOCK` line.
@@ -76,6 +81,7 @@ pub mod catalog;
 use crate::event::Stream;
 use crate::fingerprint::{Fingerprint, Fingerprinter};
 use crate::num::{Price, Qty, Rate};
+use crate::state_hash::StateEncode;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
@@ -206,9 +212,18 @@ impl FeatureKey {
         }
     }
 
-    fn encode(self, hasher: &mut Fingerprinter) {
+    /// The ADR-029 encoding: `write_str` of the id, `write_u32` of the
+    /// version. Definitions and the state hash (ADR-041) share it.
+    pub(crate) fn encode(self, hasher: &mut Fingerprinter) {
         hasher.write_str(self.id.as_str());
         hasher.write_u32(self.version.get());
+    }
+}
+
+impl StateEncode for FeatureKey {
+    /// The ADR-029 encoding of [`FeatureKey::encode`] (ADR-041).
+    fn encode(&self, f: &mut Fingerprinter) {
+        FeatureKey::encode(*self, f);
     }
 }
 
@@ -389,6 +404,16 @@ pub enum Unavailability {
     OutOfRange,
 }
 
+impl StateEncode for Unavailability {
+    /// `write_u8`: `InputInvalid` 0, `OutOfRange` 1 (ADR-041).
+    fn encode(&self, f: &mut Fingerprinter) {
+        f.write_u8(match self {
+            Self::InputInvalid => 0,
+            Self::OutOfRange => 1,
+        });
+    }
+}
+
 /// A feature value with its validity.
 ///
 /// Only [`Ready`](Self::Ready) carries a value; no accessor returns it in
@@ -436,6 +461,28 @@ impl<T> FeatureValue<T> {
                 FeatureValue::WarmingUp { observed, required }
             }
             Self::Unavailable { reason } => FeatureValue::Unavailable { reason },
+        }
+    }
+}
+
+impl<T: StateEncode> StateEncode for FeatureValue<T> {
+    /// `write_u8` of the state, `WarmingUp` 0, `Ready` 1, `Unavailable` 2,
+    /// then its content (ADR-041).
+    fn encode(&self, f: &mut Fingerprinter) {
+        match self {
+            Self::WarmingUp { observed, required } => {
+                f.write_u8(0);
+                f.write_u64(*observed);
+                f.write_u64(*required);
+            }
+            Self::Ready(value) => {
+                f.write_u8(1);
+                value.encode(f);
+            }
+            Self::Unavailable { reason } => {
+                f.write_u8(2);
+                reason.encode(f);
+            }
         }
     }
 }
@@ -749,6 +796,13 @@ impl FeatureSetVersion {
     /// The underlying fingerprint.
     pub const fn fingerprint(self) -> Fingerprint {
         self.0
+    }
+}
+
+impl StateEncode for FeatureSetVersion {
+    /// `write_u64` of the fingerprint value (ADR-041).
+    fn encode(&self, f: &mut Fingerprinter) {
+        f.write_u64(self.0.value());
     }
 }
 

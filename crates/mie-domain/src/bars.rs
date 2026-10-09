@@ -28,7 +28,9 @@
 
 use crate::event::{Aggressor, FeedGap, Kline, MarketEvent, Stream, Trade};
 use crate::feature::{FeatureKey, FeatureValue, catalog};
+use crate::fingerprint::Fingerprinter;
 use crate::num::{Price, Qty};
+use crate::state_hash::StateEncode;
 use crate::time::EventTime;
 use std::fmt;
 
@@ -59,6 +61,21 @@ pub enum Timeframe {
     H4,
     /// One day, opening at 00:00 UTC.
     D1,
+}
+
+impl StateEncode for Timeframe {
+    /// `write_u8` in declaration order: M1 0, M5 1, M15 2, H1 3, H4 4, D1 5
+    /// (ADR-041).
+    fn encode(&self, f: &mut Fingerprinter) {
+        f.write_u8(match self {
+            Self::M1 => 0,
+            Self::M5 => 1,
+            Self::M15 => 2,
+            Self::H1 => 3,
+            Self::H4 => 4,
+            Self::D1 => 5,
+        });
+    }
 }
 
 impl Timeframe {
@@ -141,6 +158,21 @@ pub struct Ohlc {
     pub close: Price,
 }
 
+impl StateEncode for Ohlc {
+    fn encode(&self, f: &mut Fingerprinter) {
+        let Self {
+            open,
+            high,
+            low,
+            close,
+        } = self;
+        open.encode(f);
+        high.encode(f);
+        low.encode(f);
+        close.encode(f);
+    }
+}
+
 /// Why a bar may not hold every trade of its interval. Both `false` means
 /// complete.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -150,6 +182,17 @@ pub struct Coverage {
     pub partial_start: bool,
     /// The bar overlaps a trades feed gap.
     pub feed_gap: bool,
+}
+
+impl StateEncode for Coverage {
+    fn encode(&self, f: &mut Fingerprinter) {
+        let Self {
+            partial_start,
+            feed_gap,
+        } = self;
+        partial_start.encode(f);
+        feed_gap.encode(f);
+    }
 }
 
 impl Coverage {
@@ -195,6 +238,31 @@ pub struct Bar {
     pub trade_count: u64,
     /// Completeness.
     pub coverage: Coverage,
+}
+
+impl StateEncode for Bar {
+    fn encode(&self, f: &mut Fingerprinter) {
+        let Self {
+            timeframe,
+            open_time,
+            ohlc,
+            volume,
+            buy_volume,
+            sell_volume,
+            delta,
+            trade_count,
+            coverage,
+        } = self;
+        timeframe.encode(f);
+        open_time.encode(f);
+        ohlc.encode(f);
+        volume.encode(f);
+        buy_volume.encode(f);
+        sell_volume.encode(f);
+        delta.encode(f);
+        trade_count.encode(f);
+        coverage.encode(f);
+    }
 }
 
 impl Bar {
@@ -300,6 +368,21 @@ pub struct BarSeries {
     feature: FeatureKey,
     last_closed: FeatureValue<Bar>,
     developing: FeatureValue<Bar>,
+}
+
+impl StateEncode for BarSeries {
+    fn encode(&self, f: &mut Fingerprinter) {
+        let Self {
+            timeframe,
+            feature,
+            last_closed,
+            developing,
+        } = self;
+        timeframe.encode(f);
+        feature.encode(f);
+        last_closed.encode(f);
+        developing.encode(f);
+    }
 }
 
 /// The validity of a bar that has not appeared yet.
@@ -431,6 +514,13 @@ fn bars_to_close(developing: &Bar, time: EventTime) -> u64 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BarSet {
     series: [BarSeries; 6],
+}
+
+impl StateEncode for BarSet {
+    fn encode(&self, f: &mut Fingerprinter) {
+        let Self { series } = self;
+        series.encode(f);
+    }
 }
 
 impl Default for BarSet {

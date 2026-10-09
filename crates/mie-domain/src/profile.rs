@@ -26,8 +26,10 @@
 use crate::bars::{Bar, Coverage, Timeframe};
 use crate::event::MarketEvent;
 use crate::feature::{FeatureKey, FeatureValue, Unavailability, catalog};
+use crate::fingerprint::Fingerprinter;
 use crate::location::LevelKind;
 use crate::num::{Price, Qty, SCALE};
+use crate::state_hash::StateEncode;
 use crate::time::EventTime;
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
@@ -80,6 +82,23 @@ pub struct ProfileNode {
     pub prominence_permille: u32,
 }
 
+impl StateEncode for ProfileNode {
+    fn encode(&self, f: &mut Fingerprinter) {
+        let Self {
+            price,
+            low,
+            high,
+            volume,
+            prominence_permille,
+        } = self;
+        price.encode(f);
+        low.encode(f);
+        high.encode(f);
+        volume.encode(f);
+        prominence_permille.encode(f);
+    }
+}
+
 /// A volume profile with its levels: one `profile.volume.*@1` value
 /// (ADR-036).
 ///
@@ -122,6 +141,43 @@ pub struct VolumeProfile {
     pub lvn: Vec<ProfileNode>,
     /// The OR of the inputs' coverage (decision 3).
     pub coverage: Coverage,
+}
+
+impl StateEncode for VolumeProfile {
+    fn encode(&self, f: &mut Fingerprinter) {
+        let Self {
+            feature,
+            start,
+            end,
+            sessions,
+            total_volume,
+            low,
+            high,
+            poc,
+            poc_volume,
+            val,
+            vah,
+            value_area_volume,
+            hvn,
+            lvn,
+            coverage,
+        } = self;
+        feature.encode(f);
+        start.encode(f);
+        end.encode(f);
+        sessions.encode(f);
+        total_volume.encode(f);
+        low.encode(f);
+        high.encode(f);
+        poc.encode(f);
+        poc_volume.encode(f);
+        val.encode(f);
+        vah.encode(f);
+        value_area_volume.encode(f);
+        hvn.encode(f);
+        lvn.encode(f);
+        coverage.encode(f);
+    }
 }
 
 /// A level for location (brief §10): the hand-off to the level registry
@@ -240,6 +296,19 @@ pub struct VolumeProfiles {
     /// `profile.volume.composite_5d@1`, warming up until five UTC days have
     /// closed.
     pub composite_5d: FeatureValue<VolumeProfile>,
+}
+
+impl StateEncode for VolumeProfiles {
+    fn encode(&self, f: &mut Fingerprinter) {
+        let Self {
+            utc_day,
+            prior_day,
+            composite_5d,
+        } = self;
+        utc_day.encode(f);
+        prior_day.encode(f);
+        composite_5d.encode(f);
+    }
 }
 
 impl Default for VolumeProfiles {

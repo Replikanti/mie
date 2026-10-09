@@ -15,6 +15,7 @@
 //! | Event-stream hash (ADR-039)               | [`event_hash`]               |
 //! | Canonical event order (ADR-028)           | [`order`]                    |
 //! | Market State                              | [`state`]                    |
+//! | Market State hash (ADR-041)               | [`state_hash`]               |
 //! | Event-time bars (ADR-031)                 | [`bars`]                     |
 //! | L2 order book (ADR-038)                   | [`book`]                     |
 //! | Feature identity and versioning (ADR-029) | [`feature`], [`fingerprint`] |
@@ -45,6 +46,7 @@ pub mod profile;
 pub mod regime;
 pub mod research;
 pub mod state;
+pub mod state_hash;
 pub mod strategy;
 pub mod structure;
 pub mod time;
