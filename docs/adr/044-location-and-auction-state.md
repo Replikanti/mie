@@ -88,6 +88,7 @@ of #12, 2025-10-01 … 2026-09-30 (`docs/data-availability.md`).
     |---|---|---|---|---|---|---|---|---|
     | 3 | 884 / 801 | 83.4 / 81.0 % | 11.8, 8.8, 7.5, 7.8, 5.6 / 9.9, 7.9, 7.7, 6.4, 4.3 % | 0.78 / 0.72 % | 75.0 / 72.0 % | 85.1 / 82.4 % | 91.2 / 88.4 % | 55.3 / 54.8 % |
     | 5 | 700 / 618 | 80.6 / 77.5 % | 7.9, 6.3, 4.2, 6.5, 4.6 / 5.0, 5.3, 6.1, 4.5, 3.1 % | 0.86 / 0.53 % | 68.4 / 64.3 % | 81.2 / 77.5 % | 88.3 / 84.6 % | 54.6 / 52.9 % |
+    | 6 | 640 / 567 | 79.4 / 76.9 % | 6.6, 5.1, 4.9, 5.9, 4.3 / 3.4, 4.8, 5.4, 3.9, 2.4 % | 0.93 / 0.59 % | 65.6 / 61.5 % | 79.7 / 75.7 % | 87.4 / 83.3 % | 53.9 / 52.5 % |
     | 8 | 541 / 484 | 77.3 / 74.6 % | 4.4, 3.5, 5.1, 5.6, 2.3 / 2.9, 3.2, 4.4, 2.3, 2.1 % | 0.80 / 0.48 % | 61.2 / 56.2 % | 75.8 / 71.2 % | 84.9 / 80.1 % | 53.7 / 51.7 % |
 
     At `w` = 5 the hazard falls on to 0.45 % at closes 60–89 and 0.07 % at
@@ -112,9 +113,26 @@ of #12, 2025-10-01 … 2026-09-30 (`docs/data-availability.md`).
   six months of BTC cannot be researched, so its absence is a definition
   bug, fixed before merge. Constants change only before merge, because the
   lock lines are published at merge. The first-half p75 is 5.93 bps, so
-  **`w` changed from 5 to 6** under the D3 rule. **Pending:** the re-run
-  with `w` = 6 (M2 at `w` = 6 next to 3, 5 and 8; M3 and M4 at the fixed
-  `w`) is recorded here, and D9 is re-checked on its first-half table.
+  **`w` changed from 5 to 6** under the D3 rule.
+
+  Re-run with `w` = 6 (same window and host): 603 218 226 events, 0 domain
+  rejections, wall time 1 152.2 s (19.2 min). M1 is unchanged; 5.54 %
+  (first half) and 7.06 % (second half) of closes fall in the `w` = 6 edge
+  bands. M2 at `w` = 6 is the row above. M3: registry sizes unchanged (all
+  254/342); zone events per day 1 383.7 arrived, 34.1 created, 1 403.1
+  departed, 14.7 retired. M4 at `w` = 6, `N_acc` = 60: inside value 38.2 /
+  35.9 %, at value edge 2.1 / 2.8 %, outside value 15.8 / 16.1 %, breakout
+  6.8 / 6.6 %, failed breakout 4.3 / 4.2 %, failed reclaim 2.6 / 2.7 %,
+  acceptance 30.3 / 31.7 %. Every state occurs in each half; 24.7 / 23.5
+  transitions a day; the engine and the tool's classifier agreed on every
+  close.
+
+  The D9 re-check on the `w` = 6 first-half table met the first reason
+  (79.7 % caught by 60) and fell short of the second as written: the hazard
+  at 45–59 (0.93 %) is 4.6–7.1× below the first five closes (4.3–6.6 %),
+  not an order of magnitude. The plan-time probe had put the ratio at
+  6.4–8.4× (M0b). Per the rule the change stopped and was reported on #23;
+  the decision there kept `N_acc` = 60 (D9).
 
 ## Decision
 
@@ -275,18 +293,25 @@ of #12, 2025-10-01 … 2026-09-30 (`docs/data-availability.md`).
      session? the reference day?) that swings with time-of-day activity.
      Volume can come in a `@2`, with a measurement, if #31 asks for it.
 9. **`N_acc` = 60 closes (1 h).** The hazard per counted close shows no
-   knee: it falls smoothly from 4.2–7.9 % over the first five closes to
-   0.86 % at closes 45–59, 0.45 % at 60–89 and below 0.1 % from 180 on (M2,
-   `w` = 5, first half; M0b showed the same shape).
-   - *At 60:* 81.2 % of same-day failures are already labelled
-     `FailedBreakout` (77.5 % in the second half), and the hazard is 5–9×
-     below each of the first five closes — the ratio M0b's 0.88 % against
-     5.6–7.4 % had at plan time.
-   - *At 30:* 31.6 % of failures would be labelled `Acceptance` first (68.4
+   knee: it falls smoothly from 4.3–6.6 % over the first five closes to
+   0.93 % at closes 45–59, 0.42 % at 60–89 and below 0.1 % from 180 on (M2,
+   `w` = 6, first half; M0b and the `w` = 5 table show the same shape).
+   - *At 60:* 79.7 % of same-day failures are already labelled
+     `FailedBreakout` (75.7 % in the second half), and the hazard is
+     4.6–7.1× below each of the first five closes. The plan stated "an order
+     of magnitude" from the probe (6.4–8.4×, M0b); the exact ratio is
+     smaller and is recorded as measured.
+   - *Why 60 holds anyway:* with no knee, the ratio criterion picks no N of
+     its own — moving to 90 only to reach 10× would fit the number to the
+     test (ADR-013). 90 would catch 84.1 % instead of 79.7 % and leave 50.6 %
+     instead of 53.9 % of held breakouts returning the same day: 4 points
+     more failures caught for a 30-minute later `Acceptance` that predicts
+     no better.
+   - *At 30:* 34.5 % of failures would be labelled `Acceptance` first (65.6
      % caught).
-   - *At 120:* 7 more points of failures are caught (88.3 %), but every
+   - *At 120:* 8 more points of failures are caught (87.4 %), but every
      `Acceptance` label waits 2 h.
-   - *Stated limit:* 54.6 % of breakouts that held 60 closes still return
+   - *Stated limit:* 53.9 % of breakouts that held 60 closes still return
      inside prior-day value the same day (M2). Acceptance is descriptive
      ("held for an hour"), not predictive; whether it predicts anything is
      for #26/#31 to measure, and confirmation depth is a research variable
@@ -298,10 +323,11 @@ of #12, 2025-10-01 … 2026-09-30 (`docs/data-availability.md`).
      parameter.
    - *Fixing rule:* `N_acc` stays 60 unless the exact first-half table (M2)
      contradicts either reason — about four in five same-day failures caught
-     by 60 closes, and a hazard at 45–59 well below (about 5× or more) the
-     first closes. If it does, the change stops and is reported on #23; no
-     other value is picked silently. The `w` = 5 table supports 60; the
-     re-check on the `w` = 6 re-run is pending (*Measurements*).
+     by 60 closes, and a hazard an order of magnitude below the first
+     closes. If it does, the change stops and is reported on #23; no other
+     value is picked silently. The `w` = 6 table met the first reason and
+     fell short of the second (4.6–7.1×); the stop was reported on #23 and
+     the decision kept 60 for the reasons above (*Measurements*).
 10. **Features** (the ids are permanent; `location` joins the families of
     "Adding a feature").
 
