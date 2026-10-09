@@ -13,31 +13,41 @@
 //!    recompute it with [`LiveReplay::run_replay`] — no chaining, no window
 //!    — and drive a fresh [`MarketStateEngine`] through
 //!    [`drive_checkpointed`] at the run's journaled interval, the drive live
-//!    ingestion used. [`compare`] the replay's checkpoints with the
-//!    journaled ones, the state hashes only when the run's feature set is
-//!    this binary's (ADR-041); the delivered events and domain rejections
-//!    are also compared with `run_end`.
+//!    ingestion used. When the run's feature set is this binary's,
+//!    [`compare`] the replay's checkpoints with the journaled ones and the
+//!    delivered events and domain rejections with `run_end`. Otherwise
+//!    (ADR-041) only what no engine change can move is compared:
+//!    [`compare_events`] — each journaled checkpoint's event-stream hash
+//!    against the replay's after as many events — and the delivered events
+//!    with `run_end`. A run with no journaled checkpoint that matches its
+//!    totals delivered no event; nothing was compared, so it is NOT
+//!    COMPARABLE too.
 //! 3. Print a header (window, source, encodings, current feature set), one
 //!    line per run with its verdict — `EQUIVALENT`, `DIVERGED`,
 //!    `EVENTS EQUIVALENT, STATE NOT COMPARABLE` or `NOT COMPARABLE` — the
 //!    first divergence of a diverged run, then `PASS` or `FAIL: …`.
 //!
 //! The report carries no wall-clock field, so the same request prints the
-//! same bytes. It passes when at least one run was compared and every
-//! selected run is `EQUIVALENT`.
+//! same bytes. It passes when every selected run is `EQUIVALENT` and there
+//! is at least one: an `EQUIVALENT` run compared at least one checkpoint.
 
 use crate::config::IngestConfig;
 use crate::journal::{JournaledRun, read_runs};
 use mie_adapter_binance::LiveReplay;
 use mie_adapter_parquet::ParquetRawStore;
 use mie_app::equivalence::{
-    Comparison, Divergence, DivergenceKind, StateCheckpoint, compare, drive_checkpointed,
+    Comparison, Divergence, DivergenceKind, EventComparison, EventDivergence, EventPrefixes,
+    StateCheckpoint, compare, compare_events, drive_checkpointed,
 };
-use mie_domain::event_hash;
+use mie_domain::event_hash::{self, EventStreamHash};
 use mie_domain::feature::{FeatureSetVersion, catalog};
 use mie_domain::state::MarketStateEngine;
 use mie_domain::state_hash::STATE_HASH_ENCODING;
+use mie_ports::outbound::{MarketDataProvider, ProviderError};
 use std::io::Write;
+
+/// Why a cleanly ended run without a checkpoint is not compared.
+pub const NOTHING_COMPARED: &str = "no checkpoint to compare: the run delivered no event";
 
 /// One `mie equivalence` invocation.
 #[derive(Debug, Clone)]
@@ -74,6 +84,9 @@ pub enum Verdict {
 pub enum Mismatch {
     /// The first divergent checkpoint.
     Checkpoint(Divergence),
+    /// The first checkpoint whose events differ, for a run recorded with
+    /// another feature set.
+    Events(EventDivergence),
     /// Every checkpoint matches, but a `run_end` total does not.
     Total {
         /// The total: `events` or `domain_rejections`.
@@ -230,45 +243,63 @@ fn judge(
         Ok(replay) => replay,
         Err(error) => return not_comparable(report, format!("replay failed: {error}")),
     };
-    let mut engine = MarketStateEngine::new();
-    let mut rejections = 0_u64;
-    let mut checkpoints: Vec<StateCheckpoint> = Vec::new();
-    let driven = drive_checkpointed(
-        &mut replay,
-        &mut engine,
-        checkpointing.interval_ms,
-        |_| rejections += 1,
-        |checkpoint| checkpoints.push(*checkpoint),
-    );
-    let events = match driven {
-        Ok(events) => events,
+    let compare_state = checkpointing.feature_set == current;
+    let interval_ms = checkpointing.interval_ms;
+    let (driven, prefixes) = if compare_state {
+        (recompute(&mut replay, interval_ms), Vec::new())
+    } else {
+        let mut observed = EventPrefixes::new(&mut replay, &run.checkpoints);
+        let driven = recompute(&mut observed, interval_ms);
+        (driven, observed.into_hashes())
+    };
+    let Recomputed {
+        events,
+        rejections,
+        checkpoints,
+    } = match driven {
+        Ok(recomputed) => recomputed,
         Err(error) => return not_comparable(report, format!("replay failed: {error}")),
     };
-    let compare_state = checkpointing.feature_set == current;
-    let comparison = compare(&run.checkpoints, &checkpoints, compare_state);
-    let verdict = match comparison {
-        Comparison::Diverged(divergence) => Verdict::Diverged(Mismatch::Checkpoint(divergence)),
-        Comparison::Equivalent { .. } => {
-            let totals = [
-                ("events", end.events, events),
-                ("domain_rejections", end.domain_rejections, rejections),
-            ];
-            match totals
-                .into_iter()
-                .find(|(_, live, replay)| live.is_some_and(|live| live != *replay))
-            {
-                Some((name, live, replay)) => Verdict::Diverged(Mismatch::Total {
-                    name,
-                    live: live.unwrap_or_default(),
-                    replay,
-                }),
-                None if compare_state => Verdict::Equivalent,
-                None => Verdict::EventsOnly {
-                    recorded: checkpointing.feature_set,
-                    current,
-                },
-            }
+    let checkpoint = if compare_state {
+        match compare(&run.checkpoints, &checkpoints) {
+            Comparison::Diverged(divergence) => Some(Mismatch::Checkpoint(divergence)),
+            Comparison::Equivalent { .. } => None,
         }
+    } else {
+        match compare_events(&run.checkpoints, &prefixes) {
+            EventComparison::Diverged(divergence) => Some(Mismatch::Events(divergence)),
+            EventComparison::Equivalent { .. } => None,
+        }
+    };
+    // Domain rejections depend on the engine: compared with state only.
+    let totals = [
+        ("events", end.events, events, true),
+        (
+            "domain_rejections",
+            end.domain_rejections,
+            rejections,
+            compare_state,
+        ),
+    ];
+    let total = || {
+        totals
+            .into_iter()
+            .find(|&(_, live, replay, compared)| compared && live.is_some_and(|l| l != replay))
+            .map(|(name, live, replay, _)| Mismatch::Total {
+                name,
+                live: live.unwrap_or_default(),
+                replay,
+            })
+    };
+    let verdict = match checkpoint.or_else(total) {
+        Some(mismatch) => Verdict::Diverged(mismatch),
+        // Nothing was compared: no PASS on an empty run.
+        None if run.checkpoints.is_empty() => Verdict::NotComparable(NOTHING_COMPARED.to_owned()),
+        None if compare_state => Verdict::Equivalent,
+        None => Verdict::EventsOnly {
+            recorded: checkpointing.feature_set,
+            current,
+        },
     };
     let stats = replay.stats();
     line(
@@ -288,12 +319,43 @@ fn judge(
     verdict
 }
 
+/// What the recompute of one run delivered.
+struct Recomputed {
+    events: u64,
+    rejections: u64,
+    checkpoints: Vec<StateCheckpoint>,
+}
+
+/// Drives a fresh engine through `provider` as live ingestion did.
+fn recompute<P: MarketDataProvider + ?Sized>(
+    provider: &mut P,
+    interval_ms: i64,
+) -> Result<Recomputed, ProviderError> {
+    let mut rejections = 0_u64;
+    let mut checkpoints = Vec::new();
+    let events = drive_checkpointed(
+        provider,
+        &mut MarketStateEngine::new(),
+        interval_ms,
+        |_| rejections += 1,
+        |checkpoint| checkpoints.push(*checkpoint),
+    )?;
+    Ok(Recomputed {
+        events,
+        rejections,
+        checkpoints,
+    })
+}
+
 /// The verdict as the run line prints it.
 fn headline(verdict: &Verdict) -> String {
     match verdict {
         Verdict::Equivalent => "EQUIVALENT".to_owned(),
         Verdict::Diverged(Mismatch::Checkpoint(d)) => {
             format!("DIVERGED at checkpoint {} ({})", d.index, d.kind)
+        }
+        Verdict::Diverged(Mismatch::Events(d)) => {
+            format!("DIVERGED at checkpoint {} (event stream)", d.index)
         }
         Verdict::Diverged(Mismatch::Total { name, .. }) => format!("DIVERGED ({name})"),
         Verdict::EventsOnly { recorded, current } => {
@@ -343,6 +405,37 @@ fn detail(report: &mut Vec<u8>, mismatch: &Mismatch) {
             );
             line(report, row("state hash", &|c| c.state.to_string()));
             line(report, row("last", &|c| c.last.to_string()));
+        }
+        Mismatch::Events(d) => {
+            line(
+                report,
+                format!(
+                    "  first divergence: checkpoint {}, the delivered events differ (events \
+                     only)",
+                    d.index
+                ),
+            );
+            let replay = |f: &dyn Fn(&EventStreamHash) -> String| {
+                d.replay.as_ref().map_or_else(|| "-".to_owned(), f)
+            };
+            line(
+                report,
+                format!(
+                    "  {:<10} live {:<20} replay {}",
+                    "ordinal",
+                    d.live.ordinal,
+                    replay(&|h| h.events.to_string())
+                ),
+            );
+            line(
+                report,
+                format!(
+                    "  {:<10} live {:<20} replay {}",
+                    "event hash",
+                    d.live.events.fingerprint.to_string(),
+                    replay(&|h| h.fingerprint.to_string())
+                ),
+            );
         }
         Mismatch::Total { name, live, replay } => {
             line(report, format!("  run_end {name} {live}, replay {replay}"))

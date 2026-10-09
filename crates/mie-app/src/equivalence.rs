@@ -20,7 +20,12 @@
 //!   recorded one.
 //!
 //! [`compare`] reports the first checkpoint at which two lists differ and
-//! whether the event streams diverged or only the states.
+//! whether the event streams diverged or only the states. The cadence,
+//! `as_of`, the end marker and the state all depend on what the engine
+//! accepts, so a run recorded with another feature set is checked with
+//! [`compare_events`] instead: each recorded checkpoint's ordinal and
+//! event-stream hash against the replay's hash after as many events
+//! ([`EventPrefixes`]), which no engine change can move (ADR-041).
 
 use crate::drive_tolerant_observed;
 use mie_domain::event::MarketEvent;
@@ -203,14 +208,10 @@ pub enum Comparison {
     Diverged(Divergence),
 }
 
-/// Compares two checkpoint lists in order and reports the first difference
-/// only. With `compare_state` false the Market State hashes are ignored —
-/// for runs recorded with another feature set (ADR-041) — and nothing else.
-pub fn compare(
-    live: &[StateCheckpoint],
-    replay: &[StateCheckpoint],
-    compare_state: bool,
-) -> Comparison {
+/// Compares two checkpoint lists recorded with the same engine in order and
+/// reports the first difference only. Runs recorded with another feature
+/// set go through [`compare_events`] (module docs).
+pub fn compare(live: &[StateCheckpoint], replay: &[StateCheckpoint]) -> Comparison {
     for index in 0..live.len().max(replay.len()) {
         let (l, r) = (live.get(index), replay.get(index));
         let kind = match (l, r) {
@@ -218,7 +219,7 @@ pub fn compare(
                 if (l.ordinal, l.as_of, l.events, l.last) != (r.ordinal, r.as_of, r.events, r.last)
                 {
                     DivergenceKind::EventStream
-                } else if compare_state && l.state != r.state {
+                } else if l.state != r.state {
                     DivergenceKind::State
                 } else {
                     continue;
@@ -234,6 +235,98 @@ pub fn compare(
         });
     }
     Comparison::Equivalent {
+        checkpoints: live.len(),
+    }
+}
+
+/// A provider that also takes the event-stream hash of what it delivered
+/// after each ordinal of a recorded checkpoint list, for [`compare_events`].
+#[derive(Debug)]
+pub struct EventPrefixes<'a, P: ?Sized> {
+    inner: &'a mut P,
+    hasher: EventStreamHasher,
+    delivered: u64,
+    /// The recorded ordinals, in list order.
+    ordinals: Vec<u64>,
+    /// The hash after each of the first `hashes.len()` ordinals.
+    hashes: Vec<EventStreamHash>,
+}
+
+impl<'a, P: ?Sized> EventPrefixes<'a, P> {
+    /// Wraps `inner`; hashes are taken at the ordinals of `recorded`.
+    pub fn new(inner: &'a mut P, recorded: &[StateCheckpoint]) -> Self {
+        Self {
+            inner,
+            hasher: EventStreamHasher::new(),
+            delivered: 0,
+            ordinals: recorded.iter().map(|c| c.ordinal).collect(),
+            hashes: Vec::new(),
+        }
+    }
+
+    /// The hashes taken so far, one per recorded ordinal reached in order.
+    pub fn into_hashes(self) -> Vec<EventStreamHash> {
+        self.hashes
+    }
+}
+
+impl<P: MarketDataProvider + ?Sized> MarketDataProvider for EventPrefixes<'_, P> {
+    fn next_event(&mut self) -> Result<Option<MarketEvent>, ProviderError> {
+        let event = self.inner.next_event()?;
+        if let Some(event) = &event {
+            self.hasher.push(event);
+            self.delivered += 1;
+            while self.ordinals.get(self.hashes.len()) == Some(&self.delivered) {
+                self.hashes.push(self.hasher.finish());
+            }
+        }
+        Ok(event)
+    }
+}
+
+/// The first recorded checkpoint whose events the replay did not deliver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventDivergence {
+    /// Its position in the recorded list, from 0.
+    pub index: usize,
+    /// The recorded checkpoint.
+    pub live: StateCheckpoint,
+    /// The replay's hash after `live.ordinal` events; `None` when the
+    /// replay delivered fewer events.
+    pub replay: Option<EventStreamHash>,
+}
+
+/// The result of [`compare_events`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventComparison {
+    /// Every recorded checkpoint's events match.
+    Equivalent {
+        /// The number of checkpoints compared.
+        checkpoints: usize,
+    },
+    /// The first difference.
+    Diverged(EventDivergence),
+}
+
+/// Compares the delivered events only: each `live` checkpoint's event-stream
+/// hash with the replay's hash after as many events (`replay`, from
+/// [`EventPrefixes`] over the same list). `as_of`, the end marker, the state
+/// and where checkpoints fall depend on the engine and are ignored, so a run
+/// recorded with another feature set diverges here only when the events
+/// differ (ADR-041). Events the replay delivers after the last recorded
+/// checkpoint are left to the caller's total.
+pub fn compare_events(live: &[StateCheckpoint], replay: &[EventStreamHash]) -> EventComparison {
+    for (index, l) in live.iter().enumerate() {
+        let r = replay.get(index).copied();
+        if r != Some(l.events) {
+            return EventComparison::Diverged(EventDivergence {
+                index,
+                live: *l,
+                replay: r,
+            });
+        }
+    }
+    EventComparison::Equivalent {
         checkpoints: live.len(),
     }
 }
@@ -381,7 +474,7 @@ mod tests {
         let events = tape();
         let (base, _) = run(&events, 10_000);
         assert_eq!(
-            compare(&base, &base, true),
+            compare(&base, &base),
             Comparison::Equivalent { checkpoints: 3 }
         );
 
@@ -389,7 +482,7 @@ mod tests {
         let mut perturbed = events.clone();
         perturbed[3] = trade(13_000, 4, 2_000_000);
         let (other, _) = run(&perturbed, 10_000);
-        let Comparison::Diverged(d) = compare(&base, &other, true) else {
+        let Comparison::Diverged(d) = compare(&base, &other) else {
             panic!("equivalent")
         };
         assert_eq!((d.index, d.kind), (1, DivergenceKind::EventStream));
@@ -398,38 +491,91 @@ mod tests {
         // Equal events, another state.
         let mut state = base.clone();
         state[2].state = StateHash::from_fingerprint(Fingerprint::from_raw(7));
-        let Comparison::Diverged(d) = compare(&base, &state, true) else {
+        let Comparison::Diverged(d) = compare(&base, &state) else {
             panic!("equivalent")
         };
         assert_eq!((d.index, d.kind), (2, DivergenceKind::State));
-        // Without state comparison only the state is ignored.
-        assert_eq!(
-            compare(&base, &state, false),
-            Comparison::Equivalent { checkpoints: 3 }
-        );
-        let Comparison::Diverged(d) = compare(&base, &other, false) else {
-            panic!("equivalent")
-        };
-        assert_eq!(d.kind, DivergenceKind::EventStream);
         let mut moved = base.clone();
         moved[0].as_of = Some(EventTime::from_millis(12_001));
-        let Comparison::Diverged(d) = compare(&base, &moved, false) else {
+        let Comparison::Diverged(d) = compare(&base, &moved) else {
             panic!("equivalent")
         };
         assert_eq!((d.index, d.kind), (0, DivergenceKind::EventStream));
 
         // A shorter list.
-        let Comparison::Diverged(d) = compare(&base, &base[..2], true) else {
+        let Comparison::Diverged(d) = compare(&base, &base[..2]) else {
             panic!("equivalent")
         };
         assert_eq!(
             (d.index, d.kind, d.live, d.replay),
             (2, DivergenceKind::Missing, Some(base[2]), None)
         );
-        let Comparison::Diverged(d) = compare(&[], &base, true) else {
+        let Comparison::Diverged(d) = compare(&[], &base) else {
             panic!("equivalent")
         };
         assert_eq!((d.index, d.live, d.replay), (0, None, Some(base[0])));
         assert_eq!(DivergenceKind::State.to_string(), "state");
+    }
+
+    /// The hashes [`EventPrefixes`] takes from `events` at the ordinals of
+    /// `recorded`, after delivering all of them.
+    fn prefixes(recorded: &[StateCheckpoint], events: &[MarketEvent]) -> Vec<EventStreamHash> {
+        let mut feed = Feed(events.iter().cloned().collect());
+        let mut provider = EventPrefixes::new(&mut feed, recorded);
+        while provider.next_event().unwrap().is_some() {}
+        provider.into_hashes()
+    }
+
+    #[test]
+    fn compare_events_ignores_everything_the_engine_decides() {
+        let events = tape();
+        let (base, _) = run(&events, 10_000);
+        let hashes = prefixes(&base, &events);
+        assert_eq!(hashes, base.iter().map(|c| c.events).collect::<Vec<_>>());
+        assert_eq!(
+            compare_events(&base, &hashes),
+            EventComparison::Equivalent { checkpoints: 3 }
+        );
+
+        // Another engine recorded the same events with other `as_of`
+        // values, end marker and states, at another cadence: the events
+        // still match.
+        let mut engine_moved = base.clone();
+        engine_moved[0].as_of = Some(EventTime::from_millis(12_001));
+        engine_moved[1].state = StateHash::from_fingerprint(Fingerprint::from_raw(7));
+        engine_moved[2].last = false;
+        assert_eq!(
+            compare_events(&engine_moved, &prefixes(&engine_moved, &events)),
+            EventComparison::Equivalent { checkpoints: 3 }
+        );
+        let (dense, _) = run(&events, 1_000);
+        assert!(dense.len() > base.len());
+        assert_eq!(
+            compare_events(&dense, &prefixes(&dense, &events)),
+            EventComparison::Equivalent {
+                checkpoints: dense.len()
+            }
+        );
+
+        // One event changed after 12 s: the second checkpoint diverges.
+        let mut perturbed = events.clone();
+        perturbed[3] = trade(13_000, 4, 2_000_000);
+        let EventComparison::Diverged(d) = compare_events(&base, &prefixes(&base, &perturbed))
+        else {
+            panic!("equivalent")
+        };
+        assert_eq!((d.index, d.live), (1, base[1]));
+        assert_eq!(d.replay, Some(hash_of(&perturbed[..5])));
+
+        // A replay that ends early has no hash at the last ordinal.
+        let EventComparison::Diverged(d) = compare_events(&base, &prefixes(&base, &events[..5]))
+        else {
+            panic!("equivalent")
+        };
+        assert_eq!((d.index, d.replay), (2, None));
+        assert_eq!(
+            compare_events(&[], &[]),
+            EventComparison::Equivalent { checkpoints: 0 }
+        );
     }
 }

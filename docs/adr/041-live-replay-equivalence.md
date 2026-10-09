@@ -98,16 +98,22 @@ Two facts shape the comparison:
    `EventStream` (ordinal, `as_of`, event hash or end marker differ),
    `State` (equal events, different state) or `Missing` (one list ends
    early). The delivered events and domain rejections are also compared
-   with `run_end`. Verdicts per run: `EQUIVALENT`; `DIVERGED` with the
-   first divergent checkpoint; `EVENTS EQUIVALENT, STATE NOT COMPARABLE`
-   when the run's feature set is not the binary's (state hashes are then
-   ignored and nothing else); `NOT COMPARABLE` for a run without a clean
-   `run_end` (a crashed run's sealed prefix is not what live delivered
-   before the crash), without checkpoints (journaled before this ADR), with
-   another encoding, or whose replay fails. The report has no wall-clock
+   with `run_end`. When the run's feature set is not the binary's, the
+   engine may accept other events than live's did, and with them `as_of`,
+   the end marker, where checkpoints fall and the domain rejections move;
+   only the events are compared then: each journaled checkpoint's ordinal
+   and event hash against the replay's event hash after as many events
+   (`compare_events`), and the delivered events with `run_end`. Verdicts
+   per run: `EQUIVALENT`; `DIVERGED` with the first divergent checkpoint;
+   `EVENTS EQUIVALENT, STATE NOT COMPARABLE` when the run's feature set is
+   not the binary's and its events match; `NOT COMPARABLE` for a run
+   without a clean `run_end` (a crashed run's sealed prefix is not what
+   live delivered before the crash), without checkpoints (journaled before
+   this ADR), with another encoding, whose replay fails, or that delivered
+   no event (no checkpoint to compare). The report has no wall-clock
    field, so a re-run prints identical bytes. The command exits 0 only
-   when at least one run was compared and every selected run is
-   `EQUIVALENT`.
+   when every selected run is `EQUIVALENT` and there is at least one, so
+   at least one checkpoint was compared.
 5. **CI coverage (D5).** `crates/mie-cli/tests/equivalence_offline.rs`,
    run by the `check` job's `cargo test --workspace`, offline:
    (A) a recorded live session of about 3 minutes (aggTrade, markPrice,

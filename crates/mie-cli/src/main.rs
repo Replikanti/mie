@@ -86,8 +86,9 @@ USAGE:
         state checkpoints (ordinal, event-stream hash, Market State hash)
         with the ones the run journaled. Prints one line per run —
         EQUIVALENT, DIVERGED with the first divergent checkpoint, EVENTS
-        EQUIVALENT / STATE NOT COMPARABLE (another feature set), or NOT
-        COMPARABLE (crashed, no checkpoints, replay error) — then PASS or
+        EQUIVALENT / STATE NOT COMPARABLE (another feature set: only the
+        delivered events are compared), or NOT COMPARABLE (crashed, no
+        checkpoints, no event delivered, replay error) — then PASS or
         FAIL; the same request prints the same bytes. Exits 0 only when at
         least one run was compared and every run is EQUIVALENT.
 

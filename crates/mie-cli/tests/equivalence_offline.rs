@@ -14,8 +14,12 @@
 //!   so nothing that depends on it is pinned.
 //! - (C) A mutated trade, a flipped journaled state hash and a dropped
 //!   record fail.
-//! - (D) A run without checkpoints, or a window without runs, fails.
+//! - (D) A run without checkpoints, a run that delivered no event, or a
+//!   window without runs, fails.
 //! - (E) The same request prints the same bytes.
+//! - (F) A run recorded with another feature set compares its events only:
+//!   what the engine decides may differ, a mutated trade still diverges as
+//!   an event stream.
 
 mod common;
 
@@ -25,7 +29,9 @@ use mie_adapter_binance::{BinanceStream, LiveReplay};
 use mie_adapter_parquet::{ParquetRawStore, RotationPolicy};
 use mie_app::equivalence::{DivergenceKind, StateCheckpoint, drive_checkpointed};
 use mie_cli::config::IngestConfig;
-use mie_cli::equivalence::{self, EquivalenceOutcome, EquivalenceRequest, Mismatch, Verdict};
+use mie_cli::equivalence::{
+    self, EquivalenceOutcome, EquivalenceRequest, Mismatch, NOTHING_COMPARED, Verdict,
+};
 use mie_cli::ingest::Transports;
 use mie_cli::journal::{JournaledRun, read_runs};
 use mie_domain::event::MarketEvent;
@@ -323,11 +329,11 @@ fn the_same_request_prints_the_same_bytes() {
 // ---------------------------------------------------------------------------
 // (C) Mutations.
 
-#[test]
-fn a_mutated_trade_diverges_at_the_first_checkpoint_it_reaches() {
-    let fixture = Fixture::load();
-    let start = fixture.started_at_ms();
-    let original = TempDir::new("equivalence-c1-original");
+/// The fixture with the quantity of one aggregate trade from its middle
+/// changed, and the index of the first journaled checkpoint that trade
+/// reaches.
+fn mutated_trade(fixture: &Fixture) -> (Fixture, usize) {
+    let original = TempDir::new("equivalence-mutation-original");
     let config = fixture.materialize(original.path());
     let (delivered, _) = recompute(&config, &fixture.run_id(), 10_000);
     let journaled: Vec<u64> = fixture
@@ -358,15 +364,29 @@ fn a_mutated_trade_diverges_at_the_first_checkpoint_it_reaches() {
     let qty = payload["q"].as_str().unwrap().to_owned();
     payload["q"] = json!(if qty == "9.999" { "8.888" } else { "9.999" });
     mutated.records[index].payload = payload.to_string();
-
-    let dir = TempDir::new("equivalence-c1");
-    let config = mutated.materialize(dir.path());
-    let (outcome, text) = check(&config, start, start + 1);
     let expected = journaled
         .iter()
         .position(|&ordinal| ordinal >= position)
         .expect("a checkpoint at or after the trade");
     assert!(expected > 0, "the mutation is past the first checkpoint");
+    (mutated, expected)
+}
+
+#[test]
+fn a_mutated_trade_diverges_at_the_first_checkpoint_it_reaches() {
+    let fixture = Fixture::load();
+    let start = fixture.started_at_ms();
+    let (mutated, expected) = mutated_trade(&fixture);
+    let journaled: Vec<u64> = fixture
+        .journal
+        .iter()
+        .filter(|l| l["type"] == "state_checkpoint")
+        .map(|l| l["ordinal"].as_u64().unwrap())
+        .collect();
+
+    let dir = TempDir::new("equivalence-c1");
+    let config = mutated.materialize(dir.path());
+    let (outcome, text) = check(&config, start, start + 1);
     let Verdict::Diverged(Mismatch::Checkpoint(d)) = &outcome.runs[0].verdict else {
         panic!("{text}")
     };
@@ -483,6 +503,150 @@ fn a_run_without_checkpoints_or_a_window_without_runs_fails() {
     assert_eq!(outcome.exit_code(), 1);
     assert!(
         text.ends_with("FAIL: no run started in the window\n"),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_run_that_delivered_no_event_is_not_compared() {
+    // A clean run stopped before any frame arrived: its `run_start` carries
+    // the ADR-041 keys, its `run_end` counts nothing, no checkpoint.
+    let fixture = Fixture::load();
+    let mut journal = fixture.journal.clone();
+    let mut start = fixture.line("run_start").clone();
+    let at = fixture.line("run_end")["at_ms"].as_i64().unwrap() + 60_000;
+    let run_id = "20991231T235959Z";
+    start["run_id"] = json!(run_id);
+    start["at_ms"] = json!(at);
+    journal.push(start);
+    journal.push(json!({
+        "type": "run_end", "run_id": run_id, "at_ms": at + 5_000, "exit_code": 0,
+        "error": null, "events": 0, "domain_rejections": 0, "records": 0,
+    }));
+    let dir = TempDir::new("equivalence-d-empty");
+    let config = Fixture {
+        records: fixture.records.clone(),
+        journal,
+    }
+    .materialize(dir.path());
+
+    // Alone in the window: nothing was compared, so no PASS.
+    let (outcome, text) = check(&config, at, at + 1);
+    assert_eq!(outcome.runs.len(), 1, "{text}");
+    assert_eq!(
+        outcome.runs[0].verdict,
+        Verdict::NotComparable(NOTHING_COMPARED.to_owned())
+    );
+    assert!(!outcome.pass);
+    assert_eq!(outcome.exit_code(), 1);
+    assert!(
+        text.contains(&format!(
+            "run {run_id}: records 0, events 0, rejections 0, checkpoints 0, dataset "
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(": NOT COMPARABLE: {NOTHING_COMPARED}\n")),
+        "{text}"
+    );
+    assert!(
+        text.ends_with("FAIL: 1 of 1 run(s) not equivalent\n"),
+        "{text}"
+    );
+
+    // Next to a compared run it still fails the window.
+    let (outcome, text) = check(&config, fixture.started_at_ms(), at + 1);
+    assert_eq!(outcome.runs.len(), 2, "{text}");
+    assert_eq!(
+        outcome.runs[1].verdict,
+        Verdict::NotComparable(NOTHING_COMPARED.to_owned())
+    );
+    assert_eq!(outcome.exit_code(), 1);
+    let failed = if fixture.same_feature_set() { 1 } else { 2 };
+    assert!(
+        text.ends_with(&format!("FAIL: {failed} of 2 run(s) not equivalent\n")),
+        "{text}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// (F) Another feature set: events only.
+
+/// `fixture` as if recorded with another feature set than this binary's.
+fn another_feature_set(fixture: &Fixture) -> Fixture {
+    let mut other = fixture.clone();
+    for line in &mut other.journal {
+        if line["type"] == "run_start" {
+            line["feature_set"] = json!("00000000000000ff");
+        }
+    }
+    assert!(!other.same_feature_set());
+    other
+}
+
+#[test]
+fn another_feature_set_compares_the_events_only() {
+    let fixture = Fixture::load();
+    let start = fixture.started_at_ms();
+
+    // What the recording engine decided — `as_of`, the end marker, the
+    // state, where checkpoints fall, the domain rejections — differs from
+    // this binary's; the events are the same.
+    let mut engine_moved = another_feature_set(&fixture);
+    let mut seen = 0;
+    engine_moved.journal.retain(|line| {
+        if line["type"] != "state_checkpoint" {
+            return true;
+        }
+        seen += 1;
+        seen != 3
+    });
+    for line in &mut engine_moved.journal {
+        match line["type"].as_str() {
+            Some("state_checkpoint") => {
+                line["as_of"] = json!(line["as_of"].as_i64().unwrap() + 1);
+                line["last"] = json!(!line["last"].as_bool().unwrap());
+                line["state_hash"] = json!("0123456789abcdef");
+            }
+            Some("run_end") => line["domain_rejections"] = json!(7),
+            _ => {}
+        }
+    }
+    let dir = TempDir::new("equivalence-f-engine");
+    let config = engine_moved.materialize(dir.path());
+    let (outcome, text) = check(&config, start, start + 1);
+    assert!(
+        matches!(outcome.runs[0].verdict, Verdict::EventsOnly { .. }),
+        "{text}"
+    );
+    assert_eq!(outcome.exit_code(), 1);
+    assert!(
+        text.contains("EVENTS EQUIVALENT, STATE NOT COMPARABLE (feature set 00000000000000ff ≠ "),
+        "{text}"
+    );
+
+    // A mutated trade still diverges at the first checkpoint it reaches.
+    let (mutated, expected) = mutated_trade(&fixture);
+    let dir = TempDir::new("equivalence-f-mutated");
+    let config = another_feature_set(&mutated).materialize(dir.path());
+    let (outcome, text) = check(&config, start, start + 1);
+    let Verdict::Diverged(Mismatch::Events(d)) = &outcome.runs[0].verdict else {
+        panic!("{text}")
+    };
+    assert_eq!(d.index, expected);
+    assert_eq!(d.replay.unwrap().events, d.live.ordinal);
+    assert_ne!(d.replay.unwrap(), d.live.events);
+    assert_eq!(outcome.exit_code(), 1);
+    assert!(
+        text.contains(&format!(
+            ": DIVERGED at checkpoint {expected} (event stream)\n"
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "  first divergence: checkpoint {expected}, the delivered events differ (events only)\n"
+        )),
         "{text}"
     );
 }
