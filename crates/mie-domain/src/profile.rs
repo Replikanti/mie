@@ -181,7 +181,8 @@ impl StateEncode for VolumeProfile {
 }
 
 /// A level for location (brief §10): the hand-off to the level registry
-/// (#23). Its zone `[low, high)` is the level's bin.
+/// `location.levels@1` (ADR-044 D5), which reads the prior-day and 5-day
+/// composite profiles' levels. Its zone `[low, high)` is the level's bin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProfileLevel {
     /// Which level.

@@ -26,7 +26,7 @@
 //! | Market structure (ADR-037)                | [`structure`]                |
 //! | Derivatives context (ADR-042)             | [`derivatives`]              |
 //! | Regime (ADR-017, ADR-033)                 | [`regime`]                   |
-//! | Location / auction state                  | [`location`]                 |
+//! | Location / auction state (ADR-044)        | [`location`]                 |
 //! | Bias / trigger (ADR-012, ADR-024)         | [`trigger`]                  |
 //! | Strategy lifecycle / edge health          | [`strategy`]                 |
 //! | Experiments and results (ADR-040)         | [`research`]                 |

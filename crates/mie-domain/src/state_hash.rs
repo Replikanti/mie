@@ -7,7 +7,7 @@
 //! [`Fingerprint`] over an explicit byte encoding of every public field of
 //! [`MarketState`], written with the [`Fingerprinter`] writers (ADR-029). The
 //! engine's internal trackers (ATR window, flow, profile, structure,
-//! derivatives and liquidity trackers) are not hashed: the public state is
+//! derivatives, liquidity and location trackers) are not hashed: the public state is
 //! the contract, and a hidden divergence shows up in it at a later
 //! checkpoint. The order book is public state (`book.l2@1`, ADR-043), so
 //! every level of it is hashed.
@@ -16,7 +16,8 @@
 //! `write_u32(`[`STATE_HASH_ENCODING`]`)`, then the fields of
 //! [`MarketState`] in declaration order: `feature_set`, `as_of`,
 //! `last_trade_price`, `bars`, `motion`, `atr`, `regime`, `flow`, `profile`,
-//! `structure`, `derivatives`, `book`, `trade_count`. Every value is written
+//! `structure`, `derivatives`, `book`, `location`, `trade_count`. Every
+//! value is written
 //! by these rules:
 //!
 //! | Type | Encoding |
@@ -30,7 +31,7 @@
 //! | arrays, `Vec`, slices | `write_len`, then the elements in stored order |
 //! | `FeatureKey` | the ADR-029 encoding: `write_str` of the id, `write_u32` of the version |
 //! | `FeatureSetVersion` | `write_u64` of the fingerprint value |
-//! | enums | an explicit match, never a cast, with codes in declaration order: `Timeframe` M1 0, M5 1, M15 2, H1 3, H4 4, D1 5; `RegimeLabel` Low 0, Medium 1, High 2, Extreme 3; `Side` High 0, Low 1; `SweepOutcome` Pending 0, Sfp 1, Break 2; `book::Side` Bid 0, Ask 1 |
+//! | enums | an explicit match, never a cast, with codes in declaration order: `Timeframe` M1 0, M5 1, M15 2, H1 3, H4 4, D1 5; `RegimeLabel` Low 0, Medium 1, High 2, Extreme 3; `Side` High 0, Low 1; `SweepOutcome` Pending 0, Sfp 1, Break 2; `book::Side` Bid 0, Ask 1; `LevelKind` Poc 0, Vah 1, Val 2, Hvn 3, Lvn 4, StructuralHigh 5, StructuralLow 6, LiquidityCluster 7, PriorSweep 8, SfpRejectionZone 9, Vwap 10, ValidatedReference 11; `AuctionState` InsideValue 0, AtValueEdge 1, OutsideValue 2, Breakout 3, FailedBreakout 4, FailedReclaim 5, Acceptance 6; `LevelSide` High 0, Low 1, Bid 2, Ask 3; `Region` Below 0, In 1, Above 2; `Position` Below 0, LowEdge 1, In 2, HighEdge 3, Above 4; `Origin` Start 0, Acceptance 1 |
 //! | `OrderBook` | the chain (`write_u8`: `Straddle` 0, `Chained` 1, `Invalid` 2, then the id as `u64` unless invalid), the trusted window (two `Option<Price>`), then the bids and the asks, each best first as `write_len` followed by price and quantity per level |
 //! | `Level` (in the book features) | price, then quantity |
 //! | structs | every field, through exhaustive destructuring, in declaration order as of encoding v1 |
@@ -101,6 +102,7 @@ impl MarketState {
             structure,
             derivatives,
             book,
+            location,
             trade_count,
         } = self;
         feature_set.encode(&mut f);
@@ -115,6 +117,7 @@ impl MarketState {
         structure.encode(&mut f);
         derivatives.encode(&mut f);
         book.encode(&mut f);
+        location.encode(&mut f);
         trade_count.encode(&mut f);
         StateHash(f.finish())
     }
@@ -233,11 +236,11 @@ mod tests {
         // docs).
         assert_eq!(
             MarketStateEngine::new().state().state_hash().to_string(),
-            "a6c7504070de18ec"
+            "cc347065b37129d0"
         );
         assert_eq!(
             engine_after(&tape()).state().state_hash().to_string(),
-            "2d2d71d268a639b6"
+            "a4468a96437546b7"
         );
     }
 
@@ -440,6 +443,36 @@ mod tests {
                 s.book.clusters = FeatureValue::WarmingUp {
                     observed: 0,
                     required: 1,
+                };
+            }),
+        ));
+        assert!(base.location.vwap.is_ready());
+        edits.push((
+            "location vwap",
+            Box::new(|s| {
+                s.location.vwap = FeatureValue::WarmingUp {
+                    observed: 0,
+                    required: 1,
+                };
+            }),
+        ));
+        assert!(base.location.levels.is_ready());
+        edits.push((
+            "location levels",
+            Box::new(|s| {
+                s.location.levels = FeatureValue::WarmingUp {
+                    observed: 0,
+                    required: 1,
+                };
+            }),
+        ));
+        // The tape closes no day: the auction state is still warming up.
+        assert!(!base.location.auction.is_ready());
+        edits.push((
+            "location auction",
+            Box::new(|s| {
+                s.location.auction = FeatureValue::Unavailable {
+                    reason: Unavailability::InputInvalid,
                 };
             }),
         ));
