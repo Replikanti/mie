@@ -1,6 +1,6 @@
 # ADR-038: Binance order-book sync — diffs and snapshots raw, sync as a pure state machine, audited checkpoints
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-10-07
 
 ## Context
@@ -218,3 +218,55 @@ run, no domain rejection, late fraction at most 0.02 per stream
 - checkpoints emitted, skipped and matched, and the trusted-window width
   in bps;
 - channel high-water marks and blocked time.
+
+## Acceptance
+
+Accepted 2026-10-09. The #10 live soak ran 13 h 41 min in two runs
+(2026-10-08 22:33 – 2026-10-09 12:14 UTC, main `99aed6b`, all seven streams,
+the `ingest.example.toml` defaults) with one deliberate restart and 12
+unplanned WebSocket disconnects. It deviates from "Accept when" in two
+points, both decided by the user:
+
+- **Duration.** It is 13 h 41 min, not 24 h. The home connection drops every
+  few hours, so a 23 h connection age is unreachable, and continuing would
+  not have exercised rotation. The US session (~13:30–20:00 UTC) and the
+  16:00 funding were not observed, so the per-day figures below are
+  extrapolated from a window covering the Asian and European sessions only.
+  US-session sizes and rates are unmeasured.
+- **Planned rotation.** No planned 23 h rotation fell inside the soak,
+  because every disconnect reset connection age. The rotation path,
+  including the depth resync after it, is covered by a separate short run
+  with `max_connection_age_secs = 300` on all seven streams: the depth
+  stream rotated, resynced in 0.4 s, and 7 of 7 checkpoints matched. This is
+  how ADR-032 was accepted as well.
+
+`mie capture-report --max-late-fraction 0.02` prints `PASS`: 812 of 812
+checkpoints matched, none skipped, unverifiable, mismatched or invalidated,
+no domain rejection, no normalize error. Late events: aggTrade 1, depth 2,
+every other stream 0. The settled values:
+
+- **Depth messages per second** (per wall-clock second, p50 / p99 / max):
+  10 / 11 / 40. `@100ms` is a fixed cadence; a US-session p99 is unmeasured.
+- **Raw bytes per day** (extrapolated from 13.7 h, Parquet on disk): `depth`
+  about 640 MB, `depthSnapshot` about 20 MB, all seven streams about
+  720 MB. The 5-minute `depth` seals ran at a p50 / p99 / max of 2.1 / 4.6 /
+  7.7 MB, equivalent to 0.6 / 1.3 / 2.2 GB per day at that rate.
+- **Desyncs**: `Disconnected` 4 (two are the initial syncs of the two runs,
+  two are real depth disconnects), `SequenceBreak` 2. Both `SequenceBreak`
+  desyncs coincide with a depth `LateEvent` gap (max depth lateness
+  2594 ms against the 2000 ms hold-back), so they come from the hold-back
+  rule, not from `pu` breaks. Time unsynced (wall clock): 4.2 s in total
+  over 6 periods, at most 1.14 s. No snapshot was rejected and no buffer
+  dropped diffs.
+- **Snapshot fetches**: 818, all HTTP 200. Latency p50 347 ms, p99 828 ms,
+  max 5465 ms. REST weight per minute, from the 20 per `limit=1000` fetch
+  measured above (the journal does not record the header): average 19.9,
+  maximum 40; 25.9 and 46 with the open-interest poll. The limit is 2400.
+- **Checkpoints**: emitted 812, skipped 0, matched 812. The trusted window,
+  taken at the narrower side, is min 0, p10 10, median 13 bps; 14 of 812
+  are 5 bps or less, and all of them matched.
+- **Channels**: high-water 488 inbound and 714 core of 65 536; blocked time
+  0 ms.
+
+Results: <https://github.com/Replikanti/mie/issues/10#issuecomment-6080717136>,
+rotation: <https://github.com/Replikanti/mie/issues/10#issuecomment-6070194235>.
