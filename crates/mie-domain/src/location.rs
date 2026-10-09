@@ -316,16 +316,27 @@ pub enum LocationEvent {
         bar_end: EventTime,
     },
     /// The auction state changed with a close (decision 8).
+    ///
+    /// It carries the whole status of the close, so every emitted label can
+    /// be traced to its reference, region, probe and failure. On the event
+    /// that closes a UTC day, the day's last close is classified against the
+    /// old prior day and the classifier then switches to the new one
+    /// (decision 2): `MarketState` shows the status after the switch
+    /// (warming up or unavailable), and the old day's last status survives
+    /// only here, when its label changed.
     Auction {
         /// The previous close's state under the same prior day; `None` for
         /// the first close under it.
         from: Option<AuctionState>,
-        /// The state after the close.
+        /// The state after the close: `status.state`.
         to: AuctionState,
         /// Time of the event that closed the bar.
         known_at: EventTime,
         /// End of the bar.
         bar_end: EventTime,
+        /// The status after the close, against the reference it was
+        /// classified under.
+        status: AuctionStatus,
     },
 }
 
@@ -446,6 +457,7 @@ impl LocationTracker {
                         to,
                         known_at,
                         bar_end: classified.status.bar_end,
+                        status: classified.status,
                     });
                 }
             });

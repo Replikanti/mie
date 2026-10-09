@@ -92,7 +92,11 @@ of #12, 2025-10-01 … 2026-09-30 (`docs/data-availability.md`).
     | 8 | 541 / 484 | 77.3 / 74.6 % | 4.4, 3.5, 5.1, 5.6, 2.3 / 2.9, 3.2, 4.4, 2.3, 2.1 % | 0.80 / 0.48 % | 61.2 / 56.2 % | 75.8 / 71.2 % | 84.9 / 80.1 % | 53.7 / 51.7 % |
 
     At `w` = 5 the hazard falls on to 0.45 % at closes 60–89 and 0.07 % at
-    180–359 (first half). The exact counts are lower than M0b's (1 318 at
+    180–359 (first half). At `w` = 6, first half: hazard 0.42 % at closes
+    60–89, 0.38 % at 90–119, 0.29 % at 120–179, 0.07 % at 180–359 and 0.09 %
+    from 360 on; by `N` = 90, 84.06 % of failures are caught and 50.62 % of
+    the breakouts that held 90 closes still returned (81 of 160); by `N` =
+    180, 91.73 % and 37.84 % (42 of 111). The exact counts are lower than M0b's (1 318 at
     `w` = 5 against 1 689): the exact value area and closes differ from the
     probe's approximation.
   - **M3, the registry** at `w` = 5: p50 / p99 levels per closed minute — POC,
@@ -161,6 +165,22 @@ of #12, 2025-10-01 … 2026-09-30 (`docs/data-availability.md`).
    - When one event closes several 1m bars, or the 1d bar, the classifier
      first classifies the old day's closes against the reference it holds,
      then switches to the newly published prior-day profile.
+   - *Rollover sequence.* The trade that closes 23:59 also closes the day.
+     In that event: (1) the 23:59 close is classified against the old prior
+     day; if its label changed, `LocationEvent::Auction` carries its whole
+     `AuctionStatus` (reference, region, origin, position, probe, failure);
+     (2) the classifier switches to the new prior day; (3)
+     `MarketState.location.auction` is the status after the switch —
+     warming up, or unavailable — so the old day's last status is visible
+     only in that event; (4) the registry rebuilds on the 23:59 bar from the
+     committed sources, which already hold the new prior day's levels. A
+     last close whose label did not change emits nothing, and its counters
+     (the probe's or failure's closes) are not observable; the next day
+     starts from a new reference anyway (D8).
+   - *Rejected:* publishing the old day's last status until the new day's
+     first close — `MarketState` would then show a reference that is no
+     longer the prior day, and the registry's VAH/VAL zones of the same
+     event would disagree with it.
    - *Rejected:* stepping location on copies like the other families.
      `book.clusters@1` exists only after the liquidity commit, so location
      would have to duplicate every commit.
@@ -244,7 +264,7 @@ of #12, 2025-10-01 … 2026-09-30 (`docs/data-availability.md`).
    - *Rejected:* a weighted scalar score — its weights would be numbers
      nobody measured.
 7. **Monitored-location events.** `LocationEvent::{Entered{Arrived|Created},
-   Left{Departed|Retired}, Auction{from, to}}`, exposed by
+   Left{Departed|Retired}, Auction{from, to, status}}`, exposed by
    `MarketStateEngine::location_events()`. Not hashed; the in-zone flags and
    the auction state they follow from are.
    - A level is in zone while the closed bar's `[low, high]` overlaps its
@@ -283,7 +303,9 @@ of #12, 2025-10-01 … 2026-09-30 (`docs/data-availability.md`).
      `A` outside value → `Acceptance` (origin `Acceptance`) or
      `OutsideValue` (origin `Start`). The value carries the region, origin,
      the close's position, the probe and the failure, so every label can be
-     traced.
+     traced; so does every `LocationEvent::Auction`, which carries the
+     status of its close — the only trace of a day's last close (D2,
+     rollover sequence).
    - The classifier resets at each new prior-day publication. It is
      `Unavailable(InputInvalid)` while the prior day is unavailable or
      `VAH − VAL` is at most both edge bands (no In region); that never

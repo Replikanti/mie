@@ -1042,11 +1042,18 @@ mod tests {
             engine.apply(&next(DAY + m * MINUTE + 1_000, at)).unwrap();
             for fact in engine.location_events() {
                 if let LocationEvent::Auction {
-                    from, to, known_at, ..
+                    from,
+                    to,
+                    known_at,
+                    status,
+                    ..
                 } = fact
                 {
                     assert_eq!(*from, last);
                     assert_eq!(*known_at, t(DAY + m * MINUTE + 1_000));
+                    // No day rolls here: the event's status is the state's.
+                    assert_eq!(engine.state().location.auction.ready(), Some(status));
+                    assert_eq!(status.state, *to);
                     transitions.push((*from, *to));
                     last = Some(*to);
                 }
@@ -1069,6 +1076,75 @@ mod tests {
                 (Some(AuctionState::Breakout), AuctionState::Acceptance),
             ]
         );
+    }
+
+    #[test]
+    fn the_last_close_of_a_day_is_traced_by_its_event_only() {
+        let mut engine = MarketStateEngine::new();
+        let mut trade_id = 0;
+        let mut next = |millis: i64, at: i64| {
+            trade_id += 1;
+            trade(millis, trade_id, at)
+        };
+        // Day 0: one trade a minute, sweeping 60 000 … 60 990.
+        for m in 0..1_440 {
+            engine
+                .apply(&next(m * MINUTE + 1_000, 60_000 + (m % 100) * 10))
+                .unwrap();
+        }
+        // Day 1: inside value, a breakout from 23:50, back inside at 23:59.
+        for m in 0..1_440 {
+            let at = if (1_430..1_439).contains(&m) {
+                62_000
+            } else {
+                60_500
+            };
+            engine.apply(&next(DAY + m * MINUTE + 1_000, at)).unwrap();
+        }
+        let before = *engine.state().location.auction.ready().unwrap();
+        assert_eq!(before.state, AuctionState::Breakout);
+        // The trade that closes 23:59 and the day.
+        engine.apply(&next(2 * DAY + 1_000, 60_500)).unwrap();
+        let auction: Vec<&LocationEvent> = engine
+            .location_events()
+            .iter()
+            .filter(|fact| matches!(fact, LocationEvent::Auction { .. }))
+            .collect();
+        let [
+            LocationEvent::Auction {
+                from, to, status, ..
+            },
+        ] = auction.as_slice()
+        else {
+            panic!("one auction fact: {auction:?}")
+        };
+        // The 23:59 close against day 0's value…
+        assert_eq!(
+            (*from, *to),
+            (Some(AuctionState::Breakout), AuctionState::FailedBreakout)
+        );
+        assert_eq!(
+            (status.reference_start, status.val, status.vah),
+            (t(0), before.val, before.vah)
+        );
+        assert_eq!(
+            (status.bar_end, status.known_at),
+            (t(2 * DAY), t(2 * DAY + 1_000))
+        );
+        assert_eq!(
+            status.failure.map(|failure| failure.toward),
+            Some(Region::Above)
+        );
+        // …while the state has switched to day 1's value: one bin of 60 500
+        // is narrower than both edge bands.
+        assert_eq!(
+            engine.state().location.auction,
+            FeatureValue::Unavailable {
+                reason: Unavailability::InputInvalid
+            }
+        );
+        let levels = engine.state().location.levels.ready().unwrap();
+        assert_eq!(levels.known_at, t(2 * DAY + 1_000));
     }
 
     #[test]
