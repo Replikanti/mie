@@ -387,12 +387,23 @@ fn a_mutated_trade_diverges_at_the_first_checkpoint_it_reaches() {
     let dir = TempDir::new("equivalence-c1");
     let config = mutated.materialize(dir.path());
     let (outcome, text) = check(&config, start, start + 1);
-    let Verdict::Diverged(Mismatch::Checkpoint(d)) = &outcome.runs[0].verdict else {
-        panic!("{text}")
-    };
-    assert_eq!((d.index, d.kind), (expected, DivergenceKind::EventStream));
-    assert_eq!(d.live.unwrap().ordinal, journaled[expected]);
-    assert_ne!(d.live.unwrap().events, d.replay.unwrap().events);
+    if fixture.same_feature_set() {
+        let Verdict::Diverged(Mismatch::Checkpoint(d)) = &outcome.runs[0].verdict else {
+            panic!("{text}")
+        };
+        assert_eq!((d.index, d.kind), (expected, DivergenceKind::EventStream));
+        assert_eq!(d.live.unwrap().ordinal, journaled[expected]);
+        assert_ne!(d.live.unwrap().events, d.replay.unwrap().events);
+    } else {
+        // After a feature-set change the run compares events only (ADR-041
+        // D4); the first divergent checkpoint is the same.
+        let Verdict::Diverged(Mismatch::Events(d)) = &outcome.runs[0].verdict else {
+            panic!("{text}")
+        };
+        assert_eq!(d.index, expected);
+        assert_eq!(d.live.ordinal, journaled[expected]);
+        assert_ne!(Some(d.live.events), d.replay);
+    }
     assert_eq!(outcome.exit_code(), 1);
     assert!(
         text.contains(&format!(

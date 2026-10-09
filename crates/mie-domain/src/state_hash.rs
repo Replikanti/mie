@@ -6,15 +6,15 @@
 //! checkpoints. Both sides compare a [`StateHash`]: a FNV-1a 64
 //! [`Fingerprint`] over an explicit byte encoding of every public field of
 //! [`MarketState`], written with the [`Fingerprinter`] writers (ADR-029). The
-//! engine's internal trackers (ATR window, flow, profile and structure
-//! trackers) are not hashed: the public state is the contract, and a hidden
-//! divergence shows up in it at a later checkpoint.
+//! engine's internal trackers (ATR window, flow, profile, structure and
+//! derivatives trackers) are not hashed: the public state is the contract,
+//! and a hidden divergence shows up in it at a later checkpoint.
 //!
 //! **Encoding v1.** A header, `write_str("mie-market-state")` then
 //! `write_u32(`[`STATE_HASH_ENCODING`]`)`, then the fields of
 //! [`MarketState`] in declaration order: `feature_set`, `as_of`,
 //! `last_trade_price`, `bars`, `motion`, `atr`, `regime`, `flow`, `profile`,
-//! `structure`, `trade_count`. Every value is written by these rules:
+//! `structure`, `derivatives`, `trade_count`. Every value is written by these rules:
 //!
 //! | Type | Encoding |
 //! |---|---|
@@ -94,6 +94,7 @@ impl MarketState {
             flow,
             profile,
             structure,
+            derivatives,
             trade_count,
         } = self;
         feature_set.encode(&mut f);
@@ -106,6 +107,7 @@ impl MarketState {
         flow.encode(&mut f);
         profile.encode(&mut f);
         structure.encode(&mut f);
+        derivatives.encode(&mut f);
         trade_count.encode(&mut f);
         StateHash(f.finish())
     }
@@ -180,6 +182,7 @@ impl<T: StateEncode> StateEncode for Vec<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::derivatives::{LiquidationWindows, MarkState, OiSample, OiStep, SettledFunding};
     use crate::event::MarketEvent;
     use crate::event::samples::{one_of_each, trade};
     use crate::feature::{FeatureKey, FeatureSetVersion, FeatureValue, Unavailability};
@@ -222,11 +225,11 @@ mod tests {
         // docs).
         assert_eq!(
             MarketStateEngine::new().state().state_hash().to_string(),
-            "f86c23cd8121054d"
+            "77d7e8fe9f024a68"
         );
         assert_eq!(
             engine_after(&tape()).state().state_hash().to_string(),
-            "5b7cf2028ee66394"
+            "b57fd5949ce7de1c"
         );
     }
 
@@ -345,7 +348,66 @@ mod tests {
                 "regime minus zero",
                 Box::new(move |s| s.regime = regime(-0.0)),
             ),
+            (
+                "derivatives oi",
+                Box::new(|s| {
+                    s.derivatives.oi = s.derivatives.oi.map(|sample| OiSample {
+                        resolution_ms: sample.resolution_ms + 1,
+                        ..sample
+                    });
+                }),
+            ),
+            (
+                "derivatives oi step",
+                Box::new(|s| {
+                    s.derivatives.oi = s.derivatives.oi.map(|sample| OiSample {
+                        step: Some(OiStep {
+                            previous_time: EventTime::from_millis(0),
+                            delta: Qty::from_units(0),
+                            elapsed_ms: 1_000,
+                        }),
+                        ..sample
+                    });
+                }),
+            ),
+            (
+                "derivatives oi grid",
+                Box::new(|s| {
+                    s.derivatives.oi_5m = FeatureValue::Unavailable {
+                        reason: Unavailability::InputInvalid,
+                    };
+                }),
+            ),
+            (
+                "derivatives mark",
+                Box::new(|s| {
+                    s.derivatives.mark = s.derivatives.mark.map(|mark| MarkState {
+                        index_price: Price::from_units(mark.index_price.units() + 1),
+                        ..mark
+                    });
+                }),
+            ),
+            (
+                "derivatives funding",
+                Box::new(|s| {
+                    s.derivatives.funding_settled =
+                        s.derivatives.funding_settled.map(|funding| SettledFunding {
+                            time: EventTime::from_millis(funding.time.as_millis() + 1),
+                            ..funding
+                        });
+                }),
+            ),
+            (
+                "derivatives liquidations",
+                Box::new(|s| s.derivatives.liquidations = LiquidationWindows::new()),
+            ),
         ];
+        // The tape gives every derivatives value but the grid (no sample at
+        // or before a boundary yet) something to change.
+        assert!(base.derivatives.oi.is_ready());
+        assert!(base.derivatives.mark.is_ready());
+        assert!(base.derivatives.funding_settled.is_ready());
+        assert_ne!(base.derivatives.liquidations, LiquidationWindows::new());
         let mut seen = vec![("base", reference)];
         for (name, edit) in &edits {
             let mut state = base.clone();

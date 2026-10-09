@@ -180,6 +180,10 @@ Earlier decisions constrain the answer:
 - Nothing here emits a direction, a side bias or a signal (ADR-012,
   ADR-023, ADR-024). Divergences between CVD, OI and price belong to the
   order-flow candidates (#22).
+- `MarketState.derivatives` joins the Market State hash (ADR-041) after
+  `structure`, with an encoder next to each new type. Under ADR-041 a new
+  feature family extends encoding v1 without a bump. Runs recorded with
+  the previous feature set compare events only.
 - Mark price (1/s) and OI (every 10 s) touch only a small copied head per
   event. The liquidation minutes are a fixed ring of 61 slots keyed by
   minute, copied only on a liquidations-stream event.
@@ -215,4 +219,4 @@ Earlier decisions constrain the answer:
    with zero divergences.
 
 References: ADR-012, ADR-013, ADR-019, ADR-022, ADR-023, ADR-024, ADR-027,
-ADR-028, ADR-029, ADR-031, ADR-032, ADR-034, ADR-035, ADR-039.
+ADR-028, ADR-029, ADR-031, ADR-032, ADR-034, ADR-035, ADR-039, ADR-041.

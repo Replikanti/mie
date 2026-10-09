@@ -39,7 +39,9 @@ use crate::event::{
     Stream,
 };
 use crate::feature::{FeatureKey, FeatureValue, Unavailability, catalog};
+use crate::fingerprint::Fingerprinter;
 use crate::num::{Price, Qty, Rate, SCALE};
+use crate::state_hash::StateEncode;
 use crate::time::EventTime;
 use std::fmt;
 
@@ -91,6 +93,19 @@ pub struct OiStep {
     pub elapsed_ms: u64,
 }
 
+impl StateEncode for OiStep {
+    fn encode(&self, f: &mut Fingerprinter) {
+        let Self {
+            previous_time,
+            delta,
+            elapsed_ms,
+        } = self;
+        previous_time.encode(f);
+        delta.encode(f);
+        elapsed_ms.encode(f);
+    }
+}
+
 /// The last open-interest sample: `derivatives.oi.sample@1` (ADR-042,
 /// decision 1).
 ///
@@ -113,6 +128,23 @@ pub struct OiSample {
     /// (first sample, resolution change, open-interest gap, or an elapsed
     /// time outside `(0, resolution_ms + step_tolerance_ms]`).
     pub step: Option<OiStep>,
+}
+
+impl StateEncode for OiSample {
+    fn encode(&self, f: &mut Fingerprinter) {
+        let Self {
+            feature,
+            time,
+            open_interest,
+            resolution_ms,
+            step,
+        } = self;
+        feature.encode(f);
+        time.encode(f);
+        open_interest.encode(f);
+        resolution_ms.encode(f);
+        step.encode(f);
+    }
 }
 
 impl OiSample {
@@ -168,6 +200,25 @@ pub struct OiGridPoint {
     pub delta: Option<Qty>,
 }
 
+impl StateEncode for OiGridPoint {
+    fn encode(&self, f: &mut Fingerprinter) {
+        let Self {
+            feature,
+            boundary,
+            open_interest,
+            sample_time,
+            resolution_ms,
+            delta,
+        } = self;
+        feature.encode(f);
+        boundary.encode(f);
+        open_interest.encode(f);
+        sample_time.encode(f);
+        resolution_ms.encode(f);
+        delta.encode(f);
+    }
+}
+
 impl OiGridPoint {
     /// OI velocity in BTC per minute over the grid step: `(delta / 1e8) ×
     /// 60 000 / grid_ms`; `None` without a delta.
@@ -213,6 +264,25 @@ pub struct MarkState {
     pub funding_rate: Rate,
     /// When the next funding settles.
     pub next_funding_time: EventTime,
+}
+
+impl StateEncode for MarkState {
+    fn encode(&self, f: &mut Fingerprinter) {
+        let Self {
+            feature,
+            time,
+            mark_price,
+            index_price,
+            funding_rate,
+            next_funding_time,
+        } = self;
+        feature.encode(f);
+        time.encode(f);
+        mark_price.encode(f);
+        index_price.encode(f);
+        funding_rate.encode(f);
+        next_funding_time.encode(f);
+    }
 }
 
 impl MarkState {
@@ -271,6 +341,19 @@ pub struct SettledFunding {
     pub rate: Rate,
 }
 
+impl StateEncode for SettledFunding {
+    fn encode(&self, f: &mut Fingerprinter) {
+        let Self {
+            feature,
+            time,
+            rate,
+        } = self;
+        feature.encode(f);
+        time.encode(f);
+        rate.encode(f);
+    }
+}
+
 impl fmt::Display for SettledFunding {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "time={} rate={} {}", self.time, self.rate, self.feature)
@@ -306,6 +389,31 @@ pub struct LiquidationWindow {
     pub feed_gap: bool,
 }
 
+impl StateEncode for LiquidationWindow {
+    fn encode(&self, f: &mut Fingerprinter) {
+        let Self {
+            feature,
+            timeframe,
+            end,
+            long_count,
+            long_qty,
+            short_count,
+            short_qty,
+            partial_start,
+            feed_gap,
+        } = self;
+        feature.encode(f);
+        timeframe.encode(f);
+        end.encode(f);
+        long_count.encode(f);
+        long_qty.encode(f);
+        short_count.encode(f);
+        short_qty.encode(f);
+        partial_start.encode(f);
+        feed_gap.encode(f);
+    }
+}
+
 impl fmt::Display for LiquidationWindow {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let coverage = match (self.partial_start, self.feed_gap) {
@@ -333,6 +441,13 @@ impl fmt::Display for LiquidationWindow {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LiquidationWindows {
     values: [FeatureValue<LiquidationWindow>; 3],
+}
+
+impl StateEncode for LiquidationWindows {
+    fn encode(&self, f: &mut Fingerprinter) {
+        let Self { values } = self;
+        values.encode(f);
+    }
 }
 
 impl Default for LiquidationWindows {
@@ -396,6 +511,23 @@ pub struct Derivatives {
     /// window of closed minutes since the first liquidations-stream event is
     /// full. A lower bound.
     pub liquidations: LiquidationWindows,
+}
+
+impl StateEncode for Derivatives {
+    fn encode(&self, f: &mut Fingerprinter) {
+        let Self {
+            oi,
+            oi_5m,
+            mark,
+            funding_settled,
+            liquidations,
+        } = self;
+        oi.encode(f);
+        oi_5m.encode(f);
+        mark.encode(f);
+        funding_settled.encode(f);
+        liquidations.encode(f);
+    }
 }
 
 impl Default for Derivatives {
