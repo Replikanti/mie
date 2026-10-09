@@ -11,7 +11,7 @@ use super::{
 };
 use crate::bars::Timeframe;
 use crate::event::Stream;
-use crate::num::{Price, SCALE};
+use crate::num::{Price, Rate, SCALE};
 
 /// `trade.last_price@1`: the price of the last trade.
 ///
@@ -1123,6 +1123,215 @@ pub const LIQ_WINDOWS: [(Timeframe, &FeatureDefinition); 3] = [
     (Timeframe::H1, &DERIVATIVES_LIQ_WINDOW_1H_V1),
 ];
 
+/// `book.l2@1`: the L2 order book rebuilt from snapshots and updates
+/// (ADR-038 D6, ADR-043 D1): every level, the update-id chain and the
+/// trusted window.
+///
+/// - Inputs: order book (snapshots, updates and order-book feed gaps).
+/// - Warm-up: one sample, where a sample is a snapshot. Live only: archive
+///   replays have no order book and keep it warming up (ADR-043 D11).
+/// - Gap policy: an order-book gap, or an update that breaks the chain or
+///   carries a negative quantity, makes it `Unavailable(InputInvalid)` until
+///   the next snapshot builds a fresh book. A snapshot is a reset, never
+///   flow (ADR-038 D6).
+pub const BOOK_L2_V1: FeatureDefinition = FeatureDefinition {
+    key: FeatureKey::new("book.l2", 1),
+    params: &[],
+    inputs: &[Input::Stream(Stream::OrderBook)],
+    warm_up: WarmUp::Samples(1),
+};
+
+/// The depth bands of the order-book features, innermost first: 1, 2 and 5
+/// bps of mid as [`Rate`] units (1 bps = 10 000 units), cumulative and
+/// inclusive (ADR-043 D2).
+pub const BOOK_BANDS: [Rate; 3] = [
+    Rate::from_units(10_000),
+    Rate::from_units(20_000),
+    Rate::from_units(50_000),
+];
+
+/// The band parameters every banded book feature carries.
+const BOOK_BAND_PARAMS: [Param; 3] = [
+    Param {
+        name: "band_1",
+        value: ParamValue::Rate(BOOK_BANDS[0]),
+    },
+    Param {
+        name: "band_2",
+        value: ParamValue::Rate(BOOK_BANDS[1]),
+    },
+    Param {
+        name: "band_3",
+        value: ParamValue::Rate(BOOK_BANDS[2]),
+    },
+];
+
+/// `book.depth@1`: best bid and ask, and per band the resting bid and ask
+/// quantity and level count within 1, 2 and 5 bps of mid (ADR-043 D2–D4).
+/// Imbalance `(bid − ask) / (bid + ask)` is derived on demand.
+///
+/// - Parameters: `band_1` = 0.0001, `band_2` = 0.0002, `band_3` = 0.0005
+///   (`Rate`).
+/// - Inputs: `book.l2@1`.
+/// - Warm-up: one sample, where a sample is a snapshot (through
+///   `book.l2@1`). Recomputed after every order-book event.
+/// - Gap policy: `Unavailable(InputInvalid)` while the book is not ready,
+///   one-sided or crossed. A band whose far edge lies beyond the trusted
+///   window on either side, or whose sum leaves the `Qty` range, is
+///   `Unavailable(OutOfRange)`.
+pub const BOOK_DEPTH_V1: FeatureDefinition = FeatureDefinition {
+    key: FeatureKey::new("book.depth", 1),
+    params: &BOOK_BAND_PARAMS,
+    inputs: &[Input::Feature(BOOK_L2_V1.key)],
+    warm_up: WarmUp::Samples(1),
+};
+
+/// `book.clusters@1`: per side within 5 bps of mid, the 5 largest levels
+/// (ties to the level nearer mid), the lower-median level quantity, the
+/// total quantity and the level count (ADR-043 D8). Multiples of the median
+/// are derived on demand; there is no cluster threshold (#23 owns it).
+///
+/// - Parameters: `band` = 0.0005 (`Rate`), `top_k` = 5.
+/// - Inputs: `book.l2@1`.
+/// - Warm-up: one sample, where a sample is a snapshot (through
+///   `book.l2@1`).
+/// - Gap policy: `Unavailable(InputInvalid)` while the book is not ready,
+///   one-sided or crossed; a side whose band edge lies beyond the trusted
+///   window is `Unavailable(OutOfRange)`.
+pub const BOOK_CLUSTERS_V1: FeatureDefinition = FeatureDefinition {
+    key: FeatureKey::new("book.clusters", 1),
+    params: &[
+        Param {
+            name: "band",
+            value: ParamValue::Rate(BOOK_BANDS[2]),
+        },
+        Param {
+            name: "top_k",
+            value: ParamValue::Int(5),
+        },
+    ],
+    inputs: &[Input::Feature(BOOK_L2_V1.key)],
+    warm_up: WarmUp::Samples(1),
+};
+
+/// A `book.liquidity.window.<label>@1` definition (ADR-043 D5, D6): passive
+/// liquidity added, cancelled and filled per side and band over the last
+/// `minutes` closed 1m bars.
+const fn book_liquidity_window_v1(
+    id: &'static str,
+    params: &'static [Param],
+    minutes: u32,
+) -> FeatureDefinition {
+    FeatureDefinition {
+        key: FeatureKey::new(id, 1),
+        params,
+        inputs: &[
+            Input::Feature(BOOK_L2_V1.key),
+            Input::Stream(Stream::Trades),
+            Input::Feature(BARS_TIME_1M_V1.key),
+        ],
+        warm_up: WarmUp::Samples(minutes),
+    }
+}
+
+/// `book.liquidity.window.5m@1`: liquidity added, cancelled and filled per
+/// side and band (1, 2, 5 bps of mid) over the last 5 closed 1m bars
+/// (ADR-043 D5, D6). A decrease at a level is matched with the taker trades
+/// at its price, carried for one update; a fill the book never showed as a
+/// decrease is inferred as added and filled and counted in `inferred`.
+/// `added` and `cancelled` are lower bounds.
+///
+/// - Parameters: `band_1` = 0.0001, `band_2` = 0.0002, `band_3` = 0.0005
+///   (`Rate`), `carry_updates` = 1, `window_ms` = 300 000.
+/// - Inputs: `book.l2@1`, trades (the fills) and `bars.time.1m@1` (the
+///   clock, ADR-035 D1).
+/// - Warm-up: 5 samples, where a sample is a closed 1m bar from the minute
+///   of the first valid book on. Archive replays have no book and stay
+///   warming up.
+/// - Gap policy: the window never goes back to warming up. An order-book or
+///   trades gap flags every minute it overlaps with `feed_gap`, also minutes
+///   that already closed; so does a book event that finds or leaves the book
+///   unavailable. A snapshot books no flow and drops the pending fills. The
+///   window carries the OR of its minutes' flags (`feed_gap`, per band
+///   `beyond_window`), and its first minute is `partial_start`.
+pub const BOOK_LIQUIDITY_WINDOW_5M_V1: FeatureDefinition = book_liquidity_window_v1(
+    "book.liquidity.window.5m",
+    &[
+        BOOK_BAND_PARAMS[0],
+        BOOK_BAND_PARAMS[1],
+        BOOK_BAND_PARAMS[2],
+        Param {
+            name: "carry_updates",
+            value: ParamValue::Int(1),
+        },
+        Param {
+            name: "window_ms",
+            value: ParamValue::Int(300_000),
+        },
+    ],
+    5,
+);
+
+/// `book.liquidity.window.15m@1`: order-book liquidity flow over the last
+/// 15 closed 1m bars (ADR-043 D5, D6).
+///
+/// Parameters: bands and `carry_updates` as [`BOOK_LIQUIDITY_WINDOW_5M_V1`],
+/// `window_ms` = 900 000. Warm-up: 15 samples (closed 1m bars from the first
+/// valid book on). Inputs and gap policy as
+/// [`BOOK_LIQUIDITY_WINDOW_5M_V1`].
+pub const BOOK_LIQUIDITY_WINDOW_15M_V1: FeatureDefinition = book_liquidity_window_v1(
+    "book.liquidity.window.15m",
+    &[
+        BOOK_BAND_PARAMS[0],
+        BOOK_BAND_PARAMS[1],
+        BOOK_BAND_PARAMS[2],
+        Param {
+            name: "carry_updates",
+            value: ParamValue::Int(1),
+        },
+        Param {
+            name: "window_ms",
+            value: ParamValue::Int(900_000),
+        },
+    ],
+    15,
+);
+
+/// `book.liquidity.window.1h@1`: order-book liquidity flow over the last 60
+/// closed 1m bars (ADR-043 D5, D6).
+///
+/// Parameters: bands and `carry_updates` as [`BOOK_LIQUIDITY_WINDOW_5M_V1`],
+/// `window_ms` = 3 600 000. Warm-up: 60 samples (closed 1m bars from the
+/// first valid book on). Inputs and gap policy as
+/// [`BOOK_LIQUIDITY_WINDOW_5M_V1`].
+pub const BOOK_LIQUIDITY_WINDOW_1H_V1: FeatureDefinition = book_liquidity_window_v1(
+    "book.liquidity.window.1h",
+    &[
+        BOOK_BAND_PARAMS[0],
+        BOOK_BAND_PARAMS[1],
+        BOOK_BAND_PARAMS[2],
+        Param {
+            name: "carry_updates",
+            value: ParamValue::Int(1),
+        },
+        Param {
+            name: "window_ms",
+            value: ParamValue::Int(3_600_000),
+        },
+    ],
+    60,
+);
+
+/// The order-book liquidity window of each length, shortest first; the
+/// Market State builds its
+/// [`LiquidityWindows`](crate::liquidity::LiquidityWindows) from it. The
+/// timeframe is the window length, not a bar series.
+pub const BOOK_LIQUIDITY_WINDOWS: [(Timeframe, &FeatureDefinition); 3] = [
+    (Timeframe::M5, &BOOK_LIQUIDITY_WINDOW_5M_V1),
+    (Timeframe::M15, &BOOK_LIQUIDITY_WINDOW_15M_V1),
+    (Timeframe::H1, &BOOK_LIQUIDITY_WINDOW_1H_V1),
+];
+
 /// Every version of every feature. Never shrinks.
 pub const DEFINITIONS: &[&FeatureDefinition] = &[
     &TRADE_LAST_PRICE_V1,
@@ -1163,6 +1372,12 @@ pub const DEFINITIONS: &[&FeatureDefinition] = &[
     &DERIVATIVES_LIQ_WINDOW_5M_V1,
     &DERIVATIVES_LIQ_WINDOW_15M_V1,
     &DERIVATIVES_LIQ_WINDOW_1H_V1,
+    &BOOK_L2_V1,
+    &BOOK_DEPTH_V1,
+    &BOOK_CLUSTERS_V1,
+    &BOOK_LIQUIDITY_WINDOW_5M_V1,
+    &BOOK_LIQUIDITY_WINDOW_15M_V1,
+    &BOOK_LIQUIDITY_WINDOW_1H_V1,
 ];
 
 /// The fingerprint each published `id@version` must keep. Append-only: one
@@ -1206,6 +1421,12 @@ pub const LOCK: &[LockEntry] = &[
     LockEntry::new("derivatives.liq.window.5m", 1, 0xe58f_6c17_aae9_6808),
     LockEntry::new("derivatives.liq.window.15m", 1, 0x08b6_f494_da9d_36ed),
     LockEntry::new("derivatives.liq.window.1h", 1, 0xf8bf_c670_4109_615b),
+    LockEntry::new("book.l2", 1, 0x1540_06c4_5c86_8fe2),
+    LockEntry::new("book.depth", 1, 0xd411_5d7e_28bc_ebc6),
+    LockEntry::new("book.clusters", 1, 0x0fef_026f_910e_b2aa),
+    LockEntry::new("book.liquidity.window.5m", 1, 0x393d_380d_74a3_3d99),
+    LockEntry::new("book.liquidity.window.15m", 1, 0xe2f9_5033_82fc_e9c0),
+    LockEntry::new("book.liquidity.window.1h", 1, 0xd4a5_f617_f61e_8388),
 ];
 
 /// The default feature set: the latest version of each computed feature.
@@ -1248,6 +1469,12 @@ pub const CURRENT: &[FeatureKey] = &[
     DERIVATIVES_LIQ_WINDOW_5M_V1.key,
     DERIVATIVES_LIQ_WINDOW_15M_V1.key,
     DERIVATIVES_LIQ_WINDOW_1H_V1.key,
+    BOOK_L2_V1.key,
+    BOOK_DEPTH_V1.key,
+    BOOK_CLUSTERS_V1.key,
+    BOOK_LIQUIDITY_WINDOW_5M_V1.key,
+    BOOK_LIQUIDITY_WINDOW_15M_V1.key,
+    BOOK_LIQUIDITY_WINDOW_1H_V1.key,
 ];
 
 /// The registry of [`DEFINITIONS`].
@@ -1321,10 +1548,10 @@ mod tests {
             hasher.write_u32(entry.key.version.get());
             hasher.write_u64(entry.fingerprint.value());
         }
-        assert_eq!(LOCK.len(), 38, "lock lines");
+        assert_eq!(LOCK.len(), 44, "lock lines");
         assert_eq!(
             hasher.finish().to_string(),
-            "7fc1ab6556667ec4",
+            "612e3fbb1bbf3bba",
             "lock digest"
         );
     }
@@ -1657,6 +1884,99 @@ mod tests {
     }
 
     #[test]
+    fn book_features_match_their_parameters() {
+        assert_eq!(
+            BOOK_BANDS.map(Rate::units),
+            [10_000, 20_000, 50_000],
+            "1, 2 and 5 bps"
+        );
+        let bands = [
+            Param {
+                name: "band_1",
+                value: ParamValue::Rate(Rate::from_units(10_000)),
+            },
+            Param {
+                name: "band_2",
+                value: ParamValue::Rate(Rate::from_units(20_000)),
+            },
+            Param {
+                name: "band_3",
+                value: ParamValue::Rate(Rate::from_units(50_000)),
+            },
+        ];
+        assert!(BOOK_L2_V1.params.is_empty());
+        assert_eq!(BOOK_L2_V1.inputs, &[Input::Stream(Stream::OrderBook)]);
+        assert_eq!(BOOK_DEPTH_V1.params, &bands);
+        assert_eq!(
+            BOOK_CLUSTERS_V1.params,
+            &[
+                Param {
+                    name: "band",
+                    value: ParamValue::Rate(Rate::from_units(50_000)),
+                },
+                Param {
+                    name: "top_k",
+                    value: ParamValue::Int(5),
+                },
+            ]
+        );
+        for definition in [&BOOK_DEPTH_V1, &BOOK_CLUSTERS_V1] {
+            assert_eq!(definition.inputs, &[Input::Feature(BOOK_L2_V1.key)]);
+        }
+        for definition in [&BOOK_L2_V1, &BOOK_DEPTH_V1, &BOOK_CLUSTERS_V1] {
+            assert_eq!(definition.warm_up, WarmUp::Samples(1));
+        }
+        assert_eq!(
+            BOOK_LIQUIDITY_WINDOWS.map(|(timeframe, _)| timeframe),
+            [Timeframe::M5, Timeframe::M15, Timeframe::H1]
+        );
+        for (timeframe, definition) in BOOK_LIQUIDITY_WINDOWS {
+            assert_eq!(
+                definition.key.id.as_str(),
+                format!("book.liquidity.window.{}", timeframe.label()),
+                "{timeframe:?}"
+            );
+            let mut params = bands.to_vec();
+            params.push(Param {
+                name: "carry_updates",
+                value: ParamValue::Int(1),
+            });
+            params.push(Param {
+                name: "window_ms",
+                value: ParamValue::Int(timeframe.millis()),
+            });
+            assert_eq!(definition.params, params.as_slice(), "{timeframe:?}");
+            assert_eq!(
+                definition.inputs,
+                &[
+                    Input::Feature(BOOK_L2_V1.key),
+                    Input::Stream(Stream::Trades),
+                    Input::Feature(BARS_TIME_1M_V1.key),
+                ]
+            );
+            let minutes = u32::try_from(timeframe.millis() / Timeframe::M1.millis()).unwrap();
+            assert_eq!(
+                definition.warm_up,
+                WarmUp::Samples(minutes),
+                "{timeframe:?}"
+            );
+        }
+        let book = [
+            &BOOK_L2_V1,
+            &BOOK_DEPTH_V1,
+            &BOOK_CLUSTERS_V1,
+            &BOOK_LIQUIDITY_WINDOW_5M_V1,
+            &BOOK_LIQUIDITY_WINDOW_15M_V1,
+            &BOOK_LIQUIDITY_WINDOW_1H_V1,
+        ];
+        for definition in book {
+            assert!(definition.key.id.as_str().starts_with("book."));
+            assert_eq!(definition.key.version.get(), 1);
+            assert!(CURRENT.contains(&definition.key), "{}", definition.key);
+        }
+    }
+
+    #[test]
     fn current_set_version_is_pinned() {
         // The feature-set version every experiment records (ADR-029). It may
         // change only when CURRENT does — any other change here means a
@@ -1667,6 +1987,8 @@ mod tests {
             "bars.motion.15m@1,bars.motion.1d@1,bars.motion.1h@1,bars.motion.1m@1,\
              bars.motion.4h@1,bars.motion.5m@1,bars.time.15m@1,bars.time.1d@1,\
              bars.time.1h@1,bars.time.1m@1,bars.time.4h@1,bars.time.5m@1,\
+             book.clusters@1,book.depth@1,book.l2@1,book.liquidity.window.15m@1,\
+             book.liquidity.window.1h@1,book.liquidity.window.5m@1,\
              derivatives.funding.settled@1,derivatives.liq.window.15m@1,\
              derivatives.liq.window.1h@1,derivatives.liq.window.5m@1,\
              derivatives.mark@1,derivatives.oi.5m@1,derivatives.oi.sample@1,\
@@ -1678,6 +2000,6 @@ mod tests {
              structure.swing.1h@1,structure.swing.4h@1,trade.last_price@1,\
              volatility.atr.1h@1,volatility.regime.1h@1"
         );
-        assert_eq!(set.version().to_string(), "95352aa75cb005e3");
+        assert_eq!(set.version().to_string(), "e7c6601562a8c62d");
     }
 }

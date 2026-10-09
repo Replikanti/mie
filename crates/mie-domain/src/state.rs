@@ -10,10 +10,11 @@
 //! [`profile`]), the market structure: swings, structural levels,
 //! sweeps and SFPs on 15m, 1h, 4h and 1d (ADR-037, [`structure`]), and the
 //! derivatives context: open interest, mark price and funding, and
-//! liquidation windows (ADR-042, [`derivatives`]); every other kind passes
-//! through. Further feature families (order book) are added by the Market
-//! State issues, each as a registered, versioned definition (ADR-029,
-//! [`feature`]).
+//! liquidation windows (ADR-042, [`derivatives`]), and the order book: the
+//! L2 book itself, banded depth and imbalance, liquidity flow windows and
+//! concentration (ADR-043, [`liquidity`]); every other kind passes through.
+//! Further feature families are added by the Market State issues, each as a
+//! registered, versioned definition (ADR-029, [`feature`]).
 //! The engine computes one [`FeatureSet`] and stamps its
 //! [`FeatureSetVersion`] on every state; each feature value carries its
 //! validity ([`FeatureValue`]).
@@ -22,6 +23,7 @@
 //! [`derivatives`]: crate::derivatives
 //! [`feature`]: crate::feature
 //! [`flow`]: crate::flow
+//! [`liquidity`]: crate::liquidity
 //! [`profile`]: crate::profile
 //! [`structure`]: crate::structure
 //! [`volatility`]: crate::volatility
@@ -31,6 +33,7 @@ use crate::derivatives::{Derivatives, DerivativesError, DerivativesTracker};
 use crate::event::{MarketEvent, Stream};
 use crate::feature::{FeatureSet, FeatureSetVersion, FeatureValue, catalog};
 use crate::flow::{FlowError, FlowTracker, OrderFlow};
+use crate::liquidity::{BookState, LiquidityError, LiquidityTracker};
 use crate::num::Price;
 use crate::order::CanonicalKey;
 use crate::profile::{ProfileError, ProfileTracker, VolumeProfiles};
@@ -97,6 +100,14 @@ pub struct MarketState {
     /// by side over closed minutes. The liquidation values are a lower
     /// bound: the exchange stream is throttled.
     pub derivatives: Derivatives,
+    /// The order book (ADR-043): `book.l2@1`, the L2 book itself, hashed
+    /// whole; `book.depth@1`, best levels and depth within 1, 2 and 5 bps
+    /// of mid; `book.clusters@1`, the largest levels per side within 5 bps;
+    /// and `book.liquidity.window.<5m|15m|1h>@1`
+    /// ([`catalog::BOOK_LIQUIDITY_WINDOWS`]), liquidity added, cancelled and
+    /// filled per side and band over closed minutes. Live only: archive
+    /// replays have no book and keep every value warming up.
+    pub book: BookState,
     /// Number of trades consumed. A diagnostic counter, not a feature: it
     /// depends on where consumption started, so it is not reproducible
     /// across replay windows.
@@ -140,6 +151,8 @@ pub struct MarketStateEngine {
     /// The last open-interest sample and grid boundary, and the liquidation
     /// minutes.
     derivatives: DerivativesTracker,
+    /// The order-book flow minutes and pending fills.
+    liquidity: LiquidityTracker,
 }
 
 /// Volatility state after the bars an event closed, committed with them.
@@ -249,6 +262,7 @@ impl MarketStateEngine {
             profile: VolumeProfiles::new(),
             structure: StructureSet::new(),
             derivatives: derivatives.derivatives(),
+            book: BookState::new(),
             trade_count: 0,
         };
         Self {
@@ -266,6 +280,7 @@ impl MarketStateEngine {
             structure_events: Vec::new(),
             structure_pending: Vec::new(),
             derivatives,
+            liquidity: LiquidityTracker::new(),
         }
     }
 
@@ -290,9 +305,9 @@ impl MarketStateEngine {
     /// - [`StateError::Overflow`] if a bar's time or quantity arithmetic, a
     ///   closed bar's true range, change or range, an order-flow sum (CVD,
     ///   window), a volume-profile sum (bin, total, composite), a
-    ///   structure count (touches, window bars) or a derivatives value
-    ///   (liquidation sum or count, ΔOI, time difference) leaves its integer
-    ///   range;
+    ///   structure count (touches, window bars), a derivatives value
+    ///   (liquidation sum or count, ΔOI, time difference) or an order-book
+    ///   liquidity value (flow sum, pending fill) leaves its integer range;
     /// - [`StateError::TimeJump`] if it would close more than
     ///   [`MAX_BARS_PER_EVENT`] bars of one timeframe. Recovery: the replay
     ///   or session stops; restart it from a fresh engine after the jump.
@@ -391,6 +406,15 @@ impl MarketStateEngine {
                 });
             }
         };
+        let liquidity = match self.liquidity.step(event, &self.pending, &self.state.book) {
+            Ok(liquidity) => liquidity,
+            Err(LiquidityError::Overflow) => {
+                self.pending.clear();
+                return Err(StateError::Overflow {
+                    event: event.canonical_key(),
+                });
+            }
+        };
 
         match event {
             MarketEvent::Trade(trade) => {
@@ -431,6 +455,8 @@ impl MarketStateEngine {
         std::mem::swap(&mut self.structure_events, &mut self.structure_pending);
         self.derivatives.commit(derivatives);
         self.state.derivatives = self.derivatives.derivatives();
+        self.liquidity
+            .commit(liquidity, event, &mut self.state.book);
         self.state.as_of = Some(event.time());
         self.last = Some(event.clone());
         self.ids = ids;
@@ -521,8 +547,9 @@ pub enum StateError {
     },
     /// The event would push a bar's time or quantity arithmetic, a
     /// volatility value, an order-flow sum, a volume-profile sum, a
-    /// structure count or a derivatives value out of its integer range
-    /// (ADR-027, ADR-031, ADR-033, ADR-035, ADR-036, ADR-037, ADR-042).
+    /// structure count, a derivatives value or an order-book liquidity
+    /// value out of its integer range (ADR-027, ADR-031, ADR-033, ADR-035,
+    /// ADR-036, ADR-037, ADR-042, ADR-043).
     Overflow {
         /// Key of the rejected event.
         event: CanonicalKey,
@@ -567,7 +594,8 @@ impl fmt::Display for StateError {
                 write!(
                     f,
                     "event ({event}) overflows the bar, volatility, order-flow, \
-                     volume-profile, structure or derivatives arithmetic"
+                     volume-profile, structure, derivatives or order-book liquidity \
+                     arithmetic"
                 )
             }
             Self::TimeJump {
@@ -669,6 +697,7 @@ mod tests {
                 profile: VolumeProfiles::new(),
                 structure: StructureSet::new(),
                 derivatives: Derivatives::new(),
+                book: BookState::new(),
                 trade_count: 3,
             }
         );
@@ -868,6 +897,8 @@ mod tests {
             "bars.motion.15m@1,bars.motion.1d@1,bars.motion.1h@1,bars.motion.1m@1,\
              bars.motion.4h@1,bars.motion.5m@1,bars.time.15m@1,bars.time.1d@1,\
              bars.time.1h@1,bars.time.1m@1,bars.time.4h@1,bars.time.5m@1,\
+             book.clusters@1,book.depth@1,book.l2@1,book.liquidity.window.15m@1,\
+             book.liquidity.window.1h@1,book.liquidity.window.5m@1,\
              derivatives.funding.settled@1,derivatives.liq.window.15m@1,\
              derivatives.liq.window.1h@1,derivatives.liq.window.5m@1,\
              derivatives.mark@1,derivatives.oi.5m@1,derivatives.oi.sample@1,\
@@ -1247,6 +1278,108 @@ mod tests {
         }
     }
 
+    /// A synced book: bids 63542.00/63541.90 and asks 63542.10/63542.20,
+    /// last update id 100, at 1 000 ms.
+    fn book_snapshot(millis: i64) -> MarketEvent {
+        let level = |price: i64, qty: i64| crate::event::Level {
+            price: Price::from_units(price),
+            qty: Qty::from_units(qty),
+        };
+        MarketEvent::BookSnapshot(crate::event::BookSnapshot {
+            time: t(millis),
+            last_update_id: 100,
+            bids: vec![
+                level(6_354_200_000_000, 300_000_000),
+                level(6_354_190_000_000, 100_000_000),
+            ],
+            asks: vec![
+                level(6_354_210_000_000, 120_000_000),
+                level(6_354_220_000_000, 80_000_000),
+            ],
+        })
+    }
+
+    /// An update setting the best bid to `qty_units`.
+    fn book_update(millis: i64, first: u64, last: u64, prev: u64, qty_units: i64) -> MarketEvent {
+        MarketEvent::BookUpdate(crate::event::BookUpdate {
+            time: t(millis),
+            first_update_id: first,
+            last_update_id: last,
+            prev_update_id: prev,
+            bids: vec![crate::event::Level {
+                price: Price::from_units(6_354_200_000_000),
+                qty: Qty::from_units(qty_units),
+            }],
+            asks: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn rejects_an_event_that_overflows_a_liquidity_sum() {
+        // Two updates in one minute raise a bid each to i64::MAX units: the
+        // minute's added bid liquidity overflows on the second one.
+        let raise = |millis: i64, first: u64, last: u64, prev: u64, price: i64| {
+            MarketEvent::BookUpdate(crate::event::BookUpdate {
+                time: t(millis),
+                first_update_id: first,
+                last_update_id: last,
+                prev_update_id: prev,
+                bids: vec![crate::event::Level {
+                    price: Price::from_units(price),
+                    qty: Qty::from_units(i64::MAX),
+                }],
+                asks: Vec::new(),
+            })
+        };
+        let mut engine = engine_after(&[
+            book_snapshot(1_000),
+            raise(1_100, 95, 105, 0, 6_354_200_000_000),
+        ]);
+        assert!(engine.state().book.l2.is_ready());
+        let before = engine.state().clone();
+        let closed_before = engine.closed_bars().to_vec();
+        let overflow = raise(1_200, 106, 110, 105, 6_354_190_000_000);
+        assert_eq!(
+            engine.apply(&overflow),
+            Err(StateError::Overflow {
+                event: overflow.canonical_key()
+            })
+        );
+        // The state, the book with it, and the closed bars are unchanged.
+        assert_eq!(engine.state(), &before);
+        assert_eq!(engine.state().book, before.book);
+        assert_eq!(engine.closed_bars(), closed_before);
+        // The ordering bound did not move: the book takes the next update
+        // in the chain.
+        engine
+            .apply(&book_update(1_200, 106, 110, 105, 200_000_000))
+            .unwrap();
+        assert_ne!(engine.state().book, before.book);
+    }
+
+    #[test]
+    fn other_streams_leave_the_book_unchanged() {
+        let mut engine = engine_after(&[
+            book_snapshot(1_000),
+            book_update(1_100, 95, 105, 0, 250_000_000),
+        ]);
+        let book = engine.state().book.clone();
+        assert!(book.l2.is_ready());
+        assert!(book.depth.is_ready());
+        assert!(book.clusters.is_ready());
+        for event in [
+            mark(2_000, 1),
+            crate::event::samples::liquidation(2_001, 10_000_000),
+            crate::event::samples::open_interest(2_002, 10_000),
+            crate::event::samples::settlement(2_003, 10_000),
+            kline(-57_997, 2_003),
+            gap(Stream::MarkPrice, 2_000, 2_004, GapReason::Disconnected),
+        ] {
+            engine.apply(&event).unwrap();
+            assert_eq!(engine.state().book, book, "{event:?}");
+        }
+    }
+
     #[test]
     fn rejects_an_earlier_time() {
         let last = trade(2_000, 1);
@@ -1593,7 +1726,7 @@ mod tests {
         assert_eq!(
             StateError::Overflow { event }.to_string(),
             "event (1999ms Trade seq 2) overflows the bar, volatility, order-flow, \
-             volume-profile, structure or derivatives arithmetic"
+             volume-profile, structure, derivatives or order-book liquidity arithmetic"
         );
         assert_eq!(
             StateError::TimeJump {

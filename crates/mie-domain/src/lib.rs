@@ -18,6 +18,7 @@
 //! | Market State hash (ADR-041)               | [`state_hash`]               |
 //! | Event-time bars (ADR-031)                 | [`bars`]                     |
 //! | L2 order book (ADR-038)                   | [`book`]                     |
+//! | Order-book liquidity state (ADR-043)      | [`liquidity`]                |
 //! | Feature identity and versioning (ADR-029) | [`feature`], [`fingerprint`] |
 //! | Motion, ATR and regime (ADR-033)          | [`volatility`]               |
 //! | Order flow / aggression (ADR-035)         | [`flow`]                     |
@@ -41,6 +42,7 @@ pub mod event_hash;
 pub mod feature;
 pub mod fingerprint;
 pub mod flow;
+pub mod liquidity;
 pub mod location;
 pub mod num;
 pub mod order;
