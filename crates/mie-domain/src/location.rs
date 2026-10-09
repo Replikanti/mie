@@ -65,9 +65,9 @@ use std::fmt;
 
 /// The location tolerance `w` in basis points of the level's price: the
 /// edge bands of the auction classifier and the padding of a monitored
-/// zone (ADR-044, decision 3). Parameter `tolerance` = 0.0005 of
+/// zone (ADR-044, decision 3). Parameter `tolerance` = 0.0006 of
 /// `location.levels@1` and `location.auction.prior_day@1`.
-pub const TOLERANCE_BPS: i64 = 5;
+pub const TOLERANCE_BPS: i64 = 6;
 
 /// Whether `gap` (in `1e-8` USDT; negative means overlap) is at most
 /// `tolerance_bps` basis points of `reference`: `gap · 10 000 ≤ |reference|

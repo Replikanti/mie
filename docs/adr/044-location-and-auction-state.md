@@ -60,27 +60,61 @@ of #12, 2025-10-01 … 2026-09-30 (`docs/data-availability.md`).
     Per half of the window, the share caught by 60 closes is 81 % and
     77 %; at `w` = 8 it drops to 72 % (68 % on the second half).
 - **M1–M4, exact** — the measurement tool
-  `crates/mie-cli/tests/location_measure.rs` replays aggTrades through the
-  engine and runs the exact classifier:
-  - M1: the 1m `|Δclose|` quantiles from the engine's bars, per half;
-  - M2: the M0b table from the exact `location.auction.prior_day@1` logic,
-    acceptance off, for `w` ∈ {3, 5, 8}, per half;
-  - M3: the registry size per kind and the zone events per day by cause;
-  - M4: the share of closes in each `AuctionState` per half, and the
-    transitions per day.
+  `crates/mie-cli/tests/location_measure.rs` replays the window's aggTrades
+  through the engine and runs the exact classifier; the halves split at
+  2026-04-01 12:00 UTC. Full-year run on the capture host, with `w` = 5 (the
+  value before the D3 fixing rule): 603 218 226 events, 0 domain
+  rejections, wall time 1 155.6 s (19.3 min). The #11 replay of the same
+  window took 20.5 min over the default archive streams; this run reads
+  aggTrades only and adds the location stage, so the two bound each other
+  rather than compare like for like.
+  - **M1, the 1m close-to-close move** `|Δclose|` from the engine's bars, in
+    bps (p50 / p75 / p90 / p95 / p99):
 
-  **Pending: the full-year run before merge records its output here.** Its
-  rules decide whether a constant changes: `w` = the first-half M1 p75
-  rounded to whole bps (D3); `N_acc` per D9; and every `AuctionState` must
-  occur in each half (M4) — a state that never occurs in six months of BTC
-  cannot be researched, so its absence is a definition bug, fixed before
-  merge. Constants change only before merge, because the lock lines are
-  published at merge. A 7-day
-  smoke (2025-10-01 … 10-07) checked the tool end to end: every
-  `AuctionState` occurred in each half, the engine and the tool's
-  classifier agreed on every close, the registry held p50 88 / p99 202
-  levels, and the week replayed in 18.7 s. Seven days are too few to fix
-  any number.
+    | | n | p50 | p75 | p90 | p95 | p99 |
+    |---|---|---|---|---|---|---|
+    | First half | 262 799 | 2.93 | 5.93 | 10.35 | 14.28 | 25.86 |
+    | Second half | 262 799 | 2.25 | 4.51 | 7.74 | 10.67 | 19.36 |
+    | Whole window | 525 598 | 2.56 | 5.18 | 9.08 | 12.58 | 23.04 |
+
+    At `w` = 5, 4.59 % (first half) and 5.83 % (second half) of closes fall
+    in the edge bands. Prior-day value-area width: p10 67.9 bps, p50 153.8,
+    p90 352.1, narrowest 19.1 (364 days). 116 of 364 days open beyond an
+    edge band.
+  - **M2, breakouts** (probes out of prior-day value, acceptance off), first
+    half / second half:
+
+    | `w` | Breakouts | Failed the same day | Hazard, closes 1–5 | Hazard 45–59 | Caught by 30 | Caught by 60 | Caught by 120 | Held 60, then returned |
+    |---|---|---|---|---|---|---|---|---|
+    | 3 | 884 / 801 | 83.4 / 81.0 % | 11.8, 8.8, 7.5, 7.8, 5.6 / 9.9, 7.9, 7.7, 6.4, 4.3 % | 0.78 / 0.72 % | 75.0 / 72.0 % | 85.1 / 82.4 % | 91.2 / 88.4 % | 55.3 / 54.8 % |
+    | 5 | 700 / 618 | 80.6 / 77.5 % | 7.9, 6.3, 4.2, 6.5, 4.6 / 5.0, 5.3, 6.1, 4.5, 3.1 % | 0.86 / 0.53 % | 68.4 / 64.3 % | 81.2 / 77.5 % | 88.3 / 84.6 % | 54.6 / 52.9 % |
+    | 8 | 541 / 484 | 77.3 / 74.6 % | 4.4, 3.5, 5.1, 5.6, 2.3 / 2.9, 3.2, 4.4, 2.3, 2.1 % | 0.80 / 0.48 % | 61.2 / 56.2 % | 75.8 / 71.2 % | 84.9 / 80.1 % | 53.7 / 51.7 % |
+
+    At `w` = 5 the hazard falls on to 0.45 % at closes 60–89 and 0.07 % at
+    180–359 (first half). The exact counts are lower than M0b's (1 318 at
+    `w` = 5 against 1 689): the exact value area and closes differ from the
+    probe's approximation.
+  - **M3, the registry** at `w` = 5: p50 / p99 levels per closed minute — POC,
+    VAL, VAH 2/2 each, HVN 21/71, LVN 19/69, structural highs 48/69, lows
+    29/61, prior sweeps 80/86, SFP zones 51/63, VWAP 1/1, clusters 0/0
+    (archive), all 254/342. Zone events per day: 1 380.0 arrived, 33.1
+    created, 1 400.1 departed, 12.9 retired.
+  - **M4, auction states** at `w` = 5, `N_acc` = 60 (first half / second
+    half, share of closes): inside value 38.4 / 36.2 %, at value edge 1.7 /
+    2.2 %, outside value 15.6 / 16.0 %, breakout 6.9 / 6.7 %, failed breakout
+    4.6 / 4.4 %, failed reclaim 2.9 / 3.0 %, acceptance 30.0 / 31.5 %. Every
+    state occurs in each half; 24.0 / 23.6 transitions a day; the engine and
+    the tool's classifier agreed on every close.
+
+  The fixing rules decide whether a constant changes: `w` = the first-half
+  M1 p75 rounded to whole bps (D3); `N_acc` per D9; and every
+  `AuctionState` must occur in each half (M4) — a state that never occurs in
+  six months of BTC cannot be researched, so its absence is a definition
+  bug, fixed before merge. Constants change only before merge, because the
+  lock lines are published at merge. The first-half p75 is 5.93 bps, so
+  **`w` changed from 5 to 6** under the D3 rule. **Pending:** the re-run
+  with `w` = 6 (M2 at `w` = 6 next to 3, 5 and 8; M3 and M4 at the fixed
+  `w`) is recorded here, and D9 is re-checked on its first-half table.
 
 ## Decision
 
@@ -112,24 +146,36 @@ of #12, 2025-10-01 … 2026-09-30 (`docs/data-availability.md`).
    - *Rejected:* stepping location on copies like the other families.
      `book.clusters@1` exists only after the liquidity commit, so location
      would have to duplicate every commit.
-3. **Location tolerance `w` = 5 bps of the level price.** Exact:
-   `|p − L| · 10 000 ≤ |L| · 5`, in `i128`. One tolerance serves D5–D8.
-   - *Why 5:* about the p75 of the 1m close-to-close move (5.18 bps, M0a). A
-     probe starts beyond the edge band and fails beyond its other side, a gap
-     of `2w` = 10 bps; fewer than 10 % of minutes move that far (p90 9.08
-     bps), so a probe rarely starts and fails within one minute.
-   - *At `w` = 3 (≈ p50):* breakout episodes rise 31 % (2 210 against
-     1 689) and the first-close failure hazard nearly doubles (11.3 %
-     against 6.1 %, M0b) — whipsaw pairs.
+3. **Location tolerance `w` = 6 bps of the level price.** Exact:
+   `|p − L| · 10 000 ≤ |L| · 6`, in `i128`. One tolerance serves D5–D8.
+   - *Fixing rule, pre-registered:* `w` = the first-half p75 of the exact
+     1m close-to-close move (M1), rounded to whole bps. The first half fixes
+     the number so that the second half stays a check rather than a source.
+     The first-half p75 is 5.93 bps, so `w` = 6. The plan-time value was 5
+     (M0a whole-window p75 5.18; the exact whole-window p75 is the same,
+     5.18).
+   - *Why the p75:* a probe starts beyond one side of an edge band and fails
+     beyond its other side, a gap of `2w` = 12 bps. In the first half 10.35
+     bps is the p90 and 14.28 the p95 (M1), so fewer than 10 % of minutes
+     move that far and a probe rarely starts and fails within one minute.
+     At `w` = 5 the gap of 10 bps lies below the first-half p90: more than
+     10 % of those minutes could start and fail a probe at once.
+   - *At `w` = 3 (≈ p50):* breakouts rise 26–30 % against `w` = 5 (884
+     against 700 in the first half, 801 against 618 in the second) and the
+     first-close hazard rises to 11.8 % against 7.9 % (first half, M2) —
+     whipsaw pairs.
    - *At `w` = 8:* the two edge bands (`2 × 2w` = 32 bps) cover about half of
-     a p10-wide value area (67 bps, M0a), and the failures caught by 60
-     closes drop to 72 % (68 % on the second half, M0b).
+     a p10-wide value area (67.9 bps, M1), and the failures caught by 60
+     closes drop to 75.8 % (71.2 % on the second half, M2). At `w` = 6 the
+     bands cover 24 bps, about a third.
+   - *Second half:* its p75 is 4.51 bps (M1); the market was calmer. One
+     constant serves both halves by design (ADR-013: no regime-dependent
+     tolerance until one is measured to help), and the re-run reports M2 at
+     `w` = 6 for both halves.
    - *One tolerance:* it keeps `AtValueEdge` inside the VAH/VAL monitored
      zone, so "entered a monitored VAH zone" agrees with the classifier, and
-     it adds no parameter nobody measured. The 5 bps of ADR-037 and ADR-043
-     is a coincidence, not the reason.
-   - *Fixing rule:* `w` = the exact first-half p75 of M1, rounded to whole
-     bps. Parameter `tolerance` = 0.0005 (`Rate`).
+     it adds no parameter nobody measured.
+   - Parameter `tolerance` = 0.0006 (`Rate`).
 4. **VWAP `location.vwap.utc_day@1`.**
    - `Σ(price · qty) / Σqty` over the trades of the current UTC day's closed
      minutes; the developing minute is excluded, as in the developing
@@ -223,25 +269,28 @@ of #12, 2025-10-01 … 2026-09-30 (`docs/data-availability.md`).
    - The classifier resets at each new prior-day publication. It is
      `Unavailable(InputInvalid)` while the prior day is unavailable or
      `VAH − VAL` is at most both edge bands (no In region); that never
-     happened in the probe year (narrowest value area 19 bps against 10 bps
-     of bands, M0a).
+     happened in the window (narrowest value area 19.1 bps against 12 bps of
+     bands at `w` = 6, M1).
    - *Why time, not volume:* a volume share needs a denominator (the
      session? the reference day?) that swings with time-of-day activity.
      Volume can come in a `@2`, with a measurement, if #31 asks for it.
-9. **`N_acc` = 60 closes (1 h).** The probe shows no knee: the hazard per
-   close falls smoothly, from 5.6–7.4 % over the first five closes to 0.88 %
-   at 45–60, 0.49 % at 60–90 and about 0.15 % from 180 on (M0b).
-   - *At 60:* 79 % of same-day failures are already labelled
-     `FailedBreakout` (81 % and 77 % per half), and the hazard is an order of
-     magnitude below the first closes.
-   - *At 30:* about a third of failures (34 %) would be labelled
-     `Acceptance` first.
-   - *At 120:* 8 more points of failures are caught, but every `Acceptance`
-     label waits 2 h.
-   - *Stated limit:* 61 % of breakouts that held 60 closes still return
-     inside prior-day value the same day. Acceptance is descriptive ("held for
-     an hour"), not predictive; whether it predicts anything is for #26/#31
-     to measure, and confirmation depth is a research variable (ADR-015).
+9. **`N_acc` = 60 closes (1 h).** The hazard per counted close shows no
+   knee: it falls smoothly from 4.2–7.9 % over the first five closes to
+   0.86 % at closes 45–59, 0.45 % at 60–89 and below 0.1 % from 180 on (M2,
+   `w` = 5, first half; M0b showed the same shape).
+   - *At 60:* 81.2 % of same-day failures are already labelled
+     `FailedBreakout` (77.5 % in the second half), and the hazard is 5–9×
+     below each of the first five closes — the ratio M0b's 0.88 % against
+     5.6–7.4 % had at plan time.
+   - *At 30:* 31.6 % of failures would be labelled `Acceptance` first (68.4
+     % caught).
+   - *At 120:* 7 more points of failures are caught (88.3 %), but every
+     `Acceptance` label waits 2 h.
+   - *Stated limit:* 54.6 % of breakouts that held 60 closes still return
+     inside prior-day value the same day (M2). Acceptance is descriptive
+     ("held for an hour"), not predictive; whether it predicts anything is
+     for #26/#31 to measure, and confirmation depth is a research variable
+     (ADR-015).
    - The Market Profile convention of two 30-minute periods agrees with 60;
      corroboration only, not the reason.
    - Failure labels last the same `N_acc`: the evidence that would have
@@ -249,17 +298,18 @@ of #12, 2025-10-01 … 2026-09-30 (`docs/data-availability.md`).
      parameter.
    - *Fixing rule:* `N_acc` stays 60 unless the exact first-half table (M2)
      contradicts either reason — about four in five same-day failures caught
-     by 60 closes, and a hazard an order of magnitude below the first
-     closes. If it does, the change stops and is reported on #23; no other
-     value is picked silently.
+     by 60 closes, and a hazard at 45–59 well below (about 5× or more) the
+     first closes. If it does, the change stops and is reported on #23; no
+     other value is picked silently. The `w` = 5 table supports 60; the
+     re-check on the `w` = 6 re-run is pending (*Measurements*).
 10. **Features** (the ids are permanent; `location` joins the families of
     "Adding a feature").
 
     | Feature | Parameters | Inputs | Warm-up |
     |---|---|---|---|
     | `location.vwap.utc_day@1` | `rounding` `floor`, `session_ms` 86 400 000 | trades, `bars.time.1m@1` | `Samples(1)` |
-    | `location.levels@1` | `confluence_rule` `other_source_within_tolerance`, `tolerance` 0.0005, `zone_rule` `bar_range_overlap` | the eight D5 sources, `bars.time.1m@1` | `Samples(1)`: a closed 1m bar with trades |
-    | `location.auction.prior_day@1` | `acceptance_closes` 60, `tolerance` 0.0005 | `profile.volume.prior_day@1`, `bars.time.1m@1` | `Samples(1)`: a closed 1m bar with trades under a ready reference |
+    | `location.levels@1` | `confluence_rule` `other_source_within_tolerance`, `tolerance` 0.0006, `zone_rule` `bar_range_overlap` | the eight D5 sources, `bars.time.1m@1` | `Samples(1)`: a closed 1m bar with trades |
+    | `location.auction.prior_day@1` | `acceptance_closes` 60, `tolerance` 0.0006 | `profile.volume.prior_day@1`, `bars.time.1m@1` | `Samples(1)`: a closed 1m bar with trades under a ready reference |
 
     The classifier is a separate id so that recalibrating `N_acc` re-versions
     only the classifier (ADR-037 D10 reasoning). `MarketState.location` is
@@ -272,13 +322,14 @@ of #12, 2025-10-01 … 2026-09-30 (`docs/data-availability.md`).
 - Each closed minute rebuilds the registry: `O(n log n)` over its levels
   (a few hundred: every structure registry holds at most 20 active highs,
   20 active lows and 20 resolved sweeps plus pending sweeps and SFP zones
-  per timeframe, ADR-037 D5), plus two `i128` additions per trade for the
-  VWAP. The full-year run reports the wall time against the #11 replay
-  (20.5 min on the capture host).
-- Zone events are many — the 7-day smoke saw about 730 arrivals a day — so
-  #25 (episodes, cooldowns) and #38 (alert rate limits) consume them, not
-  egress directly. The Created/Retired causes and the unmonitored clusters
-  bound them; the full-year M3 numbers go here.
+  per timeframe, ADR-037 D5; p50 254 and p99 342 in the window, M3), plus
+  two `i128` additions per trade for the VWAP. The full year replays in
+  19.3 min with location against 20.5 min for the #11 replay (M1–M4 note on
+  comparability).
+- Zone events are many — about 1 380 arrivals and 1 400 departures a day
+  at `w` = 5 (M3) — so #25 (episodes, cooldowns) and #38 (alert rate limits)
+  consume them, not egress directly. The Created/Retired causes (about 46 a
+  day) and the unmonitored clusters bound them.
 - Archive registries hold no cluster levels (ADR-043: live only).
 - Location emits facts only — no bias, no direction, no trigger (ADR-012).
   The trigger rules for failed auction, breakout with acceptance and failed

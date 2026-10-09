@@ -9,7 +9,7 @@
 //!   minimum); the days whose first close lies beyond an edge band.
 //! - **M2**, the breakout table from the exact `location.auction.prior_day@1`
 //!   classifier ([`AuctionClassifier`]) with acceptance switched off, for
-//!   `w` ∈ {3, 5, 8} bps, per half: breakouts (probes out of value) and how
+//!   `w` ∈ {3, 5, 6, 8} bps, per half: breakouts (probes out of value) and how
 //!   they ended — failed (a close back in value, the same UTC day: the
 //!   classifier resets at each prior day), survived to the day's end, or
 //!   retargeted; the failure hazard per counted close over intervals from 1
@@ -19,9 +19,9 @@
 //!   failed ("held, then returned").
 //! - **M3**, the `location.levels@1` registry size per kind (p50, p99 over
 //!   closed minutes) and the zone events per day by cause.
-//! - **M4**, the share of closes in each `AuctionState` per half, at the
-//!   engine's constants (cross-checked against the engine's own state), and
-//!   the state transitions per day.
+//! - **M4**, the share of closes in each `AuctionState` per half at the
+//!   engine's fixed `w` and `N_acc` (cross-checked against the engine's own
+//!   state), and the state transitions per day.
 //! - The replay's wall time, events and domain rejections.
 //!
 //! Run it with
@@ -48,7 +48,7 @@ use std::time::Instant;
 const DAY_MS: i64 = 86_400_000;
 
 /// The tolerances M2 compares, in bps.
-const TOLERANCES: [i64; 3] = [3, 5, 8];
+const TOLERANCES: [i64; 4] = [3, 5, 6, 8];
 
 /// The `N` rows of the M2 table.
 const ROWS: [u32; 14] = [1, 2, 3, 5, 10, 15, 30, 45, 60, 90, 120, 180, 240, 360];

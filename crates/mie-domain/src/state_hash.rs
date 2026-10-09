@@ -236,11 +236,11 @@ mod tests {
         // docs).
         assert_eq!(
             MarketStateEngine::new().state().state_hash().to_string(),
-            "07d751789d32107b"
+            "cc347065b37129d0"
         );
         assert_eq!(
             engine_after(&tape()).state().state_hash().to_string(),
-            "eb546bdf353a938e"
+            "a4468a96437546b7"
         );
     }
 
