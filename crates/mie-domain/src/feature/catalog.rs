@@ -1115,7 +1115,8 @@ pub const DERIVATIVES_LIQ_WINDOW_1H_V1: FeatureDefinition = liq_window_v1(
 );
 
 /// The liquidation window of each length, shortest first; the Market State
-/// builds its liquidation windows from it. The timeframe is the window length, not a bar series.
+/// builds its [`LiquidationWindows`](crate::derivatives::LiquidationWindows)
+/// from it. The timeframe is the window length, not a bar series.
 pub const LIQ_WINDOWS: [(Timeframe, &FeatureDefinition); 3] = [
     (Timeframe::M5, &DERIVATIVES_LIQ_WINDOW_5M_V1),
     (Timeframe::M15, &DERIVATIVES_LIQ_WINDOW_15M_V1),
