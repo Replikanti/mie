@@ -7,7 +7,7 @@ use mie_cli::config::IngestConfig;
 use mie_cli::ingest::Transports;
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -379,4 +379,96 @@ pub fn ingest_depth(
 ) -> mie_cli::ingest::IngestOutcome {
     let (transports, shutdown) = depth_transports(start_ms, connections, snapshots, open_interest);
     mie_cli::ingest::run(config, transports, shutdown).expect("ingest starts")
+}
+
+/// A clock that the threads named in `drivers` advance by sleeping; other
+/// threads' sleeps are short real sleeps. The open-interest poller drives
+/// the poll cadence and the trade stream its own reconnect backoff, so
+/// neither waits for the other.
+pub struct DrivenClock {
+    pub utc_ns: Mutex<i64>,
+    pub drivers: [&'static str; 2],
+}
+
+impl Clock for DrivenClock {
+    fn now_utc_ns(&self) -> i64 {
+        *self.utc_ns.lock().unwrap()
+    }
+
+    fn monotonic_ns(&self) -> u64 {
+        *self.utc_ns.lock().unwrap() as u64
+    }
+
+    fn sleep(&self, d: Duration) {
+        let name = std::thread::current().name().map(str::to_owned);
+        if name.is_some_and(|n| self.drivers.contains(&n.as_str())) {
+            *self.utc_ns.lock().unwrap() += d.as_nanos() as i64;
+        } else {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
+/// Scripted WebSocket connections per stream path. A connection whose
+/// frames are spent closes while another one is scripted (a reconnect),
+/// otherwise it idles; `pending` counts the paths not yet spent. The path
+/// `last_path` sends only once every other path is spent, so the arrival
+/// order across streams — and with it what the hold-back makes late — is
+/// fixed.
+pub struct Connections {
+    pub scripts: Mutex<BTreeMap<String, VecDeque<Vec<String>>>>,
+    pub pending: Arc<AtomicUsize>,
+    pub last_path: String,
+}
+
+impl WsConnector for Connections {
+    fn connect(&self, url: &str) -> Result<Box<dyn WsConnection>, String> {
+        let path = url.rsplit('/').next().unwrap_or_default().to_owned();
+        let mut scripts = self.scripts.lock().unwrap();
+        let queue = scripts.get_mut(&path).ok_or("unscripted path")?;
+        let frames = queue.pop_front().ok_or("script exhausted")?;
+        Ok(Box::new(Connection {
+            frames: frames.into(),
+            last: queue.is_empty(),
+            spent: false,
+            waits: path == self.last_path,
+            pending: Arc::clone(&self.pending),
+        }))
+    }
+}
+
+struct Connection {
+    frames: VecDeque<String>,
+    last: bool,
+    spent: bool,
+    waits: bool,
+    pending: Arc<AtomicUsize>,
+}
+
+impl WsConnection for Connection {
+    fn read(&mut self) -> ReadOutcome {
+        if self.waits && self.pending.load(Ordering::SeqCst) > 1 {
+            std::thread::sleep(Duration::from_millis(1));
+            return ReadOutcome::Control;
+        }
+        if let Some(frame) = self.frames.pop_front() {
+            return ReadOutcome::Frame(frame.into_bytes());
+        }
+        if !self.last {
+            return ReadOutcome::Closed("scripted reconnect".to_owned());
+        }
+        // The previous frame was handed to the capture before this read.
+        if !self.spent {
+            self.spent = true;
+            self.pending.fetch_sub(1, Ordering::SeqCst);
+        }
+        std::thread::sleep(Duration::from_millis(1));
+        ReadOutcome::Control
+    }
+
+    fn ping(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn close(&mut self) {}
 }

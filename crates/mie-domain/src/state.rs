@@ -38,6 +38,11 @@ use std::cmp::Ordering;
 use std::fmt;
 
 /// The market as known after the last consumed event.
+///
+/// [`MarketState::state_hash`] identifies it across processes, so live and
+/// replay states can be compared (ADR-041, [`state_hash`]).
+///
+/// [`state_hash`]: crate::state_hash
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MarketState {
     /// Version of the feature set this state was computed with (ADR-029);

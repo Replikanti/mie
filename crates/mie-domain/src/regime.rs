@@ -7,6 +7,8 @@
 //! `volatility.regime.1h@1` feature in [`volatility`](crate::volatility).
 
 use crate::feature::FeatureKey;
+use crate::fingerprint::Fingerprinter;
+use crate::state_hash::StateEncode;
 use std::fmt;
 
 /// ATR percentile on the canonical 0–100 scale (ADR-017).
@@ -16,6 +18,14 @@ use std::fmt;
 /// the result and maps it to its canonical label.
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
 pub struct AtrPercentile(f64);
+
+impl StateEncode for AtrPercentile {
+    /// The bit pattern of the `f64` (ADR-041).
+    fn encode(&self, f: &mut Fingerprinter) {
+        let Self(value) = self;
+        value.encode(f);
+    }
+}
 
 /// Sound because every constructor rejects NaN, so `==` is reflexive.
 impl Eq for AtrPercentile {}
@@ -70,6 +80,19 @@ pub enum RegimeLabel {
     Extreme,
 }
 
+impl StateEncode for RegimeLabel {
+    /// `write_u8` in declaration order: Low 0, Medium 1, High 2, Extreme 3
+    /// (ADR-041).
+    fn encode(&self, f: &mut Fingerprinter) {
+        f.write_u8(match self {
+            Self::Low => 0,
+            Self::Medium => 1,
+            Self::High => 2,
+            Self::Extreme => 3,
+        });
+    }
+}
+
 impl RegimeLabel {
     /// Maps a percentile onto the canonical scale.
     ///
@@ -118,6 +141,19 @@ pub struct Regime {
     pub label: RegimeLabel,
     /// The feature that computed it, such as `volatility.regime.1h@1`.
     pub feature: FeatureKey,
+}
+
+impl StateEncode for Regime {
+    fn encode(&self, f: &mut Fingerprinter) {
+        let Self {
+            atr_percentile,
+            label,
+            feature,
+        } = self;
+        atr_percentile.encode(f);
+        label.encode(f);
+        feature.encode(f);
+    }
 }
 
 impl Regime {

@@ -9,6 +9,8 @@
 //! Parsing is exact or it fails: [`FromStr`] accepts `-?[0-9]+(\.[0-9]+)?`
 //! and rejects any value it cannot hold without rounding (ADR-027).
 
+use crate::fingerprint::Fingerprinter;
+use crate::state_hash::StateEncode;
 use std::fmt;
 use std::str::FromStr;
 
@@ -82,6 +84,27 @@ impl Rate {
     /// The count of `1 / SCALE` units.
     pub const fn units(self) -> i64 {
         self.0
+    }
+}
+
+impl StateEncode for Price {
+    /// `write_i64` of the units (ADR-041).
+    fn encode(&self, f: &mut Fingerprinter) {
+        f.write_i64(self.0);
+    }
+}
+
+impl StateEncode for Qty {
+    /// `write_i64` of the units (ADR-041).
+    fn encode(&self, f: &mut Fingerprinter) {
+        f.write_i64(self.0);
+    }
+}
+
+impl StateEncode for Rate {
+    /// `write_i64` of the units (ADR-041).
+    fn encode(&self, f: &mut Fingerprinter) {
+        f.write_i64(self.0);
     }
 }
 

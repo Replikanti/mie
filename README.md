@@ -55,7 +55,7 @@ enforces the boundary (ADR-025):
 | [`mie-adapter-binance`](crates/mie-adapter-binance) | Binance USDⓈ-M live capture: raw-first persistence, shared normalization, feed gaps, canonical merge (ADR-032); order-book sync from depth diffs and REST snapshots with audited checkpoints (ADR-038); public-archive backfill: checksum-verified, exactly-once import (ADR-034); replay of both from the raw store (ADR-039). |
 | [`mie-adapter-fs`](crates/mie-adapter-fs) | Research result store: append-only, read-only result files with SHA-256 trailers, keyed by experiment and pipeline (ADR-040). |
 | `mie-adapter-*` *(planned)* | DuckDB, Telegram, LLM operators, backtest engine. |
-| [`mie-cli`](crates/mie-cli) | Composition root, the `mie` binary: wires adapters to ports. Today `ingest`, `capture-report`, `archive-import` / `archive-verify` / `archive-kline-check`, `replay` and `experiment validate` / `experiment run`; report follows. |
+| [`mie-cli`](crates/mie-cli) | Composition root, the `mie` binary: wires adapters to ports. Today `ingest`, `capture-report`, `archive-import` / `archive-verify` / `archive-kline-check`, `replay`, `equivalence` and `experiment validate` / `experiment run`; report follows. |
 
 First milestone data path (brief §19):
 
@@ -124,6 +124,16 @@ cargo run --release -p mie-cli -- replay \
     --config crates/mie-cli/ingest.example.toml --from <epoch ms> --to <epoch ms>
 cargo run --release -p mie-cli -- replay --source archive \
     --config crates/mie-cli/archive.example.toml --from 2025-10-01 --to 2026-09-30
+```
+
+Check live/replay equivalence (ADR-041): every capture run started in the
+window is recomputed alone into a fresh engine, and its state checkpoints
+(event-stream hash and Market State hash) are compared with the ones
+`mie ingest` journaled; the first divergence is reported:
+
+```sh
+cargo run --release -p mie-cli -- equivalence \
+    --config crates/mie-cli/ingest.example.toml --from <epoch ms> --to <epoch ms>
 ```
 
 Validate an experiment spec, then run it over a replay of its sample and

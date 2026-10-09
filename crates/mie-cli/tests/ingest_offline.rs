@@ -12,6 +12,9 @@ use mie_adapter_parquet::ParquetRawStore;
 use mie_cli::config::IngestConfig;
 use mie_cli::journal::RunParameters;
 use mie_domain::event::MarketEvent;
+use mie_domain::event_hash;
+use mie_domain::feature::catalog;
+use mie_domain::state_hash::STATE_HASH_ENCODING;
 use mie_domain::time::EventTime;
 use mie_ports::outbound::ReplayWindow;
 use mie_ports::raw::{RawRecordSource, RawSelection, RawStreamKey};
@@ -83,6 +86,25 @@ fn ingest_seals_raw_files_journals_and_seeds_the_next_run() {
     let end = of_type(&lines, "run_end")[0];
     assert_eq!(end["exit_code"], 0);
     assert_eq!(end["normalize_errors"], 1);
+
+    // The comparability keys of the equivalence harness (ADR-041), and the
+    // core's checkpoints: the run spans 50 ms of event time, so only the
+    // last one, after its final event.
+    let start = of_type(&lines, "run_start")[0];
+    assert_eq!(start["state_checkpoint_interval_ms"], 60_000);
+    assert_eq!(start["state_hash_encoding"], STATE_HASH_ENCODING);
+    assert_eq!(start["event_hash_encoding"], event_hash::ENCODING_VERSION);
+    assert_eq!(
+        start["feature_set"],
+        catalog::current_set().version().to_string()
+    );
+    let checkpoints = of_type(&lines, "state_checkpoint");
+    assert_eq!(checkpoints.len(), 1);
+    assert_eq!(checkpoints[0]["ordinal"], 6);
+    assert_eq!(checkpoints[0]["as_of"], t1 + 60);
+    assert_eq!(checkpoints[0]["last"], true);
+    assert_eq!(checkpoints[0]["event_hash"].as_str().unwrap().len(), 16);
+    assert_eq!(checkpoints[0]["state_hash"].as_str().unwrap().len(), 16);
 
     // Run 2 an hour later: seeded with run 1's last event, so it opens
     // with a restart gap.

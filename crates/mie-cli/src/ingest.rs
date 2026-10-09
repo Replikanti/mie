@@ -5,21 +5,27 @@
 //! 2. Seed each stream with the largest event time sealed in the last
 //!    7 days, so the run opens with a restart gap per stream.
 //! 3. Start the live capture and drive the core on this thread through
-//!    [`mie_app::drive_tolerant`], the drive replay uses too (ADR-019,
-//!    ADR-039 D9). An event the engine rejects is journaled and counted,
-//!    and driving resumes: the engine leaves its state untouched on a
-//!    rejection, and a soak must not stop on one. A provider failure ends
+//!    [`mie_app::equivalence::drive_checkpointed`]: the rejection policy of
+//!    [`mie_app::drive_tolerant`], which replay uses too (ADR-019, ADR-039
+//!    D9), plus the state checkpoints the equivalence harness recomputes
+//!    (ADR-041). An event the engine rejects is journaled and counted, and
+//!    driving resumes: the engine leaves its state untouched on a
+//!    rejection, and a soak must not stop on one. Every checkpoint is
+//!    journaled as a `state_checkpoint` line, the last one after the final
+//!    event of a run without a provider failure. A provider failure ends
 //!    the run.
 //! 4. On shutdown (SIGINT/SIGTERM sets the flag), join the capture, close
 //!    the writer (sealing everything) and journal a `run_end` summary.
 
 use crate::config::IngestConfig;
-use crate::journal::{Journal, JournalObserver, files_json, pipeline_json};
+use crate::journal::{Journal, JournalObserver, files_json, pipeline_json, state_checkpoint_json};
 use mie_adapter_binance::transport::{Clock, HttpGet, WsConnector};
 use mie_adapter_binance::{BinanceStream, CaptureSummary, run_id, start};
 use mie_adapter_parquet::{ParquetRawStore, RotationPolicy};
 use mie_domain::event::MarketEvent;
+use mie_domain::event_hash;
 use mie_domain::state::MarketStateEngine;
+use mie_domain::state_hash::STATE_HASH_ENCODING;
 use mie_domain::time::EventTime;
 use mie_ports::outbound::{MarketDataProvider, ProviderError, ReplayWindow};
 use mie_ports::raw::{RawRecordSource, RawSelection, RawStreamKey};
@@ -119,7 +125,11 @@ pub fn run(
     );
 
     let streams = config.streams().map_err(|e| e.to_string())?;
+    let checkpoint_interval_ms = config
+        .state_checkpoint_interval_ms()
+        .map_err(|e| e.to_string())?;
     let seeds = seeds(&store, config, &streams, now().div_euclid(1_000_000))?;
+    let mut engine = MarketStateEngine::new();
     log(
         "run_start",
         json!({
@@ -138,6 +148,10 @@ pub fn run(
                 .iter()
                 .map(|(s, t)| (s.raw_name().to_owned(), json!(t.as_millis())))
                 .collect::<serde_json::Map<_, _>>(),
+            "state_checkpoint_interval_ms": checkpoint_interval_ms,
+            "state_hash_encoding": STATE_HASH_ENCODING,
+            "event_hash_encoding": event_hash::ENCODING_VERSION,
+            "feature_set": engine.feature_set().version().to_string(),
         }),
     );
 
@@ -160,16 +174,21 @@ pub fn run(
     )
     .map_err(|e| e.to_string())?;
 
-    let mut engine = MarketStateEngine::new();
     let mut counting = Counting {
         inner: &mut provider,
         events: 0,
     };
     let mut domain_rejections = 0_u64;
-    let driven = mie_app::drive_tolerant(&mut counting, &mut engine, |rejected| {
-        domain_rejections += 1;
-        log("domain_rejection", json!({"error": rejected.to_string()}));
-    });
+    let driven = mie_app::equivalence::drive_checkpointed(
+        &mut counting,
+        &mut engine,
+        checkpoint_interval_ms,
+        |rejected| {
+            domain_rejections += 1;
+            log("domain_rejection", json!({"error": rejected.to_string()}));
+        },
+        |checkpoint| log("state_checkpoint", state_checkpoint_json(checkpoint)),
+    );
     let mut error = driven.err().map(|failed| failed.to_string());
     let events = counting.events;
     drop(provider);

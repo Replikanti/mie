@@ -31,8 +31,10 @@
 
 use crate::bars::{Bar, Coverage, Timeframe};
 use crate::feature::{FeatureKey, FeatureValue, Unavailability, catalog};
+use crate::fingerprint::Fingerprinter;
 use crate::num::Price;
 use crate::regime::{AtrPercentile, Regime};
+use crate::state_hash::StateEncode;
 use crate::time::EventTime;
 use std::fmt;
 
@@ -153,6 +155,27 @@ pub struct BarMotion {
     pub coverage: Coverage,
 }
 
+impl StateEncode for BarMotion {
+    fn encode(&self, f: &mut Fingerprinter) {
+        let Self {
+            timeframe,
+            open_time,
+            previous_close,
+            close,
+            change,
+            range,
+            coverage,
+        } = self;
+        timeframe.encode(f);
+        open_time.encode(f);
+        previous_close.encode(f);
+        close.encode(f);
+        change.encode(f);
+        range.encode(f);
+        coverage.encode(f);
+    }
+}
+
 impl BarMotion {
     /// The motion of `bar` from `previous_close`.
     fn of(bar: &Bar, previous_close: Price) -> Result<Self, VolatilityError> {
@@ -228,6 +251,13 @@ const MOTION_NOT_YET: FeatureValue<BarMotion> = FeatureValue::WarmingUp {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MotionSet {
     values: [FeatureValue<BarMotion>; 6],
+}
+
+impl StateEncode for MotionSet {
+    fn encode(&self, f: &mut Fingerprinter) {
+        let Self { values } = self;
+        values.encode(f);
+    }
 }
 
 impl Default for MotionSet {

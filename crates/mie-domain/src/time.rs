@@ -4,6 +4,8 @@
 //! has consumed. That is what lets live processing and historical replay
 //! produce identical results (ADR-019).
 
+use crate::fingerprint::Fingerprinter;
+use crate::state_hash::StateEncode;
 use std::fmt;
 
 /// Exchange event time in milliseconds since the Unix epoch (UTC).
@@ -23,6 +25,13 @@ impl EventTime {
     /// Milliseconds since the Unix epoch.
     pub const fn as_millis(self) -> i64 {
         self.0
+    }
+}
+
+impl StateEncode for EventTime {
+    /// `write_i64` of the epoch milliseconds (ADR-041).
+    fn encode(&self, f: &mut Fingerprinter) {
+        f.write_i64(self.0);
     }
 }
 

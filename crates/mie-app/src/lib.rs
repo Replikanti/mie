@@ -11,9 +11,15 @@
 //! driving (ADR-039 D9). [`HashingProvider`] identifies what a provider
 //! delivered (ADR-039 D7).
 //!
+//! [`equivalence`] records the state checkpoints that live ingestion
+//! journals and the equivalence harness recomputes, through
+//! [`drive_tolerant_observed`], and compares two checkpoint lists (#13,
+//! ADR-041).
+//!
 //! [`ExperimentService`] ([`research`]) runs an experiment spec and is the
 //! only writer of research results (ADR-020, ADR-040).
 
+pub mod equivalence;
 pub mod kline_check;
 pub mod research;
 
@@ -82,7 +88,27 @@ where
 pub fn drive_tolerant<P>(
     provider: &mut P,
     engine: &mut MarketStateEngine,
+    on_rejection: impl FnMut(&StateError),
+) -> Result<u64, ProviderError>
+where
+    P: MarketDataProvider + ?Sized,
+{
+    drive_tolerant_observed(provider, engine, on_rejection, |_, _| {})
+}
+
+/// [`drive_tolerant`], calling `observe` after every delivered event,
+/// accepted or rejected (after `on_rejection` for a rejected one), with the
+/// engine's state as of that event. The equivalence checkpoints of live
+/// ingestion and of their recompute are recorded here ([`equivalence`]).
+///
+/// # Errors
+///
+/// As [`drive_tolerant`]; `observe` is not called after a provider failure.
+pub fn drive_tolerant_observed<P>(
+    provider: &mut P,
+    engine: &mut MarketStateEngine,
     mut on_rejection: impl FnMut(&StateError),
+    mut observe: impl FnMut(&MarketEvent, &MarketStateEngine),
 ) -> Result<u64, ProviderError>
 where
     P: MarketDataProvider + ?Sized,
@@ -93,6 +119,7 @@ where
         if let Err(rejected) = engine.apply(&event) {
             on_rejection(&rejected);
         }
+        observe(&event, engine);
     }
     Ok(events)
 }

@@ -121,6 +121,9 @@ pub struct CaptureSettings {
     pub depth_checkpoint_interval_secs: u64,
     /// Least time between two depth snapshot requests.
     pub depth_snapshot_min_spacing_ms: u64,
+    /// Event-time cadence of the state checkpoints the core journals for the
+    /// equivalence harness (#13, ADR-041).
+    pub state_checkpoint_interval_secs: u64,
 }
 
 impl Default for CaptureSettings {
@@ -141,6 +144,7 @@ impl Default for CaptureSettings {
             depth_snapshot_limit: 1_000,
             depth_checkpoint_interval_secs: 60,
             depth_snapshot_min_spacing_ms: 2_000,
+            state_checkpoint_interval_secs: 60,
         }
     }
 }
@@ -237,10 +241,15 @@ impl IngestConfig {
                 "depth_snapshot_min_spacing_ms",
                 c.depth_snapshot_min_spacing_ms,
             ),
+            (
+                "state_checkpoint_interval_secs",
+                c.state_checkpoint_interval_secs,
+            ),
         ];
         if let Some((name, _)) = positive.iter().find(|(_, v)| *v == 0) {
             return Err(ConfigError(format!("capture.{name} must be positive")));
         }
+        self.state_checkpoint_interval_ms()?;
         if c.backoff_max_ms < c.backoff_initial_ms {
             return Err(ConfigError(
                 "capture.backoff_max_ms is below backoff_initial_ms".to_owned(),
@@ -263,6 +272,21 @@ impl IngestConfig {
             )));
         }
         Ok(())
+    }
+
+    /// The state checkpoint interval in event-time milliseconds (ADR-041).
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError`] when it does not fit an `i64` of milliseconds.
+    pub fn state_checkpoint_interval_ms(&self) -> Result<i64, ConfigError> {
+        self.capture
+            .state_checkpoint_interval_secs
+            .checked_mul(1_000)
+            .and_then(|ms| i64::try_from(ms).ok())
+            .ok_or_else(|| {
+                ConfigError("capture.state_checkpoint_interval_secs is too large".to_owned())
+            })
     }
 
     /// The configured streams, in configuration order.
