@@ -1,12 +1,14 @@
 //! Driven (outbound) ports.
 //!
-//! Present: live and historical market data. Planned, each landing with the
-//! issue that first needs it: `FeatureStore`, `StrategyRepository`,
-//! `BacktestEngine`, `ResearchResultStore`, `AlertGateway`. There is
+//! Present: live and historical market data, and the research result store
+//! ([`ResearchResultReader`], [`ResearchResultStore`], ADR-040). Planned,
+//! each landing with the issue that first needs it: `FeatureStore`,
+//! `StrategyRepository`, `BacktestEngine`, `AlertGateway`. There is
 //! deliberately no `ExecutionGateway`: the MVP is informational (ADR-010).
 
 use crate::raw::DatasetVersion;
 use mie_domain::event::MarketEvent;
+use mie_domain::research::{ExperimentId, ExperimentResult, HypothesisId, ResultKey};
 use mie_domain::time::EventTime;
 use std::fmt;
 
@@ -120,9 +122,173 @@ impl fmt::Display for ProviderError {
 
 impl std::error::Error for ProviderError {}
 
+/// Reads stored experiment results (ADR-040). Agents and reports get this
+/// trait only; writing is the pipeline's (ADR-020).
+pub trait ResearchResultReader {
+    /// The result stored under `key`, verified, if any.
+    ///
+    /// # Errors
+    ///
+    /// [`ResultStoreError`] when the stored result fails verification or the
+    /// store cannot be read.
+    fn get(&self, key: &ResultKey) -> Result<Option<ExperimentResult>, ResultStoreError>;
+
+    /// The keys of every stored result whose spec tests `hypothesis`,
+    /// sorted.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::get`].
+    fn by_hypothesis(&self, hypothesis: &HypothesisId) -> Result<Vec<ResultKey>, ResultStoreError>;
+}
+
+/// The append-only store of experiment results (ADR-040), written only by
+/// the deterministic research pipeline (ADR-020).
+///
+/// Contract: a stored result is never replaced and never deleted. A second
+/// append under a stored key fails with [`ResultStoreError::AlreadyStored`]
+/// and leaves the stored result untouched; so does an append whose spec
+/// differs from a stored spec with the same experiment id
+/// ([`ResultStoreError::Collision`]). `Ok` means the result is stored and
+/// durable: it survives a crash or power loss.
+pub trait ResearchResultStore: ResearchResultReader {
+    /// Stores `result` under [`ExperimentResult::key`] and returns the key.
+    ///
+    /// # Errors
+    ///
+    /// [`ResultStoreError`]. [`ResultStoreError::NotDurable`] means the
+    /// result is stored and readable but may not survive a crash; on every
+    /// other error nothing stored is changed.
+    fn append(&mut self, result: &ExperimentResult) -> Result<ResultKey, ResultStoreError>;
+}
+
+/// Why the result store refused or failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResultStoreError {
+    /// A result is already stored under the key; it stays as it is.
+    AlreadyStored {
+        /// The key.
+        key: ResultKey,
+        /// Whether the stored result equals the one offered.
+        identical: bool,
+    },
+    /// A different spec with the same experiment id is stored: a 64-bit
+    /// fingerprint collision. Nothing is written.
+    Collision {
+        /// The experiment id both specs share.
+        experiment: ExperimentId,
+    },
+    /// A stored result fails its integrity check.
+    Integrity(String),
+    /// A stored result is intact but not where its key says it belongs, or
+    /// does not parse.
+    Corrupt(String),
+    /// The result was stored and is readable, but the store could not make
+    /// it durable (for example, a directory sync failed), so it may not
+    /// survive a crash. It is not rewritten; a later run of the key finds it
+    /// stored or, after a crash, appends it again.
+    NotDurable {
+        /// The key.
+        key: ResultKey,
+        /// What failed.
+        detail: String,
+    },
+    /// The store cannot be read or written.
+    Io(String),
+}
+
+impl fmt::Display for ResultStoreError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AlreadyStored {
+                key,
+                identical: true,
+            } => write!(f, "result {key} is already stored, identical"),
+            Self::AlreadyStored {
+                key,
+                identical: false,
+            } => write!(
+                f,
+                "result {key} is already stored with a different outcome; stored results are \
+                 never overwritten"
+            ),
+            Self::Collision { experiment } => write!(
+                f,
+                "experiment id {experiment} is already taken by a different spec (fingerprint \
+                 collision)"
+            ),
+            Self::Integrity(detail) => write!(f, "stored result failed verification: {detail}"),
+            Self::Corrupt(detail) => write!(f, "stored result is corrupt: {detail}"),
+            Self::NotDurable { key, detail } => write!(
+                f,
+                "result {key} is stored, but it may not survive a crash: {detail}"
+            ),
+            Self::Io(detail) => write!(f, "result store I/O failed: {detail}"),
+        }
+    }
+}
+
+impl std::error::Error for ResultStoreError {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mie_domain::fingerprint::Fingerprint;
+    use mie_domain::research::PipelineKey;
+
+    #[test]
+    fn result_store_errors_describe_themselves() {
+        let experiment = ExperimentId::from_fingerprint(Fingerprint::from_raw(0xab));
+        let key = ResultKey {
+            experiment,
+            pipeline: PipelineKey::new("research.replay_summary", 1),
+        };
+        let cases = [
+            (
+                ResultStoreError::AlreadyStored {
+                    key: key.clone(),
+                    identical: true,
+                },
+                "result 00000000000000ab/research.replay_summary@1 is already stored, identical",
+            ),
+            (
+                ResultStoreError::AlreadyStored {
+                    key: key.clone(),
+                    identical: false,
+                },
+                "result 00000000000000ab/research.replay_summary@1 is already stored with a \
+                 different outcome; stored results are never overwritten",
+            ),
+            (
+                ResultStoreError::Collision { experiment },
+                "experiment id 00000000000000ab is already taken by a different spec \
+                 (fingerprint collision)",
+            ),
+            (
+                ResultStoreError::Integrity("sha256 mismatch".to_owned()),
+                "stored result failed verification: sha256 mismatch",
+            ),
+            (
+                ResultStoreError::Corrupt("misplaced".to_owned()),
+                "stored result is corrupt: misplaced",
+            ),
+            (
+                ResultStoreError::NotDurable {
+                    key,
+                    detail: "fsync failed".to_owned(),
+                },
+                "result 00000000000000ab/research.replay_summary@1 is stored, but it may not \
+                 survive a crash: fsync failed",
+            ),
+            (
+                ResultStoreError::Io("disk full".to_owned()),
+                "result store I/O failed: disk full",
+            ),
+        ];
+        for (error, text) in cases {
+            assert_eq!(error.to_string(), text);
+        }
+    }
 
     #[test]
     fn replay_window_is_half_open() {

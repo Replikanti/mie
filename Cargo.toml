@@ -17,6 +17,7 @@ mie-ports = { path = "crates/mie-ports" }
 mie-app = { path = "crates/mie-app" }
 mie-adapter-binance = { path = "crates/mie-adapter-binance" }
 mie-adapter-parquet = { path = "crates/mie-adapter-parquet" }
+mie-adapter-fs = { path = "crates/mie-adapter-fs" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

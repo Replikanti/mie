@@ -111,6 +111,25 @@ pub const fn is_valid_id(id: &str) -> bool {
     !after_dot
 }
 
+/// Splits the canonical text `id@N` into the id and the version: an id
+/// valid under [`is_valid_id`] and a version written as a decimal integer
+/// from 1 without sign or leading zeros that fits a `u32`. `None` for any
+/// other text.
+///
+/// Feature keys and the versioned rule and pipeline references of
+/// experiments ([`crate::research`]) share this grammar.
+pub(crate) fn parse_versioned_id(text: &str) -> Option<(&str, u32)> {
+    let (id, version) = text.split_once('@')?;
+    let canonical_number = !version.is_empty()
+        && version.bytes().all(|byte| byte.is_ascii_digit())
+        && !version.starts_with('0');
+    if !is_valid_id(id) || !canonical_number {
+        return None;
+    }
+    let version: u32 = version.parse().ok()?;
+    Some((id, version))
+}
+
 /// The stable identity of a feature, such as `volatility.atr_5m`.
 ///
 /// Ids are never renamed or reused. The grammar is checked by
@@ -659,17 +678,9 @@ impl FeatureRegistry {
     ///   zeros;
     /// - [`ResolveError::Unknown`] — well formed but not registered.
     pub fn resolve(&self, text: &str) -> Result<&'static FeatureDefinition, ResolveError> {
-        let malformed = || ResolveError::Malformed {
+        let (id, version) = parse_versioned_id(text).ok_or_else(|| ResolveError::Malformed {
             text: text.to_owned(),
-        };
-        let (id, version) = text.split_once('@').ok_or_else(malformed)?;
-        let canonical_number = !version.is_empty()
-            && version.bytes().all(|byte| byte.is_ascii_digit())
-            && !version.starts_with('0');
-        if !is_valid_id(id) || !canonical_number {
-            return Err(malformed());
-        }
-        let version: u32 = version.parse().map_err(|_| malformed())?;
+        })?;
         self.definitions
             .iter()
             .find(|(key, _)| key.id.as_str() == id && key.version.get() == version)

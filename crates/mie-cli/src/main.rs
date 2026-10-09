@@ -7,12 +7,13 @@ use mie_adapter_binance::transport::{
 };
 use mie_cli::archive::{self, ArchiveTransports, ImportRequest};
 use mie_cli::config::{ArchiveConfig, IngestConfig};
+use mie_cli::experiment::{self, ExperimentRequest};
 use mie_cli::ingest::{self, Transports};
 use mie_cli::replay::{self, ReplayRequest, ReplaySource};
 use mie_cli::report;
 use mie_domain::time::EventTime;
 use mie_ports::outbound::ReplayWindow;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -75,6 +76,22 @@ USAGE:
         the event-stream hash; the same window prints the same bytes. Exits
         0 on PASS; 1 when the replay failed, the domain rejected an event or
         the window holds no event.
+
+    mie experiment validate <spec>
+        Validate an experiment spec (spec text v1, ADR-040). Prints the
+        experiment id and the canonical spec; exits 0. An invalid spec
+        prints every error, one per line, and exits 1. See
+        crates/mie-cli/experiment.example.spec.
+
+    mie experiment run <spec> --config <path> --results <dir>
+                       [--source live|archive] [--streams <a,b,...>]
+        Run the spec's sample period through the core (source options as
+        mie replay) and record the result in the append-only result store
+        under <dir>. Prints `recorded <key>` for a new result or
+        `reproduced <key>` when the stored result was reproduced exactly;
+        exits 0. A data-version mismatch, an empty sample, a provider
+        failure or a result that differs from the stored one prints
+        `FAIL: <reason>` and exits 1. Stored results are never overwritten.
 
     mie --help
 ";
@@ -197,29 +214,7 @@ fn dispatch(args: &[String]) -> Result<ExitCode, String> {
             if from >= to {
                 return Err(format!("--from {from} must be below --to {to}"));
             }
-            let source = match options.optional("--source").unwrap_or("live") {
-                "live" => {
-                    if options.optional("--streams").is_some() {
-                        return Err("--streams applies to --source archive only".to_owned());
-                    }
-                    ReplaySource::Live(IngestConfig::load(&config_path).map_err(|e| e.to_string())?)
-                }
-                "archive" => {
-                    let config = ArchiveConfig::load(&config_path).map_err(|e| e.to_string())?;
-                    let streams = match options.optional("--streams") {
-                        Some(list) => {
-                            let names: Vec<String> = list.split(',').map(str::to_owned).collect();
-                            Some(
-                                ArchiveConfig::expand(&names, &config.archive.kline_intervals)
-                                    .map_err(|e| e.to_string())?,
-                            )
-                        }
-                        None => None,
-                    };
-                    ReplaySource::Archive { config, streams }
-                }
-                other => return Err(format!("--source {other:?} is neither live nor archive")),
-            };
+            let source = options.replay_source(&config_path)?;
             let request = ReplayRequest {
                 source,
                 window: ReplayWindow {
@@ -230,6 +225,32 @@ fn dispatch(args: &[String]) -> Result<ExitCode, String> {
             let outcome = replay::run(&request, &mut std::io::stdout().lock())?;
             Ok(exit(outcome.pass))
         }
+        Some("experiment") => match (args.get(1).map(String::as_str), args.get(2)) {
+            (Some("validate"), Some(spec)) => {
+                Options::parse(&args[3..], &[], &[])?;
+                let valid =
+                    experiment::validate(&PathBuf::from(spec), &mut std::io::stdout().lock())?;
+                Ok(exit(valid))
+            }
+            (Some("run"), Some(spec)) => {
+                let options = Options::parse(
+                    &args[3..],
+                    &["--config", "--source", "--streams", "--results"],
+                    &[],
+                )?;
+                let request = ExperimentRequest {
+                    spec: PathBuf::from(spec),
+                    source: options.replay_source(&options.path("--config")?)?,
+                    results: options.path("--results")?,
+                };
+                let pass = experiment::run(&request, &mut std::io::stdout().lock())?;
+                Ok(exit(pass))
+            }
+            _ => Err(
+                "expected `mie experiment validate <spec>` or `mie experiment run <spec> …`"
+                    .to_owned(),
+            ),
+        },
         Some(other) => Err(format!("unknown command {other:?}")),
     }
 }
@@ -334,6 +355,36 @@ impl Options {
             return Err("--from is after --to".to_owned());
         }
         Ok((from, to))
+    }
+
+    /// The replay source of `--source live|archive` (default live) over the
+    /// configuration at `config_path`, with `--streams` for the archive.
+    fn replay_source(&self, config_path: &Path) -> Result<ReplaySource, String> {
+        match self.optional("--source").unwrap_or("live") {
+            "live" => {
+                if self.optional("--streams").is_some() {
+                    return Err("--streams applies to --source archive only".to_owned());
+                }
+                Ok(ReplaySource::Live(
+                    IngestConfig::load(config_path).map_err(|e| e.to_string())?,
+                ))
+            }
+            "archive" => {
+                let config = ArchiveConfig::load(config_path).map_err(|e| e.to_string())?;
+                let streams = match self.optional("--streams") {
+                    Some(list) => {
+                        let names: Vec<String> = list.split(',').map(str::to_owned).collect();
+                        Some(
+                            ArchiveConfig::expand(&names, &config.archive.kline_intervals)
+                                .map_err(|e| e.to_string())?,
+                        )
+                    }
+                    None => None,
+                };
+                Ok(ReplaySource::Archive { config, streams })
+            }
+            other => Err(format!("--source {other:?} is neither live nor archive")),
+        }
     }
 
     fn value(&self, flag: &str) -> Result<&str, String> {
