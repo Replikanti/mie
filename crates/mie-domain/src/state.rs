@@ -7,16 +7,19 @@
 //! the bars each event closes (ADR-033, [`volatility`]), the order flow:
 //! CVD and rolling aggression windows (ADR-035, [`flow`]), and the volume
 //! profiles: developing UTC day, prior day and 5-day composite (ADR-036,
-//! [`profile`]), and the market structure: swings, structural levels,
-//! sweeps and SFPs on 15m, 1h, 4h and 1d (ADR-037, [`structure`]); every
-//! other kind passes through. Further feature families (order book,
-//! OI/funding) are added by the Market State issues, each as a registered,
-//! versioned definition (ADR-029, [`feature`]).
+//! [`profile`]), the market structure: swings, structural levels,
+//! sweeps and SFPs on 15m, 1h, 4h and 1d (ADR-037, [`structure`]), and the
+//! derivatives context: open interest, mark price and funding, and
+//! liquidation windows (ADR-042, [`derivatives`]); every other kind passes
+//! through. Further feature families (order book) are added by the Market
+//! State issues, each as a registered, versioned definition (ADR-029,
+//! [`feature`]).
 //! The engine computes one [`FeatureSet`] and stamps its
 //! [`FeatureSetVersion`] on every state; each feature value carries its
 //! validity ([`FeatureValue`]).
 //!
 //! [`bars`]: crate::bars
+//! [`derivatives`]: crate::derivatives
 //! [`feature`]: crate::feature
 //! [`flow`]: crate::flow
 //! [`profile`]: crate::profile
@@ -24,6 +27,7 @@
 //! [`volatility`]: crate::volatility
 
 use crate::bars::{Bar, BarError, BarSet, MAX_BARS_PER_EVENT, Timeframe};
+use crate::derivatives::{Derivatives, DerivativesError, DerivativesTracker};
 use crate::event::{MarketEvent, Stream};
 use crate::feature::{FeatureSet, FeatureSetVersion, FeatureValue, catalog};
 use crate::flow::{FlowError, FlowTracker, OrderFlow};
@@ -84,6 +88,15 @@ pub struct MarketState {
     /// swings and the structural level registry with touches, sweeps and
     /// SFPs. Structure facts, never signals (ADR-012).
     pub structure: StructureSet,
+    /// Derivatives context (ADR-042): `derivatives.oi.sample@1`,
+    /// `derivatives.oi.5m@1`, `derivatives.mark@1`,
+    /// `derivatives.funding.settled@1` and
+    /// `derivatives.liq.window.<5m|15m|1h>@1` ([`catalog::LIQ_WINDOWS`]) —
+    /// open interest at its source resolution and on the 5-minute grid,
+    /// mark price with indicative funding, settled funding, and liquidations
+    /// by side over closed minutes. The liquidation values are a lower
+    /// bound: the exchange stream is throttled.
+    pub derivatives: Derivatives,
     /// Number of trades consumed. A diagnostic counter, not a feature: it
     /// depends on where consumption started, so it is not reproducible
     /// across replay windows.
@@ -124,6 +137,9 @@ pub struct MarketStateEngine {
     /// Scratch buffer for an event's structure facts, swapped with
     /// `structure_events` once the event is accepted.
     structure_pending: Vec<StructureEvent>,
+    /// The last open-interest sample and grid boundary, and the liquidation
+    /// minutes.
+    derivatives: DerivativesTracker,
 }
 
 /// Volatility state after the bars an event closed, committed with them.
@@ -216,6 +232,7 @@ impl MarketStateEngine {
         let features = catalog::current_set();
         let volatility = AtrRegimeSeries::new();
         let flow = FlowTracker::new();
+        let derivatives = DerivativesTracker::new();
         let state = MarketState {
             feature_set: features.version(),
             as_of: None,
@@ -231,6 +248,7 @@ impl MarketStateEngine {
             flow: flow.flow(),
             profile: VolumeProfiles::new(),
             structure: StructureSet::new(),
+            derivatives: derivatives.derivatives(),
             trade_count: 0,
         };
         Self {
@@ -247,6 +265,7 @@ impl MarketStateEngine {
             structure: StructureTracker::new(),
             structure_events: Vec::new(),
             structure_pending: Vec::new(),
+            derivatives,
         }
     }
 
@@ -270,8 +289,10 @@ impl MarketStateEngine {
     ///   accepted one of its stream;
     /// - [`StateError::Overflow`] if a bar's time or quantity arithmetic, a
     ///   closed bar's true range, change or range, an order-flow sum (CVD,
-    ///   window), a volume-profile sum (bin, total, composite) or a
-    ///   structure count (touches, window bars) leaves its integer range;
+    ///   window), a volume-profile sum (bin, total, composite), a
+    ///   structure count (touches, window bars) or a derivatives value
+    ///   (liquidation sum or count, ΔOI, time difference) leaves its integer
+    ///   range;
     /// - [`StateError::TimeJump`] if it would close more than
     ///   [`MAX_BARS_PER_EVENT`] bars of one timeframe. Recovery: the replay
     ///   or session stops; restart it from a fresh engine after the jump.
@@ -361,13 +382,22 @@ impl MarketStateEngine {
                 });
             }
         };
+        let derivatives = match self.derivatives.step(event, &self.pending) {
+            Ok(derivatives) => derivatives,
+            Err(DerivativesError::Overflow) => {
+                self.pending.clear();
+                return Err(StateError::Overflow {
+                    event: event.canonical_key(),
+                });
+            }
+        };
 
         match event {
             MarketEvent::Trade(trade) => {
                 self.state.last_trade_price = FeatureValue::Ready(trade.price);
                 self.state.trade_count += 1;
             }
-            // No feature consumes these yet.
+            // Consumed by the trackers above, not by trade fields.
             MarketEvent::FeedGap(_)
             | MarketEvent::BookSnapshot(_)
             | MarketEvent::Liquidation(_)
@@ -399,6 +429,8 @@ impl MarketStateEngine {
             );
         }
         std::mem::swap(&mut self.structure_events, &mut self.structure_pending);
+        self.derivatives.commit(derivatives);
+        self.state.derivatives = self.derivatives.derivatives();
         self.state.as_of = Some(event.time());
         self.last = Some(event.clone());
         self.ids = ids;
@@ -488,9 +520,9 @@ pub enum StateError {
         end: EventTime,
     },
     /// The event would push a bar's time or quantity arithmetic, a
-    /// volatility value, an order-flow sum, a volume-profile sum or a
-    /// structure count out of its integer range (ADR-027, ADR-031, ADR-033,
-    /// ADR-035, ADR-036, ADR-037).
+    /// volatility value, an order-flow sum, a volume-profile sum, a
+    /// structure count or a derivatives value out of its integer range
+    /// (ADR-027, ADR-031, ADR-033, ADR-035, ADR-036, ADR-037, ADR-042).
     Overflow {
         /// Key of the rejected event.
         event: CanonicalKey,
@@ -535,7 +567,7 @@ impl fmt::Display for StateError {
                 write!(
                     f,
                     "event ({event}) overflows the bar, volatility, order-flow, \
-                     volume-profile or structure arithmetic"
+                     volume-profile, structure or derivatives arithmetic"
                 )
             }
             Self::TimeJump {
@@ -636,6 +668,7 @@ mod tests {
                 },
                 profile: VolumeProfiles::new(),
                 structure: StructureSet::new(),
+                derivatives: Derivatives::new(),
                 trade_count: 3,
             }
         );
@@ -835,6 +868,9 @@ mod tests {
             "bars.motion.15m@1,bars.motion.1d@1,bars.motion.1h@1,bars.motion.1m@1,\
              bars.motion.4h@1,bars.motion.5m@1,bars.time.15m@1,bars.time.1d@1,\
              bars.time.1h@1,bars.time.1m@1,bars.time.4h@1,bars.time.5m@1,\
+             derivatives.funding.settled@1,derivatives.liq.window.15m@1,\
+             derivatives.liq.window.1h@1,derivatives.liq.window.5m@1,\
+             derivatives.mark@1,derivatives.oi.5m@1,derivatives.oi.sample@1,\
              flow.cvd.continuous@1,flow.cvd.utc_day@1,flow.window.15m@1,\
              flow.window.1h@1,flow.window.5m@1,profile.volume.composite_5d@1,\
              profile.volume.prior_day@1,profile.volume.utc_day@1,\
@@ -1140,6 +1176,74 @@ mod tests {
         ] {
             engine.apply(&event).unwrap();
             assert_eq!(engine.state().flow, flow, "{event:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_an_event_that_overflows_a_derivatives_sum() {
+        let huge = |millis: i64| {
+            MarketEvent::Liquidation(crate::event::Liquidation {
+                time: t(millis),
+                aggressor: crate::event::Aggressor::Sell,
+                price: Price::from_units(1),
+                avg_price: Price::from_units(1),
+                filled_qty: Qty::from_units(i64::MAX),
+            })
+        };
+        let mut engine = engine_after(&[trade(500, 1), huge(1_000)]);
+        let before = engine.state().clone();
+        let closed_before = engine.closed_bars().to_vec();
+        let overflow = huge(2_000);
+        assert_eq!(
+            engine.apply(&overflow),
+            Err(StateError::Overflow {
+                event: overflow.canonical_key()
+            })
+        );
+        assert_eq!(engine.state(), &before);
+        assert_eq!(engine.closed_bars(), closed_before);
+        // The ordering bound did not move.
+        assert_eq!(
+            engine.apply(&huge(1_000)),
+            Err(StateError::Duplicate {
+                key: huge(1_000).canonical_key()
+            })
+        );
+        // The minute's short side still has room.
+        engine
+            .apply(&MarketEvent::Liquidation(crate::event::Liquidation {
+                time: t(2_000),
+                aggressor: crate::event::Aggressor::Buy,
+                price: Price::from_units(1),
+                avg_price: Price::from_units(1),
+                filled_qty: Qty::from_units(i64::MAX),
+            }))
+            .unwrap();
+    }
+
+    #[test]
+    fn other_streams_leave_the_derivatives_unchanged() {
+        let mut engine = engine_after(&[
+            trade(1_000, 1),
+            crate::event::samples::liquidation(2_000, 10_000_000),
+            crate::event::samples::open_interest(3_000, 10_000),
+            mark(4_000, 6_354_150_000_000),
+            crate::event::samples::settlement(5_000, 10_000),
+        ]);
+        let derivatives = engine.state().derivatives;
+        assert!(derivatives.oi.is_ready());
+        assert!(derivatives.mark.is_ready());
+        assert!(derivatives.funding_settled.is_ready());
+        for event in [
+            trade(6_000, 2),
+            snapshot(6_001, 10),
+            gap(Stream::OrderBook, 6_000, 6_002, GapReason::Disconnected),
+            gap(Stream::Trades, 6_000, 6_003, GapReason::Disconnected),
+            update(6_004, 11, 12, 10),
+            kline(-53_995, 6_004),
+        ] {
+            engine.apply(&event).unwrap();
+            assert_eq!(engine.state().derivatives, derivatives, "{event:?}");
         }
     }
 
@@ -1489,7 +1593,7 @@ mod tests {
         assert_eq!(
             StateError::Overflow { event }.to_string(),
             "event (1999ms Trade seq 2) overflows the bar, volatility, order-flow, \
-             volume-profile or structure arithmetic"
+             volume-profile, structure or derivatives arithmetic"
         );
         assert_eq!(
             StateError::TimeJump {

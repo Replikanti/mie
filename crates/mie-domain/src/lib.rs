@@ -23,6 +23,7 @@
 //! | Order flow / aggression (ADR-035)         | [`flow`]                     |
 //! | Volume profile (ADR-036)                  | [`profile`]                  |
 //! | Market structure (ADR-037)                | [`structure`]                |
+//! | Derivatives context (ADR-042)             | [`derivatives`]              |
 //! | Regime (ADR-017, ADR-033)                 | [`regime`]                   |
 //! | Location / auction state                  | [`location`]                 |
 //! | Bias / trigger (ADR-012, ADR-024)         | [`trigger`]                  |
@@ -34,6 +35,7 @@
 
 pub mod bars;
 pub mod book;
+pub mod derivatives;
 pub mod event;
 pub mod event_hash;
 pub mod feature;

@@ -42,8 +42,8 @@ and the 12 monthly `fundingRate` files were published, **0 missing**
 |---|---|---|---|---|
 | Event-time bars `bars.time.*` (1m … 1d) and ATR / ATR percentile (#16) | trades | yes, from aggTrades | yes | Bars come from trades only; klines are a cross-check (ADR-031) |
 | Delta, CVD, volume at price | trades with aggressor | yes | yes | Aggressor from `is_buyer_maker` / `m` (ADR-023) |
-| OI level, ΔOI, OI velocity (#19) | open interest | yes, 5 min | yes, 10 s | `resolution_ms` per value tells them apart; archive values lag up to one interval |
-| Funding settlements | funding rate | yes | no settlement event; the indicative rate arrives with `MarkPrice` | Live settlements come from the archive once published (next day) |
-| Indicative funding, mark/index price, basis | mark price | **no** | yes | Mark/index price klines are not imported |
-| Liquidation features | liquidations | **no** | yes | Lower bound only |
+| OI level, ΔOI, OI velocity (#19): `derivatives.oi.sample@1` (source resolution), `derivatives.oi.5m@1` (UTC 5-minute grid) | open interest | yes, 5 min | yes, 10 s | `resolution_ms` per value tells them apart; the native step never crosses resolutions, the grid is computable from both sources (ADR-042); archive values lag up to one interval |
+| Funding settlements: `derivatives.funding.settled@1` | funding rate | yes | no settlement event; the indicative rate arrives with `MarkPrice` | Live settlements come from the archive once published (next day) |
+| Indicative funding, mark/index price, basis, time to next funding: `derivatives.mark@1` | mark price | **no** | yes | Mark/index price klines are not imported; stays warming up in archive replays |
+| Liquidation windows by side: `derivatives.liq.window.<5m\|15m\|1h>@1` | liquidations | **no** | yes | Lower bound only; warming up until the first liquidations-stream event, so archive zeros never read as a quiet market (ADR-042) |
 | Depth-dependent order flow (#17/#18/#22): liquidity added/removed, absorption with passive liquidity | order book | **no** | **from the start of live depth capture (#10) only** | bookDepth bands (raw, from 2023-01-01) are too coarse to substitute |

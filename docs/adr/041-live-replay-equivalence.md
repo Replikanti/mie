@@ -36,7 +36,7 @@ Two facts shape the comparison:
    `write_str("mie-market-state")`, `write_u32(1)`, then every public field
    of `MarketState` in declaration order — `feature_set`, `as_of`,
    `last_trade_price`, `bars`, `motion`, `atr`, `regime`, `flow`, `profile`,
-   `structure`, `trade_count`. The rules:
+   `structure`, `derivatives`, `trade_count`. The rules:
 
    | Type | Encoding |
    |---|---|
@@ -57,7 +57,7 @@ Two facts shape the comparison:
    `MarketState`, `trade_count` included: both sides of a comparison start
    from the same point (D4), so the counter is reproducible there even
    though it is not across replay windows. The engine's internal trackers
-   (ATR window, flow, profile and structure trackers, the last event and
+   (ATR window, flow, profile, structure and derivatives trackers, the last event and
    ids) are excluded: the public state is the contract, and a divergence
    hidden in a tracker shows up in the public state at a later checkpoint.
 2. **Versioning and comparability (D2).** Two state hashes are comparable
