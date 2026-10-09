@@ -1189,7 +1189,8 @@ pub const BOOK_DEPTH_V1: FeatureDefinition = FeatureDefinition {
 /// `book.clusters@1`: per side within 5 bps of mid, the 5 largest levels
 /// (ties to the level nearer mid), the lower-median level quantity, the
 /// total quantity and the level count (ADR-043 D8). Multiples of the median
-/// are derived on demand; there is no cluster threshold (#23 owns it).
+/// are derived on demand; there is no cluster threshold (ADR-044 D5
+/// registers every candidate as a location level).
 ///
 /// - Parameters: `band` = 0.0005 (`Rate`), `top_k` = 5.
 /// - Inputs: `book.l2@1`.

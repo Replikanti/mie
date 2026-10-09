@@ -13,7 +13,8 @@
 //!   the clock of the order-flow windows (ADR-035).
 //! - **Concentration** `book.clusters@1` ([`BookClusters`], decision 8): per
 //!   side within 5 bps, the largest levels with the side's median level
-//!   quantity. No threshold: #23 owns what counts as a cluster.
+//!   quantity. No threshold: location registers every top-5 candidate as a
+//!   liquidity-cluster level and scores it (ADR-044 D5).
 //!
 //! **Bands** (decision 2) are cumulative, 1, 2 and 5 bps of the mid
 //! `(best bid + best ask) / 2`, inclusive, compared exactly in doubled `i128`
@@ -436,7 +437,8 @@ impl fmt::Display for SideClusters {
 }
 
 /// Liquidity concentration per side: `book.clusters@1` (ADR-043, decision
-/// 8). Candidates for the liquidity clusters of #23, without a threshold.
+/// 8). Candidates for the liquidity-cluster levels of location, without a
+/// threshold: ADR-044 D5 registers every one of them.
 ///
 /// `Display` prints the canonical line the golden tests pin: the bid side,
 /// the ask side, then the feature key.

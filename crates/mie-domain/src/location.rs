@@ -7,7 +7,7 @@
 //!
 //! - `location.vwap.utc_day@1` ([`Vwap`], decision 4): the volume-weighted
 //!   average price of the current UTC day over its closed minutes, exact in
-//!   `i128` and floored to [`Price`](crate::num::Price).
+//!   `i128` and floored to [`Price`].
 //! - `location.levels@1` ([`LevelSet`], decisions 5–7): every level location
 //!   monitors, rebuilt at each closed 1m bar with trades from the prior-day
 //!   and 5-day composite profiles, the structure registries, the book's

@@ -31,7 +31,7 @@
 //! | arrays, `Vec`, slices | `write_len`, then the elements in stored order |
 //! | `FeatureKey` | the ADR-029 encoding: `write_str` of the id, `write_u32` of the version |
 //! | `FeatureSetVersion` | `write_u64` of the fingerprint value |
-//! | enums | an explicit match, never a cast, with codes in declaration order: `Timeframe` M1 0, M5 1, M15 2, H1 3, H4 4, D1 5; `RegimeLabel` Low 0, Medium 1, High 2, Extreme 3; `Side` High 0, Low 1; `SweepOutcome` Pending 0, Sfp 1, Break 2; `book::Side` Bid 0, Ask 1 |
+//! | enums | an explicit match, never a cast, with codes in declaration order: `Timeframe` M1 0, M5 1, M15 2, H1 3, H4 4, D1 5; `RegimeLabel` Low 0, Medium 1, High 2, Extreme 3; `Side` High 0, Low 1; `SweepOutcome` Pending 0, Sfp 1, Break 2; `book::Side` Bid 0, Ask 1; `LevelKind` Poc 0, Vah 1, Val 2, Hvn 3, Lvn 4, StructuralHigh 5, StructuralLow 6, LiquidityCluster 7, PriorSweep 8, SfpRejectionZone 9, Vwap 10, ValidatedReference 11; `AuctionState` InsideValue 0, AtValueEdge 1, OutsideValue 2, Breakout 3, FailedBreakout 4, FailedReclaim 5, Acceptance 6; `LevelSide` High 0, Low 1, Bid 2, Ask 3; `Region` Below 0, In 1, Above 2; `Position` Below 0, LowEdge 1, In 2, HighEdge 3, Above 4; `Origin` Start 0, Acceptance 1 |
 //! | `OrderBook` | the chain (`write_u8`: `Straddle` 0, `Chained` 1, `Invalid` 2, then the id as `u64` unless invalid), the trusted window (two `Option<Price>`), then the bids and the asks, each best first as `write_len` followed by price and quantity per level |
 //! | `Level` (in the book features) | price, then quantity |
 //! | structs | every field, through exhaustive destructuring, in declaration order as of encoding v1 |

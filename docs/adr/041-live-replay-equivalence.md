@@ -38,7 +38,7 @@ Two facts shape the comparison:
    `write_str("mie-market-state")`, `write_u32(1)`, then every public field
    of `MarketState` in declaration order — `feature_set`, `as_of`,
    `last_trade_price`, `bars`, `motion`, `atr`, `regime`, `flow`, `profile`,
-   `structure`, `derivatives`, `book`, `trade_count`. The rules:
+   `structure`, `derivatives`, `book`, `location`, `trade_count`. The rules:
 
    | Type | Encoding |
    |---|---|
@@ -51,7 +51,7 @@ Two facts shape the comparison:
    | arrays, `Vec` | `write_len`, then the elements in stored order |
    | `FeatureKey` | the ADR-029 encoding: id string, version `u32` |
    | `FeatureSetVersion` | `write_u64` of the fingerprint |
-   | enums | an explicit match with codes in declaration order: `Timeframe` M1 0 … D1 5; `RegimeLabel` Low 0 … Extreme 3; `Side` High 0, Low 1; `SweepOutcome` Pending 0, Sfp 1, Break 2; `book::Side` Bid 0, Ask 1 |
+   | enums | an explicit match with codes in declaration order: `Timeframe` M1 0 … D1 5; `RegimeLabel` Low 0 … Extreme 3; `Side` High 0, Low 1; `SweepOutcome` Pending 0, Sfp 1, Break 2; `book::Side` Bid 0, Ask 1; `LevelKind` Poc 0 … ValidatedReference 11; `AuctionState` InsideValue 0 … Acceptance 6; `LevelSide` High 0, Low 1, Bid 2, Ask 3; `Region` Below 0, In 1, Above 2; `Position` Below 0, LowEdge 1, In 2, HighEdge 3, Above 4; `Origin` Start 0, Acceptance 1 (ADR-044) |
    | `OrderBook` | the chain (`write_u8`: `Straddle` 0, `Chained` 1, `Invalid` 2; then the id as `u64` unless invalid), the trusted window (two `Option<Price>`), then the bids and the asks, each best first as `write_len` followed by price and quantity per level |
    | structs | every field, by exhaustive destructuring, in declaration order |
 
@@ -60,8 +60,8 @@ Two facts shape the comparison:
    `MarketState`, `trade_count` included: both sides of a comparison start
    from the same point (D4), so the counter is reproducible there even
    though it is not across replay windows. The engine's internal trackers
-   (ATR window, flow, profile, structure, derivatives and liquidity trackers,
-   the last event and ids) are excluded: the public state is the contract,
+   (ATR window, flow, profile, structure, derivatives, liquidity and
+   location trackers, the last event and ids) are excluded: the public state is the contract,
    and a divergence hidden in a tracker shows up in the public state at a
    later checkpoint. The order book is public state (`book.l2@1`), so it is
    hashed whole.
@@ -227,8 +227,10 @@ acceptance record.
    covers that.
 4. **The 00:00 UTC boundary inside a run.** It is the raw store's date
    partition boundary (`date=YYYY-MM-DD`, ADR-030), the reset point of the
-   UTC-day features (`profile.volume.utc_day@1`, `flow.cvd.utc_day@1`;
-   `profile.rs`, `flow.rs`), and a funding settlement time (every 8 h,
+   UTC-day features (`profile.volume.utc_day@1`, `flow.cvd.utc_day@1`,
+   `location.vwap.utc_day@1`; `profile.rs`, `flow.rs`, `location/vwap.rs`),
+   the switch of `location.auction.prior_day@1` to the new prior day
+   (ADR-044 D2), and a funding settlement time (every 8 h,
    `docs/data-availability.md`), the instant `next_funding_time` of the mark
    price moves on (ADR-042 D3).
 5. **Liquidations present early enough for their windows to turn `Ready`
@@ -258,11 +260,17 @@ list, derived from the code (the values below are the constants in the tree):
   up in a run of about 3 h, and 4h and 1d cannot in any run of a day.
 - `derivatives.funding.settled@1`: archive only, no live settlement event
   (ADR-042 D4), so it stays `WarmingUp` live and cannot be compared here.
+- `location.auction.prior_day@1` (ADR-044): it needs a prior day, so a run
+  reaches it only after its 00:00 UTC boundary (coverage item 4), and then
+  against a partial prior day, the run's part before the boundary. The
+  classifier is compared from there on; a full prior day is covered by the
+  fixture tests only.
 
 For these, coverage rests on the fixture tests (A), (B) and (C) of D5 and
 on the pinned `state_hash` golden values, not on the live run. A feature
 whose warm-up the run does reach (bars, flow, the profile, 15m structure,
-the 5m/15m/1h liquidation windows, OI, mark price) is covered by it.
+the 5m/15m/1h liquidation windows, OI, mark price, the UTC-day VWAP and the
+location level registry with its book clusters) is covered by it.
 
 **Capacity gate.** The run's `stats` journal records carry the channel
 `high_water` and `blocked_ms` (`journal.rs`).

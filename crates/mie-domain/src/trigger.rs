@@ -13,6 +13,10 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TriggerFamily {
     /// Failed auction: a probe beyond value rejected back inside.
+    ///
+    /// The location fact is [`AuctionState::FailedBreakout`](crate::location::AuctionState::FailedBreakout)
+    /// of `location.auction.prior_day@1` (ADR-044); the trigger rule is
+    /// owned by the bias/trigger issue.
     FailedAuction,
     /// Swing failure pattern: a sweep of a swing level followed by rejection.
     ///
@@ -31,7 +35,14 @@ pub enum TriggerFamily {
     /// Open-interest expansion followed by rejection.
     OiExpansionRejection,
     /// Failed reclaim of a lost level.
+    ///
+    /// The location fact is [`AuctionState::FailedReclaim`](crate::location::AuctionState::FailedReclaim)
+    /// (ADR-044); the trigger rule is owned by the bias/trigger issue.
     FailedReclaim,
     /// Breakout followed by acceptance.
+    ///
+    /// The location fact is a [`Breakout`](crate::location::AuctionState::Breakout)
+    /// that turns into [`Acceptance`](crate::location::AuctionState::Acceptance)
+    /// (ADR-044); the trigger rule is owned by the bias/trigger issue.
     BreakoutAcceptance,
 }

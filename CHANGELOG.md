@@ -19,6 +19,17 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   median level quantity) and `book.liquidity.window.<5m|15m|1h>@1`
   (liquidity added, cancelled and filled per side and band, fills matched
   with taker trades). Live only.
+- **Location and auction state (ADR-044).** `location.vwap.utc_day@1` (the
+  UTC-day VWAP over closed minutes), `location.levels@1` (a level registry
+  over the prior-day and 5-day profiles, the structure registries, the book
+  clusters and the VWAP, with distance, touches, age, source, confluence
+  and cluster strength per level, and Entered/Left zone events) and
+  `location.auction.prior_day@1` (the auction state against the prior day's
+  value: inside value, at the edge, outside, breakout, failed breakout,
+  failed reclaim, acceptance after 60 closes beyond the edge). Transitions
+  and zone events are exposed by `MarketStateEngine::location_events`.
+  `crates/mie-cli/tests/location_measure.rs` measures the numbers behind
+  the tolerance and the acceptance time over the archive.
 
 ## [0.1.0] - 2026-10-09
 
