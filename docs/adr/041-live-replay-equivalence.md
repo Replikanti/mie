@@ -24,9 +24,11 @@ Two facts shape the comparison:
   `mie replay` chains the runs of a window into one engine (ADR-039 D3) and
   restricts each run's output to the window (D4). A replay window that
   spans a restart therefore reaches other states than live did, by design.
-- `MarketState` has no order-book fields yet: the domain `OrderBook`
-  (ADR-038) joins the state with #18. Book events reach the engine and are
-  covered by the event-stream hash.
+- The order book joined `MarketState` with #18 (ADR-043): the domain
+  `OrderBook` (ADR-038) is the public feature `book.l2@1`, so its state
+  hash covers every level, not only the derived book features. Before
+  that, book events reached the engine only through the event-stream
+  hash.
 
 ## Decision
 
@@ -36,7 +38,7 @@ Two facts shape the comparison:
    `write_str("mie-market-state")`, `write_u32(1)`, then every public field
    of `MarketState` in declaration order — `feature_set`, `as_of`,
    `last_trade_price`, `bars`, `motion`, `atr`, `regime`, `flow`, `profile`,
-   `structure`, `derivatives`, `trade_count`. The rules:
+   `structure`, `derivatives`, `book`, `trade_count`. The rules:
 
    | Type | Encoding |
    |---|---|
@@ -49,7 +51,8 @@ Two facts shape the comparison:
    | arrays, `Vec` | `write_len`, then the elements in stored order |
    | `FeatureKey` | the ADR-029 encoding: id string, version `u32` |
    | `FeatureSetVersion` | `write_u64` of the fingerprint |
-   | enums | an explicit match with codes in declaration order: `Timeframe` M1 0 … D1 5; `RegimeLabel` Low 0 … Extreme 3; `Side` High 0, Low 1; `SweepOutcome` Pending 0, Sfp 1, Break 2 |
+   | enums | an explicit match with codes in declaration order: `Timeframe` M1 0 … D1 5; `RegimeLabel` Low 0 … Extreme 3; `Side` High 0, Low 1; `SweepOutcome` Pending 0, Sfp 1, Break 2; `book::Side` Bid 0, Ask 1 |
+   | `OrderBook` | the chain (`write_u8`: `Straddle` 0, `Chained` 1, `Invalid` 2; then the id as `u64` unless invalid), the trusted window (two `Option<Price>`), then the bids and the asks, each best first as `write_len` followed by price and quantity per level |
    | structs | every field, by exhaustive destructuring, in declaration order |
 
    Each encoder sits next to its type and destructures it without `..`, so
@@ -57,9 +60,11 @@ Two facts shape the comparison:
    `MarketState`, `trade_count` included: both sides of a comparison start
    from the same point (D4), so the counter is reproducible there even
    though it is not across replay windows. The engine's internal trackers
-   (ATR window, flow, profile, structure and derivatives trackers, the last event and
-   ids) are excluded: the public state is the contract, and a divergence
-   hidden in a tracker shows up in the public state at a later checkpoint.
+   (ATR window, flow, profile, structure, derivatives and liquidity trackers,
+   the last event and ids) are excluded: the public state is the contract,
+   and a divergence hidden in a tracker shows up in the public state at a
+   later checkpoint. The order book is public state (`book.l2@1`), so it is
+   hashed whole.
 2. **Versioning and comparability (D2).** Two state hashes are comparable
    only when their encoding (`STATE_HASH_ENCODING`) and their
    `FeatureSetVersion` are both equal. A new feature family — a new
@@ -126,7 +131,12 @@ Two facts shape the comparison:
    `mie ingest` composition in two runs against one store must be
    `EQUIVALENT` with state comparison; (C) a mutated trade quantity, a
    flipped journaled state hash and a dropped record must fail at the
-   first affected checkpoint or at the integrity check.
+   first affected checkpoint or at the integrity check; (G) the recorded
+   live depth window (the adapter's `depth*.jsonl` fixture, one sync)
+   played through the offline `mie ingest` composition with checkpoints
+   every second must be `EQUIVALENT` with state compared, and a mutated
+   level quantity in one recorded diff and a flipped state hash must
+   diverge at the first affected checkpoint (ADR-043).
 
 ## Consequences
 

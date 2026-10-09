@@ -34,7 +34,7 @@ and the 12 monthly `fundingRate` files were published, **0 missing**
 | Liquidation snapshots | `forceOrder` | ≤ 1/s per symbol (throttled lower bound) | start of live capture | `Liquidation` |
 | Closed 1m klines | `kline_1m` | 1 min | start of live capture | `Kline` |
 | Open interest | `openInterest` | 10 s poll | start of live capture | `OpenInterest`, `resolution_ms` 10 000 |
-| Order book (diff depth + snapshots) | planned (#10) | per update | start of live depth capture | `BookUpdate`, `BookSnapshot` |
+| Order book (diff depth + snapshots) | `depth`, `depthSnapshot` | diffs per 100 ms batch; `limit=1000` snapshots on every resync and a checkpoint every 60 s (ADR-038) | start of live depth capture (#10, first soak 2026-10-08) | `BookUpdate`, `BookSnapshot` |
 
 ## Features by period
 
@@ -46,4 +46,5 @@ and the 12 monthly `fundingRate` files were published, **0 missing**
 | Funding settlements: `derivatives.funding.settled@1` | funding rate | yes | no settlement event; the indicative rate arrives with `MarkPrice` | Live settlements come from the archive once published (next day) |
 | Indicative funding, mark/index price, basis, time to next funding: `derivatives.mark@1` | mark price | **no** | yes | Mark/index price klines are not imported; stays warming up in archive replays |
 | Liquidation windows by side: `derivatives.liq.window.<5m\|15m\|1h>@1` | liquidations | **no** | yes | Lower bound only; warming up until the first liquidations-stream event, so archive zeros never read as a quiet market (ADR-042) |
-| Depth-dependent order flow (#17/#18/#22): liquidity added/removed, absorption with passive liquidity | order book | **no** | **from the start of live depth capture (#10) only** | bookDepth bands (raw, from 2023-01-01) are too coarse to substitute |
+| Order-book liquidity state (#18): `book.l2@1` (the L2 book), `book.depth@1` (depth and imbalance within 1, 2 and 5 bps), `book.clusters@1` (largest levels within 5 bps), `book.liquidity.window.<5m\|15m\|1h>@1` (liquidity added, cancelled and filled) | order book, trades | **no** | **from the start of live depth capture (#10) only** | Live only (ADR-043): every `book.*` value stays warming up in archive replays. bookDepth bands (raw, from 2023-01-01) are too coarse to substitute |
+| Depth-dependent order flow (#22): absorption and exhaustion with passive liquidity | order book, trades | **no** | from the start of live depth capture (#10) only | Built on the `book.*` features |
