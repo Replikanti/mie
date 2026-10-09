@@ -377,12 +377,11 @@ impl Frame {
         })
     }
 
-    fn within(self, side: Side, price: i64, band: usize) -> bool {
-        let twice = 2 * i128::from(price);
-        let distance = match side {
-            Side::Bid => self.sum - twice,
-            Side::Ask => twice - self.sum,
-        };
+    /// Within band `band` of mid by absolute distance, on either side
+    /// (ADR-043, decision 2): an add beyond the pre-update mid counts by how
+    /// far it really is.
+    fn within(self, price: i64, band: usize) -> bool {
+        let distance = (self.sum - 2 * i128::from(price)).abs();
         distance * i128::from(SCALE) <= i128::from(catalog::BOOK_BANDS[band].units()) * self.sum
     }
 
@@ -391,7 +390,7 @@ impl Frame {
             Side::Bid => self.lowest_bid.is_some_and(|w| price >= w.units()),
             Side::Ask => self.highest_ask.is_some_and(|w| price <= w.units()),
         };
-        inside && self.within(side, price, BANDS - 1)
+        inside && self.within(price, BANDS - 1)
     }
 }
 
@@ -453,7 +452,7 @@ fn run(config: Config) -> Outcome {
                     continue;
                 }
                 for (band, sides) in cell.iter_mut().enumerate() {
-                    if frame.within(action.side, action.price, band) {
+                    if frame.within(action.price, band) {
                         let t = &mut sides[side_index(action.side)];
                         match action.kind {
                             Kind::Add => t.added += action.qty,
@@ -475,7 +474,7 @@ fn run(config: Config) -> Outcome {
                     }
                     let old = book.qty_at(side, level.price).map_or(0, Qty::units);
                     for (band, sides) in cell.iter_mut().enumerate() {
-                        if frame.within(side, price, band) {
+                        if frame.within(price, band) {
                             sides[side_index(side)].net += level.qty.units() - old;
                         }
                     }

@@ -93,9 +93,17 @@ Every number below cites one of these. The probe used public data only.
 2. **Mid and bands.**
    - Mid = (best bid + best ask) / 2. Every comparison uses doubled units in
      `i128`, so it is exact for any mid, also a half-unit one.
-   - Bands are cumulative and inclusive: **1, 2 and 5 bps** of mid. Bid `p`
-     is in band `e` iff `(a + b − 2p) · SCALE ≤ e · (a + b)`, with `e` in
-     `Rate` units (1 bps = 10 000); asks symmetrically.
+   - Bands are cumulative and inclusive: **1, 2 and 5 bps** of mid. Price
+     `p` on either side is in band `e` iff `|a + b − 2p| · SCALE ≤ e · (a + b)`,
+     with `e` in `Rate` units (1 bps = 10 000).
+   - *Why the absolute distance:* for the resting levels of an uncrossed
+     book it equals the signed distance away from the spread. Decision 5
+     measures an update's levels against the mid before the update, and a
+     batch can place a level beyond that mid (a bid above it, an ask below
+     it). The signed form gives such a level a negative distance, so a bid
+     50 bps above mid would count in every band; the absolute form books it
+     by how far it really is. Rejected: clamping the signed distance at 0,
+     which still puts any far-side level in the 1 bps band.
    - *Why bps:* they scale with price; an absolute USDT band changes meaning
      as price moves. Rejected: ATR-scaled bands, which widen in high
      volatility, exactly when drift eats the window, so they would be out of
@@ -134,7 +142,8 @@ Every number below cites one of these. The probe used public data only.
    1. Within the update, the last value per (side, price) wins: one final
       quantity per level.
    2. Accounted prices lie inside the trusted window on their side and
-      within 5 bps of `m`. Each counts in every band that contains it.
+      within 5 bps of `m` by absolute distance (decision 2). Each counts in
+      every band that contains it.
    3. `Δ = final − old`, with `old` = 0 when the level is absent inside the
       window.
    4. Pending fills per (side, price): a `Trade` with aggressor `Buy` adds
@@ -236,8 +245,16 @@ Every number below cites one of these. The probe used public data only.
    levels that approach the bulk. *Why 5 bps:* the outer band of decision 2,
    with the same availability.
 9. **Exactness and atomicity.**
-   - Flow and pending sums use checked `Qty` and fail the step with
-     `StateError::Overflow`; nothing is committed then, the book included.
+   - A minute's flow and the pending sums use checked `Qty` and fail the
+     step with `StateError::Overflow`; nothing is committed then, the book
+     included.
+   - A window sum outside the `Qty` range makes that window
+     `Unavailable{OutOfRange}`, as a depth sum does its band (decision 4).
+     *Why:* the windows are recomputed on the event that closes a minute,
+     usually a trade. Failing the step there would reject an ordinary
+     trade for every bar, flow and profile family for as long as the
+     out-of-range minutes stay in the window, up to an hour; the window is
+     the only value that cannot be computed.
    - The book is mutated only in commit, after every step succeeded.
    - Floats are derived on demand only, so `MarketState` stays `Eq`.
 10. **Features** (the ids are permanent). Parameters are sorted by name; a
