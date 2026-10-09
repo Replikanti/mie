@@ -956,6 +956,172 @@ pub const STRUCTURE_LEVELS: [(Timeframe, &FeatureDefinition); 4] = [
     (Timeframe::D1, &STRUCTURE_LEVELS_1D_V1),
 ];
 
+/// `derivatives.oi.sample@1`: the last open-interest sample at its source
+/// resolution, with the exact step (ΔOI, elapsed time) against the previous
+/// sample (ADR-042, decision 1). OI velocity is derived from the step.
+///
+/// - Parameters: `gap_policy` = `break_chain`, `step_tolerance_ms` =
+///   15 000.
+/// - Inputs: open interest (samples and open-interest feed gaps).
+/// - Warm-up: one sample, where a sample is an open-interest event.
+/// - Gap policy: the level stays ready. An open-interest gap breaks the
+///   chain: the next sample has no step. So does a change of
+///   `resolution_ms` or an elapsed time outside `(0, resolution_ms +
+///   step_tolerance_ms]`.
+pub const DERIVATIVES_OI_SAMPLE_V1: FeatureDefinition = FeatureDefinition {
+    key: FeatureKey::new("derivatives.oi.sample", 1),
+    params: &[
+        Param {
+            name: "gap_policy",
+            value: ParamValue::Text("break_chain"),
+        },
+        Param {
+            name: "step_tolerance_ms",
+            value: ParamValue::Int(15_000),
+        },
+    ],
+    inputs: &[Input::Stream(Stream::OpenInterest)],
+    warm_up: WarmUp::Samples(1),
+};
+
+/// `derivatives.oi.5m@1`: open interest on the UTC 5-minute grid — the
+/// latest sample at or before each boundary, with ΔOI against the previous
+/// boundary (ADR-042, decision 2). Live (10 s) and archive (5 min) samples
+/// both produce it; the value keeps the source `resolution_ms`.
+///
+/// - Parameters: `grid_ms` = 300 000, `max_age_ms` = 60 000.
+/// - Inputs: open interest.
+/// - Warm-up: one sample, where a sample is a closed boundary. Boundaries
+///   close on open-interest events only.
+/// - Gap policy: no separate rule. A boundary whose sample is older than
+///   `max_age_ms` is `Unavailable(InputInvalid)`, which is what a boundary
+///   after a feed hole becomes; the delta needs the previous boundary,
+///   ready and at the same resolution.
+pub const DERIVATIVES_OI_5M_V1: FeatureDefinition = FeatureDefinition {
+    key: FeatureKey::new("derivatives.oi.5m", 1),
+    params: &[
+        Param {
+            name: "grid_ms",
+            value: ParamValue::Int(300_000),
+        },
+        Param {
+            name: "max_age_ms",
+            value: ParamValue::Int(60_000),
+        },
+    ],
+    inputs: &[Input::Stream(Stream::OpenInterest)],
+    warm_up: WarmUp::Samples(1),
+};
+
+/// `derivatives.mark@1`: the last mark and index price with the indicative
+/// funding rate and the next funding time (ADR-042, decision 3). Basis and
+/// the time to the next funding are derived exactly.
+///
+/// - Inputs: mark price (live only).
+/// - Warm-up: one sample, where a sample is a mark-price event.
+/// - Gap policy: none — a feed gap leaves the value, which keeps its own
+///   time.
+pub const DERIVATIVES_MARK_V1: FeatureDefinition = FeatureDefinition {
+    key: FeatureKey::new("derivatives.mark", 1),
+    params: &[],
+    inputs: &[Input::Stream(Stream::MarkPrice)],
+    warm_up: WarmUp::Samples(1),
+};
+
+/// `derivatives.funding.settled@1`: the last settled funding rate (ADR-042,
+/// decision 4).
+///
+/// - Inputs: funding settlements (archive only today).
+/// - Warm-up: one sample, where a sample is a funding settlement.
+/// - Gap policy: none — a feed gap leaves the value, which keeps its own
+///   time.
+pub const DERIVATIVES_FUNDING_SETTLED_V1: FeatureDefinition = FeatureDefinition {
+    key: FeatureKey::new("derivatives.funding.settled", 1),
+    params: &[],
+    inputs: &[Input::Stream(Stream::Funding)],
+    warm_up: WarmUp::Samples(1),
+};
+
+/// A `derivatives.liq.window.<label>@1` definition (ADR-042, decision 5):
+/// liquidations by side over the last `minutes` closed 1m bars.
+const fn liq_window_v1(
+    id: &'static str,
+    params: &'static [Param],
+    minutes: u32,
+) -> FeatureDefinition {
+    FeatureDefinition {
+        key: FeatureKey::new(id, 1),
+        params,
+        inputs: &[
+            Input::Stream(Stream::Liquidations),
+            Input::Feature(BARS_TIME_1M_V1.key),
+        ],
+        warm_up: WarmUp::Samples(minutes),
+    }
+}
+
+/// `derivatives.liq.window.5m@1`: liquidation count and filled quantity by
+/// side over the last 5 closed 1m bars (ADR-042, decision 5). A `Sell`
+/// liquidation order closes a long, a `Buy` order a short. Every value is a
+/// lower bound: the exchange stream is throttled.
+///
+/// - Parameters: `window_ms` = 300 000.
+/// - Inputs: liquidations and `bars.time.1m@1` (the clock).
+/// - Warm-up: 5 samples, where a sample is a closed 1m bar from the minute
+///   of the first liquidations-stream event (a liquidation or a gap) on.
+///   Until that event the window warms up with 0 samples: the archive has
+///   no liquidations, and its zeros are not a quiet market.
+/// - Gap policy: the window never goes back to warming up. A liquidations
+///   gap flags every minute it overlaps with `feed_gap`, also minutes that
+///   already closed; the window carries the OR of its minutes' flags, and
+///   the first minute is `partial_start`.
+pub const DERIVATIVES_LIQ_WINDOW_5M_V1: FeatureDefinition = liq_window_v1(
+    "derivatives.liq.window.5m",
+    &[Param {
+        name: "window_ms",
+        value: ParamValue::Int(300_000),
+    }],
+    5,
+);
+
+/// `derivatives.liq.window.15m@1`: liquidations by side over the last 15
+/// closed 1m bars (ADR-042, decision 5). A lower bound.
+///
+/// Parameters: `window_ms` = 900 000. Warm-up: 15 samples (closed 1m bars
+/// from the first liquidations-stream event on). Inputs and gap policy as
+/// [`DERIVATIVES_LIQ_WINDOW_5M_V1`].
+pub const DERIVATIVES_LIQ_WINDOW_15M_V1: FeatureDefinition = liq_window_v1(
+    "derivatives.liq.window.15m",
+    &[Param {
+        name: "window_ms",
+        value: ParamValue::Int(900_000),
+    }],
+    15,
+);
+
+/// `derivatives.liq.window.1h@1`: liquidations by side over the last 60
+/// closed 1m bars (ADR-042, decision 5). A lower bound.
+///
+/// Parameters: `window_ms` = 3 600 000. Warm-up: 60 samples (closed 1m bars
+/// from the first liquidations-stream event on). Inputs and gap policy as
+/// [`DERIVATIVES_LIQ_WINDOW_5M_V1`].
+pub const DERIVATIVES_LIQ_WINDOW_1H_V1: FeatureDefinition = liq_window_v1(
+    "derivatives.liq.window.1h",
+    &[Param {
+        name: "window_ms",
+        value: ParamValue::Int(3_600_000),
+    }],
+    60,
+);
+
+/// The liquidation window of each length, shortest first; the Market State
+/// builds its liquidation windows from it. The timeframe is the window length, not a bar series.
+pub const LIQ_WINDOWS: [(Timeframe, &FeatureDefinition); 3] = [
+    (Timeframe::M5, &DERIVATIVES_LIQ_WINDOW_5M_V1),
+    (Timeframe::M15, &DERIVATIVES_LIQ_WINDOW_15M_V1),
+    (Timeframe::H1, &DERIVATIVES_LIQ_WINDOW_1H_V1),
+];
+
 /// Every version of every feature. Never shrinks.
 pub const DEFINITIONS: &[&FeatureDefinition] = &[
     &TRADE_LAST_PRICE_V1,
@@ -989,6 +1155,13 @@ pub const DEFINITIONS: &[&FeatureDefinition] = &[
     &STRUCTURE_LEVELS_1H_V1,
     &STRUCTURE_LEVELS_4H_V1,
     &STRUCTURE_LEVELS_1D_V1,
+    &DERIVATIVES_OI_SAMPLE_V1,
+    &DERIVATIVES_OI_5M_V1,
+    &DERIVATIVES_MARK_V1,
+    &DERIVATIVES_FUNDING_SETTLED_V1,
+    &DERIVATIVES_LIQ_WINDOW_5M_V1,
+    &DERIVATIVES_LIQ_WINDOW_15M_V1,
+    &DERIVATIVES_LIQ_WINDOW_1H_V1,
 ];
 
 /// The fingerprint each published `id@version` must keep. Append-only: one
@@ -1025,6 +1198,13 @@ pub const LOCK: &[LockEntry] = &[
     LockEntry::new("structure.levels.1h", 1, 0x8dca_ac85_b01e_2e17),
     LockEntry::new("structure.levels.4h", 1, 0x9e80_e15b_4382_0c99),
     LockEntry::new("structure.levels.1d", 1, 0xb81f_aa9e_a38e_5d88),
+    LockEntry::new("derivatives.oi.sample", 1, 0x0306_c571_c734_0c06),
+    LockEntry::new("derivatives.oi.5m", 1, 0x0323_23ab_6e3e_fd77),
+    LockEntry::new("derivatives.mark", 1, 0xe582_9004_7f9c_145d),
+    LockEntry::new("derivatives.funding.settled", 1, 0x593b_4c94_d6cc_22d0),
+    LockEntry::new("derivatives.liq.window.5m", 1, 0xe58f_6c17_aae9_6808),
+    LockEntry::new("derivatives.liq.window.15m", 1, 0x08b6_f494_da9d_36ed),
+    LockEntry::new("derivatives.liq.window.1h", 1, 0xf8bf_c670_4109_615b),
 ];
 
 /// The default feature set: the latest version of each computed feature.
@@ -1060,6 +1240,13 @@ pub const CURRENT: &[FeatureKey] = &[
     STRUCTURE_LEVELS_1H_V1.key,
     STRUCTURE_LEVELS_4H_V1.key,
     STRUCTURE_LEVELS_1D_V1.key,
+    DERIVATIVES_OI_SAMPLE_V1.key,
+    DERIVATIVES_OI_5M_V1.key,
+    DERIVATIVES_MARK_V1.key,
+    DERIVATIVES_FUNDING_SETTLED_V1.key,
+    DERIVATIVES_LIQ_WINDOW_5M_V1.key,
+    DERIVATIVES_LIQ_WINDOW_15M_V1.key,
+    DERIVATIVES_LIQ_WINDOW_1H_V1.key,
 ];
 
 /// The registry of [`DEFINITIONS`].
@@ -1133,10 +1320,10 @@ mod tests {
             hasher.write_u32(entry.key.version.get());
             hasher.write_u64(entry.fingerprint.value());
         }
-        assert_eq!(LOCK.len(), 31, "lock lines");
+        assert_eq!(LOCK.len(), 38, "lock lines");
         assert_eq!(
             hasher.finish().to_string(),
-            "087dddb089e9bf7e",
+            "7fc1ab6556667ec4",
             "lock digest"
         );
     }
@@ -1381,6 +1568,94 @@ mod tests {
     }
 
     #[test]
+    fn derivatives_features_match_their_parameters() {
+        assert_eq!(
+            LIQ_WINDOWS.map(|(timeframe, _)| timeframe),
+            [Timeframe::M5, Timeframe::M15, Timeframe::H1]
+        );
+        for (timeframe, definition) in LIQ_WINDOWS {
+            assert_eq!(
+                definition.key.id.as_str(),
+                format!("derivatives.liq.window.{}", timeframe.label()),
+                "{timeframe:?}"
+            );
+            assert_eq!(
+                definition.params,
+                &[Param {
+                    name: "window_ms",
+                    value: ParamValue::Int(timeframe.millis()),
+                }],
+                "{timeframe:?}"
+            );
+            assert_eq!(
+                definition.inputs,
+                &[
+                    Input::Stream(Stream::Liquidations),
+                    Input::Feature(BARS_TIME_1M_V1.key)
+                ]
+            );
+            let minutes = u32::try_from(timeframe.millis() / Timeframe::M1.millis()).unwrap();
+            assert_eq!(
+                definition.warm_up,
+                WarmUp::Samples(minutes),
+                "{timeframe:?}"
+            );
+        }
+        assert_eq!(
+            DERIVATIVES_OI_SAMPLE_V1.params,
+            &[
+                Param {
+                    name: "gap_policy",
+                    value: ParamValue::Text("break_chain"),
+                },
+                Param {
+                    name: "step_tolerance_ms",
+                    value: ParamValue::Int(15_000),
+                },
+            ]
+        );
+        assert_eq!(
+            DERIVATIVES_OI_5M_V1.params,
+            &[
+                Param {
+                    name: "grid_ms",
+                    value: ParamValue::Int(Timeframe::M5.millis()),
+                },
+                Param {
+                    name: "max_age_ms",
+                    value: ParamValue::Int(60_000),
+                },
+            ]
+        );
+        assert!(DERIVATIVES_MARK_V1.params.is_empty());
+        assert!(DERIVATIVES_FUNDING_SETTLED_V1.params.is_empty());
+        let streams = [
+            (&DERIVATIVES_OI_SAMPLE_V1, Stream::OpenInterest),
+            (&DERIVATIVES_OI_5M_V1, Stream::OpenInterest),
+            (&DERIVATIVES_MARK_V1, Stream::MarkPrice),
+            (&DERIVATIVES_FUNDING_SETTLED_V1, Stream::Funding),
+        ];
+        for (definition, stream) in streams {
+            assert_eq!(definition.inputs, &[Input::Stream(stream)]);
+            assert_eq!(definition.warm_up, WarmUp::Samples(1));
+        }
+        let derivatives = [
+            &DERIVATIVES_OI_SAMPLE_V1,
+            &DERIVATIVES_OI_5M_V1,
+            &DERIVATIVES_MARK_V1,
+            &DERIVATIVES_FUNDING_SETTLED_V1,
+            &DERIVATIVES_LIQ_WINDOW_5M_V1,
+            &DERIVATIVES_LIQ_WINDOW_15M_V1,
+            &DERIVATIVES_LIQ_WINDOW_1H_V1,
+        ];
+        for definition in derivatives {
+            assert!(definition.key.id.as_str().starts_with("derivatives."));
+            assert_eq!(definition.key.version.get(), 1);
+            assert!(CURRENT.contains(&definition.key), "{}", definition.key);
+        }
+    }
+
+    #[test]
     fn current_set_version_is_pinned() {
         // The feature-set version every experiment records (ADR-029). It may
         // change only when CURRENT does — any other change here means a
@@ -1391,6 +1666,9 @@ mod tests {
             "bars.motion.15m@1,bars.motion.1d@1,bars.motion.1h@1,bars.motion.1m@1,\
              bars.motion.4h@1,bars.motion.5m@1,bars.time.15m@1,bars.time.1d@1,\
              bars.time.1h@1,bars.time.1m@1,bars.time.4h@1,bars.time.5m@1,\
+             derivatives.funding.settled@1,derivatives.liq.window.15m@1,\
+             derivatives.liq.window.1h@1,derivatives.liq.window.5m@1,\
+             derivatives.mark@1,derivatives.oi.5m@1,derivatives.oi.sample@1,\
              flow.cvd.continuous@1,flow.cvd.utc_day@1,flow.window.15m@1,\
              flow.window.1h@1,flow.window.5m@1,profile.volume.composite_5d@1,\
              profile.volume.prior_day@1,profile.volume.utc_day@1,\
@@ -1399,6 +1677,6 @@ mod tests {
              structure.swing.1h@1,structure.swing.4h@1,trade.last_price@1,\
              volatility.atr.1h@1,volatility.regime.1h@1"
         );
-        assert_eq!(set.version().to_string(), "faac613e2a5ebbab");
+        assert_eq!(set.version().to_string(), "95352aa75cb005e3");
     }
 }
