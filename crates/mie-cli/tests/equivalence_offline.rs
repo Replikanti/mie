@@ -20,10 +20,16 @@
 //! - (F) A run recorded with another feature set compares its events only:
 //!   what the engine decides may differ, a mutated trade still diverges as
 //!   an event stream.
+//! - (G) The order book in the state (ADR-043): the recorded live depth
+//!   window (`mie-adapter-binance/tests/fixtures/depth*.jsonl`) through the
+//!   offline `mie ingest` composition, checkpoints every second, is
+//!   EQUIVALENT with the state compared; a mutated level quantity in one
+//!   recorded diff diverges at the first checkpoint after it, and a flipped
+//!   state hash as state.
 
 mod common;
 
-use common::{Connections, DrivenClock, TempDir};
+use common::{Connections, DepthConnection, DrivenClock, TempDir, ingest_depth};
 use mie_adapter_binance::transport::{Clock, HttpGet};
 use mie_adapter_binance::{BinanceStream, LiveReplay};
 use mie_adapter_parquet::{ParquetRawStore, RotationPolicy};
@@ -35,7 +41,7 @@ use mie_cli::equivalence::{
 use mie_cli::ingest::Transports;
 use mie_cli::journal::{JournaledRun, read_runs};
 use mie_domain::event::MarketEvent;
-use mie_domain::feature::catalog;
+use mie_domain::feature::{FeatureValue, catalog};
 use mie_domain::state::MarketStateEngine;
 use mie_domain::time::EventTime;
 use mie_ports::outbound::{MarketDataProvider, ReplayWindow};
@@ -797,6 +803,209 @@ fn the_offline_live_path_in_two_runs_is_equivalent_with_state() {
     };
     assert_eq!((d.index, d.kind), (1, DivergenceKind::State));
     assert_eq!(outcome.exit_code(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// (G) The order book in the state: a depth-only offline ingest.
+
+/// The adapter's recorded live depth window (its fixture README): 29 diffs
+/// and two `limit=100` snapshots.
+const DEPTH_FIXTURES: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../mie-adapter-binance/tests/fixtures"
+);
+
+fn depth_lines(name: &str) -> Vec<String> {
+    std::fs::read_to_string(Path::new(DEPTH_FIXTURES).join(format!("{name}.jsonl")))
+        .expect("read the depth fixture")
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// A depth-only capture into `dir`, state checkpoints every second.
+fn depth_config(dir: &Path) -> IngestConfig {
+    IngestConfig::parse(&format!(
+        r#"
+[instrument]
+symbol = "BTCUSDT"
+source = "binance-um"
+
+[paths]
+raw_root = "{}"
+journal = "{}"
+
+[binance]
+ws_base_url = "wss://fake.invalid/market/ws"
+ws_public_base_url = "wss://fake.invalid/public/ws"
+rest_base_url = "https://fake.invalid"
+streams = ["depth", "depthSnapshot"]
+
+[capture]
+hold_back_ms = 750
+depth_snapshot_min_spacing_ms = 1
+state_checkpoint_interval_secs = 1
+"#,
+        dir.join("raw").display(),
+        dir.join("journal.jsonl").display()
+    ))
+    .expect("valid test config")
+}
+
+/// Every record of `config`'s store, in `receive_seq` order.
+fn stored_records(config: &IngestConfig) -> Vec<Record> {
+    let store = ParquetRawStore::new(&config.paths.raw_root);
+    let keys: BTreeSet<RawStreamKey> = ["depth", "depthSnapshot"]
+        .iter()
+        .map(|s| RawStreamKey::new("binance-um", "BTCUSDT", s).unwrap())
+        .collect();
+    let day = 86_400_000;
+    let first = depth_time(&depth_lines("depth")[0]);
+    let window = ReplayWindow {
+        start: EventTime::from_millis(first - day),
+        end: EventTime::from_millis(first + day),
+    };
+    let mut records = Vec::new();
+    for file in store
+        .select(&RawSelection::new(keys, window).unwrap())
+        .unwrap()
+        .files
+    {
+        for record in store.read(&file).unwrap() {
+            let capture = record.capture.clone().unwrap();
+            records.push(Record {
+                stream: BinanceStream::from_raw_name(file.stream.stream()).unwrap(),
+                receive_seq: capture.receive_seq,
+                receive_time_ns: capture.receive_time_ns,
+                session_id: capture.session_id,
+                event_time_ms: record.event_time.as_millis(),
+                payload: String::from_utf8(record.payload).unwrap(),
+            });
+        }
+    }
+    records.sort_by_key(|r| r.receive_seq);
+    records
+}
+
+/// The `T` of a depth diff.
+fn depth_time(diff: &str) -> i64 {
+    let payload: Value = serde_json::from_str(diff).unwrap();
+    payload["T"].as_i64().unwrap()
+}
+
+#[test]
+fn the_order_book_state_replays_equivalently_and_a_mutated_level_diverges() {
+    let diffs = depth_lines("depth");
+    let snapshots = depth_lines("depthSnapshot");
+    let dir = TempDir::new("equivalence-depth");
+    let config = depth_config(dir.path());
+    let start = depth_time(&diffs[0]);
+    let outcome = ingest_depth(
+        &config,
+        start,
+        vec![DepthConnection {
+            frames: diffs.clone(),
+            await_served: 1,
+        }],
+        snapshots,
+        vec![],
+    );
+    assert_eq!(outcome.exit_code(), 0, "{:?}", outcome.error);
+    assert_eq!(outcome.domain_rejections, 0);
+    let runs = read_runs(&config.paths.journal, "binance-um").unwrap();
+    assert_eq!(runs.len(), 1);
+    let run = &runs[0];
+    assert!(run.checkpoints.len() >= 3, "{run:?}");
+    let run_id = run.parameters.run_id.clone();
+
+    let (outcome, text) = check(&config, start, start + 1);
+    assert_eq!(outcome.runs.len(), 1, "{text}");
+    assert_eq!(outcome.runs[0].verdict, Verdict::Equivalent, "{text}");
+    assert_eq!(outcome.exit_code(), 0);
+
+    // The compared states carry the book: the recompute ends with it ready.
+    let (delivered, checkpoints) = recompute(&config, &run_id, 1_000);
+    assert_eq!(checkpoints.len(), run.checkpoints.len());
+    let mut engine = MarketStateEngine::new();
+    for event in &delivered {
+        engine.apply(event).unwrap();
+    }
+    assert!(
+        matches!(engine.state().book.l2, FeatureValue::Ready(_)),
+        "{:?}",
+        engine.state().book.l2
+    );
+
+    // A mutated level quantity in a diff from the middle of the window.
+    let records = stored_records(&config);
+    let journal: Vec<Value> = std::fs::read_to_string(&config.paths.journal)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let journaled: Vec<u64> = journal
+        .iter()
+        .filter(|l| l["type"] == "state_checkpoint")
+        .map(|l| l["ordinal"].as_u64().unwrap())
+        .collect();
+    let target = records
+        .iter()
+        .position(|r| r.stream == BinanceStream::Depth && r.payload == diffs[14])
+        .expect("the 15th diff is stored");
+    let u = serde_json::from_str::<Value>(&diffs[14]).unwrap()["u"]
+        .as_u64()
+        .unwrap();
+    let position = delivered
+        .iter()
+        .position(|e| matches!(e, MarketEvent::BookUpdate(b) if b.last_update_id == u))
+        .expect("the 15th diff is delivered after the sync") as u64
+        + 1;
+    let expected = journaled
+        .iter()
+        .position(|&ordinal| ordinal >= position)
+        .expect("a checkpoint at or after the diff");
+    let mut mutated = records.clone();
+    let mut payload: Value = serde_json::from_str(&mutated[target].payload).unwrap();
+    let qty = payload["b"][0][1].as_str().unwrap().to_owned();
+    payload["b"][0][1] = json!(if qty == "9.999" { "8.888" } else { "9.999" });
+    mutated[target].payload = payload.to_string();
+    let dir = TempDir::new("equivalence-depth-mutated");
+    let mutated_config = depth_config(dir.path());
+    write_store(&mutated_config.paths.raw_root, &mutated);
+    write_journal(&mutated_config.paths.journal, &journal);
+    let (outcome, text) = check(&mutated_config, start, start + 1);
+    let Verdict::Diverged(Mismatch::Checkpoint(d)) = &outcome.runs[0].verdict else {
+        panic!("{text}")
+    };
+    assert_eq!(
+        (d.index, d.kind),
+        (expected, DivergenceKind::EventStream),
+        "{text}"
+    );
+    assert_eq!(outcome.exit_code(), 1);
+
+    // A flipped state hash diverges as state.
+    let mut flipped = journal.clone();
+    let positions: Vec<usize> = (0..flipped.len())
+        .filter(|&i| flipped[i]["type"] == "state_checkpoint")
+        .collect();
+    let target = positions.len() / 2;
+    let line = &mut flipped[positions[target]];
+    let hash = line["state_hash"].as_str().unwrap().to_owned();
+    line["state_hash"] = json!(if hash == "0123456789abcdef" {
+        "fedcba9876543210"
+    } else {
+        "0123456789abcdef"
+    });
+    let dir = TempDir::new("equivalence-depth-flipped");
+    let flipped_config = depth_config(dir.path());
+    write_store(&flipped_config.paths.raw_root, &records);
+    write_journal(&flipped_config.paths.journal, &flipped);
+    let (outcome, text) = check(&flipped_config, start, start + 1);
+    let Verdict::Diverged(Mismatch::Checkpoint(d)) = &outcome.runs[0].verdict else {
+        panic!("{text}")
+    };
+    assert_eq!((d.index, d.kind), (target, DivergenceKind::State), "{text}");
 }
 
 // ---------------------------------------------------------------------------

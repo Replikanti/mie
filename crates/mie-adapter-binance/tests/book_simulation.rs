@@ -11,15 +11,18 @@
 //! fetched on a cadence.
 //!
 //! Asserts: the engine accepts everything, the domain book is invalidated
-//! only by `OrderBook` gaps, [`BookAudit`] reports only `Matched`, and the
-//! recorded records recompute to the identical output. Perturbing one level
-//! of one diff makes the audit report a mismatch.
+//! only by `OrderBook` gaps, the engine's `book.l2@1` equals the domain book
+//! after every event while it is valid and is not ready otherwise (ADR-043
+//! D1), [`BookAudit`] reports only `Matched`, and the recorded records
+//! recompute to the identical output. Perturbing one level of one diff makes
+//! the audit report a mismatch.
 
 use mie_adapter_binance::book_sync::BookTransition;
 use mie_adapter_binance::normalize::record_time;
 use mie_adapter_binance::{BinanceStream, BookAudit, CheckpointResult, Pipeline};
 use mie_domain::book::{BookStep, OrderBook};
 use mie_domain::event::{GapReason, MarketEvent};
+use mie_domain::feature::FeatureValue;
 use mie_domain::state::MarketStateEngine;
 use mie_ports::raw::{Capture, RawRecord};
 use std::collections::BTreeMap;
@@ -383,6 +386,16 @@ fn verify(events: &[MarketEvent]) -> Vec<CheckpointResult> {
                 matches!(event, MarketEvent::FeedGap(_)),
                 "event {i} invalidated the book: {why:?}"
             );
+        }
+        // The engine owns the same book (ADR-043 D1).
+        match &engine.state().book.l2 {
+            FeatureValue::Ready(l2) => {
+                assert!(book.is_valid(), "event {i}");
+                assert_eq!(l2, &book, "event {i}");
+            }
+            FeatureValue::WarmingUp { .. } | FeatureValue::Unavailable { .. } => {
+                assert!(!book.is_valid(), "event {i}");
+            }
         }
         checkpoints.extend(audit.apply(event));
     }

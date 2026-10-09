@@ -10,6 +10,16 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
 
 ## [Unreleased]
 
+### Added
+
+- **Order-book liquidity state (ADR-043).** The engine owns the L2 book as
+  `book.l2@1` and hashes it whole in the Market State; `book.depth@1` (best
+  levels, depth and imbalance within 1, 2 and 5 bps of mid),
+  `book.clusters@1` (the five largest levels per side within 5 bps with the
+  median level quantity) and `book.liquidity.window.<5m|15m|1h>@1`
+  (liquidity added, cancelled and filled per side and band, fills matched
+  with taker trades). Live only.
+
 ## [0.1.0] - 2026-10-09
 
 ### Added

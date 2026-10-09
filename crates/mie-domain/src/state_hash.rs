@@ -6,15 +6,18 @@
 //! checkpoints. Both sides compare a [`StateHash`]: a FNV-1a 64
 //! [`Fingerprint`] over an explicit byte encoding of every public field of
 //! [`MarketState`], written with the [`Fingerprinter`] writers (ADR-029). The
-//! engine's internal trackers (ATR window, flow, profile, structure and
-//! derivatives trackers) are not hashed: the public state is the contract,
-//! and a hidden divergence shows up in it at a later checkpoint.
+//! engine's internal trackers (ATR window, flow, profile, structure,
+//! derivatives and liquidity trackers) are not hashed: the public state is
+//! the contract, and a hidden divergence shows up in it at a later
+//! checkpoint. The order book is public state (`book.l2@1`, ADR-043), so
+//! every level of it is hashed.
 //!
 //! **Encoding v1.** A header, `write_str("mie-market-state")` then
 //! `write_u32(`[`STATE_HASH_ENCODING`]`)`, then the fields of
 //! [`MarketState`] in declaration order: `feature_set`, `as_of`,
 //! `last_trade_price`, `bars`, `motion`, `atr`, `regime`, `flow`, `profile`,
-//! `structure`, `derivatives`, `trade_count`. Every value is written by these rules:
+//! `structure`, `derivatives`, `book`, `trade_count`. Every value is written
+//! by these rules:
 //!
 //! | Type | Encoding |
 //! |---|---|
@@ -27,7 +30,9 @@
 //! | arrays, `Vec`, slices | `write_len`, then the elements in stored order |
 //! | `FeatureKey` | the ADR-029 encoding: `write_str` of the id, `write_u32` of the version |
 //! | `FeatureSetVersion` | `write_u64` of the fingerprint value |
-//! | enums | an explicit match, never a cast, with codes in declaration order: `Timeframe` M1 0, M5 1, M15 2, H1 3, H4 4, D1 5; `RegimeLabel` Low 0, Medium 1, High 2, Extreme 3; `Side` High 0, Low 1; `SweepOutcome` Pending 0, Sfp 1, Break 2 |
+//! | enums | an explicit match, never a cast, with codes in declaration order: `Timeframe` M1 0, M5 1, M15 2, H1 3, H4 4, D1 5; `RegimeLabel` Low 0, Medium 1, High 2, Extreme 3; `Side` High 0, Low 1; `SweepOutcome` Pending 0, Sfp 1, Break 2; `book::Side` Bid 0, Ask 1 |
+//! | `OrderBook` | the chain (`write_u8`: `Straddle` 0, `Chained` 1, `Invalid` 2, then the id as `u64` unless invalid), the trusted window (two `Option<Price>`), then the bids and the asks, each best first as `write_len` followed by price and quantity per level |
+//! | `Level` (in the book features) | price, then quantity |
 //! | structs | every field, through exhaustive destructuring, in declaration order as of encoding v1 |
 //!
 //! Each type's encoder sits next to the type, so private fields stay
@@ -95,6 +100,7 @@ impl MarketState {
             profile,
             structure,
             derivatives,
+            book,
             trade_count,
         } = self;
         feature_set.encode(&mut f);
@@ -108,6 +114,7 @@ impl MarketState {
         profile.encode(&mut f);
         structure.encode(&mut f);
         derivatives.encode(&mut f);
+        book.encode(&mut f);
         trade_count.encode(&mut f);
         StateHash(f.finish())
     }
@@ -182,9 +189,10 @@ impl<T: StateEncode> StateEncode for Vec<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::book::{OrderBook, Side};
     use crate::derivatives::{LiquidationWindows, MarkState, OiSample, OiStep, SettledFunding};
-    use crate::event::MarketEvent;
     use crate::event::samples::{one_of_each, trade};
+    use crate::event::{BookSnapshot, BookUpdate, Level, MarketEvent};
     use crate::feature::{FeatureKey, FeatureSetVersion, FeatureValue, Unavailability};
     use crate::flow::Cvd;
     use crate::num::{Price, Qty};
@@ -225,11 +233,11 @@ mod tests {
         // docs).
         assert_eq!(
             MarketStateEngine::new().state().state_hash().to_string(),
-            "77d7e8fe9f024a68"
+            "a6c7504070de18ec"
         );
         assert_eq!(
             engine_after(&tape()).state().state_hash().to_string(),
-            "b57fd5949ce7de1c"
+            "2d2d71d268a639b6"
         );
     }
 
@@ -300,7 +308,7 @@ mod tests {
             coverage: crate::bars::Coverage::default(),
         };
 
-        let edits: Vec<(&str, Edit<'_>)> = vec![
+        let mut edits: Vec<(&str, Edit<'_>)> = vec![
             (
                 "feature_set",
                 Box::new(|s| {
@@ -402,6 +410,39 @@ mod tests {
                 Box::new(|s| s.derivatives.liquidations = LiquidationWindows::new()),
             ),
         ];
+        // The tape's update misses the snapshot's straddle, so the book ends
+        // invalid. Books that differ in one level's quantity, the chain or a
+        // window bound only.
+        assert_eq!(
+            base.book.l2,
+            FeatureValue::Unavailable {
+                reason: Unavailability::InputInvalid
+            }
+        );
+        let books = book_variants();
+        for (name, book) in books {
+            edits.push((
+                name,
+                Box::new(move |s| s.book.l2 = FeatureValue::Ready(book.clone())),
+            ));
+        }
+        edits.push((
+            "book depth",
+            Box::new(|s| {
+                s.book.depth = FeatureValue::Unavailable {
+                    reason: Unavailability::OutOfRange,
+                };
+            }),
+        ));
+        edits.push((
+            "book clusters",
+            Box::new(|s| {
+                s.book.clusters = FeatureValue::WarmingUp {
+                    observed: 0,
+                    required: 1,
+                };
+            }),
+        ));
         // The tape gives every derivatives value but the grid (no sample at
         // or before a boundary yet) something to change.
         assert!(base.derivatives.oi.is_ready());
@@ -418,6 +459,80 @@ mod tests {
             }
             seen.push((name, hash));
         }
+    }
+
+    /// Five valid books, each differing from the first in one respect only:
+    /// a level's quantity, the chain id, the chain state or the trusted
+    /// window.
+    fn book_variants() -> Vec<(&'static str, OrderBook)> {
+        let level = |price: i64, qty: i64| Level {
+            price: Price::from_units(price),
+            qty: Qty::from_units(qty),
+        };
+        let book = |id: u64, deepest: i64, best_qty: i64, chained: bool| {
+            let mut book = OrderBook::new();
+            book.apply(&MarketEvent::BookSnapshot(BookSnapshot {
+                time: EventTime::from_millis(1_000),
+                last_update_id: id,
+                bids: vec![level(100, best_qty), level(deepest, 5)],
+                asks: vec![level(101, 7)],
+            }));
+            if chained {
+                // Removes the deepest bid; the window keeps its bound.
+                book.apply(&MarketEvent::BookUpdate(BookUpdate {
+                    time: EventTime::from_millis(1_000),
+                    first_update_id: id,
+                    last_update_id: id + 1,
+                    prev_update_id: 0,
+                    bids: vec![level(deepest, 0)],
+                    asks: Vec::new(),
+                }));
+            }
+            assert!(book.is_valid());
+            book
+        };
+        vec![
+            ("book l2", book(10, 98, 3, false)),
+            ("book level qty", book(10, 98, 4, false)),
+            ("book chain id", book(11, 98, 3, false)),
+            ("book chained", book(10, 98, 3, true)),
+            ("book window", book(10, 97, 3, true)),
+        ]
+    }
+
+    #[test]
+    fn book_encoding_is_explicit() {
+        // Straddle 0 + id, the window, then the levels best first.
+        let (_, book) = book_variants().remove(0);
+        let mut expected = Fingerprinter::new();
+        expected.write_u8(0);
+        expected.write_u64(10);
+        expected.write_u8(1);
+        expected.write_i64(98);
+        expected.write_u8(1);
+        expected.write_i64(101);
+        expected.write_len(2);
+        for (price, qty) in [(100, 3), (98, 5)] {
+            expected.write_i64(price);
+            expected.write_i64(qty);
+        }
+        expected.write_len(1);
+        expected.write_i64(101);
+        expected.write_i64(7);
+        assert_eq!(encoded(&book), expected.finish());
+        assert_ne!(encoded(&Side::Bid), encoded(&Side::Ask));
+        let mut bid = Fingerprinter::new();
+        bid.write_u8(0);
+        assert_eq!(encoded(&Side::Bid), bid.finish());
+        // An invalid book writes its state alone, then the empty window and
+        // sides.
+        let mut invalid = Fingerprinter::new();
+        invalid.write_u8(2);
+        invalid.write_u8(0);
+        invalid.write_u8(0);
+        invalid.write_len(0);
+        invalid.write_len(0);
+        assert_eq!(encoded(&OrderBook::new()), invalid.finish());
     }
 
     #[test]

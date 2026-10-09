@@ -23,12 +23,21 @@
 //!   snapshot returned fewer levels than requested.
 //!
 //! A snapshot is a reset, never liquidity flow: a feature that measures
-//! added or removed liquidity (#18) starts over at a snapshot instead of
-//! reading the difference to the previous book as market activity.
+//! added or removed liquidity (#18, [`liquidity`], ADR-043) starts over at a
+//! snapshot instead of reading the difference to the previous book as market
+//! activity.
+//!
+//! The Market State carries the book as `book.l2@1` and hashes it whole
+//! (ADR-041, ADR-043): the chain, the trusted window and every level.
+//!
+//! [`liquidity`]: crate::liquidity
 
 use crate::event::{BookSnapshot, BookUpdate, GapReason, Level, MarketEvent, Stream};
+use crate::fingerprint::Fingerprinter;
 use crate::num::{Price, Qty};
+use crate::state_hash::StateEncode;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 
 /// A side of the book.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -37,6 +46,16 @@ pub enum Side {
     Bid,
     /// Resting sell orders.
     Ask,
+}
+
+impl StateEncode for Side {
+    /// `write_u8` in declaration order: `Bid` 0, `Ask` 1 (ADR-041).
+    fn encode(&self, f: &mut Fingerprinter) {
+        f.write_u8(match self {
+            Self::Bid => 0,
+            Self::Ask => 1,
+        });
+    }
 }
 
 /// Why the book became invalid.
@@ -158,6 +177,35 @@ enum Chain {
     Chained(u64),
 }
 
+impl StateEncode for Chain {
+    /// `write_u8` of the state, `Straddle` 0, `Chained` 1, `Invalid` 2, then
+    /// the id, if any (ADR-041, ADR-043).
+    fn encode(&self, f: &mut Fingerprinter) {
+        match self {
+            Self::Straddle(id) => {
+                f.write_u8(0);
+                id.encode(f);
+            }
+            Self::Chained(id) => {
+                f.write_u8(1);
+                id.encode(f);
+            }
+            Self::Invalid => f.write_u8(2),
+        }
+    }
+}
+
+impl StateEncode for TrustedWindow {
+    fn encode(&self, f: &mut Fingerprinter) {
+        let Self {
+            lowest_bid,
+            highest_ask,
+        } = self;
+        lowest_bid.encode(f);
+        highest_ask.encode(f);
+    }
+}
+
 /// An L2 order book rebuilt from snapshots and updates (ADR-038).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrderBook {
@@ -165,6 +213,55 @@ pub struct OrderBook {
     asks: BTreeMap<Price, Qty>,
     chain: Chain,
     window: TrustedWindow,
+}
+
+impl StateEncode for OrderBook {
+    /// The chain, the trusted window, then the bids and the asks, each best
+    /// first as `write_len` followed by price and quantity per level
+    /// (ADR-043).
+    fn encode(&self, f: &mut Fingerprinter) {
+        let Self {
+            bids,
+            asks,
+            chain,
+            window,
+        } = self;
+        chain.encode(f);
+        window.encode(f);
+        f.write_len(bids.len());
+        for (price, qty) in bids.iter().rev() {
+            price.encode(f);
+            qty.encode(f);
+        }
+        f.write_len(asks.len());
+        for (price, qty) in asks {
+            price.encode(f);
+            qty.encode(f);
+        }
+    }
+}
+
+impl fmt::Display for OrderBook {
+    /// The canonical summary line the golden tests pin: the last update id,
+    /// the trusted window, the level counts and the best levels, such as
+    /// `id=105 window=98.00000000..103.00000000 bids=3 asks=3
+    /// best=100.00000000@0.10000000/101.00000000@0.11000000`; `-` for
+    /// anything absent.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let opt = |value: Option<String>| value.unwrap_or_else(|| "-".to_owned());
+        let level = |level: Option<Level>| opt(level.map(|l| format!("{}@{}", l.price, l.qty)));
+        write!(
+            f,
+            "id={} window={}..{} bids={} asks={} best={}/{}",
+            opt(self.last_update_id().map(|id| id.to_string())),
+            opt(self.window.lowest_bid.map(|p| p.to_string())),
+            opt(self.window.highest_ask.map(|p| p.to_string())),
+            self.bids.len(),
+            self.asks.len(),
+            level(self.best_bid()),
+            level(self.best_ask()),
+        )
+    }
 }
 
 impl Default for OrderBook {
@@ -186,13 +283,59 @@ impl OrderBook {
 
     /// Consumes the next event of the canonical sequence.
     pub fn apply(&mut self, event: &MarketEvent) -> BookStep {
+        let step = self.peek(event);
+        match (step, event) {
+            (BookStep::Invalidated(why), _) => self.invalidate(why),
+            (BookStep::Reset, MarketEvent::BookSnapshot(snapshot)) => self.reset(snapshot),
+            (BookStep::Applied, MarketEvent::BookUpdate(update)) => self.update(update),
+            _ => step,
+        }
+    }
+
+    /// What [`Self::apply`] would return for `event`, without applying it:
+    /// the liquidity features (ADR-043) decide from it whether an update
+    /// counts as flow before the book changes.
+    pub fn peek(&self, event: &MarketEvent) -> BookStep {
         match event {
             MarketEvent::FeedGap(gap) if gap.stream == Stream::OrderBook => {
-                self.invalidate(Invalidation::Gap(gap.reason))
+                BookStep::Invalidated(Invalidation::Gap(gap.reason))
             }
-            MarketEvent::BookSnapshot(snapshot) => self.reset(snapshot),
-            MarketEvent::BookUpdate(update) => self.update(update),
+            MarketEvent::BookSnapshot(snapshot) => match negative(&snapshot.bids, &snapshot.asks) {
+                Some(why) => BookStep::Invalidated(why),
+                None => BookStep::Reset,
+            },
+            MarketEvent::BookUpdate(update) => self.check(update),
             _ => BookStep::Unrelated,
+        }
+    }
+
+    /// Whether `update` continues the chain and carries no negative
+    /// quantity.
+    fn check(&self, update: &BookUpdate) -> BookStep {
+        match self.chain {
+            Chain::Invalid => return BookStep::Ignored,
+            Chain::Straddle(snapshot_id) => {
+                if !(update.first_update_id <= snapshot_id && snapshot_id <= update.last_update_id)
+                {
+                    return BookStep::Invalidated(Invalidation::MissedStraddle {
+                        snapshot_id,
+                        first_update_id: update.first_update_id,
+                        last_update_id: update.last_update_id,
+                    });
+                }
+            }
+            Chain::Chained(last) => {
+                if update.prev_update_id != last {
+                    return BookStep::Invalidated(Invalidation::ChainBreak {
+                        expected: last,
+                        found: update.prev_update_id,
+                    });
+                }
+            }
+        }
+        match negative(&update.bids, &update.asks) {
+            Some(why) => BookStep::Invalidated(why),
+            None => BookStep::Applied,
         }
     }
 
@@ -204,10 +347,8 @@ impl OrderBook {
         BookStep::Invalidated(why)
     }
 
+    /// Replaces the book with `snapshot`, which [`Self::peek`] accepted.
     fn reset(&mut self, snapshot: &BookSnapshot) -> BookStep {
-        if let Some(why) = negative(&snapshot.bids, &snapshot.asks) {
-            return self.invalidate(why);
-        }
         self.bids.clear();
         self.asks.clear();
         set_levels(&mut self.bids, &snapshot.bids);
@@ -220,31 +361,8 @@ impl OrderBook {
         BookStep::Reset
     }
 
+    /// Applies `update`, which [`Self::peek`] accepted.
     fn update(&mut self, update: &BookUpdate) -> BookStep {
-        match self.chain {
-            Chain::Invalid => return BookStep::Ignored,
-            Chain::Straddle(snapshot_id) => {
-                if !(update.first_update_id <= snapshot_id && snapshot_id <= update.last_update_id)
-                {
-                    return self.invalidate(Invalidation::MissedStraddle {
-                        snapshot_id,
-                        first_update_id: update.first_update_id,
-                        last_update_id: update.last_update_id,
-                    });
-                }
-            }
-            Chain::Chained(last) => {
-                if update.prev_update_id != last {
-                    return self.invalidate(Invalidation::ChainBreak {
-                        expected: last,
-                        found: update.prev_update_id,
-                    });
-                }
-            }
-        }
-        if let Some(why) = negative(&update.bids, &update.asks) {
-            return self.invalidate(why);
-        }
         set_levels(&mut self.bids, &update.bids);
         set_levels(&mut self.asks, &update.asks);
         self.chain = Chain::Chained(update.last_update_id);
@@ -295,6 +413,15 @@ impl OrderBook {
     /// The ask levels, best (lowest) first.
     pub fn asks(&self) -> impl Iterator<Item = Level> + '_ {
         self.asks.iter().map(|(&price, &qty)| Level { price, qty })
+    }
+
+    /// The resting quantity at `price` on `side`; `None` when the book holds
+    /// no level there.
+    pub fn qty_at(&self, side: Side, price: Price) -> Option<Qty> {
+        match side {
+            Side::Bid => self.bids.get(&price).copied(),
+            Side::Ask => self.asks.get(&price).copied(),
+        }
     }
 
     /// Number of levels, both sides.
