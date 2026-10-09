@@ -10,6 +10,8 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-10-09
+
 ### Added
 
 - **Hexagonal workspace with an enforced crate graph (ADR-025).** `mie-domain`
