@@ -59,12 +59,11 @@ Earlier decisions constrain the answer:
        resolution is positive;
      - no `FeedGap` on the open-interest stream arrived since that sample;
      - `0 < elapsed_ms ≤ resolution_ms + step_tolerance_ms`, with
-       `step_tolerance_ms` = 15 000: the 10 s re-time allowance of ADR-032
-       D12 plus REST response jitter.
+       `step_tolerance_ms` = 15 000 (derivation below).
 
      Archive spacing is exact (ADR-034 D3), so one missing 5-minute row
-     (600 s) breaks the chain; live re-time jitter (deliveries roughly
-     6–24 s apart) does not.
+     (600 s) breaks the chain; live spacing jitter (2.0 to 18.9 s between
+     consecutive samples on clean spans, measured below) does not.
    - **Resolution change.** The first sample at a new resolution has no
      step; the chain restarts there.
    - **Gap policy.** The level stays `Ready`: it is a real observation that
@@ -72,6 +71,53 @@ Earlier decisions constrain the answer:
    - **Velocity** is derived on demand, never stored:
      `(delta / 1e8) × 60 000 / elapsed_ms`, in BTC per minute; `None`
      without a step.
+   - **Why `step_tolerance_ms` is 15 000.** At the live resolution the
+     cut-off is `resolution_ms` 10 000 + 15 000 = 25 000 ms between two
+     consecutive samples. The number answers one question: how far apart
+     can two consecutive live samples be without a hole between them? Too
+     low, and ordinary poll jitter breaks the ΔOI chain and drops steps
+     that are real. Too high, and a hole (a missed poll or an outage the
+     sequencer did not mark) is bridged as a step; the step still carries
+     its `elapsed_ms`, so velocity stays exact, but it is no longer a
+     10 s step. A `FeedGap` breaks the chain regardless of the tolerance,
+     so the tolerance only governs unmarked spacing.
+
+     The value was first set from reasoning (the 10 s re-time allowance of
+     ADR-032 D12 plus unmeasured REST jitter) and a spacing range
+     of 6–24 s that sat 1 s under the cut-off. It is now checked against
+     the data of the #9 and #10 soaks (source: the raw stores of both
+     soaks, the exchange `time` of each `openInterest` payload; measured
+     2026-10-09, <https://github.com/Replikanti/mie/issues/69#issuecomment-6082384614>).
+     15 783 samples over 4 runs (#9: 2 runs, #10: 2 runs); spacings are
+     computed within a run, run boundaries excluded. No payload `time` differs
+     from the stored event time and no exchange time is duplicated. The
+     journals show 15 783 `oi_poll` persisted, 1 error, 0 not persisted,
+     and 3 open-interest gaps, all `Disconnected`.
+
+     | Spans | n | min | p50 | p90 | p99 | p99.9 | max | > 20 s | > 25 s |
+     |---|---|---|---|---|---|---|---|---|---|
+     | clean (no OI gap) | 15 772 | 1 975 ms | 10 422 | 13 306 | 16 312 | 17 320 | 18 928 | 0 | 0 |
+     | overlapping an OI gap | 7 | 6 929 | 10 560 | 19 329 | 19 329 | 19 329 | 19 329 | 0 | 0 |
+     | all | 15 779 | 1 975 | 10 422 | 13 311 | 16 313 | 17 329 | 19 329 | 0 | 0 |
+
+     The poll interval is 10 000 ms (`OI_POLL_INTERVAL_MS`), so the p50 of
+     10 422 ms is 422 ms above it, and the clean maximum of 18 928 ms is
+     the poll interval plus 8 928 ms of jitter. **Rule:** `step_tolerance_ms`
+     stays 15 000 only if the clean-span maximum is within the cut-off with
+     a stated margin. It is: 25 000 − 18 928 = 6 072 ms of margin, and no
+     spacing in any span exceeds 20 s. The number therefore stays and no
+     `derivatives.oi.sample@2` follows. A different value would be a new
+     version of the feature (ADR-029), that is code, and would need new
+     evidence first.
+
+     **What the table does not measure.** It is the spacing of the
+     exchange `time`, which is what the raw store holds. The step compares
+     the *delivery* times of ADR-032 D12: a late sample is delivered at
+     `last released + 1`, shifted by at most `oi_retime_ms` (10 000 ms)
+     from its exchange time, so a delivered spacing can differ from the
+     table's by up to that shift in either direction. The margin above is
+     therefore a margin on the exchange spacing. The delivered spacing is
+     measured in *Accept when*, item 3.
 2. **OI on the 5-minute UTC grid** (`derivatives.oi.5m@1`). Live (10 s) and
    archive (5 min) data both produce it, so a condition learned on archive
    history can be evaluated live.
@@ -173,7 +219,7 @@ Earlier decisions constrain the answer:
   (ADR-034 D3), but which instant the archive value measures is
   unverified. Archive-sourced grid values may lag live-sourced ones by one
   step. `resolution_ms` (300 000 vs 10 000) identifies the source; *Accept
-  when* measures the lag.
+  when* measures the lag, and its outcome table decides what follows.
 - Liquidation gaps are over-marked: the sequencer reports a sparse
   stream's gap from its last event, not from the disconnect, so minutes
   before the outage can carry `feed_gap`.
@@ -208,15 +254,83 @@ Earlier decisions constrain the answer:
 
 ## Accept when
 
-1. A DuckDB query over raw data, on at least one day covered by both live
-   capture and the archive: for each archive row, compare
-   `sum_open_interest` at `create_time` T with the live raw OI nearest to T
-   and nearest to T + 5 min. Record here which instant the archive
-   measures, with the median and p99 absolute difference. If it measures T,
-   record the one-step lag of archive-sourced grid values. No code change
-   follows: ADR-034 D3 stands.
-2. The live/replay equivalence run of #13 covers the derivatives family
-   with zero divergences.
+1. **Archive versus live open interest.** Which instant does an archive
+   `metrics` row measure: its `create_time` T or T + 5 min (the ordering
+   time of ADR-034 D3)? This is measured, then recorded here; no outcome is
+   decided in advance.
+
+   - **Prerequisite (satisfied 2026-10-09).** Overlap needs archive rows
+     for the days the live capture covers. The archive store ended at
+     2026-09-30 (`docs/data-availability.md`, the window of #12) and live
+     raw open interest starts at 2026-10-07 15:50 UTC (the start of the #9
+     soak, ADR-032 *Acceptance*). `metrics` was therefore imported for
+     2026-10-01 to 2026-10-08 with `mie archive-import --streams metrics
+     --from 2026-10-01 --to 2026-10-08` (ADR-034; idempotent,
+     checksum-verified): imported 8, failed 0, 2 304 rows (288 rows a day
+     × 8). Source:
+     <https://github.com/Replikanti/mie/issues/69#issuecomment-6082384614>.
+     The contiguous range was chosen over the two overlap days alone
+     because the import costs one small file a day. The import changes the
+     archive dataset version; the acceptance record names the version
+     used.
+   - **Overlap.** The query runs over the days live capture and archive
+     both cover, chosen by live coverage: the #9 soak (2026-10-07 15:50 to
+     2026-10-08 22:00 UTC, about 30 h) and not the hole between the two
+     soaks (2026-10-08 22:00 to 22:33). About 30 h is about 360 archive
+     rows (12 a hour).
+   - **Query (fixed here).** For each archive row, take its T. Compare
+     `sum_open_interest` with the live OI sample nearest to T and with the
+     one nearest to T + 5 min, by the live sample's raw-store event time
+     (the exchange `time`, not the re-timed delivery time of ADR-032 D12).
+     Before comparing, check that both series are in the same unit (BTC).
+     Exclude a row when no live sample lies within one poll interval
+     (10 000 ms) of T or of T + 5 min, and a row where the two nearest live
+     samples carry the same value (it cannot discriminate), and report both
+     exclusion counts with the number of rows left.
+   - **Sample size.** A p99 differs from the maximum only with at least 100
+     rows, and one day is 288 rows (a 5-minute series,
+     `docs/data-availability.md`), which puts 3 rows above its p99. The p99 is reported when at least 100
+     rows remain; below that, only the maximum.
+   - **Decision rule.** The statistic is the share of rows whose nearest
+     live instant is T + 5 min. If the archive carried no information
+     about the instant, that share would be 50 % (a coin flip), with a
+     standard deviation of √(0.25 / n); at n = 288 that is 0.0295, so a
+     share of 59 % is 3 standard deviations above the coin flip. A smaller
+     threshold would let noise decide, a larger one would leave real
+     effects inconclusive. A share of at least 59 % means the archive
+     measures T + 5 min. A share of at most 41 % means it measures T.
+     Anything between is inconclusive. For another n after the exclusions,
+     the same 3 standard deviations apply (50 % ± 1.5 / √n; for example
+     60.6 % at n = 200), and the session running the query states n and
+     the threshold used. Report the median and the p99 absolute difference
+     at both instants.
+   - **Outcomes (none is pre-decided):**
+
+     | Outcome | What follows |
+     |---|---|
+     | Measures T + 5 min | ADR-034 D3 stands; the grid lag risk (*Consequences*) is closed. |
+     | Measures T | Choose between amending the archive ordering (a code and golden-value change, and a new ADR superseding ADR-034 D3, per the lifecycle in `docs/adr/README.md`) and documenting the one-step lag with `resolution_ms` as the discriminator (the current text). The choice and its reason are recorded here. |
+     | Inconclusive | Record the share, n and the threshold; no change; repeat with more days (each day adds 288 rows; later days are published by the archive with a delay). |
+
+     The session that runs the acceptance records the result here and files
+     any follow-up issue; the follow-up is not part of this ADR's text.
+2. **Equivalence coverage of the derivatives family.** The live/replay
+   run of #13 covers it with zero divergences. The run's coverage list is
+   ADR-041's *Accept when*: all seven streams, so liquidations, open
+   interest and mark price are present, with the liquidation windows
+   turning `Ready` in-run (its item 5). `derivatives.funding.settled@1` is
+   archive only (decision 4) and is not coverable live; ADR-041 lists it
+   among the limits, and its coverage rests on the fixture tests and
+   golden values.
+3. **Delivered open-interest spacing.** From the OI events of the run in
+   item 2 (delivery times, as the engine sees them), count consecutive
+   events more than 25 000 ms apart without a feed gap between them; each
+   is a missing step. Record the count, the number of OI events and the
+   maximum spacing. The cut-off is the one derived in decision 1. A count
+   of 0 confirms `step_tolerance_ms` on the delivered quantity the step
+   uses; a count above 0 is recorded with the maximum, and the follow-up
+   (which would be `derivatives.oi.sample@2`, ADR-029) is filed by the
+   session that runs the acceptance.
 
 References: ADR-012, ADR-013, ADR-019, ADR-022, ADR-023, ADR-024, ADR-027,
 ADR-028, ADR-029, ADR-031, ADR-032, ADR-034, ADR-035, ADR-039, ADR-041.
