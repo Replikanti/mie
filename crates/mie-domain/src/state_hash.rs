@@ -236,11 +236,11 @@ mod tests {
         // docs).
         assert_eq!(
             MarketStateEngine::new().state().state_hash().to_string(),
-            "ca6194f68351b1d9"
+            "1bdd19fbf691b4e4"
         );
         assert_eq!(
             engine_after(&tape()).state().state_hash().to_string(),
-            "97b7d5991680602f"
+            "db2cde4fdab54da5"
         );
     }
 
@@ -451,6 +451,16 @@ mod tests {
             "location vwap",
             Box::new(|s| {
                 s.location.vwap = FeatureValue::WarmingUp {
+                    observed: 0,
+                    required: 1,
+                };
+            }),
+        ));
+        assert!(base.location.levels.is_ready());
+        edits.push((
+            "location levels",
+            Box::new(|s| {
+                s.location.levels = FeatureValue::WarmingUp {
                     observed: 0,
                     required: 1,
                 };

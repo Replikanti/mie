@@ -13,7 +13,8 @@
 //! liquidation windows (ADR-042, [`derivatives`]), and the order book: the
 //! L2 book itself, banded depth and imbalance, liquidity flow windows and
 //! concentration (ADR-043, [`liquidity`]), and location: the UTC-day VWAP
-//! (ADR-044, [`location`]); every other kind passes through.
+//! and the level registry with its zone events (ADR-044, [`location`]);
+//! every other kind passes through.
 //! Further feature families are added by the Market State issues, each as a
 //! registered, versioned definition (ADR-029, [`feature`]).
 //! The engine computes one [`FeatureSet`] and stamps its
@@ -36,7 +37,7 @@ use crate::event::{MarketEvent, Stream};
 use crate::feature::{FeatureSet, FeatureSetVersion, FeatureValue, catalog};
 use crate::flow::{FlowError, FlowTracker, OrderFlow};
 use crate::liquidity::{BookState, LiquidityError, LiquidityTracker};
-use crate::location::{LocationError, LocationState, LocationTracker};
+use crate::location::{self, LocationError, LocationEvent, LocationState, LocationTracker};
 use crate::num::Price;
 use crate::order::CanonicalKey;
 use crate::profile::{ProfileError, ProfileTracker, VolumeProfiles};
@@ -112,7 +113,10 @@ pub struct MarketState {
     /// replays have no book and keep every value warming up.
     pub book: BookState,
     /// Location (ADR-044): `location.vwap.utc_day@1`, the volume-weighted
-    /// average price of the current UTC day over its closed minutes.
+    /// average price of the current UTC day over its closed minutes, and
+    /// `location.levels@1`, the level registry with score components and
+    /// in-zone flags, rebuilt at each closed 1m bar with trades. Location
+    /// facts, never signals (ADR-012).
     pub location: LocationState,
     /// Number of trades consumed. A diagnostic counter, not a feature: it
     /// depends on where consumption started, so it is not reproducible
@@ -161,6 +165,11 @@ pub struct MarketStateEngine {
     liquidity: LiquidityTracker,
     /// The VWAP sums.
     location: LocationTracker,
+    /// The location facts of the last accepted event.
+    location_events: Vec<LocationEvent>,
+    /// Scratch buffer for an event's location facts, swapped with
+    /// `location_events` once the event is accepted.
+    location_pending: Vec<LocationEvent>,
 }
 
 /// Volatility state after the bars an event closed, committed with them.
@@ -291,6 +300,8 @@ impl MarketStateEngine {
             derivatives,
             liquidity: LiquidityTracker::new(),
             location: LocationTracker::new(),
+            location_events: Vec::new(),
+            location_pending: Vec::new(),
         }
     }
 
@@ -478,6 +489,28 @@ impl MarketStateEngine {
         self.liquidity
             .commit(liquidity, event, &mut self.state.book);
         self.location.commit(location, &mut self.state.location);
+        // The infallible location stage, on the committed state (ADR-044
+        // decision 2).
+        self.location_pending.clear();
+        let MarketState {
+            profile,
+            structure,
+            book,
+            location: located,
+            ..
+        } = &mut self.state;
+        self.location.locate(
+            event,
+            &self.pending,
+            location::Inputs {
+                profile,
+                structure,
+                book,
+            },
+            located,
+            &mut self.location_pending,
+        );
+        std::mem::swap(&mut self.location_events, &mut self.location_pending);
         self.state.as_of = Some(event.time());
         self.last = Some(event.clone());
         self.ids = ids;
@@ -529,6 +562,13 @@ impl MarketStateEngine {
     /// leaves them unchanged.
     pub fn structure_events(&self) -> &[StructureEvent] {
         &self.structure_events
+    }
+
+    /// The location facts of the last accepted event, in emission order
+    /// (ADR-044, decision 7); empty when it produced none. A rejected event
+    /// leaves them unchanged.
+    pub fn location_events(&self) -> &[LocationEvent] {
+        &self.location_events
     }
 }
 
@@ -925,8 +965,8 @@ mod tests {
              derivatives.liq.window.1h@1,derivatives.liq.window.5m@1,\
              derivatives.mark@1,derivatives.oi.5m@1,derivatives.oi.sample@1,\
              flow.cvd.continuous@1,flow.cvd.utc_day@1,flow.window.15m@1,\
-             flow.window.1h@1,flow.window.5m@1,location.vwap.utc_day@1,\
-             profile.volume.composite_5d@1,\
+             flow.window.1h@1,flow.window.5m@1,location.levels@1,\
+             location.vwap.utc_day@1,profile.volume.composite_5d@1,\
              profile.volume.prior_day@1,profile.volume.utc_day@1,\
              structure.levels.15m@1,structure.levels.1d@1,structure.levels.1h@1,\
              structure.levels.4h@1,structure.swing.15m@1,structure.swing.1d@1,\
