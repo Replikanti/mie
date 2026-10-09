@@ -12,7 +12,8 @@
 //! derivatives context: open interest, mark price and funding, and
 //! liquidation windows (ADR-042, [`derivatives`]), and the order book: the
 //! L2 book itself, banded depth and imbalance, liquidity flow windows and
-//! concentration (ADR-043, [`liquidity`]); every other kind passes through.
+//! concentration (ADR-043, [`liquidity`]), and location: the UTC-day VWAP
+//! (ADR-044, [`location`]); every other kind passes through.
 //! Further feature families are added by the Market State issues, each as a
 //! registered, versioned definition (ADR-029, [`feature`]).
 //! The engine computes one [`FeatureSet`] and stamps its
@@ -24,6 +25,7 @@
 //! [`feature`]: crate::feature
 //! [`flow`]: crate::flow
 //! [`liquidity`]: crate::liquidity
+//! [`location`]: crate::location
 //! [`profile`]: crate::profile
 //! [`structure`]: crate::structure
 //! [`volatility`]: crate::volatility
@@ -34,6 +36,7 @@ use crate::event::{MarketEvent, Stream};
 use crate::feature::{FeatureSet, FeatureSetVersion, FeatureValue, catalog};
 use crate::flow::{FlowError, FlowTracker, OrderFlow};
 use crate::liquidity::{BookState, LiquidityError, LiquidityTracker};
+use crate::location::{LocationError, LocationState, LocationTracker};
 use crate::num::Price;
 use crate::order::CanonicalKey;
 use crate::profile::{ProfileError, ProfileTracker, VolumeProfiles};
@@ -108,6 +111,9 @@ pub struct MarketState {
     /// filled per side and band over closed minutes. Live only: archive
     /// replays have no book and keep every value warming up.
     pub book: BookState,
+    /// Location (ADR-044): `location.vwap.utc_day@1`, the volume-weighted
+    /// average price of the current UTC day over its closed minutes.
+    pub location: LocationState,
     /// Number of trades consumed. A diagnostic counter, not a feature: it
     /// depends on where consumption started, so it is not reproducible
     /// across replay windows.
@@ -153,6 +159,8 @@ pub struct MarketStateEngine {
     derivatives: DerivativesTracker,
     /// The order-book flow minutes and pending fills.
     liquidity: LiquidityTracker,
+    /// The VWAP sums.
+    location: LocationTracker,
 }
 
 /// Volatility state after the bars an event closed, committed with them.
@@ -263,6 +271,7 @@ impl MarketStateEngine {
             structure: StructureSet::new(),
             derivatives: derivatives.derivatives(),
             book: BookState::new(),
+            location: LocationState::new(),
             trade_count: 0,
         };
         Self {
@@ -281,6 +290,7 @@ impl MarketStateEngine {
             structure_pending: Vec::new(),
             derivatives,
             liquidity: LiquidityTracker::new(),
+            location: LocationTracker::new(),
         }
     }
 
@@ -306,8 +316,9 @@ impl MarketStateEngine {
     ///   closed bar's true range, change or range, an order-flow sum (CVD,
     ///   window), a volume-profile sum (bin, total, composite), a
     ///   structure count (touches, window bars), a derivatives value
-    ///   (liquidation sum or count, ΔOI, time difference) or an order-book
-    ///   liquidity value (flow sum, pending fill) leaves its integer range;
+    ///   (liquidation sum or count, ΔOI, time difference), an order-book
+    ///   liquidity value (flow sum, pending fill) or a VWAP sum leaves its
+    ///   integer range;
     /// - [`StateError::TimeJump`] if it would close more than
     ///   [`MAX_BARS_PER_EVENT`] bars of one timeframe. Recovery: the replay
     ///   or session stops; restart it from a fresh engine after the jump.
@@ -415,6 +426,15 @@ impl MarketStateEngine {
                 });
             }
         };
+        let location = match self.location.step(event, &self.pending) {
+            Ok(location) => location,
+            Err(LocationError::Overflow) => {
+                self.pending.clear();
+                return Err(StateError::Overflow {
+                    event: event.canonical_key(),
+                });
+            }
+        };
 
         match event {
             MarketEvent::Trade(trade) => {
@@ -457,6 +477,7 @@ impl MarketStateEngine {
         self.state.derivatives = self.derivatives.derivatives();
         self.liquidity
             .commit(liquidity, event, &mut self.state.book);
+        self.location.commit(location, &mut self.state.location);
         self.state.as_of = Some(event.time());
         self.last = Some(event.clone());
         self.ids = ids;
@@ -547,9 +568,9 @@ pub enum StateError {
     },
     /// The event would push a bar's time or quantity arithmetic, a
     /// volatility value, an order-flow sum, a volume-profile sum, a
-    /// structure count, a derivatives value or an order-book liquidity
-    /// value out of its integer range (ADR-027, ADR-031, ADR-033, ADR-035,
-    /// ADR-036, ADR-037, ADR-042, ADR-043).
+    /// structure count, a derivatives value, an order-book liquidity value
+    /// or a VWAP sum out of its integer range (ADR-027, ADR-031, ADR-033,
+    /// ADR-035, ADR-036, ADR-037, ADR-042, ADR-043, ADR-044).
     Overflow {
         /// Key of the rejected event.
         event: CanonicalKey,
@@ -594,8 +615,8 @@ impl fmt::Display for StateError {
                 write!(
                     f,
                     "event ({event}) overflows the bar, volatility, order-flow, \
-                     volume-profile, structure, derivatives or order-book liquidity \
-                     arithmetic"
+                     volume-profile, structure, derivatives, order-book liquidity \
+                     or VWAP arithmetic"
                 )
             }
             Self::TimeJump {
@@ -698,6 +719,7 @@ mod tests {
                 structure: StructureSet::new(),
                 derivatives: Derivatives::new(),
                 book: BookState::new(),
+                location: LocationState::new(),
                 trade_count: 3,
             }
         );
@@ -903,7 +925,8 @@ mod tests {
              derivatives.liq.window.1h@1,derivatives.liq.window.5m@1,\
              derivatives.mark@1,derivatives.oi.5m@1,derivatives.oi.sample@1,\
              flow.cvd.continuous@1,flow.cvd.utc_day@1,flow.window.15m@1,\
-             flow.window.1h@1,flow.window.5m@1,profile.volume.composite_5d@1,\
+             flow.window.1h@1,flow.window.5m@1,location.vwap.utc_day@1,\
+             profile.volume.composite_5d@1,\
              profile.volume.prior_day@1,profile.volume.utc_day@1,\
              structure.levels.15m@1,structure.levels.1d@1,structure.levels.1h@1,\
              structure.levels.4h@1,structure.swing.15m@1,structure.swing.1d@1,\
@@ -1250,6 +1273,35 @@ mod tests {
                 filled_qty: Qty::from_units(i64::MAX),
             }))
             .unwrap();
+    }
+
+    #[test]
+    fn rejects_an_event_that_overflows_a_vwap_sum() {
+        // Unreachable from trades alone: a day's volume fits the 1d bar's
+        // `i64`, so |Σ price · qty| < 2^126. The sum is set directly.
+        let mut engine = engine_after(&[trade(1_000, 1)]);
+        engine.location.vwap.notional = i128::MAX - 1;
+        let before = engine.state().clone();
+        let tracker = engine.location.clone();
+        let closed_before = engine.closed_bars().to_vec();
+        let overflow = trade(2_000, 2);
+        assert_eq!(
+            engine.apply(&overflow),
+            Err(StateError::Overflow {
+                event: overflow.canonical_key()
+            })
+        );
+        assert_eq!(engine.state(), &before);
+        assert_eq!(engine.location, tracker);
+        assert_eq!(engine.closed_bars(), closed_before);
+        // The ordering bound did not move; other streams still pass.
+        assert_eq!(
+            engine.apply(&trade(1_000, 1)),
+            Err(StateError::Duplicate {
+                key: trade(1_000, 1).canonical_key()
+            })
+        );
+        engine.apply(&mark(2_000, 1)).unwrap();
     }
 
     #[test]
@@ -1726,7 +1778,8 @@ mod tests {
         assert_eq!(
             StateError::Overflow { event }.to_string(),
             "event (1999ms Trade seq 2) overflows the bar, volatility, order-flow, \
-             volume-profile, structure, derivatives or order-book liquidity arithmetic"
+             volume-profile, structure, derivatives, order-book liquidity or VWAP \
+             arithmetic"
         );
         assert_eq!(
             StateError::TimeJump {

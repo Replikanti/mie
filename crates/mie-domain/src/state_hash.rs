@@ -7,7 +7,7 @@
 //! [`Fingerprint`] over an explicit byte encoding of every public field of
 //! [`MarketState`], written with the [`Fingerprinter`] writers (ADR-029). The
 //! engine's internal trackers (ATR window, flow, profile, structure,
-//! derivatives and liquidity trackers) are not hashed: the public state is
+//! derivatives, liquidity and location trackers) are not hashed: the public state is
 //! the contract, and a hidden divergence shows up in it at a later
 //! checkpoint. The order book is public state (`book.l2@1`, ADR-043), so
 //! every level of it is hashed.
@@ -16,7 +16,8 @@
 //! `write_u32(`[`STATE_HASH_ENCODING`]`)`, then the fields of
 //! [`MarketState`] in declaration order: `feature_set`, `as_of`,
 //! `last_trade_price`, `bars`, `motion`, `atr`, `regime`, `flow`, `profile`,
-//! `structure`, `derivatives`, `book`, `trade_count`. Every value is written
+//! `structure`, `derivatives`, `book`, `location`, `trade_count`. Every
+//! value is written
 //! by these rules:
 //!
 //! | Type | Encoding |
@@ -101,6 +102,7 @@ impl MarketState {
             structure,
             derivatives,
             book,
+            location,
             trade_count,
         } = self;
         feature_set.encode(&mut f);
@@ -115,6 +117,7 @@ impl MarketState {
         structure.encode(&mut f);
         derivatives.encode(&mut f);
         book.encode(&mut f);
+        location.encode(&mut f);
         trade_count.encode(&mut f);
         StateHash(f.finish())
     }
@@ -233,11 +236,11 @@ mod tests {
         // docs).
         assert_eq!(
             MarketStateEngine::new().state().state_hash().to_string(),
-            "a6c7504070de18ec"
+            "ca6194f68351b1d9"
         );
         assert_eq!(
             engine_after(&tape()).state().state_hash().to_string(),
-            "2d2d71d268a639b6"
+            "97b7d5991680602f"
         );
     }
 
@@ -438,6 +441,16 @@ mod tests {
             "book clusters",
             Box::new(|s| {
                 s.book.clusters = FeatureValue::WarmingUp {
+                    observed: 0,
+                    required: 1,
+                };
+            }),
+        ));
+        assert!(base.location.vwap.is_ready());
+        edits.push((
+            "location vwap",
+            Box::new(|s| {
+                s.location.vwap = FeatureValue::WarmingUp {
                     observed: 0,
                     required: 1,
                 };

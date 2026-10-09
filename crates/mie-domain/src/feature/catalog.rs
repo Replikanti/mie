@@ -1332,6 +1332,38 @@ pub const BOOK_LIQUIDITY_WINDOWS: [(Timeframe, &FeatureDefinition); 3] = [
     (Timeframe::H1, &BOOK_LIQUIDITY_WINDOW_1H_V1),
 ];
 
+/// `location.vwap.utc_day@1`: the volume-weighted average price of the
+/// current UTC day, `Σ(price · qty) / Σqty` over the trades of its closed
+/// minutes (ADR-044 D4). The sums are exact `i128`; the mean is floored to
+/// 1e-8 USDT. No bands, no prior-day VWAP.
+///
+/// - Parameters: `rounding` = `floor`, `session_ms` = 86 400 000.
+/// - Inputs: trades (the sums) and `bars.time.1m@1` (the clock and the
+///   coverage).
+/// - Warm-up: one sample, where a sample is a closed 1m bar of the current
+///   UTC day with volume. It restarts at 00:00 UTC; the developing minute is
+///   never included.
+/// - Gap policy: a trades gap never resets the sums. The value carries the
+///   OR of the day's closed minutes' coverage.
+pub const LOCATION_VWAP_UTC_DAY_V1: FeatureDefinition = FeatureDefinition {
+    key: FeatureKey::new("location.vwap.utc_day", 1),
+    params: &[
+        Param {
+            name: "rounding",
+            value: ParamValue::Text("floor"),
+        },
+        Param {
+            name: "session_ms",
+            value: ParamValue::Int(86_400_000),
+        },
+    ],
+    inputs: &[
+        Input::Stream(Stream::Trades),
+        Input::Feature(BARS_TIME_1M_V1.key),
+    ],
+    warm_up: WarmUp::Samples(1),
+};
+
 /// Every version of every feature. Never shrinks.
 pub const DEFINITIONS: &[&FeatureDefinition] = &[
     &TRADE_LAST_PRICE_V1,
@@ -1378,6 +1410,7 @@ pub const DEFINITIONS: &[&FeatureDefinition] = &[
     &BOOK_LIQUIDITY_WINDOW_5M_V1,
     &BOOK_LIQUIDITY_WINDOW_15M_V1,
     &BOOK_LIQUIDITY_WINDOW_1H_V1,
+    &LOCATION_VWAP_UTC_DAY_V1,
 ];
 
 /// The fingerprint each published `id@version` must keep. Append-only: one
@@ -1427,6 +1460,7 @@ pub const LOCK: &[LockEntry] = &[
     LockEntry::new("book.liquidity.window.5m", 1, 0x393d_380d_74a3_3d99),
     LockEntry::new("book.liquidity.window.15m", 1, 0xe2f9_5033_82fc_e9c0),
     LockEntry::new("book.liquidity.window.1h", 1, 0xd4a5_f617_f61e_8388),
+    LockEntry::new("location.vwap.utc_day", 1, 0x03e9_3688_148e_d1ac),
 ];
 
 /// The default feature set: the latest version of each computed feature.
@@ -1475,6 +1509,7 @@ pub const CURRENT: &[FeatureKey] = &[
     BOOK_LIQUIDITY_WINDOW_5M_V1.key,
     BOOK_LIQUIDITY_WINDOW_15M_V1.key,
     BOOK_LIQUIDITY_WINDOW_1H_V1.key,
+    LOCATION_VWAP_UTC_DAY_V1.key,
 ];
 
 /// The registry of [`DEFINITIONS`].
@@ -1548,10 +1583,10 @@ mod tests {
             hasher.write_u32(entry.key.version.get());
             hasher.write_u64(entry.fingerprint.value());
         }
-        assert_eq!(LOCK.len(), 44, "lock lines");
+        assert_eq!(LOCK.len(), 45, "lock lines");
         assert_eq!(
             hasher.finish().to_string(),
-            "612e3fbb1bbf3bba",
+            "157e1b957029b234",
             "lock digest"
         );
     }
@@ -1977,6 +2012,37 @@ mod tests {
     }
 
     #[test]
+    fn location_features_match_adr_044() {
+        assert_eq!(
+            LOCATION_VWAP_UTC_DAY_V1.params,
+            &[
+                Param {
+                    name: "rounding",
+                    value: ParamValue::Text("floor"),
+                },
+                Param {
+                    name: "session_ms",
+                    value: ParamValue::Int(Timeframe::D1.millis()),
+                },
+            ]
+        );
+        assert_eq!(
+            LOCATION_VWAP_UTC_DAY_V1.inputs,
+            &[
+                Input::Stream(Stream::Trades),
+                Input::Feature(BARS_TIME_1M_V1.key)
+            ]
+        );
+        let location = [&LOCATION_VWAP_UTC_DAY_V1];
+        for definition in location {
+            assert!(definition.key.id.as_str().starts_with("location."));
+            assert_eq!(definition.key.version.get(), 1);
+            assert_eq!(definition.warm_up, WarmUp::Samples(1));
+            assert!(CURRENT.contains(&definition.key), "{}", definition.key);
+        }
+    }
+
+    #[test]
     fn current_set_version_is_pinned() {
         // The feature-set version every experiment records (ADR-029). It may
         // change only when CURRENT does — any other change here means a
@@ -1993,13 +2059,14 @@ mod tests {
              derivatives.liq.window.1h@1,derivatives.liq.window.5m@1,\
              derivatives.mark@1,derivatives.oi.5m@1,derivatives.oi.sample@1,\
              flow.cvd.continuous@1,flow.cvd.utc_day@1,flow.window.15m@1,\
-             flow.window.1h@1,flow.window.5m@1,profile.volume.composite_5d@1,\
+             flow.window.1h@1,flow.window.5m@1,location.vwap.utc_day@1,\
+             profile.volume.composite_5d@1,\
              profile.volume.prior_day@1,profile.volume.utc_day@1,\
              structure.levels.15m@1,structure.levels.1d@1,structure.levels.1h@1,\
              structure.levels.4h@1,structure.swing.15m@1,structure.swing.1d@1,\
              structure.swing.1h@1,structure.swing.4h@1,trade.last_price@1,\
              volatility.atr.1h@1,volatility.regime.1h@1"
         );
-        assert_eq!(set.version().to_string(), "e7c6601562a8c62d");
+        assert_eq!(set.version().to_string(), "0db18323562d9f1d");
     }
 }
