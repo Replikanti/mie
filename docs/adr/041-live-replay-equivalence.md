@@ -110,9 +110,10 @@ Two facts shape the comparison:
    `EQUIVALENT`.
 5. **CI coverage (D5).** `crates/mie-cli/tests/equivalence_offline.rs`,
    run by the `check` job's `cargo test --workspace`, offline:
-   (A) a recorded live session of about 5 minutes (aggTrade, markPrice,
-   forceOrder, kline_1m, openInterest; no depth, to keep the fixture near
-   0.5 MB; checkpoints every 10 s) written into a temporary raw store must
+   (A) a recorded live session of about 3 minutes (aggTrade, markPrice,
+   forceOrder, kline_1m, openInterest; no depth, and short enough to keep
+   the fixture under about 0.5 MB; checkpoints every 10 s) written into a
+   temporary raw store must
    be `EQUIVALENT`; after a later feature-set change the test asserts
    `EVENTS EQUIVALENT, STATE NOT COMPARABLE` instead, so the fixture need
    not be re-recorded; (B) the same payloads played through the offline

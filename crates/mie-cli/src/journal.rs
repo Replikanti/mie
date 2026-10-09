@@ -287,10 +287,10 @@ impl JournaledRun {
 /// A line that is not JSON is skipped: a crash can leave a partial line,
 /// which the next run's first line then follows. A `run_start`, `run_end`
 /// or `state_checkpoint` that does not carry its fields is an error, and so
-/// is one without its run's `run_start`, and so are two `run_start`s
-/// of one run id — a restart within the same second, whose records the
-/// session prefix could not tell apart (ADR-032) — a second `run_end`, and a
-/// `run_end` without a `run_start`.
+/// are two `run_start`s of one run id — a restart within the same second,
+/// whose records the session prefix could not tell apart (ADR-032) — a
+/// second `run_end`, and a `run_end` or `state_checkpoint` without a
+/// `run_start`.
 ///
 /// # Errors
 ///
