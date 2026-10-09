@@ -1180,6 +1180,74 @@ mod tests {
     }
 
     #[test]
+    fn rejects_an_event_that_overflows_a_derivatives_sum() {
+        let huge = |millis: i64| {
+            MarketEvent::Liquidation(crate::event::Liquidation {
+                time: t(millis),
+                aggressor: crate::event::Aggressor::Sell,
+                price: Price::from_units(1),
+                avg_price: Price::from_units(1),
+                filled_qty: Qty::from_units(i64::MAX),
+            })
+        };
+        let mut engine = engine_after(&[trade(500, 1), huge(1_000)]);
+        let before = engine.state().clone();
+        let closed_before = engine.closed_bars().to_vec();
+        let overflow = huge(2_000);
+        assert_eq!(
+            engine.apply(&overflow),
+            Err(StateError::Overflow {
+                event: overflow.canonical_key()
+            })
+        );
+        assert_eq!(engine.state(), &before);
+        assert_eq!(engine.closed_bars(), closed_before);
+        // The ordering bound did not move.
+        assert_eq!(
+            engine.apply(&huge(1_000)),
+            Err(StateError::Duplicate {
+                key: huge(1_000).canonical_key()
+            })
+        );
+        // The minute's short side still has room.
+        engine
+            .apply(&MarketEvent::Liquidation(crate::event::Liquidation {
+                time: t(2_000),
+                aggressor: crate::event::Aggressor::Buy,
+                price: Price::from_units(1),
+                avg_price: Price::from_units(1),
+                filled_qty: Qty::from_units(i64::MAX),
+            }))
+            .unwrap();
+    }
+
+    #[test]
+    fn other_streams_leave_the_derivatives_unchanged() {
+        let mut engine = engine_after(&[
+            trade(1_000, 1),
+            crate::event::samples::liquidation(2_000, 10_000_000),
+            crate::event::samples::open_interest(3_000, 10_000),
+            mark(4_000, 6_354_150_000_000),
+            crate::event::samples::settlement(5_000, 10_000),
+        ]);
+        let derivatives = engine.state().derivatives;
+        assert!(derivatives.oi.is_ready());
+        assert!(derivatives.mark.is_ready());
+        assert!(derivatives.funding_settled.is_ready());
+        for event in [
+            trade(6_000, 2),
+            snapshot(6_001, 10),
+            gap(Stream::OrderBook, 6_000, 6_002, GapReason::Disconnected),
+            gap(Stream::Trades, 6_000, 6_003, GapReason::Disconnected),
+            update(6_004, 11, 12, 10),
+            kline(-53_995, 6_004),
+        ] {
+            engine.apply(&event).unwrap();
+            assert_eq!(engine.state().derivatives, derivatives, "{event:?}");
+        }
+    }
+
+    #[test]
     fn rejects_an_earlier_time() {
         let last = trade(2_000, 1);
         let late = trade(1_999, 2);
