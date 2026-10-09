@@ -77,6 +77,7 @@ dataset → DuckDB replay/research → Strategy Research Lab → Telegram
 | [Strategy Research Lab](docs/design/BTC_MIE_Strategy_Research_Lab.md) | Research loop, experiment definition, anti-overfitting |
 | [Strategy Registry & Suitability](docs/design/BTC_MIE_Strategy_Registry_and_Suitability.md) | Lifecycle, runtime suitability, edge decay |
 | [ADR-025 onwards](docs/adr/) | Decisions made during implementation |
+| [Releasing](docs/release.md) | Versioning, changelog, tag-triggered GitHub Releases |
 
 ## Development
 

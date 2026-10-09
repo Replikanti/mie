@@ -1,0 +1,96 @@
+name: Release
+
+# A pushed `vX.Y.Z` tag builds, tests and publishes the Linux x86_64 `mie`
+# binary as a GitHub Release (recipe: docs/release.md). `workflow_dispatch` is
+# a dry run: it builds and uploads the artifact but never publishes.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  TARGET: x86_64-unknown-linux-gnu
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # Cold-cache build of the Arrow/rustls stack plus the test suite.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The ancestry guard needs main's history.
+          fetch-depth: 0
+      # Fail before building anything when the tag is not a release of this
+      # tree: it must be `v` + the workspace version, on a commit in main, with a
+      # non-empty changelog section.
+      # Ref names reach the shell through env only, never `${{ }}` in `run:`.
+      - name: Guard tag against workspace version and main
+        if: github.ref_type == 'tag'
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 --offline \
+            | jq -r '.packages[] | select(.name == "mie-cli") | .version')
+          if [ "$TAG" != "v$version" ]; then
+            echo "FAIL: tag $TAG does not match the workspace version v$version"
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "FAIL: tagged commit $GITHUB_SHA is not on main"
+            exit 1
+          fi
+          # No release with an empty body: the changelog section must exist.
+          tools/release-notes.sh "${TAG#v}" > /dev/null
+          echo "OK: $TAG is v$version on main, changelog section present"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.TARGET }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --locked
+      - run: cargo build --release --locked -p mie-cli --target "$TARGET"
+      - name: Package binary and checksum
+        env:
+          # The tag on releases, the commit sha on dry runs.
+          NAME: ${{ github.ref_type == 'tag' && github.ref_name || format('dev-{0}', github.sha) }}
+        run: |
+          mkdir dist
+          cp "target/$TARGET/release/mie" "dist/mie-$NAME-linux-x86_64"
+          # Inside dist/ so the sidecar names the bare file (sha256sum -c works
+          # in the download directory).
+          cd dist
+          sha256sum "mie-$NAME-linux-x86_64" > "mie-$NAME-linux-x86_64.sha256"
+          cat "mie-$NAME-linux-x86_64.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mie-dist
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: mie-dist
+          path: dist
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          tools/release-notes.sh "${TAG#v}" > notes.md
+          gh release create "$TAG" dist/* --title "$TAG" --notes-file notes.md

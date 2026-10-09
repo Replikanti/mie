@@ -54,4 +54,5 @@ cargo deny check
   lock, validity via `FeatureValue`.
 - Every new dependency is justified in a `Cargo.toml` comment; licenses per
   `deny.toml`. Core crates take none (ADR-025).
+- Releases: `CHANGELOG.md` + tag-triggered workflow, recipe in `docs/release.md`.
 - Public repository: no local paths, credentials, API keys or private data.
