@@ -268,8 +268,10 @@ Every number below cites one of these. The probe used public data only.
 - Every depth diff costs the engine one pass over the diff's levels and one
   pass over the levels within 5 bps (about 700 at the M3 density) for depth
   and clusters: on the order of 1–2 k operations per diff at 10 diffs/s,
-  plus a full-book hash once per state checkpoint. The #13 soak's channel
-  high-water and blocked time measure it.
+  plus a full-book hash once per state checkpoint. #13's acceptance run
+  measures it: its core channel blocked time must stay 0 ms, and its
+  high-water is reported against the #9 and #10 baselines (ADR-041
+  *Accept when*).
 - With `limit=100` snapshots (the test fixture's window, about 1.5 bps) only
   the 1 bps band is in range; the default `limit=1000` is what makes 2 and
   5 bps available (M1).
@@ -312,8 +314,9 @@ Both are reachable on this host.
      decision 5 fails, and a `@2` revises the rule;
    - the 5th candidate's median multiple stays above the side's median p90
      level multiple; otherwise a `@2` lowers K.
-2. #13's acceptance soak (ADR-041 Accept when), on a binary with this
-   feature set, compares the book state with zero divergences.
+2. #13's acceptance run (ADR-041 *Accept when*: its coverage list includes
+   a book desync and resync), on a binary with this feature set, reports
+   every run `EQUIVALENT` with the state, and with it the book, compared.
 
 References: ADR-012, ADR-013, ADR-019, ADR-021, ADR-022, ADR-023, ADR-024,
 ADR-027, ADR-028, ADR-029, ADR-031, ADR-034, ADR-035, ADR-038, ADR-041,
