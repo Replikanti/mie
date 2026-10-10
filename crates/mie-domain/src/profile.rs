@@ -66,6 +66,83 @@ pub const COMPOSITE_SESSIONS: usize = 5;
 /// before node detection (decision 6), centred on the middle weight.
 pub const NODE_KERNEL: [i64; 5] = [1, 2, 3, 2, 1];
 
+/// The largest weight sum [`ProfileShape::new`] accepts for a kernel: with
+/// a total volume below `2^63` units, every smoothed bin stays below `2^83`
+/// and `1000 ·` it below `2^93`, so node detection stays exact in `i128`.
+const MAX_KERNEL_WEIGHT: i64 = 1 << 20;
+
+/// The parameters that shape a profile from its histogram (decisions 1 and
+/// 4–6), so the measurement tool can run the exact profile logic at other
+/// values, as ADR-044 did with its `AuctionClassifier`. The engine runs
+/// [`ProfileShape::V1`], the `profile.volume.*@1` parameters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProfileShape {
+    /// The bin size in `1 / SCALE` units: positive and even.
+    bin_units: i64,
+    /// The widest profile in bins.
+    max_bins: usize,
+    /// The value area's share of the volume in percent.
+    value_area_pct: i64,
+    /// The least prominence of a node, in percent of the highest smoothed
+    /// bin.
+    node_prominence_pct: i64,
+    /// The smoothing kernel: odd length, symmetric, positive weights.
+    kernel: &'static [i64],
+}
+
+impl ProfileShape {
+    /// The `profile.volume.*@1` parameters: [`BIN_SIZE`], [`MAX_BINS`],
+    /// [`VALUE_AREA_PCT`], [`NODE_PROMINENCE_PCT`] and [`NODE_KERNEL`].
+    pub const V1: Self = Self {
+        bin_units: BIN_UNITS,
+        max_bins: MAX_BINS,
+        value_area_pct: VALUE_AREA_PCT,
+        node_prominence_pct: NODE_PROMINENCE_PCT,
+        kernel: &NODE_KERNEL,
+    };
+
+    /// A shape with these parameters, or `None` if one is invalid: a bin
+    /// size that is not positive and even in `1 / SCALE` units (midpoints
+    /// must stay exact), no bins, a value-area percentage outside `1..=100`,
+    /// a prominence outside `0..=100`, or a kernel that is empty, of even
+    /// length, asymmetric, with a weight that is not positive, or with
+    /// weights summing beyond `2^20` (exactness of node detection).
+    pub fn new(
+        bin_size: Price,
+        max_bins: usize,
+        value_area_pct: i64,
+        node_prominence_pct: i64,
+        kernel: &'static [i64],
+    ) -> Option<Self> {
+        let bin_units = bin_size.units();
+        let kernel_ok = kernel.len() % 2 == 1
+            && kernel.iter().all(|weight| *weight > 0)
+            && kernel.iter().eq(kernel.iter().rev())
+            && kernel
+                .iter()
+                .try_fold(0_i64, |sum, weight| sum.checked_add(*weight))
+                .is_some_and(|sum| sum <= MAX_KERNEL_WEIGHT);
+        (bin_units > 0
+            && bin_units % 2 == 0
+            && max_bins > 0
+            && (1..=100).contains(&value_area_pct)
+            && (0..=100).contains(&node_prominence_pct)
+            && kernel_ok)
+            .then_some(Self {
+                bin_units,
+                max_bins,
+                value_area_pct,
+                node_prominence_pct,
+                kernel,
+            })
+    }
+
+    /// The bin of `price` (decision 1): `floor(price / bin_size)`.
+    pub fn bin_of(&self, price: Price) -> i64 {
+        price.units().div_euclid(self.bin_units)
+    }
+}
+
 /// A high- or low-volume node: one bin of the profile (decision 6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProfileNode {
@@ -338,39 +415,48 @@ impl VolumeProfiles {
     }
 }
 
-/// The bin of `price` (decision 1).
-fn bin_of(price: Price) -> i64 {
-    price.units().div_euclid(BIN_UNITS)
-}
-
-/// The lower edge, midpoint and upper edge of bin `bin`, if representable.
-fn bin_prices(bin: i64) -> Option<(Price, Price, Price)> {
-    let low = bin.checked_mul(BIN_UNITS)?;
-    let high = low.checked_add(BIN_UNITS)?;
+/// The lower edge, midpoint and upper edge of bin `bin` of `shape`, if
+/// representable.
+fn bin_prices(shape: &ProfileShape, bin: i64) -> Option<(Price, Price, Price)> {
+    let low = bin.checked_mul(shape.bin_units)?;
+    let high = low.checked_add(shape.bin_units)?;
     Some((
         Price::from_units(low),
-        Price::from_units(low + HALF_BIN_UNITS),
+        Price::from_units(low + shape.bin_units / 2),
         Price::from_units(high),
     ))
 }
 
-/// The levels of a dense histogram: a [`VolumeProfile`] without its window.
+/// The levels of a histogram: a [`VolumeProfile`] without its window
+/// (decisions 4–6). The fields mean what [`VolumeProfile`]'s fields of the
+/// same name mean.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Levels {
-    total_volume: Qty,
-    low: Price,
-    high: Price,
-    poc: Price,
-    poc_volume: Qty,
-    val: Price,
-    vah: Price,
-    value_area_volume: Qty,
-    hvn: Vec<ProfileNode>,
-    lvn: Vec<ProfileNode>,
+pub struct ProfileLevels {
+    /// Volume in the profile.
+    pub total_volume: Qty,
+    /// Lower edge of the lowest bin with volume.
+    pub low: Price,
+    /// Upper (exclusive) edge of the highest bin with volume.
+    pub high: Price,
+    /// Point of control: the midpoint of the bin with the most volume.
+    pub poc: Price,
+    /// Volume in the POC bin.
+    pub poc_volume: Qty,
+    /// Value-area low: the lower edge of the lowest value-area bin.
+    pub val: Price,
+    /// Value-area high: the upper (exclusive) edge of the highest
+    /// value-area bin.
+    pub vah: Price,
+    /// Volume in the value area.
+    pub value_area_volume: Qty,
+    /// High-volume nodes, by price ascending.
+    pub hvn: Vec<ProfileNode>,
+    /// Low-volume nodes, by price ascending.
+    pub lvn: Vec<ProfileNode>,
 }
 
-/// The levels of the dense histogram `bins`, whose first bin is `low_bin`
-/// (decisions 4–6).
+/// The levels of the dense histogram `bins` under `shape`, whose first bin
+/// is `low_bin` (decisions 4–6).
 ///
 /// `bins` is non-empty, holds no negative volume, and its first and last
 /// bins hold volume. `Ok(None)` when a bin edge is not representable as a
@@ -379,7 +465,11 @@ struct Levels {
 /// # Errors
 ///
 /// [`ProfileError::Overflow`] if the total volume leaves the `i64` range.
-fn levels(low_bin: i64, bins: &[Qty]) -> Result<Option<Levels>, ProfileError> {
+fn levels(
+    shape: &ProfileShape,
+    low_bin: i64,
+    bins: &[Qty],
+) -> Result<Option<ProfileLevels>, ProfileError> {
     let total: i128 = bins.iter().map(|volume| i128::from(volume.units())).sum();
     let total_volume = Qty::from_units(i64::try_from(total).map_err(|_| ProfileError::Overflow)?);
     let Some(last_bin) = i64::try_from(bins.len())
@@ -389,24 +479,25 @@ fn levels(low_bin: i64, bins: &[Qty]) -> Result<Option<Levels>, ProfileError> {
         return Ok(None);
     };
     // Both outer edges representable: so is every edge between them.
-    let (Some((low, _, _)), Some((_, _, high))) = (bin_prices(low_bin), bin_prices(last_bin))
+    let (Some((low, _, _)), Some((_, _, high))) =
+        (bin_prices(shape, low_bin), bin_prices(shape, last_bin))
     else {
         return Ok(None);
     };
     let prices = |index: usize| {
         // `index < bins.len()`, inside the representable range above.
         let offset = i64::try_from(index).unwrap_or(i64::MAX);
-        let low = low.units() + offset * BIN_UNITS;
+        let low = low.units() + offset * shape.bin_units;
         (
             Price::from_units(low),
-            Price::from_units(low + HALF_BIN_UNITS),
-            Price::from_units(low + BIN_UNITS),
+            Price::from_units(low + shape.bin_units / 2),
+            Price::from_units(low + shape.bin_units),
         )
     };
     let poc = poc(bins);
-    let (lo, hi, value_area) = value_area(bins, poc, total);
-    let smoothed = smooth(bins);
-    let (peaks, valleys) = nodes(&smoothed);
+    let (lo, hi, value_area) = value_area(shape, bins, poc, total);
+    let smoothed = smooth(shape, bins);
+    let (peaks, valleys) = nodes(shape, &smoothed);
     let to_node = |candidate: &Candidate| {
         let (low, price, high) = prices(candidate.index);
         ProfileNode {
@@ -417,7 +508,7 @@ fn levels(low_bin: i64, bins: &[Qty]) -> Result<Option<Levels>, ProfileError> {
             prominence_permille: candidate.permille,
         }
     };
-    Ok(Some(Levels {
+    Ok(Some(ProfileLevels {
         total_volume,
         low,
         high,
@@ -453,13 +544,13 @@ fn poc(bins: &[Qty]) -> usize {
 }
 
 /// The value area (decision 5): single-bin expansion from `poc` until it
-/// holds [`VALUE_AREA_PCT`] % of `total`, adding the larger neighbour, or
-/// both when they are equal. Returns the lowest and highest bin and the
-/// volume.
-fn value_area(bins: &[Qty], poc: usize, total: i128) -> (usize, usize, i128) {
+/// holds the shape's value-area percentage ([`VALUE_AREA_PCT`] at `@1`) of
+/// `total`, adding the larger neighbour, or both when they are equal.
+/// Returns the lowest and highest bin and the volume.
+fn value_area(shape: &ProfileShape, bins: &[Qty], poc: usize, total: i128) -> (usize, usize, i128) {
     let (mut lo, mut hi) = (poc, poc);
     let mut volume = i128::from(bins[poc].units());
-    let target = total * i128::from(VALUE_AREA_PCT);
+    let target = total * i128::from(shape.value_area_pct);
     while volume * 100 < target {
         let below = lo.checked_sub(1).map(|index| bins[index]);
         let above = bins.get(hi + 1).copied();
@@ -492,13 +583,15 @@ fn value_area(bins: &[Qty], poc: usize, total: i128) -> (usize, usize, i128) {
     (lo, hi, volume)
 }
 
-/// The smoothed series `s[k] = Σ w_j · v[k+j]` with [`NODE_KERNEL`]; bins
-/// outside the range count as 0 (decision 6).
-fn smooth(bins: &[Qty]) -> Vec<i128> {
-    let reach = NODE_KERNEL.len() / 2;
+/// The smoothed series `s[k] = Σ w_j · v[k+j]` with the shape's kernel
+/// ([`NODE_KERNEL`] at `@1`); bins outside the range count as 0
+/// (decision 6).
+fn smooth(shape: &ProfileShape, bins: &[Qty]) -> Vec<i128> {
+    let reach = shape.kernel.len() / 2;
     (0..bins.len())
         .map(|center| {
-            NODE_KERNEL
+            shape
+                .kernel
                 .iter()
                 .enumerate()
                 .filter_map(|(offset, weight)| {
@@ -522,13 +615,14 @@ struct Candidate {
     permille: u32,
 }
 
-/// The peaks and valleys of `s` that meet [`NODE_PROMINENCE_PCT`]
-/// (decision 6), each by index ascending. `s` is non-empty and
-/// non-negative.
-fn nodes(s: &[i128]) -> (Vec<Candidate>, Vec<Candidate>) {
+/// The peaks and valleys of `s` that meet the shape's prominence
+/// ([`NODE_PROMINENCE_PCT`] at `@1`, decision 6), each by index ascending.
+/// `s` is non-empty and non-negative.
+fn nodes(shape: &ProfileShape, s: &[i128]) -> (Vec<Candidate>, Vec<Candidate>) {
     let max = s.iter().copied().max().unwrap_or(0);
+    let threshold = i128::from(shape.node_prominence_pct);
     let keep = |index: usize, prominence: i128| {
-        (max > 0 && prominence * 100 >= max * i128::from(NODE_PROMINENCE_PCT)).then(|| Candidate {
+        (max > 0 && prominence * 100 >= max * threshold).then(|| Candidate {
             index,
             prominence,
             // At most 1000: the prominence never exceeds the maximum.
@@ -599,17 +693,23 @@ struct Window {
     coverage: Coverage,
 }
 
-/// The profile of the bin-wise sum of `histograms` over `window`
-/// (decisions 1 and 4–6): `Unavailable(InputInvalid)` without volume,
-/// `Unavailable(OutOfRange)` beyond [`MAX_BINS`] or the `Price` range.
+/// The levels of the bin-wise sum of `histograms` under `shape`
+/// (decisions 1 and 4–6): `Unavailable(InputInvalid)` without a bin,
+/// `Unavailable(OutOfRange)` beyond the shape's `max_bins` or the `Price`
+/// range. Each histogram maps a bin of `shape` ([`ProfileShape::bin_of`])
+/// to a positive volume.
+///
+/// The engine's profiles are this function at [`ProfileShape::V1`]; the
+/// measurement tool runs the exact same logic at other parameters, the
+/// pattern ADR-044 set with its `AuctionClassifier`.
 ///
 /// # Errors
 ///
 /// [`ProfileError::Overflow`] if a bin or the total leaves the `i64` range.
-fn profile(
+pub fn shape_levels(
+    shape: &ProfileShape,
     histograms: &[&BTreeMap<i64, Qty>],
-    window: Window,
-) -> Result<FeatureValue<VolumeProfile>, ProfileError> {
+) -> Result<FeatureValue<ProfileLevels>, ProfileError> {
     let unavailable = |reason| Ok(FeatureValue::Unavailable { reason });
     let first = histograms
         .iter()
@@ -623,7 +723,10 @@ fn profile(
         return unavailable(Unavailability::InputInvalid);
     };
     let span = i128::from(last) - i128::from(first) + 1;
-    let Some(len) = usize::try_from(span).ok().filter(|len| *len <= MAX_BINS) else {
+    let Some(len) = usize::try_from(span)
+        .ok()
+        .filter(|len| *len <= shape.max_bins)
+    else {
         return unavailable(Unavailability::OutOfRange);
     };
     let mut dense = vec![Qty::from_units(0); len];
@@ -634,26 +737,41 @@ fn profile(
             *slot = slot.checked_add(*volume).ok_or(ProfileError::Overflow)?;
         }
     }
-    let Some(levels) = levels(first, &dense)? else {
+    let Some(levels) = levels(shape, first, &dense)? else {
         return unavailable(Unavailability::OutOfRange);
     };
-    Ok(FeatureValue::Ready(VolumeProfile {
-        feature: window.feature,
-        start: window.start,
-        end: window.end,
-        sessions: window.sessions,
-        total_volume: levels.total_volume,
-        low: levels.low,
-        high: levels.high,
-        poc: levels.poc,
-        poc_volume: levels.poc_volume,
-        val: levels.val,
-        vah: levels.vah,
-        value_area_volume: levels.value_area_volume,
-        hvn: levels.hvn,
-        lvn: levels.lvn,
-        coverage: window.coverage,
-    }))
+    Ok(FeatureValue::Ready(levels))
+}
+
+/// The `@1` profile of the bin-wise sum of `histograms` over `window`:
+/// [`shape_levels`] at [`ProfileShape::V1`], with the window.
+///
+/// # Errors
+///
+/// [`ProfileError::Overflow`] if a bin or the total leaves the `i64` range.
+fn profile(
+    histograms: &[&BTreeMap<i64, Qty>],
+    window: Window,
+) -> Result<FeatureValue<VolumeProfile>, ProfileError> {
+    Ok(
+        shape_levels(&ProfileShape::V1, histograms)?.map(|levels| VolumeProfile {
+            feature: window.feature,
+            start: window.start,
+            end: window.end,
+            sessions: window.sessions,
+            total_volume: levels.total_volume,
+            low: levels.low,
+            high: levels.high,
+            poc: levels.poc,
+            poc_volume: levels.poc_volume,
+            val: levels.val,
+            vah: levels.vah,
+            value_area_volume: levels.value_area_volume,
+            hvn: levels.hvn,
+            lvn: levels.lvn,
+            coverage: window.coverage,
+        }),
+    )
 }
 
 /// One completed UTC day.
@@ -802,7 +920,7 @@ impl ProfileTracker {
         if let MarketEvent::Trade(trade) = event
             && trade.qty.units() > 0
         {
-            let bin = bin_of(trade.price);
+            let bin = ProfileShape::V1.bin_of(trade.price);
             let volume = developing
                 .get(&bin)
                 .copied()
@@ -949,6 +1067,7 @@ mod tests {
     use crate::feature::{FeatureDefinition, ParamValue, WarmUp};
     use crate::state::MarketStateEngine;
 
+    const V1: &ProfileShape = &ProfileShape::V1;
     const DAY: i64 = 86_400_000;
     const MINUTE: i64 = 60_000;
     const COMPLETE: Coverage = Coverage {
@@ -1022,8 +1141,8 @@ mod tests {
     }
 
     /// The levels of `volumes` from bin 6 200 (62 000 USDT).
-    fn levels_of(volumes: &[i64]) -> Levels {
-        levels(6_200, &hist(volumes)).unwrap().unwrap()
+    fn levels_of(volumes: &[i64]) -> ProfileLevels {
+        levels(V1, 6_200, &hist(volumes)).unwrap().unwrap()
     }
 
     /// `(index, prominence, permille)` of every candidate.
@@ -1035,7 +1154,7 @@ mod tests {
     }
 
     fn node_indices(volumes: &[i64]) -> (Vec<usize>, Vec<usize>) {
-        let (peaks, valleys) = nodes(&smooth(&hist(volumes)));
+        let (peaks, valleys) = nodes(V1, &smooth(V1, &hist(volumes)));
         let indices = |candidates: Vec<Candidate>| {
             candidates
                 .iter()
@@ -1066,7 +1185,7 @@ mod tests {
         let area = |volumes: &[i64]| {
             let bins = hist(volumes);
             let total = volumes.iter().map(|volume| i128::from(*volume)).sum();
-            value_area(&bins, poc(&bins), total)
+            value_area(V1, &bins, poc(&bins), total)
         };
         // Symmetric and unimodal; the tie at 4 / 4 adds both bins at once.
         assert_eq!(area(&[1, 2, 4, 8, 4, 2, 1]), (2, 4, 16));
@@ -1114,32 +1233,32 @@ mod tests {
         assert_eq!((ladder.val, ladder.vah), (price("62020"), price("62050")));
         assert_eq!(ladder.value_area_volume, Qty::from_units(16));
         // Negative prices bin by floor division.
-        let below_zero = levels(-1, &hist(&[3])).unwrap().unwrap();
+        let below_zero = levels(V1, -1, &hist(&[3])).unwrap().unwrap();
         assert_eq!(
             (below_zero.low, below_zero.poc, below_zero.high),
             (price("-10"), price("-5"), price("0"))
         );
         // A bin whose upper edge leaves the `Price` range has no levels.
-        assert_eq!(levels(i64::MAX / BIN_UNITS, &hist(&[1])), Ok(None));
+        assert_eq!(levels(V1, i64::MAX / BIN_UNITS, &hist(&[1])), Ok(None));
         assert!(
-            levels(i64::MAX / BIN_UNITS - 1, &hist(&[1]))
+            levels(V1, i64::MAX / BIN_UNITS - 1, &hist(&[1]))
                 .unwrap()
                 .is_some()
         );
         // A total beyond `i64` overflows.
         assert_eq!(
-            levels(0, &hist(&[i64::MAX, 1])),
+            levels(V1, 0, &hist(&[i64::MAX, 1])),
             Err(ProfileError::Overflow)
         );
     }
 
     #[test]
     fn smoothing_uses_the_triangular_kernel() {
-        assert_eq!(smooth(&hist(&[7])), [21]);
-        assert_eq!(smooth(&hist(&[1, 0, 0, 0, 0])), [3, 2, 1, 0, 0]);
-        assert_eq!(smooth(&hist(&[0, 0, 4, 0, 0])), [4, 8, 12, 8, 4]);
+        assert_eq!(smooth(V1, &hist(&[7])), [21]);
+        assert_eq!(smooth(V1, &hist(&[1, 0, 0, 0, 0])), [3, 2, 1, 0, 0]);
+        assert_eq!(smooth(V1, &hist(&[0, 0, 4, 0, 0])), [4, 8, 12, 8, 4]);
         assert_eq!(
-            smooth(&hist(&[5, 5, 5, 5, 5, 5, 5])),
+            smooth(V1, &hist(&[5, 5, 5, 5, 5, 5, 5])),
             [30, 40, 45, 45, 45, 40, 30]
         );
     }
@@ -1148,20 +1267,20 @@ mod tests {
     fn nodes_meet_the_prominence_threshold_exactly() {
         // Peak 3 has prominence 10 = 10 % of 100 (its base is the valley at
         // 2), and so has the valley: both are in.
-        let (peaks, valleys) = nodes(&[10, 100, 10, 20, 10]);
+        let (peaks, valleys) = nodes(V1, &[10, 100, 10, 20, 10]);
         assert_eq!(summary(&peaks), [(1, 100, 1000), (3, 10, 100)]);
         assert_eq!(summary(&valleys), [(2, 10, 100)]);
         // One unit less: both are out.
-        let (peaks, valleys) = nodes(&[10, 100, 10, 19, 10]);
+        let (peaks, valleys) = nodes(V1, &[10, 100, 10, 19, 10]);
         assert_eq!(summary(&peaks), [(1, 100, 1000)]);
         assert!(valleys.is_empty());
         // A valley's prominence is the lower of its two tops above it.
-        let (_, valleys) = nodes(&[100, 90, 100, 50, 100]);
+        let (_, valleys) = nodes(V1, &[100, 90, 100, 50, 100]);
         assert_eq!(summary(&valleys), [(1, 10, 100), (3, 50, 500)]);
-        let (_, valleys) = nodes(&[100, 91, 100, 50, 100]);
+        let (_, valleys) = nodes(V1, &[100, 91, 100, 50, 100]);
         assert_eq!(summary(&valleys), [(3, 50, 500)]);
         // The permille rounds down.
-        let (peaks, _) = nodes(&[0, 300, 0, 0, 0, 101, 0]);
+        let (peaks, _) = nodes(V1, &[0, 300, 0, 0, 0, 101, 0]);
         assert_eq!(summary(&peaks), [(1, 300, 1000), (5, 101, 336)]);
     }
 
@@ -1187,7 +1306,7 @@ mod tests {
     fn edge_peaks_are_allowed_edge_valleys_never() {
         // Smoothed: 30 24 17 9 9 8 6 — falling from the lower edge.
         assert_eq!(
-            smooth(&hist(&[9, 1, 1, 1, 1, 1, 1])),
+            smooth(V1, &hist(&[9, 1, 1, 1, 1, 1, 1])),
             [30, 24, 17, 9, 9, 8, 6]
         );
         assert_eq!(node_indices(&[9, 1, 1, 1, 1, 1, 1]), (vec![0], vec![]));
@@ -1234,9 +1353,9 @@ mod tests {
             vec![3, 3, 3],
         ] {
             let bins = hist(&volumes);
-            let smoothed = smooth(&bins);
+            let smoothed = smooth(V1, &bins);
             let max = smoothed.iter().copied().max().unwrap();
-            let (peaks, _) = nodes(&smoothed);
+            let (peaks, _) = nodes(V1, &smoothed);
             assert!(
                 peaks
                     .iter()
@@ -1357,9 +1476,9 @@ mod tests {
             let low_bin = 6_000 + lcg.below(1_000);
 
             // Nodes against the oracle, threshold applied to both.
-            let smoothed = smooth(&bins);
+            let smoothed = smooth(V1, &bins);
             let max = *smoothed.iter().max().unwrap();
-            let (peaks, valleys) = nodes(&smoothed);
+            let (peaks, valleys) = nodes(V1, &smoothed);
             let (reference_peaks, reference_valleys) = reference_nodes(&smoothed);
             let kept = |candidates: Vec<(usize, i128)>| {
                 candidates
@@ -1387,7 +1506,7 @@ mod tests {
 
             // Value area against the oracle and its invariants.
             let poc_index = poc(&bins);
-            let (lo, hi, volume) = value_area(&bins, poc_index, total);
+            let (lo, hi, volume) = value_area(V1, &bins, poc_index, total);
             let (reference_lo, reference_hi, steps) = reference_value_area(&volumes, poc_index);
             assert_eq!((lo, hi), (reference_lo, reference_hi), "{volumes:?}");
             assert_eq!(volume, *steps.last().unwrap());
@@ -1410,7 +1529,7 @@ mod tests {
             }
 
             // Prices: VAL ≤ POC < VAH, and every node inside the range.
-            let ladder = levels(low_bin, &bins).unwrap().unwrap();
+            let ladder = levels(V1, low_bin, &bins).unwrap().unwrap();
             assert!(ladder.low <= ladder.val && ladder.val <= ladder.poc);
             assert!(ladder.poc < ladder.vah && ladder.vah <= ladder.high);
             assert_eq!(ladder.total_volume.units(), i64::try_from(total).unwrap());
@@ -1568,6 +1687,29 @@ mod tests {
         }
         assert_eq!(NODE_KERNEL, [1, 2, 3, 2, 1]);
         assert_eq!(BIN_SIZE, price("10"));
+        // The engine's shape is the catalog's parameters.
+        let ProfileShape {
+            bin_units,
+            max_bins,
+            value_area_pct,
+            node_prominence_pct,
+            kernel,
+        } = ProfileShape::V1;
+        assert_eq!(bin_units, BIN_SIZE.units());
+        assert_eq!(max_bins, MAX_BINS);
+        assert_eq!(value_area_pct, VALUE_AREA_PCT);
+        assert_eq!(node_prominence_pct, NODE_PROMINENCE_PCT);
+        assert_eq!(kernel, NODE_KERNEL);
+        assert_eq!(
+            ProfileShape::new(
+                BIN_SIZE,
+                MAX_BINS,
+                VALUE_AREA_PCT,
+                NODE_PROMINENCE_PCT,
+                &NODE_KERNEL
+            ),
+            Some(ProfileShape::V1)
+        );
         assert_eq!(param(all[0], "sessions"), None);
         assert_eq!(param(all[1], "sessions"), Some(ParamValue::Int(1)));
         assert_eq!(
@@ -1586,6 +1728,98 @@ mod tests {
             VolumeProfiles::new().composite_5d,
             warming(0, COMPOSITE_SESSIONS as u64)
         );
+    }
+
+    #[test]
+    fn shape_rejects_invalid_parameters() {
+        let shape = |bin: &str, max_bins: usize, value_area, prominence, kernel: &'static [i64]| {
+            ProfileShape::new(price(bin), max_bins, value_area, prominence, kernel)
+        };
+        // The boundaries that are still valid.
+        assert!(shape("0.00000002", 1, 1, 0, &[1]).is_some());
+        assert!(shape("50", MAX_BINS, 100, 100, &[1, 2, 3, 4, 3, 2, 1]).is_some());
+        assert!(shape("10", 1, 70, 10, &[1 << 20]).is_some());
+        // Bin size: positive and even in units.
+        assert_eq!(shape("0", 1, 70, 10, &NODE_KERNEL), None);
+        assert_eq!(shape("-10", 1, 70, 10, &NODE_KERNEL), None);
+        assert_eq!(shape("0.00000001", 1, 70, 10, &NODE_KERNEL), None);
+        assert_eq!(shape("0.00000003", 1, 70, 10, &NODE_KERNEL), None);
+        // No bins.
+        assert_eq!(shape("10", 0, 70, 10, &NODE_KERNEL), None);
+        // Value area outside 1..=100.
+        assert_eq!(shape("10", 1, 0, 10, &NODE_KERNEL), None);
+        assert_eq!(shape("10", 1, 101, 10, &NODE_KERNEL), None);
+        // Prominence outside 0..=100.
+        assert_eq!(shape("10", 1, 70, -1, &NODE_KERNEL), None);
+        assert_eq!(shape("10", 1, 70, 101, &NODE_KERNEL), None);
+        // Kernels: empty, even, asymmetric, non-positive, too heavy.
+        assert_eq!(shape("10", 1, 70, 10, &[]), None);
+        assert_eq!(shape("10", 1, 70, 10, &[1, 1]), None);
+        assert_eq!(shape("10", 1, 70, 10, &[1, 2, 2]), None);
+        assert_eq!(shape("10", 1, 70, 10, &[0, 1, 0]), None);
+        assert_eq!(shape("10", 1, 70, 10, &[-1, 3, -1]), None);
+        assert_eq!(shape("10", 1, 70, 10, &[(1 << 20) + 1]), None);
+        assert_eq!(shape("10", 1, 70, 10, &[i64::MAX, 1, i64::MAX]), None);
+    }
+
+    /// The `triangular_k` kernels, `none` being `k = 1`.
+    const KERNELS: [&[i64]; 5] = [
+        &[1],
+        &[1, 2, 1],
+        &[1, 2, 3, 2, 1],
+        &[1, 2, 3, 4, 3, 2, 1],
+        &[1, 2, 3, 4, 5, 4, 3, 2, 1],
+    ];
+
+    #[test]
+    fn kernel_resolution_is_pinned() {
+        // Two equal single-bin peaks `d` bins apart stay two HVNs exactly
+        // when `d ≥ r_k = (k + 3) / 2`: none 2, t3 3, t5 4, t7 5, t9 6.
+        let hvn_count = |kernel: &'static [i64], d: i64| {
+            let shape = ProfileShape::new(BIN_SIZE, MAX_BINS, 70, 10, kernel).unwrap();
+            let volume = Qty::from_units(100_000_000);
+            let histogram = BTreeMap::from([(6_200, volume), (6_200 + d, volume)]);
+            let levels = shape_levels(&shape, &[&histogram]).unwrap();
+            levels.ready().unwrap().hvn.len()
+        };
+        let mut resolutions = Vec::new();
+        for kernel in KERNELS {
+            let r = i64::try_from((kernel.len() + 3) / 2).unwrap();
+            resolutions.push(r);
+            assert_eq!(hvn_count(kernel, r - 1), 1, "{kernel:?}");
+            assert_eq!(hvn_count(kernel, r), 2, "{kernel:?}");
+        }
+        assert_eq!(resolutions, [2, 3, 4, 5, 6]);
+        // At `@1`: 4 bins, 40 USDT.
+        assert_eq!(ProfileShape::V1.kernel, KERNELS[2]);
+    }
+
+    #[test]
+    fn rebinning_matches_direct_binning() {
+        // A 5 USDT bin divided by `m` (floor) is the bin at `5m` USDT.
+        let fine = ProfileShape::new(price("5"), MAX_BINS, 70, 10, &NODE_KERNEL).unwrap();
+        let mut lcg = Lcg(0x6d69_6500_0000_0079);
+        for m in [1, 2, 4, 5, 10] {
+            let coarse = ProfileShape::new(
+                Price::from_units(5 * m * SCALE),
+                MAX_BINS,
+                70,
+                10,
+                &NODE_KERNEL,
+            )
+            .unwrap();
+            for _ in 0..2_000 {
+                // Prices from −200 000 to 200 000 USDT, often on a bin edge.
+                let mut units = (lcg.below(400_000) - 200_000) * SCALE;
+                if lcg.below(2) == 0 {
+                    units += lcg.below(u64::try_from(SCALE).unwrap()) - SCALE / 2;
+                }
+                let price = Price::from_units(units);
+                assert_eq!(fine.bin_of(price).div_euclid(m), coarse.bin_of(price));
+            }
+        }
+        assert_eq!(ProfileShape::V1.bin_of(price("62009.99999999")), 6_200);
+        assert_eq!(ProfileShape::V1.bin_of(price("-0.00000001")), -1);
     }
 
     #[test]
