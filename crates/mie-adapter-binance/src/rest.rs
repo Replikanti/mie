@@ -56,7 +56,10 @@ impl OiTask {
             not_before_ms = slot_ms + 1;
 
             let request_time_ns = self.clock.now_utc_ns();
-            let result = self.http.get(&self.url);
+            let result = self
+                .http
+                .get_reply(&self.url)
+                .map(|reply| (reply.status, reply.body));
             let response_time_ns = self.clock.now_utc_ns();
             let (status, error, persisted) = match result {
                 Ok((status, body)) if (200..300).contains(&status) => {

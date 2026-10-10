@@ -7,7 +7,9 @@
 
 use mie_adapter_binance::book_sync::{BookTransition, SnapshotRejection};
 use mie_adapter_binance::live::CaptureError;
-use mie_adapter_binance::transport::{Clock, HttpGet, ReadOutcome, WsConnection, WsConnector};
+use mie_adapter_binance::transport::{
+    Clock, HttpGet, HttpReply, ReadOutcome, WsConnection, WsConnector,
+};
 use mie_adapter_binance::{
     BinanceStream, CaptureEvent, CaptureObserver, CaptureSummary, CheckpointResult, LiveConfig,
     SnapshotTrigger, start,
@@ -218,6 +220,8 @@ impl WsConnection for FakeConnection {
 /// One scripted HTTP response.
 enum Http {
     Status(u16, String),
+    /// A status and body with a `Retry-After` header value.
+    StatusRetryAfter(u16, String, &'static str),
     Fail,
 }
 
@@ -230,7 +234,12 @@ struct FakeHttp {
 }
 
 impl HttpGet for FakeHttp {
-    fn get(&self, _url: &str) -> Result<(u16, Vec<u8>), String> {
+    fn get(&self, url: &str) -> Result<(u16, Vec<u8>), String> {
+        let reply = self.get_reply(url)?;
+        Ok((reply.status, reply.body))
+    }
+
+    fn get_reply(&self, _url: &str) -> Result<HttpReply, String> {
         self.requests
             .lock()
             .unwrap()
@@ -238,7 +247,16 @@ impl HttpGet for FakeHttp {
         // Every response takes 37 ms.
         self.clock.advance(Duration::from_millis(37));
         match self.script.lock().unwrap().pop_front() {
-            Some(Http::Status(status, body)) => Ok((status, body.into_bytes())),
+            Some(Http::Status(status, body)) => Ok(HttpReply {
+                status,
+                body: body.into_bytes(),
+                retry_after: None,
+            }),
+            Some(Http::StatusRetryAfter(status, body, retry_after)) => Ok(HttpReply {
+                status,
+                body: body.into_bytes(),
+                retry_after: Some(retry_after.to_owned()),
+            }),
             Some(Http::Fail) => Err("scripted transport failure".to_owned()),
             None => {
                 self.shutdown.store(true, Ordering::Relaxed);
@@ -927,6 +945,181 @@ fn open_interest_polls_align_back_off_and_never_persist_failures() {
     );
 }
 
+/// The body of a scripted 418 or 429.
+const RATE_LIMITED: &str = "{\"code\":-1003}";
+
+/// Runs an open-interest-only capture over `script` with the default
+/// configuration, starting 3.456 s into a 10 s slot. Returns the outcome
+/// and the request times in ms after `D0`, including the request that
+/// exhausted the script.
+fn open_interest_run(script: Vec<Http>) -> (Outcome, Vec<i64>) {
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let clock = FakeClock::new(D0 + 3_456, "mie-openInterest");
+    let http = Arc::new(FakeHttp {
+        script: Mutex::new(script.into()),
+        clock: Arc::clone(&clock),
+        shutdown: Arc::clone(&shutdown),
+        requests: Mutex::default(),
+    });
+    let connector = FakeConnector::new(vec![], &clock, &shutdown);
+    let requests = Arc::clone(&http);
+    let out = run(
+        config(&[BinanceStream::OpenInterest]),
+        connector,
+        http,
+        clock,
+        shutdown,
+        None,
+    );
+    let requests = requests
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|t| t - D0)
+        .collect();
+    (out, requests)
+}
+
+/// (request ms after `D0`, response ms after `D0`, status, persisted) of
+/// every journaled poll.
+fn open_interest_polls(out: &Outcome) -> Vec<(i64, i64, Option<u16>, bool)> {
+    out.observed
+        .iter()
+        .filter_map(|e| match e {
+            CaptureEvent::OiPoll {
+                request_time_ns,
+                response_time_ns,
+                status,
+                persisted,
+                ..
+            } => Some((
+                request_time_ns / MS - D0,
+                response_time_ns / MS - D0,
+                *status,
+                *persisted,
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn open_interest_honours_retry_after_and_stays_on_the_grid() {
+    let (out, requests) = open_interest_run(vec![
+        Http::Status(200, oi(D0 + 10_030)),
+        Http::StatusRetryAfter(429, RATE_LIMITED.to_owned(), "30"),
+        Http::StatusRetryAfter(418, RATE_LIMITED.to_owned(), "120"),
+        Http::Status(200, oi(D0 + 190_030)),
+        // Below the 60 s fallback: the header still decides (ADR-045 D2).
+        Http::StatusRetryAfter(429, RATE_LIMITED.to_owned(), "5"),
+        Http::Status(200, oi(D0 + 210_030)),
+    ]);
+    // A Retry-After of N s defers the next poll to the first 10 s slot at
+    // or after response + N s: 20.037 + 30 → 60, 60.037 + 120 → 190,
+    // 200.037 + 5 → 210.
+    assert_eq!(
+        requests[..6],
+        [10_000, 20_000, 60_000, 190_000, 200_000, 210_000]
+    );
+    // Every poll stays on the 10 s wall-clock grid.
+    assert!(requests.iter().all(|t| t % 10_000 == 0), "{requests:?}");
+    let polls = open_interest_polls(&out);
+    assert_eq!(
+        polls[..6],
+        [
+            (10_000, 10_037, Some(200), true),
+            (20_000, 20_037, Some(429), false),
+            (60_000, 60_037, Some(418), false),
+            (190_000, 190_037, Some(200), true),
+            (200_000, 200_037, Some(429), false),
+            (210_000, 210_037, Some(200), true),
+        ]
+    );
+    // No poll before response time + Retry-After.
+    for (rate_limited, retry_after_ms) in [(1, 30_000), (2, 120_000), (4, 5_000)] {
+        assert!(requests[rate_limited + 1] >= polls[rate_limited].1 + retry_after_ms);
+    }
+    let sessions: Vec<_> = out
+        .records()
+        .iter()
+        .map(|r| r.capture.as_ref().unwrap().session_id.clone())
+        .collect();
+    assert_eq!(
+        sessions,
+        [
+            "20261006T000000Z/openInterest/1",
+            "20261006T000000Z/openInterest/3",
+            "20261006T000000Z/openInterest/4"
+        ]
+    );
+    assert_eq!(
+        out.gaps(),
+        [
+            (Stream::OpenInterest, GapReason::Disconnected),
+            (Stream::OpenInterest, GapReason::Disconnected)
+        ]
+    );
+}
+
+#[test]
+fn open_interest_without_a_usable_retry_after_falls_back_to_its_own_pause() {
+    let (out, requests) = open_interest_run(vec![
+        Http::Status(429, RATE_LIMITED.to_owned()),
+        // An HTTP-date and a decimal are not delay-seconds (ADR-045 D1).
+        Http::StatusRetryAfter(
+            429,
+            RATE_LIMITED.to_owned(),
+            "Wed, 21 Oct 2026 07:28:00 GMT",
+        ),
+        Http::StatusRetryAfter(429, RATE_LIMITED.to_owned(), "1.5"),
+        Http::Status(418, RATE_LIMITED.to_owned()),
+        Http::Status(200, oi(D0 + 350_030)),
+    ]);
+    // 60 s after each 429 and 120 s after the 418, measured from the
+    // response and rounded up to the 10 s grid (ADR-045 D4, D5).
+    assert_eq!(requests[..5], [10_000, 80_000, 150_000, 220_000, 350_000]);
+    let statuses: Vec<_> = open_interest_polls(&out)
+        .iter()
+        .take(5)
+        .map(|p| (p.2, p.3))
+        .collect();
+    assert_eq!(
+        statuses,
+        [
+            (Some(429), false),
+            (Some(429), false),
+            (Some(429), false),
+            (Some(418), false),
+            (Some(200), true)
+        ]
+    );
+    assert_eq!(out.records().len(), 1);
+}
+
+#[test]
+fn open_interest_rate_limiting_polls_at_most_once_per_weight_window() {
+    let (_out, requests) = open_interest_run(
+        (0..6)
+            .map(|_| Http::Status(429, RATE_LIMITED.to_owned()))
+            .collect(),
+    );
+    assert_eq!(
+        requests[..6],
+        [10_000, 80_000, 150_000, 220_000, 290_000, 360_000]
+    );
+    // Without errors, a 60 s window holds 6 polls. From the first
+    // rate-limited answer on, each one holds exactly 1: no poll lands in
+    // the 1-minute REQUEST_WEIGHT window that answered 429 (ADR-045 D4).
+    for &t in &requests[..6] {
+        let in_window = requests
+            .iter()
+            .filter(|&&r| (t..t + 60_000).contains(&r))
+            .count();
+        assert_eq!(in_window, 1, "polls in [{t}, {}): {requests:?}", t + 60_000);
+    }
+}
+
 fn mark(time: i64) -> String {
     format!(
         r#"{{"e":"markPriceUpdate","E":{time},"s":"BTCUSDT","p":"85001.00000000","i":"85002.50000000","r":"0.00010000","T":1791273600000}}"#
@@ -1337,7 +1530,10 @@ impl HttpGet for DepthHttp {
             .push((url.to_owned(), self.clock.now_utc_ns() / MS));
         self.clock.advance(Duration::from_millis(37));
         match self.script.lock().unwrap().pop_front() {
-            Some(Http::Status(status, body)) => Ok((status, body.into_bytes())),
+            // The depth fetcher reads no headers (ADR-045 D6).
+            Some(Http::Status(status, body) | Http::StatusRetryAfter(status, body, _)) => {
+                Ok((status, body.into_bytes()))
+            }
             Some(Http::Fail) => Err("scripted transport failure".to_owned()),
             None => {
                 self.shutdown.store(true, Ordering::Relaxed);
