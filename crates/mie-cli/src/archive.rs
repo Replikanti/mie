@@ -17,6 +17,7 @@ use mie_adapter_binance::archive::replay::open_requests;
 use mie_adapter_binance::archive::{ARCHIVE_SOURCE, ArchiveStream};
 use mie_adapter_binance::transport::{Clock, HttpDownload, HttpGet};
 use mie_adapter_parquet::{ParquetRawStore, RotationPolicy};
+use mie_app::kline_check::{KlineVerdict, MAX_EXPECTED_INCOMPLETE};
 use mie_domain::bars::Timeframe;
 use mie_domain::event::MarketEvent;
 use mie_domain::state::MarketStateEngine;
@@ -450,11 +451,13 @@ fn check_stream(
 /// It replays the archive (ADR-039 D5) with trades over
 /// `[start − 60 s, end + 60 s)` and the six kline streams over the window,
 /// so every in-window bar of every timeframe can close complete. The replay
-/// delivers trade-id breaks and missing days as gaps, which leave the bars
-/// they touch incomplete.
-/// Returns whether at least one complete bar was compared and every
-/// compared bar matched its kline: a window without the trade stream or
-/// without klines is no evidence and fails.
+/// delivers missing days, and for `aggTrades` trade-id breaks, as gaps,
+/// which leave the bars they touch incomplete; `trades` ids are sparse by
+/// design, so a jump there is no gap (ADR-045).
+/// Returns the report's verdict (ADR-045): a mismatch, or a window without
+/// the trade stream or without klines (nothing compared), fails; more
+/// incomplete bars than the partial start of each timeframe is
+/// inconclusive. A coverage line precedes the verdict line.
 ///
 /// # Errors
 ///
@@ -466,7 +469,7 @@ pub fn kline_check(
     to_day: i64,
     trade_stream: ArchiveStream,
     out: &mut dyn Write,
-) -> Result<bool, String> {
+) -> Result<KlineVerdict, String> {
     if !matches!(
         trade_stream,
         ArchiveStream::AggTrades | ArchiveStream::Trades
@@ -512,15 +515,42 @@ pub fn kline_check(
         let _ = writeln!(out, "dataset {name} {version}");
     }
     let _ = writeln!(out, "{report}");
-    let pass = report.compared > 0 && report.all_matched();
-    if report.compared == 0 {
-        let _ = writeln!(
-            out,
-            "FAIL: no complete bar was compared; import {trade_stream} and klines for the \
-             window and the minute around it"
-        );
-    } else {
-        let _ = writeln!(out, "{}", if pass { "PASS" } else { "FAIL" });
+    let _ = writeln!(
+        out,
+        "coverage: compared {} of {} closed bars, {} skipped as incomplete (expected at most \
+         {MAX_EXPECTED_INCOMPLETE})",
+        report.compared,
+        report.compared + report.incomplete_skipped,
+        report.incomplete_skipped
+    );
+    let verdict = report.verdict();
+    match verdict {
+        KlineVerdict::Fail if report.compared == 0 => {
+            let _ = writeln!(
+                out,
+                "FAIL: no complete bar was compared; import {trade_stream} and klines for the \
+                 window and the minute around it"
+            );
+        }
+        KlineVerdict::Fail => {
+            let _ = writeln!(out, "FAIL");
+        }
+        KlineVerdict::Inconclusive => {
+            let gaps = match trade_stream {
+                ArchiveStream::Trades => "missing days",
+                _ => "missing days and trade-id breaks",
+            };
+            let _ = writeln!(
+                out,
+                "INCONCLUSIVE: {} bars skipped as incomplete under trades from {trade_stream}; \
+                 feed gaps ({gaps}) leave the bars they touch incomplete, archive-verify lists \
+                 them",
+                report.incomplete_skipped
+            );
+        }
+        KlineVerdict::Pass => {
+            let _ = writeln!(out, "PASS");
+        }
     }
-    Ok(pass)
+    Ok(verdict)
 }

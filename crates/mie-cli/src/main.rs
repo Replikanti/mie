@@ -5,6 +5,7 @@ use mie_adapter_binance::archive::catalog::parse_day;
 use mie_adapter_binance::transport::{
     DownloadTimeouts, NetTimeouts, SystemClock, TungsteniteConnector, UreqDownload, UreqHttp,
 };
+use mie_app::kline_check::KlineVerdict;
 use mie_cli::archive::{self, ArchiveTransports, ImportRequest};
 use mie_cli::config::{ArchiveConfig, IngestConfig};
 use mie_cli::equivalence::{self, EquivalenceRequest};
@@ -61,8 +62,14 @@ USAGE:
                             [--trade-source aggTrades|trades]
         Build bars from archive trades (default aggTrades) through the
         domain and compare every complete bar with the archive klines
-        (ADR-031). Exits 0 only when at least one complete bar was compared
-        and every compared bar matched.
+        (ADR-031). Prints a coverage line (compared and incomplete bars)
+        before the verdict (ADR-045): PASS (exit 0) when at least one
+        complete bar was compared, every compared bar matched and at most
+        one bar per timeframe (the partial starts) was skipped as
+        incomplete; FAIL (exit 1) on a mismatch or when nothing was
+        compared; INCONCLUSIVE (exit 3) when no bar disagrees but feed gaps
+        left more bars incomplete. trades ids are sparse by design, so only
+        missing days are gaps under --trade-source trades.
 
     mie replay --config <path> --from <ms|YYYY-MM-DD> --to <ms|YYYY-MM-DD>
                [--source live|archive] [--streams <a,b,...>]
@@ -208,14 +215,14 @@ fn dispatch(args: &[String]) -> Result<ExitCode, String> {
                     ));
                 }
             };
-            let matched = archive::kline_check(
+            let verdict = archive::kline_check(
                 &config,
                 from_day,
                 to_day,
                 trade_source,
                 &mut std::io::stdout().lock(),
             )?;
-            Ok(exit(matched))
+            Ok(ExitCode::from(verdict_code(verdict)))
         }
         Some("replay") => {
             let options = Options::parse(
@@ -292,6 +299,16 @@ fn exit(pass: bool) -> ExitCode {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
+    }
+}
+
+/// Exit code of an `archive-kline-check` verdict (ADR-045): 0 pass, 1 fail,
+/// 3 inconclusive; 2 stays the usage-error code.
+fn verdict_code(verdict: KlineVerdict) -> u8 {
+    match verdict {
+        KlineVerdict::Pass => 0,
+        KlineVerdict::Fail => 1,
+        KlineVerdict::Inconclusive => 3,
     }
 }
 
@@ -447,5 +464,17 @@ impl Options {
         value
             .parse()
             .map_err(|_| format!("{flag} {value:?} is not an integer of epoch milliseconds"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kline_check_verdicts_map_to_distinct_exit_codes() {
+        assert_eq!(verdict_code(KlineVerdict::Pass), 0);
+        assert_eq!(verdict_code(KlineVerdict::Fail), 1);
+        assert_eq!(verdict_code(KlineVerdict::Inconclusive), 3);
     }
 }

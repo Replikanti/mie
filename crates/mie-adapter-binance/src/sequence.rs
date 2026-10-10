@@ -13,6 +13,12 @@
 //!   when trade ids happen to be contiguous, so every reconnect is visible.
 //! - **Sequence break**: within one session, a trade id other than
 //!   `last + 1` is preceded by a `SequenceBreak` gap between the two trades.
+//!   Exception: a sequencer built with
+//!   [`allowing_trade_id_gaps`](StreamSequencer::allowing_trade_id_gaps)
+//!   reports no id jump, for the one dataset whose id space is sparse by
+//!   design (the archive `trades` files: 9 881 jumps in a day whose kline
+//!   trade counts sum to its row count, ADR-045). Dedupe and the session
+//!   change still apply.
 //! - **Seed**: the first event of a run is preceded by a `Disconnected` gap
 //!   from the previous run's last persisted event time, which turns any
 //!   restart (and the crash loss of ADR-030 D5) into a gap.
@@ -46,6 +52,8 @@ pub struct StreamSequencer {
     /// The last delivered event (never a gap).
     last: Option<MarketEvent>,
     last_trade_id: Option<u64>,
+    /// Whether a trade id jump within a session is no gap (ADR-045).
+    allow_trade_id_gaps: bool,
     duplicates: u64,
     regressions: u64,
 }
@@ -60,9 +68,20 @@ impl StreamSequencer {
             session: None,
             last: None,
             last_trade_id: None,
+            allow_trade_id_gaps: false,
             duplicates: 0,
             regressions: 0,
         }
+    }
+
+    /// The same sequencer, except that a trade id above `last + 1` within a
+    /// session is delivered without a `SequenceBreak` gap. For a dataset
+    /// whose ids are sparse by design (archive `trades`, ADR-045) only; live
+    /// capture and archive `aggTrades` keep the strict rule. Repeated and
+    /// regressing ids are still dropped, a session change is still a gap.
+    pub fn allowing_trade_id_gaps(mut self) -> Self {
+        self.allow_trade_id_gaps = true;
+        self
     }
 
     /// Takes the next event of the stream, received in `session_id`, and
@@ -82,7 +101,8 @@ impl StreamSequencer {
             }
             (Some(MarketEvent::Trade(last)), _) => match &event {
                 MarketEvent::Trade(trade)
-                    if Some(trade.trade_id) != last.trade_id.checked_add(1) =>
+                    if !self.allow_trade_id_gaps
+                        && Some(trade.trade_id) != last.trade_id.checked_add(1) =>
                 {
                     Some((last.time, GapReason::SequenceBreak))
                 }
@@ -210,6 +230,38 @@ mod tests {
             [
                 gap(Stream::Trades, 1_010, 1_030, GapReason::SequenceBreak),
                 trade(1_030, 103)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_sparse_id_sequencer_reports_no_id_jump_but_keeps_the_other_rules() {
+        let mut seq = StreamSequencer::new(Stream::Trades, None).allowing_trade_id_gaps();
+        assert_eq!(seq.push("s1", trade(1_000, 1)), [trade(1_000, 1)]);
+        assert_eq!(seq.push("s1", trade(1_010, 2)), [trade(1_010, 2)]);
+        assert_eq!(seq.push("s1", trade(1_030, 5)), [trade(1_030, 5)]);
+        // Repeated and lower ids are still dropped and counted.
+        assert!(seq.push("s1", trade(1_031, 5)).is_empty());
+        assert!(seq.push("s1", trade(1_032, 3)).is_empty());
+        assert_eq!((seq.duplicates(), seq.regressions()), (1, 1));
+        // A session change is still a disconnect.
+        assert_eq!(
+            seq.push("s2", trade(4_000, 9)),
+            [
+                gap(Stream::Trades, 1_030, 4_000, GapReason::Disconnected),
+                trade(4_000, 9)
+            ]
+        );
+        // The default sequencer (live capture, aggTrades) keeps the strict
+        // rule for the same ids.
+        let mut strict = StreamSequencer::new(Stream::Trades, None);
+        strict.push("s1", trade(1_000, 1));
+        strict.push("s1", trade(1_010, 2));
+        assert_eq!(
+            strict.push("s1", trade(1_030, 5)),
+            [
+                gap(Stream::Trades, 1_010, 1_030, GapReason::SequenceBreak),
+                trade(1_030, 5)
             ]
         );
     }
