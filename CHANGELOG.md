@@ -31,8 +31,25 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   `crates/mie-cli/tests/location_measure.rs` measures the numbers behind
   the tolerance and the acceptance time over the archive.
 
+### Changed
+
+- **`archive-kline-check` reports coverage and an INCONCLUSIVE verdict
+  (ADR-045).** A coverage line (window bars compared, bars skipped as
+  incomplete, klines without a bar) precedes the verdict. A run with no
+  mismatch prints `INCONCLUSIVE` and exits 3 instead of passing when it
+  compared fewer bars than the window
+  holds (1855 per day), for example because trade or kline days are
+  missing at the window's edges, or when it skipped more than the six
+  partial-start bars (one per timeframe). Exit 0 (`PASS`) and 1 (`FAIL`)
+  keep their meaning.
+
 ### Fixed
 
+- **`archive-kline-check --trade-source trades` compared almost no bars
+  (#85, ADR-045).** The archive `trades` id space is sparse by design (the
+  exchange skips ids its klines do not count), so an id jump in that
+  dataset is no longer a `SequenceBreak` gap. Live capture and archive
+  `aggTrades` keep the strict rule.
 - **Open-interest polling backs off from rate limits (ADR-046, #84).** On a
   418 or 429 the poller honours `Retry-After` (seconds, capped at 3 days);
   without the header it pauses 60 s after a 429 (one `REQUEST_WEIGHT`

@@ -31,6 +31,9 @@
 //!   repeats (overlapping files, exact duplicate rows) and turns a trade-id
 //!   jump into a `SequenceBreak` gap; one zero hold-back
 //!   [`HoldBack`] then places same-millisecond gaps in the canonical order.
+//!   The `trades` stream (kline cross-check only) is the exception: its id
+//!   space is sparse by design, so an id jump there is no gap (ADR-045);
+//!   dedupe and missing days still apply to it.
 //! - **Missing days.** A source day of a requested window that no sealed
 //!   file of the stream holds is a `MissingData` gap from the stream's
 //!   previous event (or the window start) to its first event after the
@@ -264,7 +267,13 @@ pub fn open_requests<'a>(
         .keys()
         .map(|&s| {
             let domain = s.domain_stream().expect("checked above");
-            (s, StreamSequencer::new(domain, None))
+            let sequencer = StreamSequencer::new(domain, None);
+            let sequencer = match s {
+                // Sparse by design: an id jump is not a lost trade (ADR-045).
+                ArchiveStream::Trades => sequencer.allowing_trade_id_gaps(),
+                _ => sequencer,
+            };
+            (s, sequencer)
         })
         .collect();
     Ok(ArchiveReplayStream {

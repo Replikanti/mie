@@ -27,6 +27,47 @@ pub struct KlineMismatch {
     pub fields: Vec<KlineField>,
 }
 
+/// Most closed bars a clean window skips as incomplete: the partial first
+/// bar of each timeframe, one per entry of [`Timeframe::ALL`] (ADR-031
+/// decision 6, ADR-045). Measured: the ADR-031 February window skips exactly
+/// 6 under both trade sources. At 0 every clean run would be inconclusive;
+/// at more than 6 a feed gap could pass, since a gap that arrives while
+/// bars are open marks at least one bar per timeframe.
+pub const MAX_EXPECTED_INCOMPLETE: u64 = Timeframe::ALL.len() as u64;
+
+/// The bars of every [`Timeframe`] that lie wholly inside `[start, end)`:
+/// the bars a kline check over that window has to compare (ADR-045). A
+/// whole UTC day holds 1440 + 288 + 96 + 24 + 6 + 1 = 1855.
+pub fn window_bars(start: EventTime, end: EventTime) -> u64 {
+    let (start, end) = (start.as_millis(), end.as_millis());
+    Timeframe::ALL
+        .into_iter()
+        .map(|timeframe| {
+            let span = timeframe.millis();
+            // Opens are multiples of the span; a bar is inside when
+            // `start <= open` and `open + span <= end`.
+            let first = start.div_euclid(span) + i64::from(start.rem_euclid(span) != 0);
+            let after_last = end.div_euclid(span);
+            u64::try_from(after_last - first).unwrap_or(0)
+        })
+        .sum()
+}
+
+/// What a [`KlineCheckReport`] supports (ADR-045).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KlineVerdict {
+    /// Every bar of the window was compared and matched, and at most
+    /// [`MAX_EXPECTED_INCOMPLETE`] bars were skipped as incomplete.
+    Pass,
+    /// A compared bar disagrees with its kline, or no bar was compared.
+    Fail,
+    /// No compared bar disagrees, but a bar of the window was not compared
+    /// (incomplete, never built because its trades are missing, or without
+    /// a kline), or more bars than a clean window's partial starts were
+    /// skipped as incomplete: the run lacks the evidence for a pass.
+    Inconclusive,
+}
+
 /// The outcome of [`cross_check_klines`]. `Display` prints the summary
 /// posted on an issue after a real-data run.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -59,6 +100,21 @@ impl KlineCheckReport {
     /// Whether every compared bar matched its kline.
     pub fn all_matched(&self) -> bool {
         self.mismatches.is_empty()
+    }
+
+    /// The verdict over a window of `window_bars` bars ([`window_bars`]),
+    /// in precedence order: any mismatch fails; so does a run that compared
+    /// nothing; fewer compared bars than the window holds, or more than
+    /// [`MAX_EXPECTED_INCOMPLETE`] incomplete bars, is inconclusive;
+    /// otherwise the run passes.
+    pub fn verdict(&self, window_bars: u64) -> KlineVerdict {
+        if !self.all_matched() || self.compared == 0 {
+            KlineVerdict::Fail
+        } else if self.compared < window_bars || self.incomplete_skipped > MAX_EXPECTED_INCOMPLETE {
+            KlineVerdict::Inconclusive
+        } else {
+            KlineVerdict::Pass
+        }
     }
 
     fn compare(&mut self, bar: &Bar, kline: Option<Kline>) {
@@ -167,4 +223,85 @@ where
     })?;
     report.klines_without_bar = u64::try_from(pending.len()).unwrap_or(u64::MAX);
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn report(compared: u64, mismatches: usize, incomplete_skipped: u64) -> KlineCheckReport {
+        let mismatch = KlineMismatch {
+            timeframe: Timeframe::M1,
+            open_time: EventTime::from_millis(0),
+            fields: vec![KlineField::Volume],
+        };
+        KlineCheckReport {
+            compared,
+            matched: compared - mismatches as u64,
+            mismatches: vec![mismatch; mismatches],
+            incomplete_skipped,
+            ..KlineCheckReport::default()
+        }
+    }
+
+    #[test]
+    fn the_allowance_is_one_partial_start_per_timeframe() {
+        assert_eq!(MAX_EXPECTED_INCOMPLETE, 6);
+    }
+
+    const THREE_DAYS: u64 = 3 * 1_855;
+
+    #[test]
+    fn a_whole_day_holds_1855_bars() {
+        let day = 86_400_000;
+        let at = EventTime::from_millis;
+        assert_eq!(window_bars(at(20 * day), at(21 * day)), 1_855);
+        assert_eq!(window_bars(at(20 * day), at(23 * day)), THREE_DAYS);
+        // Only bars wholly inside count: one minute in, the 1d bar and the
+        // first 5m, 15m, 1h and 4h bars are cut.
+        assert_eq!(
+            window_bars(at(20 * day + 60_000), at(21 * day)),
+            1_439 + 287 + 95 + 23 + 5
+        );
+        assert_eq!(window_bars(at(day), at(day)), 0);
+    }
+
+    #[test]
+    fn a_mismatch_fails_even_with_low_coverage() {
+        assert_eq!(report(5, 1, 5_566).verdict(THREE_DAYS), KlineVerdict::Fail);
+    }
+
+    #[test]
+    fn a_run_that_compared_nothing_fails() {
+        assert_eq!(report(0, 0, 0).verdict(THREE_DAYS), KlineVerdict::Fail);
+        assert_eq!(report(0, 0, 9).verdict(THREE_DAYS), KlineVerdict::Fail);
+    }
+
+    #[test]
+    fn coverage_beyond_the_partial_starts_is_inconclusive() {
+        assert_eq!(report(5_565, 0, 6).verdict(THREE_DAYS), KlineVerdict::Pass);
+        assert_eq!(report(5_565, 0, 0).verdict(THREE_DAYS), KlineVerdict::Pass);
+        assert_eq!(
+            report(5_565, 0, 7).verdict(THREE_DAYS),
+            KlineVerdict::Inconclusive
+        );
+        assert_eq!(
+            report(5, 0, 5_566).verdict(THREE_DAYS),
+            KlineVerdict::Inconclusive
+        );
+    }
+
+    #[test]
+    fn a_window_bar_that_was_not_compared_is_inconclusive() {
+        // Missing trade days at the window's edges build no bar at all, so
+        // nothing is skipped as incomplete; only the window count shows it.
+        assert_eq!(
+            report(1_849, 0, 6).verdict(THREE_DAYS),
+            KlineVerdict::Inconclusive
+        );
+        assert_eq!(
+            report(5_564, 0, 6).verdict(THREE_DAYS),
+            KlineVerdict::Inconclusive
+        );
+    }
 }

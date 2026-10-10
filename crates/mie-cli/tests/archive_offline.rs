@@ -13,6 +13,7 @@ use mie_adapter_binance::archive::normalize::record_time;
 use mie_adapter_binance::archive::{ARCHIVE_SOURCE, ArchiveStream};
 use mie_adapter_binance::transport::{Clock, HttpDownload, HttpGet};
 use mie_adapter_parquet::{ParquetRawStore, RawWriter, RotationPolicy};
+use mie_app::kline_check::KlineVerdict;
 use mie_cli::archive::{self, ArchiveTransports, ImportRequest};
 use mie_cli::config::ArchiveConfig;
 use mie_domain::bars::Timeframe;
@@ -157,6 +158,13 @@ struct Tick {
     maker: bool,
 }
 
+/// Coverage of a three-day kline check whose middle trade day is missing:
+/// the 1855 bars of that day, the bars of the two other days that the gap
+/// touches and the six partial starts are incomplete.
+const COVERAGE_WITH_A_MISSING_DAY: &str = "coverage: compared 3698 of 5565 window bars; 1873 \
+     closed bars skipped as incomplete (expected at most 6), 0 klines without a closed bar, 0 \
+     complete bars without a kline";
+
 fn decimal(value: i64, places: u32) -> String {
     let scale = 10_i64.pow(places);
     format!(
@@ -200,6 +208,22 @@ fn agg_trades_csv(ticks: &[Tick]) -> String {
         ));
     }
     csv
+}
+
+/// The ticks with a sparse raw trade-id space, as the archive `trades`
+/// files have (ADR-045): every second trade is followed by a skipped id, so
+/// every minute of a 30 s tape holds an id jump.
+fn sparse_trade_ids(ticks: &[Tick]) -> Vec<Tick> {
+    ticks
+        .iter()
+        .map(|t| {
+            let global = t.trade_id - 9_000_000;
+            Tick {
+                trade_id: 9_000_000 + global + global / 2,
+                ..*t
+            }
+        })
+        .collect()
 }
 
 fn trades_csv(ticks: &[Tick]) -> String {
@@ -824,17 +848,34 @@ fn the_kline_check_matches_consistent_days_and_counts_an_altered_kline() {
     let archive = Arc::new(FakeArchive::default());
     let (from, to) = (day("2026-09-28"), day("2026-09-30"));
     let published = publish_all(&archive, from, to, 30_000);
+    // The raw trades skip ids, as the real dataset does: no gap (#85).
+    for d in from..=to {
+        archive.publish(
+            ArchiveStream::Trades,
+            Period::Day(d),
+            &trades_csv(&sparse_trade_ids(&ticks(d, 30_000))),
+        );
+    }
     run_import(&config, &archive, from, to, false);
     let middle = day("2026-09-29");
 
     for source in [ArchiveStream::AggTrades, ArchiveStream::Trades] {
         let mut out = Vec::new();
-        let matched = archive::kline_check(&config, middle, middle, source, &mut out).unwrap();
+        let verdict = archive::kline_check(&config, middle, middle, source, &mut out).unwrap();
         let text = String::from_utf8(out).unwrap();
-        assert!(matched, "{text}");
+        assert_eq!(verdict, KlineVerdict::Pass, "{text}");
         // 1440 + 288 + 96 + 24 + 6 + 1 bars of the day.
         assert!(
             text.contains("complete bars compared: 1855, matched: 1855, mismatched: 0"),
+            "{text}"
+        );
+        // The partial first bar of each timeframe, nothing else.
+        assert!(
+            text.contains(
+                "coverage: compared 1855 of 1855 window bars; 6 closed bars skipped as \
+                 incomplete (expected at most 6), 0 klines without a closed bar, 0 complete bars \
+                 without a kline\nPASS\n"
+            ),
             "{text}"
         );
         assert!(text.contains(&format!("trades from {source}")), "{text}");
@@ -859,12 +900,137 @@ fn the_kline_check_matches_consistent_days_and_counts_an_altered_kline() {
     );
     run_import(&config2, &altered, from, to, false);
     let mut out = Vec::new();
-    let matched =
+    let verdict =
         archive::kline_check(&config2, middle, middle, ArchiveStream::AggTrades, &mut out).unwrap();
     let text = String::from_utf8(out).unwrap();
-    assert!(!matched);
+    assert_eq!(verdict, KlineVerdict::Fail, "{text}");
     assert!(text.contains("mismatched: 1"), "{text}");
     assert!(text.contains("mismatch: 1m"), "{text}");
+    assert!(text.ends_with("FAIL\n"), "{text}");
+}
+
+#[test]
+fn the_kline_check_is_inconclusive_when_a_trade_day_is_missing() {
+    let dir = TempDir::new("archive-klines-missing-day");
+    let config = config(dir.path(), r#"["aggTrades", "klines", "trades"]"#);
+    let archive = Arc::new(FakeArchive::default());
+    let (d0, d4) = (day("2026-09-27"), day("2026-10-01"));
+    let (d1, d2, d3) = (d0 + 1, d0 + 2, d0 + 3);
+    publish_all(&archive, d0, d1, 30_000);
+    publish_all(&archive, d3, d4, 30_000);
+    // The klines of the middle day exist; its trades were never published.
+    for timeframe in Timeframe::ALL {
+        archive.publish(
+            ArchiveStream::Klines(timeframe),
+            Period::Day(d2),
+            &klines_csv(&ticks(d2, 30_000), timeframe),
+        );
+    }
+    run_import(&config, &archive, d0, d4, false);
+
+    for source in [ArchiveStream::AggTrades, ArchiveStream::Trades] {
+        let mut out = Vec::new();
+        let verdict = archive::kline_check(&config, d1, d3, source, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(verdict, KlineVerdict::Inconclusive, "{text}");
+        assert!(text.contains("mismatched: 0"), "{text}");
+        let coverage = text
+            .lines()
+            .find(|line| line.starts_with("coverage: "))
+            .unwrap_or_else(|| panic!("{text}"));
+        assert_eq!(coverage, COVERAGE_WITH_A_MISSING_DAY, "{text}");
+        let last = text.lines().last().unwrap();
+        assert!(last.starts_with("INCONCLUSIVE: "), "{text}");
+        assert!(last.contains(&format!("trades from {source}")), "{text}");
+    }
+}
+
+/// Runs the kline check over the three days after `d0` with trades and
+/// klines published for `full_days`, klines alone for `kline_days`, the
+/// import covering `d0 ..= d0 + 4`; asserts INCONCLUSIVE under both trade
+/// sources and returns the coverage line.
+fn edge_coverage(tag: &str, full_days: &[i64], kline_days: &[i64]) -> String {
+    let dir = TempDir::new(tag);
+    let config = config(dir.path(), r#"["aggTrades", "klines", "trades"]"#);
+    let archive = Arc::new(FakeArchive::default());
+    let d0 = day("2026-09-27");
+    for &d in full_days {
+        publish_all(&archive, d0 + d, d0 + d, 30_000);
+    }
+    for &d in kline_days {
+        for timeframe in Timeframe::ALL {
+            archive.publish(
+                ArchiveStream::Klines(timeframe),
+                Period::Day(d0 + d),
+                &klines_csv(&ticks(d0 + d, 30_000), timeframe),
+            );
+        }
+    }
+    run_import(&config, &archive, d0, d0 + 4, false);
+    let mut lines = Vec::new();
+    for source in [ArchiveStream::AggTrades, ArchiveStream::Trades] {
+        let mut out = Vec::new();
+        let verdict = archive::kline_check(&config, d0 + 1, d0 + 3, source, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(verdict, KlineVerdict::Inconclusive, "{text}");
+        assert!(text.contains("mismatched: 0"), "{text}");
+        let last = text.lines().last().unwrap();
+        assert!(last.starts_with("INCONCLUSIVE: compared "), "{text}");
+        let coverage = text
+            .lines()
+            .find(|line| line.starts_with("coverage: "))
+            .unwrap_or_else(|| panic!("{text}"));
+        lines.push(coverage.to_owned());
+    }
+    assert_eq!(lines[0], lines[1]);
+    lines.swap_remove(0)
+}
+
+// The bars of missing trade days at a window's edges are never built, so
+// no bar is skipped as incomplete there; only the window count shows them
+// (#85 review of ADR-045).
+
+#[test]
+fn the_kline_check_is_inconclusive_when_the_window_starts_without_trades() {
+    // Trades for the last window day and the end margin only.
+    assert_eq!(
+        edge_coverage("archive-klines-leading", &[3, 4], &[1, 2]),
+        "coverage: compared 1849 of 5565 window bars; 6 closed bars skipped as incomplete \
+         (expected at most 6), 3710 klines without a closed bar, 0 complete bars without a kline"
+    );
+}
+
+#[test]
+fn the_kline_check_is_inconclusive_when_the_window_ends_without_trades() {
+    // Trades for the start margin and the first window day only.
+    assert_eq!(
+        edge_coverage("archive-klines-trailing", &[0, 1], &[2, 3]),
+        "coverage: compared 1849 of 5565 window bars; 6 closed bars skipped as incomplete \
+         (expected at most 6), 3716 klines without a closed bar, 0 complete bars without a kline"
+    );
+}
+
+#[test]
+fn the_kline_check_is_inconclusive_when_the_end_margin_is_missing() {
+    // Every window day is whole; the day after it was never imported, so
+    // the window's last bars never close.
+    assert_eq!(
+        edge_coverage("archive-klines-end-margin", &[0, 1, 2, 3], &[]),
+        "coverage: compared 5559 of 5565 window bars; 6 closed bars skipped as incomplete \
+         (expected at most 6), 6 klines without a closed bar, 0 complete bars without a kline"
+    );
+}
+
+#[test]
+fn the_kline_check_is_inconclusive_when_an_edge_day_has_neither_trades_nor_klines() {
+    // Nothing at all for the start margin and the first window day: no bar
+    // and no kline of that day, no incomplete bar and no kline without a
+    // bar, so only the window count shows it.
+    assert_eq!(
+        edge_coverage("archive-klines-empty-edge", &[2, 3, 4], &[]),
+        "coverage: compared 3704 of 5565 window bars; 6 closed bars skipped as incomplete \
+         (expected at most 6), 0 klines without a closed bar, 0 complete bars without a kline"
+    );
 }
 
 /// Imports one metrics day; the tests then set up a crash window by hand.
@@ -1020,10 +1186,10 @@ fn the_kline_check_fails_when_no_bar_was_compared() {
 
     // `trades` is opt-in and was never imported.
     let mut out = Vec::new();
-    let matched =
+    let verdict =
         archive::kline_check(&config, middle, middle, ArchiveStream::Trades, &mut out).unwrap();
     let text = String::from_utf8(out).unwrap();
-    assert!(!matched, "{text}");
+    assert_eq!(verdict, KlineVerdict::Fail, "{text}");
     assert!(text.contains("complete bars compared: 0"), "{text}");
     assert!(
         text.contains("FAIL: no complete bar was compared"),
@@ -1033,13 +1199,15 @@ fn the_kline_check_fails_when_no_bar_was_compared() {
     // A day outside the import has no trades and no klines either.
     let mut out = Vec::new();
     let empty = day("2026-10-05");
-    assert!(
-        !archive::kline_check(&config, empty, empty, ArchiveStream::AggTrades, &mut out).unwrap()
+    assert_eq!(
+        archive::kline_check(&config, empty, empty, ArchiveStream::AggTrades, &mut out).unwrap(),
+        KlineVerdict::Fail
     );
 
     let mut out = Vec::new();
-    assert!(
-        archive::kline_check(&config, middle, middle, ArchiveStream::AggTrades, &mut out).unwrap()
+    assert_eq!(
+        archive::kline_check(&config, middle, middle, ArchiveStream::AggTrades, &mut out).unwrap(),
+        KlineVerdict::Pass
     );
     assert!(String::from_utf8(out).unwrap().ends_with("PASS\n"));
 }
