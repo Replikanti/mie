@@ -1,6 +1,6 @@
 # ADR-035: Order-flow and aggression state
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-10-07
 
 ## Context
@@ -47,6 +47,20 @@ Per-bar delta therefore ships already; this decision adds what spans bars.
    the windows sit on the 1m grid, a window that ends on a 5m, 15m or 1h
    boundary has exactly the volumes, delta and trade count of that
    timeframe's closed bar.
+
+   Why these horizons (a judgment; no measurement supports it). 5m, 15m and
+   1h are the timeframes of the ADR-031 set between the 1m grid and 4h. On
+   those the closed-bar agreement above is a free check of the window
+   against bars that are themselves cross-checked against klines
+   (ADR-031). The horizons above are already served: 4h and 1d by the
+   per-bar delta (ADR-031, decision 3), the day by the UTC-day CVD
+   (decision 2). Below 5m the 1m bar's own delta ships. What breaks at
+   other values: a length that is no bar timeframe, such as 7m, has no
+   closed bar to agree with, so the window loses its only check; a 4h
+   window would need a ring of 241 minutes (decision 9). Whether these
+   horizons carry information is not established here; ADR-013 assigns
+   that judgment to the order-flow candidates (#22), which can add another
+   window as its own id.
 2. **CVD under two explicit anchors**, as two features:
    - **Continuous** (`flow.cvd.continuous@1`): the sum of signed aggressor
      quantity (buy `+qty`, sell `−qty`) since the first consumed trade, the
@@ -68,10 +82,87 @@ Per-bar delta therefore ships already; this decision adds what spans bars.
    window would be unavailable for an hour after each daily reconnect.
 4. **Large print.** A print is large when `|price × qty| ≥ 100 000 USDT`,
    computed exactly in `i128`. The threshold is per print (`aggTrade`),
-   absolute, inclusive, and the parameter `large_notional_usdt`. The value
-   is provisional (*Accept when*). One `aggTrade` holds one taker order's
-   fills at one price, so a taker order that sweeps k levels is k prints,
-   each judged on its own size: sweeps are understated.
+   absolute, inclusive, and the parameter `large_notional_usdt`. One
+   `aggTrade` holds one taker order's fills at one price, so a taker order
+   that sweeps k levels is k prints, each judged on its own size: sweeps are
+   understated.
+
+   Where 100 000 comes from. No exchange limit or brief defines a large
+   print, so the only possible source is measurement. The value is a round
+   number set when this ADR was drafted, before any measurement; the
+   measurement below shows that it passes the band, not that it is the best
+   value inside the band. It is absolute USDT, not a fixed BTC quantity,
+   because a taker's notional is the capital it commits, while a fixed
+   quantity changes that size with the price level (1.6 BTC is 100 000 USDT
+   at a price of 62 500 and 160 000 at 100 000). The USDT share still
+   drifts with price level and activity, which is why the check below is per
+   day over twelve months and not pooled.
+
+   The band (a judgment, not a measurement or an exchange number). The
+   archive averages about 1.65 M prints a day (603 218 226 rows over 365
+   days), about 5 700 per 5-minute window. At 0.1 % that is about 6 large
+   prints per 5m window: below it, quiet windows show 0 or 1 and
+   `large_count`, `large_buy` and `large_sell` degenerate into an on/off
+   flag. At 2 % (1 print in 50) it is about 115 per 5m window: above it the
+   large class stops being a tail and `large_volume_share` tracks total
+   volume. The band is checked per day, not pooled, because #22 consumes
+   windows on every day.
+
+   Measured (*Accept when*, 12 UTC days, the 15th of each month): print
+   share 1.03 % ... 2.00 % per day (pooled 255 626 of 17 488 959 prints,
+   1.46 %), volume share 39 % ... 58 %, all twelve days inside the band.
+   Of 3 456 five-minute buckets with prints, 3 (0.09 %) had no large print.
+
+   | Day | Prints | Large | Print share | Volume share |
+   |---|---:|---:|---:|---:|
+   | 2025-10-15 | 1 978 366 | 27 444 | 1.387 % | 49.63 % |
+   | 2025-11-15 | 1 305 142 | 14 501 | 1.111 % | 39.25 % |
+   | 2025-12-15 | 2 183 186 | 33 275 | 1.524 % | 51.42 % |
+   | 2026-01-15 | 1 713 783 | 27 447 | 1.602 % | 51.63 % |
+   | 2026-02-15 | 1 693 202 | 17 375 | 1.026 % | 42.75 % |
+   | 2026-03-15 | 1 269 283 | 15 559 | 1.226 % | 46.58 % |
+   | 2026-04-15 | 1 439 403 | 18 061 | 1.255 % | 47.55 % |
+   | 2026-05-15 | 1 341 111 | 23 960 | 1.787 % | 54.28 % |
+   | 2026-06-15 | 1 354 068 | 20 387 | 1.506 % | 48.57 % |
+   | 2026-07-15 | 1 107 089 | 16 378 | 1.479 % | 48.87 % |
+   | 2026-08-15 | 204 161 | 3 246 | 1.590 % | 49.80 % |
+   | 2026-09-15 | 1 900 165 | 37 993 | 1.999 % | 57.63 % |
+
+   2026-08-15 is a quiet Saturday: its row count equals the import ledger
+   and #12 found no holes.
+
+   The upper edge was nearly reached. On 2026-09-15, the day with the
+   highest share in the sample (its 18:00 UTC hour is also the sample's
+   busiest), the print share is 37 993 / 1 900 165 = 1.99946 %: inside by
+   about 11 prints (2 % is 38 003.3). The share rises with activity and with
+   the BTC price level, and the sample has no day above it. This is a fact
+   for any future re-check of the threshold.
+
+   What breaks at a different value (print share per day over the same 12
+   days):
+
+   | Threshold (USDT) | Min | Max | Days inside 0.1 % ... 2 % |
+   |---:|---:|---:|---:|
+   | 25 000 | 4.569 % | 6.913 % | 0 of 12 (above the band) |
+   | 50 000 | 2.546 % | 4.159 % | 0 of 12 (above the band) |
+   | **100 000** | 1.026 % | 1.999 % | 12 of 12 |
+   | 250 000 | 0.249 % | 0.617 % | 12 of 12 |
+   | 500 000 | 0.065 % | 0.182 % | 9 of 12 (2026-02-15, 2025-11-15 and 2026-04-15 fall below) |
+   | 1 000 000 | 0.017 % | 0.048 % | 0 of 12 (below the band) |
+
+   At 25 000 and 50 000 USDT the class is no tail (one print in 15 to 40).
+   At 1 000 000 it is nearly empty. At 250 000 the band would also hold,
+   with more margin on the upper edge and less on the lower; the band does
+   not choose between 100 000 and 250 000, and this ADR does not claim it
+   does. A percentile of recent trade sizes is rejected below.
+
+   Caveat from ADR-047. Trades of the `trades` file that no aggregate
+   covers were measured up to 2026-06-09, at most 478 a day (2026-05-15),
+   and on none of the 22 sampled days from 2026-06-10. Against about 1.65 M
+   prints a day that is at most 0.03 %, below the band's resolution; even if
+   all 478 were large, 2026-05-15 would move from 1.787 % to 1.823 %. The
+   day nearest the upper edge, 2026-09-15, lies after the last uncovered
+   trade.
 5. **Intensity**: trades per minute and volume per minute over the
    window's nominal span (N minutes), whatever its coverage. An incomplete
    window understates intensity, and its coverage flag says so.
@@ -115,6 +206,16 @@ Per-bar delta therefore ships already; this decision adds what spans bars.
    `MarketState.flow` carries the five values. Each names the feature that
    produced it. They are stepped on the same atomic path as bars and
    volatility: a rejected event changes none of them.
+9. **Ring of 61 closed minutes.** The engine keeps the last 61 closed 1m
+   bars in a fixed ring: 60 for the longest window (1h) plus the minute
+   before it, whose close is the window's reference price (decision 6; the
+   `RING` constant in `crates/mie-domain/src/flow.rs`). One extra minute is
+   enough because every minute carries the last close forward over empty
+   minutes (`close_after`), so the latest close before the window is always
+   the close of that one minute. At 60 the 1h window has no reference
+   minute and never a displacement or a price response. Above 61 every
+   closed minute copies state that no input reads. Decision 1 gives the
+   cost of a 4h window (241). The ring is copied only when a minute closes.
 
 ## Consequences
 
@@ -132,16 +233,16 @@ Per-bar delta therefore ships already; this decision adds what spans bars.
   zero delta can be very large; it is a raw measurement for #22 to baseline.
 - Nothing here emits a direction, a side bias or a signal (ADR-023,
   ADR-024). The order-flow candidates (#22) judge the measurements.
-- The engine keeps the last 61 closed minutes in a fixed ring, copied only
-  when a minute closes; per trade the work is one checked add and one
-  `i128` multiply.
+- Per trade the work is one checked add and one `i128` multiply; the ring
+  (decision 9) is copied only when a minute closes.
 
 ## Alternatives considered
 
 - **Sliding windows over individual trades in event time.** Memory grows
-  with the trade rate (hundreds of thousands of prints per hour at peaks),
-  values change on every print, and the windows could no longer be checked
-  against the bars they must agree with. Rejected.
+  with the trade rate (the busiest hour of the 12 sampled days held
+  438 754 prints, 2026-09-15 18:00 UTC; a sample, so a lower bound on
+  peaks), values change on every print, and the windows could no longer be
+  checked against the bars they must agree with. Rejected.
 - **Resetting the CVD at every gap.** ADR-032 plans a sub-second reconnect
   gap every day, so the CVD would reset at a random time each day.
   Rejected.
@@ -151,6 +252,14 @@ Per-bar delta therefore ships already; this decision adds what spans bars.
   Needs a warm-up, depends on the window, costs more per trade, and can
   ship later as its own id if research justifies it (ADR-013). Rejected for
   `@1`.
+- **A fixed BTC quantity as the large-print threshold.** Its economic size
+  moves with the price level (decision 4); the USDT share moves with it too,
+  but the threshold keeps meaning the same capital. Rejected for `@1`.
+- **A ring of 60 closed minutes.** The 1h window would have no reference
+  price (decision 9). Rejected.
+- **Windows of other lengths** (for example 7m, or 4h). No closed bar to
+  check against, or a ring of 241 minutes (decision 1). Rejected for `@1`;
+  a further window can ship as its own id if #22 shows a need.
 - **Merging same-millisecond, same-side prints** to recover sweeps. Merges
   distinct taker orders and delays the classification by one print.
   Rejected.
@@ -160,11 +269,42 @@ Per-bar delta therefore ships already; this decision adds what spans bars.
 
 ## Accept when
 
-On at least 30 consecutive backfilled days (#12), the share of prints and
-the share of volume at or above the decision 4 threshold are measured and
-recorded here. A print share between 0.1 % and 2 % keeps the threshold.
-Otherwise a `@2` of the window ids with a recalibrated threshold supersedes
-it.
+Both rules hold on the sample below; there is no clause that lets a mismatch
+be explained away.
+
+Sample: the 15th of each month from 2025-10 to 2026-09, 12 UTC days of the
+#12 backfill. One day per month covers every month's price level and
+activity once, chosen by calendar and not by outcome (the calendar rule of
+the ADR-047 sample). It replaces "30 consecutive days": the measurement is
+a property of each print, nothing carries across days, and 30 adjacent days
+sample one price regime while the threshold is an absolute USDT figure.
+12 days are about 17.5 M prints, so count noise at a share near 0.1 % is
+negligible; day-to-day regime variation is what the twelve months are for.
+
+- **R0, the run is valid.** For every day the measuring script's row count
+  equals `rows` in the import ledger and the zip's sha256 equals the
+  published `.CHECKSUM` and the ledger `sha256`; the script's classifier
+  reproduces the boundary cases of the `flow.rs` test
+  (`large_prints_meet_the_threshold_exactly`). Any mismatch voids the run;
+  it is never read as a result.
+- **R1, the threshold holds.** On each of the 12 days the print share at
+  100 000 USDT lies within [0.1 %, 2 %], both ends inclusive. One day
+  outside is a FAIL. Widening the sample may characterise a failure, never
+  rescue it. On a FAIL, a `@2` of the three window ids with a recalibrated
+  `large_notional_usdt` supersedes this decision (ADR-029 lock).
+
+Recorded, not criteria: volume share per day, maximum prints in one UTC
+hour, the share of 5m buckets without a large print, the sensitivity table
+(decision 4).
+
+Met 2026-10-11: R0 valid on all 12 days (sha256, `.CHECKSUM` and ledger
+agree; script rows equal ledger rows; boundary cases reproduced). R1 PASS,
+12 of 12 days inside the band, from 1.026 % (2026-02-15) to 1.99946 %
+(2026-09-15; see decision 4 for the margin). The measuring script, the
+sha256 of the 12 archive zips and the full results are posted in
+<https://github.com/Replikanti/mie/issues/78#issuecomment-6102779743>;
+the script is a one-off over archive files and is not committed (the
+ADR-047 precedent).
 
 References: ADR-013, ADR-019, ADR-021, ADR-022, ADR-023, ADR-024, ADR-027,
-ADR-028, ADR-029, ADR-031, ADR-032, ADR-033.
+ADR-028, ADR-029, ADR-031, ADR-032, ADR-033, ADR-034, ADR-047.
