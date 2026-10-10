@@ -945,7 +945,6 @@ fn the_kline_check_is_inconclusive_when_a_trade_day_is_missing() {
     }
 }
 
-/// Imports one metrics day; the tests then set up a crash window by hand.
 /// Runs the kline check over the three days after `d0` with trades and
 /// klines published for `full_days`, klines alone for `kline_days`, the
 /// import covering `d0 ..= d0 + 4`; asserts INCONCLUSIVE under both trade
@@ -1034,6 +1033,7 @@ fn the_kline_check_is_inconclusive_when_an_edge_day_has_neither_trades_nor_kline
     );
 }
 
+/// Imports one metrics day; the tests then set up a crash window by hand.
 fn imported_day(tag: &str) -> (TempDir, ArchiveConfig, Arc<FakeArchive>, i64) {
     let dir = TempDir::new(tag);
     let config = config(dir.path(), r#"["metrics"]"#);
