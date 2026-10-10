@@ -1,5 +1,5 @@
 //! Order flow and aggression state (Market State & Regime brief, "Order
-//! Flow / Aggression State"; brief §8; ADR-021, ADR-023, ADR-035, proposed).
+//! Flow / Aggression State"; brief §8; ADR-021, ADR-023, ADR-035).
 //!
 //! Per-bar aggressive buy and sell volume and delta are part of every bar
 //! (`bars.time.<tf>@1`, ADR-031). This module adds what spans bars:
