@@ -219,7 +219,7 @@ the 128 MiB payload limit".
 
 ### D4 rotation: 1 000 000 rows, 128 MiB, 1 h
 
-**Where each limit binds.**
+**Where each limit binds** (M0b, section 5).
 
 - **Live**, at the 300 s seal cadence (ADR-032 D10): none of the three. A
   5-minute part of depth, the heaviest live stream, holds about 2 940
@@ -237,14 +237,15 @@ the 128 MiB payload limit".
 
 **What each limit is for.**
 
-- **Rows and bytes bound one `read`.** `ParquetRawStore::read` loads and
-  verifies the whole file, then returns every record in one
-  `Vec<RawRecord>` (`reader.rs`). Its memory is the file, the decoded
-  batches and, per row, a 72-byte `RawRecord` plus its payload. Reading
-  the largest aggTrades part (1 000 000 rows, 26.9 MB file, 65.4 MB
-  payload) peaks at 182.6 MB RSS. The 128 MiB caps the payload term for
-  every stream, including large rows: a depth snapshot is 42 kB. The row
-  limit caps the per-row term, which dominates for small rows.
+- **Rows and bytes bound one `read`** (M0b, section 6).
+  `ParquetRawStore::read` loads and verifies the whole file, then returns
+  every record in one `Vec<RawRecord>` (`reader.rs`). Its memory is the
+  file, the decoded batches and, per row, a 72-byte `RawRecord` plus its
+  payload. Reading the largest aggTrades part (1 000 000 rows, 26.9 MB
+  file, 65.4 MB payload) peaks at 182.6 MB RSS. The 128 MiB caps the
+  payload term for every stream, including large rows: a depth snapshot is
+  42 kB. The row limit caps the per-row term, which dominates for small
+  rows.
 - **The same limits bound two archive costs.** Archive replay holds about
   one file per stream (ADR-039 D5). After an archive crash, recovery
   discards the unsealed part (D5) and the resume appends its rows again
@@ -266,9 +267,9 @@ the 128 MiB payload limit".
   9 542 097 aggTrades rows) would fit in one part. A `read` would need
   about 10 times the 182.6 MB, roughly 1.8 GB.
 - **A tenth of the rows (100 000).** 6 215 aggTrades parts for the year
-  instead of 780 (by the per-date row counts): about eight times the
-  files and manifests, and the same factor in `file` lines in every
-  dataset version.
+  instead of 780 (per-date row sums, M0b, section 5): about eight times the
+  files and manifests, and the same factor in `file` lines in every dataset
+  version.
 - **Any change now.** A re-import would write other files. The archive
   dataset version accepted above (`fa73cb88…`) would then no longer
   reproduce by re-import, so a change needs a superseding ADR.
@@ -284,12 +285,13 @@ the writer sees the records.
   so before the 2000 ms hold-back (ADR-032 D2; `live.rs`, steps 3 and 4).
   The audit premise, a grace "presumed > 2000 ms hold-back", ties the grace
   to the wrong quantity, because the hold-back acts after the writer.
-- **Live, measured.** In `receive_seq` order, the largest regression is
-  3 958 ms (forceOrder, #9 run 2). Every other stream had 0 in every run
-  of #9, #10 and #13. Maximum lateness bounds the regression from above,
-  at 10 424 ms (openInterest, #9; ADR-032 *Acceptance*), because a stream's
-  own maximum never exceeds the merge watermark. 60 s is about 15 times
-  the measured regression and 5.8 times the bound.
+- **Live, measured** (M0b, section 8). Over every record the writer
+  received, in `receive_seq` order, the largest regression is 3 958 ms
+  (forceOrder, #9 run 2). Every other stream had 0 in every run of #9, the
+  #9 rotation run, #10 and #13. 60 s is about 15 times that. Maximum
+  lateness (ADR-032 *Acceptance*) is not a bound here. It is noted only for
+  records that become events, and open klines, depth diffs buffered while
+  the book is unsynced and records that fail to normalize produce none.
 - **Archive.** The day's 23:55 open-interest sample in `metrics` is filed
   at exactly the next midnight (ADR-034 D3), and metrics rows are not
   sorted (ADR-034 D5). With a grace of 0, that row would seal the day's
@@ -297,10 +299,10 @@ the writer sees the records.
   them would open a second part.
 - **Live midnights.** At the 300 s cadence, the `seal_all` tick falls in
   the first 60 s after midnight about one midnight in five. It then seals
-  the old date before the grace can. That happened in #9 (tick at
-  +33.4 s) and #13 (+21.8 s). In #10 the grace path sealed the 2026-10-08
-  parts live, at 00:01:00–00:01:10 UTC. The tick at +233 s only reported
-  them (file mtimes, M0b section 8). None of the three midnights left a
+  the old date before the grace can. That happened in #9 (tick at +33.4 s)
+  and #13 (+21.8 s). In #10 the grace path sealed the 2026-10-08 parts
+  live, at 00:01:00–00:01:10 UTC. The tick at +233 s only reported them
+  (file mtimes, M0b, section 8). None of the three midnights left a
   straggler part.
 
 **At other values.**
@@ -318,8 +320,8 @@ the writer sees the records.
 
 ### Row groups: at most 65 536 rows or 32 MiB
 
-- **Correction.** The audit row calls this the parquet-rs default. It is
-  not. parquet 60 defaults to 1 048 576 rows per row group
+- **Correction** (M0b, section 7). The audit row calls this the parquet-rs
+  default. It is not. parquet 60 defaults to 1 048 576 rows per row group
   (`DEFAULT_MAX_ROW_GROUP_ROW_COUNT`) and no byte cap
   (`max_row_group_bytes` is `None`). 65 536 is 1/16 of the default, and
   32 MiB has no default to come from.
@@ -327,7 +329,8 @@ the writer sees the records.
   memory and writes it out once a limit is reached, so the caps bound
   writer memory per open part. Live capture keeps up to 7 open parts, one
   per stream, and more around midnight, when the old date's parts are
-  still open. Measured on a full aggTrades part (1 000 000 rows):
+  still open. Measured on a full aggTrades part (1 000 000 rows; M0b,
+  section 7):
   - with the pinned properties, the in-progress buffer peaks at 3.2 MB and
     the write adds 10.4 MB of peak RSS;
   - with the parquet defaults, which give one row group, the buffer peaks
@@ -338,9 +341,9 @@ the writer sees the records.
 - **What it costs.** For that part, 4.7 % more file than one row group
   (26.89 against 25.68 MB). That is the overhead of 16 sets of column
   chunks instead of one.
-- **Where it binds.** A full archive part has 16 row groups
-  (15 × 65 536 + 16 960). A live 5-minute part has one: about 2 940 depth
-  rows.
+- **Where it binds** (M0b, sections 5 and 7). A full archive part has 16
+  row groups (15 × 65 536 + 16 960). A live 5-minute part has one: about
+  2 940 depth rows.
 
   The byte cap is an encoded-size estimate in parquet 60: the compressed
   finished pages plus the open page. It does not count payload. At 65 536
@@ -371,14 +374,15 @@ the writer sees the records.
   (86 400 / 10 000 = 8.64).
 
   In use: the live default makes 288 parts per stream-date, and the
-  archive at most 10 (aggTrades) and 20 (trades). Running out is a writer
-  error ("no free part number"), which stops live capture (ADR-032 D10).
+  archive at most 10 (aggTrades) and 20 (trades) (M0b, section 5).
+  Running out is a writer error ("no free part number"), which stops live
+  capture (ADR-032 D10).
 - **Segment length.** At least 1 character, because an empty Hive value
   breaks `key=value` partitioning. At most 64, which keeps the longest
   directory name (`instrument=` plus 64) at 75 bytes, far under the
   255-byte name limit of common Linux filesystems. The longest segment in
-  use is `binance-archive` (15 characters), so 64 is a round bound, not a
-  forced one.
+  use is `binance-archive` (15 characters, `ARCHIVE_SOURCE`), so 64 is a
+  round bound, not a forced one.
 - **Charset** `[A-Za-z0-9_-]`. It excludes `/` (the path separator), `=`
   (Hive syntax) and `.` (hidden temp files and `..`), as well as spaces,
   `\` and non-ASCII.
@@ -396,18 +400,20 @@ depth, 20 MB of depth snapshots and 720 MB for all seven streams
 (ADR-038 *Acceptance*).
 
 The measured cost of verbatim payloads under `LZ4_RAW` is the payload ÷
-file ratio:
+file ratio. Live ranges run over the #9, #9 rotation, #10 and #13 stores
+(M0b, section 5):
 
 | Stream | Payload ÷ file |
 |---|---:|
-| depth | 3.00 |
-| depth snapshots | 2.98 |
+| depth | 3.0–3.1 |
+| depth snapshots | 3.0–3.3 |
 | live aggTrade | 3.2–3.5 |
 | kline_1m | 3.7–3.9 |
 | mark price | 2.8–3.0 |
 | archive aggTrades | 2.55 |
 | archive trades | 2.80 |
-| open interest, liquidations | 0.2–0.6 |
+| open interest | 0.5–0.6 |
+| liquidations | 0.2–0.6 |
 
 The open-interest and liquidation files are small, so their fixed
 per-file overhead dominates. No typed-column baseline exists, so the
@@ -417,19 +423,21 @@ extra cost of verbatim storage over typed columns is still unmeasured.
 
 - **History.** The #8 plan wrote this criterion and took the 24 h from
   #9's soak.
-- **What 24 h proves here.** Every window of 24 h or more contains a UTC
-  midnight wherever it starts, so the soak had to exercise sealing across
-  a date partition on live data. #9 crossed one midnight (2026-10-08), and
-  the 300 s tick sealed it at +33.4 s without a straggler part. The grace
-  path was exercised live later, in #10 (section *Date grace*).
+- **What 24 h proves here** (M0b, section 8). Every window of 24 h or more
+  contains a UTC midnight wherever it starts, so the soak had to exercise
+  sealing across a date partition on live data. #9 crossed one midnight
+  (2026-10-08), and the 300 s tick sealed it at +33.4 s without a straggler
+  part. The grace path was exercised live later, in #10 (section *Date
+  grace*).
 - **What it does not stand for.** The 23 h connection rotation is
   ADR-032's criterion, not this ADR's. Nothing in the format depends on
   it.
-- **Crash rule (D5).** The seven live recoveries in the soak journals
-  were all clean, because no live process was ever killed. In #12, a
-  deliberate `kill -9` mid-import made recovery discard one temp part
-  (2025-10-03 aggTrades part 00001, 4 974 248 bytes, from the #12 import
-  log), and the resume was exact (ADR-034 *Acceptance*). Tests cover the rest:
+- **Crash rule (D5)** (M0b, section 9). The seven live recoveries in the
+  soak journals were all clean, because no live process was ever killed. In
+  #12, a deliberate `kill -9` mid-import made recovery discard one temp
+  part (2025-10-03 aggTrades part 00001, 4 974 248 bytes, from the #12
+  import log), and the resume was exact (ADR-034 *Acceptance*). Tests cover
+  the rest:
   - `kill_during_write.rs`: SIGKILL after 8 delays, from 0 to 120 ms;
   - `a_crash_at_every_seal_step_recovers_deterministically` and
     `a_crash_mid_part_discards_the_part` (`writer.rs`).
