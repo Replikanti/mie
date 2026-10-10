@@ -745,8 +745,6 @@ where
                 let task = OiTask {
                     url: format!("{rest}/fapi/v1/openInterest?symbol={}", config.symbol),
                     run_id: config.run_id.clone(),
-                    backoff_initial: config.backoff_initial,
-                    backoff_max: config.backoff_max,
                     http: Arc::clone(&http),
                     clock,
                     tx,

@@ -56,6 +56,18 @@ pub trait WsConnector: Send + Sync {
     fn connect(&self, url: &str) -> Result<Box<dyn WsConnection>, String>;
 }
 
+/// One HTTP response as [`HttpGet::get_reply`] returns it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpReply {
+    /// The status code.
+    pub status: u16,
+    /// The exact body bytes.
+    pub body: Vec<u8>,
+    /// The first `Retry-After` header value as received; `None` when the
+    /// header is absent or not visible ASCII.
+    pub retry_after: Option<String>,
+}
+
 /// A blocking HTTP GET.
 pub trait HttpGet: Send + Sync {
     /// Fetches `url` and returns the status code and the exact body bytes.
@@ -65,6 +77,24 @@ pub trait HttpGet: Send + Sync {
     ///
     /// A description of a transport failure (DNS, connect, TLS, timeout).
     fn get(&self, url: &str) -> Result<(u16, Vec<u8>), String>;
+
+    /// Fetches `url` like [`HttpGet::get`] and also returns the
+    /// `Retry-After` header. The default sees no headers and wraps
+    /// [`HttpGet::get`] with `retry_after: None`. A transport that sees
+    /// headers must override it: the open-interest poller calls only this
+    /// method (ADR-046 D7).
+    ///
+    /// # Errors
+    ///
+    /// A description of a transport failure (DNS, connect, TLS, timeout).
+    fn get_reply(&self, url: &str) -> Result<HttpReply, String> {
+        let (status, body) = self.get(url)?;
+        Ok(HttpReply {
+            status,
+            body,
+            retry_after: None,
+        })
+    }
 }
 
 /// A blocking HTTP GET whose body is streamed into a sink, for files of any
@@ -325,17 +355,31 @@ impl UreqHttp {
 
 impl HttpGet for UreqHttp {
     fn get(&self, url: &str) -> Result<(u16, Vec<u8>), String> {
+        let reply = self.get_reply(url)?;
+        Ok((reply.status, reply.body))
+    }
+
+    fn get_reply(&self, url: &str) -> Result<HttpReply, String> {
         let mut response = self
             .agent
             .get(url)
             .call()
             .map_err(|e| format!("GET {url}: {e}"))?;
         let status = response.status().as_u16();
+        let retry_after = response
+            .headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
         let body = response
             .body_mut()
             .read_to_vec()
             .map_err(|e| format!("GET {url} body: {e}"))?;
-        Ok((status, body))
+        Ok(HttpReply {
+            status,
+            body,
+            retry_after,
+        })
     }
 }
 

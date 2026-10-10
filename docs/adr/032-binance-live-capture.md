@@ -1,6 +1,8 @@
 # ADR-032: Binance live capture — per-stream connections, raw first, bounded hold-back
 
-- Status: accepted
+- Status: accepted; the 418/429 clause of D9 ("A 418 or 429 defers the
+  next poll by an exponential backoff") and the "418/429 backoff" row of the
+  2026-10-10 justification addendum (section f) are superseded by ADR-046
 - Date: 2026-10-06
 - Amended: 2026-10-10 (#74)
 
