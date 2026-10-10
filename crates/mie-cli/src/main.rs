@@ -62,14 +62,15 @@ USAGE:
                             [--trade-source aggTrades|trades]
         Build bars from archive trades (default aggTrades) through the
         domain and compare every complete bar with the archive klines
-        (ADR-031). Prints a coverage line (compared and incomplete bars)
-        before the verdict (ADR-045): PASS (exit 0) when at least one
-        complete bar was compared, every compared bar matched and at most
-        one bar per timeframe (the partial starts) was skipped as
-        incomplete; FAIL (exit 1) on a mismatch or when nothing was
-        compared; INCONCLUSIVE (exit 3) when no bar disagrees but feed gaps
-        left more bars incomplete. trades ids are sparse by design, so only
-        missing days are gaps under --trade-source trades.
+        (ADR-031). Prints a coverage line (window bars compared, bars
+        skipped as incomplete, klines without a bar) before the verdict
+        (ADR-045): PASS (exit 0) when every bar of the window was compared
+        and matched and at most one bar per timeframe (the partial starts)
+        was skipped as incomplete; FAIL (exit 1) on a mismatch or when
+        nothing was compared; INCONCLUSIVE (exit 3) when no bar disagrees
+        but missing days or feed gaps left bars of the window uncompared.
+        trades ids are sparse by design, so only missing days are gaps
+        under --trade-source trades.
 
     mie replay --config <path> --from <ms|YYYY-MM-DD> --to <ms|YYYY-MM-DD>
                [--source live|archive] [--streams <a,b,...>]

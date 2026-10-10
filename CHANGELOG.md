@@ -34,11 +34,14 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
 ### Changed
 
 - **`archive-kline-check` reports coverage and an INCONCLUSIVE verdict
-  (ADR-045).** A coverage line (bars compared and skipped as incomplete)
-  precedes the verdict; a run with no mismatch that skipped more than the
-  six partial-start bars (one per timeframe) prints `INCONCLUSIVE` and
-  exits 3 instead of passing. Exit 0 (`PASS`) and 1 (`FAIL`) keep their
-  meaning.
+  (ADR-045).** A coverage line (window bars compared, bars skipped as
+  incomplete, klines without a bar) precedes the verdict. A run with no
+  mismatch prints `INCONCLUSIVE` and exits 3 instead of passing when it
+  compared fewer bars than the window
+  holds (1855 per day), for example because trade or kline days are
+  missing at the window's edges, or when it skipped more than the six
+  partial-start bars (one per timeframe). Exit 0 (`PASS`) and 1 (`FAIL`)
+  keep their meaning.
 
 ### Fixed
 

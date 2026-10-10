@@ -161,8 +161,9 @@ struct Tick {
 /// Coverage of a three-day kline check whose middle trade day is missing:
 /// the 1855 bars of that day, the bars of the two other days that the gap
 /// touches and the six partial starts are incomplete.
-const COVERAGE_WITH_A_MISSING_DAY: &str = "coverage: compared 3698 of 5571 closed bars, 1873 \
-     skipped as incomplete (expected at most 6)";
+const COVERAGE_WITH_A_MISSING_DAY: &str = "coverage: compared 3698 of 5565 window bars; 1873 \
+     closed bars skipped as incomplete (expected at most 6), 0 klines without a closed bar, 0 \
+     complete bars without a kline";
 
 fn decimal(value: i64, places: u32) -> String {
     let scale = 10_i64.pow(places);
@@ -871,8 +872,9 @@ fn the_kline_check_matches_consistent_days_and_counts_an_altered_kline() {
         // The partial first bar of each timeframe, nothing else.
         assert!(
             text.contains(
-                "coverage: compared 1855 of 1861 closed bars, 6 skipped as incomplete \
-                 (expected at most 6)\nPASS\n"
+                "coverage: compared 1855 of 1855 window bars; 6 closed bars skipped as \
+                 incomplete (expected at most 6), 0 klines without a closed bar, 0 complete bars \
+                 without a kline\nPASS\n"
             ),
             "{text}"
         );
@@ -944,6 +946,94 @@ fn the_kline_check_is_inconclusive_when_a_trade_day_is_missing() {
 }
 
 /// Imports one metrics day; the tests then set up a crash window by hand.
+/// Runs the kline check over the three days after `d0` with trades and
+/// klines published for `full_days`, klines alone for `kline_days`, the
+/// import covering `d0 ..= d0 + 4`; asserts INCONCLUSIVE under both trade
+/// sources and returns the coverage line.
+fn edge_coverage(tag: &str, full_days: &[i64], kline_days: &[i64]) -> String {
+    let dir = TempDir::new(tag);
+    let config = config(dir.path(), r#"["aggTrades", "klines", "trades"]"#);
+    let archive = Arc::new(FakeArchive::default());
+    let d0 = day("2026-09-27");
+    for &d in full_days {
+        publish_all(&archive, d0 + d, d0 + d, 30_000);
+    }
+    for &d in kline_days {
+        for timeframe in Timeframe::ALL {
+            archive.publish(
+                ArchiveStream::Klines(timeframe),
+                Period::Day(d0 + d),
+                &klines_csv(&ticks(d0 + d, 30_000), timeframe),
+            );
+        }
+    }
+    run_import(&config, &archive, d0, d0 + 4, false);
+    let mut lines = Vec::new();
+    for source in [ArchiveStream::AggTrades, ArchiveStream::Trades] {
+        let mut out = Vec::new();
+        let verdict = archive::kline_check(&config, d0 + 1, d0 + 3, source, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(verdict, KlineVerdict::Inconclusive, "{text}");
+        assert!(text.contains("mismatched: 0"), "{text}");
+        let last = text.lines().last().unwrap();
+        assert!(last.starts_with("INCONCLUSIVE: compared "), "{text}");
+        let coverage = text
+            .lines()
+            .find(|line| line.starts_with("coverage: "))
+            .unwrap_or_else(|| panic!("{text}"));
+        lines.push(coverage.to_owned());
+    }
+    assert_eq!(lines[0], lines[1]);
+    lines.swap_remove(0)
+}
+
+// The bars of missing trade days at a window's edges are never built, so
+// no bar is skipped as incomplete there; only the window count shows them
+// (#85 review of ADR-045).
+
+#[test]
+fn the_kline_check_is_inconclusive_when_the_window_starts_without_trades() {
+    // Trades for the last window day and the end margin only.
+    assert_eq!(
+        edge_coverage("archive-klines-leading", &[3, 4], &[1, 2]),
+        "coverage: compared 1849 of 5565 window bars; 6 closed bars skipped as incomplete \
+         (expected at most 6), 3710 klines without a closed bar, 0 complete bars without a kline"
+    );
+}
+
+#[test]
+fn the_kline_check_is_inconclusive_when_the_window_ends_without_trades() {
+    // Trades for the start margin and the first window day only.
+    assert_eq!(
+        edge_coverage("archive-klines-trailing", &[0, 1], &[2, 3]),
+        "coverage: compared 1849 of 5565 window bars; 6 closed bars skipped as incomplete \
+         (expected at most 6), 3716 klines without a closed bar, 0 complete bars without a kline"
+    );
+}
+
+#[test]
+fn the_kline_check_is_inconclusive_when_the_end_margin_is_missing() {
+    // Every window day is whole; the day after it was never imported, so
+    // the window's last bars never close.
+    assert_eq!(
+        edge_coverage("archive-klines-end-margin", &[0, 1, 2, 3], &[]),
+        "coverage: compared 5559 of 5565 window bars; 6 closed bars skipped as incomplete \
+         (expected at most 6), 6 klines without a closed bar, 0 complete bars without a kline"
+    );
+}
+
+#[test]
+fn the_kline_check_is_inconclusive_when_an_edge_day_has_neither_trades_nor_klines() {
+    // Nothing at all for the start margin and the first window day: no bar
+    // and no kline of that day, no incomplete bar and no kline without a
+    // bar, so only the window count shows it.
+    assert_eq!(
+        edge_coverage("archive-klines-empty-edge", &[2, 3, 4], &[]),
+        "coverage: compared 3704 of 5565 window bars; 6 closed bars skipped as incomplete \
+         (expected at most 6), 0 klines without a closed bar, 0 complete bars without a kline"
+    );
+}
+
 fn imported_day(tag: &str) -> (TempDir, ArchiveConfig, Arc<FakeArchive>, i64) {
     let dir = TempDir::new(tag);
     let config = config(dir.path(), r#"["metrics"]"#);

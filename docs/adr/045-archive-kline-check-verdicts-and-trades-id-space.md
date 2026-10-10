@@ -56,23 +56,27 @@ space, where the exchange itself skips ids.
 
 ## Decision
 
-1. **Three verdicts (D1).** `KlineCheckReport::verdict()` returns `Pass`,
-   `Fail` or `Inconclusive`, in this precedence: any mismatch fails; a run
-   that compared no bar fails (unchanged: a window without the trade
-   stream or the klines is no evidence); more than
-   `MAX_EXPECTED_INCOMPLETE` bars skipped as incomplete is inconclusive;
-   otherwise the run passes. `archive-kline-check` exits 0, 1 and 3
-   respectively. Why a third verdict: `FAIL` would claim that bars
+1. **Three verdicts (D1).** `KlineCheckReport::verdict(window_bars)`
+   returns `Pass`, `Fail` or `Inconclusive`, in this precedence: any
+   mismatch fails; a run that compared no bar fails (unchanged: a window
+   without the trade stream or the klines is no evidence); fewer compared
+   bars than the window holds (D4), or more than
+   `MAX_EXPECTED_INCOMPLETE` bars skipped as incomplete (D3), is
+   inconclusive; otherwise the run passes. `archive-kline-check` exits 0,
+   1 and 3 respectively. Why a third verdict: `FAIL` would claim that bars
    disagree with the klines when none did, and `PASS` would claim evidence
    that does not exist. Why exit 3: 0 and 1 keep their meaning for scripts
    that already test them, and 2 is the CLI's usage-error code.
 2. **Coverage next to the verdict (D2).** Right before the verdict line the
-   check prints `coverage: compared C of C+S closed bars, S skipped as
-   incomplete (expected at most 6)`. The counts are bars, not trades (#85
-   says "skipped trade counts"): the check compares bars, and a bar is the
-   unit a gap removes from the evidence. The `INCONCLUSIVE` line names the
-   trade source and the gaps that make bars incomplete for it, and points
-   at `archive-verify`, which lists them.
+   check prints `coverage: compared C of W window bars; S closed bars
+   skipped as incomplete (expected at most 6), K klines without a closed
+   bar, B complete bars without a kline`. `W` is the window count of D4;
+   `K` and `B` say which side is missing when `C < W`. The counts are bars,
+   not trades (#85 says "skipped trade counts"): the check compares bars,
+   and a bar is the unit a gap removes from the evidence. The
+   `INCONCLUSIVE` line names the trade source, the compared and window
+   counts and what leaves bars uncompared for it, and points at
+   `archive-verify`, which lists missing days and gaps.
 3. **Allowance: 6 incomplete bars (D3).** `MAX_EXPECTED_INCOMPLETE =
    Timeframe::ALL.len()` = 6. Derivation: in a clean window the only
    incomplete bars are the `partial_start` bars, one per timeframe: the bar
@@ -82,13 +86,40 @@ space, where the exchange itself skips ids.
    6`), the 2026-10-10 `aggTrades` re-run of the February window skipped 6
    (5565 of 5571 compared), and the offline fixture of this change skips 6
    under both sources. What another value breaks: at 0 every clean run is
-   inconclusive. Above 6 a mid-window feed gap could pass: a gap marks every
-   open bar it overlaps (ADR-031 decision 6), at least one per timeframe,
-   so the smallest gap adds 6 incomplete bars; at 12 one short gap passes,
-   at hundreds (a day has 1855 bars) a window whose gaps removed most of
-   its 1h, 4h and 1d evidence passes. A percentage threshold was rejected
-   for the same reason (below).
-4. **The archive `trades` id space is sparse (D4).** The archive replay
+   inconclusive. Above 6 a gap that arrives while bars are open would no
+   longer be enough on its own: such a gap marks every open bar it
+   overlaps (ADR-031 decision 6), at least one per timeframe, so it adds
+   at least 6. This count cannot see everything, though. A gap before the
+   first trade marks nothing, and missing days after the last trade are
+   never delivered as gaps (ADR-039 D4, trailing gaps), so missing days at
+   the window's edges leave `S` at 6. D4 covers them. With D4 in place,
+   an incomplete bar inside the window already makes the run inconclusive.
+   D3 stays as a cross-check on the replay: in a clean window `S` is
+   exactly 6, so `S > 6` with every window bar compared would mean
+   incomplete bars in unexpected places. No such case is known.
+4. **Every bar of the window must be compared (D4).** `W =
+   window_bars(start, end)` counts the bars of every timeframe that lie
+   wholly inside the window: 1440 + 288 + 96 + 24 + 6 + 1 = 1855 per UTC
+   day (the timeframes of `Timeframe::ALL`). The allowance for uncompared
+   window bars is 0: `C < W` is inconclusive. Why 0, measured: in a clean
+   window every window bar closes complete inside the 60 s trade margin
+   after the window and has its kline. The #12 runs and the 2026-10-10
+   `aggTrades` re-run compared 5565 = 3 × 1855 bars in each three-day
+   window, and the offline fixture compares 1855 of 1855. Each uncompared
+   window bar is a bar whose agreement with the exchange is unknown. What
+   breaks above 0 (offline fixture, three-day window, measured under both
+   sources):
+   - A missing end-margin day leaves the last bar of each timeframe
+     unclosed (`5559 of 5565`). An allowance of 6 or more passes it.
+   - Missing trade days at the start or the end of the window leave whole
+     days of bars unbuilt (`1849 of 5565`). Neither is visible in `S`,
+     which stays 6.
+   - A start margin and first window day with neither trades nor klines
+     leave `3704 of 5565`, with `S = 6` and `K = 0`. No count except `W`
+     shows it.
+   The 2026-10-10 `trades` re-run (5 compared of 5571 closed bars) gives
+   `5 of 5565`.
+5. **The archive `trades` id space is sparse (D5).** The archive replay
    builds the `trades` sequencer with `allowing_trade_id_gaps()`: a trade id
    above `last + 1` is delivered without a `SequenceBreak` gap. Repeated and
    regressing ids are still dropped and counted, a session change is still
@@ -102,7 +133,7 @@ space, where the exchange itself skips ids.
    aggregate trades (ADR-031 addendum), so in practice the rule applies to
    the kline cross-check alone. Default replays keep their event-stream
    hashes.
-5. **What still detects a lost trade in `trades` (D5).** The id jump was the
+6. **What still detects a lost trade in `trades` (D6).** The id jump was the
    signal for a lost trade. For this dataset it carries none (9 881 jumps
    on a day whose kline counts sum to its row count), and the check that
    reads the dataset detects losses by what it compares: volume,
@@ -119,17 +150,25 @@ space, where the exchange itself skips ids.
   with the 153 mismatches of the 2025-10-10 defect (exit 1). That
   regenerates the ADR-031 acceptance evidence that the 2026-10-10 re-run
   could not; the real-data output is posted on the PR of #85.
-- A run with a real feed gap, or with a source day missing from the store,
-  is `INCONCLUSIVE` (exit 3) instead of `PASS`. Scripts that test exit 1
-  against 0 see no change for passing or mismatching runs; exit 3 is new.
+- A run with a real feed gap is `INCONCLUSIVE` (exit 3) instead of
+  `PASS`. So is a run where the store lacks a trade or kline source day
+  anywhere in the window or in the 60 s around it: in the middle of the
+  window (the gap marks bars incomplete), or at its start or end (the
+  bars are never built, D4). Scripts that test exit 1 against 0 see no
+  change for passing or mismatching runs; exit 3 is new.
 - Negative: the id-jump signal is gone for `trades`. A loss that leaves
   every complete bar's volume, taker-buy volume and OHLC equal to the
   kline cannot be seen by this check. Such a loss would also have to keep
   the kline trade counts unaffected, since those are counted by the
   exchange; the check reports trade-count differences (not a mismatch for
   `aggTrades`, where they are expected).
-- Negative: `INCONCLUSIVE` reports only how many bars were skipped, not
-  which gap caused them; `archive-verify` and `mie replay` list the gaps.
+- Negative: `INCONCLUSIVE` reports counts, not which gap or missing day
+  caused them; `archive-verify` and `mie replay` list them.
+- Negative: a window whose edge falls on a quiet minute, where no trade
+  arrives in the 60 s margin after the window, would leave its last bars
+  unclosed and be inconclusive. BTCUSDT has had a trade every 60 s on
+  every measured day (#12: 5565 of 5565 in both windows), so this has not
+  been seen. If it happens, the fix is a wider margin, not an allowance.
 - Not addressed: the aggregates' trade-id ranges of 2026-02-05 cover
   19 583 973 ids, 2 413 more than the `trades` file holds. It is the same
   class as the 2025-10-10 defect, it does not change the rule above, and
@@ -150,8 +189,13 @@ space, where the exchange itself skips ids.
   day above has up to 3 skipped ids per break and about 7 breaks per
   minute), it still turns a public-trade-free id into a gap, and the bar
   comparison already decides whether a bar's trades are complete.
+- **Inconclusive on `klines_without_bar > 0`** instead of the window
+  count (the review's first suggestion). Rejected: it catches the edge
+  cases whose klines exist, but not an edge day with neither trades nor
+  klines (`K = 0`, `S = 6`, measured above). The window count `W` comes
+  from the request alone, so it needs no store data to be right.
 - **A percentage coverage threshold** (for example 99 % of closed bars
   compared). Rejected: there is no measurement behind 99 %, and on a
   three-day window (5571 bars) 1 % is 55 bars, which lets several real
-  feed gaps pass; the allowance of D3 is derived from what a clean window
+  feed gaps pass; the allowances of D3 and D4 are derived from what a clean window
   can skip.
