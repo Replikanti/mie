@@ -145,7 +145,10 @@ The session S is 6 h 30 min, and 1 % of it is 3 min 54 s.
 3. **Coverage.** The run starts at or before 30 min before the session
    opens and ends at or after the session close. Within S:
    - aggTrade and depth are each connected for at least 99 % of S;
-   - the depth book is synced for at least 99 % of S.
+   - the depth book is synced for at least 99 % of S;
+   - `streams.aggTrade.records` and `streams.depth.records` each grow
+     in at least 99 % of the `stats` lines written inside S. A line
+     grows when its count is above the run's previous `stats` line.
 
    Time is counted positively. A stream is connected from a `connected`
    line until its next `disconnected` or `planned_rotation` line, or
@@ -229,6 +232,23 @@ Why each condition:
   #13, aggTrade lacked at most 22.0 s, depth at most 4.3 s, and the book
   was unsynced for at most 4.5 s. A healthy run is therefore far above
   99 %, and only an outage longer than 3.9 min fails check 3.
+- **Records growing per `stats` minute** (M0b, section 10). Connected does
+  not mean that data flows. Pings and pongs reset the 90 s liveness timer
+  (`transport.rs`: `Ping`/`Pong` → `ReadOutcome::Control`, which `ws.rs`
+  counts as a frame). The client pings every 30 s, so a connection whose
+  server stops pushing data but still answers pings stays connected, and a
+  run could pass on reduced load. The record counters close that gap at the
+  journal's resolution of one minute. depth pushes at a fixed 100 ms
+  cadence, and aggTrade ran at a p50 of 5 messages per second in #9. A
+  healthy minute therefore always grows, and the soaks confirm it:
+  - aggTrade grew in all 638 US-session minutes of #9;
+  - aggTrade and depth grew in every periodic minute of #9 rotation,
+    #10 and #13. The only exception is the #13 run 1 shutdown line,
+    written 0.5 s after the periodic line before it; a run's tail lies
+    outside S.
+
+  The 99 % (at most 3 of the 390 session minutes) only tolerates a
+  stall of a few minutes.
 
 Progress 2026-10-10: the #9 soak (about 30 h, trades without depth) fed the
 core with channel blocked time 0 ms and no dropped events. Its high-water
