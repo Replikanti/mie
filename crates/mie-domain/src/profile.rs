@@ -71,6 +71,17 @@ pub const NODE_KERNEL: [i64; 5] = [1, 2, 3, 2, 1];
 /// and `1000 ·` it below `2^93`, so node detection stays exact in `i128`.
 const MAX_KERNEL_WEIGHT: i64 = 1 << 20;
 
+/// The largest `max_bins` [`ProfileShape::new`] accepts. A recompute holds
+/// the dense histogram (`Qty`, 8 B) and the smoothed series (`i128`, 16 B):
+/// 24 B per bin, so at most 24 MB here, against 240 KB at [`MAX_BINS`].
+/// That is 100 × the `@1` guard, which leaves room to sweep the guard
+/// itself; at the finest bin the measurement tool uses (5 USDT) it spans
+/// 5 000 000 USDT, far wider than any BTC range, so it never filters a real
+/// profile. An unbounded value would let a range guard of `usize::MAX`
+/// reach the allocation and abort on capacity overflow instead of
+/// reporting `OutOfRange`.
+const MAX_BINS_CEILING: usize = 1_000_000;
+
 /// The parameters that shape a profile from its histogram (decisions 1 and
 /// 4–6), so the measurement tool can run the exact profile logic at other
 /// values, as ADR-044 did with its `AuctionClassifier`. The engine runs
@@ -103,7 +114,8 @@ impl ProfileShape {
 
     /// A shape with these parameters, or `None` if one is invalid: a bin
     /// size that is not positive and even in `1 / SCALE` units (midpoints
-    /// must stay exact), no bins, a value-area percentage outside `1..=100`,
+    /// must stay exact), no bins or more than 1 000 000 (bounded memory per
+    /// recompute), a value-area percentage outside `1..=100`,
     /// a prominence outside `0..=100`, or a kernel that is empty, of even
     /// length, asymmetric, with a weight that is not positive, or with
     /// weights summing beyond `2^20` (exactness of node detection).
@@ -124,7 +136,7 @@ impl ProfileShape {
                 .is_some_and(|sum| sum <= MAX_KERNEL_WEIGHT);
         (bin_units > 0
             && bin_units % 2 == 0
-            && max_bins > 0
+            && (1..=MAX_BINS_CEILING).contains(&max_bins)
             && (1..=100).contains(&value_area_pct)
             && (0..=100).contains(&node_prominence_pct)
             && kernel_ok)
@@ -1744,8 +1756,14 @@ mod tests {
         assert_eq!(shape("-10", 1, 70, 10, &NODE_KERNEL), None);
         assert_eq!(shape("0.00000001", 1, 70, 10, &NODE_KERNEL), None);
         assert_eq!(shape("0.00000003", 1, 70, 10, &NODE_KERNEL), None);
-        // No bins.
+        // No bins, or more than the ceiling.
         assert_eq!(shape("10", 0, 70, 10, &NODE_KERNEL), None);
+        assert!(shape("10", MAX_BINS_CEILING, 70, 10, &NODE_KERNEL).is_some());
+        assert_eq!(
+            shape("10", MAX_BINS_CEILING + 1, 70, 10, &NODE_KERNEL),
+            None
+        );
+        assert_eq!(shape("10", usize::MAX, 70, 10, &NODE_KERNEL), None);
         // Value area outside 1..=100.
         assert_eq!(shape("10", 1, 0, 10, &NODE_KERNEL), None);
         assert_eq!(shape("10", 1, 101, 10, &NODE_KERNEL), None);
