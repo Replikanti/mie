@@ -31,6 +31,15 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   `crates/mie-cli/tests/location_measure.rs` measures the numbers behind
   the tolerance and the acceptance time over the archive.
 
+### Fixed
+
+- **Open-interest polling backs off from rate limits (ADR-045, #84).** On a
+  418 or 429 the poller honours `Retry-After` (seconds, capped at 3 days);
+  without the header it pauses 60 s after a 429 (one `REQUEST_WEIGHT`
+  window) and 120 s after a 418 (the shortest ban). Before, the reconnect
+  backoff was swallowed by the 10 s poll slot and polling went on into the
+  rate limit. Successful polls stay on the 10 s grid.
+
 ## [0.1.0] - 2026-10-09
 
 ### Added

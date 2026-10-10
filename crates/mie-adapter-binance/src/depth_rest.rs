@@ -11,12 +11,12 @@
 //!   re-anchor on it.
 //!
 //! Two requests are never sent within `min_spacing`, and a 418 or 429 (rate
-//! limit) pushes the next request back by an exponential backoff, as for
-//! open interest. A 2xx body is forwarded verbatim as a frame of the
-//! `depthSnapshot` stream, in session `<run_id>/depthSnapshot/<ordinal>`;
-//! the ordinal grows after every failed fetch. Non-2xx responses and
-//! transport failures are journaled through
-//! [`CaptureEvent::DepthSnapshotFetch`] and never persisted.
+//! limit) pushes the next request back by an exponential backoff. A 2xx
+//! body is forwarded verbatim as a frame of the `depthSnapshot` stream, in
+//! session `<run_id>/depthSnapshot/<ordinal>`; the ordinal grows after
+//! every failed fetch. Non-2xx responses and transport failures are
+//! journaled through [`CaptureEvent::DepthSnapshotFetch`] and never
+//! persisted.
 //!
 //! The trigger decides only *when* a snapshot is fetched. What the pipeline
 //! does with it depends on the persisted records alone (ADR-038).

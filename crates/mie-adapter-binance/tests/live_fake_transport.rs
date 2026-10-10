@@ -862,8 +862,8 @@ fn open_interest_polls_align_back_off_and_never_persist_failures() {
                 Http::Status(429, "{\"code\":-1003}".to_owned()),
                 Http::Status(429, "{\"code\":-1003}".to_owned()),
                 Http::Fail,
-                Http::Status(200, oi(D0 + 90_030)),
-                Http::Status(200, oi(D0 + 100_030)),
+                Http::Status(200, oi(D0 + 170_030)),
+                Http::Status(200, oi(D0 + 180_030)),
             ]
             .into(),
         ),
@@ -872,9 +872,7 @@ fn open_interest_polls_align_back_off_and_never_persist_failures() {
         requests: Mutex::default(),
     });
     let connector = FakeConnector::new(vec![], &clock, &shutdown);
-    let mut cfg = config(&[BinanceStream::OpenInterest]);
-    cfg.backoff_initial = Duration::from_secs(15);
-    cfg.backoff_max = Duration::from_secs(30);
+    let cfg = config(&[BinanceStream::OpenInterest]);
     let requests = Arc::clone(&http);
     let out = run(cfg, connector, http, clock, shutdown, None);
     let requests: Vec<i64> = requests
@@ -884,10 +882,12 @@ fn open_interest_polls_align_back_off_and_never_persist_failures() {
         .iter()
         .map(|t| t - D0)
         .collect();
-    // 10 s slots; a 429 at 20 s defers past 35 s, the next one past 70 s.
+    // 10 s slots; a 429 at 20 s pauses 60 s from its response (80.037 s,
+    // so 90 s), the next one past 150.037 s (ADR-045 D4, D5). A transport
+    // failure does not pause.
     assert_eq!(
         requests[..6],
-        [10_000, 20_000, 40_000, 80_000, 90_000, 100_000]
+        [10_000, 20_000, 90_000, 160_000, 170_000, 180_000]
     );
     let polls: Vec<_> = out
         .observed
@@ -913,10 +913,10 @@ fn open_interest_polls_align_back_off_and_never_persist_failures() {
         [
             (10_000, 37 * MS, Some(200), true),
             (20_000, 37 * MS, Some(429), false),
-            (40_000, 37 * MS, Some(429), false),
-            (80_000, 37 * MS, None, false),
-            (90_000, 37 * MS, Some(200), true),
-            (100_000, 37 * MS, Some(200), true),
+            (90_000, 37 * MS, Some(429), false),
+            (160_000, 37 * MS, None, false),
+            (170_000, 37 * MS, Some(200), true),
+            (180_000, 37 * MS, Some(200), true),
         ]
     );
     let records = out.records();
