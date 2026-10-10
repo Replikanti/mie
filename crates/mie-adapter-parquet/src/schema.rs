@@ -190,6 +190,16 @@ mod tests {
     }
 
     #[test]
+    fn writer_properties_pin_adr_030_row_groups() {
+        // ADR-030: row groups of at most 65 536 rows or 32 MiB. They are part
+        // of the bytes a re-import writes, so of every dataset version.
+        let stream = RawStreamKey::new("binance-um", "BTCUSDT", "aggTrade").unwrap();
+        let properties = writer_properties(&stream);
+        assert_eq!(properties.max_row_group_row_count(), Some(65_536));
+        assert_eq!(properties.max_row_group_bytes(), Some(33_554_432));
+    }
+
+    #[test]
     fn batches_round_trip_every_shape() {
         let records = vec![
             record(1, Some(capture(0)), br#"{"e":"aggTrade","p":"60000.10"}"#),
