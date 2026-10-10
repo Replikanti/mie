@@ -1,4 +1,4 @@
-# ADR-045: Open-interest poller honours Retry-After; rate-limit pauses from exchange limits
+# ADR-046: Open-interest poller honours Retry-After; rate-limit pauses from exchange limits
 
 - Status: accepted
 - Date: 2026-10-10

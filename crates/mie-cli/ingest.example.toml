@@ -46,7 +46,7 @@ rotation_stagger_secs = 300
 ping_interval_secs = 30
 liveness_timeout_secs = 90
 # Reconnect (ADR-032 D8) and depth-snapshot 418/429 backoff (ADR-038 D3);
-# the open-interest poller pauses per ADR-045 instead.
+# the open-interest poller pauses per ADR-046 instead.
 backoff_initial_ms = 250
 backoff_max_ms = 30000
 inbound_channel_capacity = 65536

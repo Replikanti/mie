@@ -82,7 +82,7 @@ pub trait HttpGet: Send + Sync {
     /// `Retry-After` header. The default sees no headers and wraps
     /// [`HttpGet::get`] with `retry_after: None`. A transport that sees
     /// headers must override it: the open-interest poller calls only this
-    /// method (ADR-045 D7).
+    /// method (ADR-046 D7).
     ///
     /// # Errors
     ///

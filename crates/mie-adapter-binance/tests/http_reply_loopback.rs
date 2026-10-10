@@ -1,5 +1,5 @@
 //! [`UreqHttp`] passes the `Retry-After` header through
-//! [`HttpGet::get_reply`] (ADR-045 D7). It is the only production
+//! [`HttpGet::get_reply`] (ADR-046 D7). It is the only production
 //! [`HttpGet`] the open-interest poller receives, so a transport that kept
 //! the trait's header-blind default would silently disable `Retry-After`.
 //! A plain-HTTP server on the loopback interface answers; no external

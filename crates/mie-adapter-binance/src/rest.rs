@@ -12,7 +12,7 @@
 //! the missed samples into a `Disconnected` gap on the next success.
 //!
 //! A 418 or 429 (rate limit) pauses polling, measured from the response
-//! (ADR-045). A `Retry-After` in delay-seconds sets the pause, capped at
+//! (ADR-046). A `Retry-After` in delay-seconds sets the pause, capped at
 //! [`RETRY_AFTER_MAX_S`]; without a usable one the pause is
 //! [`PAUSE_AFTER_429_MS`] or [`PAUSE_AFTER_418_MS`]. The next poll is the
 //! first 10 s slot at or after the pause's end, so polls stay on the grid.
@@ -27,19 +27,19 @@ use std::time::Duration;
 const SLEEP_SLICE_NS: i64 = 100_000_000;
 const NS_PER_MS: i64 = 1_000_000;
 
-/// The longest `Retry-After` honoured, in seconds (ADR-045 D3): 3 days,
+/// The longest `Retry-After` honoured, in seconds (ADR-046 D3): 3 days,
 /// Binance's longest documented IP ban. On a 418 the header counts down to
 /// the ban's end, so a shorter cap would poll into an active ban; a longer
 /// one would let a corrupt value keep open interest dark past any
 /// documented ban.
 const RETRY_AFTER_MAX_S: u64 = 259_200;
 
-/// The pause after a 429 without a usable `Retry-After` (ADR-045 D4): one
+/// The pause after a 429 without a usable `Retry-After` (ADR-046 D4): one
 /// window of the 1-minute `REQUEST_WEIGHT` limit, so no second poll lands
 /// in the window that answered 429.
 const PAUSE_AFTER_429_MS: i64 = 60_000;
 
-/// The pause after a 418 without a usable `Retry-After` (ADR-045 D4):
+/// The pause after a 418 without a usable `Retry-After` (ADR-046 D4):
 /// Binance's shortest documented IP ban, 2 minutes. A shorter pause polls
 /// inside every possible ban.
 const PAUSE_AFTER_418_MS: i64 = 120_000;
@@ -47,7 +47,7 @@ const PAUSE_AFTER_418_MS: i64 = 120_000;
 /// A `Retry-After` value in delay-seconds (RFC 9110 §10.2.3,
 /// `1*DIGIT`) as milliseconds, capped at [`RETRY_AFTER_MAX_S`]; `None`
 /// for any other form, such as an HTTP-date, a sign or a decimal
-/// (ADR-045 D1, D3).
+/// (ADR-046 D1, D3).
 fn retry_after_ms(value: &str) -> Option<i64> {
     let digits = value.trim_ascii();
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
@@ -62,7 +62,7 @@ fn retry_after_ms(value: &str) -> Option<i64> {
 
 /// How long polling pauses after `status`, measured from the response:
 /// `None` unless it is a rate limit (418 or 429). A usable `Retry-After`
-/// replaces the fallback, also when it is shorter (ADR-045 D2, D4).
+/// replaces the fallback, also when it is shorter (ADR-046 D2, D4).
 fn rate_limit_pause_ms(status: u16, retry_after: Option<&str>) -> Option<i64> {
     let fallback = match status {
         418 => PAUSE_AFTER_418_MS,

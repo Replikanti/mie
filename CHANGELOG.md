@@ -33,7 +33,7 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
 
 ### Fixed
 
-- **Open-interest polling backs off from rate limits (ADR-045, #84).** On a
+- **Open-interest polling backs off from rate limits (ADR-046, #84).** On a
   418 or 429 the poller honours `Retry-After` (seconds, capped at 3 days);
   without the header it pauses 60 s after a 429 (one `REQUEST_WEIGHT`
   window) and 120 s after a 418 (the shortest ban). Before, the reconnect

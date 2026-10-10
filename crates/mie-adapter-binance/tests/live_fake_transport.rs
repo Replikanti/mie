@@ -883,7 +883,7 @@ fn open_interest_polls_align_back_off_and_never_persist_failures() {
         .map(|t| t - D0)
         .collect();
     // 10 s slots; a 429 at 20 s pauses 60 s from its response (80.037 s,
-    // so 90 s), the next one past 150.037 s (ADR-045 D4, D5). A transport
+    // so 90 s), the next one past 150.037 s (ADR-046 D4, D5). A transport
     // failure does not pause.
     assert_eq!(
         requests[..6],
@@ -1011,7 +1011,7 @@ fn open_interest_honours_retry_after_and_stays_on_the_grid() {
         Http::StatusRetryAfter(429, RATE_LIMITED.to_owned(), "30"),
         Http::StatusRetryAfter(418, RATE_LIMITED.to_owned(), "120"),
         Http::Status(200, oi(D0 + 190_030)),
-        // Below the 60 s fallback: the header still decides (ADR-045 D2).
+        // Below the 60 s fallback: the header still decides (ADR-046 D2).
         Http::StatusRetryAfter(429, RATE_LIMITED.to_owned(), "5"),
         Http::Status(200, oi(D0 + 210_030)),
     ]);
@@ -1066,7 +1066,7 @@ fn open_interest_honours_retry_after_and_stays_on_the_grid() {
 fn open_interest_without_a_usable_retry_after_falls_back_to_its_own_pause() {
     let (out, requests) = open_interest_run(vec![
         Http::Status(429, RATE_LIMITED.to_owned()),
-        // An HTTP-date and a decimal are not delay-seconds (ADR-045 D1).
+        // An HTTP-date and a decimal are not delay-seconds (ADR-046 D1).
         Http::StatusRetryAfter(
             429,
             RATE_LIMITED.to_owned(),
@@ -1077,7 +1077,7 @@ fn open_interest_without_a_usable_retry_after_falls_back_to_its_own_pause() {
         Http::Status(200, oi(D0 + 350_030)),
     ]);
     // 60 s after each 429 and 120 s after the 418, measured from the
-    // response and rounded up to the 10 s grid (ADR-045 D4, D5).
+    // response and rounded up to the 10 s grid (ADR-046 D4, D5).
     assert_eq!(requests[..5], [10_000, 80_000, 150_000, 220_000, 350_000]);
     let statuses: Vec<_> = open_interest_polls(&out)
         .iter()
@@ -1110,7 +1110,7 @@ fn open_interest_rate_limiting_polls_at_most_once_per_weight_window() {
     );
     // Without errors, a 60 s window holds 6 polls. From the first
     // rate-limited answer on, each one holds exactly 1: no poll lands in
-    // the 1-minute REQUEST_WEIGHT window that answered 429 (ADR-045 D4).
+    // the 1-minute REQUEST_WEIGHT window that answered 429 (ADR-046 D4).
     for &t in &requests[..6] {
         let in_window = requests
             .iter()
@@ -1530,7 +1530,7 @@ impl HttpGet for DepthHttp {
             .push((url.to_owned(), self.clock.now_utc_ns() / MS));
         self.clock.advance(Duration::from_millis(37));
         match self.script.lock().unwrap().pop_front() {
-            // The depth fetcher reads no headers (ADR-045 D6).
+            // The depth fetcher reads no headers (ADR-046 D6).
             Some(Http::Status(status, body) | Http::StatusRetryAfter(status, body, _)) => {
                 Ok((status, body.into_bytes()))
             }
