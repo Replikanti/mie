@@ -49,6 +49,7 @@ liveness_timeout_secs = 90
 # the open-interest poller pauses per ADR-046 instead.
 backoff_initial_ms = 250
 backoff_max_ms = 30000
+# Messages each live channel holds before its sender blocks (ADR-026).
 inbound_channel_capacity = 65536
 core_channel_capacity = 65536
 stats_interval_secs = 60

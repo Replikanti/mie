@@ -280,18 +280,20 @@ location level registry with its book clusters) is covered by it.
   blocking means the core thread could not keep up with the capture, and
   this ADR adds hashing to that thread (*Consequences*). It is 0 ms in both
   soaks: #9 (ADR-026, *Accept when*) and #10 (ADR-038, *Acceptance*). The
-  channels hold 65 536 messages, about 87 times the largest high-water
-  seen, so a single blocked millisecond is already far outside anything
-  observed.
+  channels hold 65 536 messages, about 25 times the largest high-water
+  seen (core 2 604, #9 run 2; ADR-026, *Why 65 536*), so a single blocked
+  millisecond is already far outside anything observed.
 - **High-water is reported, not gated.** Baselines as context: #10, all
   seven streams as in this run, core 714 and inbound 488 of 65 536 (ADR-038,
-  *Acceptance*); #9, trades only, at most 753 of 65 536 (ADR-032,
-  *Acceptance*, ADR-026). 753 is the largest of two observations, not a
-  derived limit, and a run of hours sees fewer bursts than a run of ~30 h.
-  A hard bound at 753 would fail on an ordinary burst and prove nothing
-  about capacity, while a bound near 65 536 would only trip when the
-  channel is already full, which blocked time reports anyway. The value is
-  recorded in the acceptance record.
+  *Acceptance*); #9, trades only, core 2 604 and inbound 603 of 65 536
+  (run 2; ADR-026, *Why 65 536*). The "≤ 753" in ADR-032 *Acceptance* is
+  an interim run 1 value, corrected in that ADR's #77 addendum. 2 604 is
+  the largest of the soaks' observations, not a derived limit, and a run
+  of hours sees fewer bursts than a run of ~30 h. A hard bound at 2 604
+  would fail on an ordinary burst and prove nothing about capacity, while
+  a bound near 65 536 would only trip when the channel is already full,
+  which blocked time reports anyway. The value is recorded in the
+  acceptance record.
 
 **Example schedule (illustrative; the coverage list decides).** Start the
 first run at about 22:30 UTC, restart at about 23:15, stop the second run

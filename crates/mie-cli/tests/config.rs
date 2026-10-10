@@ -41,6 +41,9 @@ fn the_example_file_parses_with_the_documented_defaults() {
     assert_eq!(live.depth_snapshot_limit, 1_000);
     assert_eq!(live.depth_checkpoint_interval, Duration::from_secs(60));
     assert_eq!(live.depth_snapshot_min_spacing, Duration::from_secs(2));
+    // Channel capacity, derived in ADR-026 ("Why 65 536").
+    assert_eq!(live.inbound_capacity, 65_536);
+    assert_eq!(live.core_capacity, 65_536);
     assert_eq!(example.capture.state_checkpoint_interval_secs, 60);
     assert_eq!(example.state_checkpoint_interval_ms(), Ok(60_000));
     // Every stream by default, depth included.

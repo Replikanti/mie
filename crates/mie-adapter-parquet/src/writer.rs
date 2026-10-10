@@ -523,6 +523,21 @@ mod tests {
     }
 
     #[test]
+    fn default_policy_is_adr_030_d4() {
+        // ADR-030 D4: 1 000 000 rows, 128 MiB of payload, 1 h of event-time
+        // span, and a 60 s date grace. Live capture writes with this policy.
+        assert_eq!(
+            RotationPolicy::default(),
+            RotationPolicy {
+                max_rows: 1_000_000,
+                max_payload_bytes: 134_217_728,
+                max_event_span_ms: 3_600_000,
+                date_grace_ms: 60_000,
+            }
+        );
+    }
+
+    #[test]
     fn a_crash_at_every_seal_step_recovers_deterministically() {
         let key = stream("aggTrade");
         let input = records(10, D0);

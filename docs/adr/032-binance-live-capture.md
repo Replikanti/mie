@@ -5,6 +5,7 @@
   2026-10-10 justification addendum (section f) are superseded by ADR-046
 - Date: 2026-10-06
 - Amended: 2026-10-10 (#74)
+- Amended: 2026-10-10 (#77)
 
 ## Context
 
@@ -520,3 +521,32 @@ the REST weight limit were probed on 2026-10-10.
 | Seal 300 s | D10 | Engineering default, not measured: it bounds the ADR-030 D5 crash loss to 5 min of records. Measured: 1030 sealed files in run 2 (18.1 h, five streams), about 1360 per day | PR #48 | More, smaller files. At 60 s, about five times as many (about 6800 per day) | A larger crash loss, up to one interval of records per stream (the restart seed still turns it into a gap) |
 | `oi_retime_ms` 10 000 | D12 | One poll interval, argued in D12. The soak's maximum open-interest lateness, 10 424 ms, means at most 8424 ms at H = 2000 (section c) | PR #48 | Section c | D12: a staler sample would overlap its successor's slot |
 | Accept when "≥ 24 h" | Accept when | Its only recorded reason was to include the 23 h planned reconnects (#9 plan, soak step 2). The same plan's deliberate restart at about 12 h reset connection age, so a planned rotation needed at least 35 h, which the soak did not reach (about 30 h; an outage also reset the age). A separate run with a 300 s connection age covered the rotation. That substitution was also decided after the soak, in the Acceptance section | PR #48 | A run shorter than 23 h 15 min (the last rotation with the soak's five streams) cannot contain a planned rotation | Any restart or outage resets connection age, so length alone does not guarantee a rotation: this soak ran 30 h without one |
+
+## Justification addendum (2026-10-10)
+
+Added for #77, the second addendum of this date. Like the one above, it
+changes no value, threshold, acceptance criterion or normative statement.
+It only corrects one figure of *Acceptance* against the run journals.
+Evidence: <https://github.com/Replikanti/mie/issues/77#issuecomment-6101927637>.
+
+### Channels high-water (Acceptance)
+
+*Acceptance* lists "High-water ≤ 753 of 65 536". That is not the soak
+maximum. `high_water` in the `stats` journal lines is a running maximum
+per run. The soak's maxima are:
+
+| Run | Core | Inbound |
+|---|---:|---:|
+| Run 1 | 1 121 (2026-10-08 02:11:41 UTC) | 266 |
+| Run 2 | **2 604** (2026-10-08 17:00:57 UTC, 13 h 09 min into the run, inside the US cash session) | **603** |
+
+753 is the run 1 core maximum as of the early evening of 2026-10-07. It
+first appears in the stats line of 16:33:27 UTC, shortly after the
+16:04–16:18 burst, and it stayed the run maximum until 02:11:41. The #9 results comment quotes it in its
+"Late events" paragraph about that burst, and this ADR's *Acceptance*
+copied it as the soak figure.
+
+The blocked time stands: 0 ms on both channels in every `stats` line of
+both runs. The headroom over the true maximum is about 25 times, not 87.
+The channel capacity itself is ADR-026's decision, and its derivation is
+there (*Why 65 536*).
