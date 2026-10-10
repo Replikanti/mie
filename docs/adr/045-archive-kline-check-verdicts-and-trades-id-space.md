@@ -145,11 +145,13 @@ space, where the exchange itself skips ids.
 ## Consequences
 
 - The February window is expected to compare 5565 bars and skip 6 under
-  both sources again (`PASS`, exit 0; 0 mismatches under `trades`, the
-  same 1658 under `aggTrades`), and the October window 5565 under `trades`
-  with the 153 mismatches of the 2025-10-10 defect (exit 1). That
-  regenerates the ADR-031 acceptance evidence that the 2026-10-10 re-run
-  could not; the real-data output is posted on the PR of #85.
+  both sources again: `PASS` (exit 0, 0 mismatches) under `trades`, and
+  `FAIL` (exit 1) under `aggTrades` with the same 1658 mismatches that
+  ADR-031 explains as aggregation-boundary effects. The October window is
+  expected to compare 5565 bars under `trades` with the 153 mismatches of
+  the 2025-10-10 defect (exit 1). That regenerates the ADR-031 acceptance
+  evidence that the 2026-10-10 re-run could not; the real-data output is
+  posted on the PR of #85.
 - A run with a real feed gap is `INCONCLUSIVE` (exit 3) instead of
   `PASS`. So is a run where the store lacks a trade or kline source day
   anywhere in the window or in the 60 s around it: in the middle of the
