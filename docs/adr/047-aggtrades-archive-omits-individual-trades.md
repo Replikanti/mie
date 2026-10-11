@@ -1,6 +1,7 @@
 # ADR-047: The `aggTrades` archive omits individual trades — measured extent, and what it changes in ADR-031's explained mismatches
 
-- Status: accepted
+- Status: accepted; decision 2 (the loss recorded as a caveat, no
+  correction) is superseded by ADR-050
 - Date: 2026-10-10
 
 Relation to earlier ADRs: ADR-031 (acceptance rule, "Accept when") and

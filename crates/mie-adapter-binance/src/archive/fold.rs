@@ -1,0 +1,513 @@
+//! The aggTrades fold (ADR-050): trades the `aggTrades` archive omits,
+//! restored from the `trades` archive of the same source day.
+//!
+//! The `aggTrades` archive of 2025-10 … 2026-06-09 leaves individual trades
+//! out of every aggregate's `first_trade_id ..= last_trade_id` range
+//! (ADR-047). Aggregate ids stay consecutive, so no whole aggregate is
+//! missing: the lost trades are the tail of the aggregate right below them
+//! (ADR-050 D3, measured on all 2109 known ones).
+//!
+//! [`fold_day`] is a pure pass over one source day, both inputs in id order:
+//!
+//! - **Covered.** A trade inside some aggregate's range is already counted.
+//! - **Uncovered.** A trade strictly between two ranges is folded into the
+//!   preceding aggregate `P` when its price and aggressor equal `P`'s: `P`
+//!   keeps its id, price, time and side, its quantity grows. Otherwise it is
+//!   [`Unattributed`] and the replay marks the span with a gap (ADR-050 D4).
+//! - **Edge ids.** A trade before the first or after the last range belongs
+//!   to a neighbouring day's aggregates and is ignored (ADR-047 D3).
+//! - **Repeats.** An aggregate or trade id at or below the previous one is
+//!   skipped and counted, as the live [`StreamSequencer`] drops it, so
+//!   overlapping sealed files fold as they deliver.
+//! - **Contract.** A range with `first > last`, or one that starts at or
+//!   below the previous range's end, fails the fold naming its aggregate.
+//!
+//! The pass keeps O(1) state beyond its output, so the replay can feed it
+//! one sealed part at a time.
+//!
+//! [`StreamSequencer`]: crate::sequence::StreamSequencer
+
+use mie_domain::event::{Aggressor, Trade};
+use mie_domain::num::{Price, Qty};
+use mie_domain::time::EventTime;
+use std::collections::BTreeMap;
+use std::fmt;
+
+/// Whether an archive replay folds the `trades` archive into `aggTrades`
+/// (ADR-050). Every caller states it; there is no hidden default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum TradeCorrection {
+    /// Fold uncovered trades into their aggregate (ADR-050 D3), reading the
+    /// `trades` files of every source day that has them.
+    Fold,
+    /// Deliver every aggregate exactly as normalized: the data and dataset
+    /// versions recorded before ADR-050.
+    None,
+}
+
+impl TradeCorrection {
+    /// The command-line spelling: `fold` or `none`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fold => "fold",
+            Self::None => "none",
+        }
+    }
+
+    /// The correction spelled `text` (`fold` or `none`), if any.
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "fold" => Some(Self::Fold),
+            "none" => Some(Self::None),
+            _ => Option::None,
+        }
+    }
+}
+
+impl fmt::Display for TradeCorrection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// One `aggTrades` row as the fold needs it: the aggregate and the
+/// constituent trade-id range the normalized `Trade` drops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AggRange {
+    /// The aggregate id (the delivered event's trade id).
+    pub agg_id: u64,
+    /// First constituent trade id.
+    pub first_trade_id: u64,
+    /// Last constituent trade id.
+    pub last_trade_id: u64,
+    /// The aggregate's price.
+    pub price: Price,
+    /// The side that crossed the spread.
+    pub aggressor: Aggressor,
+    /// The aggregate's `transact_time`.
+    pub time: EventTime,
+}
+
+/// What an aggregate gains from the trades folded into it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fold {
+    /// Summed quantity of the folded trades.
+    pub qty: Qty,
+    /// Folded trades.
+    pub trades: u64,
+    /// The largest folded trade id: the aggregate's restored
+    /// `last_trade_id`.
+    pub last_trade_id: u64,
+}
+
+/// An uncovered trade whose price or aggressor differs from the preceding
+/// aggregate's: not folded (ADR-050 D4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Unattributed {
+    /// The trade id.
+    pub trade_id: u64,
+    /// The trade's time.
+    pub time: EventTime,
+    /// The aggregate right below it (`P`).
+    pub after_agg_id: u64,
+    /// The aggregate right above it (`N`), before which the replay
+    /// delivers the gap.
+    pub before_agg_id: u64,
+}
+
+/// The fold of one source day.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DayFold {
+    /// Per aggregate id, what is folded into it.
+    pub folds: BTreeMap<u64, Fold>,
+    /// Uncovered trades that fold nowhere, in id order.
+    pub unattributed: Vec<Unattributed>,
+    /// Uncovered trades: folded plus unattributed.
+    pub uncovered: u64,
+    /// Aggregate and trade rows skipped as repeated or regressing ids.
+    pub repeats: u64,
+}
+
+impl DayFold {
+    /// Folded trades, summed over the aggregates.
+    pub fn folded_trades(&self) -> u64 {
+        self.folds.values().map(|f| f.trades).sum()
+    }
+}
+
+/// Why a fold failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FoldError {
+    /// An input row could not be read or normalized.
+    Input(String),
+    /// The aggregate ranges break their contract (module docs).
+    Contract(String),
+    /// A folded quantity exceeds the fixed-point range.
+    Overflow {
+        /// The aggregate whose quantity overflowed.
+        agg_id: u64,
+    },
+}
+
+impl fmt::Display for FoldError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Input(detail) | Self::Contract(detail) => f.write_str(detail),
+            Self::Overflow { agg_id } => {
+                write!(f, "the folded quantity of aggregate {agg_id} overflows")
+            }
+        }
+    }
+}
+
+/// The aggregate ranges in id order, repeats skipped and the range
+/// contract checked.
+struct Ranges<I> {
+    inner: I,
+    last: Option<AggRange>,
+    repeats: u64,
+}
+
+impl<I: Iterator<Item = Result<AggRange, FoldError>>> Ranges<I> {
+    fn next(&mut self) -> Result<Option<AggRange>, FoldError> {
+        for range in self.inner.by_ref() {
+            let range = range?;
+            if range.first_trade_id > range.last_trade_id {
+                return Err(FoldError::Contract(format!(
+                    "aggregate {}: first trade id {} is above its last {}",
+                    range.agg_id, range.first_trade_id, range.last_trade_id
+                )));
+            }
+            if let Some(last) = self.last {
+                if range.agg_id <= last.agg_id {
+                    self.repeats += 1;
+                    continue;
+                }
+                if range.first_trade_id <= last.last_trade_id {
+                    return Err(FoldError::Contract(format!(
+                        "aggregate {}: trade ids {} ..= {} overlap aggregate {} ending at {}",
+                        range.agg_id,
+                        range.first_trade_id,
+                        range.last_trade_id,
+                        last.agg_id,
+                        last.last_trade_id
+                    )));
+                }
+            }
+            self.last = Some(range);
+            return Ok(Some(range));
+        }
+        Ok(None)
+    }
+}
+
+/// Folds one source day: `ranges` are the day's `aggTrades` rows, `trades`
+/// its `trades` rows, each in id order (module docs).
+///
+/// # Errors
+///
+/// The first input error, a broken range contract, or a quantity overflow.
+pub fn fold_day(
+    ranges: impl Iterator<Item = Result<AggRange, FoldError>>,
+    trades: impl Iterator<Item = Result<Trade, FoldError>>,
+) -> Result<DayFold, FoldError> {
+    let mut ranges = Ranges {
+        inner: ranges,
+        last: None,
+        repeats: 0,
+    };
+    let mut day = DayFold::default();
+    // `previous` ends below the current trade; `current` ends at or above it.
+    let mut previous: Option<AggRange> = None;
+    let mut current = ranges.next()?;
+    let mut last_trade: Option<u64> = None;
+    for trade in trades {
+        let trade = trade?;
+        if last_trade.is_some_and(|last| trade.trade_id <= last) {
+            day.repeats += 1;
+            continue;
+        }
+        last_trade = Some(trade.trade_id);
+        while let Some(range) = current.filter(|r| r.last_trade_id < trade.trade_id) {
+            previous = Some(range);
+            current = ranges.next()?;
+        }
+        // After the last range, or before the first one: an edge id.
+        let (Some(below), Some(above)) = (previous, current) else {
+            continue;
+        };
+        if above.first_trade_id <= trade.trade_id {
+            continue;
+        }
+        day.uncovered += 1;
+        if trade.price == below.price && trade.aggressor == below.aggressor {
+            let fold = day.folds.entry(below.agg_id).or_insert(Fold {
+                qty: Qty::from_units(0),
+                trades: 0,
+                last_trade_id: below.last_trade_id,
+            });
+            fold.qty = fold.qty.checked_add(trade.qty).ok_or(FoldError::Overflow {
+                agg_id: below.agg_id,
+            })?;
+            fold.trades += 1;
+            fold.last_trade_id = trade.trade_id;
+        } else {
+            day.unattributed.push(Unattributed {
+                trade_id: trade.trade_id,
+                time: trade.time,
+                after_agg_id: below.agg_id,
+                before_agg_id: above.agg_id,
+            });
+        }
+    }
+    // The rest of the ranges: their contract and repeats still count.
+    while ranges.next()?.is_some() {}
+    day.repeats += ranges.repeats;
+    Ok(day)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn price(text: &str) -> Price {
+        text.parse().unwrap()
+    }
+
+    fn qty(text: &str) -> Qty {
+        text.parse().unwrap()
+    }
+
+    fn range(agg_id: u64, first: u64, last: u64, p: &str, aggressor: Aggressor) -> AggRange {
+        AggRange {
+            agg_id,
+            first_trade_id: first,
+            last_trade_id: last,
+            price: price(p),
+            aggressor,
+            time: EventTime::from_millis(1_000 * agg_id as i64),
+        }
+    }
+
+    fn trade(id: u64, p: &str, q: &str, aggressor: Aggressor) -> Trade {
+        Trade {
+            time: EventTime::from_millis(10 * id as i64),
+            trade_id: id,
+            price: price(p),
+            qty: qty(q),
+            aggressor,
+        }
+    }
+
+    fn run(ranges: &[AggRange], trades: &[Trade]) -> Result<DayFold, FoldError> {
+        fold_day(
+            ranges.iter().copied().map(Ok),
+            trades.iter().copied().map(Ok),
+        )
+    }
+
+    use Aggressor::{Buy, Sell};
+
+    /// Three aggregates over ids 1 ..= 2, 5 ..= 5 and 8 ..= 9.
+    fn three() -> Vec<AggRange> {
+        vec![
+            range(10, 1, 2, "100.0", Buy),
+            range(11, 5, 5, "100.5", Sell),
+            range(12, 8, 9, "101.0", Buy),
+        ]
+    }
+
+    #[test]
+    fn covered_trades_fold_nothing() {
+        let trades = [
+            trade(1, "100.0", "0.1", Buy),
+            trade(2, "100.0", "0.1", Buy),
+            trade(5, "100.5", "0.2", Sell),
+            trade(8, "101.0", "0.3", Buy),
+            trade(9, "101.0", "0.3", Buy),
+        ];
+        assert_eq!(run(&three(), &trades), Ok(DayFold::default()));
+    }
+
+    #[test]
+    fn one_tail_trade_folds_into_the_aggregate_below() {
+        let trades = [
+            trade(2, "100.0", "0.1", Buy),
+            trade(3, "100.0", "0.25", Buy),
+            trade(5, "100.5", "0.2", Sell),
+        ];
+        let day = run(&three(), &trades).unwrap();
+        assert_eq!(
+            day.folds,
+            BTreeMap::from([(
+                10,
+                Fold {
+                    qty: qty("0.25"),
+                    trades: 1,
+                    last_trade_id: 3
+                }
+            )])
+        );
+        assert_eq!((day.uncovered, day.folded_trades()), (1, 1));
+        assert!(day.unattributed.is_empty());
+    }
+
+    #[test]
+    fn several_tail_trades_of_one_gap_fold_together() {
+        let trades = [
+            trade(6, "100.5", "0.01", Sell),
+            trade(7, "100.5", "0.02", Sell),
+        ];
+        let day = run(&three(), &trades).unwrap();
+        assert_eq!(
+            day.folds[&11],
+            Fold {
+                qty: qty("0.03"),
+                trades: 2,
+                last_trade_id: 7
+            }
+        );
+        assert_eq!(day.uncovered, 2);
+    }
+
+    #[test]
+    fn a_gap_without_trade_rows_folds_nothing() {
+        // Ids 3, 4, 6 and 7 lie between ranges, but the sparse `trades`
+        // file has no row for them (ADR-045).
+        let trades = [trade(1, "100.0", "0.1", Buy), trade(9, "101.0", "0.1", Buy)];
+        assert_eq!(run(&three(), &trades), Ok(DayFold::default()));
+    }
+
+    #[test]
+    fn a_price_or_side_mismatch_is_unattributed() {
+        let trades = [trade(3, "100.1", "0.1", Buy), trade(6, "100.5", "0.1", Buy)];
+        let day = run(&three(), &trades).unwrap();
+        assert!(day.folds.is_empty());
+        assert_eq!(day.uncovered, 2);
+        assert_eq!(
+            day.unattributed,
+            [
+                Unattributed {
+                    trade_id: 3,
+                    time: EventTime::from_millis(30),
+                    after_agg_id: 10,
+                    before_agg_id: 11
+                },
+                Unattributed {
+                    trade_id: 6,
+                    time: EventTime::from_millis(60),
+                    after_agg_id: 11,
+                    before_agg_id: 12
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn edge_ids_before_the_first_and_after_the_last_range_are_ignored() {
+        let ranges = [range(10, 5, 5, "100.0", Buy), range(11, 6, 6, "100.0", Buy)];
+        let trades = [
+            trade(3, "100.0", "0.1", Buy),
+            trade(4, "100.0", "0.1", Buy),
+            trade(7, "100.0", "0.1", Buy),
+            trade(8, "100.0", "0.1", Buy),
+        ];
+        assert_eq!(run(&ranges, &trades), Ok(DayFold::default()));
+        // No range at all: every trade is an edge id.
+        assert_eq!(run(&[], &trades), Ok(DayFold::default()));
+    }
+
+    #[test]
+    fn repeated_or_regressing_ids_are_skipped_and_counted() {
+        let mut ranges = three();
+        // A second, overlapping file repeats aggregate 11 and regresses.
+        ranges.insert(2, range(11, 5, 5, "100.5", Sell));
+        ranges.insert(3, range(10, 1, 2, "100.0", Buy));
+        let trades = [
+            trade(3, "100.0", "0.1", Buy),
+            trade(3, "100.0", "0.1", Buy),
+            trade(2, "100.0", "0.1", Buy),
+            trade(4, "100.0", "0.2", Buy),
+        ];
+        let day = run(&ranges, &trades).unwrap();
+        assert_eq!(day.repeats, 4);
+        assert_eq!(day.folds[&10].qty, qty("0.3"));
+        assert_eq!(day.folds[&10].trades, 2);
+    }
+
+    #[test]
+    fn an_overlapping_or_inverted_range_is_a_contract_error() {
+        let overlapping = [range(10, 1, 5, "1.0", Buy), range(11, 5, 6, "1.0", Buy)];
+        let inverted = [range(10, 1, 2, "1.0", Buy), range(11, 7, 6, "1.0", Buy)];
+        for ranges in [&overlapping[..], &inverted[..]] {
+            let error = run(ranges, &[]).unwrap_err();
+            assert!(
+                matches!(&error, FoldError::Contract(detail) if detail.starts_with("aggregate 11:")),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_quantity_overflow_is_an_error() {
+        let big = Trade {
+            qty: Qty::from_units(i64::MAX),
+            ..trade(3, "100.0", "1", Buy)
+        };
+        let trades = [big, Trade { trade_id: 4, ..big }];
+        assert_eq!(
+            run(&three(), &trades),
+            Err(FoldError::Overflow { agg_id: 10 })
+        );
+    }
+
+    #[test]
+    fn an_input_error_fails_the_fold() {
+        let failing = [Err(FoldError::Input("part-00000: bad row".to_owned()))];
+        assert_eq!(
+            fold_day(failing.into_iter(), std::iter::empty()),
+            Err(FoldError::Input("part-00000: bad row".to_owned()))
+        );
+    }
+
+    /// The live truncation of 2026-10-08 (#90 M0.3): a delivered aggregate
+    /// starts at the same trade as the complete one but ends early. Folding
+    /// the trades up to the next aggregate restores the complete row's `q`
+    /// and `l`.
+    #[test]
+    fn the_live_truncation_shape_restores_the_complete_aggregate() {
+        // Complete: aggregate 7 over ids 100 ..= 104, q = 0.5.
+        let truncated = [
+            range(7, 100, 101, "62000.1", Sell),
+            range(8, 105, 105, "62000.0", Sell),
+        ];
+        let trades = [
+            trade(100, "62000.1", "0.1", Sell),
+            trade(101, "62000.1", "0.1", Sell),
+            trade(102, "62000.1", "0.1", Sell),
+            trade(103, "62000.1", "0.15", Sell),
+            trade(104, "62000.1", "0.05", Sell),
+            trade(105, "62000.0", "0.3", Sell),
+        ];
+        let day = run(&truncated, &trades).unwrap();
+        let fold = day.folds[&7];
+        assert_eq!(fold.last_trade_id, 104);
+        assert_eq!(
+            qty("0.2").checked_add(fold.qty),
+            Some(qty("0.5")),
+            "q of the complete aggregate"
+        );
+    }
+
+    #[test]
+    fn corrections_spell_fold_and_none() {
+        for correction in [TradeCorrection::Fold, TradeCorrection::None] {
+            assert_eq!(
+                TradeCorrection::parse(correction.as_str()),
+                Some(correction)
+            );
+            assert_eq!(correction.to_string(), correction.as_str());
+        }
+        assert_eq!(TradeCorrection::parse("Fold"), Option::None);
+    }
+}

@@ -2,6 +2,7 @@
 
 use mie_adapter_binance::archive::ArchiveStream;
 use mie_adapter_binance::archive::catalog::parse_day;
+use mie_adapter_binance::archive::fold::TradeCorrection;
 use mie_adapter_binance::transport::{
     DownloadTimeouts, NetTimeouts, SystemClock, TungsteniteConnector, UreqDownload, UreqHttp,
 };
@@ -60,9 +61,14 @@ USAGE:
 
     mie archive-kline-check --config <path> --from <YYYY-MM-DD> --to <YYYY-MM-DD>
                             [--trade-source aggTrades|trades]
+                            [--trade-correction fold|none]
         Build bars from archive trades (default aggTrades) through the
         domain and compare every complete bar with the archive klines
-        (ADR-031). Prints a coverage line (window bars compared, bars
+        (ADR-031). aggTrades are folded with the trades archive by default
+        (ADR-050; --trade-correction none delivers them as published and
+        reproduces results from before ADR-050); the flag is refused with
+        --trade-source trades. Prints the fold summary and a coverage line
+        (window bars compared, bars
         skipped as incomplete, klines without a bar) before the verdict
         (ADR-045): PASS (exit 0) when every bar of the window was compared
         and matched and at most one bar per timeframe (the partial starts)
@@ -74,13 +80,19 @@ USAGE:
 
     mie replay --config <path> --from <ms|YYYY-MM-DD> --to <ms|YYYY-MM-DD>
                [--source live|archive] [--streams <a,b,...>]
+               [--trade-correction fold|none]
         Replay [from, to) of the raw store through the core (a date is a
         UTC day: --from its start, --to its end, inclusive). live (default)
         reads an ingest config and recomputes every capture run that
         touches the window from its journal; archive reads an archive
         config and merges the backfill (--streams replaces the configured
-        streams, which default to all but trades and bookDepth). Prints the
-        dataset version, runs or streams, delivered events and gaps,
+        streams, which default to all but trades and bookDepth). An archive
+        replay folds the trades the aggTrades archive omits back in from
+        imported trades files (ADR-050, --trade-correction fold, the
+        default); none delivers aggTrades as published and reproduces data
+        versions and hashes from before ADR-050. Prints the dataset
+        version, runs or streams, the fold summary with one line per
+        corrected day and per corrected minute, delivered events and gaps,
         trailing gaps, missing days, domain rejections, the final state and
         the event-stream hash; the same window prints the same bytes. Exits
         0 on PASS; 1 when the replay failed, the domain rejected an event or
@@ -108,6 +120,7 @@ USAGE:
 
     mie experiment run <spec> --config <path> --results <dir>
                        [--source live|archive] [--streams <a,b,...>]
+                       [--trade-correction fold|none]
         Run the spec's sample period through the core (source options as
         mie replay) and record the result in the append-only result store
         under <dir>. Prints `recorded <key>` for a new result or
@@ -201,12 +214,15 @@ fn dispatch(args: &[String]) -> Result<ExitCode, String> {
         Some("archive-kline-check") => {
             let options = Options::parse(
                 &args[1..],
-                &["--config", "--from", "--to", "--trade-source"],
+                &[
+                    "--config",
+                    "--from",
+                    "--to",
+                    "--trade-source",
+                    "--trade-correction",
+                ],
                 &[],
             )?;
-            let config =
-                ArchiveConfig::load(&options.path("--config")?).map_err(|e| e.to_string())?;
-            let (from_day, to_day) = options.days()?;
             let trade_source = match options.optional("--trade-source").unwrap_or("aggTrades") {
                 "aggTrades" => ArchiveStream::AggTrades,
                 "trades" => ArchiveStream::Trades,
@@ -216,11 +232,26 @@ fn dispatch(args: &[String]) -> Result<ExitCode, String> {
                     ));
                 }
             };
+            let correction = match trade_source {
+                ArchiveStream::Trades => {
+                    if options.optional("--trade-correction").is_some() {
+                        return Err("--trade-correction applies to --trade-source aggTrades \
+                                    only: trades has nothing to correct"
+                            .to_owned());
+                    }
+                    TradeCorrection::None
+                }
+                _ => options.correction()?,
+            };
+            let config =
+                ArchiveConfig::load(&options.path("--config")?).map_err(|e| e.to_string())?;
+            let (from_day, to_day) = options.days()?;
             let verdict = archive::kline_check(
                 &config,
                 from_day,
                 to_day,
                 trade_source,
+                correction,
                 &mut std::io::stdout().lock(),
             )?;
             Ok(ExitCode::from(verdict_code(verdict)))
@@ -228,7 +259,14 @@ fn dispatch(args: &[String]) -> Result<ExitCode, String> {
         Some("replay") => {
             let options = Options::parse(
                 &args[1..],
-                &["--config", "--from", "--to", "--source", "--streams"],
+                &[
+                    "--config",
+                    "--from",
+                    "--to",
+                    "--source",
+                    "--streams",
+                    "--trade-correction",
+                ],
                 &[],
             )?;
             let config_path = options.path("--config")?;
@@ -275,7 +313,13 @@ fn dispatch(args: &[String]) -> Result<ExitCode, String> {
             (Some("run"), Some(spec)) => {
                 let options = Options::parse(
                     &args[3..],
-                    &["--config", "--source", "--streams", "--results"],
+                    &[
+                        "--config",
+                        "--source",
+                        "--streams",
+                        "--results",
+                        "--trade-correction",
+                    ],
                     &[],
                 )?;
                 let request = ExperimentRequest {
@@ -407,19 +451,30 @@ impl Options {
         Ok((from, to))
     }
 
+    /// `--trade-correction fold|none`, default `fold` (ADR-050 D8).
+    fn correction(&self) -> Result<TradeCorrection, String> {
+        let value = self.optional("--trade-correction").unwrap_or("fold");
+        TradeCorrection::parse(value)
+            .ok_or_else(|| format!("--trade-correction {value:?} is neither fold nor none"))
+    }
+
     /// The replay source of `--source live|archive` (default live) over the
-    /// configuration at `config_path`, with `--streams` for the archive.
+    /// configuration at `config_path`, with `--streams` and
+    /// `--trade-correction` for the archive.
     fn replay_source(&self, config_path: &Path) -> Result<ReplaySource, String> {
         match self.optional("--source").unwrap_or("live") {
             "live" => {
-                if self.optional("--streams").is_some() {
-                    return Err("--streams applies to --source archive only".to_owned());
+                for flag in ["--streams", "--trade-correction"] {
+                    if self.optional(flag).is_some() {
+                        return Err(format!("{flag} applies to --source archive only"));
+                    }
                 }
                 Ok(ReplaySource::Live(
                     IngestConfig::load(config_path).map_err(|e| e.to_string())?,
                 ))
             }
             "archive" => {
+                let correction = self.correction()?;
                 let config = ArchiveConfig::load(config_path).map_err(|e| e.to_string())?;
                 let streams = match self.optional("--streams") {
                     Some(list) => {
@@ -431,7 +486,11 @@ impl Options {
                     }
                     None => None,
                 };
-                Ok(ReplaySource::Archive { config, streams })
+                Ok(ReplaySource::Archive {
+                    config,
+                    streams,
+                    correction,
+                })
             }
             other => Err(format!("--source {other:?} is neither live nor archive")),
         }

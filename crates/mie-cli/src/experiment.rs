@@ -10,17 +10,20 @@
 //!   result and `reproduced <key>` when the stored result was reproduced
 //!   exactly; anything else is `FAIL: <reason>`. The composition root is the
 //!   only place that hands the writable store to the pipeline (ADR-020).
+//!   A data-version mismatch of an archive run that folds `aggTrades`
+//!   (ADR-050) adds a hint: `--trade-correction none` opens the data
+//!   versions recorded before ADR-050.
 
 use crate::journal::read_runs;
-use crate::replay::ReplaySource;
+use crate::replay::{ReplaySource, archive_replay};
 use mie_adapter_binance::LiveReplay;
-use mie_adapter_binance::archive::replay::ArchiveReplay;
+use mie_adapter_binance::archive::fold::TradeCorrection;
 use mie_adapter_fs::FsResultStore;
 use mie_adapter_parquet::ParquetRawStore;
 use mie_app::ExperimentService;
 use mie_domain::feature::catalog;
 use mie_domain::research::{ExperimentSpec, SpecError};
-use mie_ports::inbound::{ExperimentRun, RunResearchExperiment};
+use mie_ports::inbound::{ExperimentRun, ResearchError, RunResearchExperiment};
 use mie_ports::outbound::HistoricalDataProvider;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -93,22 +96,20 @@ pub fn run(request: &ExperimentRequest, out: &mut dyn Write) -> Result<bool, Str
                             &config.instrument.symbol,
                             runs,
                         );
-                        execute(live, results, &spec)
+                        execute(live, results, &spec, false)
                     }
                     Err(error) => Err(error),
                 }
             }
-            ReplaySource::Archive { config, streams } => {
-                let symbol = &config.instrument.symbol;
+            ReplaySource::Archive {
+                config,
+                streams,
+                correction,
+            } => {
                 let store = ParquetRawStore::new(&config.paths.raw_root);
-                let replay = match streams {
-                    Some(streams) => Ok(ArchiveReplay::new(&store, symbol, streams)),
-                    None => config
-                        .streams()
-                        .map(|configured| ArchiveReplay::with_defaults(&store, symbol, &configured))
-                        .map_err(|e| e.to_string()),
-                };
-                replay.and_then(|replay| execute(replay, results, &spec))
+                let folding = *correction == TradeCorrection::Fold;
+                archive_replay(&store, config, streams.as_deref(), *correction)
+                    .and_then(|replay| execute(replay, results, &spec, folding))
             }
         },
         Err(error) => Err(error.to_string()),
@@ -123,14 +124,23 @@ pub fn run(request: &ExperimentRequest, out: &mut dyn Write) -> Result<bool, Str
 }
 
 /// Runs `spec` over `history` into `results`: the line to print, or why it
-/// failed.
+/// failed. `folding`: the history folds `aggTrades` (ADR-050), so a data
+/// version from before the fold may be the cause of a mismatch.
 fn execute<H: HistoricalDataProvider>(
     history: H,
     results: FsResultStore,
     spec: &ExperimentSpec,
+    folding: bool,
 ) -> Result<String, String> {
     let mut service = ExperimentService::new(history, results);
-    match service.run(spec).map_err(|e| e.to_string())? {
+    let run = service.run(spec).map_err(|e| match e {
+        ResearchError::DataVersionMismatch { .. } if folding => format!(
+            "{e}\nhint: --trade-correction none reproduces data versions recorded before \
+             ADR-050 (the aggTrades fold)"
+        ),
+        e => e.to_string(),
+    })?;
+    match run {
         ExperimentRun::Recorded(result) => Ok(format!("recorded {}", result.key())),
         ExperimentRun::Reproduced(result) => Ok(format!("reproduced {}", result.key())),
     }

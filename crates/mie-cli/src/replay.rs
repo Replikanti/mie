@@ -8,11 +8,12 @@
 //!    [`mie_app::drive_tolerant`] — the drive of live ingestion — with the
 //!    stream wrapped in a [`HashingProvider`]: a domain rejection is counted
 //!    and driving resumes.
-//! 3. Print the window, the source, the dataset version, one line per run
-//!    (live) or per stream (archive), the delivered events and gaps by
-//!    stream and reason, trailing gaps, missing days, domain rejections, the
-//!    final state and `event-stream <events>:<hex>`, then `PASS` or
-//!    `FAIL: …`.
+//! 3. Print the window, the source (with the archive's `aggTrades` fold
+//!    correction, ADR-050), the dataset version, one line per run (live) or
+//!    per stream (archive), the fold's provenance ([`fold_lines`]), the
+//!    delivered events and gaps by stream and reason, trailing gaps,
+//!    missing days, domain rejections, the final state and
+//!    `event-stream <events>:<hex>`, then `PASS` or `FAIL: …`.
 //!
 //! The report carries no wall-clock field, so replaying the same window of
 //! the same store twice prints identical bytes. It passes when the replay
@@ -22,14 +23,16 @@ use crate::config::{ArchiveConfig, IngestConfig};
 use crate::journal::read_runs;
 use mie_adapter_binance::archive::catalog::DAY_MS;
 use mie_adapter_binance::archive::catalog::day_label;
+use mie_adapter_binance::archive::fold::TradeCorrection;
 use mie_adapter_binance::archive::replay::ArchiveReplay;
-use mie_adapter_binance::archive::replay::ArchiveReplayStream;
+use mie_adapter_binance::archive::replay::{ArchiveReplayStream, DayStatus, FoldReport};
 use mie_adapter_binance::archive::{ARCHIVE_SOURCE, ArchiveStream};
 use mie_adapter_binance::{LiveReplay, LiveReplayStream};
 use mie_adapter_parquet::ParquetRawStore;
 use mie_app::{HashingProvider, drive_tolerant};
 use mie_domain::event::{FeedGap, GapReason, MarketEvent, Stream};
 use mie_domain::event_hash::EventStreamHash;
+use mie_domain::num::Qty;
 use mie_domain::state::MarketStateEngine;
 use mie_ports::outbound::{
     HistoricalDataProvider, MarketDataProvider, ProviderError, Replay, ReplayWindow,
@@ -54,6 +57,8 @@ pub enum ReplaySource {
         /// Streams replacing the configured ones that replay by default
         /// (`--streams`).
         streams: Option<Vec<ArchiveStream>>,
+        /// The `aggTrades` fold (`--trade-correction`, ADR-050).
+        correction: TradeCorrection,
     },
 }
 
@@ -118,23 +123,21 @@ pub fn run(request: &ReplayRequest, out: &mut dyn Write) -> Result<ReplayOutcome
                 Err(error) => failed(&mut report, error),
             }
         }
-        ReplaySource::Archive { config, streams } => {
+        ReplaySource::Archive {
+            config,
+            streams,
+            correction,
+        } => {
             let symbol = &config.instrument.symbol;
             let store = ParquetRawStore::new(&config.paths.raw_root);
-            let replay = match streams {
-                Some(streams) => Ok(ArchiveReplay::new(&store, symbol, streams)),
-                None => config
-                    .streams()
-                    .map(|configured| ArchiveReplay::with_defaults(&store, symbol, &configured))
-                    .map_err(|e| e.to_string()),
-            };
-            match replay {
+            match archive_replay(&store, config, streams.as_deref(), *correction) {
                 Ok(replay) => {
                     let names: Vec<_> = replay.streams().iter().map(|s| s.raw_name()).collect();
                     line(
                         &mut report,
                         format!(
-                            "replay {} source archive {ARCHIVE_SOURCE}/{symbol} streams {}",
+                            "replay {} source archive {ARCHIVE_SOURCE}/{symbol} streams {} \
+                             correction {correction}",
                             span(window),
                             names.join(",")
                         ),
@@ -149,6 +152,28 @@ pub fn run(request: &ReplayRequest, out: &mut dyn Write) -> Result<ReplayOutcome
         .and_then(|()| out.flush())
         .map_err(|e| format!("write the report: {e}"))?;
     Ok(outcome)
+}
+
+/// The archive replay of `config`: `streams` when given, else the
+/// configured streams that replay by default.
+///
+/// # Errors
+///
+/// A description when the configured streams do not validate.
+pub fn archive_replay<'a>(
+    store: &'a ParquetRawStore,
+    config: &ArchiveConfig,
+    streams: Option<&[ArchiveStream]>,
+    correction: TradeCorrection,
+) -> Result<ArchiveReplay<'a>, String> {
+    let symbol = &config.instrument.symbol;
+    match streams {
+        Some(streams) => Ok(ArchiveReplay::new(store, symbol, streams, correction)),
+        None => config
+            .streams()
+            .map(|configured| ArchiveReplay::with_defaults(store, symbol, &configured, correction))
+            .map_err(|e| e.to_string()),
+    }
 }
 
 fn line(report: &mut Vec<u8>, text: String) {
@@ -334,7 +359,101 @@ fn describe_archive(stream: &ArchiveReplayStream<'_>, report: &mut Vec<u8>) {
             line(report, format!("  missing day {}", day_label(day)));
         }
     }
+    if let Some(fold) = stream.fold_report() {
+        for text in fold_lines(fold, true) {
+            line(report, text);
+        }
+    }
     trailing(report, stream.trailing_gaps());
+}
+
+/// Consecutive days as `first..last` ranges (a single day alone), comma
+/// separated; `-` for none.
+fn day_ranges(days: &[i64]) -> String {
+    let mut ranges: Vec<(i64, i64)> = Vec::new();
+    for &day in days {
+        match ranges.last_mut() {
+            Some((_, last)) if *last + 1 == day => *last = day,
+            _ => ranges.push((day, day)),
+        }
+    }
+    if ranges.is_empty() {
+        return "-".to_owned();
+    }
+    ranges
+        .iter()
+        .map(|&(first, last)| {
+            if first == last {
+                day_label(first)
+            } else {
+                format!("{}..{}", day_label(first), day_label(last))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// The provenance of a folding archive replay (ADR-050 D7), in a fixed
+/// order and without a wall-clock field (ADR-039 D9):
+///
+/// - `fold summary: corrected <n> [<days>], clean <n> [<days>], unchecked
+///   <n> [<days>]; aggregates <a>, trades folded <t>, qty <q>,
+///   unattributed <u>` — the day statuses as day ranges and the totals of
+///   the corrected days;
+/// - with `detail`, one `fold <day>: …` line per corrected day (the whole
+///   source day) and one `fold minute <open ms>: …` line per 1m minute
+///   holding a folded aggregate delivered in the window. A bar of any
+///   timeframe carries folded data iff it contains such a minute.
+pub fn fold_lines(fold: &FoldReport, detail: bool) -> Vec<String> {
+    let mut corrected = Vec::new();
+    let mut clean = Vec::new();
+    let mut unchecked = Vec::new();
+    let (mut aggregates, mut trades, mut unattributed) = (0_u64, 0_u64, 0_u64);
+    let mut qty = Some(Qty::from_units(0));
+    let mut days = Vec::new();
+    for (&day, status) in &fold.days {
+        match *status {
+            DayStatus::Corrected {
+                aggregates: a,
+                trades: t,
+                qty: q,
+                unattributed: u,
+            } => {
+                corrected.push(day);
+                aggregates += a;
+                trades += t;
+                unattributed += u;
+                qty = qty.and_then(|sum| sum.checked_add(q));
+                days.push(format!(
+                    "fold {}: aggregates {a}, trades {t}, qty {q}, unattributed {u}",
+                    day_label(day)
+                ));
+            }
+            DayStatus::Clean => clean.push(day),
+            DayStatus::Unchecked => unchecked.push(day),
+        }
+    }
+    let qty = qty.map_or_else(|| "overflow".to_owned(), |q| q.to_string());
+    let mut lines = vec![format!(
+        "fold summary: corrected {} [{}], clean {} [{}], unchecked {} [{}]; aggregates \
+         {aggregates}, trades folded {trades}, qty {qty}, unattributed {unattributed}",
+        corrected.len(),
+        day_ranges(&corrected),
+        clean.len(),
+        day_ranges(&clean),
+        unchecked.len(),
+        day_ranges(&unchecked),
+    )];
+    if detail {
+        lines.extend(days);
+        lines.extend(fold.minutes.iter().map(|(open, m)| {
+            format!(
+                "fold minute {open}: aggregates {}, trades {}, qty {}",
+                m.aggregates, m.trades, m.qty
+            )
+        }));
+    }
+    lines
 }
 
 /// Parses a `--from` or `--to` bound: epoch milliseconds, or a UTC date
