@@ -137,10 +137,11 @@ section 5.
   | 58 | 4 | 44 | 764 |
   | 100 | 4 | 44 | 764 |
   | 699 (p10) | 80 | 44 | 688 |
-  | 894 (median) | 406 | 25 | 381 |
+  | 894 (#73's median) | 406 | 25 | 381 |
 
   The smaller per-side count has min 0, p1 288, p10 699 and median 893
-  (nearest rank); below 100 its values are 0, 0, 0 and 57.
+  (nearest rank; #73 section 10 reports 894); below 100 its values are 0,
+  0, 0 and 57.
 
   - Why 1: on one side, `matched` claims that the compared levels are
     equal. With 0 levels it claims nothing; with k ≥ 1 it claims exactly
@@ -155,7 +156,7 @@ section 5.
     such a value would have no derivation.
   - What breaks at 58 and above: 11:51:52 UTC is discarded, a real
     comparison of 57 levels at 1.16 bps. At p10 (699) 80 checkpoints go.
-    At the median (894) half go, and run 1 keeps 25 of 44. A floor that
+    At #73's median (894) half go, and run 1 keeps 25 of 44. A floor that
     high measures how far the price moved, not whether the audit saw
     anything. A larger value would also need larger test books: the fake
     transport's book holds one ask level.
@@ -169,7 +170,9 @@ section 5.
   0.02 bps beyond the best read as "0 bps", like a real window under 1 bp.
   Rounding down in hundredths would report a one-tick window as 0 above
   100 000 USDT. Rounding up overstates by less than one hundredth and never
-  reports a positive width as 0, so 0 means exactly "no level inside". The
+  reports a positive width as 0, so 0 means exactly "the edge is at or
+  beyond the best price". An edge exactly at the best still holds that one
+  level; an empty side is `levels_* == 0`, never a width of 0. The
   value is a `u32` and saturates instead of overflowing. It would saturate
   only above 42.9 million bps, which a window between two books of one
   price never reaches.
