@@ -51,6 +51,23 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
 
 ### Changed
 
+- **Breaking: the order-book checkpoint audit has a per-side level floor
+  and an exact window width (ADR-049, #98).** A checkpoint without a
+  mismatch whose bid or ask side compared fewer than `MIN_SIDE_LEVELS` (1)
+  levels is now `inconclusive` instead of `matched`; a mismatch still takes
+  precedence. `capture-report` counts `inconclusive` on the order-book row,
+  does not fail on it, and does not count it as `matched` for the presence
+  rule. The window width is measured per side from the fresh best to the
+  window edge, in hundredths of a bp, rounded up, and is 0 when the edge
+  lies beyond the best price (before: the absolute distance, truncated to
+  whole bps). In `book_checkpoint` journal lines, `window_bid_bps` and
+  `window_ask_bps` are replaced by `window_bid_cbps` and `window_ask_cbps`,
+  and `levels_bid` and `levels_ask` are added (`inconclusive` lines also
+  carry `min_side_levels`). Older lines are judged by their `result`, and
+  their whole-bp widths stay out of the window statistic. Over the #10 soak
+  the audit now gives 809 `matched` and 3 `inconclusive` (an empty side
+  after the price outran the previous window), still PASS.
+
 - **The default level registry reads the 7-day composite (ADR-044 D5).**
   `location.levels@2` replaces `@1` in the default feature set, and
   `profile.volume.composite_7d@1` joins it; `composite_5d@1` stays computed.
