@@ -335,7 +335,7 @@ impl fmt::Display for Sweep {
 }
 
 /// A level for location (brief §10): the hand-off to the level registry
-/// `location.levels@1` (ADR-044 D5), which reads every timeframe's levels.
+/// `location.levels` (ADR-044 D5), which reads every timeframe's levels.
 /// Its zone is `[low, high]`; only an SFP rejection zone is wider than its
 /// price.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

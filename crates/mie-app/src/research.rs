@@ -10,8 +10,9 @@
 //! replaced. The backtest (#30) adds its own pipeline and outcome kind.
 
 use crate::{HashingProvider, drive_tolerant};
+use mie_domain::feature::{FeatureKey, catalog};
 use mie_domain::research::{DataVersion, ExperimentResult, ExperimentSpec, Outcome, PipelineKey};
-use mie_domain::state::MarketStateEngine;
+use mie_domain::state::{MarketStateEngine, UnsupportedFeatureSet};
 use mie_ports::inbound::{ExperimentRun, ResearchError, RunResearchExperiment};
 use mie_ports::outbound::{
     HistoricalDataProvider, Replay, ReplayWindow, ResearchResultStore, ResultStoreError,
@@ -50,9 +51,12 @@ impl<H: HistoricalDataProvider, S: ResearchResultStore> RunResearchExperiment
 {
     /// Runs [`REPLAY_SUMMARY_V1`]:
     ///
-    /// 1. every member of the spec's feature set must be computed by the
-    ///    engine at the same key and definition — a subset check, so new
-    ///    features in the default set never orphan an old spec;
+    /// 1. the engine computes [`catalog::CURRENT`] with each member of the
+    ///    spec's feature set listed in [`catalog::SELECTABLE`] in place of
+    ///    the current version of its id (ADR-040 D4, ADR-044 D10), and
+    ///    every member of the spec's set must be computed by that engine at
+    ///    the same key and definition — a subset check, so new features in
+    ///    the default set never orphan an old spec;
     /// 2. the replay of the sample must open exactly the spec's data
     ///    version;
     /// 3. the sample is driven through the domain with the live rejection
@@ -62,7 +66,7 @@ impl<H: HistoricalDataProvider, S: ResearchResultStore> RunResearchExperiment
     ///    [`Diverged`](ResearchError::Diverged) and nothing is written. A
     ///    new result is appended ([`ExperimentRun::Recorded`]).
     fn run(&mut self, spec: &ExperimentSpec) -> Result<ExperimentRun, ResearchError> {
-        let mut engine = MarketStateEngine::new();
+        let mut engine = engine_for(spec)?;
         for member in spec.features().definitions() {
             let computed = engine
                 .feature_set()
@@ -120,6 +124,36 @@ impl<H: HistoricalDataProvider, S: ResearchResultStore> RunResearchExperiment
             Err(error) => Err(error.into()),
         }
     }
+}
+
+/// The engine for `spec`: [`catalog::CURRENT`] with the spec's
+/// [`catalog::SELECTABLE`] members in place of the current versions of
+/// their ids. Any other member the engine does not compute is left to the
+/// subset check, which names it.
+///
+/// # Errors
+///
+/// [`ResearchError::FeatureUnavailable`] if the selected versions do not
+/// form a set the engine computes — impossible while the catalog tests
+/// pass.
+fn engine_for(spec: &ExperimentSpec) -> Result<MarketStateEngine, ResearchError> {
+    let older: Vec<FeatureKey> = spec
+        .features()
+        .definitions()
+        .map(|definition| definition.key)
+        .filter(|key| catalog::SELECTABLE.contains(key))
+        .collect();
+    let Some(&first) = older.first() else {
+        return Ok(MarketStateEngine::new());
+    };
+    let features = catalog::current_set_with(&older)
+        .map_err(|_| ResearchError::FeatureUnavailable { feature: first })?;
+    MarketStateEngine::with_features(features).map_err(|error| {
+        let (UnsupportedFeatureSet::NotComputed { feature }
+        | UnsupportedFeatureSet::Redefined { feature }
+        | UnsupportedFeatureSet::Missing { feature }) = error;
+        ResearchError::FeatureUnavailable { feature }
+    })
 }
 
 /// A stored result against a fresh run of the same key.

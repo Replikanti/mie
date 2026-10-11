@@ -22,16 +22,19 @@ What exists:
   highs and lows, prior sweeps, SFP rejection zones per timeframe, ADR-037)
   and `SideClusters` (the five largest book levels per side within 5 bps,
   ADR-043). ADR-043 left the cluster threshold to this issue.
-- Event-time bars on six timeframes (ADR-031); the developing, prior-day
-  and 5-day composite volume profiles over UTC days (ADR-036).
+- Event-time bars on six timeframes (ADR-031); the developing, prior-day,
+  5-day and 7-day composite volume profiles over UTC days (ADR-036).
 - The Market State hash (ADR-041), the feature registry with its lock and
   goldens (ADR-029), exact fixed point (ADR-027), one domain path for live
   and replay (ADR-019), measured contribution before any weight (ADR-013).
 
 The inputs of ADR-036 and ADR-037 (bin, 70 % value area, structure `N`,
 `K` and tolerance) are under audit in #70. Location builds on their `@1`
-versions; an upstream `@2` means a `location.*@2` and a re-run of the
-measurement tool. Nothing changes silently.
+versions; an upstream `@2` or a new upstream id means a `location.*@2` and
+a re-run of the measurement tool. Nothing changes silently. The first such
+change is #96: ADR-036 moved the composite location reads from 5 to 7 days
+(a new id, `profile.volume.composite_7d@1`, ADR-036 decision 2), so
+`location.levels@2` consumes it and M3 is re-run (D5, D10).
 
 ### Measurements behind the numbers
 
@@ -138,6 +141,37 @@ of #12, 2025-10-01 … 2026-09-30 (`docs/data-availability.md`).
   6.4–8.4× (M0b). Per the rule the change stopped and was reported on #23;
   the decision there kept `N_acc` = 60 (D9).
 
+  **M3 re-run for `location.levels@2` (#96).** The tool drives two engines
+  over one replay of the same window, `@2` (the default set) and `@1`
+  (selected through `with_features`, D10), and samples each registry once
+  per closed minute. M3 fixes no constant, so #96 pre-registered rules for
+  what the re-run can prove, before any `@2` number was read: V1, the run
+  is valid (603 218 226 events and 0 domain rejections on both engines, 0
+  label mismatches); V2, it is comparable (`@1` reproduces the `w` = 6 M3
+  line above, to the printed precision, since neither its definition nor
+  its code changed); I, isolation (after every bar-closing event the two
+  states are equal once the feature-set stamp and `location.levels` are
+  set equal, and the auction facts are equal, since `@2` changes only the
+  composite that feeds the registry); S, sourcing (at every rebuild the
+  `@2` registry holds no level from `composite_5d@1` and at least 3, the
+  POC, VAL and VAH every ready profile hands over, from `composite_7d@1`
+  while it is ready, none otherwise; `@1` mirrored). The `@2` sizes are
+  recorded without a threshold: this ADR sets no size bound, and one set
+  now would be an unmeasured number (the D5 argument).
+  Result: 603 218 226 events, 0 rejections on either engine, 0 label
+  mismatches (V1); `@1` all 254/342 and every per-kind and zone-event
+  figure as above (V2); 0 isolation breaks (I); 0 of 825 211 rebuilds
+  break S, per version. All four hold. `@2`, p50 / p99 per closed minute:
+  POC, VAL, VAH 2/2 each, HVN 22/70, LVN 20/68, structural highs 48/69,
+  lows 29/61, prior sweeps 80/86, SFP zones 51/63, VWAP 1/1, clusters 0/0,
+  all 256/351; zone events per day 1 375.7 arrived, 34.0 created, 1 395.0
+  departed, 14.6 retired. Only HVN and LVN move, by one level at p50 and
+  at p99; the total p99 moves by 9. M1, M2 and M4 come from the `@2` engine
+  and are unchanged, because they read bars and the prior-day value, not
+  the composite. Wall time 1 863.0 s (31.1 min) for both engines, against
+  1 152.2 s for one. Results:
+  <https://github.com/Replikanti/mie/issues/96#issuecomment-6110025815>.
+
 ## Decision
 
 1. **Clock: closed 1m bars (ADR-031).** Location steps only on an event
@@ -227,10 +261,15 @@ of #12, 2025-10-01 … 2026-09-30 (`docs/data-availability.md`).
    - Warm-up `Samples(1)`, a closed minute of the day with volume; it
      restarts each UTC day. No bands and no prior-day VWAP in `@1`
      (ADR-013: none is measured yet).
-5. **Level registry `location.levels@1`**, rebuilt at each closed 1m bar
-   with trades from:
-   - `profile.volume.prior_day@1` and `profile.volume.composite_5d@1`: POC,
-     VAL, VAH, HVN and LVN (`VolumeProfile::levels`);
+5. **Level registry `location.levels@2`** (and `@1`), rebuilt at each
+   closed 1m bar with trades from:
+   - `profile.volume.prior_day@1` and one composite profile: POC, VAL, VAH,
+     HVN and LVN (`VolumeProfile::levels`). `@2` sources
+     `profile.volume.composite_7d@1`, `@1` sources
+     `profile.volume.composite_5d@1`; nothing else differs between them.
+     The reason for 7 days is ADR-036 decision 2: a 7-day window holds
+     every weekday once, so the composite's levels no longer move with the
+     weekday they are computed on;
    - `structure.levels.<15m|1h|4h|1d>@1`: structural highs and lows, prior
      sweeps and SFP rejection zones (`LevelRegistry::levels`);
    - `book.clusters@1`: each top-5 candidate per side as `LiquidityCluster`,
@@ -281,7 +320,8 @@ of #12, 2025-10-01 … 2026-09-30 (`docs/data-availability.md`).
    value area `[VAL, VAH)` (ADR-036).
    - *Why the prior day:* the developing day's value contains price by
      construction, which makes the classification tautological.
-     `composite_5d` gets its own id if research asks for it (ADR-013).
+     The composite (`composite_7d@1`) gets its own id if research asks for
+     it (ADR-013).
    - Regions of a close `c` (exact, D3): Above `c > VAH + w`; Below
      `c < VAL − w`; In `VAL + w < c < VAH − w`; otherwise neutral, in an edge
      band.
@@ -356,12 +396,37 @@ of #12, 2025-10-01 … 2026-09-30 (`docs/data-availability.md`).
     | Feature | Parameters | Inputs | Warm-up |
     |---|---|---|---|
     | `location.vwap.utc_day@1` | `rounding` `floor`, `session_ms` 86 400 000 | trades, `bars.time.1m@1` | `Samples(1)` |
-    | `location.levels@1` | `confluence_rule` `other_source_within_tolerance`, `tolerance` 0.0006, `zone_rule` `bar_range_overlap` | the eight D5 sources, `bars.time.1m@1` | `Samples(1)`: a closed 1m bar with trades |
+    | `location.levels@1` | `confluence_rule` `other_source_within_tolerance`, `tolerance` 0.0006, `zone_rule` `bar_range_overlap` | the eight D5 sources with `profile.volume.composite_5d@1`, `bars.time.1m@1` | `Samples(1)`: a closed 1m bar with trades |
+    | `location.levels@2` | as `@1` | as `@1`, with `profile.volume.composite_7d@1` in place of `composite_5d@1` | as `@1` |
     | `location.auction.prior_day@1` | `acceptance_closes` 60, `tolerance` 0.0006 | `profile.volume.prior_day@1`, `bars.time.1m@1` | `Samples(1)`: a closed 1m bar with trades under a ready reference |
 
     The classifier is a separate id so that recalibrating `N_acc` re-versions
     only the classifier (ADR-037 D10 reasoning). `MarketState.location` is
     declared after `book` and hashed (ADR-041 D1).
+
+    `location.levels@2` replaces `@1` in the default feature set
+    (`catalog::CURRENT`). `@1` stays computable, as ADR-029 D3 requires of
+    every published version, and keeps its golden test byte for byte:
+    `MarketStateEngine::with_features` builds an engine for `CURRENT` with
+    any id at a version listed in `catalog::SELECTABLE` instead, today only
+    `location.levels@1`, and stamps the state with that set's version. It
+    rejects a set that holds a version this binary has no code path for
+    (`NotComputed`), a member whose definition (fingerprint) differs from
+    the catalog's under the same key (`Redefined`: the engine computes the
+    catalog definition, so the stamp would name one it never computed), and
+    a set that omits an id the engine computes anyway (`Missing`): the
+    engine computes every family on every event, so such a stamp would not
+    name every value the state holds. The experiment service builds its
+    engine this way from the spec's feature set (ADR-040 D4), so a spec on
+    `location.levels@1` runs and reproduces. The engine keeps the
+    registry version as state (not hashed: the stamp names it), and the two
+    versions differ only in the composite the registry reads, which
+    `v1_and_v2_differ_only_in_the_registry` checks on a ten-day tape. This
+    is the selector ADR-029 *Consequences* announced for the first `@2`.
+    - *Rejected:* a test-only selector — `@1` would be computable in tests
+      only, so an experiment recorded on it could not reproduce outside
+      them; a general per-feature switch — it has no consumer yet and would
+      make every tracker optional.
 
 ## Consequences
 
@@ -370,7 +435,8 @@ of #12, 2025-10-01 … 2026-09-30 (`docs/data-availability.md`).
 - Each closed minute rebuilds the registry: `O(n log n)` over its levels
   (a few hundred: every structure registry holds at most 20 active highs,
   20 active lows and 20 resolved sweeps plus pending sweeps and SFP zones
-  per timeframe, ADR-037 D5; p50 254 and p99 342 in the window, M3), plus
+  per timeframe, ADR-037 D5; p50 256 and p99 351 in the window for
+  `location.levels@2`, 254 and 342 for `@1`, M3), plus
   two `i128` additions per trade for the VWAP. The full year replays in
   19.3 min with location against 20.5 min for the #11 replay (M1–M4 note on
   comparability).
@@ -390,9 +456,9 @@ of #12, 2025-10-01 … 2026-09-30 (`docs/data-availability.md`).
 - **A weighted scalar score** (D6): rejected; weights are #31's output.
 - **Volume-based acceptance** (D8): rejected for `@1`; no measured
   denominator.
-- **The developing day or the 5-day composite as the auction reference**
-  (D8): tautological for the developing day; the composite can get its own
-  id when research asks.
+- **The developing day or the composite (`composite_7d@1`) as the auction
+  reference** (D8): tautological for the developing day; the composite can
+  get its own id when research asks.
 - **A cluster threshold** (D5): rejected; it would be an unmeasured number.
 
 ## Accept when

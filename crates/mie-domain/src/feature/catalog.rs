@@ -6,8 +6,8 @@
 //! in the [`feature`](super) module docs ("Adding a feature").
 
 use super::{
-    FeatureDefinition, FeatureKey, FeatureRegistry, FeatureSet, Input, LockEntry, Param,
-    ParamValue, WarmUp,
+    FeatureDefinition, FeatureKey, FeatureRegistry, FeatureSet, FeatureSetError, Input, LockEntry,
+    Param, ParamValue, WarmUp,
 };
 use crate::bars::Timeframe;
 use crate::event::Stream;
@@ -634,6 +634,66 @@ pub const PROFILE_VOLUME_COMPOSITE_5D_V1: FeatureDefinition = FeatureDefinition 
         Input::Feature(BARS_TIME_1D_V1.key),
     ],
     warm_up: WarmUp::Samples(5),
+};
+
+/// `profile.volume.composite_7d@1`: the bin-wise sum of the last 7
+/// completed UTC days (ADR-036, decision 2), recomputed once per day close.
+/// It is the composite `location.levels@2` consumes: a 7-day window holds
+/// every weekday once, so its volume does not depend on the weekday it is
+/// computed on.
+///
+/// - Parameters: those of [`PROFILE_VOLUME_COMPOSITE_5D_V1`], with
+///   `sessions` = 7.
+/// - Inputs: as [`PROFILE_VOLUME_PRIOR_DAY_V1`].
+/// - Warm-up: 7 samples, where a sample is a closed UTC day. Empty days
+///   count; seven days without volume are `Unavailable(InputInvalid)`.
+/// - Gap policy: a trades gap never resets the profile. The value carries
+///   the OR of the seven closed daily bars' coverage.
+pub const PROFILE_VOLUME_COMPOSITE_7D_V1: FeatureDefinition = FeatureDefinition {
+    key: FeatureKey::new("profile.volume.composite_7d", 1),
+    params: &[
+        Param {
+            name: "bin_size",
+            value: ParamValue::Price(Price::from_units(10 * SCALE)),
+        },
+        Param {
+            name: "max_bins",
+            value: ParamValue::Int(10_000),
+        },
+        Param {
+            name: "node_prominence_pct",
+            value: ParamValue::Int(10),
+        },
+        Param {
+            name: "node_smoothing",
+            value: ParamValue::Text("triangular_5"),
+        },
+        Param {
+            name: "poc_rule",
+            value: ParamValue::Text("max_volume_center_lower"),
+        },
+        Param {
+            name: "session_ms",
+            value: ParamValue::Int(86_400_000),
+        },
+        Param {
+            name: "sessions",
+            value: ParamValue::Int(7),
+        },
+        Param {
+            name: "value_area_pct",
+            value: ParamValue::Int(70),
+        },
+        Param {
+            name: "value_area_rule",
+            value: ParamValue::Text("single_bin_ties_both"),
+        },
+    ],
+    inputs: &[
+        Input::Stream(Stream::Trades),
+        Input::Feature(BARS_TIME_1D_V1.key),
+    ],
+    warm_up: WarmUp::Samples(7),
 };
 
 /// A `structure.swing.<label>@1` or `structure.levels.<label>@1`
@@ -1366,7 +1426,8 @@ pub const LOCATION_VWAP_UTC_DAY_V1: FeatureDefinition = FeatureDefinition {
 };
 
 /// The location tolerance `w` = 6 bps as a `Rate` (ADR-044 D3): parameter
-/// `tolerance` of `location.levels@1` and `location.auction.prior_day@1`.
+/// `tolerance` of `location.levels@1`, `location.levels@2` and
+/// `location.auction.prior_day@1`.
 pub const LOCATION_TOLERANCE: Rate = Rate::from_units(60_000);
 
 /// `location.levels@1`: the level registry (ADR-044 D5–D7), rebuilt at each
@@ -1408,6 +1469,39 @@ pub const LOCATION_LEVELS_V1: FeatureDefinition = FeatureDefinition {
     inputs: &[
         Input::Feature(PROFILE_VOLUME_PRIOR_DAY_V1.key),
         Input::Feature(PROFILE_VOLUME_COMPOSITE_5D_V1.key),
+        Input::Feature(STRUCTURE_LEVELS_15M_V1.key),
+        Input::Feature(STRUCTURE_LEVELS_1H_V1.key),
+        Input::Feature(STRUCTURE_LEVELS_4H_V1.key),
+        Input::Feature(STRUCTURE_LEVELS_1D_V1.key),
+        Input::Feature(BOOK_CLUSTERS_V1.key),
+        Input::Feature(LOCATION_VWAP_UTC_DAY_V1.key),
+        Input::Feature(BARS_TIME_1M_V1.key),
+    ],
+    warm_up: WarmUp::Samples(1),
+};
+
+/// `location.levels@2`: [`LOCATION_LEVELS_V1`] with the 7-day composite
+/// profile in place of the 5-day one (ADR-044 D5, ADR-036 decision 2). The
+/// registry is rebuilt at each closed 1m bar with trades from the POC, VAL,
+/// VAH, HVNs and LVNs of the prior-day and 7-day composite profiles, and
+/// from every other source of `@1`, with the same score components, zones
+/// and location events. A 7-day window holds every weekday once, so the
+/// composite's levels no longer depend on the weekday they are computed on.
+///
+/// - Parameters: those of [`LOCATION_LEVELS_V1`].
+/// - Inputs: those of [`LOCATION_LEVELS_V1`], with
+///   `profile.volume.composite_7d@1` in place of
+///   `profile.volume.composite_5d@1`.
+/// - Warm-up: one sample, where a sample is a closed 1m bar with trades.
+/// - Gap policy: as [`LOCATION_LEVELS_V1`]: an empty bar neither counts nor
+///   changes anything; a source that is not ready contributes no level, and
+///   its levels retire.
+pub const LOCATION_LEVELS_V2: FeatureDefinition = FeatureDefinition {
+    key: FeatureKey::new("location.levels", 2),
+    params: LOCATION_LEVELS_V1.params,
+    inputs: &[
+        Input::Feature(PROFILE_VOLUME_PRIOR_DAY_V1.key),
+        Input::Feature(PROFILE_VOLUME_COMPOSITE_7D_V1.key),
         Input::Feature(STRUCTURE_LEVELS_15M_V1.key),
         Input::Feature(STRUCTURE_LEVELS_1H_V1.key),
         Input::Feature(STRUCTURE_LEVELS_4H_V1.key),
@@ -1485,6 +1579,7 @@ pub const DEFINITIONS: &[&FeatureDefinition] = &[
     &PROFILE_VOLUME_UTC_DAY_V1,
     &PROFILE_VOLUME_PRIOR_DAY_V1,
     &PROFILE_VOLUME_COMPOSITE_5D_V1,
+    &PROFILE_VOLUME_COMPOSITE_7D_V1,
     &STRUCTURE_SWING_15M_V1,
     &STRUCTURE_SWING_1H_V1,
     &STRUCTURE_SWING_4H_V1,
@@ -1508,6 +1603,7 @@ pub const DEFINITIONS: &[&FeatureDefinition] = &[
     &BOOK_LIQUIDITY_WINDOW_1H_V1,
     &LOCATION_VWAP_UTC_DAY_V1,
     &LOCATION_LEVELS_V1,
+    &LOCATION_LEVELS_V2,
     &LOCATION_AUCTION_PRIOR_DAY_V1,
 ];
 
@@ -1561,6 +1657,8 @@ pub const LOCK: &[LockEntry] = &[
     LockEntry::new("location.vwap.utc_day", 1, 0x03e9_3688_148e_d1ac),
     LockEntry::new("location.levels", 1, 0xf47b_2fce_581c_a8ba),
     LockEntry::new("location.auction.prior_day", 1, 0x1017_20ac_f993_c63a),
+    LockEntry::new("profile.volume.composite_7d", 1, 0x9d86_e7fc_b93c_bb7e),
+    LockEntry::new("location.levels", 2, 0x4216_e2ee_3ce1_d483),
 ];
 
 /// The default feature set: the latest version of each computed feature.
@@ -1588,6 +1686,7 @@ pub const CURRENT: &[FeatureKey] = &[
     PROFILE_VOLUME_UTC_DAY_V1.key,
     PROFILE_VOLUME_PRIOR_DAY_V1.key,
     PROFILE_VOLUME_COMPOSITE_5D_V1.key,
+    PROFILE_VOLUME_COMPOSITE_7D_V1.key,
     STRUCTURE_SWING_15M_V1.key,
     STRUCTURE_SWING_1H_V1.key,
     STRUCTURE_SWING_4H_V1.key,
@@ -1610,9 +1709,15 @@ pub const CURRENT: &[FeatureKey] = &[
     BOOK_LIQUIDITY_WINDOW_15M_V1.key,
     BOOK_LIQUIDITY_WINDOW_1H_V1.key,
     LOCATION_VWAP_UTC_DAY_V1.key,
-    LOCATION_LEVELS_V1.key,
+    LOCATION_LEVELS_V2.key,
     LOCATION_AUCTION_PRIOR_DAY_V1.key,
 ];
+
+/// Older versions the engine still computes on request, each in place of
+/// the [`CURRENT`] version of its id (ADR-029 D3, ADR-044 D10): an
+/// experiment recorded on one of them reproduces. Only versions whose code
+/// path is still in the engine are listed.
+pub const SELECTABLE: &[FeatureKey] = &[LOCATION_LEVELS_V1.key];
 
 /// The registry of [`DEFINITIONS`].
 ///
@@ -1632,6 +1737,33 @@ pub fn registry() -> FeatureRegistry {
 /// anything ships.
 pub fn current_set() -> FeatureSet {
     FeatureSet::new(&registry(), CURRENT).expect("the current set is valid (see the catalog tests)")
+}
+
+/// [`CURRENT`] with each key of `older` in place of the [`CURRENT`] key of
+/// the same id, such as the set of the `location.levels@1` engine
+/// ([`SELECTABLE`]). A key whose id is not in [`CURRENT`] is added.
+///
+/// # Errors
+///
+/// As [`FeatureSet::new`]: an unknown key, an id given twice, or a missing
+/// upstream version.
+pub fn current_set_with(older: &[FeatureKey]) -> Result<FeatureSet, FeatureSetError> {
+    let mut keys: Vec<FeatureKey> = CURRENT
+        .iter()
+        .map(|key| {
+            older
+                .iter()
+                .find(|other| other.id == key.id)
+                .copied()
+                .unwrap_or(*key)
+        })
+        .collect();
+    keys.extend(
+        older
+            .iter()
+            .filter(|key| CURRENT.iter().all(|current| current.id != key.id)),
+    );
+    FeatureSet::new(&registry(), &keys)
 }
 
 #[cfg(test)]
@@ -1685,10 +1817,10 @@ mod tests {
             hasher.write_u32(entry.key.version.get());
             hasher.write_u64(entry.fingerprint.value());
         }
-        assert_eq!(LOCK.len(), 47, "lock lines");
+        assert_eq!(LOCK.len(), 49, "lock lines");
         assert_eq!(
             hasher.finish().to_string(),
-            "d2cd7c0013c5b267",
+            "c2ea10471718bc54",
             "lock digest"
         );
     }
@@ -2169,6 +2301,28 @@ mod tests {
                     .contains(&Input::Feature(levels.key))
             );
         }
+        // `@2` is `@1` over the 7-day composite (ADR-044 D5, ADR-036
+        // decision 2): the same parameters, the same inputs with the
+        // composite swapped, the same warm-up.
+        assert_eq!(LOCATION_LEVELS_V2.params, LOCATION_LEVELS_V1.params);
+        let swapped: Vec<Input> = LOCATION_LEVELS_V1
+            .inputs
+            .iter()
+            .map(|input| {
+                if *input == Input::Feature(PROFILE_VOLUME_COMPOSITE_5D_V1.key) {
+                    Input::Feature(PROFILE_VOLUME_COMPOSITE_7D_V1.key)
+                } else {
+                    *input
+                }
+            })
+            .collect();
+        assert_eq!(LOCATION_LEVELS_V2.inputs, swapped.as_slice());
+        assert_ne!(LOCATION_LEVELS_V2.inputs, LOCATION_LEVELS_V1.inputs);
+        assert_eq!(LOCATION_LEVELS_V2.warm_up, LOCATION_LEVELS_V1.warm_up);
+        assert_eq!(LOCATION_LEVELS_V2.key.id, LOCATION_LEVELS_V1.key.id);
+        assert_eq!(LOCATION_LEVELS_V2.key.version.get(), 2);
+        assert!(!CURRENT.contains(&LOCATION_LEVELS_V1.key));
+        assert!(CURRENT.contains(&LOCATION_LEVELS_V2.key));
         assert_eq!(
             LOCATION_AUCTION_PRIOR_DAY_V1.params,
             &[
@@ -2191,15 +2345,46 @@ mod tests {
         );
         let location = [
             &LOCATION_VWAP_UTC_DAY_V1,
-            &LOCATION_LEVELS_V1,
+            &LOCATION_LEVELS_V2,
             &LOCATION_AUCTION_PRIOR_DAY_V1,
         ];
         for definition in location {
             assert!(definition.key.id.as_str().starts_with("location."));
-            assert_eq!(definition.key.version.get(), 1);
             assert_eq!(definition.warm_up, WarmUp::Samples(1));
             assert!(CURRENT.contains(&definition.key), "{}", definition.key);
         }
+    }
+
+    #[test]
+    fn selectable_versions_are_older_than_current() {
+        // ADR-029 D3, ADR-044 D10: each selectable version is registered,
+        // older than the CURRENT version of its id, and substitutes into
+        // CURRENT as a valid set.
+        let registry = registry();
+        assert_eq!(SELECTABLE, &[LOCATION_LEVELS_V1.key]);
+        for key in SELECTABLE {
+            assert!(registry.get(*key).is_some(), "{key}");
+            assert!(!CURRENT.contains(key), "{key}");
+            let current = CURRENT.iter().find(|current| current.id == key.id).unwrap();
+            assert!(key.version < current.version, "{key}");
+            let set = current_set_with(&[*key]).unwrap();
+            assert!(set.definitions().any(|definition| definition.key == *key));
+            assert!(
+                set.definitions()
+                    .all(|definition| definition.key != *current)
+            );
+            assert_ne!(set.version(), current_set().version());
+            assert_eq!(set.definitions().count(), CURRENT.len());
+        }
+        // Without substitutes, the current set itself.
+        assert_eq!(current_set_with(&[]).unwrap(), current_set());
+        // A key whose id is not in CURRENT is added, and the set checks it.
+        assert_eq!(
+            current_set_with(&[FeatureKey::new("not.registered", 1)]),
+            Err(FeatureSetError::Unknown {
+                key: FeatureKey::new("not.registered", 1)
+            })
+        );
     }
 
     #[test]
@@ -2220,13 +2405,14 @@ mod tests {
              derivatives.mark@1,derivatives.oi.5m@1,derivatives.oi.sample@1,\
              flow.cvd.continuous@1,flow.cvd.utc_day@1,flow.window.15m@1,\
              flow.window.1h@1,flow.window.5m@1,location.auction.prior_day@1,\
-             location.levels@1,location.vwap.utc_day@1,profile.volume.composite_5d@1,\
-             profile.volume.prior_day@1,profile.volume.utc_day@1,\
+             location.levels@2,location.vwap.utc_day@1,profile.volume.composite_5d@1,\
+             profile.volume.composite_7d@1,profile.volume.prior_day@1,\
+             profile.volume.utc_day@1,\
              structure.levels.15m@1,structure.levels.1d@1,structure.levels.1h@1,\
              structure.levels.4h@1,structure.swing.15m@1,structure.swing.1d@1,\
              structure.swing.1h@1,structure.swing.4h@1,trade.last_price@1,\
              volatility.atr.1h@1,volatility.regime.1h@1"
         );
-        assert_eq!(set.version().to_string(), "be668af626d0ce5a");
+        assert_eq!(set.version().to_string(), "685b83d7bf13b54c");
     }
 }

@@ -7,8 +7,8 @@
 //!
 //! - **A0**, a valid run: events, domain rejections, and on every completed
 //!   day the tool's recomputation at [`ProfileShape::V1`] over its own
-//!   binning against the engine's `prior_day` and `composite_5d`, field by
-//!   field.
+//!   binning against the engine's `prior_day`, `composite_5d` and, from the
+//!   seventh completed day, `composite_7d` (#96), field by field.
 //! - **A1**, no `OutOfRange` among the prior-day and composite profiles.
 //! - **A2**, `bin_size · 10 000 ≤ P_min · w`, `w` being
 //!   [`TOLERANCE_BPS`].
@@ -49,8 +49,9 @@ use mie_domain::feature::{FeatureValue, Unavailability};
 use mie_domain::location::TOLERANCE_BPS;
 use mie_domain::num::{Price, Qty, SCALE};
 use mie_domain::profile::{
-    BIN_SIZE, COMPOSITE_SESSIONS, MAX_BINS, NODE_KERNEL, NODE_PROMINENCE_PCT, ProfileLevels,
-    ProfileNode, ProfileShape, VALUE_AREA_PCT, VolumeProfile, shape_levels,
+    BIN_SIZE, COMPOSITE_7D_SESSIONS, COMPOSITE_SESSIONS, MAX_BINS, NODE_KERNEL,
+    NODE_PROMINENCE_PCT, ProfileLevels, ProfileNode, ProfileShape, VALUE_AREA_PCT, VolumeProfile,
+    shape_levels,
 };
 use mie_domain::state::MarketStateEngine;
 use mie_domain::time::EventTime;
@@ -529,7 +530,8 @@ fn measure_profile() {
     let mut days: VecDeque<Day> = VecDeque::new();
     let keep = COMPOSITES.into_iter().max().unwrap();
     let (mut events, mut rejections) = (0_u64, 0_u64);
-    let (mut compared, mut mismatches) = ([0_u64; 2], [0_u64; 2]);
+    // A0 slots: prior_day, composite_5d, composite_7d.
+    let (mut compared, mut mismatches) = ([0_u64; 3], [0_u64; 3]);
     let mut price_range = [(i64::MAX, i64::MIN); 2];
     let mut weekday = [[(0_f64, 0_u64); 7]; 2];
 
@@ -607,11 +609,16 @@ fn measure_profile() {
         if profiles.prior_day.clone().map(|p| levels_of(&p)) != tool {
             mismatches[0] += 1;
         }
-        if days.len() >= COMPOSITE_SESSIONS {
-            let tool = profile_of(&days, COMPOSITE_SESSIONS, &ProfileShape::V1, V1_MULTIPLE, 0);
-            compared[1] += 1;
-            if profiles.composite_5d.clone().map(|p| levels_of(&p)) != tool {
-                mismatches[1] += 1;
+        for (slot, sessions, engine_value) in [
+            (1, COMPOSITE_SESSIONS, &profiles.composite_5d),
+            (2, COMPOSITE_7D_SESSIONS, &profiles.composite_7d),
+        ] {
+            if days.len() >= sessions {
+                let tool = profile_of(&days, sessions, &ProfileShape::V1, V1_MULTIPLE, 0);
+                compared[slot] += 1;
+                if engine_value.clone().map(|p| levels_of(&p)) != tool {
+                    mismatches[slot] += 1;
+                }
             }
         }
         if let Some(out) = &mut profile_out {
@@ -634,7 +641,7 @@ fn measure_profile() {
         EventTime::from_millis(split)
     );
     println!(
-        "A0: {events} events{}, {rejections} domain rejections; engine/tool mismatches prior_day {} of {}, composite_5d {} of {}",
+        "A0: {events} events{}, {rejections} domain rejections; engine/tool mismatches prior_day {} of {}, composite_5d {} of {}, composite_7d {} of {}",
         if is_w {
             format!(" (W: {W_EVENTS} expected)")
         } else {
@@ -643,7 +650,9 @@ fn measure_profile() {
         mismatches[0],
         compared[0],
         mismatches[1],
-        compared[1]
+        compared[1],
+        mismatches[2],
+        compared[2]
     );
     println!("Prices per half: P_min and P_max, and each compared bin in bps there");
     for (half, (low, high)) in price_range.iter().enumerate() {
@@ -719,7 +728,7 @@ fn measure_profile() {
     // The rules at `@1`.
     let v1 = &rows[v1_row];
     let a0 =
-        rejections == 0 && mismatches == [0, 0] && compared[0] > 0 && (!is_w || events == W_EVENTS);
+        rejections == 0 && mismatches == [0; 3] && compared[0] > 0 && (!is_w || events == W_EVENTS);
     let oor: u64 = v1
         .cells
         .iter()
@@ -799,7 +808,7 @@ fn measure_profile() {
         if c1 { "HOLDS" } else { "FAILS" }
     );
     assert!(
-        mismatches == [0, 0] && rejections == 0,
+        mismatches == [0; 3] && rejections == 0,
         "A0 void: the tool disagrees with the engine or the engine rejected events"
     );
 }

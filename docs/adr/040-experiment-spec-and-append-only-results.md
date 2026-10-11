@@ -72,8 +72,12 @@ deciding them.
    every member at the same key and definition — a subset check, so adding
    features to the default set never orphans an old spec. A spec on a
    feature version the engine no longer computes fails with
-   `FeatureUnavailable` until `MarketStateEngine::with_features` lands
-   (ADR-029).
+   `FeatureUnavailable`. Since #96 the service builds its engine with
+   `MarketStateEngine::with_features` (ADR-044 D10): `catalog::CURRENT`
+   with each spec member listed in `catalog::SELECTABLE` (today
+   `location.levels@1`) in place of the current version of its id, so a
+   spec on such an older version runs and reproduces (ADR-029). A spec on
+   any other older version still fails with `FeatureUnavailable`.
 5. **Data version (D5).** `data` is the raw store's dataset version
    (ADR-030). The domain mirrors it as `DataVersion`; the ports convert
    `DatasetVersion` into it, because ADR-030 keeps `DatasetVersion` in the
@@ -149,8 +153,9 @@ deciding them.
   rewrite its trailer: it is not tamper evidence. A forged result is caught
   by re-running its spec, which reports `Diverged`; a keyed or signed
   trailer is left to a later ADR if results ever cross a trust boundary.
-- A feature version bump of a used feature cannot be re-run until
-  `MarketStateEngine::with_features` lands; the error names the feature.
+- A feature version bump of a used feature can be re-run only while the
+  older version is listed in `catalog::SELECTABLE` (ADR-044 D10); otherwise
+  the run fails and the error names the feature.
 - Results are not type-sealed across crates: the ADR-020 guarantee is the
   wiring in `mie-cli`. #34 adds a no-write-path test for the agent adapter.
 - Hard links are unsupported on some network and FUSE filesystems; the

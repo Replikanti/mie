@@ -1,6 +1,6 @@
 # ADR-036: Volume profile
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-10-07
 
 ## Context
@@ -43,7 +43,10 @@ oracle the old *Accept when* named (a circular reason), and the 5 days, the
 of #70 asked for the reasons; #79 measured them. Every `@1` value is locked
 (ADR-029) and consumed by `location.levels@1` (ADR-044 D5), so a value
 change means a new id or `@2` plus `location.*@2` and an ADR-044 re-run. No
-value changed in #79.
+value changed in #79. #96 then added a new id,
+`profile.volume.composite_7d@1`, and `location.levels@2`, which consumes it
+in place of `composite_5d@1` (decision 2); no `@1` value changed in #96
+either.
 
 ### Measurements behind the numbers
 
@@ -214,7 +217,7 @@ resolution at which profile levels are needed.
      than 1 000 bins (p50 725, p99 2 267): it would filter real days, which
      rule A1 forbids. The bound scales with the bin: a 5 USDT `@2` needs
      the same price range in twice the bins.
-2. **Windows.** Three profiles:
+2. **Windows.** Four profiles:
    - `profile.volume.utc_day@1`: the developing profile of the current UTC
      day (00:00 UTC, the anchor of `bars.time.1d@1` and
      `flow.cvd.utc_day@1`). Its levels are recomputed only when a 1m bar
@@ -230,6 +233,12 @@ resolution at which profile levels are needed.
      closed days. Empty days count as days (ADR-031 yields a bar for every
      elapsed interval); five empty days give `Unavailable { reason:
      InputInvalid }`.
+   - `profile.volume.composite_7d@1`: the same over the last 7 completed
+     UTC days, warming up over 7 closed days; seven empty days give
+     `Unavailable { reason: InputInvalid }`. This is the composite location
+     consumes (`location.levels@2`, ADR-044 D5). `composite_5d@1` stays
+     computed and locked, and only `location.levels@1` consumes it, so
+     experiments recorded on it reproduce (ADR-029).
 
    Not in `@1`: rolling (e.g. 24 h) profiles, which need per-minute
    histograms to subtract; a developing composite; intraday sessions.
@@ -250,9 +259,32 @@ resolution at which profile levels are needed.
    prior day (POC beyond `w` on 87.6 / 93.4 % of days). 3 days does not remove the cycle.
    The composite therefore moves to 7 days, through a new id
    `profile.volume.composite_7d@1` (ids name their parameterization,
-   ADR-029) together with `location.levels@2` and an ADR-044 M3 re-run.
-   That is #96 and is pending; until it lands, this decision stays at 5
-   days and `location.levels@1` keeps consuming `composite_5d@1`.
+   ADR-029) together with `location.levels@2` and an ADR-044 M3 re-run
+   (#96).
+
+   *Why 7.* A window of n consecutive days holds each weekday equally
+   often only when n is a multiple of 7, so 7 is the shortest window
+   without the weekly cycle. The measured span grows with the length
+   (composite-length table), so 7 also gives the narrowest such composite.
+   - *Weekend days per window.* Every 7-day window holds exactly 2 weekend
+     days, on every compute day. A 5-day window holds 3, 3, 3, 4, 5, 4, 3
+     weekdays when its last day is Monday … Sunday (pinned by
+     `the_composite_7d_holds_two_weekend_days_on_every_compute_day` in
+     `profile.rs`).
+   - *Weekend volume, from the C1 means* (first half / second half; these
+     figures derive from the weekday means, no window was measured). A
+     weekend day carries 0.53 / 0.46 of a weekday's volume. At 7 days the
+     weekend share of the window's volume is 17.4 / 15.4 % on every compute
+     day. At 5 days it ranges over 0.0–26.4 / 0.0–23.5 % with the compute
+     day, and the window's expected total changes by a factor of 1.25 /
+     1.29 with the weekday alone (786 937–987 071 / 680 812–879 271 BTC).
+   - *What breaks at other lengths.* 5 and 3 keep the cycle. 14 removes it
+     too, but widens the median span by 33 / 46 % against 7 (1 108 / 739
+     against 832 / 506 bins), and its POC lies further from the prior day:
+     beyond `w` on 87.6 / 93.4 % of days, against 82.4 / 89.6 % at 7.
+   - *Cost of 7 over 5,* as measured above: the same maximum span in the
+     first half and 31 bins more in the second, κ within 0.02, no
+     `OutOfRange`, and a warm-up two days longer.
 3. **Gap policy.** A trades gap never resets a profile. The value carries
    the OR of its inputs' coverage: the folded 1m bars of the day for the
    developing profile, the closed 1d bars for the completed ones. The
@@ -343,8 +375,10 @@ resolution at which profile levels are needed.
      day.
    - `profile.volume.composite_5d@1`: also `sessions` 5; inputs and
      samples as `prior_day`; warm-up `Samples(5)`.
+   - `profile.volume.composite_7d@1`: also `sessions` 7; inputs and
+     samples as `prior_day`; warm-up `Samples(7)`.
 
-   `MarketState.profile` carries the three values; each names the feature
+   `MarketState.profile` carries the four values; each names the feature
    that produced it. They are stepped on the same atomic path as bars,
    volatility and order flow: a rejected event changes none of them. Each
    profile exposes its levels (POC, VAL, VAH, then every HVN and LVN) as
@@ -377,8 +411,14 @@ resolution at which profile levels are needed.
 - The completed profiles depend only on the trades of their days, so they
   are reproducible from any replay window that starts at or before the
   first included day's open (coverage per ADR-031).
-- Until #96 lands, the composite's weekday mix varies with the day it is
-  computed (decision 2).
+- The 7-day composite warms up over 7 days: a replay has no composite
+  levels in its first 7 days (`location.levels@2`), two days longer than
+  at 5.
+- The tracker keeps 7 sparse day histograms instead of 5; the widest day in
+  W spans 2 099 bins. The `max_bins` margin is unchanged: the widest 7-day
+  composite of W spans 2 470 bins, a 4.0× margin, as the 5-day one.
+- Keeping `composite_5d@1` computed for `location.levels@1` costs one
+  extra `shape_levels` per day close.
 
 ## Alternatives considered
 
@@ -408,8 +448,14 @@ resolution at which profile levels are needed.
 - **Other bin sizes** (5, 20, 25, 50 USDT), **kernels** (none, t3, t7, t9),
   **prominences** (5, 15, 20, 30 %), **value areas** (60, 68, 80 %) and
   **composite lengths** (3, 14 days): rejected for the measured reasons in
-  decisions 1, 2, 5 and 6. 7 days is accepted in decision 2 and pending in
-  #96.
+  decisions 1, 2, 5 and 6.
+- **Keeping the composite at 5 days.** Its weekday mix, and with it its
+  expected volume (×1.25 / 1.29), changes with the compute day because a
+  weekend day carries about half a weekday's volume (C1). Rejected
+  (decision 2).
+- **`profile.volume.composite_5d@2` with `sessions` 7.** Ids name their
+  parameterization (ADR-029 D1): a 7-day composite must not carry a `_5d`
+  id. Rejected for the new id `composite_7d@1`.
 - **CBOT dual-row value-area expansion.** A TPO-era rule that compares two
   rows per side and overshoots by up to two bins; with fine volume bins,
   single-bin expansion is the norm. Rejected.
@@ -484,10 +530,25 @@ Met 2026-10-11 for A0–A5 at `@1`, on main after #93:
   plus each node's edges and raw bin volume against the histogram.
 - C1 HOLDS: weekend days below every weekday in both halves.
 
-Pending: #96 (`profile.volume.composite_7d@1`, `location.levels@2`,
-ADR-044 M3 re-run). This ADR stays `proposed` until it merges. Full results
-and the sha256 of the 36 archive zips:
+Full results of the `@1` run and the sha256 of the 36 archive zips:
 <https://github.com/Replikanti/mie/issues/79#issuecomment-6106618884>.
+
+Met 2026-10-11 for the 7-day composite (#96), on the #96 head before
+merge, same window and rules:
+
+- A0 PASS: 603 218 226 events, 0 rejections; the tool's recomputation
+  equals the engine's `composite_7d` on 358 of 358 days (364 completed
+  days less the 6 that close before a 7-day window exists), next to
+  `prior_day` 364 of 364 and `composite_5d` 360 of 360, unchanged.
+- A1, A3 and A4 hold for `composite_7d@1` on the composite-length table
+  (*Context*), which this run reproduced exactly: 0 `OutOfRange`, LVN p50
+  15 / 12, κ HVN, LVN 0.657, 0.665 / 0.714, 0.715. A2 does not depend on
+  the composite length, and A5 concerns `prior_day` only.
+- C1 HOLDS, so the composite location consumes is `composite_7d@1`
+  (decision 2), shipped by #96 with `location.levels@2` and the ADR-044 M3
+  re-run (ADR-044 *Measurements*). That was the follow-up C1 named; this
+  ADR is accepted with it. Results:
+  <https://github.com/Replikanti/mie/issues/96#issuecomment-6110025815>.
 
 References: ADR-013, ADR-019, ADR-022, ADR-023, ADR-025, ADR-027, ADR-028,
 ADR-029, ADR-031, ADR-033, ADR-034, ADR-035, ADR-044, ADR-047.

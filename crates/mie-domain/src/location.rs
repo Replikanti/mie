@@ -8,10 +8,13 @@
 //! - `location.vwap.utc_day@1` ([`Vwap`], decision 4): the volume-weighted
 //!   average price of the current UTC day over its closed minutes, exact in
 //!   `i128` and floored to [`Price`].
-//! - `location.levels@1` ([`LevelSet`], decisions 5–7): every level location
+//! - `location.levels@2` ([`LevelSet`], decisions 5–7): every level location
 //!   monitors, rebuilt at each closed 1m bar with trades from the prior-day
-//!   and 5-day composite profiles, the structure registries, the book's
-//!   cluster candidates and the VWAP. Each level carries its score
+//!   and 7-day composite profiles, the structure registries, the book's
+//!   cluster candidates and the VWAP. `location.levels@1`, the same registry
+//!   over the 5-day composite, can still be selected
+//!   ([`MarketStateEngine::with_features`](crate::state::MarketStateEngine::with_features),
+//!   decision 10). Each level carries its score
 //!   components — distance, touches, age, source, confluence, strength —
 //!   and no scalar score (ADR-013). A level is **in zone** while the closed
 //!   bar's range overlaps its zone padded by the tolerance
@@ -53,11 +56,11 @@ pub(crate) use vwap::{VwapStep, VwapTracker};
 
 use crate::bars::{Bar, Timeframe};
 use crate::event::MarketEvent;
-use crate::feature::FeatureValue;
+use crate::feature::{FeatureKey, FeatureValue, catalog};
 use crate::fingerprint::Fingerprinter;
 use crate::liquidity::BookState;
 use crate::num::Price;
-use crate::profile::VolumeProfiles;
+use crate::profile::{VolumeProfile, VolumeProfiles};
 use crate::state_hash::StateEncode;
 use crate::structure::StructureSet;
 use crate::time::EventTime;
@@ -66,8 +69,39 @@ use std::fmt;
 /// The location tolerance `w` in basis points of the level's price: the
 /// edge bands of the auction classifier and the padding of a monitored
 /// zone (ADR-044, decision 3). Parameter `tolerance` = 0.0006 of
-/// `location.levels@1` and `location.auction.prior_day@1`.
+/// `location.levels@1`, `location.levels@2` and
+/// `location.auction.prior_day@1`.
 pub const TOLERANCE_BPS: i64 = 6;
+
+/// Which version of the level registry an engine computes (ADR-044 D5,
+/// D10): engine state, not hashed — the feature set stamped on the state
+/// names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LevelsVersion {
+    /// `location.levels@1`, over the 5-day composite.
+    V1,
+    /// `location.levels@2`, over the 7-day composite.
+    V2,
+}
+
+impl LevelsVersion {
+    /// The feature this version computes.
+    pub(crate) fn key(self) -> FeatureKey {
+        match self {
+            Self::V1 => catalog::LOCATION_LEVELS_V1.key,
+            Self::V2 => catalog::LOCATION_LEVELS_V2.key,
+        }
+    }
+
+    /// The composite profile this version reads its levels from:
+    /// `composite_5d` at `@1`, `composite_7d` at `@2`.
+    pub(crate) fn composite(self, profiles: &VolumeProfiles) -> &FeatureValue<VolumeProfile> {
+        match self {
+            Self::V1 => &profiles.composite_5d,
+            Self::V2 => &profiles.composite_7d,
+        }
+    }
+}
 
 /// Whether `gap` (in `1e-8` USDT; negative means overlap) is at most
 /// `tolerance_bps` basis points of `reference`: `gap · 10 000 ≤ |reference|
@@ -237,8 +271,9 @@ pub struct LocationState {
     /// `location.vwap.utc_day@1`, warming up until a minute of the current
     /// UTC day with volume closes.
     pub vwap: FeatureValue<Vwap>,
-    /// `location.levels@1`, warming up until the first closed 1m bar with
-    /// trades.
+    /// `location.levels@2`, or `@1` on an engine that selected it
+    /// ([`LevelSet::feature`] names which), warming up until the first
+    /// closed 1m bar with trades.
     pub levels: FeatureValue<LevelSet>,
     /// `location.auction.prior_day@1`, warming up until the first closed 1m
     /// bar with trades under a ready prior day, and again from each new
@@ -377,19 +412,15 @@ impl fmt::Display for LocationEvent {
     }
 }
 
-/// The location engine state (ADR-044): the VWAP sums and the auction
-/// classifier. Engine state; the Market State exposes only
-/// [`LocationState`].
+/// The location engine state (ADR-044): the VWAP sums, the auction
+/// classifier and the registry version. Engine state; the Market State
+/// exposes only [`LocationState`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LocationTracker {
     pub(crate) vwap: VwapTracker,
     auction: AuctionClassifier,
-}
-
-impl Default for LocationTracker {
-    fn default() -> Self {
-        Self::new()
-    }
+    /// The registry version the engine computes.
+    levels: LevelsVersion,
 }
 
 /// The fallible part of one event's location step, committed with the other
@@ -399,11 +430,12 @@ pub(crate) struct LocationStep {
 }
 
 impl LocationTracker {
-    /// An empty tracker.
-    pub(crate) fn new() -> Self {
+    /// An empty tracker that computes the registry at `levels`.
+    pub(crate) fn new(levels: LevelsVersion) -> Self {
         Self {
             vwap: VwapTracker::default(),
             auction: AuctionClassifier::new(TOLERANCE_BPS, ACCEPTANCE_CLOSES),
+            levels,
         }
     }
 
@@ -471,8 +503,21 @@ impl LocationTracker {
         let Some((bar, ohlc)) = minute else {
             return;
         };
-        let sourced = registry::sourced(inputs.profile, inputs.structure, inputs.book, &state.vwap);
-        let (set, zone) = registry::rebuild(state.levels.ready(), sourced, bar, &ohlc, known_at);
+        let sourced = registry::sourced(
+            inputs.profile,
+            inputs.structure,
+            inputs.book,
+            &state.vwap,
+            self.levels,
+        );
+        let (set, zone) = registry::rebuild(
+            state.levels.ready(),
+            sourced,
+            bar,
+            &ohlc,
+            known_at,
+            self.levels,
+        );
         let bar_end = bar.end();
         events.extend(
             zone.left

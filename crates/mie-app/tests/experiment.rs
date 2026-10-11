@@ -253,6 +253,33 @@ fn a_feature_the_engine_does_not_compute_is_refused_before_the_replay() {
 }
 
 #[test]
+fn a_spec_on_a_selectable_older_version_runs_and_reproduces() {
+    // A spec recorded on the default set before #96: `location.levels@1`,
+    // without `profile.volume.composite_7d@1` (ADR-044 D10, ADR-040 D4).
+    let keys: Vec<FeatureKey> = catalog::current_set_with(&[catalog::LOCATION_LEVELS_V1.key])
+        .unwrap()
+        .definitions()
+        .map(|definition| definition.key)
+        .filter(|key| *key != catalog::PROFILE_VOLUME_COMPOSITE_7D_V1.key)
+        .collect();
+    let features = FeatureSet::new(&catalog::registry(), &keys)
+        .unwrap()
+        .to_string();
+    let spec = spec_with(
+        &catalog::registry(),
+        &features,
+        (0, 10_000),
+        &"0f".repeat(32),
+    );
+    let mut service = ExperimentService::new(Recorded(tape()), MemoryStore::default());
+    let ExperimentRun::Recorded(recorded) = service.run(&spec).unwrap() else {
+        panic!("the first run records");
+    };
+    assert_eq!(service.run(&spec), Ok(ExperimentRun::Reproduced(recorded)));
+    assert_eq!(service.store().appends, 1);
+}
+
+#[test]
 fn other_events_under_the_same_data_version_diverge_and_the_stored_result_stays() {
     let spec = spec((0, 10_000));
     let mut service = ExperimentService::new(Recorded(tape()), MemoryStore::default());

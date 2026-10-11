@@ -67,12 +67,22 @@ Two facts shape the comparison:
    hashed whole.
 2. **Versioning and comparability (D2).** Two state hashes are comparable
    only when their encoding (`STATE_HASH_ENCODING`) and their
-   `FeatureSetVersion` are both equal. A new feature family — a new
-   `MarketState` field — changes the feature-set version anyway (ADR-029);
-   it extends the encoder in the same PR without an encoding bump, and
-   updates the pinned golden values ("Adding a feature" step 6). Changing
-   how an already-encoded field is written (its writer, an enum code or the
-   order) bumps `STATE_HASH_ENCODING`.
+   `FeatureSetVersion` are both equal. A new feature changes the
+   feature-set version anyway (ADR-029), whether it is a new `MarketState`
+   field (a new family) or a field appended last to a family's struct
+   (`profile.volume.composite_7d@1` in `VolumeProfiles`, #96); it extends
+   the encoder in the same PR without an encoding bump, and updates the
+   pinned golden values ("Adding a feature" step 6). Hashes are compared
+   only under equal feature-set versions, so the new bytes never meet a
+   hash written without them; and because the field is appended last,
+   every field encoded before it is written as before (#96 pins this: the
+   pre-#96 goldens come out of the `location.levels@1` engine once the new
+   field and the stamp are factored out). Changing how an already-encoded
+   field is written (its writer, an enum code or the order of existing
+   fields) bumps `STATE_HASH_ENCODING`.
+   - *Why not bump for an appended field:* a bump would treat every new
+     feature as a re-encoding, and the feature-set version already makes
+     the old and new hashes incomparable.
 3. **Checkpoints (D3).** One recorder (`mie_app::equivalence`) serves live
    and replay: `drive_checkpointed` is `drive_tolerant` plus a
    `CheckpointRecorder`. A checkpoint is recorded after the event that
@@ -254,6 +264,9 @@ list, derived from the code (the values below are the constants in the tree):
   days.
 - `profile.volume.composite_5d@1`: `COMPOSITE_SESSIONS` = 5 completed UTC
   days (`profile.rs`), which no run of hours reaches.
+- `profile.volume.composite_7d@1`: `COMPOSITE_7D_SESSIONS` = 7 completed
+  UTC days (`profile.rs`), likewise; so neither composite contributes
+  levels to `location.levels@2` or `@1` in a run.
 - `structure.swing.<tf>@1` and `structure.levels.<tf>@1`: `Samples(7)`
   closed bars of the timeframe (ADR-037 D10). That is 105 minutes at 15m,
   7 h at 1h, 28 h at 4h and 7 days at 1d; only the 15m timeframe can warm

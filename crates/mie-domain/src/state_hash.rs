@@ -42,13 +42,16 @@
 //!
 //! **Versioning.** Two state hashes are comparable only when both their
 //! [`STATE_HASH_ENCODING`] and their [`FeatureSetVersion`] are equal. A new
-//! feature family — a new [`MarketState`] field — changes the feature-set
-//! version anyway (ADR-029); it extends the encoder in the same change,
-//! without an encoding bump. Changing how an already-encoded field is
-//! written (its writer, an enum code or the order) bumps
-//! [`STATE_HASH_ENCODING`].
+//! feature changes the feature-set version anyway (ADR-029), whether it is
+//! a new [`MarketState`] field (a new family) or a field appended last to a
+//! family's struct (`profile.volume.composite_7d@1` in
+//! [`VolumeProfiles`]); it extends the encoder in the same change, without
+//! an encoding bump, and every field encoded before it is written as
+//! before (ADR-041 D2). Changing how an already-encoded field is written
+//! (its writer, an enum code or the order) bumps [`STATE_HASH_ENCODING`].
 //!
 //! [`FeatureSetVersion`]: crate::feature::FeatureSetVersion
+//! [`VolumeProfiles`]: crate::profile::VolumeProfiles
 
 use crate::fingerprint::{Fingerprint, Fingerprinter};
 use crate::state::MarketState;
@@ -196,10 +199,12 @@ mod tests {
     use crate::derivatives::{LiquidationWindows, MarkState, OiSample, OiStep, SettledFunding};
     use crate::event::samples::{one_of_each, trade};
     use crate::event::{BookSnapshot, BookUpdate, Level, MarketEvent};
-    use crate::feature::{FeatureKey, FeatureSetVersion, FeatureValue, Unavailability};
+    use crate::feature::{
+        FeatureKey, FeatureSet, FeatureSetVersion, FeatureValue, Unavailability, catalog,
+    };
     use crate::flow::Cvd;
     use crate::num::{Price, Qty};
-    use crate::profile::{ProfileNode, VolumeProfile};
+    use crate::profile::{ProfileNode, VolumeProfile, VolumeProfiles};
     use crate::regime::{AtrPercentile, Regime};
     use crate::state::MarketStateEngine;
     use crate::time::EventTime;
@@ -231,17 +236,96 @@ mod tests {
 
     #[test]
     fn the_golden_values_of_encoding_v1_are_pinned() {
-        // Both values change with every feature-set change (update them in
-        // that change) and otherwise only with an encoding bump (module
-        // docs).
+        // Both values change with every feature-set change, a feature
+        // appended to a family's struct included (update them in that
+        // change), and otherwise only with an encoding bump (module docs).
         assert_eq!(
             MarketStateEngine::new().state().state_hash().to_string(),
-            "cc347065b37129d0"
+            "212f9b3749af5471"
         );
         assert_eq!(
             engine_after(&tape()).state().state_hash().to_string(),
-            "a4468a96437546b7"
+            "2e1f872d7f95c19f"
         );
+    }
+
+    /// The hash `state` has without `profile.composite_7d`: every other
+    /// field written exactly as [`MarketState::state_hash`] writes it. This
+    /// is encoding v1 as it stood before #96 appended the field.
+    fn hash_without_composite_7d(state: &MarketState) -> StateHash {
+        let mut f = header();
+        let MarketState {
+            feature_set,
+            as_of,
+            last_trade_price,
+            bars,
+            motion,
+            atr,
+            regime,
+            flow,
+            profile,
+            structure,
+            derivatives,
+            book,
+            location,
+            trade_count,
+        } = state;
+        let VolumeProfiles {
+            utc_day,
+            prior_day,
+            composite_5d,
+            composite_7d: _,
+        } = profile;
+        feature_set.encode(&mut f);
+        as_of.encode(&mut f);
+        last_trade_price.encode(&mut f);
+        bars.encode(&mut f);
+        motion.encode(&mut f);
+        atr.encode(&mut f);
+        regime.encode(&mut f);
+        flow.encode(&mut f);
+        utc_day.encode(&mut f);
+        prior_day.encode(&mut f);
+        composite_5d.encode(&mut f);
+        structure.encode(&mut f);
+        derivatives.encode(&mut f);
+        book.encode(&mut f);
+        location.encode(&mut f);
+        trade_count.encode(&mut f);
+        StateHash(f.finish())
+    }
+
+    #[test]
+    fn appending_composite_7d_leaves_the_pre_96_hashes_intact() {
+        // The default set before #96: `location.levels@1` and no
+        // `profile.volume.composite_7d@1`. It still builds, to the version
+        // the pre-#96 pins recorded.
+        let keys: Vec<FeatureKey> = catalog::current_set_with(&[catalog::LOCATION_LEVELS_V1.key])
+            .unwrap()
+            .definitions()
+            .map(|definition| definition.key)
+            .filter(|key| *key != catalog::PROFILE_VOLUME_COMPOSITE_7D_V1.key)
+            .collect();
+        let pre_96 = FeatureSet::new(&catalog::registry(), &keys).unwrap();
+        assert_eq!(pre_96.version().to_string(), "be668af626d0ce5a");
+        // The `location.levels@1` engine reaches the pre-#96 state on every
+        // other field: under the pre-#96 stamp and without the appended
+        // field, it gives the two encoding-v1 goldens pinned before #96.
+        let features = catalog::current_set_with(&[catalog::LOCATION_LEVELS_V1.key]).unwrap();
+        for (events, golden) in [
+            (Vec::new(), "cc347065b37129d0"),
+            (tape(), "a4468a96437546b7"),
+        ] {
+            let mut engine = MarketStateEngine::with_features(features.clone()).unwrap();
+            for event in &events {
+                engine.apply(event).unwrap();
+            }
+            let mut state = engine.state().clone();
+            state.feature_set = pre_96.version();
+            assert_eq!(hash_without_composite_7d(&state).to_string(), golden);
+            // The appended field is written: the full hash differs.
+            assert_ne!(state.state_hash(), hash_without_composite_7d(&state));
+        }
     }
 
     #[test]
@@ -348,6 +432,10 @@ mod tests {
             (
                 "profile node",
                 Box::new(move |s| s.profile.utc_day = FeatureValue::Ready(profile(99))),
+            ),
+            (
+                "profile composite_7d",
+                Box::new(move |s| s.profile.composite_7d = FeatureValue::Ready(profile(100))),
             ),
             ("regime", Box::new(move |s| s.regime = regime(50.0))),
             (
