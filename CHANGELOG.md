@@ -36,7 +36,10 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   and `location.levels@2`, the level registry over the prior-day and 7-day
   composite profiles. `MarketStateEngine::with_features` builds an engine
   for the default set with an older version selected instead, today
-  `location.levels@1`, which stays computable.
+  `location.levels@1`, which stays computable; it refuses a set whose
+  definitions differ from the catalog's. The experiment service builds its
+  engine with it, so a spec on `location.levels@1` runs and reproduces
+  (ADR-040 D4).
 
 ### Changed
 

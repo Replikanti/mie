@@ -282,6 +282,10 @@ impl MarketStateEngine {
     /// - [`UnsupportedFeatureSet::NotComputed`] — a member at a version that
     ///   is neither in [`catalog::CURRENT`] nor in [`catalog::SELECTABLE`]:
     ///   this binary has no code path for it;
+    /// - [`UnsupportedFeatureSet::Redefined`] — a member whose definition
+    ///   differs from the catalog's under the same key: the engine computes
+    ///   the catalog definition, so the stamp would name definitions it
+    ///   never computed;
     /// - [`UnsupportedFeatureSet::Missing`] — an id of
     ///   [`catalog::CURRENT`] the set omits: the engine computes every
     ///   family on every event, so the stamp would not name every value the
@@ -292,6 +296,16 @@ impl MarketStateEngine {
                 && !catalog::SELECTABLE.contains(&definition.key)
         }) {
             return Err(UnsupportedFeatureSet::NotComputed {
+                feature: definition.key,
+            });
+        }
+        let registry = catalog::registry();
+        if let Some(definition) = features.definitions().find(|definition| {
+            registry
+                .get(definition.key)
+                .is_none_or(|computed| computed.fingerprint() != definition.fingerprint())
+        }) {
+            return Err(UnsupportedFeatureSet::Redefined {
                 feature: definition.key,
             });
         }
@@ -742,6 +756,12 @@ pub enum UnsupportedFeatureSet {
         /// The member.
         feature: FeatureKey,
     },
+    /// The set holds a key the engine computes, but under a definition
+    /// (fingerprint) other than the catalog's.
+    Redefined {
+        /// The member.
+        feature: FeatureKey,
+    },
     /// The set omits an id the engine always computes.
     Missing {
         /// The [`catalog::CURRENT`] key of the omitted id.
@@ -755,6 +775,10 @@ impl fmt::Display for UnsupportedFeatureSet {
             Self::NotComputed { feature } => {
                 write!(f, "the engine cannot compute {feature}")
             }
+            Self::Redefined { feature } => write!(
+                f,
+                "the set defines {feature} other than the catalog the engine computes"
+            ),
             Self::Missing { feature } => write!(
                 f,
                 "the set omits {}, which the engine always computes ({feature})",
@@ -1983,6 +2007,45 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "the engine cannot compute trade.last_price@2"
+        );
+    }
+
+    /// `trade.last_price@1` under a warm-up the engine does not compute.
+    static TRADE_LAST_PRICE_V1_REDEFINED: crate::feature::FeatureDefinition =
+        crate::feature::FeatureDefinition {
+            key: FeatureKey::new("trade.last_price", 1),
+            params: &[],
+            inputs: &[crate::feature::Input::Stream(Stream::Trades)],
+            warm_up: crate::feature::WarmUp::Samples(999),
+        };
+
+    #[test]
+    fn with_features_refuses_a_member_defined_other_than_the_catalog() {
+        // Same keys as `CURRENT`, but one definition differs: the stamp
+        // would name a warm-up of 999 trades while the engine computes 1.
+        let definitions: Vec<&'static crate::feature::FeatureDefinition> = catalog::DEFINITIONS
+            .iter()
+            .map(|definition| {
+                if definition.key == catalog::TRADE_LAST_PRICE_V1.key {
+                    &TRADE_LAST_PRICE_V1_REDEFINED
+                } else {
+                    *definition
+                }
+            })
+            .collect();
+        let registry = crate::feature::FeatureRegistry::new(&definitions).unwrap();
+        let set = FeatureSet::new(&registry, catalog::CURRENT).unwrap();
+        assert_ne!(set.version(), catalog::current_set().version());
+        let error = MarketStateEngine::with_features(set).unwrap_err();
+        assert_eq!(
+            error,
+            UnsupportedFeatureSet::Redefined {
+                feature: catalog::TRADE_LAST_PRICE_V1.key
+            }
+        );
+        assert_eq!(
+            error.to_string(),
+            "the set defines trade.last_price@1 other than the catalog the engine computes"
         );
     }
 

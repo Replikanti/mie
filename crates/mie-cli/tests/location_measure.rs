@@ -30,10 +30,10 @@
 //! - The #96 checks of `@2` against `@1`, each a count asserted zero:
 //!   **isolation** (rule I), events after which the two states differ
 //!   anywhere but in the feature-set stamp and the registry, or the two
-//!   engines' auction facts differ; **sourcing** (rule S), rebuilds where a
-//!   registry holds a level of the other version's composite, or fewer than
-//!   3 levels of its own composite while that is ready, or any while it is
-//!   not.
+//!   engines' auction facts differ, or that only one engine rejected;
+//!   **sourcing** (rule S), rebuilds where a registry holds a level of the
+//!   other version's composite, or fewer than 3 levels of its own composite
+//!   while that is ready, or any while it is not.
 //! - The replay's wall time, events and domain rejections of each engine.
 //!
 //! M1, M2 and M4 come from the `@2` engine; they read only the prior-day
@@ -475,8 +475,10 @@ fn measure_location() {
     let mut breakouts: Vec<Breakouts> = TOLERANCES.into_iter().map(Breakouts::new).collect();
     let mut labels = AuctionClassifier::new(TOLERANCE_BPS, ACCEPTANCE_CLOSES);
     let mut events = 0_u64;
-    // Rule I: events after which the states or auction facts differ.
+    // Rule I: events after which the states or auction facts differ,
+    // including events only one engine rejected (`one_sided`).
     let mut isolation = 0_u64;
+    let mut one_sided = 0_u64;
     // M1.
     let mut moves: [Vec<f64>; 2] = [Vec::new(), Vec::new()];
     let mut previous_close: Option<f64> = None;
@@ -498,6 +500,12 @@ fn measure_location() {
             if !*accepted {
                 registry.rejections += 1;
             }
+        }
+        // Rule I: an event only one engine rejected is a divergence where it
+        // happens, even if nothing later shows it.
+        if accepted[0] != accepted[1] {
+            one_sided += 1;
+            isolation += 1;
         }
         if accepted != [true, true] {
             continue;
@@ -660,7 +668,10 @@ fn measure_location() {
     }
     println!("  engine/tool label mismatches: {mismatches}");
     println!("#96: @2 against @1");
-    println!("  isolation (rule I): {isolation} events where the states or auction facts differ");
+    println!(
+        "  isolation (rule I): {isolation} events where the states or auction facts differ \
+         ({one_sided} of them rejected by one engine only)"
+    );
     for registry in &registries {
         println!(
             "  sourcing (rule S), {}: {} of {} rebuilds break it",

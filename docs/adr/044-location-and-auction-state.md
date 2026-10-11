@@ -380,9 +380,14 @@ of #12, 2025-10-01 … 2026-09-30 (`docs/data-availability.md`).
     any id at a version listed in `catalog::SELECTABLE` instead, today only
     `location.levels@1`, and stamps the state with that set's version. It
     rejects a set that holds a version this binary has no code path for
-    (`NotComputed`) and a set that omits an id the engine computes anyway
-    (`Missing`): the engine computes every family on every event, so such a
-    stamp would not name every value the state holds. The engine keeps the
+    (`NotComputed`), a member whose definition (fingerprint) differs from
+    the catalog's under the same key (`Redefined`: the engine computes the
+    catalog definition, so the stamp would name one it never computed), and
+    a set that omits an id the engine computes anyway (`Missing`): the
+    engine computes every family on every event, so such a stamp would not
+    name every value the state holds. The experiment service builds its
+    engine this way from the spec's feature set (ADR-040 D4), so a spec on
+    `location.levels@1` runs and reproduces. The engine keeps the
     registry version as state (not hashed: the stamp names it), and the two
     versions differ only in the composite the registry reads, which
     `v1_and_v2_differ_only_in_the_registry` checks on a ten-day tape. This
@@ -390,8 +395,7 @@ of #12, 2025-10-01 … 2026-09-30 (`docs/data-availability.md`).
     - *Rejected:* a test-only selector — `@1` would be computable in tests
       only, so an experiment recorded on it could not reproduce outside
       them; a general per-feature switch — it has no consumer yet and would
-      make every tracker optional. Wiring the selector into the experiment
-      service is out of scope (ADR-040 D4).
+      make every tracker optional.
 
 ## Consequences
 
