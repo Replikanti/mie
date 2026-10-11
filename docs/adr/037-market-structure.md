@@ -525,7 +525,10 @@ converge. Why:
   year, S5), so it shows the skew that exists today.
 - **Validity.** `missing` must be 0 under `until_swept`: from `X` on, a
   cold model confirms a subset of the same swings and sweeps them at the
-  same trades.
+  same trades. `missing_swept` is not part of validity: both resolved
+  lists keep only their 20 newest sweeps, so the cold list can still hold
+  a sweep the full list has already dropped, and `missing_swept` can be
+  non-zero under `until_swept`.
 - **Recorded only.** The skew record has no threshold: the warm-start
   (#106) is needed whatever the skew, and how long a skew lasts is a
   property of the path.

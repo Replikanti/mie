@@ -68,7 +68,9 @@
 //!   `extra_swept` and `missing_swept` the same for pending and resolved
 //!   sweeps. Printed: their p50, maximum and end values, and the days until
 //!   all four stay 0. The record is VALID when `missing` is 0 under
-//!   `until_swept`.
+//!   `until_swept`; `missing_swept` is not part of validity, because both
+//!   resolved lists keep only their 20 newest sweeps and the cold list can
+//!   still hold a sweep the full list has already dropped.
 //!
 //! The rules are evaluated over the whole window; the test asserts R0 and
 //! the validity of S6 and prints R1–R3 as PASS or FAIL, so a failing rule
