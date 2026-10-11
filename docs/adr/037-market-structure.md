@@ -334,8 +334,8 @@ the bias/trigger issue (#24, ADR-012, ADR-024).
   resolved list reaches back p50 1.10 days on 15m, 4.28 on 1h, 18.12 on
   4h and 97.31 on 1d.
 - Bars come from aggTrades, which omit individual trades on some days
-  (ADR-047: up to 478 a day on affected days, none from 2026-06-10 on). A
-  missing trade changes a bar's extreme or close, and with it a swing, a
+  (ADR-047: up to 478 a day on affected days, none in the 22 sampled days
+  from 2026-06-10 on). A missing trade changes a bar's extreme or close, and with it a swing, a
   touch, a sweep or an SFP, only when it is that extreme or the bar's last
   trade. ADR-031 found the highs and lows of 15m and longer bars matching
   the exchange klines in both its windows. The engine and the measurement
