@@ -3,8 +3,11 @@
 #![allow(dead_code)]
 
 use mie_adapter_binance::transport::{Clock, HttpGet, ReadOutcome, WsConnection, WsConnector};
+use mie_adapter_parquet::{ParquetRawStore, RotationPolicy};
 use mie_cli::config::IngestConfig;
 use mie_cli::ingest::Transports;
+use mie_domain::time::EventTime;
+use mie_ports::raw::{Capture, RawRecord, RawRecordSink, RawStreamKey};
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -471,4 +474,40 @@ impl WsConnection for Connection {
     }
 
     fn close(&mut self) {}
+}
+
+/// One raw record of [`write_records`].
+pub struct RawLine {
+    /// The raw stream name, e.g. `aggTrade`.
+    pub stream: &'static str,
+    pub receive_seq: u64,
+    pub session_id: String,
+    pub event_time_ms: i64,
+    pub payload: String,
+}
+
+/// Writes `records` into the raw store of `config` (sealed, source
+/// `binance-um`) and `journal` as its journal: a capture written directly,
+/// without the ingest pipeline, so the fixture is exactly these records.
+pub fn write_records(config: &IngestConfig, records: &[RawLine], journal: &[serde_json::Value]) {
+    let mut writer = ParquetRawStore::new(&config.paths.raw_root)
+        .writer("binance-um", RotationPolicy::default())
+        .unwrap();
+    for r in records {
+        let key = RawStreamKey::new("binance-um", "BTCUSDT", r.stream).unwrap();
+        let record = RawRecord {
+            event_time: EventTime::from_millis(r.event_time_ms),
+            capture: Some(Capture {
+                receive_time_ns: r.event_time_ms * MS + 120 * MS,
+                receive_seq: r.receive_seq,
+                session_id: r.session_id.clone(),
+            }),
+            payload: r.payload.clone().into_bytes(),
+        };
+        writer.append(&key, record).unwrap();
+    }
+    writer.close().unwrap();
+    let text: String = journal.iter().map(|l| format!("{l}\n")).collect();
+    std::fs::create_dir_all(config.paths.journal.parent().unwrap()).unwrap();
+    std::fs::write(&config.paths.journal, text).unwrap();
 }

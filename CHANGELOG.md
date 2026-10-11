@@ -12,6 +12,14 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
 
 ### Added
 
+- **`capture-report` check 7, kline reconciliation (ADR-048).** Closed
+  `kline_1m` minutes and `aggTrade` records are reconciled in trade-id
+  space per run; a block of minutes whose kline volume differs from its
+  aggregate quantity fails the report, with one line per block and a
+  totals row. A window with a trade lost inside an aggregate — which keeps
+  the aggregate id consecutive and journals no gap — now FAILs, the #9 soak
+  window included (2026-10-08, 43.250 BTC). Skipped unless both streams are
+  configured.
 - **Order-book liquidity state (ADR-043).** The engine owns the L2 book as
   `book.l2@1` and hashes it whole in the Market State; `book.depth@1` (best
   levels, depth and imbalance within 1, 2 and 5 bps of mid),

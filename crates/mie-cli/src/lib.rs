@@ -26,5 +26,6 @@ pub mod equivalence;
 pub mod experiment;
 pub mod ingest;
 pub mod journal;
+mod reconcile;
 pub mod replay;
 pub mod report;
