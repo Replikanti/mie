@@ -1,7 +1,9 @@
-//! The ADR-037 measurements (issue #80): an independent model of the
-//! ADR-037 decision text, run next to one `MarketStateEngine`, with the swing
-//! size `N`, the SFP window `K`, the touch tolerance and the cap as runtime
-//! parameters.
+//! The ADR-037 measurements (issues #80 and #104): an independent model of
+//! the ADR-037 decision text, run next to one `MarketStateEngine`, with the
+//! swing size `N`, the SFP window `K`, the touch tolerance, the active-list
+//! rule (a count cap `max_active`, a distance threshold `max_distance_bps`,
+//! or none: `until_swept`), the resolved-list cap `max_resolved` and an
+//! optional cold start as runtime parameters.
 //!
 //! The model is written from decisions 2–7, not from the engine's internals.
 //! It reads only the engine's closed bars of every structure timeframe, plus
@@ -35,12 +37,42 @@
 //!   confirmation lag; S2 level life in bars at `N` ∈ {1…5}; S3 sweeps per
 //!   day, the SFP share at `K` ∈ {1, 2, 3, 4, 6}, the first-reclaim bar and
 //!   the sweep's position in its bar; S4 touches at 1–20 bps; S5 the uncapped
-//!   list size, evictions, `lost` at caps 10, 20 and 40, the evicted levels'
-//!   distance from the last close and the resolved list's history depth.
+//!   list size, evictions, `lost` at caps 10, 20, 40, 80 and 160, the evicted
+//!   levels' distance from the last close and the resolved list's history
+//!   depth.
+//! - **S5, the alternatives** (recorded only): for every cap of [`CAPS`],
+//!   every distance of [`DISTANCES`] and `until_swept`, each with
+//!   `max_resolved` 20, per timeframe the active evictions, `lost` against
+//!   the uncapped model, the R2 verdict the rule would get (printed as
+//!   "alternative", not a gate) and the active-list p99 and maximum per
+//!   side. A distance rule retires an active level `L` at a closed bar with
+//!   trades when `|L - close| * 10 000 > close * D`, exact in `i128`; a
+//!   retirement counts as an eviction.
+//! - **Premise P** (#95): no cap or distance that evicts at least one active
+//!   level passes R2 on all four timeframes; printed `HOLDS` or `FAILS`
+//!   with the falsifying candidates ([`premise_p`]).
+//! - **S5, TTL** (recorded only): the smallest level age `A*` at which the
+//!   uncapped model's sweeps of older levels fit R2's bound, with `n` and
+//!   `p` of the kept sweeps ([`ttl_star`]). A TTL removes exactly the sweeps
+//!   of the levels that outlive it, so no TTL model is run.
+//! - **S5, growth** (recorded only): the uncapped active-list maximum per
+//!   UTC calendar month of the bar's open, per timeframe and side.
+//! - **S6, the live/replay skew** (recorded only): cold models of cap 20
+//!   and of `until_swept`, started at 00:00 UTC on the 1st of every month
+//!   after the window start. A cold model ignores the closed bars that open
+//!   before its start, and the empty bars before its first bar with trades,
+//!   as a fresh engine started there would. After every closed bar it
+//!   accepted, it is compared with the full-window model of its rule by
+//!   level identity (side, price, `swing_time`): `extra` and `missing`
+//!   count the active levels only the full or only the cold model holds,
+//!   `extra_swept` and `missing_swept` the same for pending and resolved
+//!   sweeps. Printed: their p50, maximum and end values, and the days until
+//!   all four stay 0. The record is VALID when `missing` is 0 under
+//!   `until_swept`.
 //!
-//! The rules are evaluated over the whole window; the test asserts R0 only
-//! and prints R1–R3 as PASS or FAIL, so a failing rule still prints
-//! everything. Run it with
+//! The rules are evaluated over the whole window; the test asserts R0 and
+//! the validity of S6 and prints R1–R3 as PASS or FAIL, so a failing rule
+//! still prints everything. Run it with
 //! `MIE_MEASURE_RAW_ROOT=<raw root> MIE_MEASURE_FROM=<YYYY-MM-DD>
 //! MIE_MEASURE_TO=<YYYY-MM-DD> cargo test --release -p mie-cli --test
 //! structure_measure -- --ignored --nocapture`; `MIE_MEASURE_TO` is
@@ -48,10 +80,15 @@
 //! the replay's event count (R0).
 //!
 //! `model_reproduces_the_engine_on_a_synthetic_tape` runs the same R0
-//! comparison in CI on a seeded tape, and asserts that every compared kind
-//! occurred, so R0 cannot pass vacuously.
+//! comparison in CI on a seeded tape, with a cold start, so every report
+//! section runs, and asserts that every compared kind occurred, so R0
+//! cannot pass vacuously. Further CI tests pin distance retirement at its
+//! boundary and at 10 000 bps, check a cold cap-20 model against a fresh
+//! engine and a cold `until_swept` model's subset property, and pin the
+//! `A*` and premise-P helpers.
 
 use mie_adapter_binance::archive::ArchiveStream;
+use mie_adapter_binance::archive::catalog::{Period, PeriodKind, day_label};
 use mie_adapter_binance::archive::replay::ArchiveReplay;
 use mie_adapter_parquet::ParquetRawStore;
 use mie_cli::replay::parse_bound;
@@ -80,8 +117,14 @@ const SWING_SIZES: [usize; 5] = [1, 2, 3, 4, 5];
 /// The SFP windows S3 compares.
 const WINDOWS: [u32; 5] = [1, 2, 3, 4, 6];
 
-/// The caps S5 compares.
-const CAPS: [usize; 3] = [10, 20, 40];
+/// The caps S5 compares: #80's 10, 20 and 40, doubled on to the first value
+/// above the year's largest uncapped list (148, 15m highs).
+const CAPS: [usize; 5] = [10, 20, 40, 80, 160];
+
+/// The distance thresholds S5 compares, in bps of the close: from below the
+/// 15m p10 of the distance at which cap 20 evicted, to 10 000, at which a
+/// low can never retire (ADR-037, "Recorded, not criteria").
+const DISTANCES: [i64; 5] = [500, 1_000, 2_000, 5_000, 10_000];
 
 /// The bars after a sweep S3 follows for the first close at or inside the
 /// level; later reclaims count as "> 10".
@@ -98,8 +141,13 @@ struct Params {
     swing_bars: usize,
     sfp_window_bars: u32,
     touch_tolerance_bps: i64,
-    /// `None`: an uncapped registry.
-    max_levels: Option<usize>,
+    /// The active lists' count cap; `None`: no cap.
+    max_active: Option<usize>,
+    /// The resolved list's cap; `None`: no cap.
+    max_resolved: Option<usize>,
+    /// The active lists' distance threshold in bps of the close; `None`: no
+    /// threshold. Model only, the engine has none.
+    max_distance_bps: Option<i64>,
 }
 
 impl Params {
@@ -108,8 +156,33 @@ impl Params {
         swing_bars: SWING_BARS,
         sfp_window_bars: SFP_WINDOW_BARS,
         touch_tolerance_bps: TOUCH_TOLERANCE_BPS,
-        max_levels: Some(MAX_LEVELS),
+        max_active: Some(MAX_LEVELS),
+        max_resolved: Some(MAX_LEVELS),
+        max_distance_bps: None,
     };
+
+    /// No list is capped: R2's reference.
+    const UNCAPPED: Self = Self {
+        max_active: None,
+        max_resolved: None,
+        ..Self::ENGINE
+    };
+
+    /// `until_swept` (#95 D1 and D3): an active level stays until a trade
+    /// sweeps it, the resolved list keeps the engine's cap.
+    const UNTIL_SWEPT: Self = Self {
+        max_active: None,
+        ..Self::ENGINE
+    };
+
+    /// The active-list rule, as the report names it.
+    fn rule(&self) -> String {
+        match (self.max_distance_bps, self.max_active) {
+            (Some(bps), _) => format!("distance {bps} bps"),
+            (None, Some(cap)) => format!("cap {cap}"),
+            (None, None) => "until_swept".to_owned(),
+        }
+    }
 }
 
 fn side_index(side: Side) -> usize {
@@ -257,6 +330,9 @@ struct Stats {
     /// Level life from `known_at` to the sweep, in bars, by half of
     /// `known_at`.
     life: [Vec<f64>; 2],
+    /// The life of every resolved sweep's level, in bars, and whether the
+    /// sweep resolved as an SFP (the TTL record).
+    resolved_life: Vec<(f64, bool)>,
     /// Touches at every tolerance of every level once it was swept,
     /// evicted, or active at the window end; by half of `known_at`.
     touched: [Vec<[u32; TOLERANCES.len()]>; 2],
@@ -270,10 +346,15 @@ struct Stats {
     position_k2: Vec<f64>,
     /// Active list size per side after every closed bar.
     active: [Vec<f64>; 2],
-    /// Active levels and resolved sweeps evicted by the cap.
+    /// The largest active list per side, per UTC calendar month of the
+    /// bar's open, in time order (the growth record).
+    monthly: Vec<(Period, [usize; 2])>,
+    /// Active levels evicted by the cap or retired by the distance
+    /// threshold, and resolved sweeps evicted by the cap.
     evicted: u64,
     evicted_resolved: u64,
-    /// Distance of evicted active levels from the last close, in bps.
+    /// Distance of evicted or retired active levels from the last close, in
+    /// bps.
     evicted_bps: Vec<f64>,
     /// Age of the oldest resolved sweep after every closed bar, in days.
     history_days: Vec<f64>,
@@ -302,11 +383,18 @@ struct TimeframeModel {
     resolved: Vec<ModelSweep>,
     follows: Vec<Follow>,
     last_close: Option<Price>,
+    /// The cold start; `None`: the replay start.
+    start: Option<EventTime>,
+    /// Whether the model takes closed bars: from the replay start, or for a
+    /// cold model from its first bar with trades opening at or after
+    /// `start`, as a fresh engine's first bar holds its first trade
+    /// (ADR-031, `partial_start`).
+    started: bool,
     stats: Stats,
 }
 
 impl TimeframeModel {
-    fn new(timeframe: Timeframe, params: Params) -> Self {
+    fn new(timeframe: Timeframe, params: Params, start: Option<EventTime>) -> Self {
         Self {
             timeframe,
             params,
@@ -317,8 +405,21 @@ impl TimeframeModel {
             resolved: Vec::new(),
             follows: Vec::new(),
             last_close: None,
+            start,
+            started: start.is_none(),
             stats: Stats::default(),
         }
+    }
+
+    /// Whether the model takes `bar`: a cold model ignores every closed bar
+    /// that opens before its start, and every empty bar before its first
+    /// bar with trades.
+    fn takes(&mut self, bar: &Bar) -> bool {
+        if !self.started {
+            let after = self.start.is_some_and(|start| bar.open_time >= start);
+            self.started = after && bar.ohlc.is_some();
+        }
+        self.started
     }
 
     fn half(time: EventTime, mid: i64) -> usize {
@@ -331,7 +432,8 @@ impl TimeframeModel {
 
     /// Takes one closed bar, closed by the event at `known_at`: the bar's
     /// sweeps, then resolutions, touches and swing confirmations
-    /// (decisions 2–8).
+    /// (decisions 2–8), then the distance retirements. A bar the model does
+    /// not take ([`takes`](Self::takes)) changes nothing.
     fn close(
         &mut self,
         bar: &Bar,
@@ -340,6 +442,9 @@ impl TimeframeModel {
         mid: i64,
         facts: &mut Vec<Fact>,
     ) -> Result<(), String> {
+        if !self.takes(bar) {
+            return Ok(());
+        }
         let half = Self::half(bar.open_time, mid);
         self.stats.bars[half] += 1;
         if let Some(ohlc) = &bar.ohlc {
@@ -370,8 +475,21 @@ impl TimeframeModel {
             }
         }
         self.confirm(bar, known_at, mid, facts);
+        // An empty bar has no close (ADR-031), so it retires nothing.
+        if let Some(ohlc) = &bar.ohlc {
+            self.retire_distant(ohlc.close, mid);
+        }
         self.stats.active[0].push(self.highs.len() as f64);
         self.stats.active[1].push(self.lows.len() as f64);
+        let month = Period::month_of(bar.open_time.as_millis().div_euclid(DAY_MS));
+        let sizes = [self.highs.len(), self.lows.len()];
+        match self.stats.monthly.last_mut() {
+            Some((last, max)) if *last == month => {
+                max[0] = max[0].max(sizes[0]);
+                max[1] = max[1].max(sizes[1]);
+            }
+            _ => self.stats.monthly.push((month, sizes)),
+        }
         if let Some(oldest) = self.resolved.iter().map(|sweep| sweep.time).min() {
             let age = bar.end().as_millis() - oldest.as_millis();
             self.stats.history_days.push(age as f64 / DAY_MS as f64);
@@ -515,7 +633,11 @@ impl TimeframeModel {
                 sweep.outcome = SweepOutcome::Break;
                 self.stats.breaks[half] += 1;
             }
-            if let Some(cap) = self.params.max_levels
+            let life = sweep.time.as_millis() - sweep.level.known_at.as_millis();
+            self.stats
+                .resolved_life
+                .push((life as f64 / self.timeframe.millis() as f64, reclaimed));
+            if let Some(cap) = self.params.max_resolved
                 && self.resolved.len() >= cap
                 && let Some(oldest) = oldest(&self.resolved, |s| (s.time, s.level.price))
             {
@@ -576,7 +698,7 @@ impl TimeframeModel {
     /// Decision 5: adds a level, evicting the oldest of its list (by
     /// `confirmed_bar_end`, then price) when the list is full.
     fn add(&mut self, level: ModelLevel, mid: i64) {
-        let cap = self.params.max_levels;
+        let cap = self.params.max_active;
         let list = match level.side {
             Side::High => &mut self.highs,
             Side::Low => &mut self.lows,
@@ -590,13 +712,43 @@ impl TimeframeModel {
         }
         list.push(level);
         if let Some(evicted) = evicted {
-            self.stats.evicted += 1;
-            if let Some(close) = self.last_close {
-                let close = close.units() as f64;
-                let distance = (evicted.price.units() as f64 - close).abs() * 10_000.0 / close;
-                self.stats.evicted_bps.push(distance);
-            }
-            self.retire(&evicted, mid);
+            self.evict(&evicted, mid);
+        }
+    }
+
+    /// Records an active level the cap evicted or the distance threshold
+    /// retired.
+    fn evict(&mut self, level: &ModelLevel, mid: i64) {
+        self.stats.evicted += 1;
+        if let Some(close) = self.last_close {
+            let close = close.units() as f64;
+            let distance = (level.price.units() as f64 - close).abs() * 10_000.0 / close;
+            self.stats.evicted_bps.push(distance);
+        }
+        self.retire(level, mid);
+    }
+
+    /// The distance rule: retires every active level `L` with
+    /// `|L - close| * 10 000 > close * D`, exact in `i128`. The denominator
+    /// is the close, so at `D` = 10 000 no low (`0 < L < close`) can retire.
+    fn retire_distant(&mut self, close: Price, mid: i64) {
+        let Some(bps) = self.params.max_distance_bps else {
+            return;
+        };
+        let close = i128::from(close.units());
+        let far = |level: &ModelLevel| {
+            (i128::from(level.price.units()) - close).abs() * 10_000 > close * i128::from(bps)
+        };
+        let mut retired = Vec::new();
+        for list in [&mut self.highs, &mut self.lows] {
+            let (gone, kept): (Vec<ModelLevel>, Vec<ModelLevel>) = std::mem::take(list)
+                .into_iter()
+                .partition(|level| far(level));
+            *list = kept;
+            retired.extend(gone);
+        }
+        for level in &retired {
+            self.evict(level, mid);
         }
     }
 
@@ -629,10 +781,172 @@ fn oldest<T, K: Ord>(list: &[T], key: impl Fn(&T) -> K) -> Option<usize> {
         .map(|(index, _)| index)
 }
 
-/// One parameter set over every structure timeframe.
+/// One parameter set over every structure timeframe, from the replay start
+/// or from a cold start.
 struct Model {
     params: Params,
+    /// The cold start; `None`: the replay start.
+    start: Option<EventTime>,
     timeframes: [TimeframeModel; 4],
+}
+
+impl Model {
+    fn new(params: Params, start: Option<EventTime>) -> Self {
+        Self {
+            params,
+            start,
+            timeframes: STRUCTURE_TIMEFRAMES
+                .map(|timeframe| TimeframeModel::new(timeframe, params, start)),
+        }
+    }
+}
+
+/// A level's identity in the skew record, per side: price and
+/// `swing_time`.
+type Key = (Price, EventTime);
+
+/// The active levels and the pending and resolved sweeps' levels of one
+/// side, each sorted.
+fn keys(model: &TimeframeModel, side: Side) -> (Vec<Key>, Vec<Key>) {
+    let list = match side {
+        Side::High => &model.highs,
+        Side::Low => &model.lows,
+    };
+    let mut active: Vec<Key> = list
+        .iter()
+        .map(|level| (level.price, level.swing_time))
+        .collect();
+    let mut swept: Vec<Key> = model
+        .pending
+        .iter()
+        .chain(&model.resolved)
+        .filter(|sweep| sweep.level.side == side)
+        .map(|sweep| (sweep.level.price, sweep.level.swing_time))
+        .collect();
+    active.sort_unstable();
+    swept.sort_unstable();
+    (active, swept)
+}
+
+/// By a sorted merge of two sorted key lists: how many keys only `full`
+/// holds, and how many only `cold` holds.
+fn differ(full: &[Key], cold: &[Key]) -> (u64, u64) {
+    let (mut i, mut j) = (0, 0);
+    let (mut only_full, mut only_cold) = (0, 0);
+    while i < full.len() && j < cold.len() {
+        match full[i].cmp(&cold[j]) {
+            std::cmp::Ordering::Less => {
+                only_full += 1;
+                i += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                only_cold += 1;
+                j += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    only_full += (full.len() - i) as u64;
+    only_cold += (cold.len() - j) as u64;
+    (only_full, only_cold)
+}
+
+/// The skew of one cold model against the full-window model of its rule,
+/// on one timeframe and side (S6).
+#[derive(Default)]
+struct SkewRecord {
+    /// `extra` and `extra_swept` after every compared bar.
+    extra: Vec<f64>,
+    extra_swept: Vec<f64>,
+    missing_max: u64,
+    missing_swept_max: u64,
+    /// `extra`, `missing`, `extra_swept`, `missing_swept` after the last
+    /// compared bar.
+    end: [u64; 4],
+    /// The end of the first closed bar from which all four counts stayed 0;
+    /// `None` while any is non-zero.
+    converged: Option<EventTime>,
+}
+
+impl SkewRecord {
+    fn push(&mut self, counts: [u64; 4], bar_end: EventTime) {
+        let [extra, missing, extra_swept, missing_swept] = counts;
+        self.extra.push(extra as f64);
+        self.extra_swept.push(extra_swept as f64);
+        self.missing_max = self.missing_max.max(missing);
+        self.missing_swept_max = self.missing_swept_max.max(missing_swept);
+        self.end = counts;
+        if counts.iter().any(|count| *count > 0) {
+            self.converged = None;
+        } else if self.converged.is_none() {
+            self.converged = Some(bar_end);
+        }
+    }
+}
+
+/// The skew record of one rule: its full-window model and its cold models.
+struct Skew {
+    params: Params,
+    /// The full-window model's slot in [`Run::models`].
+    full: usize,
+    /// Per cold start, the cold model's slot.
+    cold: Vec<usize>,
+    /// `[cold start][timeframe][side]`.
+    records: Vec<[[SkewRecord; 2]; 4]>,
+}
+
+impl Skew {
+    /// Compares every cold model that took `bar` with the full model, on
+    /// the bar's timeframe `index`.
+    fn compare(&mut self, index: usize, bar: &Bar, models: &[Model]) {
+        if !self
+            .cold
+            .iter()
+            .any(|slot| models[*slot].timeframes[index].started)
+        {
+            return;
+        }
+        let full = &models[self.full].timeframes[index];
+        let theirs = SIDES.map(|side| keys(full, side));
+        for (records, slot) in self.records.iter_mut().zip(&self.cold) {
+            let cold = &models[*slot].timeframes[index];
+            if !cold.started {
+                continue;
+            }
+            for (side, record) in SIDES.into_iter().zip(&mut records[index]) {
+                let (active, swept) = keys(cold, side);
+                let (full_active, full_swept) = &theirs[side_index(side)];
+                let (extra, missing) = differ(full_active, &active);
+                let (extra_swept, missing_swept) = differ(full_swept, &swept);
+                record.push([extra, missing, extra_swept, missing_swept], bar.end());
+            }
+        }
+    }
+
+    /// The sum over every start, timeframe and side of the largest
+    /// `missing`.
+    fn missing(&self) -> u64 {
+        self.records
+            .iter()
+            .flatten()
+            .flatten()
+            .map(|record| record.missing_max)
+            .sum()
+    }
+}
+
+/// A fresh engine started at a cold start, compared with the cold
+/// engine-parameter model under R0's comparison (CI only).
+struct Fresh {
+    start: EventTime,
+    /// The cold engine-parameter model's slot in [`Run::models`].
+    slot: usize,
+    engine: MarketStateEngine,
+    check: Check,
+    rejections: u64,
 }
 
 /// The R0 comparison of the engine-parameter model with the engine.
@@ -830,55 +1144,115 @@ struct Run {
     mid: i64,
     engine: MarketStateEngine,
     paths: [Path; 4],
-    /// `models[0]` has the engine's parameters.
+    /// `models[0]` has the engine's parameters; the full-window models come
+    /// first, then the cold ones.
     models: Vec<Model>,
+    /// The cold starts of the skew record, ascending.
+    starts: Vec<EventTime>,
+    /// The skew record of cap 20 (the engine's rule), then `until_swept`.
+    skews: Vec<Skew>,
+    /// A fresh engine checked against a cold model (CI only).
+    fresh: Option<Fresh>,
     check: Check,
     events: u64,
     rejections: u64,
 }
 
 impl Run {
-    fn new(mid: i64) -> Self {
+    /// Every model of the report, and for every start of `cold_starts` a
+    /// cold model of cap 20 and one of `until_swept`.
+    fn new(mid: i64, cold_starts: &[EventTime]) -> Self {
         let mut params = vec![Params::ENGINE];
         for swing_bars in SWING_SIZES {
             params.push(Params {
                 swing_bars,
-                max_levels: None,
-                ..Params::ENGINE
+                ..Params::UNCAPPED
             });
         }
-        for cap in CAPS {
-            let capped = Params {
-                max_levels: Some(cap),
+        let alternatives = CAPS
+            .map(|cap| Params {
+                max_active: Some(cap),
                 ..Params::ENGINE
-            };
-            if !params.contains(&capped) {
-                params.push(capped);
+            })
+            .into_iter()
+            .chain(DISTANCES.map(|bps| Params {
+                max_distance_bps: Some(bps),
+                ..Params::UNTIL_SWEPT
+            }))
+            .chain([Params::UNTIL_SWEPT]);
+        for alternative in alternatives {
+            if !params.contains(&alternative) {
+                params.push(alternative);
             }
+        }
+        let mut models: Vec<Model> = params
+            .into_iter()
+            .map(|params| Model::new(params, None))
+            .collect();
+        let mut skews = Vec::new();
+        for rule in [Params::ENGINE, Params::UNTIL_SWEPT] {
+            let full = models
+                .iter()
+                .position(|model| model.params == rule)
+                .expect("a full-window model of the rule");
+            let mut cold = Vec::new();
+            for start in cold_starts {
+                cold.push(models.len());
+                models.push(Model::new(rule, Some(*start)));
+            }
+            skews.push(Skew {
+                params: rule,
+                full,
+                records: cold.iter().map(|_| Default::default()).collect(),
+                cold,
+            });
         }
         Self {
             mid,
             engine: MarketStateEngine::new(),
             paths: Default::default(),
-            models: params
-                .into_iter()
-                .map(|params| Model {
-                    params,
-                    timeframes: STRUCTURE_TIMEFRAMES
-                        .map(|timeframe| TimeframeModel::new(timeframe, params)),
-                })
-                .collect(),
+            models,
+            starts: cold_starts.to_vec(),
+            skews,
+            fresh: None,
             check: Check::default(),
             events: 0,
             rejections: 0,
         }
     }
 
+    /// Adds a fresh engine that takes the events from `start` on, checked
+    /// against the cold engine-parameter model at `start`.
+    fn with_fresh(mut self, start: EventTime) -> Self {
+        let slot = self
+            .models
+            .iter()
+            .position(|model| model.params == Params::ENGINE && model.start == Some(start))
+            .expect("a cold engine-parameter model at the start");
+        self.fresh = Some(Fresh {
+            start,
+            slot,
+            engine: MarketStateEngine::new(),
+            check: Check::default(),
+            rejections: 0,
+        });
+        self
+    }
+
+    /// The full-window model of `params`.
     fn model(&self, params: Params) -> &Model {
         self.models
             .iter()
-            .find(|model| model.params == params)
+            .find(|model| model.params == params && model.start.is_none())
             .expect("a model of these parameters")
+    }
+
+    /// The cold model of `params` started at `start`.
+    fn cold(&self, params: Params, start: EventTime) -> &Model {
+        self.models
+            .iter()
+            .find(|model| model.params == params && model.start == Some(start))
+            .expect("a cold model of these parameters")
     }
 
     fn step(&mut self, event: &MarketEvent) {
@@ -889,6 +1263,8 @@ impl Run {
         }
         let known_at = event.time();
         let mut facts = Vec::new();
+        let mut fresh_facts = Vec::new();
+        let fresh_slot = self.fresh.as_ref().map(|fresh| fresh.slot);
         let mut closed = [false; 4];
         let mut scratch = Vec::new();
         for bar in self.engine.closed_bars() {
@@ -911,11 +1287,42 @@ impl Run {
                 if slot == 0 {
                     facts.extend(scratch.iter().map(|fact| (index, *fact)));
                 }
+                if Some(slot) == fresh_slot {
+                    fresh_facts.extend(scratch.iter().map(|fact| (index, *fact)));
+                }
+            }
+            for skew in &mut self.skews {
+                skew.compare(index, bar, &self.models);
             }
         }
         if closed.contains(&true) || !self.engine.structure_events().is_empty() {
             self.check
                 .compare(&self.engine, known_at, &facts, closed, &self.models[0]);
+        }
+        if let Some(fresh) = &mut self.fresh
+            && known_at >= fresh.start
+        {
+            if fresh.engine.apply(event).is_err() {
+                fresh.rejections += 1;
+            } else {
+                // The closed flags are the fresh engine's, the facts the
+                // cold model's.
+                let mut closed = [false; 4];
+                for bar in fresh.engine.closed_bars() {
+                    if let Some(index) = timeframe_index(bar.timeframe) {
+                        closed[index] = true;
+                    }
+                }
+                if closed.contains(&true) || !fresh.engine.structure_events().is_empty() {
+                    fresh.check.compare(
+                        &fresh.engine,
+                        known_at,
+                        &fresh_facts,
+                        closed,
+                        &self.models[fresh.slot],
+                    );
+                }
+            }
         }
         if let MarketEvent::Trade(trade) = event {
             for (path, timeframe) in self.paths.iter_mut().zip(STRUCTURE_TIMEFRAMES) {
@@ -1012,10 +1419,7 @@ fn report(run: &Run, from: i64, to: i64, wall: Duration) {
     let days = (to - from) as f64 / DAY_MS as f64;
     let half_days = |half: Option<usize>| if half.is_some() { days / 2.0 } else { days };
     let base = run.model(Params::ENGINE);
-    let uncapped = run.model(Params {
-        max_levels: None,
-        ..Params::ENGINE
-    });
+    let uncapped = run.model(Params::UNCAPPED);
     let check = &run.check;
     println!(
         "window {} .. {} ({days:.0} days), halves split at {}",
@@ -1108,8 +1512,7 @@ fn report(run: &Run, from: i64, to: i64, wall: Duration) {
             let stats = &run
                 .model(Params {
                     swing_bars: n,
-                    max_levels: None,
-                    ..Params::ENGINE
+                    ..Params::UNCAPPED
                 })
                 .timeframes[index]
                 .stats;
@@ -1148,8 +1551,7 @@ fn report(run: &Run, from: i64, to: i64, wall: Duration) {
             let stats = &run
                 .model(Params {
                     swing_bars: n,
-                    max_levels: None,
-                    ..Params::ENGINE
+                    ..Params::UNCAPPED
                 })
                 .timeframes[index]
                 .stats;
@@ -1257,7 +1659,7 @@ fn report(run: &Run, from: i64, to: i64, wall: Duration) {
             .map(|cap| {
                 let capped = &run
                     .model(Params {
-                        max_levels: Some(*cap),
+                        max_active: Some(*cap),
                         ..Params::ENGINE
                     })
                     .timeframes[index]
@@ -1278,6 +1680,270 @@ fn report(run: &Run, from: i64, to: i64, wall: Duration) {
             quantiles(&stats.history_days, &[0.1, 0.5], 2)
         );
     }
+    report_alternatives(run);
+    report_skew(run);
+}
+
+/// R2 for `n` resolved sweeps, `sfp` of them SFPs, and `lost` sweeps:
+/// `(p, lost share, sqrt(p (1 - p) / n), PASS)`.
+fn r2(n: u64, sfp: u64, lost: u64) -> (f64, f64, f64, bool) {
+    let p = if n == 0 {
+        f64::NAN
+    } else {
+        sfp as f64 / n as f64
+    };
+    let bound = (p * (1.0 - p) / n as f64).sqrt();
+    let share = lost as f64 / (n + lost) as f64;
+    (p, share, bound, share <= bound)
+}
+
+/// One fixed-grid candidate of premise P: a cap or a distance.
+#[derive(Clone)]
+struct Candidate {
+    rule: String,
+    /// Active evictions summed over the four timeframes.
+    evictions: u64,
+    /// The R2 verdict per timeframe.
+    passes: [bool; 4],
+}
+
+/// Premise P (#95): no candidate that evicts at least one active level
+/// passes R2 on all four timeframes. Returns the candidates that falsify
+/// it; empty when P holds.
+fn premise_p(candidates: &[Candidate]) -> Vec<&str> {
+    candidates
+        .iter()
+        .filter(|candidate| candidate.evictions >= 1 && candidate.passes.iter().all(|pass| *pass))
+        .map(|candidate| candidate.rule.as_str())
+        .collect()
+}
+
+/// The TTL record at the smallest passing age.
+#[derive(Debug, PartialEq)]
+struct Ttl {
+    /// `A*`, in bars.
+    age: f64,
+    /// Sweeps of levels that lived longer than `A*`.
+    lost: u64,
+    /// Resolved sweeps of levels that lived at most `A*`, and their SFPs.
+    n: u64,
+    sfp: u64,
+}
+
+/// The smallest level age `A*` at which a TTL would pass R2. `lives` are
+/// the level lives of every sweep, `resolved` those of the resolved sweeps
+/// with their SFP flag. At an age `A`, `lost` counts the sweeps with life
+/// `> A` (a TTL of `A` retires exactly those levels before their sweep);
+/// `n` and `p` come from the resolved sweeps with life `<= A`. R2 is not
+/// monotone in `A`, so every distinct life is scanned in ascending order
+/// and the first passing one is returned; `None` if none passes.
+fn ttl_star(lives: &[f64], resolved: &[(f64, bool)]) -> Option<Ttl> {
+    let mut lives = lives.to_vec();
+    lives.sort_by(f64::total_cmp);
+    let mut resolved = resolved.to_vec();
+    resolved.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let (mut kept, mut n, mut sfp) = (0, 0, 0);
+    let mut ages = lives.clone();
+    ages.dedup();
+    for age in ages {
+        while kept < lives.len() && lives[kept] <= age {
+            kept += 1;
+        }
+        while n < resolved.len() && resolved[n].0 <= age {
+            sfp += u64::from(resolved[n].1);
+            n += 1;
+        }
+        let lost = (lives.len() - kept) as u64;
+        if r2(n as u64, sfp, lost).3 {
+            return Some(Ttl {
+                age,
+                lost,
+                n: n as u64,
+                sfp,
+            });
+        }
+    }
+    None
+}
+
+/// S5's alternatives, premise P, the TTL record and the growth record.
+fn report_alternatives(run: &Run) {
+    let uncapped = run.model(Params::UNCAPPED);
+    let rules: Vec<Params> = CAPS
+        .map(|cap| Params {
+            max_active: Some(cap),
+            ..Params::ENGINE
+        })
+        .into_iter()
+        .chain(DISTANCES.map(|bps| Params {
+            max_distance_bps: Some(bps),
+            ..Params::UNTIL_SWEPT
+        }))
+        .chain([Params::UNTIL_SWEPT])
+        .collect();
+    println!(
+        "S5: alternatives, active-list rule with max_resolved {MAX_LEVELS} (R2 per rule, not a gate)"
+    );
+    let mut candidates = Vec::new();
+    for rule in rules {
+        let model = run.model(rule);
+        let mut evictions = 0;
+        let mut passes = [false; 4];
+        for (index, timeframe) in STRUCTURE_TIMEFRAMES.iter().enumerate() {
+            let stats = &model.timeframes[index].stats;
+            let (sfp, breaks) = stats.resolved();
+            let n = sfp + breaks;
+            let lost = uncapped.timeframes[index].stats.sweeps() - stats.sweeps();
+            let (p, share, bound, pass) = r2(n, sfp, lost);
+            evictions += stats.evicted;
+            passes[index] = pass;
+            println!(
+                "  {} {timeframe}: active evictions {}, lost {lost}; R2 n {n}, p {p:.4}, lost share \
+                 {share:.4}, sqrt(p(1-p)/n) {bound:.4} -> alternative {}; active highs p99/max {}, \
+                 lows {}",
+                rule.rule(),
+                stats.evicted,
+                verdict(pass),
+                quantiles(&stats.active[0], &[0.99, 1.0], 0),
+                quantiles(&stats.active[1], &[0.99, 1.0], 0)
+            );
+        }
+        if rule != Params::UNTIL_SWEPT {
+            candidates.push(Candidate {
+                rule: rule.rule(),
+                evictions,
+                passes,
+            });
+        }
+    }
+    let falsifying = premise_p(&candidates);
+    if falsifying.is_empty() {
+        println!("premise P: HOLDS");
+    } else {
+        println!("premise P: FAILS ({})", falsifying.join(", "));
+    }
+
+    println!("S5: TTL, the smallest age A* at which R2 passes (uncapped)");
+    for (index, timeframe) in STRUCTURE_TIMEFRAMES.iter().enumerate() {
+        let stats = &uncapped.timeframes[index].stats;
+        match ttl_star(&joined(&stats.life, None), &stats.resolved_life) {
+            Some(ttl) => {
+                let days = ttl.age * timeframe.millis() as f64 / DAY_MS as f64;
+                let (p, share, bound, _) = r2(ttl.n, ttl.sfp, ttl.lost);
+                println!(
+                    "  {timeframe}: A* {:.2} bars ({days:.2} days); lost {}, n {}, p {p:.4}, \
+                     lost share {share:.4}, sqrt(p(1-p)/n) {bound:.4}",
+                    ttl.age, ttl.lost, ttl.n
+                );
+            }
+            None => println!("  {timeframe}: no age passes R2"),
+        }
+    }
+
+    println!("S5: growth, the uncapped active-list maximum per UTC month of the bar's open");
+    for (index, timeframe) in STRUCTURE_TIMEFRAMES.iter().enumerate() {
+        let stats = &uncapped.timeframes[index].stats;
+        for (side, name) in [(0, "highs"), (1, "lows")] {
+            let cells: Vec<String> = stats
+                .monthly
+                .iter()
+                .map(|(month, max)| format!("{month} {}", max[side]))
+                .collect();
+            println!("  {timeframe} {name}: {}", cells.join(", "));
+        }
+    }
+}
+
+/// Days from `start` to the convergence of a record; `None`: not
+/// converged, or no bar compared.
+fn converged_days(record: &SkewRecord, start: EventTime) -> Option<f64> {
+    record
+        .converged
+        .map(|end| (end.as_millis() - start.as_millis()) as f64 / DAY_MS as f64)
+}
+
+fn days_label(days: Option<f64>) -> String {
+    days.map_or_else(|| "not converged".to_owned(), |days| format!("{days:.2}"))
+}
+
+/// The sum over every start, timeframe and side of the largest `missing`
+/// under `until_swept`: the skew record is valid when it is 0.
+fn until_swept_missing(run: &Run) -> u64 {
+    run.skews
+        .iter()
+        .filter(|skew| skew.params == Params::UNTIL_SWEPT)
+        .map(Skew::missing)
+        .sum()
+}
+
+/// S6: the skew of the cold models against the full-window models.
+fn report_skew(run: &Run) {
+    if run.starts.is_empty() {
+        return;
+    }
+    println!(
+        "S6: live/replay skew, cold models against the full-window model of their rule, \
+         after every closed bar from the start"
+    );
+    for skew in &run.skews {
+        let rule = skew.params.rule();
+        for (index, timeframe) in STRUCTURE_TIMEFRAMES.iter().enumerate() {
+            for (side, name) in [(0, "highs"), (1, "lows")] {
+                for (records, start) in skew.records.iter().zip(&run.starts) {
+                    let record = &records[index][side];
+                    let label = day_label(start.as_millis().div_euclid(DAY_MS));
+                    if record.extra.is_empty() {
+                        println!("  {rule} {timeframe} {name} from {label}: no bar compared");
+                        continue;
+                    }
+                    let [extra, missing, extra_swept, missing_swept] = record.end;
+                    let convergence = match converged_days(record, *start) {
+                        Some(days) => format!("converged after {days:.2} days"),
+                        None => "not converged".to_owned(),
+                    };
+                    println!(
+                        "  {rule} {timeframe} {name} from {label}: extra p50/max {}, extra_swept \
+                         p50/max {}; at the end extra {extra}, missing {missing}, extra_swept \
+                         {extra_swept}, missing_swept {missing_swept}; missing max {}, \
+                         missing_swept max {}; {convergence}",
+                        quantiles(&record.extra, &[0.5, 1.0], 0),
+                        quantiles(&record.extra_swept, &[0.5, 1.0], 0),
+                        record.missing_max,
+                        record.missing_swept_max
+                    );
+                }
+            }
+            // Per start the later side; a start that never converges ranks
+            // after every one that does.
+            let mut per_start: Vec<Option<f64>> = skew
+                .records
+                .iter()
+                .zip(&run.starts)
+                .map(|(records, start)| {
+                    let [highs, lows] = &records[index];
+                    Some(converged_days(highs, *start)?.max(converged_days(lows, *start)?))
+                })
+                .collect();
+            per_start.sort_by(|a, b| match (a, b) {
+                (Some(a), Some(b)) => a.total_cmp(b),
+                (a, b) => a.is_none().cmp(&b.is_none()),
+            });
+            let never = per_start.iter().filter(|days| days.is_none()).count();
+            let median = per_start[((per_start.len() - 1) as f64 * 0.5).round() as usize];
+            println!(
+                "  {rule} {timeframe} over {} starts: convergence days median {}, max {}; \
+                 never converged {never}",
+                per_start.len(),
+                days_label(median),
+                days_label(*per_start.last().expect("a start"))
+            );
+        }
+    }
+    let missing = until_swept_missing(run);
+    println!(
+        "S6: missing under until_swept {missing} -> {}",
+        if missing == 0 { "VALID" } else { "VOID" }
+    );
 }
 
 #[test]
@@ -1296,8 +1962,16 @@ fn measure_structure() {
     let store = ParquetRawStore::new(&raw_root);
     let replay = ArchiveReplay::new(&store, "BTCUSDT", &[ArchiveStream::AggTrades]);
     let mut stream = replay.replay(window).unwrap().stream;
+    // S6: 00:00 UTC on the 1st of every month strictly inside the window.
+    let cold_starts: Vec<EventTime> = PeriodKind::Monthly
+        .periods(from.div_euclid(DAY_MS), (to - 1).div_euclid(DAY_MS))
+        .into_iter()
+        .map(Period::start_ms)
+        .filter(|start| *start > from && *start < to)
+        .map(EventTime::from_millis)
+        .collect();
     let started = Instant::now();
-    let mut run = Run::new(from + (to - from) / 2);
+    let mut run = Run::new(from + (to - from) / 2, &cold_starts);
     while let Some(event) = stream.next_event().unwrap() {
         run.step(&event);
     }
@@ -1311,6 +1985,11 @@ fn measure_structure() {
     assert_eq!(
         run.check.mismatches, 0,
         "the model disagrees with the engine"
+    );
+    assert_eq!(
+        until_swept_missing(&run),
+        0,
+        "a cold until_swept model holds a level the full one lacks"
     );
 }
 
@@ -1400,9 +2079,21 @@ fn synthetic_tape() -> Vec<MarketEvent> {
     events
 }
 
+/// The tape's cold start, `TAPE_START` + 20 days: 00:00 UTC, a bar
+/// boundary of every structure timeframe; after the day 10–17 uptrend, so
+/// the full model holds unswept lows from before it that a cold model
+/// lacks; before the day 22–27 downtrend, which piles highs past cap 20,
+/// so the cold cap model evicts; and 20 days before the tape's end, more
+/// than the 1d warm-up of `2N + 1` bars, so a fresh engine's 1d registry
+/// becomes `Ready` and is compared.
+const COLD_START: i64 = TAPE_START + 20 * DAY_MS;
+
 #[test]
 fn model_reproduces_the_engine_on_a_synthetic_tape() {
-    let mut run = Run::new(TAPE_START + 20 * DAY_MS);
+    let mut run = Run::new(
+        TAPE_START + 20 * DAY_MS,
+        &[EventTime::from_millis(COLD_START)],
+    );
     for event in synthetic_tape() {
         run.step(&event);
     }
@@ -1438,4 +2129,229 @@ fn model_reproduces_the_engine_on_a_synthetic_tape() {
     for (kind, count) in kinds {
         assert!(count > 0, "the tape compared no {kind}");
     }
+}
+
+/// A 15m bar opening at `open` with a trade, its prices in USDT.
+fn usdt_bar(open: i64, high: i64, low: i64, close: i64) -> Bar {
+    let usdt = |price: i64| Price::from_units(price * SCALE);
+    Bar {
+        ohlc: Some(Ohlc {
+            open: usdt(close),
+            high: usdt(high),
+            low: usdt(low),
+            close: usdt(close),
+        }),
+        trade_count: 1,
+        ..Bar::empty(Timeframe::M15, EventTime::from_millis(open))
+    }
+}
+
+/// An active level confirmed at the tape start.
+fn tape_level(side: Side, price: Price) -> ModelLevel {
+    let start = EventTime::from_millis(TAPE_START);
+    ModelLevel {
+        side,
+        price,
+        swing_time: start,
+        confirmed_bar_end: start,
+        known_at: start,
+        touches: 0,
+        touches_at: [0; TOLERANCES.len()],
+    }
+}
+
+/// A full-window 15m model of `until_swept` with the distance threshold
+/// `bps`.
+fn distance_model(bps: i64) -> TimeframeModel {
+    let params = Params {
+        max_distance_bps: Some(bps),
+        ..Params::UNTIL_SWEPT
+    };
+    TimeframeModel::new(Timeframe::M15, params, None)
+}
+
+/// At `D` = 10 000 a low retires when `(close - L) * 10 000 > close *
+/// 10 000`, which no `L > 0` meets: the smallest positive price stays. A
+/// high at three times the close is `2 * close` away and retires, which a
+/// denominator of `|L|` (`2/3` of `L`) would not do.
+#[test]
+fn distance_10000_never_retires_a_low() {
+    let mut model = distance_model(10_000);
+    model.lows.push(tape_level(Side::Low, Price::from_units(1)));
+    model
+        .highs
+        .push(tape_level(Side::High, Price::from_units(300_000 * SCALE)));
+    let bar = usdt_bar(TAPE_START, 100_000, 100_000, 100_000);
+    model
+        .close(
+            &bar,
+            bar.end(),
+            &Path::default(),
+            TAPE_START,
+            &mut Vec::new(),
+        )
+        .unwrap();
+    assert_eq!(model.lows.len(), 1, "the low retired");
+    assert!(model.highs.is_empty(), "the high at 3x the close stayed");
+    assert_eq!(model.stats.evicted, 1);
+}
+
+/// A high at 101 000 and a low at 99 000 are both exactly 100 bps of a
+/// 100 000 close away (`1 000 * 10 000 = 100 000 * 100`). The bar sweeps
+/// neither. At `D` = 100 the test is not strictly beyond, so none retires;
+/// at `D` = 99, below both, both retire at this close, each an eviction
+/// recorded at its 100 bps.
+#[test]
+fn distance_retires_strictly_beyond_the_threshold() {
+    for (bps, retired) in [(100, 0), (99, 2)] {
+        let mut model = distance_model(bps);
+        model
+            .highs
+            .push(tape_level(Side::High, Price::from_units(101_000 * SCALE)));
+        model
+            .lows
+            .push(tape_level(Side::Low, Price::from_units(99_000 * SCALE)));
+        let bar = usdt_bar(TAPE_START, 100_500, 99_500, 100_000);
+        let mut facts = Vec::new();
+        model
+            .close(&bar, bar.end(), &Path::default(), TAPE_START, &mut facts)
+            .unwrap();
+        assert!(facts.is_empty(), "D = {bps}: the bar swept a level");
+        assert_eq!(model.stats.evicted, retired, "D = {bps}");
+        assert_eq!(
+            model.highs.len() + model.lows.len(),
+            2 - retired as usize,
+            "D = {bps}"
+        );
+        assert_eq!(model.stats.evicted_bps.len(), retired as usize);
+        for distance in &model.stats.evicted_bps {
+            assert!((distance - 100.0).abs() < 1e-9, "D = {bps}: {distance}");
+        }
+        let recorded: usize = model.stats.touched.iter().map(Vec::len).sum();
+        assert_eq!(recorded, retired as usize, "D = {bps}: touches recorded");
+    }
+}
+
+#[test]
+fn cold_model_matches_a_fresh_engine() {
+    let start = EventTime::from_millis(COLD_START);
+    let mut run = Run::new(COLD_START, &[start]).with_fresh(start);
+    for event in synthetic_tape() {
+        run.step(&event);
+    }
+    let fresh = run.fresh.as_ref().expect("a fresh engine");
+    assert_eq!(run.rejections, 0, "the engine rejected the tape");
+    assert_eq!(fresh.rejections, 0, "the fresh engine rejected the tape");
+    let check = &fresh.check;
+    assert_eq!(check.mismatches, 0, "{:#?}", check.notes);
+    // Every compared kind occurred, so the check did not pass vacuously.
+    let evicted: u64 = run
+        .cold(Params::ENGINE, start)
+        .timeframes
+        .iter()
+        .map(|tf| tf.stats.evicted)
+        .sum();
+    let kinds = [
+        ("swings", check.swings),
+        ("sweeps of highs", check.sweeps[0]),
+        ("sweeps of lows", check.sweeps[1]),
+        ("SFPs", check.sfps),
+        ("breaks", check.breaks),
+        ("registries", check.registries),
+        ("evicted active levels", evicted),
+    ];
+    for (kind, count) in kinds {
+        assert!(count > 0, "the cold check compared no {kind}");
+    }
+}
+
+#[test]
+fn cold_until_swept_model_is_a_subset() {
+    let start = EventTime::from_millis(COLD_START);
+    let mut run = Run::new(COLD_START, &[start]);
+    let mut lacking = 0;
+    for event in synthetic_tape() {
+        run.step(&event);
+        for bar in run.engine.closed_bars() {
+            let Some(index) = timeframe_index(bar.timeframe) else {
+                continue;
+            };
+            let full = &run.model(Params::UNTIL_SWEPT).timeframes[index];
+            let cold = &run.cold(Params::UNTIL_SWEPT, start).timeframes[index];
+            if !cold.started {
+                continue;
+            }
+            for (theirs, ours) in [(&full.highs, &cold.highs), (&full.lows, &cold.lows)] {
+                for level in ours {
+                    let same = theirs.iter().find(|other| {
+                        other.price == level.price && other.swing_time == level.swing_time
+                    });
+                    assert!(
+                        same.is_some_and(|other| other.touches == level.touches),
+                        "{} {}: cold level {level:?} not in the full model",
+                        bar.timeframe,
+                        bar.open_time
+                    );
+                }
+                if theirs.len() > ours.len() {
+                    lacking += 1;
+                }
+            }
+        }
+    }
+    assert!(
+        lacking > 0,
+        "the full model never held a level the cold one lacked"
+    );
+    // The per-bar S6 record agrees.
+    assert_eq!(until_swept_missing(&run), 0);
+}
+
+/// Sweep lives 1, 2, 3, 4 and 10 bars; the first four resolved as SFP,
+/// break, SFP, break, the last still pending. At age `A`, `lost` counts the
+/// lives `> A`, `n` and `p` the resolved lives `<= A`:
+/// - `A` = 1: lost 4, n 1, p 1, bound 0, share 4/5: FAIL;
+/// - `A` = 2: lost 3, n 2, p 0.5, bound 0.354, share 0.6: FAIL;
+/// - `A` = 3: lost 2, n 3, p 2/3, bound 0.272, share 0.4: FAIL;
+/// - `A` = 4: lost 1, n 4, p 0.5, bound 0.25, share 0.2: PASS, so `A*` = 4
+///   (`A` = 10 passes too, with nothing lost, but is not the smallest).
+///
+/// The inputs are unsorted, so the scan cannot rely on their order.
+/// Without a resolved sweep `p` is undefined and no age passes.
+#[test]
+fn ttl_star_is_the_smallest_passing_age() {
+    let lives = [10.0, 3.0, 1.0, 4.0, 2.0];
+    let resolved = [(4.0, false), (1.0, true), (3.0, true), (2.0, false)];
+    assert_eq!(
+        ttl_star(&lives, &resolved),
+        Some(Ttl {
+            age: 4.0,
+            lost: 1,
+            n: 4,
+            sfp: 2,
+        })
+    );
+    assert_eq!(ttl_star(&[1.0], &[]), None);
+}
+
+/// A candidate falsifies P only when it evicts at least one active level
+/// and passes R2 on all four timeframes: one that evicts nothing passes R2
+/// trivially (it is the uncapped registry) and is ignored, one that fails
+/// R2 on a timeframe does not count.
+#[test]
+fn premise_p_ignores_candidates_that_retire_nothing() {
+    let candidate = |rule: &str, evictions, passes| Candidate {
+        rule: rule.to_owned(),
+        evictions,
+        passes,
+    };
+    let holds = [
+        candidate("distance 10000 bps", 0, [true; 4]),
+        candidate("cap 20", 120, [false, false, true, true]),
+        candidate("cap 160", 1, [true, true, true, false]),
+    ];
+    assert!(premise_p(&holds).is_empty());
+    let mut fails = holds.to_vec();
+    fails.push(candidate("cap 80", 1, [true; 4]));
+    assert_eq!(premise_p(&fails), ["cap 80"]);
 }
