@@ -334,8 +334,10 @@ struct Registry {
     other: FeatureKey,
     composite: fn(&VolumeProfiles) -> &FeatureValue<VolumeProfile>,
     rejections: u64,
-    /// Per kind, then all kinds: the size at each rebuild.
+    /// Per kind, then all kinds: the size at each closed minute where it
+    /// was rebuilt (the unit ADR-044 M3 recorded `@1` in).
     sizes: Vec<Vec<f64>>,
+    minutes: u64,
     /// Entered: arrived, created. Left: departed, retired.
     entered: [u64; 2],
     left: [u64; 2],
@@ -362,6 +364,7 @@ impl Registry {
             sizes: vec![Vec::new(); KINDS.len() + 1],
             entered: [0; 2],
             left: [0; 2],
+            minutes: 0,
             rebuilds: 0,
             sourcing: 0,
         }
@@ -373,14 +376,19 @@ impl Registry {
         if let FeatureValue::Ready(set) = &state.location.levels
             && set.known_at == known_at
         {
-            let mut counts = [0_u32; KINDS.len()];
-            for level in set.levels() {
-                counts[KINDS.iter().position(|kind| *kind == level.kind).unwrap()] += 1;
+            // M3 samples once per closed minute, as ADR-044 M3 did; rule S
+            // checks every rebuild.
+            if !self.engine.closed_bars().is_empty() {
+                let mut counts = [0_u32; KINDS.len()];
+                for level in set.levels() {
+                    counts[KINDS.iter().position(|kind| *kind == level.kind).unwrap()] += 1;
+                }
+                for (slot, count) in counts.iter().enumerate() {
+                    self.sizes[slot].push(f64::from(*count));
+                }
+                self.sizes[KINDS.len()].push(set.levels().len() as f64);
+                self.minutes += 1;
             }
-            for (slot, count) in counts.iter().enumerate() {
-                self.sizes[slot].push(f64::from(*count));
-            }
-            self.sizes[KINDS.len()].push(set.levels().len() as f64);
             self.rebuilds += 1;
             let from = |source: FeatureKey| {
                 set.levels()
@@ -414,8 +422,8 @@ impl Registry {
     /// The M3 lines.
     fn print(&mut self, days: f64) {
         println!(
-            "M3: {} registry size per kind over {} rebuilds (p50 / p99)",
-            self.label, self.rebuilds
+            "M3: {} registry size per kind over {} closed minutes (p50 / p99)",
+            self.label, self.minutes
         );
         let mut columns = Vec::new();
         for (slot, values) in self.sizes.iter_mut().enumerate() {
