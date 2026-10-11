@@ -33,20 +33,36 @@
 //! 6. **Order book** (ADR-038): no journaled checkpoint is `mismatched` or
 //!    `invalidated`, and every run whose `depth` records span more than
 //!    twice its checkpoint interval has at least one `matched` checkpoint.
+//! 7. **Kline reconciliation** (ADR-048, detector C3 in [`crate::reconcile`]):
+//!    within each run, closed `kline_1m` minutes and `aggTrade` records are
+//!    linked in trade-id space (`k.f..k.L` against `f..l`) into blocks of
+//!    minutes that share an aggregate. A conclusive block fails when its
+//!    kline volume differs from its aggregate quantity at all: a trade lost
+//!    inside an aggregate keeps the aggregate id consecutive, so check 1
+//!    cannot see it. A block is inconclusive, and not checked, when its
+//!    minutes are not consecutive, it reaches outside the run's aggregate
+//!    time span, it overlaps a journaled `Trades` or `Klines` gap of any
+//!    reason, or it holds an aggregate that lies in no closed minute.
+//!    Skipped unless both `aggTrade` and `kline_1m` are configured.
 //!
 //! It prints per-stream rows (raw records, then delivery: events, gaps by
 //! reason, late fraction, maximum lateness), an order-book row (syncs,
-//! desyncs, rejected snapshots, checkpoints, trusted-window width), then one
-//! line per failed check and a final `PASS` or `FAIL`.
+//! desyncs, rejected snapshots, checkpoints, trusted-window width), a
+//! kline-reconciliation totals row (blocks, conclusive, inconclusive by
+//! reason, flagged blocks and minutes, total difference), then one line per
+//! failed check and a final `PASS` or `FAIL`.
 
 use crate::config::IngestConfig;
+use crate::reconcile::{AggregateRange, ClosedMinute, Inconclusive, Verdict, reconcile};
 use mie_adapter_binance::BinanceStream;
 use mie_adapter_binance::normalize::parse;
 use mie_adapter_parquet::ParquetRawStore;
 use mie_domain::event::MarketEvent;
+use mie_domain::num::Qty;
 use mie_domain::time::EventTime;
 use mie_ports::outbound::ReplayWindow;
 use mie_ports::raw::{RawRecordSource, RawSelection, RawStreamKey};
+use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
@@ -60,6 +76,56 @@ struct Row {
     /// The record normalizes to a domain event.
     has_event: bool,
     trade_id: Option<u64>,
+    /// The record's input to check 7; `aggTrade` and closed `kline_1m`
+    /// records only.
+    c3: Option<C3Input>,
+}
+
+/// What check 7 reads from one raw payload.
+enum C3Input {
+    Aggregate(AggregateRange),
+    Minute(ClosedMinute),
+    /// An `aggTrade` record without a readable `a`, `f`, `l`, `q` or `T`:
+    /// an orphan at its record time.
+    Unreadable,
+}
+
+/// The `aggTrade` fields of check 7.
+#[derive(Deserialize)]
+struct AggTradeIds {
+    a: Option<u64>,
+    f: Option<i64>,
+    l: Option<i64>,
+    q: Option<String>,
+    #[serde(rename = "T")]
+    time: Option<i64>,
+}
+
+/// The `kline_1m` fields of check 7 (`k.L` is the last trade id, `k.l` the
+/// low price).
+#[derive(Deserialize)]
+struct KlineIds {
+    k: Option<KlineBar>,
+}
+
+#[derive(Deserialize)]
+struct KlineBar {
+    t: Option<i64>,
+    f: Option<i64>,
+    #[serde(rename = "L")]
+    last: Option<i64>,
+    v: Option<String>,
+    n: Option<u64>,
+    x: Option<bool>,
+}
+
+/// Check 7's inputs of one run, in `receive_seq` order.
+#[derive(Default)]
+struct C3Run {
+    aggregates: Vec<AggregateRange>,
+    minutes: Vec<ClosedMinute>,
+    /// Record times of unreadable `aggTrade` records.
+    unreadable: Vec<i64>,
 }
 
 /// A journaled gap.
@@ -129,6 +195,7 @@ pub fn run(
     .map_err(io)?;
 
     let mut depth_spans: BTreeMap<String, i64> = BTreeMap::new();
+    let mut c3_runs: BTreeMap<String, C3Run> = BTreeMap::new();
     for &stream in &streams {
         let (files, rows) = read_stream(&store, config, stream, from_ms, to_ms)?;
         let mut by_run: BTreeMap<String, Vec<Row>> = BTreeMap::new();
@@ -170,6 +237,15 @@ pub fn run(
             if stream == BinanceStream::AggTrade {
                 check_trade_ids(run, rows, journal, &mut problems);
             }
+            let inputs = c3_runs.entry(run.clone()).or_default();
+            for row in rows.iter_mut() {
+                match row.c3.take() {
+                    Some(C3Input::Aggregate(a)) => inputs.aggregates.push(a),
+                    Some(C3Input::Minute(m)) => inputs.minutes.push(m),
+                    Some(C3Input::Unreadable) => inputs.unreadable.push(row.time),
+                    None => {}
+                }
+            }
         }
         let range = |t: i64, empty: bool| {
             if empty { "-".to_owned() } else { t.to_string() }
@@ -203,6 +279,9 @@ pub fn run(
         .unwrap_or(i64::MAX)
         .saturating_mul(1_000);
     check_book(&runs, &depth_spans, default_interval_ms, out, &mut problems)?;
+    let reconciled =
+        streams.contains(&BinanceStream::AggTrade) && streams.contains(&BinanceStream::Kline1m);
+    check_kline_reconciliation(reconciled, &runs, &c3_runs, out, &mut problems)?;
     let source_dir = config
         .paths
         .raw_root
@@ -333,16 +412,58 @@ fn read_stream(
                 Some(MarketEvent::Trade(trade)) => Some(trade.trade_id),
                 _ => None,
             };
+            let c3 = match stream {
+                BinanceStream::AggTrade => Some(aggregate_of(&record.payload)),
+                BinanceStream::Kline1m => closed_minute_of(&record.payload).map(C3Input::Minute),
+                _ => None,
+            };
             rows.push(Row {
                 seq: capture.receive_seq,
                 session: capture.session_id,
                 time: record.event_time.as_millis(),
                 has_event: event.is_some(),
                 trade_id,
+                c3,
             });
         }
     }
     Ok((dataset.files.len(), rows))
+}
+
+/// Check 7's view of an `aggTrade` payload.
+fn aggregate_of(payload: &[u8]) -> C3Input {
+    let Ok(msg) = serde_json::from_slice::<AggTradeIds>(payload) else {
+        return C3Input::Unreadable;
+    };
+    let qty = msg.q.as_deref().and_then(|q| q.parse::<Qty>().ok());
+    match (msg.a, msg.f, msg.l, qty, msg.time) {
+        (Some(id), Some(first), Some(last), Some(qty), Some(time)) => {
+            C3Input::Aggregate(AggregateRange {
+                id,
+                first,
+                last,
+                qty,
+                time,
+            })
+        }
+        _ => C3Input::Unreadable,
+    }
+}
+
+/// Check 7's view of a `kline_1m` payload: `None` unless the bar is closed
+/// and every field is readable (the minute then has no closed kline).
+fn closed_minute_of(payload: &[u8]) -> Option<ClosedMinute> {
+    let bar = serde_json::from_slice::<KlineIds>(payload).ok()?.k?;
+    if bar.x != Some(true) {
+        return None;
+    }
+    Some(ClosedMinute {
+        minute: bar.t?.div_euclid(60_000),
+        first: bar.f?,
+        last: bar.last?,
+        volume: bar.v?.parse().ok()?,
+        trades: bar.n?,
+    })
 }
 
 /// Check 2; returns the number of session changes.
@@ -506,6 +627,115 @@ fn check_book(
         group("desyncs."),
         group("snapshots_rejected."),
         counters.get("checkpoints_emitted").copied().unwrap_or(0),
+    )
+    .map_err(io)?;
+    Ok(())
+}
+
+/// Check 7, with its totals row.
+fn check_kline_reconciliation(
+    enabled: bool,
+    runs: &BTreeMap<String, RunJournal>,
+    c3_runs: &BTreeMap<String, C3Run>,
+    out: &mut dyn Write,
+    problems: &mut Vec<String>,
+) -> Result<(), String> {
+    let io = |e: std::io::Error| e.to_string();
+    if !enabled {
+        writeln!(
+            out,
+            "kline reconciliation: skipped (needs aggTrade and kline_1m)"
+        )
+        .map_err(io)?;
+        return Ok(());
+    }
+    let (mut blocks, mut conclusive, mut flagged, mut flagged_minutes) = (0, 0, 0, 0);
+    let mut inconclusive: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut total = Some(Qty::from_units(0));
+    for (run, inputs) in c3_runs {
+        let Some(journal) = runs.get(run) else {
+            continue;
+        };
+        let span = inputs
+            .aggregates
+            .iter()
+            .fold((i64::MAX, i64::MIN), |(lo, hi), a| {
+                (lo.min(a.time), hi.max(a.time))
+            });
+        // Any reason on the two reconciled series (ADR-048 D3).
+        let gaps: Vec<(i64, i64)> = journal
+            .gaps
+            .iter()
+            .filter(|g| g.stream == "Trades" || g.stream == "Klines")
+            .map(|g| (g.start, g.end))
+            .collect();
+        let result = reconcile(
+            &inputs.minutes,
+            &inputs.aggregates,
+            &inputs.unreadable,
+            span,
+            &gaps,
+        );
+        let run_blocks = match result {
+            Ok(run_blocks) => run_blocks,
+            Err(e) => {
+                problems.push(format!("kline_1m/aggTrade run {run}: {e}"));
+                continue;
+            }
+        };
+        for block in run_blocks {
+            blocks += 1;
+            let reason = match block.verdict {
+                Verdict::Pass => {
+                    conclusive += 1;
+                    continue;
+                }
+                Verdict::Flagged => {
+                    conclusive += 1;
+                    flagged += 1;
+                    flagged_minutes += block.minutes.len();
+                    total = total.and_then(|t| t.checked_add(block.difference));
+                    let minutes: Vec<String> = block
+                        .minutes
+                        .iter()
+                        .map(|m| m.saturating_mul(60_000).to_string())
+                        .collect();
+                    problems.push(format!(
+                        "kline_1m/aggTrade run {run}: minutes {}: kline volume {}, \
+                         aggregate quantity {}, difference {}",
+                        minutes.join(", "),
+                        block.kline_volume,
+                        block.aggregate_qty,
+                        block.difference
+                    ));
+                    continue;
+                }
+                Verdict::Inconclusive(Inconclusive::NotConsecutive) => "not consecutive",
+                Verdict::Inconclusive(Inconclusive::RunEdge) => "run edge",
+                Verdict::Inconclusive(Inconclusive::Gap) => "gap",
+                Verdict::Inconclusive(Inconclusive::Orphan) => "orphan",
+            };
+            *inconclusive.entry(reason).or_default() += 1;
+        }
+    }
+    let count = |reason: &str| inconclusive.get(reason).copied().unwrap_or(0);
+    let total = match total {
+        Some(total) => total.to_string(),
+        None => {
+            problems.push("kline reconciliation: the total difference overflows".to_owned());
+            "overflow".to_owned()
+        }
+    };
+    writeln!(
+        out,
+        "kline reconciliation: blocks {blocks} | conclusive {conclusive} | inconclusive {} \
+         (not consecutive {}, run edge {}, gap {}, orphan {}) | flagged {flagged} \
+         ({flagged_minutes} minutes) | difference {total}",
+        inconclusive.values().sum::<usize>(),
+        count("not consecutive"),
+        count("run edge"),
+        count("gap"),
+        count("orphan"),
     )
     .map_err(io)?;
     Ok(())

@@ -16,7 +16,7 @@ and the 12 monthly `fundingRate` files were published, **0 missing**
 
 | Dataset | Archive path | Raw stream | Resolution | Archive history start | Imported window | Normalized to | Gaps / caveats |
 |---|---|---|---|---|---|---|---|
-| Aggregate trades | `daily/aggTrades/BTCUSDT/` | `aggTrades` | per aggregate, ms | 2019-12-31 | 2025-10-01 … 2026-09-30 | `Trade` (`is_buyer_maker` ⇒ sell aggressor) | 0 id breaks, 0 holes over 60 s across the whole year (780 files, 603 218 226 rows). An aggregate's constituents can fall in another minute than its `transact_time`, so aggTrades bars differ from klines at minute boundaries (ADR-034 D8). Not every trade is in an aggregate: trades of the `trades` file covered by no aggregate range were measured on 32 of 41 sampled days up to 2026-06-09 (2109 trades, up to 478 a day; 8 on 2026-02-05, 74 of ADR-031's 1658 mismatching bars touched) and on 0 of 22 sampled days from 2026-06-10; id continuity does not detect it, live capture is not measured (ADR-047, #90) |
+| Aggregate trades | `daily/aggTrades/BTCUSDT/` | `aggTrades` | per aggregate, ms | 2019-12-31 | 2025-10-01 … 2026-09-30 | `Trade` (`is_buyer_maker` ⇒ sell aggressor) | 0 id breaks, 0 holes over 60 s across the whole year (780 files, 603 218 226 rows). An aggregate's constituents can fall in another minute than its `transact_time`, so aggTrades bars differ from klines at minute boundaries (ADR-034 D8). Not every trade is in an aggregate: trades of the `trades` file covered by no aggregate range were measured on 32 of 41 sampled days up to 2026-06-09 (2109 trades, up to 478 a day; 8 on 2026-02-05, 74 of ADR-031's 1658 mismatching bars touched) and on 0 of 22 sampled days from 2026-06-10; id continuity does not detect it, live capture has its own loss mode, see the live table (ADR-048) |
 | Klines 1m, 5m, 15m, 1h, 4h, 1d | `daily/klines/BTCUSDT/<interval>/` | `klines_1m` … `klines_1d` | the interval | 2019-12-31 | as above | `Kline` (cross-check only, never a bar source) | 365 files per interval, 0 missing, 0 integrity errors |
 | Funding rate | `monthly/fundingRate/BTCUSDT/` | `fundingRate` | per settlement (8 h) | 2020-01 | months overlapping the window | `FundingSettlement` at `calc_time` | Monthly files only; `calc_time` has ms jitter. 12 months, 0 missing; 12 rows use exponent notation (`-1.8E-7`), parsed exactly since #55 |
 | Metrics (open interest, ratios) | `daily/metrics/BTCUSDT/` | `metrics` | 5 min | 2021-12-01 | as above | `OpenInterest`, `resolution_ms` 300 000, ordered at `create_time` + 5 min (ADR-034 D3) | Rows unsorted in the file; the 23:55 sample is filed under the next day. Ratio columns stored raw only |
@@ -35,6 +35,8 @@ and the 12 monthly `fundingRate` files were published, **0 missing**
 | Closed 1m klines | `kline_1m` | 1 min | start of live capture | `Kline` |
 | Open interest | `openInterest` | 10 s poll | start of live capture | `OpenInterest`, `resolution_ms` 10 000 |
 | Order book (diff depth + snapshots) | `depth`, `depthSnapshot` | diffs per 100 ms batch; `limit=1000` snapshots on every resync and a checkpoint every 60 s (ADR-038) | start of live depth capture (#10, first soak 2026-10-08) | `BookUpdate`, `BookSnapshot` |
+
+Live aggregates can omit trades without an id break (2026-10-08 12:50–15:43 UTC: 465 trades, 43.250 BTC, while the archive is complete), and `mie capture-report` check 7 reports such losses per block of minutes (ADR-048).
 
 ## Features by period
 
