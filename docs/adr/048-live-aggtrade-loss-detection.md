@@ -1,6 +1,6 @@
 # ADR-048: Live `aggTrade` loss inside aggregates — kline reconciliation as `capture-report` check 7
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-10-11
 
 Relation to earlier ADRs: ADR-032 D5 ends with "On trades, the next id break
@@ -122,6 +122,33 @@ ADR-047 speaks for the archive only, and its correction is #102.
    stream captured (ADR-032 D1), so it is the finest reference there is; a
    block is longer only where aggregates straddle minutes (M0: 1 to 7
    minutes on the archive, up to 5 among the live flags).
+
+   Why the last record per minute and dedup by `a`: raw data is stored
+   unchanged (ADR-022), so a record the source delivers twice is stored
+   twice. Counting a duplicate twice would double its `v` or `q` and flag a
+   false difference. The last record in `receive_seq`
+   order is the one the store has most recently confirmed. For identical
+   duplicates the choice does not matter: M0 measured 0 duplicate `a` and
+   `nq` = `q` everywhere. Why an unreadable `aggTrade` is an orphan at its
+   record time: its `[f, l]` and `q` are unknown, so its block would lack
+   its `q` and be flagged with a positive difference, a false loss. Its
+   record time is the only position the store still knows for it, and rule
+   (d) of D3 makes that minute's block inconclusive instead. M0 saw 0
+   unreadable records.
+
+   Why an error, reported as a `FAIL` problem line, instead of a verdict:
+   - **Non-increasing trade-id intervals.** The sweep that assigns
+     aggregates to minutes requires the closed minutes' `[f, L]` to increase
+     with the minute. Binance assigns trade ids in time order, so a
+     violation means the kline records are corrupt or come from another
+     instrument. Any block verdict computed over them would be meaningless,
+     in either direction.
+   - **`Qty` overflow.** It means the sums cannot be represented (ADR-027
+     checked arithmetic, no wrapping).
+
+   Both fail the report, and neither is silently skipped, for the reason
+   given in D4: a report that passes over data it could not check is the
+   #9 failure mode. M0 met neither case.
 2. **Tolerance 0 (D2).** Both sums are exact integer counts of 10⁻⁸ BTC
    (ADR-027), so rounding cannot make honest data differ. Measured: 0 false
    flags at tolerance 0 on 6 538 archive-simulated and 2 547 conclusive live
@@ -251,5 +278,23 @@ M0's 2 547 / 84; a difference is explained (M0 pooled gaps across stores,
 check 7 uses each run's own journal). An extra flag or a missing block
 stops the acceptance.
 
-References: ADR-027, ADR-028, ADR-029, ADR-030, ADR-032, ADR-034, ADR-041,
+References: ADR-022, ADR-027, ADR-028, ADR-029, ADR-030, ADR-032, ADR-034, ADR-041,
 ADR-047. Issues: #9, #10, #13, #88, #90, #102.
+
+### Accepted: M2 result (2026-10-11)
+
+Each store matched M0's hash table (parquet file counts 728 / 4 / 332 / 75
+and the journal sha256). A release build of this PR, run over the window
+2026-10-06 … 10-13:
+
+| Store | Blocks | Conclusive | Inconclusive (edge / gap / orphan) | Flagged | Difference |
+|---|---|---|---|---|---|
+| #9 | 1666 | 1644 | 22 (2 / 20 / 0) | 13 (18 minutes) | 43.25000000 |
+| #9-rotation | 9 | 5 | 4 (1 / 3 / 0) | 0 | 0 |
+| #10 | 782 | 771 | 11 (2 / 9 / 0) | 0 | 0 |
+| #13 | 174 | 127 | 47 (2 / 45 / 0) | 0 | 0 |
+
+The 13 flagged blocks are those of the table above, with the same minutes
+and differences, all in run 20261008T035138Z. The totals equal M0's
+2 547 conclusive and 84 inconclusive, so per-run journals and M0's pooled
+gaps gave the same split. Record: #90 M2 comment.
