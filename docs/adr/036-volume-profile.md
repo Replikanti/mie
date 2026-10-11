@@ -272,7 +272,8 @@ resolution at which profile levels are needed.
      distribution (68.3 %), rounded to 70 %; Dalton, Jones and Dalton,
      *Mind Over Markets* (updated edition, Wiley, 2013), describe the value
      area as the price range where about 70 % of the day's activity took
-     place. VAH and VAL are named
+     place (cited without a page: the page was not verified against the
+     print). VAH and VAL are named
      market levels, and the auction classifier reads "inside value" in that
      sense (ADR-044 D8), so a different share would name a different
      level.
@@ -475,8 +476,12 @@ Met 2026-10-11 for A0–A5 at `@1`, on main after #93:
   25 USDT would also pass; 50 USDT fails.
 - A3 PASS: median LVN count prior_day 9 / 5, composite 14 / 11.
 - A4 PASS: all 8 cells between 0.636 and 0.715 (*Context*).
-- A5 PASS: 12 of 12 days exact; pinned in CI by
-  `crates/mie-domain/tests/profile_reference.rs`.
+- A5 PASS: 12 of 12 days exact. The engine's binning, day attribution
+  and archive deduplication were checked once, by this run; CI does not
+  repeat them. What CI pins is the level computation:
+  `crates/mie-domain/tests/profile_reference.rs` runs `shape_levels` on the
+  reference's 12 histograms and requires the reference's levels exactly,
+  plus each node's edges and raw bin volume against the histogram.
 - C1 HOLDS: weekend days below every weekday in both halves.
 
 Pending: #96 (`profile.volume.composite_7d@1`, `location.levels@2`,

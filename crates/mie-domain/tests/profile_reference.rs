@@ -120,6 +120,25 @@ fn profile_levels_match_the_independent_reference_on_real_days() {
         if levels.lvn.is_empty() {
             lvn_free += 1;
         }
+        // The line carries each node's midpoint and permille only; its edges
+        // and raw bin volume (hashed with the state) are checked against the
+        // histogram the node's midpoint falls in.
+        let bin_units = BIN_SIZE.units();
+        for node in levels.hvn.iter().chain(&levels.lvn) {
+            let bin = ProfileShape::V1.bin_of(node.price);
+            assert_eq!(node.low.units(), bin * bin_units, "{day}: {node:?}");
+            assert_eq!(node.high.units(), (bin + 1) * bin_units, "{day}: {node:?}");
+            assert_eq!(
+                node.price.units(),
+                bin * bin_units + bin_units / 2,
+                "{day}: {node:?}"
+            );
+            assert_eq!(
+                Some(&node.volume),
+                histograms[day].get(&bin),
+                "{day}: {node:?}"
+            );
+        }
         let start = day_open_ms(day);
         let profile = VolumeProfile {
             feature: catalog::PROFILE_VOLUME_PRIOR_DAY_V1.key,
