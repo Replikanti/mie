@@ -1,6 +1,6 @@
 # ADR-036: Volume profile
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-10-07
 
 ## Context
@@ -530,10 +530,25 @@ Met 2026-10-11 for A0–A5 at `@1`, on main after #93:
   plus each node's edges and raw bin volume against the histogram.
 - C1 HOLDS: weekend days below every weekday in both halves.
 
-Pending: #96 (`profile.volume.composite_7d@1`, `location.levels@2`,
-ADR-044 M3 re-run). This ADR stays `proposed` until it merges. Full results
-and the sha256 of the 36 archive zips:
+Full results of the `@1` run and the sha256 of the 36 archive zips:
 <https://github.com/Replikanti/mie/issues/79#issuecomment-6106618884>.
+
+Met 2026-10-11 for the 7-day composite (#96), on the #96 head before
+merge, same window and rules:
+
+- A0 PASS: 603 218 226 events, 0 rejections; the tool's recomputation
+  equals the engine's `composite_7d` on 358 of 358 days (364 completed
+  days less the 6 that close before a 7-day window exists), next to
+  `prior_day` 364 of 364 and `composite_5d` 360 of 360, unchanged.
+- A1, A3 and A4 hold for `composite_7d@1` on the composite-length table
+  (*Context*), which this run reproduced exactly: 0 `OutOfRange`, LVN p50
+  15 / 12, κ HVN, LVN 0.657, 0.665 / 0.714, 0.715. A2 does not depend on
+  the composite length, and A5 concerns `prior_day` only.
+- C1 HOLDS, so the composite location consumes is `composite_7d@1`
+  (decision 2), shipped by #96 with `location.levels@2` and the ADR-044 M3
+  re-run (ADR-044 *Measurements*). That was the follow-up C1 named; this
+  ADR is accepted with it. Results:
+  <https://github.com/Replikanti/mie/issues/96#issuecomment-6110025815>.
 
 References: ADR-013, ADR-019, ADR-022, ADR-023, ADR-025, ADR-027, ADR-028,
 ADR-029, ADR-031, ADR-033, ADR-034, ADR-035, ADR-044, ADR-047.

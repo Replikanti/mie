@@ -141,6 +141,37 @@ of #12, 2025-10-01 … 2026-09-30 (`docs/data-availability.md`).
   6.4–8.4× (M0b). Per the rule the change stopped and was reported on #23;
   the decision there kept `N_acc` = 60 (D9).
 
+  **M3 re-run for `location.levels@2` (#96).** The tool drives two engines
+  over one replay of the same window, `@2` (the default set) and `@1`
+  (selected through `with_features`, D10), and samples each registry once
+  per closed minute. M3 fixes no constant, so #96 pre-registered rules for
+  what the re-run can prove, before any `@2` number was read: V1, the run
+  is valid (603 218 226 events and 0 domain rejections on both engines, 0
+  label mismatches); V2, it is comparable (`@1` reproduces the `w` = 6 M3
+  line above, to the printed precision, since neither its definition nor
+  its code changed); I, isolation (after every bar-closing event the two
+  states are equal once the feature-set stamp and `location.levels` are
+  set equal, and the auction facts are equal, since `@2` changes only the
+  composite that feeds the registry); S, sourcing (at every rebuild the
+  `@2` registry holds no level from `composite_5d@1` and at least 3, the
+  POC, VAL and VAH every ready profile hands over, from `composite_7d@1`
+  while it is ready, none otherwise; `@1` mirrored). The `@2` sizes are
+  recorded without a threshold: this ADR sets no size bound, and one set
+  now would be an unmeasured number (the D5 argument).
+  Result: 603 218 226 events, 0 rejections on either engine, 0 label
+  mismatches (V1); `@1` all 254/342 and every per-kind and zone-event
+  figure as above (V2); 0 isolation breaks (I); 0 of 825 211 rebuilds
+  break S, per version. All four hold. `@2`, p50 / p99 per closed minute:
+  POC, VAL, VAH 2/2 each, HVN 22/70, LVN 20/68, structural highs 48/69,
+  lows 29/61, prior sweeps 80/86, SFP zones 51/63, VWAP 1/1, clusters 0/0,
+  all 256/351; zone events per day 1 375.7 arrived, 34.0 created, 1 395.0
+  departed, 14.6 retired. Only HVN and LVN move, by one level at p50 and
+  at p99; the total p99 moves by 9. M1, M2 and M4 come from the `@2` engine
+  and are unchanged, because they read bars and the prior-day value, not
+  the composite. Wall time 1 863.0 s (31.1 min) for both engines, against
+  1 152.2 s for one. Results:
+  <https://github.com/Replikanti/mie/issues/96#issuecomment-6110025815>.
+
 ## Decision
 
 1. **Clock: closed 1m bars (ADR-031).** Location steps only on an event
@@ -404,7 +435,8 @@ of #12, 2025-10-01 … 2026-09-30 (`docs/data-availability.md`).
 - Each closed minute rebuilds the registry: `O(n log n)` over its levels
   (a few hundred: every structure registry holds at most 20 active highs,
   20 active lows and 20 resolved sweeps plus pending sweeps and SFP zones
-  per timeframe, ADR-037 D5; p50 254 and p99 342 in the window, M3), plus
+  per timeframe, ADR-037 D5; p50 256 and p99 351 in the window for
+  `location.levels@2`, 254 and 342 for `@1`, M3), plus
   two `i128` additions per trade for the VWAP. The full year replays in
   19.3 min with location against 20.5 min for the #11 replay (M1–M4 note on
   comparability).

@@ -1,5 +1,5 @@
 //! Volume profile: POC, value area, HVN and LVN (brief §8 and §10; Market
-//! State & Regime brief; ADR-036, proposed).
+//! State & Regime brief; ADR-036).
 //!
 //! Every trade adds its exact quantity to a fixed 10 USDT price bin
 //! (decision 1); nothing is spread or estimated from bars. Four profiles
