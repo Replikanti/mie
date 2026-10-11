@@ -1,6 +1,8 @@
 # ADR-038: Binance order-book sync — diffs and snapshots raw, sync as a pure state machine, audited checkpoints
 
-- Status: accepted
+- Status: accepted; decision 8's "matched" verdict (no minimum of compared
+  levels per side, window depth in whole bps) and the KEEP verdict of the
+  2026-10-11 justification addendum section c.6 are superseded by ADR-049
 - Date: 2026-10-07
 - Amended: 2026-10-11 (#73)
 

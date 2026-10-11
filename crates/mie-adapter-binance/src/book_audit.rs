@@ -11,31 +11,61 @@
 //! trusted windows, and the shadow is adopted, as the core resets at the
 //! snapshot.
 //!
+//! A comparison without a mismatch is `Matched` only when each side
+//! compared at least [`MIN_SIDE_LEVELS`] levels; otherwise it is
+//! `Inconclusive`, because a side that compared nothing proves nothing
+//! (ADR-049). Each side reports its compared levels and the width of its
+//! compared window in hundredths of a basis point ([`SideCoverage`]).
+//!
 //! The audit has no clock and does no I/O; it only observes. A mismatch
 //! never changes what the core receives.
 
-use mie_domain::book::{BookStep, Invalidation, LevelMismatch, OrderBook};
+use mie_domain::book::{BookStep, Invalidation, LevelMismatch, OrderBook, Side};
 use mie_domain::event::{GapReason, MarketEvent, Stream};
 use mie_domain::num::Price;
 
 /// Examples kept per mismatched checkpoint.
 pub const MISMATCH_EXAMPLES: usize = 5;
 
+/// Fewest levels a side must compare for a checkpoint without a mismatch to
+/// count as `Matched` (ADR-049 D2): one level is the least evidence that a
+/// side was compared at all. A code constant, not a run parameter.
+pub const MIN_SIDE_LEVELS: usize = 1;
+
+/// What one side of a checkpoint comparison covered (ADR-049 D1, D4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SideCoverage {
+    /// Distinct prices compared on this side.
+    pub levels: usize,
+    /// Width of the compared window from the fresh book's best price to the
+    /// window edge, in hundredths of a basis point of that best, rounded up;
+    /// 0 when the edge lies beyond the best price, so no level is inside.
+    /// `None` when the side has no window or the fresh book no best on it.
+    pub width_cbps: Option<u32>,
+}
+
 /// The verdict on one checkpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckpointResult {
-    /// Every level inside both trusted windows matched.
+    /// No level inside both trusted windows differs, and each side compared
+    /// at least [`MIN_SIDE_LEVELS`] levels.
     Matched {
-        /// Distinct prices compared, both sides.
-        levels: usize,
-        /// Depth of the compared bid window below the best bid, in basis
-        /// points of the best bid; `None` without a bid window.
-        window_bid_bps: Option<u32>,
-        /// Depth of the compared ask window above the best ask, in basis
-        /// points of the best ask; `None` without an ask window.
-        window_ask_bps: Option<u32>,
+        /// The bid side.
+        bid: SideCoverage,
+        /// The ask side.
+        ask: SideCoverage,
     },
-    /// Some levels differ.
+    /// No level differs, but a side compared fewer than
+    /// [`MIN_SIDE_LEVELS`] levels, so the comparison proves nothing about
+    /// it (ADR-049). Typically the price moved past the previous window's
+    /// edge between two checkpoints.
+    Inconclusive {
+        /// The bid side.
+        bid: SideCoverage,
+        /// The ask side.
+        ask: SideCoverage,
+    },
+    /// Some levels differ; this takes precedence over a thin side.
     Mismatched {
         /// Distinct prices compared, both sides.
         levels: usize,
@@ -116,23 +146,9 @@ fn judge(rebuilt: &OrderBook, fresh: &OrderBook) -> CheckpointResult {
         // Both books are valid here; keep the function total.
         return CheckpointResult::Unverifiable(GapReason::SequenceBreak);
     };
-    if comparison.is_match() {
-        CheckpointResult::Matched {
-            levels: comparison.levels_compared,
-            window_bid_bps: comparison
-                .window
-                .lowest_bid
-                .zip(fresh.best_bid())
-                .map(|(lowest, best)| bps(best.price, lowest)),
-            window_ask_bps: comparison
-                .window
-                .highest_ask
-                .zip(fresh.best_ask())
-                .map(|(highest, best)| bps(best.price, highest)),
-        }
-    } else {
-        CheckpointResult::Mismatched {
-            levels: comparison.levels_compared,
+    if !comparison.is_match() {
+        return CheckpointResult::Mismatched {
+            levels: comparison.levels_compared(),
             mismatches: comparison.mismatches.len(),
             examples: comparison
                 .mismatches
@@ -140,24 +156,56 @@ fn judge(rebuilt: &OrderBook, fresh: &OrderBook) -> CheckpointResult {
                 .take(MISMATCH_EXAMPLES)
                 .copied()
                 .collect(),
-        }
+        };
+    }
+    let bid = SideCoverage {
+        levels: comparison.bid_levels,
+        width_cbps: comparison
+            .window
+            .lowest_bid
+            .zip(fresh.best_bid())
+            .map(|(lowest, best)| width_cbps(Side::Bid, best.price, lowest)),
+    };
+    let ask = SideCoverage {
+        levels: comparison.ask_levels,
+        width_cbps: comparison
+            .window
+            .highest_ask
+            .zip(fresh.best_ask())
+            .map(|(highest, best)| width_cbps(Side::Ask, best.price, highest)),
+    };
+    if bid.levels < MIN_SIDE_LEVELS || ask.levels < MIN_SIDE_LEVELS {
+        CheckpointResult::Inconclusive { bid, ask }
+    } else {
+        CheckpointResult::Matched { bid, ask }
     }
 }
 
-/// `|edge − best| / best` in whole basis points, rounded down.
-fn bps(best: Price, edge: Price) -> u32 {
+/// Width of a side's window from `best` to `edge`, in hundredths of a basis
+/// point of `best`, rounded up (ADR-049 D4). The edge lies at or below the
+/// best bid, or at or above the best ask; beyond the best it is 0, as no
+/// level lies inside. A non-positive `best` gives 0; a width that does not
+/// fit saturates.
+fn width_cbps(side: Side, best: Price, edge: Price) -> u32 {
     let best = i128::from(best.units());
     if best <= 0 {
         return 0;
     }
-    let distance = (i128::from(edge.units()) - best).abs();
-    u32::try_from(distance * 10_000 / best).unwrap_or(u32::MAX)
+    let edge = i128::from(edge.units());
+    let width = match side {
+        Side::Bid => best - edge,
+        Side::Ask => edge - best,
+    };
+    if width <= 0 {
+        return 0;
+    }
+    let cbps = (width * 1_000_000 + best - 1) / best;
+    u32::try_from(cbps).unwrap_or(u32::MAX)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mie_domain::book::Side;
     use mie_domain::event::{BookSnapshot, BookUpdate, FeedGap, Level};
     use mie_domain::num::Qty;
     use mie_domain::time::EventTime;
@@ -241,10 +289,16 @@ mod tests {
         assert_eq!(
             result,
             Some(CheckpointResult::Matched {
-                levels: 5,
-                // 10 000 → 9 990 is 10 bps; 10 001 → 10 020 is 18.99 bps.
-                window_bid_bps: Some(10),
-                window_ask_bps: Some(18),
+                // 10 000 → 9 990 is exactly 10 bps.
+                bid: SideCoverage {
+                    levels: 3,
+                    width_cbps: Some(1_000),
+                },
+                // 10 001 → 10 020 is 18.998 bps, rounded up.
+                ask: SideCoverage {
+                    levels: 2,
+                    width_cbps: Some(1_900),
+                },
             })
         );
         // The shadow was adopted; the next diff chains on it.
@@ -326,12 +380,162 @@ mod tests {
         assert_eq!(anchored().apply(&trade_gap), None);
     }
 
+    /// Settles one checkpoint after the price fell through the bid side of
+    /// the anchor's window: the initial snapshot holds `MIN_SIDE_LEVELS + 2`
+    /// bids at 1 000, 999, …; a diff removes all but the `kept` lowest of
+    /// them and adds one bid below the window, which the checkpoint repeats.
+    /// The bid side then compares exactly `kept` levels.
+    fn thinned(kept: usize) -> Option<CheckpointResult> {
+        let total = MIN_SIDE_LEVELS + 2;
+        assert!(kept <= total);
+        let bids: Vec<(i64, i64)> = (0..total).map(|i| (1_000 - i as i64, 1)).collect();
+        let below = 1_000 - total as i64 - 5;
+        let mut diff: Vec<(i64, i64)> = bids[..total - kept].iter().map(|&(p, _)| (p, 0)).collect();
+        diff.push((below, 1));
+        let mut fresh: Vec<(i64, i64)> = bids[total - kept..].to_vec();
+        fresh.push((below, 1));
+
+        let mut audit = BookAudit::new();
+        audit.apply(&snapshot(100, &bids, &[(1_001, 1), (1_002, 1)]));
+        assert_eq!(audit.apply(&update(100, 105, 99, &diff)), None);
+        assert_eq!(
+            audit.apply(&snapshot(107, &fresh, &[(1_001, 1), (1_002, 1)])),
+            None
+        );
+        audit.apply(&update(106, 110, 105, &[]))
+    }
+
     #[test]
-    fn window_bps_round_down() {
+    fn an_edge_beyond_the_best_price_is_zero_width_and_inconclusive() {
+        // Every bid of the anchor's window is gone; the fresh best lies
+        // below the compared window's edge.
+        let result = thinned(0);
+        assert_eq!(
+            result,
+            Some(CheckpointResult::Inconclusive {
+                bid: SideCoverage {
+                    levels: 0,
+                    width_cbps: Some(0),
+                },
+                // 1 001 → 1 002 is 999.001 hundredths of a bp, rounded up.
+                ask: SideCoverage {
+                    levels: 2,
+                    width_cbps: Some(1_000),
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn an_edge_at_the_best_price_is_zero_width_with_one_level() {
+        let Some(CheckpointResult::Matched { bid, .. }) = thinned(1) else {
+            panic!("expected Matched at a floor of {MIN_SIDE_LEVELS}");
+        };
+        assert_eq!(
+            bid,
+            SideCoverage {
+                levels: 1,
+                width_cbps: Some(0),
+            }
+        );
+    }
+
+    #[test]
+    fn the_floor_separates_inconclusive_from_matched() {
+        let below = thinned(MIN_SIDE_LEVELS - 1).expect("settled");
+        let CheckpointResult::Inconclusive { bid, .. } = below else {
+            panic!("{below:?}");
+        };
+        assert_eq!(bid.levels, MIN_SIDE_LEVELS - 1);
+        let at = thinned(MIN_SIDE_LEVELS).expect("settled");
+        let CheckpointResult::Matched { bid, .. } = at else {
+            panic!("{at:?}");
+        };
+        assert_eq!(bid.levels, MIN_SIDE_LEVELS);
+    }
+
+    #[test]
+    fn a_side_with_zero_levels_is_inconclusive() {
+        // The rebuilt book lost every ask of its window; the checkpoint has
+        // asks only above it.
+        let mut audit = BookAudit::new();
+        audit.apply(&snapshot(100, &[(1_000, 1)], &[(1_001, 1), (1_002, 1)]));
+        let ask_diff = MarketEvent::BookUpdate(BookUpdate {
+            time: EventTime::from_millis(1_000),
+            first_update_id: 100,
+            last_update_id: 105,
+            prev_update_id: 99,
+            bids: Vec::new(),
+            asks: vec![lv(1_001, 0), lv(1_002, 0), lv(1_010, 1)],
+        });
+        assert_eq!(audit.apply(&ask_diff), None);
+        audit.apply(&snapshot(107, &[(1_000, 1)], &[(1_010, 1)]));
+        let result = audit.apply(&update(106, 110, 105, &[]));
+        assert_eq!(
+            result,
+            Some(CheckpointResult::Inconclusive {
+                bid: SideCoverage {
+                    levels: 1,
+                    width_cbps: Some(0),
+                },
+                ask: SideCoverage {
+                    levels: 0,
+                    width_cbps: Some(0),
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn a_mismatch_takes_precedence_over_an_empty_side() {
+        // The bid side is empty as in `thinned(0)`, but the checkpoint
+        // disagrees on an ask.
+        let total = MIN_SIDE_LEVELS + 2;
+        let bids: Vec<(i64, i64)> = (0..total).map(|i| (1_000 - i as i64, 1)).collect();
+        let mut diff: Vec<(i64, i64)> = bids.iter().map(|&(p, _)| (p, 0)).collect();
+        diff.push((900, 1));
+        let mut audit = BookAudit::new();
+        audit.apply(&snapshot(100, &bids, &[(1_001, 1), (1_002, 1)]));
+        audit.apply(&update(100, 105, 99, &diff));
+        audit.apply(&snapshot(107, &[(900, 1)], &[(1_001, 2), (1_002, 1)]));
+        let result = audit.apply(&update(106, 110, 105, &[])).expect("settled");
+        let CheckpointResult::Mismatched {
+            levels, mismatches, ..
+        } = result
+        else {
+            panic!("{result:?}");
+        };
+        assert_eq!((levels, mismatches), (2, 1));
+    }
+
+    #[test]
+    fn a_sub_bp_width_is_not_zero() {
         let p = Price::from_units;
-        assert_eq!(bps(p(1_000_000), p(999_000)), 10);
-        assert_eq!(bps(p(1_000_000), p(1_000_999)), 9);
-        assert_eq!(bps(p(1_000_000), p(1_000_000)), 0);
-        assert_eq!(bps(p(0), p(5)), 0);
+        // 50 units of 1 000 000 is 0.5 bps, i.e. 50 hundredths.
+        assert_eq!(width_cbps(Side::Bid, p(1_000_000), p(999_950)), 50);
+        assert_eq!(width_cbps(Side::Ask, p(1_000_000), p(1_000_050)), 50);
+        // One unit is 0.01 bps here.
+        assert_eq!(width_cbps(Side::Bid, p(1_000_000), p(999_999)), 1);
+    }
+
+    #[test]
+    fn window_widths_round_up_per_side() {
+        let p = Price::from_units;
+        assert_eq!(width_cbps(Side::Bid, p(1_000_000), p(999_000)), 1_000);
+        assert_eq!(width_cbps(Side::Ask, p(1_000_000), p(1_001_000)), 1_000);
+        // 999 units of 1 000 000 is exactly 999 hundredths; half a
+        // hundredth or 1.5 hundredths round up.
+        assert_eq!(width_cbps(Side::Ask, p(1_000_000), p(1_000_999)), 999);
+        assert_eq!(width_cbps(Side::Ask, p(2_000_000), p(2_000_001)), 1);
+        assert_eq!(width_cbps(Side::Ask, p(2_000_000), p(2_000_003)), 2);
+        // At the best, and beyond it on either side, the width is 0.
+        assert_eq!(width_cbps(Side::Bid, p(1_000_000), p(1_000_000)), 0);
+        assert_eq!(width_cbps(Side::Ask, p(1_000_000), p(1_000_000)), 0);
+        assert_eq!(width_cbps(Side::Bid, p(1_000_000), p(1_000_500)), 0);
+        assert_eq!(width_cbps(Side::Ask, p(1_000_000), p(999_500)), 0);
+        // A non-positive best gives 0; an oversized width saturates.
+        assert_eq!(width_cbps(Side::Ask, p(0), p(5)), 0);
+        assert_eq!(width_cbps(Side::Bid, p(-5), p(-10)), 0);
+        assert_eq!(width_cbps(Side::Ask, p(1), p(i64::MAX)), u32::MAX);
     }
 }

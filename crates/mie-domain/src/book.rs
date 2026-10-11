@@ -152,14 +152,21 @@ pub struct LevelMismatch {
 pub struct BookComparison {
     /// The window compared: the intersection of both books' windows.
     pub window: TrustedWindow,
-    /// Distinct prices compared, both sides.
-    pub levels_compared: usize,
+    /// Distinct bid prices compared.
+    pub bid_levels: usize,
+    /// Distinct ask prices compared.
+    pub ask_levels: usize,
     /// The prices whose quantities differ, bids from the best down, then
     /// asks from the best up.
     pub mismatches: Vec<LevelMismatch>,
 }
 
 impl BookComparison {
+    /// Distinct prices compared, both sides.
+    pub fn levels_compared(&self) -> usize {
+        self.bid_levels + self.ask_levels
+    }
+
     /// Whether every compared level matched.
     pub fn is_match(&self) -> bool {
         self.mismatches.is_empty()
@@ -446,7 +453,8 @@ impl OrderBook {
             return None;
         }
         let window = self.window.intersect(other.window);
-        let mut levels_compared = 0;
+        let mut bid_levels = 0;
+        let mut ask_levels = 0;
         let mut mismatches = Vec::new();
         if let Some(lowest) = window.lowest_bid {
             let prices: BTreeSet<Price> = self
@@ -455,7 +463,7 @@ impl OrderBook {
                 .chain(other.bids.range(lowest..))
                 .map(|(&price, _)| price)
                 .collect();
-            levels_compared += prices.len();
+            bid_levels = prices.len();
             for &price in prices.iter().rev() {
                 push_mismatch(&mut mismatches, Side::Bid, price, &self.bids, &other.bids);
             }
@@ -467,14 +475,15 @@ impl OrderBook {
                 .chain(other.asks.range(..=highest))
                 .map(|(&price, _)| price)
                 .collect();
-            levels_compared += prices.len();
+            ask_levels = prices.len();
             for &price in &prices {
                 push_mismatch(&mut mismatches, Side::Ask, price, &self.asks, &other.asks);
             }
         }
         Some(BookComparison {
             window,
-            levels_compared,
+            bid_levels,
+            ask_levels,
             mismatches,
         })
     }
@@ -762,7 +771,8 @@ mod tests {
         let book = base();
         let comparison = book.compare(&book.clone()).unwrap();
         assert!(comparison.is_match());
-        assert_eq!(comparison.levels_compared, 6);
+        assert_eq!((comparison.bid_levels, comparison.ask_levels), (3, 3));
+        assert_eq!(comparison.levels_compared(), 6);
         assert_eq!(comparison.window, book.window());
         assert_eq!(book.compare(&OrderBook::new()), None);
         assert_eq!(OrderBook::new().compare(&book), None);
@@ -809,11 +819,12 @@ mod tests {
             ]
         );
         // 980, 990, 995, 1000 and 1010, 1020, 1030; not 1040.
-        assert_eq!(comparison.levels_compared, 7);
+        assert_eq!((comparison.bid_levels, comparison.ask_levels), (4, 3));
+        assert_eq!(comparison.levels_compared(), 7);
         assert!(!comparison.is_match());
         // The comparison is symmetric up to the roles.
         let back = theirs.compare(&ours).unwrap();
-        assert_eq!(back.levels_compared, 7);
+        assert_eq!((back.bid_levels, back.ask_levels), (4, 3));
         assert_eq!(back.mismatches.len(), 5);
         assert_eq!(back.mismatches[1].ours, Some(Qty::from_units(5)));
     }
@@ -833,7 +844,7 @@ mod tests {
                 highest_ask: Some(Price::from_units(101)),
             }
         );
-        assert_eq!(comparison.levels_compared, 2);
+        assert_eq!((comparison.bid_levels, comparison.ask_levels), (1, 1));
         assert!(comparison.is_match());
         assert_eq!(theirs.compare(&ours).unwrap(), comparison);
 
@@ -842,7 +853,7 @@ mod tests {
         bids_only.apply(&snapshot(100, &[(100, 99)], &[]));
         let comparison = ours.compare(&bids_only).unwrap();
         assert_eq!(comparison.window.highest_ask, None);
-        assert_eq!(comparison.levels_compared, 1);
+        assert_eq!((comparison.bid_levels, comparison.ask_levels), (1, 0));
         assert_eq!(comparison.mismatches.len(), 1);
 
         // A level changed outside the window is known but not compared.

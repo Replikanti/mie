@@ -51,7 +51,7 @@ mod testing;
 pub mod transport;
 mod ws;
 
-pub use book_audit::{BookAudit, CheckpointResult};
+pub use book_audit::{BookAudit, CheckpointResult, MIN_SIDE_LEVELS, SideCoverage};
 pub use book_sync::{BookSequencer, BookStats, BookTransition};
 pub use live::{
     BinanceLiveProvider, CaptureEvent, CaptureHandle, CaptureObserver, CaptureSummary, LiveConfig,

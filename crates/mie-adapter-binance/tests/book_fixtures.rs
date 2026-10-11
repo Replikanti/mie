@@ -1,13 +1,13 @@
 //! The recorded live sync window (`tests/fixtures/depth*.jsonl`) through the
 //! pipeline: the book syncs on the first snapshot, chains, re-anchors on the
-//! second, and the audit matches the rebuilt book against it. This pins the
+//! second, and the audit compares the rebuilt book with it. This pins the
 //! ADR-038 assumption that a REST snapshot's `T` is the time of its
 //! `lastUpdateId`, on real data, and the engine's book features on it
 //! (ADR-043): which depth bands a `limit=100` window can know.
 
 use mie_adapter_binance::book_sync::{BookTransition, SnapshotRejection};
 use mie_adapter_binance::normalize::record_time;
-use mie_adapter_binance::{BinanceStream, BookAudit, CheckpointResult, Pipeline};
+use mie_adapter_binance::{BinanceStream, BookAudit, CheckpointResult, Pipeline, SideCoverage};
 use mie_domain::book::OrderBook;
 use mie_domain::event::MarketEvent;
 use mie_domain::feature::{FeatureValue, Unavailability};
@@ -70,7 +70,7 @@ fn records() -> Vec<(BinanceStream, RawRecord)> {
 }
 
 #[test]
-fn the_recorded_window_syncs_chains_and_matches_its_checkpoint() {
+fn the_recorded_window_syncs_chains_and_audits_its_checkpoint() {
     let records = records();
     assert_eq!(records.len(), 31);
     // The defaults of a live capture.
@@ -185,11 +185,23 @@ fn the_recorded_window_syncs_chains_and_matches_its_checkpoint() {
         );
     }
 
-    assert_eq!(checkpoints.len(), 1);
-    let CheckpointResult::Matched { levels, .. } = checkpoints[0] else {
-        panic!("{:?}", checkpoints[0]);
-    };
-    assert!(levels > 100, "{levels}");
+    // Within the 2 s between the snapshots the ask rose past the first
+    // snapshot's deepest ask: every bid level of the window agrees, but no
+    // ask lies inside it. Before ADR-049 this counted as matched; with no
+    // ask compared it proves nothing about the asks.
+    assert_eq!(
+        checkpoints,
+        [CheckpointResult::Inconclusive {
+            bid: SideCoverage {
+                levels: 101,
+                width_cbps: Some(171),
+            },
+            ask: SideCoverage {
+                levels: 0,
+                width_cbps: Some(0),
+            },
+        }]
+    );
 
     let stats = pipeline.stats();
     assert_eq!(stats.book.syncs, 1);

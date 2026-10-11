@@ -12,7 +12,7 @@ use mie_adapter_binance::transport::{
 };
 use mie_adapter_binance::{
     BinanceStream, CaptureEvent, CaptureObserver, CaptureSummary, CheckpointResult, LiveConfig,
-    SnapshotTrigger, start,
+    SideCoverage, SnapshotTrigger, start,
 };
 use mie_domain::event::{GapReason, MarketEvent, Stream};
 use mie_domain::time::EventTime;
@@ -1712,9 +1712,14 @@ fn depth_syncs_on_requested_snapshots_and_audits_a_checkpoint() {
     assert_eq!(
         checkpoints,
         [&CheckpointResult::Matched {
-            levels: 3,
-            window_bid_bps: Some(100),
-            window_ask_bps: Some(0),
+            bid: SideCoverage {
+                levels: 2,
+                width_cbps: Some(10_000),
+            },
+            ask: SideCoverage {
+                levels: 1,
+                width_cbps: Some(0),
+            },
         }]
     );
     assert_eq!(out.gaps(), [(Stream::OrderBook, GapReason::SequenceBreak)]);
