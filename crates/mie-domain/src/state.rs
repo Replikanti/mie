@@ -6,8 +6,8 @@
 //! [`bars`]), computes bar motion, ATR(14) and the volatility regime from
 //! the bars each event closes (ADR-033, [`volatility`]), the order flow:
 //! CVD and rolling aggression windows (ADR-035, [`flow`]), and the volume
-//! profiles: developing UTC day, prior day and 5-day composite (ADR-036,
-//! [`profile`]), the market structure: swings, structural levels,
+//! profiles: developing UTC day, prior day, 5-day and 7-day composite
+//! (ADR-036, [`profile`]), the market structure: swings, structural levels,
 //! sweeps and SFPs on 15m, 1h, 4h and 1d (ADR-037, [`structure`]), and the
 //! derivatives context: open interest, mark price and funding, and
 //! liquidation windows (ADR-042, [`derivatives`]), and the order book: the
@@ -20,7 +20,9 @@
 //! registered, versioned definition (ADR-029, [`feature`]).
 //! The engine computes one [`FeatureSet`] and stamps its
 //! [`FeatureSetVersion`] on every state; each feature value carries its
-//! validity ([`FeatureValue`]).
+//! validity ([`FeatureValue`]). The set is [`catalog::CURRENT`], or
+//! [`catalog::CURRENT`] with an older version from [`catalog::SELECTABLE`]
+//! ([`MarketStateEngine::with_features`], ADR-044 D10).
 //!
 //! [`bars`]: crate::bars
 //! [`derivatives`]: crate::derivatives
@@ -35,10 +37,12 @@
 use crate::bars::{Bar, BarError, BarSet, MAX_BARS_PER_EVENT, Timeframe};
 use crate::derivatives::{Derivatives, DerivativesError, DerivativesTracker};
 use crate::event::{MarketEvent, Stream};
-use crate::feature::{FeatureSet, FeatureSetVersion, FeatureValue, catalog};
+use crate::feature::{FeatureKey, FeatureSet, FeatureSetVersion, FeatureValue, catalog};
 use crate::flow::{FlowError, FlowTracker, OrderFlow};
 use crate::liquidity::{BookState, LiquidityError, LiquidityTracker};
-use crate::location::{self, LocationError, LocationEvent, LocationState, LocationTracker};
+use crate::location::{
+    self, LevelsVersion, LocationError, LocationEvent, LocationState, LocationTracker,
+};
 use crate::num::Price;
 use crate::order::CanonicalKey;
 use crate::profile::{ProfileError, ProfileTracker, VolumeProfiles};
@@ -87,8 +91,9 @@ pub struct MarketState {
     /// (ADR-023).
     pub flow: OrderFlow,
     /// Volume profiles (ADR-036): `profile.volume.utc_day@1`,
-    /// `profile.volume.prior_day@1` and `profile.volume.composite_5d@1` —
-    /// exact volume per 10 USDT bin with POC, value area, HVNs and LVNs.
+    /// `profile.volume.prior_day@1`, `profile.volume.composite_5d@1` and
+    /// `profile.volume.composite_7d@1` — exact volume per 10 USDT bin with
+    /// POC, value area, HVNs and LVNs.
     pub profile: VolumeProfiles,
     /// Market structure (ADR-037): `structure.swing.<tf>@1` and
     /// `structure.levels.<tf>@1` ([`catalog::STRUCTURE_SWING`],
@@ -115,8 +120,10 @@ pub struct MarketState {
     pub book: BookState,
     /// Location (ADR-044): `location.vwap.utc_day@1`, the volume-weighted
     /// average price of the current UTC day over its closed minutes, and
-    /// `location.levels@1`, the level registry with score components and
-    /// in-zone flags, rebuilt at each closed 1m bar with trades; and
+    /// `location.levels@2` (or `@1` when the engine selected it,
+    /// [`MarketStateEngine::with_features`]), the level registry with score
+    /// components and in-zone flags, rebuilt at each closed 1m bar with
+    /// trades; and
     /// `location.auction.prior_day@1`, the auction state against the prior
     /// day's value area. Location facts, never signals (ADR-012).
     pub location: LocationState,
@@ -261,7 +268,56 @@ impl MarketStateEngine {
     /// Creates an engine with an empty state that computes the current
     /// feature set ([`catalog::CURRENT`]).
     pub fn new() -> Self {
-        let features = catalog::current_set();
+        Self::build(catalog::current_set(), LevelsVersion::V2)
+    }
+
+    /// Creates an engine with an empty state that computes `features`:
+    /// [`catalog::CURRENT`] with any id at a [`catalog::SELECTABLE`]
+    /// version instead, such as `location.levels@1` (ADR-044 D10). The
+    /// state is stamped with the version of `features`, so experiments
+    /// recorded on an older version reproduce.
+    ///
+    /// # Errors
+    ///
+    /// - [`UnsupportedFeatureSet::NotComputed`] — a member at a version that
+    ///   is neither in [`catalog::CURRENT`] nor in [`catalog::SELECTABLE`]:
+    ///   this binary has no code path for it;
+    /// - [`UnsupportedFeatureSet::Missing`] — an id of
+    ///   [`catalog::CURRENT`] the set omits: the engine computes every
+    ///   family on every event, so the stamp would not name every value the
+    ///   state holds.
+    pub fn with_features(features: FeatureSet) -> Result<Self, UnsupportedFeatureSet> {
+        if let Some(definition) = features.definitions().find(|definition| {
+            !catalog::CURRENT.contains(&definition.key)
+                && !catalog::SELECTABLE.contains(&definition.key)
+        }) {
+            return Err(UnsupportedFeatureSet::NotComputed {
+                feature: definition.key,
+            });
+        }
+        if let Some(missing) = catalog::CURRENT.iter().find(|key| {
+            !features
+                .definitions()
+                .any(|definition| definition.key.id == key.id)
+        }) {
+            return Err(UnsupportedFeatureSet::Missing { feature: *missing });
+        }
+        // One version per id: the set holds `location.levels` at `@1` or at
+        // `@2`.
+        let levels = if features
+            .definitions()
+            .any(|definition| definition.key == catalog::LOCATION_LEVELS_V1.key)
+        {
+            LevelsVersion::V1
+        } else {
+            LevelsVersion::V2
+        };
+        Ok(Self::build(features, levels))
+    }
+
+    /// An engine with an empty state that computes `features`, its registry
+    /// at `levels`.
+    fn build(features: FeatureSet, levels: LevelsVersion) -> Self {
         let volatility = AtrRegimeSeries::new();
         let flow = FlowTracker::new();
         let derivatives = DerivativesTracker::new();
@@ -301,7 +357,7 @@ impl MarketStateEngine {
             structure_pending: Vec::new(),
             derivatives,
             liquidity: LiquidityTracker::new(),
-            location: LocationTracker::new(),
+            location: LocationTracker::new(levels),
             location_events: Vec::new(),
             location_pending: Vec::new(),
         }
@@ -677,6 +733,39 @@ impl fmt::Display for StateError {
 
 impl std::error::Error for StateError {}
 
+/// Why [`MarketStateEngine::with_features`] rejected a feature set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnsupportedFeatureSet {
+    /// The set holds a version this binary cannot compute: neither in
+    /// [`catalog::CURRENT`] nor in [`catalog::SELECTABLE`].
+    NotComputed {
+        /// The member.
+        feature: FeatureKey,
+    },
+    /// The set omits an id the engine always computes.
+    Missing {
+        /// The [`catalog::CURRENT`] key of the omitted id.
+        feature: FeatureKey,
+    },
+}
+
+impl fmt::Display for UnsupportedFeatureSet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotComputed { feature } => {
+                write!(f, "the engine cannot compute {feature}")
+            }
+            Self::Missing { feature } => write!(
+                f,
+                "the set omits {}, which the engine always computes ({feature})",
+                feature.id
+            ),
+        }
+    }
+}
+
+impl std::error::Error for UnsupportedFeatureSet {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -968,8 +1057,9 @@ mod tests {
              derivatives.mark@1,derivatives.oi.5m@1,derivatives.oi.sample@1,\
              flow.cvd.continuous@1,flow.cvd.utc_day@1,flow.window.15m@1,\
              flow.window.1h@1,flow.window.5m@1,location.auction.prior_day@1,\
-             location.levels@1,location.vwap.utc_day@1,profile.volume.composite_5d@1,\
-             profile.volume.prior_day@1,profile.volume.utc_day@1,\
+             location.levels@2,location.vwap.utc_day@1,profile.volume.composite_5d@1,\
+             profile.volume.composite_7d@1,profile.volume.prior_day@1,\
+             profile.volume.utc_day@1,\
              structure.levels.15m@1,structure.levels.1d@1,structure.levels.1h@1,\
              structure.levels.4h@1,structure.swing.15m@1,structure.swing.1d@1,\
              structure.swing.1h@1,structure.swing.4h@1,trade.last_price@1,\
@@ -1786,6 +1876,149 @@ mod tests {
             snapshot(2_000, 105),
             update(2_000, 106, 106, 105),
         ]);
+    }
+
+    /// The engine of `location.levels@1` (ADR-044 D10).
+    fn levels_v1_engine() -> MarketStateEngine {
+        let features = catalog::current_set_with(&[catalog::LOCATION_LEVELS_V1.key]).unwrap();
+        MarketStateEngine::with_features(features).unwrap()
+    }
+
+    #[test]
+    fn with_features_accepts_the_current_set_as_new_does() {
+        let engine = MarketStateEngine::with_features(catalog::current_set()).unwrap();
+        assert_eq!(engine.feature_set(), &catalog::current_set());
+        assert_eq!(engine.state(), MarketStateEngine::new().state());
+        let mut built = engine;
+        let mut new = MarketStateEngine::new();
+        for event in one_of_each(1_000) {
+            built.apply(&event).unwrap();
+            new.apply(&event).unwrap();
+            assert_eq!(built.state(), new.state());
+        }
+    }
+
+    #[test]
+    fn with_features_selects_location_levels_v1_and_stamps_its_set() {
+        let features = catalog::current_set_with(&[catalog::LOCATION_LEVELS_V1.key]).unwrap();
+        let engine = MarketStateEngine::with_features(features.clone()).unwrap();
+        assert_eq!(engine.feature_set(), &features);
+        assert_eq!(engine.state().feature_set, features.version());
+        assert_ne!(features.version(), catalog::current_set().version());
+        assert!(
+            features
+                .definitions()
+                .any(|definition| definition.key == catalog::LOCATION_LEVELS_V1.key)
+        );
+        // The registry carries the selected version.
+        let mut engine = engine;
+        engine.apply(&trade(1_000, 1)).unwrap();
+        engine.apply(&trade(61_000, 2)).unwrap();
+        let set = engine.state().location.levels.ready().unwrap();
+        assert_eq!(set.feature, catalog::LOCATION_LEVELS_V1.key);
+        let mut current = MarketStateEngine::new();
+        current.apply(&trade(1_000, 1)).unwrap();
+        current.apply(&trade(61_000, 2)).unwrap();
+        let set = current.state().location.levels.ready().unwrap();
+        assert_eq!(set.feature, catalog::LOCATION_LEVELS_V2.key);
+    }
+
+    #[test]
+    fn with_features_refuses_a_set_without_an_always_computed_id() {
+        // The default set before #96: closed, but without
+        // `profile.volume.composite_7d@1`, which the engine computes anyway.
+        let keys: Vec<FeatureKey> = catalog::current_set_with(&[catalog::LOCATION_LEVELS_V1.key])
+            .unwrap()
+            .definitions()
+            .map(|definition| definition.key)
+            .filter(|key| *key != catalog::PROFILE_VOLUME_COMPOSITE_7D_V1.key)
+            .collect();
+        let set = FeatureSet::new(&catalog::registry(), &keys).unwrap();
+        let error = MarketStateEngine::with_features(set).unwrap_err();
+        assert_eq!(
+            error,
+            UnsupportedFeatureSet::Missing {
+                feature: catalog::PROFILE_VOLUME_COMPOSITE_7D_V1.key
+            }
+        );
+        assert_eq!(
+            error.to_string(),
+            "the set omits profile.volume.composite_7d, which the engine always computes \
+             (profile.volume.composite_7d@1)"
+        );
+    }
+
+    /// `trade.last_price@2`: registered, but not computed by the engine.
+    static TRADE_LAST_PRICE_V2: crate::feature::FeatureDefinition =
+        crate::feature::FeatureDefinition {
+            key: FeatureKey::new("trade.last_price", 2),
+            params: &[],
+            inputs: &[crate::feature::Input::Stream(Stream::Trades)],
+            warm_up: crate::feature::WarmUp::Samples(2),
+        };
+
+    #[test]
+    fn with_features_refuses_a_version_it_cannot_compute() {
+        let mut definitions = catalog::DEFINITIONS.to_vec();
+        definitions.push(&TRADE_LAST_PRICE_V2);
+        let registry = crate::feature::FeatureRegistry::new(&definitions).unwrap();
+        let keys: Vec<FeatureKey> = catalog::CURRENT
+            .iter()
+            .map(|key| {
+                if *key == catalog::TRADE_LAST_PRICE_V1.key {
+                    TRADE_LAST_PRICE_V2.key
+                } else {
+                    *key
+                }
+            })
+            .collect();
+        let set = FeatureSet::new(&registry, &keys).unwrap();
+        let error = MarketStateEngine::with_features(set).unwrap_err();
+        assert_eq!(
+            error,
+            UnsupportedFeatureSet::NotComputed {
+                feature: TRADE_LAST_PRICE_V2.key
+            }
+        );
+        assert_eq!(
+            error.to_string(),
+            "the engine cannot compute trade.last_price@2"
+        );
+    }
+
+    #[test]
+    fn v1_and_v2_differ_only_in_the_registry() {
+        // ADR-044 D10 and the #96 rule I: `@2` changes only the composite
+        // that feeds the registry, so with the stamp and the registry set
+        // equal the two states are equal after every event, and the
+        // auction facts are the same.
+        let mut v1 = levels_v1_engine();
+        let mut v2 = MarketStateEngine::new();
+        let mut differed = 0;
+        let auction = |engine: &MarketStateEngine| -> Vec<LocationEvent> {
+            engine
+                .location_events()
+                .iter()
+                .filter(|fact| matches!(fact, LocationEvent::Auction { .. }))
+                .copied()
+                .collect()
+        };
+        for event in crate::location::tests::walk_tape(0x6d69_6500_0000_0096, 10) {
+            v1.apply(&event).unwrap();
+            v2.apply(&event).unwrap();
+            let mut aligned = v1.state().clone();
+            assert_ne!(aligned.feature_set, v2.state().feature_set);
+            aligned.feature_set = v2.state().feature_set;
+            if aligned.location.levels != v2.state().location.levels {
+                differed += 1;
+            }
+            aligned.location.levels = v2.state().location.levels.clone();
+            assert_eq!(&aligned, v2.state(), "{}", event.time());
+            assert_eq!(auction(&v1), auction(&v2), "{}", event.time());
+        }
+        // The registries do differ once a composite is ready.
+        assert!(v2.state().profile.composite_7d.is_ready());
+        assert!(differed > 1_000, "{differed}");
     }
 
     #[test]

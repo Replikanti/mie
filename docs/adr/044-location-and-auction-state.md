@@ -22,16 +22,19 @@ What exists:
   highs and lows, prior sweeps, SFP rejection zones per timeframe, ADR-037)
   and `SideClusters` (the five largest book levels per side within 5 bps,
   ADR-043). ADR-043 left the cluster threshold to this issue.
-- Event-time bars on six timeframes (ADR-031); the developing, prior-day
-  and 5-day composite volume profiles over UTC days (ADR-036).
+- Event-time bars on six timeframes (ADR-031); the developing, prior-day,
+  5-day and 7-day composite volume profiles over UTC days (ADR-036).
 - The Market State hash (ADR-041), the feature registry with its lock and
   goldens (ADR-029), exact fixed point (ADR-027), one domain path for live
   and replay (ADR-019), measured contribution before any weight (ADR-013).
 
 The inputs of ADR-036 and ADR-037 (bin, 70 % value area, structure `N`,
 `K` and tolerance) are under audit in #70. Location builds on their `@1`
-versions; an upstream `@2` means a `location.*@2` and a re-run of the
-measurement tool. Nothing changes silently.
+versions; an upstream `@2` or a new upstream id means a `location.*@2` and
+a re-run of the measurement tool. Nothing changes silently. The first such
+change is #96: ADR-036 moved the composite location reads from 5 to 7 days
+(a new id, `profile.volume.composite_7d@1`, ADR-036 decision 2), so
+`location.levels@2` consumes it and M3 is re-run (D5, D10).
 
 ### Measurements behind the numbers
 
@@ -227,10 +230,15 @@ of #12, 2025-10-01 … 2026-09-30 (`docs/data-availability.md`).
    - Warm-up `Samples(1)`, a closed minute of the day with volume; it
      restarts each UTC day. No bands and no prior-day VWAP in `@1`
      (ADR-013: none is measured yet).
-5. **Level registry `location.levels@1`**, rebuilt at each closed 1m bar
-   with trades from:
-   - `profile.volume.prior_day@1` and `profile.volume.composite_5d@1`: POC,
-     VAL, VAH, HVN and LVN (`VolumeProfile::levels`);
+5. **Level registry `location.levels@2`** (and `@1`), rebuilt at each
+   closed 1m bar with trades from:
+   - `profile.volume.prior_day@1` and one composite profile: POC, VAL, VAH,
+     HVN and LVN (`VolumeProfile::levels`). `@2` sources
+     `profile.volume.composite_7d@1`, `@1` sources
+     `profile.volume.composite_5d@1`; nothing else differs between them.
+     The reason for 7 days is ADR-036 decision 2: a 7-day window holds
+     every weekday once, so the composite's levels no longer move with the
+     weekday they are computed on;
    - `structure.levels.<15m|1h|4h|1d>@1`: structural highs and lows, prior
      sweeps and SFP rejection zones (`LevelRegistry::levels`);
    - `book.clusters@1`: each top-5 candidate per side as `LiquidityCluster`,
@@ -281,7 +289,8 @@ of #12, 2025-10-01 … 2026-09-30 (`docs/data-availability.md`).
    value area `[VAL, VAH)` (ADR-036).
    - *Why the prior day:* the developing day's value contains price by
      construction, which makes the classification tautological.
-     `composite_5d` gets its own id if research asks for it (ADR-013).
+     The composite (`composite_7d@1`) gets its own id if research asks for
+     it (ADR-013).
    - Regions of a close `c` (exact, D3): Above `c > VAH + w`; Below
      `c < VAL − w`; In `VAL + w < c < VAH − w`; otherwise neutral, in an edge
      band.
@@ -356,12 +365,33 @@ of #12, 2025-10-01 … 2026-09-30 (`docs/data-availability.md`).
     | Feature | Parameters | Inputs | Warm-up |
     |---|---|---|---|
     | `location.vwap.utc_day@1` | `rounding` `floor`, `session_ms` 86 400 000 | trades, `bars.time.1m@1` | `Samples(1)` |
-    | `location.levels@1` | `confluence_rule` `other_source_within_tolerance`, `tolerance` 0.0006, `zone_rule` `bar_range_overlap` | the eight D5 sources, `bars.time.1m@1` | `Samples(1)`: a closed 1m bar with trades |
+    | `location.levels@1` | `confluence_rule` `other_source_within_tolerance`, `tolerance` 0.0006, `zone_rule` `bar_range_overlap` | the eight D5 sources with `profile.volume.composite_5d@1`, `bars.time.1m@1` | `Samples(1)`: a closed 1m bar with trades |
+    | `location.levels@2` | as `@1` | as `@1`, with `profile.volume.composite_7d@1` in place of `composite_5d@1` | as `@1` |
     | `location.auction.prior_day@1` | `acceptance_closes` 60, `tolerance` 0.0006 | `profile.volume.prior_day@1`, `bars.time.1m@1` | `Samples(1)`: a closed 1m bar with trades under a ready reference |
 
     The classifier is a separate id so that recalibrating `N_acc` re-versions
     only the classifier (ADR-037 D10 reasoning). `MarketState.location` is
     declared after `book` and hashed (ADR-041 D1).
+
+    `location.levels@2` replaces `@1` in the default feature set
+    (`catalog::CURRENT`). `@1` stays computable, as ADR-029 D3 requires of
+    every published version, and keeps its golden test byte for byte:
+    `MarketStateEngine::with_features` builds an engine for `CURRENT` with
+    any id at a version listed in `catalog::SELECTABLE` instead, today only
+    `location.levels@1`, and stamps the state with that set's version. It
+    rejects a set that holds a version this binary has no code path for
+    (`NotComputed`) and a set that omits an id the engine computes anyway
+    (`Missing`): the engine computes every family on every event, so such a
+    stamp would not name every value the state holds. The engine keeps the
+    registry version as state (not hashed: the stamp names it), and the two
+    versions differ only in the composite the registry reads, which
+    `v1_and_v2_differ_only_in_the_registry` checks on a ten-day tape. This
+    is the selector ADR-029 *Consequences* announced for the first `@2`.
+    - *Rejected:* a test-only selector — `@1` would be computable in tests
+      only, so an experiment recorded on it could not reproduce outside
+      them; a general per-feature switch — it has no consumer yet and would
+      make every tracker optional. Wiring the selector into the experiment
+      service is out of scope (ADR-040 D4).
 
 ## Consequences
 
@@ -390,9 +420,9 @@ of #12, 2025-10-01 … 2026-09-30 (`docs/data-availability.md`).
 - **A weighted scalar score** (D6): rejected; weights are #31's output.
 - **Volume-based acceptance** (D8): rejected for `@1`; no measured
   denominator.
-- **The developing day or the 5-day composite as the auction reference**
-  (D8): tautological for the developing day; the composite can get its own
-  id when research asks.
+- **The developing day or the composite (`composite_7d@1`) as the auction
+  reference** (D8): tautological for the developing day; the composite can
+  get its own id when research asks.
 - **A cluster threshold** (D5): rejected; it would be an unmeasured number.
 
 ## Accept when

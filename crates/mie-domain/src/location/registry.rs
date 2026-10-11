@@ -1,14 +1,15 @@
-//! The level registry `location.levels@1`: every level location monitors,
+//! The level registry `location.levels`: every level location monitors,
 //! with its score components and the monitored-zone events (ADR-044,
-//! decisions 5–7).
+//! decisions 5–7). `@2` reads the 7-day composite profile, `@1` the 5-day
+//! one; nothing else differs ([`LevelsVersion`]).
 //!
 //! The registry is rebuilt from its sources at every closed 1m bar with
 //! trades. A level keeps its registration time, touches and in-zone flag
 //! across rebuilds through its identity; nothing is hash-ordered.
 
-use super::{LevelKind, TOLERANCE_BPS, Vwap, within};
+use super::{LevelKind, LevelsVersion, TOLERANCE_BPS, Vwap, within};
 use crate::bars::{Bar, Ohlc};
-use crate::feature::{FeatureKey, FeatureValue, catalog};
+use crate::feature::{FeatureKey, FeatureValue};
 use crate::fingerprint::Fingerprinter;
 use crate::liquidity::{BookClusters, BookState};
 use crate::num::{Price, Qty};
@@ -310,8 +311,8 @@ fn source_groups(levels: &[LocationLevel]) -> (Vec<usize>, usize) {
     (groups, keys.len())
 }
 
-/// The level registry after a closed 1m bar: one `location.levels@1` value
-/// (decisions 5–7).
+/// The level registry after a closed 1m bar: one `location.levels@1` or
+/// `location.levels@2` value (decisions 5–7), named by [`Self::feature`].
 ///
 /// `Display` prints the canonical line the golden tests pin: the close, the
 /// level count, the levels in zone and the three nearest, then the feature
@@ -415,16 +416,18 @@ pub(super) struct ZoneEvents {
 }
 
 /// The levels of every source after the last commit (decision 5), not yet
-/// registered: the prior-day and 5-day composite profiles, the structure
-/// registries, the book's cluster candidates and the VWAP.
+/// registered: the prior-day profile and the composite profile of
+/// `version`, the structure registries, the book's cluster candidates and
+/// the VWAP.
 pub(super) fn sourced(
     profile: &VolumeProfiles,
     structure: &StructureSet,
     book: &BookState,
     vwap: &FeatureValue<Vwap>,
+    version: LevelsVersion,
 ) -> Vec<LocationLevel> {
     let mut levels = Vec::new();
-    for value in [&profile.prior_day, &profile.composite_5d] {
+    for value in [&profile.prior_day, version.composite(profile)] {
         if let FeatureValue::Ready(profile) = value {
             levels.extend(profile.levels().map(|level| {
                 LocationLevel::sourced(
@@ -573,14 +576,15 @@ fn fill_confluence(levels: &mut [LocationLevel], tolerance_bps: i64) {
 
 /// Rebuilds the registry from `sourced` at the closed 1m bar `bar` (with
 /// trades), carried by the event at `known_at`, against the previous
-/// registry `previous` (decisions 5–7). Integer arithmetic and moves only:
-/// it cannot fail.
+/// registry `previous` (decisions 5–7), as the feature of `version`.
+/// Integer arithmetic and moves only: it cannot fail.
 pub(super) fn rebuild(
     previous: Option<&LevelSet>,
     sourced: Vec<LocationLevel>,
     bar: &Bar,
     ohlc: &Ohlc,
     known_at: EventTime,
+    version: LevelsVersion,
 ) -> (LevelSet, ZoneEvents) {
     // Sorted indices, vectors and binary searches instead of maps: this
     // runs at every closed minute over a few hundred levels.
@@ -644,7 +648,7 @@ pub(super) fn rebuild(
             .collect(),
     };
     let set = LevelSet {
-        feature: catalog::LOCATION_LEVELS_V1.key,
+        feature: version.key(),
         close: ohlc.close,
         bar_end: bar.end(),
         known_at,
@@ -660,6 +664,7 @@ mod tests {
     use crate::bars::{Coverage, Timeframe};
     use crate::event::MarketEvent;
     use crate::event::samples::{t, trade as sample_trade};
+    use crate::feature::catalog;
     use crate::location::LocationEvent;
     use crate::location::tests::walk_tape;
     use crate::state::MarketStateEngine;
@@ -710,6 +715,7 @@ mod tests {
             &bar,
             &ohlc,
             t((minute + 1) * 60_000 + 1_000),
+            LevelsVersion::V1,
         )
     }
 
@@ -1107,13 +1113,15 @@ mod tests {
         assert!(clusters.iter().all(|level| level.confluence == 1));
     }
 
-    #[test]
-    fn golden_location_levels_v1() {
-        let mut engine = MarketStateEngine::new();
+    /// One line per event of `walk_tape(0x6d69_6500_0000_0044, days)` that
+    /// closed a 4h bar with the registry ready: the event time, the
+    /// registry and its state encoding; then the count and digest of every
+    /// zone fact.
+    fn golden_lines(mut engine: MarketStateEngine, days: i64) -> Vec<String> {
         let mut lines = Vec::new();
         let mut facts = Fingerprinter::new();
         let mut fact_count = 0;
-        for event in walk_tape(0x6d69_6500_0000_0044, 7) {
+        for event in walk_tape(0x6d69_6500_0000_0044, days) {
             engine.apply(&event).unwrap();
             for fact in engine.location_events() {
                 if matches!(fact, LocationEvent::Auction { .. }) {
@@ -1133,8 +1141,132 @@ mod tests {
             }
         }
         lines.push(format!("facts={fact_count} {}", facts.finish()));
-        assert_eq!(lines, GOLDEN_LEVELS);
+        lines
     }
+
+    /// The engine of `location.levels@1` (ADR-044 D10).
+    fn levels_v1_engine() -> MarketStateEngine {
+        let features = catalog::current_set_with(&[catalog::LOCATION_LEVELS_V1.key]).unwrap();
+        MarketStateEngine::with_features(features).unwrap()
+    }
+
+    #[test]
+    fn golden_location_levels_v1() {
+        assert_eq!(golden_lines(levels_v1_engine(), 7), GOLDEN_LEVELS);
+    }
+
+    #[test]
+    fn golden_location_levels_v2() {
+        // Ten days: the 7-day composite is ready from the close of day 6.
+        assert_eq!(golden_lines(MarketStateEngine::new(), 10), GOLDEN_LEVELS_V2);
+    }
+
+    #[test]
+    fn levels_v2_source_the_7d_composite() {
+        // The #96 rule S: each version reads its own composite and never
+        // the other one; a ready composite hands over at least its POC, VAL
+        // and VAH, three distinct identities.
+        let composite_5d = catalog::PROFILE_VOLUME_COMPOSITE_5D_V1.key;
+        let composite_7d = catalog::PROFILE_VOLUME_COMPOSITE_7D_V1.key;
+        for (mut engine, own, other) in [
+            (MarketStateEngine::new(), composite_7d, composite_5d),
+            (levels_v1_engine(), composite_5d, composite_7d),
+        ] {
+            let (mut rebuilds, mut ready) = (0, 0);
+            for event in walk_tape(0x6d69_6500_0000_0044, 10) {
+                engine.apply(&event).unwrap();
+                let state = engine.state();
+                let FeatureValue::Ready(set) = &state.location.levels else {
+                    continue;
+                };
+                if set.known_at != event.time() {
+                    continue;
+                }
+                rebuilds += 1;
+                let from = |source: FeatureKey| {
+                    set.levels()
+                        .iter()
+                        .filter(|level| level.source == source)
+                        .count()
+                };
+                assert_eq!(from(other), 0, "{} {set}", event.time());
+                let composite = if own == composite_7d {
+                    &state.profile.composite_7d
+                } else {
+                    &state.profile.composite_5d
+                };
+                if composite.is_ready() {
+                    ready += 1;
+                    assert!(from(own) >= 3, "{} {set}", event.time());
+                } else {
+                    assert_eq!(from(own), 0, "{} {set}", event.time());
+                }
+            }
+            assert!(rebuilds > 5_000, "{own}: {rebuilds}");
+            assert!(ready > 1_000, "{own}: {ready}");
+        }
+    }
+
+    const GOLDEN_LEVELS_V2: [&str; 58] = [
+        "57643383ms close=61952.09000000 levels=2 in=- nearest=vwap@61863.66256600:-88.42743400,structural_low@61676.70000000:-275.39000000 location.levels@2 22541c570c1c9644",
+        "72037693ms close=61233.69000000 levels=3 in=- nearest=prior_sweep@61676.70000000:443.01000000,vwap@61863.49739924:629.80739924,structural_high@62106.60000000:872.91000000 location.levels@2 310ac29d44a88942",
+        "86420258ms close=61406.66000000 levels=20 in=- nearest=hvn@61475.00000000:63.34000000,lvn@61505.00000000:93.34000000,hvn@61535.00000000:123.34000000 location.levels@2 d02f9fc401ae3916",
+        "100836539ms close=61691.19000000 levels=23 in=prior_sweep@61676.70000000,hvn@61725.00000000 nearest=prior_sweep@61676.70000000:-14.49000000,hvn@61725.00000000:28.81000000,lvn@61765.00000000:68.81000000 location.levels@2 c4253f7d433881aa",
+        "115203856ms close=61421.65000000 levels=28 in=prior_sweep@61406.66000000 nearest=prior_sweep@61406.66000000:-14.99000000,hvn@61475.00000000:48.35000000,lvn@61505.00000000:78.35000000 location.levels@2 45566bf22368408b",
+        "129605687ms close=61805.33000000 levels=33 in=lvn@61765.00000000,prior_sweep@61812.25000000,sfp_zone@61812.25000000,poc@61825.00000000,hvn@61825.00000000 nearest=prior_sweep@61812.25000000:6.92000000,sfp_zone@61812.25000000:6.92000000,poc@61825.00000000:14.67000000 location.levels@2 951d4c471d586985",
+        "144000697ms close=61915.17000000 levels=36 in=lvn@61875.00000000,hvn@61935.00000000 nearest=hvn@61935.00000000:14.83000000,lvn@61875.00000000:-35.17000000,lvn@61965.00000000:44.83000000 location.levels@2 ac8072fba63b1c92",
+        "158415979ms close=62326.31000000 levels=40 in=- nearest=sfp_zone@62106.60000000:-204.84000000,prior_sweep@62106.60000000:-219.71000000,prior_sweep@62106.60000000:-219.71000000 location.levels@2 93a833482212273a",
+        "172814127ms close=62008.11000000 levels=43 in=lvn@61975.00000000,hvn@62005.00000000,prior_sweep@62029.35000000,prior_sweep@62029.35000000,vah@62040.00000000 nearest=hvn@62005.00000000:0.00000000,prior_sweep@62029.35000000:21.24000000,prior_sweep@62029.35000000:21.24000000 location.levels@2 525dd671d43f95d1",
+        "187223532ms close=61992.57000000 levels=47 in=lvn@61975.00000000,hvn@62005.00000000,prior_sweep@62029.35000000,prior_sweep@62029.35000000,vah@62040.00000000 nearest=hvn@62005.00000000:7.43000000,lvn@61975.00000000:-12.57000000,prior_sweep@62029.35000000:36.78000000 location.levels@2 9e8ead3d7392dc44",
+        "201601106ms close=61709.80000000 levels=50 in=prior_sweep@61676.70000000 nearest=prior_sweep@61676.70000000:-33.10000000,sfp_zone@61760.67000000:49.35000000,prior_sweep@61760.67000000:50.87000000 location.levels@2 c3a4e9781dad981f",
+        "216021184ms close=61646.12000000 levels=54 in=prior_sweep@61676.70000000 nearest=prior_sweep@61676.70000000:30.58000000,lvn@61595.00000000:-46.12000000,prior_sweep@61705.73000000:59.61000000 location.levels@2 036769ee59728a70",
+        "230456871ms close=62143.09000000 levels=62 in=hvn@62105.00000000,prior_sweep@62106.60000000,prior_sweep@62106.60000000,sfp_zone@62106.60000000,prior_sweep@62125.82000000,prior_sweep@62165.30000000 nearest=prior_sweep@62125.82000000:-17.27000000,sfp_zone@62106.60000000:-21.62000000,prior_sweep@62165.30000000:22.21000000 location.levels@2 ff5d107102aa9b1e",
+        "244853059ms close=61896.28000000 levels=66 in=prior_sweep@61925.66000000 nearest=prior_sweep@61925.66000000:29.38000000,prior_sweep@61859.13000000:-37.15000000,sfp_zone@61812.25000000:-70.20000000 location.levels@2 835c6bdfffe9408b",
+        "259217962ms close=62116.57000000 levels=68 in=poc@62105.00000000,hvn@62105.00000000,prior_sweep@62106.60000000,prior_sweep@62106.60000000,sfp_zone@62106.60000000,prior_sweep@62125.82000000,prior_sweep@62144.24000000,sfp_zone@62144.24000000,structural_high@62146.34000000 nearest=sfp_zone@62106.60000000:0.00000000,poc@62105.00000000:-6.57000000,hvn@62105.00000000:-6.57000000 location.levels@2 aaf1a09314fa5be3",
+        "273630147ms close=61914.02000000 levels=73 in=hvn@61895.00000000,lvn@61925.00000000,prior_sweep@61925.66000000 nearest=lvn@61925.00000000:5.98000000,prior_sweep@61925.66000000:11.64000000,hvn@61895.00000000:-14.02000000 location.levels@2 0b691cd13cba8261",
+        "288002592ms close=62161.83000000 levels=74 in=prior_sweep@62125.82000000,prior_sweep@62144.24000000,sfp_zone@62144.24000000,prior_sweep@62146.34000000,prior_sweep@62146.34000000,prior_sweep@62165.30000000 nearest=prior_sweep@62165.30000000:3.47000000,sfp_zone@62144.24000000:-15.49000000,prior_sweep@62146.34000000:-15.49000000 location.levels@2 acf30e02f1f5dcf2",
+        "302429455ms close=61641.91000000 levels=78 in=sfp_zone@61644.12000000,sfp_zone@61750.57000000,lvn@61635.00000000,prior_sweep@61644.12000000,prior_sweep@61644.12000000,sfp_zone@61705.73000000,sfp_zone@61705.73000000 nearest=sfp_zone@61644.12000000:0.00000000,sfp_zone@61750.57000000:0.00000000,lvn@61635.00000000:-1.91000000 location.levels@2 3e37bb588bd7c1a6",
+        "316812845ms close=62038.16000000 levels=80 in=prior_sweep@62029.35000000,prior_sweep@62029.35000000 nearest=prior_sweep@62029.35000000:-8.81000000,prior_sweep@62029.35000000:-8.81000000,poc@62105.00000000:61.84000000 location.levels@2 ec1ca4bc2c6fac85",
+        "331208612ms close=61609.72000000 levels=81 in=sfp_zone@61578.84000000,sfp_zone@61644.12000000,sfp_zone@61750.57000000,prior_sweep@61578.84000000,prior_sweep@61578.84000000,prior_sweep@61584.30000000,prior_sweep@61614.20000000,prior_sweep@61614.20000000,lvn@61635.00000000,prior_sweep@61644.12000000,prior_sweep@61644.12000000,sfp_zone@61705.73000000,sfp_zone@61705.73000000 nearest=sfp_zone@61644.12000000:0.00000000,sfp_zone@61750.57000000:0.00000000,prior_sweep@61614.20000000:4.48000000 location.levels@2 2d418bfbcf6f122a",
+        "345626979ms close=61616.41000000 levels=87 in=sfp_zone@61644.12000000,sfp_zone@61750.57000000,prior_sweep@61584.30000000,structural_low@61594.26000000,structural_low@61594.26000000,sfp_zone@61614.20000000,sfp_zone@61614.20000000,prior_sweep@61614.20000000,prior_sweep@61614.20000000,prior_sweep@61644.12000000,prior_sweep@61644.12000000,sfp_zone@61705.73000000,sfp_zone@61705.73000000 nearest=sfp_zone@61644.12000000:0.00000000,sfp_zone@61750.57000000:0.00000000,sfp_zone@61614.20000000:-2.21000000 location.levels@2 6773af8a18518166",
+        "360012485ms close=62372.59000000 levels=87 in=sfp_zone@62312.18000000,prior_sweep@62343.34000000,prior_sweep@62343.34000000,prior_sweep@62343.35000000,prior_sweep@62343.35000000,prior_sweep@62343.35000000,sfp_zone@62343.35000000,sfp_zone@62343.35000000,prior_sweep@62402.12000000,prior_sweep@62402.12000000,prior_sweep@62402.12000000,sfp_zone@62402.12000000 nearest=sfp_zone@62312.18000000:0.00000000,sfp_zone@62343.35000000:0.00000000,sfp_zone@62343.35000000:0.00000000 location.levels@2 45798d9567831512",
+        "374407905ms close=62483.55000000 levels=91 in=sfp_zone@62402.12000000,structural_high@62530.70000000 nearest=sfp_zone@62402.12000000:0.00000000,structural_high@62530.70000000:47.15000000,sfp_zone@62312.18000000:-81.43000000 location.levels@2 70b5a62e972d86a9",
+        "388829346ms close=62816.00000000 levels=91 in=- nearest=structural_high@62933.74000000:117.74000000,sfp_zone@62402.12000000:-220.82000000,prior_sweep@62595.18000000:-220.82000000 location.levels@2 5064869e2e3a0489",
+        "403205890ms close=62478.79000000 levels=91 in=sfp_zone@62402.12000000 nearest=sfp_zone@62402.12000000:0.00000000,vwap@62430.06359953:-48.72640047,prior_sweep@62530.70000000:51.91000000 location.levels@2 ec73178b81e47f4f",
+        "417615844ms close=62383.48000000 levels=92 in=sfp_zone@62312.18000000,sfp_zone@62343.35000000,sfp_zone@62343.35000000,vwap@62386.66299949,prior_sweep@62402.12000000,prior_sweep@62402.12000000,prior_sweep@62402.12000000,sfp_zone@62402.12000000 nearest=sfp_zone@62312.18000000:0.00000000,sfp_zone@62343.35000000:0.00000000,sfp_zone@62343.35000000:0.00000000 location.levels@2 46087ba93ee69f44",
+        "432006040ms close=61903.49000000 levels=94 in=sfp_zone@61867.24000000,prior_sweep@61867.24000000,prior_sweep@61867.24000000,sfp_zone@62018.22000000,hvn@61885.00000000,prior_sweep@61931.21000000 nearest=sfp_zone@62018.22000000:0.00000000,hvn@61885.00000000:-13.49000000,prior_sweep@61931.21000000:27.72000000 location.levels@2 3a32a374d2b16e8f",
+        "446416920ms close=61935.23000000 levels=92 in=sfp_zone@62018.22000000,prior_sweep@61906.93000000,prior_sweep@61931.21000000,prior_sweep@61943.13000000,prior_sweep@61958.18000000,lvn@61965.00000000 nearest=sfp_zone@62018.22000000:0.00000000,prior_sweep@61931.21000000:-4.02000000,prior_sweep@61943.13000000:7.90000000 location.levels@2 d917a0ae4576940c",
+        "460829548ms close=61459.71000000 levels=92 in=structural_low@61435.04000000,structural_low@61435.04000000,structural_low@61435.04000000,sfp_zone@61471.38000000,sfp_zone@61530.85000000,prior_sweep@61471.38000000,prior_sweep@61471.39000000,prior_sweep@61471.39000000,sfp_zone@61578.84000000,prior_sweep@61488.78000000,prior_sweep@61488.78000000,sfp_zone@61594.26000000,sfp_zone@61609.65000000 nearest=sfp_zone@61471.38000000:0.00000000,sfp_zone@61530.85000000:0.00000000,prior_sweep@61471.38000000:11.67000000 location.levels@2 2ad454ed46b093fa",
+        "475232978ms close=61579.16000000 levels=95 in=sfp_zone@61578.84000000,sfp_zone@61594.26000000,sfp_zone@61609.65000000,sfp_zone@61644.12000000,sfp_zone@61750.57000000,prior_sweep@61578.84000000,prior_sweep@61578.84000000,prior_sweep@61594.26000000,prior_sweep@61594.26000000,sfp_zone@61614.20000000,sfp_zone@61614.20000000,prior_sweep@61609.65000000,prior_sweep@61609.65000000,prior_sweep@61614.20000000,prior_sweep@61614.20000000 nearest=sfp_zone@61594.26000000:0.00000000,sfp_zone@61609.65000000:0.00000000,sfp_zone@61644.12000000:0.00000000 location.levels@2 6a138551425861c2",
+        "489609614ms close=61937.89000000 levels=95 in=sfp_zone@62018.22000000,prior_sweep@61906.93000000,prior_sweep@61943.13000000,lvn@61965.00000000 nearest=sfp_zone@62018.22000000:0.00000000,prior_sweep@61943.13000000:5.24000000,lvn@61965.00000000:22.11000000 location.levels@2 85dd1738c45ea70e",
+        "504002804ms close=61757.72000000 levels=99 in=sfp_zone@61750.57000000,sfp_zone@61867.24000000,hvn@61755.00000000,prior_sweep@61750.57000000,lvn@61795.00000000 nearest=sfp_zone@61867.24000000:0.00000000,hvn@61755.00000000:0.00000000,sfp_zone@61750.57000000:-7.15000000 location.levels@2 8f0a94eb3676543c",
+        "518408813ms close=62230.26000000 levels=99 in=sfp_zone@62159.22000000,prior_sweep@62210.85000000,prior_sweep@62210.85000000,lvn@62235.00000000,prior_sweep@62230.87000000,hvn@62265.00000000 nearest=lvn@62235.00000000:0.00000000,prior_sweep@62230.87000000:0.61000000,sfp_zone@62159.22000000:-19.41000000 location.levels@2 8ab2466507cb6192",
+        "532802072ms close=62012.60000000 levels=102 in=sfp_zone@62018.22000000,lvn@61985.00000000,prior_sweep@61991.26000000,prior_sweep@62018.22000000,prior_sweep@62018.22000000,hvn@62025.00000000,vwap@62024.35628948,prior_sweep@62032.86000000,sfp_zone@62032.86000000 nearest=sfp_zone@62018.22000000:0.00000000,prior_sweep@62018.22000000:5.62000000,prior_sweep@62018.22000000:5.62000000 location.levels@2 ae727ef9916beaef",
+        "547205592ms close=62238.17000000 levels=102 in=sfp_zone@62159.22000000,prior_sweep@62210.85000000,prior_sweep@62210.85000000,lvn@62235.00000000,prior_sweep@62230.87000000,hvn@62265.00000000,structural_high@62282.58000000,structural_high@62282.58000000 nearest=lvn@62235.00000000:0.00000000,prior_sweep@62230.87000000:-7.30000000,hvn@62265.00000000:21.83000000 location.levels@2 1b320d813dbd60fc",
+        "561611926ms close=61608.87000000 levels=97 in=sfp_zone@61578.84000000,sfp_zone@61594.26000000,sfp_zone@61609.65000000,prior_sweep@61578.84000000,prior_sweep@61579.16000000,prior_sweep@61594.26000000,prior_sweep@61594.26000000,sfp_zone@61614.20000000,prior_sweep@61609.65000000,prior_sweep@61609.65000000,prior_sweep@61614.20000000,prior_sweep@61623.42000000,prior_sweep@61623.42000000,hvn@61645.00000000 nearest=sfp_zone@61609.65000000:0.00000000,sfp_zone@61614.20000000:0.00000000,prior_sweep@61609.65000000:0.78000000 location.levels@2 a93d90bc8aad7227",
+        "576009400ms close=61926.26000000 levels=99 in=sfp_zone@62018.22000000,hvn@61885.00000000,lvn@61925.00000000,hvn@61955.00000000 nearest=sfp_zone@62018.22000000:0.00000000,lvn@61925.00000000:0.00000000,hvn@61955.00000000:23.74000000 location.levels@2 5b29edf3dbfd3a11",
+        "590417633ms close=61384.82000000 levels=100 in=structural_low@61356.52000000,structural_low@61356.52000000,sfp_zone@61419.92000000,sfp_zone@61435.04000000,sfp_zone@61435.04000000,sfp_zone@61456.17000000,sfp_zone@61456.17000000,sfp_zone@61467.24000000,prior_sweep@61419.92000000,prior_sweep@61419.92000000 nearest=sfp_zone@61419.92000000:0.00000000,sfp_zone@61435.04000000:0.00000000,sfp_zone@61435.04000000:0.00000000 location.levels@2 50af9bd95283a555",
+        "604819944ms close=61623.97000000 levels=110 in=sfp_zone@61594.26000000,sfp_zone@61609.65000000,val@61590.00000000,prior_sweep@61594.26000000,prior_sweep@61594.26000000,sfp_zone@61614.20000000,prior_sweep@61609.65000000,prior_sweep@61614.20000000,val@61620.00000000,prior_sweep@61623.42000000,prior_sweep@61623.42000000 nearest=val@61620.00000000:0.00000000,prior_sweep@61623.42000000:-0.55000000,prior_sweep@61623.42000000:-0.55000000 location.levels@2 0669c10e6b11e3d0",
+        "619250416ms close=61977.95000000 levels=112 in=sfp_zone@62018.22000000,lvn@61955.00000000,lvn@61965.00000000,prior_sweep@61991.26000000,hvn@62005.00000000,hvn@62015.00000000 nearest=sfp_zone@62018.22000000:0.00000000,lvn@61965.00000000:-7.95000000,prior_sweep@61991.26000000:13.31000000 location.levels@2 966f2cc59b2522d5",
+        "633605186ms close=62009.61000000 levels=117 in=sfp_zone@62018.22000000,lvn@61965.00000000,vwap@61983.23811740,structural_low@61984.89000000,prior_sweep@61991.26000000,hvn@62005.00000000,hvn@62015.00000000,prior_sweep@62018.22000000,prior_sweep@62032.86000000,sfp_zone@62032.86000000,prior_sweep@62046.18000000 nearest=sfp_zone@62018.22000000:0.00000000,hvn@62005.00000000:0.00000000,hvn@62015.00000000:0.39000000 location.levels@2 c9f6288474b4c31a",
+        "648003156ms close=62196.31000000 levels=116 in=lvn@62155.00000000,prior_sweep@62159.22000000,prior_sweep@62159.22000000,sfp_zone@62159.22000000,prior_sweep@62177.73000000,hvn@62205.00000000,vah@62220.00000000,prior_sweep@62210.85000000,prior_sweep@62210.85000000 nearest=sfp_zone@62159.22000000:0.00000000,hvn@62205.00000000:3.69000000,vah@62220.00000000:13.69000000 location.levels@2 d0eb36fd08142dd9",
+        "662424783ms close=62047.35000000 levels=116 in=sfp_zone@62018.22000000,hvn@62015.00000000,prior_sweep@62018.22000000,prior_sweep@62046.18000000,lvn@62055.00000000,lvn@62065.00000000,prior_sweep@62067.70000000 nearest=prior_sweep@62046.18000000:-1.17000000,lvn@62055.00000000:2.65000000,lvn@62065.00000000:12.65000000 location.levels@2 97f311f7079e5ed5",
+        "676821219ms close=62264.06000000 levels=119 in=prior_sweep@62233.69000000,prior_sweep@62233.69000000,prior_sweep@62255.97000000,prior_sweep@62255.97000000,sfp_zone@62255.97000000,sfp_zone@62255.97000000,prior_sweep@62269.87000000,prior_sweep@62269.87000000,prior_sweep@62269.87000000,sfp_zone@62269.87000000,sfp_zone@62269.87000000,sfp_zone@62269.87000000,structural_high@62282.58000000,structural_high@62282.58000000,structural_high@62282.58000000 nearest=sfp_zone@62255.97000000:0.00000000,sfp_zone@62255.97000000:0.00000000,prior_sweep@62269.87000000:5.81000000 location.levels@2 feb4591089db6292",
+        "691206481ms close=61873.51000000 levels=111 in=prior_sweep@61904.28000000 nearest=prior_sweep@61904.28000000:30.77000000,hvn@61825.00000000:-43.51000000,prior_sweep@61819.93000000:-53.58000000 location.levels@2 ba2a40cfc212795d",
+        "705629176ms close=62132.34000000 levels=115 in=poc@62105.00000000,hvn@62115.00000000,prior_sweep@62159.22000000,sfp_zone@62159.22000000,hvn@62175.00000000 nearest=hvn@62115.00000000:-12.34000000,poc@62105.00000000:-22.34000000,prior_sweep@62159.22000000:26.88000000 location.levels@2 067a289fbca274cd",
+        "720007856ms close=61527.77000000 levels=114 in=sfp_zone@61488.78000000,prior_sweep@61488.78000000,sfp_zone@61594.26000000,sfp_zone@61609.65000000,prior_sweep@61547.38000000,prior_sweep@61547.38000000,sfp_zone@61587.13000000,sfp_zone@61587.13000000 nearest=sfp_zone@61594.26000000:0.00000000,sfp_zone@61609.65000000:0.00000000,prior_sweep@61547.38000000:19.61000000 location.levels@2 48f4c26040af5f61",
+        "734418675ms close=61493.82000000 levels=117 in=sfp_zone@61456.17000000,sfp_zone@61456.17000000,sfp_zone@61467.24000000,sfp_zone@61475.71000000,prior_sweep@61456.17000000,prior_sweep@61456.17000000,sfp_zone@61471.39000000,sfp_zone@61488.78000000,prior_sweep@61467.24000000,prior_sweep@61471.39000000,prior_sweep@61475.71000000,prior_sweep@61475.71000000,prior_sweep@61488.78000000,sfp_zone@61594.26000000,prior_sweep@61513.15000000,sfp_zone@61547.38000000,sfp_zone@61547.38000000 nearest=sfp_zone@61594.26000000:0.00000000,sfp_zone@61488.78000000:-5.04000000,prior_sweep@61488.78000000:-5.04000000 location.levels@2 d5ab5d2ffa52b7e5",
+        "748807923ms close=62183.38000000 levels=119 in=prior_sweep@62159.22000000,sfp_zone@62159.22000000,hvn@62175.00000000,vah@62220.00000000,vah@62220.00000000,prior_sweep@62210.85000000 nearest=sfp_zone@62159.22000000:0.00000000,hvn@62175.00000000:-3.38000000,prior_sweep@62159.22000000:-24.16000000 location.levels@2 5e08810520ce696d",
+        "763211531ms close=62137.87000000 levels=123 in=poc@62105.00000000,hvn@62115.00000000,prior_sweep@62159.22000000,sfp_zone@62159.22000000,hvn@62175.00000000,structural_high@62172.51000000 nearest=hvn@62115.00000000:-17.87000000,prior_sweep@62159.22000000:21.35000000,sfp_zone@62159.22000000:21.35000000 location.levels@2 623499a7e428c76d",
+        "777618365ms close=62224.13000000 levels=119 in=sfp_zone@62159.22000000,lvn@62195.00000000,structural_low@62197.31000000,prior_sweep@62210.85000000,hvn@62225.00000000,prior_sweep@62225.94000000,prior_sweep@62225.94000000,vah@62240.00000000,prior_sweep@62233.69000000,prior_sweep@62233.69000000,prior_sweep@62255.97000000,sfp_zone@62255.97000000,prior_sweep@62269.87000000,prior_sweep@62269.87000000,prior_sweep@62269.87000000,sfp_zone@62269.87000000,sfp_zone@62269.87000000,sfp_zone@62269.87000000 nearest=hvn@62225.00000000:0.00000000,prior_sweep@62225.94000000:1.81000000,prior_sweep@62225.94000000:1.81000000 location.levels@2 01e8b27a21473495",
+        "792000844ms close=61999.25000000 levels=120 in=prior_sweep@61966.55000000,lvn@61975.00000000,hvn@62015.00000000 nearest=hvn@62015.00000000:10.75000000,lvn@61975.00000000:-19.25000000,prior_sweep@61966.55000000:-32.70000000 location.levels@2 1a8b603559a68ae9",
+        "806418328ms close=62398.41000000 levels=115 in=sfp_zone@62343.35000000,prior_sweep@62402.12000000,sfp_zone@62402.12000000,structural_high@62406.53000000,structural_high@62406.53000000 nearest=sfp_zone@62343.35000000:0.00000000,prior_sweep@62402.12000000:3.71000000,sfp_zone@62402.12000000:3.71000000 location.levels@2 50ceb073a80c3c80",
+        "820811734ms close=61972.93000000 levels=115 in=hvn@61935.00000000,prior_sweep@61966.55000000,lvn@61975.00000000,vwap@61996.57257033,hvn@62015.00000000 nearest=lvn@61975.00000000:0.00000000,prior_sweep@61966.55000000:-6.38000000,vwap@61996.57257033:23.64257033 location.levels@2 677e77a1c2c16a8a",
+        "835237151ms close=62055.91000000 levels=118 in=hvn@62015.00000000,prior_sweep@62016.73000000,lvn@62065.00000000,lvn@62075.00000000,prior_sweep@62075.83000000,prior_sweep@62078.52000000 nearest=lvn@62065.00000000:4.09000000,lvn@62075.00000000:14.09000000,prior_sweep@62075.83000000:19.92000000 location.levels@2 463631ff55403d2a",
+        "849608419ms close=61465.26000000 levels=117 in=sfp_zone@61435.04000000,sfp_zone@61435.04000000,sfp_zone@61456.17000000,sfp_zone@61475.71000000,prior_sweep@61435.04000000,prior_sweep@61435.04000000,prior_sweep@61456.17000000,prior_sweep@61475.71000000,prior_sweep@61491.51000000,prior_sweep@61491.51000000,prior_sweep@61491.51000000,sfp_zone@61513.15000000 nearest=sfp_zone@61475.71000000:0.00000000,sfp_zone@61456.17000000:-9.09000000,prior_sweep@61456.17000000:-9.09000000 location.levels@2 b1c26951104f89ba",
+        "864034247ms close=61222.01000000 levels=115 in=- nearest=structural_low@61109.13000000:-112.88000000,structural_low@61109.13000000:-112.88000000,structural_low@61109.13000000:-112.88000000 location.levels@2 5088e261e01bf88e",
+        "facts=13274 bf73378dc6379f34",
+    ];
 
     const GOLDEN_LEVELS: [&str; 40] = [
         "57643383ms close=61952.09000000 levels=2 in=- nearest=vwap@61863.66256600:-88.42743400,structural_low@61676.70000000:-275.39000000 location.levels@1 48c5aa34dbbefdeb",

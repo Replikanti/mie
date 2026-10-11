@@ -2,7 +2,7 @@
 //! State & Regime brief; ADR-036, proposed).
 //!
 //! Every trade adds its exact quantity to a fixed 10 USDT price bin
-//! (decision 1); nothing is spread or estimated from bars. Three profiles
+//! (decision 1); nothing is spread or estimated from bars. Four profiles
 //! (decision 2):
 //!
 //! - `profile.volume.utc_day@1`: the developing profile of the current UTC
@@ -12,6 +12,10 @@
 //!   UTC day.
 //! - `profile.volume.composite_5d@1`: the bin-wise sum of the last five
 //!   completed UTC days.
+//! - `profile.volume.composite_7d@1`: the bin-wise sum of the last seven
+//!   completed UTC days, the composite location consumes (decision 2): a
+//!   7-day window holds every weekday once, so its volume never depends on
+//!   the weekday it is computed on.
 //!
 //! Each [`VolumeProfile`] carries its POC (decision 4), value area
 //! (decision 5) and high- and low-volume nodes (decision 6), and hands them
@@ -58,9 +62,20 @@ pub const VALUE_AREA_PCT: i64 = 70;
 /// parameter `node_prominence_pct` (decision 6).
 pub const NODE_PROMINENCE_PCT: i64 = 10;
 
-/// Completed UTC days in the composite: parameter `sessions` of
+/// Completed UTC days in the 5-day composite: parameter `sessions` of
 /// `profile.volume.composite_5d@1` (decision 2).
 pub const COMPOSITE_SESSIONS: usize = 5;
+
+/// Completed UTC days in the 7-day composite: parameter `sessions` of
+/// `profile.volume.composite_7d@1` (decision 2). Seven is the shortest
+/// window that holds every weekday equally often.
+pub const COMPOSITE_7D_SESSIONS: usize = 7;
+
+/// Completed UTC days the tracker keeps: enough for every composite.
+const KEPT_SESSIONS: usize = 7;
+
+const _: () =
+    assert!(KEPT_SESSIONS >= COMPOSITE_SESSIONS && KEPT_SESSIONS >= COMPOSITE_7D_SESSIONS);
 
 /// The integer triangular kernel `triangular_5` that smooths the histogram
 /// before node detection (decision 6), centred on the middle weight.
@@ -203,7 +218,8 @@ pub struct VolumeProfile {
     /// Exclusive end of what is included: the last folded minute for the
     /// developing profile, the last included day for completed ones.
     pub end: EventTime,
-    /// UTC days included: 1, or [`COMPOSITE_SESSIONS`] for the composite.
+    /// UTC days included: 1, or the composite's length
+    /// ([`COMPOSITE_SESSIONS`], [`COMPOSITE_7D_SESSIONS`]).
     pub sessions: u32,
     /// Volume in the profile.
     pub total_volume: Qty,
@@ -270,8 +286,9 @@ impl StateEncode for VolumeProfile {
 }
 
 /// A level for location (brief §10): the hand-off to the level registry
-/// `location.levels@1` (ADR-044 D5), which reads the prior-day and 5-day
-/// composite profiles' levels. Its zone `[low, high)` is the level's bin.
+/// `location.levels` (ADR-044 D5), which reads the levels of the prior-day
+/// profile and of one composite: the 5-day at `@1`, the 7-day at `@2`. Its
+/// zone `[low, high)` is the level's bin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProfileLevel {
     /// Which level.
@@ -386,6 +403,10 @@ pub struct VolumeProfiles {
     /// `profile.volume.composite_5d@1`, warming up until five UTC days have
     /// closed.
     pub composite_5d: FeatureValue<VolumeProfile>,
+    /// `profile.volume.composite_7d@1`, warming up until seven UTC days have
+    /// closed. Appended last: the encoding of every earlier field stays as
+    /// it was (ADR-041 D2).
+    pub composite_7d: FeatureValue<VolumeProfile>,
 }
 
 impl StateEncode for VolumeProfiles {
@@ -394,10 +415,12 @@ impl StateEncode for VolumeProfiles {
             utc_day,
             prior_day,
             composite_5d,
+            composite_7d,
         } = self;
         utc_day.encode(f);
         prior_day.encode(f);
         composite_5d.encode(f);
+        composite_7d.encode(f);
     }
 }
 
@@ -422,6 +445,10 @@ impl VolumeProfiles {
             composite_5d: FeatureValue::WarmingUp {
                 observed: 0,
                 required: COMPOSITE_SESSIONS as u64,
+            },
+            composite_7d: FeatureValue::WarmingUp {
+                observed: 0,
+                required: COMPOSITE_7D_SESSIONS as u64,
             },
         }
     }
@@ -798,7 +825,7 @@ struct Session {
 }
 
 /// The volume-profile engine state (ADR-036): the developing day's volume
-/// per bin and the last [`COMPOSITE_SESSIONS`] completed days. Engine state;
+/// per bin and the last [`KEPT_SESSIONS`] completed days. Engine state;
 /// the Market State exposes only [`VolumeProfiles`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProfileTracker {
@@ -827,6 +854,7 @@ pub(crate) struct ProfileStep {
     utc_day: Option<FeatureValue<VolumeProfile>>,
     prior_day: Option<FeatureValue<VolumeProfile>>,
     composite_5d: Option<FeatureValue<VolumeProfile>>,
+    composite_7d: Option<FeatureValue<VolumeProfile>>,
     /// The trade's bin and its new volume, after any closed day.
     insert: Option<(i64, Qty)>,
 }
@@ -874,6 +902,7 @@ impl ProfileTracker {
             utc_day: None,
             prior_day: None,
             composite_5d: None,
+            composite_7d: None,
             insert: None,
         };
         let mut last_minute = None;
@@ -969,7 +998,7 @@ impl ProfileTracker {
             .map(|session| (session.open, &session.bins, session.coverage))
             .chain(new)
             .collect();
-        let recent = &all[all.len().saturating_sub(COMPOSITE_SESSIONS)..];
+        let latest = |sessions: usize| &all[all.len().saturating_sub(sessions)..];
         let window = |feature: FeatureKey,
                       days: &[(EventTime, &BTreeMap<i64, Qty>, Coverage)]|
          -> Result<Window, ProfileError> {
@@ -992,24 +1021,35 @@ impl ProfileTracker {
                 coverage,
             })
         };
-        let prior = &recent[recent.len() - 1..];
+        // A composite of `sessions` days: warming up until that many days
+        // have closed.
+        let composite = |feature: FeatureKey,
+                         sessions: usize|
+         -> Result<FeatureValue<VolumeProfile>, ProfileError> {
+            let recent = latest(sessions);
+            if recent.len() < sessions {
+                return Ok(FeatureValue::WarmingUp {
+                    observed: closed_days,
+                    required: sessions as u64,
+                });
+            }
+            let histograms: Vec<&BTreeMap<i64, Qty>> =
+                recent.iter().map(|(_, bins, _)| *bins).collect();
+            profile(&histograms, window(feature, recent)?)
+        };
+        let prior = latest(1);
         step.prior_day = Some(profile(
             &[prior[0].1],
             window(catalog::PROFILE_VOLUME_PRIOR_DAY_V1.key, prior)?,
         )?);
-        step.composite_5d = Some(if recent.len() < COMPOSITE_SESSIONS {
-            FeatureValue::WarmingUp {
-                observed: closed_days,
-                required: COMPOSITE_SESSIONS as u64,
-            }
-        } else {
-            let histograms: Vec<&BTreeMap<i64, Qty>> =
-                recent.iter().map(|(_, bins, _)| *bins).collect();
-            profile(
-                &histograms,
-                window(catalog::PROFILE_VOLUME_COMPOSITE_5D_V1.key, recent)?,
-            )?
-        });
+        step.composite_5d = Some(composite(
+            catalog::PROFILE_VOLUME_COMPOSITE_5D_V1.key,
+            COMPOSITE_SESSIONS,
+        )?);
+        step.composite_7d = Some(composite(
+            catalog::PROFILE_VOLUME_COMPOSITE_7D_V1.key,
+            COMPOSITE_7D_SESSIONS,
+        )?);
         Ok(())
     }
 
@@ -1022,7 +1062,7 @@ impl ProfileTracker {
             } else {
                 BTreeMap::new()
             };
-            if self.sessions.len() == COMPOSITE_SESSIONS {
+            if self.sessions.len() == KEPT_SESSIONS {
                 self.sessions.pop_front();
             }
             self.sessions.push_back(Session {
@@ -1048,6 +1088,9 @@ impl ProfileTracker {
         }
         if let Some(value) = step.composite_5d {
             profiles.composite_5d = value;
+        }
+        if let Some(value) = step.composite_7d {
+            profiles.composite_7d = value;
         }
     }
 }
@@ -1669,6 +1712,7 @@ mod tests {
             &catalog::PROFILE_VOLUME_UTC_DAY_V1,
             &catalog::PROFILE_VOLUME_PRIOR_DAY_V1,
             &catalog::PROFILE_VOLUME_COMPOSITE_5D_V1,
+            &catalog::PROFILE_VOLUME_COMPOSITE_7D_V1,
         ];
         for definition in all {
             assert_eq!(
@@ -1729,16 +1773,39 @@ mod tests {
             Some(ParamValue::Int(i64::try_from(COMPOSITE_SESSIONS).unwrap()))
         );
         assert_eq!(
+            param(all[3], "sessions"),
+            Some(ParamValue::Int(
+                i64::try_from(COMPOSITE_7D_SESSIONS).unwrap()
+            ))
+        );
+        assert_eq!(COMPOSITE_7D_SESSIONS, 7);
+        // The 7-day composite is the 5-day one at another length.
+        let other_than_sessions = |definition: &FeatureDefinition| {
+            definition
+                .params
+                .iter()
+                .filter(|param| param.name != "sessions")
+                .copied()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(other_than_sessions(all[3]), other_than_sessions(all[2]));
+        assert_eq!(all[3].inputs, all[2].inputs);
+        assert_eq!(
             all.map(|definition| definition.warm_up),
             [
                 WarmUp::Samples(1),
                 WarmUp::Samples(1),
                 WarmUp::Samples(u32::try_from(COMPOSITE_SESSIONS).unwrap()),
+                WarmUp::Samples(u32::try_from(COMPOSITE_7D_SESSIONS).unwrap()),
             ]
         );
         assert_eq!(
             VolumeProfiles::new().composite_5d,
             warming(0, COMPOSITE_SESSIONS as u64)
+        );
+        assert_eq!(
+            VolumeProfiles::new().composite_7d,
+            warming(0, COMPOSITE_7D_SESSIONS as u64)
         );
     }
 
@@ -1952,6 +2019,232 @@ mod tests {
     }
 
     #[test]
+    fn the_composite_7d_warms_up_over_seven_days_then_slides() {
+        let events: Vec<MarketEvent> = (0..=8)
+            .map(|day| {
+                let at = format!("{}", 62_000 + 100 * day);
+                let trade_id = u64::try_from(day).unwrap() + 1;
+                buy(day * DAY + 1_000, trade_id, &at, "1")
+            })
+            .collect();
+        let profiles = profiles(&events);
+        assert_eq!(profiles[0].composite_7d, warming(0, 7));
+        for (day, profile) in (1..).zip(&profiles[1..7]) {
+            assert_eq!(profile.composite_7d, warming(day, 7));
+        }
+        // The 5-day composite is ready two days earlier.
+        assert!(profiles[5].composite_5d.is_ready());
+        let first = ready(&profiles[7].composite_7d);
+        assert_eq!(
+            (first.start, first.end, first.sessions, first.total_volume),
+            (t(0), t(7 * DAY), 7, qty("7"))
+        );
+        assert_eq!((first.low, first.high), (price("62000"), price("62610")));
+        // Day 0 was partial.
+        assert_eq!(first.coverage, PARTIAL);
+        // Seven equal bins: the POC is the centre one.
+        assert_eq!(first.poc, price("62305"));
+        assert_eq!(first.feature, catalog::PROFILE_VOLUME_COMPOSITE_7D_V1.key);
+        let second = ready(&profiles[8].composite_7d);
+        assert_eq!(
+            (
+                second.start,
+                second.end,
+                second.total_volume,
+                second.coverage
+            ),
+            (t(DAY), t(8 * DAY), qty("7"), COMPLETE)
+        );
+        assert_eq!((second.low, second.high), (price("62100"), price("62710")));
+    }
+
+    /// The weekday of the UTC day holding `millis`: 0 for Monday … 6 for
+    /// Sunday. 1970-01-01 was a Thursday.
+    fn weekday(millis: i64) -> i64 {
+        (millis.div_euclid(DAY) + 3).rem_euclid(7)
+    }
+
+    #[test]
+    fn the_composite_7d_holds_two_weekend_days_on_every_compute_day() {
+        // The helper, on two known dates: 1970-01-01 was a Thursday and
+        // 2025-10-04 a Saturday.
+        assert_eq!(weekday(0), 3);
+        assert_eq!(weekday(1_759_536_000_000), 5);
+        // One trade per UTC day for 14 days from Monday 1970-01-05.
+        let monday = 4 * DAY;
+        assert_eq!(weekday(monday), 0);
+        let events: Vec<MarketEvent> = (0..14)
+            .map(|day| buy(monday + day * DAY + 1_000, day as u64 + 1, "62000", "1"))
+            .collect();
+        let weekend = |start: EventTime, end: EventTime| {
+            (start.as_millis().div_euclid(DAY)..end.as_millis().div_euclid(DAY))
+                .filter(|day| weekday(day * DAY) >= 5)
+                .count()
+        };
+        let mut five_day_weekdays = [None; 7];
+        let mut compute_days = Vec::new();
+        for profile in profiles(&events) {
+            let FeatureValue::Ready(seven) = &profile.composite_7d else {
+                continue;
+            };
+            let last_day = weekday(seven.end.as_millis() - DAY);
+            if compute_days.last() == Some(&last_day) {
+                continue;
+            }
+            compute_days.push(last_day);
+            assert_eq!(seven.sessions, 7);
+            assert_eq!(weekend(seven.start, seven.end), 2, "{seven}");
+            let five = ready(&profile.composite_5d);
+            assert_eq!(five.end, seven.end);
+            let days = usize::try_from(five.sessions).unwrap();
+            five_day_weekdays[usize::try_from(last_day).unwrap()] =
+                Some(days - weekend(five.start, five.end));
+        }
+        // Seven consecutive compute days: every weekday once.
+        assert_eq!(compute_days.len(), 7);
+        assert_eq!(
+            five_day_weekdays,
+            [3, 3, 3, 4, 5, 4, 3].map(Some),
+            "Mon … Sun"
+        );
+    }
+
+    #[test]
+    fn the_composite_7d_is_the_bin_wise_sum_of_the_last_seven_days() {
+        const EMPTY_DAY: i64 = 9;
+        // The location walk over 16 days, with a trades gap on day 2 and
+        // without a single trade on day 9.
+        let tape: Vec<MarketEvent> = crate::location::tests::walk_tape(0x6d69_6500_0000_0096, 16)
+            .into_iter()
+            .filter(|event| {
+                !(matches!(event, MarketEvent::Trade(_))
+                    && event.time().as_millis().div_euclid(DAY) == EMPTY_DAY)
+            })
+            .collect();
+        let mut engine = MarketStateEngine::new();
+        // The tool's own binning and day attribution: day → bin → volume.
+        let mut days: BTreeMap<i64, BTreeMap<i64, Qty>> = BTreeMap::new();
+        // Per closed day: the daily bar's volume and coverage.
+        let mut closed: BTreeMap<i64, (Qty, Coverage)> = BTreeMap::new();
+        let mut checked = Vec::new();
+        for event in &tape {
+            engine.apply(event).unwrap();
+            if let MarketEvent::Trade(trade) = event {
+                let bin = trade.price.units().div_euclid(BIN_SIZE.units());
+                let slot = days
+                    .entry(trade.time.as_millis().div_euclid(DAY))
+                    .or_default()
+                    .entry(bin)
+                    .or_insert(Qty::from_units(0));
+                *slot = slot.checked_add(trade.qty).unwrap();
+            }
+            let bars: Vec<&Bar> = engine
+                .closed_bars()
+                .iter()
+                .filter(|bar| bar.timeframe == Timeframe::D1)
+                .collect();
+            for bar in &bars {
+                closed.insert(
+                    bar.open_time.as_millis().div_euclid(DAY),
+                    (bar.volume, bar.coverage),
+                );
+            }
+            let profiles = &engine.state().profile;
+            // A single closed day shows its own prior-day total; with the
+            // empty day, the event that closes day 8 closes day 9 too.
+            if let [bar] = bars.as_slice() {
+                let total = profiles.prior_day.ready().map(|prior| prior.total_volume);
+                assert_eq!(total.unwrap_or(Qty::from_units(0)), bar.volume);
+            }
+            if bars.is_empty() {
+                continue;
+            }
+            // The window: the seven days before the event's day.
+            let last = event.time().as_millis().div_euclid(DAY) - 1;
+            assert_eq!(bars.last().unwrap().open_time, t(last * DAY));
+            if last < 6 {
+                assert!(!profiles.composite_7d.is_ready());
+                continue;
+            }
+            let window = last - 6..=last;
+            let empty = BTreeMap::new();
+            let mut sum: BTreeMap<i64, Qty> = BTreeMap::new();
+            let mut coverage = COMPLETE;
+            let mut daily_total = 0;
+            for day in window.clone() {
+                for (bin, volume) in days.get(&day).unwrap_or(&empty) {
+                    let slot = sum.entry(*bin).or_insert(Qty::from_units(0));
+                    *slot = slot.checked_add(*volume).unwrap();
+                }
+                let (volume, day_coverage) = closed[&day];
+                coverage.partial_start |= day_coverage.partial_start;
+                coverage.feed_gap |= day_coverage.feed_gap;
+                daily_total += volume.units();
+            }
+            let expected = shape_levels(V1, &[&sum]).unwrap();
+            let expected = expected.ready().unwrap();
+            let engine_value = ready(&profiles.composite_7d);
+            assert_eq!(
+                (
+                    engine_value.feature,
+                    engine_value.start,
+                    engine_value.end,
+                    engine_value.sessions,
+                    engine_value.coverage,
+                ),
+                (
+                    catalog::PROFILE_VOLUME_COMPOSITE_7D_V1.key,
+                    t((last - 6) * DAY),
+                    t((last + 1) * DAY),
+                    7,
+                    coverage,
+                ),
+                "{last}"
+            );
+            let ProfileLevels {
+                total_volume,
+                low,
+                high,
+                poc,
+                poc_volume,
+                val,
+                vah,
+                value_area_volume,
+                hvn,
+                lvn,
+            } = expected;
+            assert_eq!(engine_value.total_volume, *total_volume);
+            assert_eq!((engine_value.low, engine_value.high), (*low, *high));
+            assert_eq!(
+                (engine_value.poc, engine_value.poc_volume),
+                (*poc, *poc_volume)
+            );
+            assert_eq!((engine_value.val, engine_value.vah), (*val, *vah));
+            assert_eq!(engine_value.value_area_volume, *value_area_volume);
+            assert_eq!((&engine_value.hvn, &engine_value.lvn), (hvn, lvn));
+            assert_eq!(total_volume.units(), daily_total, "{last}");
+            checked.push((last, window.contains(&EMPTY_DAY), coverage));
+        }
+        // Every window from day 6 on, the one closing days 8 and 9 counted
+        // once; the empty day inside seven of them; both flags and a
+        // complete window seen.
+        assert_eq!(
+            checked.iter().map(|(last, _, _)| *last).collect::<Vec<_>>(),
+            [6, 7, 9, 10, 11, 12, 13, 14, 15]
+        );
+        assert_eq!(checked.iter().filter(|(_, empty, _)| *empty).count(), 7);
+        assert_eq!(
+            checked[0].2,
+            Coverage {
+                partial_start: true,
+                feed_gap: true
+            }
+        );
+        assert_eq!(checked[1].2, GAP);
+        assert_eq!(checked[8].2, COMPLETE);
+    }
+
+    #[test]
     fn a_trades_gap_flags_the_coverage_without_a_reset() {
         let events = [
             buy(DAY + 1_000, 1, "62000", "1"),
@@ -2038,6 +2331,18 @@ mod tests {
         let last = &profiles[1];
         assert_eq!(last.prior_day, unavailable(Unavailability::InputInvalid));
         assert_eq!(last.composite_5d, unavailable(Unavailability::InputInvalid));
+        assert_eq!(last.composite_7d, warming(5, 7));
+    }
+
+    #[test]
+    fn seven_empty_days_leave_the_composite_7d_unavailable() {
+        let profiles = profiles(&[
+            gap(Stream::Trades, 0, 1_000, GapReason::Disconnected),
+            buy(7 * DAY + 1_000, 1, "62000", "1"),
+        ]);
+        let last = &profiles[1];
+        assert_eq!(last.composite_5d, unavailable(Unavailability::InputInvalid));
+        assert_eq!(last.composite_7d, unavailable(Unavailability::InputInvalid));
     }
 
     #[test]
@@ -2172,16 +2477,23 @@ mod tests {
     const GAP_END: i64 = GAP_START + 45 * MINUTE;
 
     /// The volume-profile golden tape: 13:00 UTC on day 0 (a partial day)
-    /// to just after 00:00 UTC on day 7. Trades from an LCG about three
-    /// price clusters that drift from day to day, with a quiet day-5
-    /// afternoon, and a trades gap on day 3.
+    /// to just after 00:00 UTC on day 7.
     fn golden_tape() -> Vec<MarketEvent> {
+        golden_tape_days(7)
+    }
+
+    /// The volume-profile golden tape over `days`: 13:00 UTC on day 0 (a
+    /// partial day) to just after 00:00 UTC on day `days`. Trades from an
+    /// LCG about three price clusters that drift from day to day, with a
+    /// quiet day-5 afternoon, and a trades gap on day 3. A longer tape
+    /// starts with every event of a shorter one.
+    fn golden_tape_days(days: i64) -> Vec<MarketEvent> {
         let mut lcg = Lcg(0x6d69_6500_0000_0036);
         let mut events = Vec::new();
         let mut time = 13 * 3_600_000;
         let mut trade_id = 0;
         let mut gapped = false;
-        while time < 7 * DAY {
+        while time < days * DAY {
             time += 20_000 + lcg.below(140_000);
             if !gapped && time >= GAP_START {
                 events.push(gap(
@@ -2231,9 +2543,18 @@ mod tests {
         timeframe: Timeframe,
         pick: impl Fn(&VolumeProfiles) -> &FeatureValue<VolumeProfile>,
     ) -> Vec<String> {
+        golden_lines_of(golden_tape(), timeframe, pick)
+    }
+
+    /// [`golden_lines`] over `tape`.
+    fn golden_lines_of(
+        tape: Vec<MarketEvent>,
+        timeframe: Timeframe,
+        pick: impl Fn(&VolumeProfiles) -> &FeatureValue<VolumeProfile>,
+    ) -> Vec<String> {
         let mut engine = MarketStateEngine::new();
         let mut lines = Vec::new();
-        for event in golden_tape() {
+        for event in tape {
             engine.apply(&event).unwrap();
             let closed = engine
                 .closed_bars()
@@ -2262,6 +2583,16 @@ mod tests {
     fn golden_profile_volume_composite_5d_v1() {
         let lines = golden_lines(Timeframe::D1, |profiles| &profiles.composite_5d);
         assert_eq!(lines, GOLDEN_COMPOSITE_5D);
+    }
+
+    #[test]
+    fn golden_profile_volume_composite_7d_v1() {
+        // Ten days: windows ending on days 6 to 9. The first seven days are
+        // the 7-day tape's.
+        let tape = golden_tape_days(10);
+        assert_eq!(tape[..golden_tape().len()], golden_tape());
+        let lines = golden_lines_of(tape, Timeframe::D1, |profiles| &profiles.composite_7d);
+        assert_eq!(lines, GOLDEN_COMPOSITE_7D);
     }
 
     const GOLDEN_UTC_DAY: [&str; 32] = [
@@ -2311,5 +2642,11 @@ mod tests {
         "432017592ms start=0ms end=432000000ms sessions=5 vol=4026.62240394 low=61920.00000000 high=63780.00000000 poc=62535.00000000 poc_vol=99.12699621 val=61920.00000000 vah=62900.00000000 va_vol=2835.47645956 hvn=62115.00000000:681,62225.00000000:348,62545.00000000:1000,62985.00000000:328,63165.00000000:314,63355.00000000:257,63515.00000000:291,63685.00000000:346 lvn=62155.00000000:348,62325.00000000:681,62745.00000000:346,63065.00000000:314,63265.00000000:328,63435.00000000:257,63605.00000000:291 partial_start+feed_gap profile.volume.composite_5d@1",
         "518417461ms start=86400000ms end=518400000ms sessions=5 vol=4178.50676709 low=62020.00000000 high=63820.00000000 poc=62535.00000000 poc_vol=99.12699621 val=62310.00000000 vah=63550.00000000 va_vol=2933.75900539 hvn=62115.00000000:681,62225.00000000:348,62545.00000000:1000,62655.00000000:239,62985.00000000:328,63175.00000000:132,63355.00000000:257,63515.00000000:291,63695.00000000:376 lvn=62155.00000000:348,62335.00000000:681,62605.00000000:239,62765.00000000:376,63045.00000000:132,63265.00000000:328,63435.00000000:257,63605.00000000:291 feed_gap profile.volume.composite_5d@1",
         "604815642ms start=172800000ms end=604800000ms sessions=5 vol=4294.22974403 low=62140.00000000 high=64110.00000000 poc=62905.00000000 poc_vol=94.48696331 val=62330.00000000 vah=63360.00000000 va_vol=3042.20555029 hvn=62225.00000000:632,62465.00000000:158,62555.00000000:166,62655.00000000:732,62905.00000000:1000,63085.00000000:103,63325.00000000:561,63515.00000000:277,63695.00000000:343,64035.00000000:253 lvn=62335.00000000:632,62505.00000000:158,62605.00000000:166,62765.00000000:732,63045.00000000:103,63205.00000000:561,63435.00000000:343,63605.00000000:277,63885.00000000:253 feed_gap profile.volume.composite_5d@1",
+    ];
+    const GOLDEN_COMPOSITE_7D: [&str; 4] = [
+        "604815642ms start=0ms end=604800000ms sessions=7 vol=5603.88227255 low=61920.00000000 high=64110.00000000 poc=62535.00000000 poc_vol=99.12699621 val=62300.00000000 vah=63520.00000000 va_vol=3935.50186396 hvn=62115.00000000:648,62225.00000000:331,62545.00000000:949,62655.00000000:227,62905.00000000:1000,63115.00000000:240,63325.00000000:503,63515.00000000:277,63695.00000000:343,64035.00000000:253 lvn=62155.00000000:331,62325.00000000:648,62605.00000000:227,62765.00000000:949,63045.00000000:240,63245.00000000:503,63435.00000000:343,63605.00000000:277,63885.00000000:253 partial_start+feed_gap profile.volume.composite_7d@1",
+        "691236815ms start=86400000ms end=691200000ms sessions=7 vol=6133.37880199 low=62020.00000000 high=64160.00000000 poc=63005.00000000 poc_vol=108.41843798 val=62520.00000000 vah=63840.00000000 va_vol=4357.14003377 hvn=62115.00000000:648,62225.00000000:331,62545.00000000:949,62655.00000000:227,62905.00000000:1000,63005.00000000:251,63325.00000000:503,63695.00000000:342,64045.00000000:431 lvn=62155.00000000:331,62335.00000000:648,62605.00000000:227,62765.00000000:949,62955.00000000:251,63245.00000000:503,63605.00000000:342,63885.00000000:431 feed_gap profile.volume.composite_7d@1",
+        "777724172ms start=172800000ms end=777600000ms sessions=7 vol=6194.55525947 low=62140.00000000 high=64340.00000000 poc=63005.00000000 poc_vol=108.41843798 val=62360.00000000 vah=63460.00000000 va_vol=4356.93996069 hvn=62225.00000000:632,62465.00000000:158,62555.00000000:166,62655.00000000:732,62905.00000000:1000,63005.00000000:251,63115.00000000:358,63325.00000000:229,63535.00000000:701,63695.00000000:322,64045.00000000:431,64245.00000000:199 lvn=62335.00000000:632,62505.00000000:158,62605.00000000:166,62765.00000000:732,62955.00000000:251,63055.00000000:358,63215.00000000:701,63465.00000000:229,63615.00000000:322,63885.00000000:431,64165.00000000:199 feed_gap profile.volume.composite_7d@1",
+        "864031403ms start=259200000ms end=864000000ms sessions=7 vol=6244.70061250 low=62370.00000000 high=64500.00000000 poc=63005.00000000 poc_vol=108.41843798 val=62370.00000000 vah=63470.00000000 va_vol=4398.39174166 hvn=62465.00000000:158,62555.00000000:637,62905.00000000:1000,63005.00000000:251,63115.00000000:358,63325.00000000:852,63535.00000000:370,63745.00000000:499,64045.00000000:431,64245.00000000:199,64425.00000000:292 lvn=62505.00000000:158,62765.00000000:637,62955.00000000:251,63055.00000000:358,63215.00000000:852,63465.00000000:370,63615.00000000:499,63895.00000000:431,64165.00000000:199,64345.00000000:292 feed_gap profile.volume.composite_7d@1",
     ];
 }

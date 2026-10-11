@@ -1,6 +1,10 @@
 //! The ADR-044 measurements over the archive backfill (not run in CI): an
 //! `ArchiveReplay` of aggTrades over a window read from the environment
-//! drives one `MarketStateEngine`, and the exact location logic prints:
+//! drives two `MarketStateEngine`s over the same events — the default one,
+//! with `location.levels@2` over the 7-day composite, and one built with
+//! `MarketStateEngine::with_features` for `location.levels@1` over the
+//! 5-day composite (ADR-044 D10, #96) — and the exact location logic
+//! prints:
 //!
 //! - **M1**, the 1m close-to-close move `|Δclose|` in bps of the previous
 //!   close, from the engine's closed 1m bars with trades: p50, p75, p90,
@@ -17,12 +21,23 @@
 //!   `N` counted closes ("caught": labelled `FailedBreakout` at
 //!   `N_acc = N`) and the share of breakouts that held `N` closes and still
 //!   failed ("held, then returned").
-//! - **M3**, the `location.levels@1` registry size per kind (p50, p99 over
-//!   closed minutes) and the zone events per day by cause.
+//! - **M3**, per registry version (`@1`, `@2`): the registry size per kind
+//!   (p50, p99 over the closed minutes where it was rebuilt) and the zone
+//!   events per day by cause.
 //! - **M4**, the share of closes in each `AuctionState` per half at the
 //!   engine's fixed `w` and `N_acc` (cross-checked against the engine's own
 //!   state), and the state transitions per day.
-//! - The replay's wall time, events and domain rejections.
+//! - The #96 checks of `@2` against `@1`, each a count asserted zero:
+//!   **isolation** (rule I), events after which the two states differ
+//!   anywhere but in the feature-set stamp and the registry, or the two
+//!   engines' auction facts differ; **sourcing** (rule S), rebuilds where a
+//!   registry holds a level of the other version's composite, or fewer than
+//!   3 levels of its own composite while that is ready, or any while it is
+//!   not.
+//! - The replay's wall time, events and domain rejections of each engine.
+//!
+//! M1, M2 and M4 come from the `@2` engine; they read only the prior-day
+//! profile, which both engines share.
 //!
 //! Run it with
 //! `MIE_MEASURE_RAW_ROOT=<raw root> MIE_MEASURE_FROM=<YYYY-MM-DD>
@@ -35,12 +50,13 @@ use mie_adapter_binance::archive::replay::ArchiveReplay;
 use mie_adapter_parquet::ParquetRawStore;
 use mie_cli::replay::parse_bound;
 use mie_domain::bars::Timeframe;
-use mie_domain::feature::FeatureValue;
+use mie_domain::feature::{FeatureKey, FeatureValue, catalog};
 use mie_domain::location::{
     ACCEPTANCE_CLOSES, AuctionClassifier, AuctionState, AuctionStatus, EnterCause, LeaveCause,
-    LevelKind, LocationEvent, Position, Region, TOLERANCE_BPS,
+    LevelKind, LocationEvent, LocationState, Position, Region, TOLERANCE_BPS,
 };
-use mie_domain::state::MarketStateEngine;
+use mie_domain::profile::{VolumeProfile, VolumeProfiles};
+use mie_domain::state::{MarketState, MarketStateEngine};
 use mie_domain::time::EventTime;
 use mie_ports::outbound::{HistoricalDataProvider, MarketDataProvider, ReplayWindow};
 use std::time::Instant;
@@ -260,6 +276,169 @@ fn half_label(half: Option<usize>) -> &'static str {
     }
 }
 
+/// Whether `a` and `b` are equal in every field but the feature-set stamp
+/// and the level registry (#96 rule I). Exhaustive, so a new field does not
+/// compile until it is compared.
+fn equal_but_registry(a: &MarketState, b: &MarketState) -> bool {
+    let MarketState {
+        feature_set: _,
+        as_of,
+        last_trade_price,
+        bars,
+        motion,
+        atr,
+        regime,
+        flow,
+        profile,
+        structure,
+        derivatives,
+        book,
+        location,
+        trade_count,
+    } = a;
+    let LocationState {
+        vwap,
+        levels: _,
+        auction,
+    } = location;
+    *as_of == b.as_of
+        && *last_trade_price == b.last_trade_price
+        && *bars == b.bars
+        && *motion == b.motion
+        && *atr == b.atr
+        && *regime == b.regime
+        && *flow == b.flow
+        && *profile == b.profile
+        && *structure == b.structure
+        && *derivatives == b.derivatives
+        && *book == b.book
+        && *vwap == b.location.vwap
+        && *auction == b.location.auction
+        && *trade_count == b.trade_count
+}
+
+/// The auction facts of the last event.
+fn auction_facts(engine: &MarketStateEngine) -> impl Iterator<Item = &LocationEvent> {
+    engine
+        .location_events()
+        .iter()
+        .filter(|fact| matches!(fact, LocationEvent::Auction { .. }))
+}
+
+/// One registry version: its engine and its M3 and rule-S counts.
+struct Registry {
+    label: &'static str,
+    engine: MarketStateEngine,
+    /// The composite this version reads, and the one it must not.
+    own: FeatureKey,
+    other: FeatureKey,
+    composite: fn(&VolumeProfiles) -> &FeatureValue<VolumeProfile>,
+    rejections: u64,
+    /// Per kind, then all kinds: the size at each rebuild.
+    sizes: Vec<Vec<f64>>,
+    /// Entered: arrived, created. Left: departed, retired.
+    entered: [u64; 2],
+    left: [u64; 2],
+    rebuilds: u64,
+    /// Rebuilds that break rule S.
+    sourcing: u64,
+}
+
+impl Registry {
+    fn new(
+        label: &'static str,
+        engine: MarketStateEngine,
+        own: FeatureKey,
+        other: FeatureKey,
+        composite: fn(&VolumeProfiles) -> &FeatureValue<VolumeProfile>,
+    ) -> Self {
+        Self {
+            label,
+            engine,
+            own,
+            other,
+            composite,
+            rejections: 0,
+            sizes: vec![Vec::new(); KINDS.len() + 1],
+            entered: [0; 2],
+            left: [0; 2],
+            rebuilds: 0,
+            sourcing: 0,
+        }
+    }
+
+    /// M3 and rule S after an accepted event at `known_at`.
+    fn observe(&mut self, known_at: EventTime) {
+        let state = self.engine.state();
+        if let FeatureValue::Ready(set) = &state.location.levels
+            && set.known_at == known_at
+        {
+            let mut counts = [0_u32; KINDS.len()];
+            for level in set.levels() {
+                counts[KINDS.iter().position(|kind| *kind == level.kind).unwrap()] += 1;
+            }
+            for (slot, count) in counts.iter().enumerate() {
+                self.sizes[slot].push(f64::from(*count));
+            }
+            self.sizes[KINDS.len()].push(set.levels().len() as f64);
+            self.rebuilds += 1;
+            let from = |source: FeatureKey| {
+                set.levels()
+                    .iter()
+                    .filter(|level| level.source == source)
+                    .count()
+            };
+            let own = from(self.own);
+            let sourced = if (self.composite)(&state.profile).ready().is_some() {
+                own >= 3
+            } else {
+                own == 0
+            };
+            if !sourced || from(self.other) != 0 {
+                self.sourcing += 1;
+            }
+        }
+        for fact in self.engine.location_events() {
+            match fact {
+                LocationEvent::Entered { cause, .. } => {
+                    self.entered[usize::from(*cause == EnterCause::Created)] += 1;
+                }
+                LocationEvent::Left { cause, .. } => {
+                    self.left[usize::from(*cause == LeaveCause::Retired)] += 1;
+                }
+                LocationEvent::Auction { .. } => {}
+            }
+        }
+    }
+
+    /// The M3 lines.
+    fn print(&mut self, days: f64) {
+        println!(
+            "M3: {} registry size per kind over {} rebuilds (p50 / p99)",
+            self.label, self.rebuilds
+        );
+        let mut columns = Vec::new();
+        for (slot, values) in self.sizes.iter_mut().enumerate() {
+            let name = KINDS
+                .get(slot)
+                .map_or("all".to_owned(), ToString::to_string);
+            columns.push(format!(
+                "{name} {:.0}/{:.0}",
+                quantile(values, 0.5),
+                quantile(values, 0.99)
+            ));
+        }
+        println!("  {}", columns.join(", "));
+        println!(
+            "  zone events per day: entered arrived {:.1}, created {:.1}; left departed {:.1}, retired {:.1}",
+            self.entered[0] as f64 / days,
+            self.entered[1] as f64 / days,
+            self.left[0] as f64 / days,
+            self.left[1] as f64 / days
+        );
+    }
+}
+
 #[test]
 #[ignore = "measures the archive for ADR-044; see the module docs"]
 fn measure_location() {
@@ -276,11 +455,28 @@ fn measure_location() {
     let mut stream = replay.replay(window).unwrap().stream;
     let started = Instant::now();
 
-    let mut engine = MarketStateEngine::new();
+    let levels_v1 = catalog::current_set_with(&[catalog::LOCATION_LEVELS_V1.key]).unwrap();
+    let mut registries = [
+        Registry::new(
+            "location.levels@1",
+            MarketStateEngine::with_features(levels_v1).unwrap(),
+            catalog::PROFILE_VOLUME_COMPOSITE_5D_V1.key,
+            catalog::PROFILE_VOLUME_COMPOSITE_7D_V1.key,
+            |profiles| &profiles.composite_5d,
+        ),
+        Registry::new(
+            "location.levels@2",
+            MarketStateEngine::new(),
+            catalog::PROFILE_VOLUME_COMPOSITE_7D_V1.key,
+            catalog::PROFILE_VOLUME_COMPOSITE_5D_V1.key,
+            |profiles| &profiles.composite_7d,
+        ),
+    ];
     let mut breakouts: Vec<Breakouts> = TOLERANCES.into_iter().map(Breakouts::new).collect();
     let mut labels = AuctionClassifier::new(TOLERANCE_BPS, ACCEPTANCE_CLOSES);
     let mut events = 0_u64;
-    let mut rejections = 0_u64;
+    // Rule I: events after which the states or auction facts differ.
+    let mut isolation = 0_u64;
     // M1.
     let mut moves: [Vec<f64>; 2] = [Vec::new(), Vec::new()];
     let mut previous_close: Option<f64> = None;
@@ -288,10 +484,6 @@ fn measure_location() {
     let mut edge_closes = [0_u64; 2];
     let mut outside_at_open = 0_u64;
     let mut opens = 0_u64;
-    // M3.
-    let mut sizes: Vec<Vec<f64>> = vec![Vec::new(); KINDS.len() + 1];
-    let mut entered = [0_u64; 2];
-    let mut left = [0_u64; 2];
     // M4.
     let mut states = [[0_u64; 7]; 2];
     let mut transitions = [0_u64; 2];
@@ -300,14 +492,32 @@ fn measure_location() {
 
     while let Some(event) = stream.next_event().unwrap() {
         events += 1;
-        if engine.apply(&event).is_err() {
-            rejections += 1;
+        let mut accepted = [false; 2];
+        for (registry, accepted) in registries.iter_mut().zip(&mut accepted) {
+            *accepted = registry.engine.apply(&event).is_ok();
+            if !*accepted {
+                registry.rejections += 1;
+            }
+        }
+        if accepted != [true, true] {
             continue;
         }
         let known_at = event.time();
+        for registry in &mut registries {
+            registry.observe(known_at);
+        }
+        let [v1, v2] = &registries;
+        let engine = &v2.engine;
         let closed = engine.closed_bars();
         if closed.is_empty() {
             continue;
+        }
+        // Rule I, after every event that closed a bar.
+        if v1.engine.closed_bars() != closed
+            || !equal_but_registry(v1.engine.state(), engine.state())
+            || !auction_facts(&v1.engine).eq(auction_facts(engine))
+        {
+            isolation += 1;
         }
         let state = engine.state();
         for bar in closed {
@@ -378,30 +588,6 @@ fn measure_location() {
         {
             mismatches += 1;
         }
-        // M3.
-        if let FeatureValue::Ready(set) = &state.location.levels
-            && set.known_at == known_at
-        {
-            let mut counts = [0_u32; KINDS.len()];
-            for level in set.levels() {
-                counts[KINDS.iter().position(|kind| *kind == level.kind).unwrap()] += 1;
-            }
-            for (slot, count) in counts.iter().enumerate() {
-                sizes[slot].push(f64::from(*count));
-            }
-            sizes[KINDS.len()].push(set.levels().len() as f64);
-        }
-        for fact in engine.location_events() {
-            match fact {
-                LocationEvent::Entered { cause, .. } => {
-                    entered[usize::from(*cause == EnterCause::Created)] += 1;
-                }
-                LocationEvent::Left { cause, .. } => {
-                    left[usize::from(*cause == LeaveCause::Retired)] += 1;
-                }
-                LocationEvent::Auction { .. } => {}
-            }
-        }
     }
     let elapsed = started.elapsed();
     let days = (to - from) as f64 / DAY_MS as f64;
@@ -438,26 +624,9 @@ fn measure_location() {
     for tracker in &breakouts {
         tracker.print();
     }
-    println!("M3: location.levels@1 registry size per closed minute (p50 / p99)");
-    let mut columns = Vec::new();
-    for (slot, values) in sizes.iter_mut().enumerate() {
-        let name = KINDS
-            .get(slot)
-            .map_or("all".to_owned(), ToString::to_string);
-        columns.push(format!(
-            "{name} {:.0}/{:.0}",
-            quantile(values, 0.5),
-            quantile(values, 0.99)
-        ));
+    for registry in &mut registries {
+        registry.print(days);
     }
-    println!("  {}", columns.join(", "));
-    println!(
-        "  zone events per day: entered arrived {:.1}, created {:.1}; left departed {:.1}, retired {:.1}",
-        entered[0] as f64 / days,
-        entered[1] as f64 / days,
-        left[0] as f64 / days,
-        left[1] as f64 / days
-    );
     println!(
         "M4: share of closes per AuctionState (w={TOLERANCE_BPS} bps, N_acc={ACCEPTANCE_CLOSES})"
     );
@@ -490,12 +659,30 @@ fn measure_location() {
         println!("  MISSING: {}", missing.join(", "));
     }
     println!("  engine/tool label mismatches: {mismatches}");
+    println!("#96: @2 against @1");
+    println!("  isolation (rule I): {isolation} events where the states or auction facts differ");
+    for registry in &registries {
+        println!(
+            "  sourcing (rule S), {}: {} of {} rebuilds break it",
+            registry.label, registry.sourcing, registry.rebuilds
+        );
+    }
+    let [v1, v2] = &registries;
     println!(
-        "wall time {:.1} s, {events} events, {rejections} domain rejections",
-        elapsed.as_secs_f64()
+        "wall time {:.1} s, {events} events, domain rejections {} {}, {} {}",
+        elapsed.as_secs_f64(),
+        v1.label,
+        v1.rejections,
+        v2.label,
+        v2.rejections
     );
     assert_eq!(
         mismatches, 0,
         "the tool's classifier disagrees with the engine"
+    );
+    assert_eq!(isolation, 0, "@2 differs from @1 beyond the registry");
+    assert!(
+        registries.iter().all(|registry| registry.sourcing == 0),
+        "a registry reads the wrong composite"
     );
 }

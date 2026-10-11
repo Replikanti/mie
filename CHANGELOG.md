@@ -30,8 +30,22 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   and zone events are exposed by `MarketStateEngine::location_events`.
   `crates/mie-cli/tests/location_measure.rs` measures the numbers behind
   the tolerance and the acceptance time over the archive.
+- **7-day composite profile and `location.levels@2` (ADR-036 decision 2,
+  ADR-044 D5, D10).** `profile.volume.composite_7d@1`, the bin-wise sum of
+  the last 7 completed UTC days (a 7-day window holds every weekday once),
+  and `location.levels@2`, the level registry over the prior-day and 7-day
+  composite profiles. `MarketStateEngine::with_features` builds an engine
+  for the default set with an older version selected instead, today
+  `location.levels@1`, which stays computable.
 
 ### Changed
+
+- **The default level registry reads the 7-day composite (ADR-044 D5).**
+  `location.levels@2` replaces `@1` in the default feature set, and
+  `profile.volume.composite_7d@1` joins it; `composite_5d@1` stays computed.
+  The feature-set version and the state-hash goldens move; no
+  `STATE_HASH_ENCODING` bump (ADR-041 D2). Runs recorded before this change
+  compare events only (ADR-041 D2).
 
 - **`archive-kline-check` reports coverage and an INCONCLUSIVE verdict
   (ADR-045).** A coverage line (window bars compared, bars skipped as
