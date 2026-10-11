@@ -269,13 +269,10 @@ fn a_clean_depth_capture_passes_and_its_reconnect_needs_the_book_gap() {
     assert!(text.contains("has no covering OrderBook gap"), "{text}");
 }
 
-#[test]
-fn a_long_depth_run_needs_a_matched_checkpoint() {
-    let dir = TempDir::new("depth-long");
-    let config = config_with(dir.path(), &["depth", "depthSnapshot"]);
+/// A depth run over 130 s of exchange time, more than twice the 60 s default
+/// checkpoint interval; the fake clock never reaches a checkpoint.
+fn long_depth_run(config: &IngestConfig) -> i64 {
     let t1 = D0 + HOUR;
-    // Diffs over 130 s of exchange time, more than twice the 60 s default
-    // checkpoint interval; the fake clock never reaches a checkpoint.
     let frames: Vec<String> = (0..14)
         .map(|i| {
             depth(
@@ -287,7 +284,7 @@ fn a_long_depth_run_needs_a_matched_checkpoint() {
         })
         .collect();
     let outcome = ingest_depth(
-        &config,
+        config,
         t1,
         vec![DepthConnection {
             frames,
@@ -297,6 +294,14 @@ fn a_long_depth_run_needs_a_matched_checkpoint() {
         vec![],
     );
     assert_eq!(outcome.exit_code(), 0, "{:?}", outcome.error);
+    t1
+}
+
+#[test]
+fn a_long_depth_run_needs_a_matched_checkpoint() {
+    let dir = TempDir::new("depth-long");
+    let config = config_with(dir.path(), &["depth", "depthSnapshot"]);
+    let t1 = long_depth_run(&config);
     let (pass, text) = report(&config);
     assert!(!pass, "{text}");
     assert!(text.contains("without a matched checkpoint"), "{text}");
@@ -305,14 +310,57 @@ fn a_long_depth_run_needs_a_matched_checkpoint() {
         &config,
         &[
             serde_json::json!({"type": "book_checkpoint", "run_id": "20261006T010000Z",
-            "at_ms": t1 + 70_000, "result": "matched", "levels": 40,
+            "at_ms": t1 + 70_000, "result": "matched", "levels": 40, "levels_bid": 22,
+            "levels_ask": 18, "window_bid_cbps": 1_234, "window_ask_cbps": 917}),
+        ],
+    );
+    let (pass, text) = report(&config);
+    assert!(pass, "{text}");
+    assert!(
+        text.contains(
+            "matched 1, inconclusive 0, unverifiable 0 | window min 9.17 bps, median 9.17 bps"
+        ),
+        "{text}"
+    );
+}
+
+#[test]
+fn an_inconclusive_checkpoint_is_counted_but_is_not_a_match() {
+    let dir = TempDir::new("depth-inconclusive");
+    let config = config_with(dir.path(), &["depth", "depthSnapshot"]);
+    let t1 = long_depth_run(&config);
+
+    // Counted, not a problem of its own, but no match for the presence rule.
+    append_lines(
+        &config,
+        &[
+            serde_json::json!({"type": "book_checkpoint", "run_id": "20261006T010000Z",
+            "at_ms": t1 + 70_000, "result": "inconclusive", "levels": 400, "levels_bid": 0,
+            "levels_ask": 400, "window_bid_cbps": 0, "window_ask_cbps": 1_500,
+            "min_side_levels": 1}),
+        ],
+    );
+    let (pass, text) = report(&config);
+    assert!(!pass, "{text}");
+    assert!(text.contains("matched 0, inconclusive 1"), "{text}");
+    assert!(text.contains("without a matched checkpoint"), "{text}");
+    assert!(!text.contains("book checkpoint inconclusive"), "{text}");
+    assert!(text.trim_end().ends_with("FAIL (1 problem(s))"), "{text}");
+
+    // A pre-ADR-049 matched line is judged by its result; its whole-bp
+    // widths stay out of the window statistic.
+    append_lines(
+        &config,
+        &[
+            serde_json::json!({"type": "book_checkpoint", "run_id": "20261006T010000Z",
+            "at_ms": t1 + 130_000, "result": "matched", "levels": 40,
             "window_bid_bps": 12, "window_ask_bps": 9}),
         ],
     );
     let (pass, text) = report(&config);
     assert!(pass, "{text}");
     assert!(
-        text.contains("matched 1, unverifiable 0 | window min 9 bps, median 9 bps"),
+        text.contains("matched 1, inconclusive 1, unverifiable 0 | window -"),
         "{text}"
     );
 }

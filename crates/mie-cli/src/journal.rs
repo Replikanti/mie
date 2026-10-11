@@ -11,7 +11,7 @@
 //! | `oi_poll` | capture | request/response time (ns), status, whether persisted |
 //! | `depth_snapshot_fetch` | capture | `trigger` (sync, checkpoint), request/response time (ns), status, whether persisted |
 //! | `book` | capture | an order-book sync change: `event` = desync, sync, snapshot_rejected, checkpoint_emitted, checkpoint_skipped; its cause, reason or id; the `receive_seq` of the record that caused it |
-//! | `book_checkpoint` | capture | the audit of a checkpoint: `result` = matched, mismatched, unverifiable, invalidated, with levels compared, window in bps or mismatch examples |
+//! | `book_checkpoint` | capture | the audit of a checkpoint: `result` = matched, inconclusive, mismatched, unverifiable, invalidated; matched and inconclusive carry `levels` (total), `levels_bid`, `levels_ask` and `window_bid_cbps`/`window_ask_cbps` (window width in hundredths of a bp, ADR-049), inconclusive also `min_side_levels`; mismatched carries levels compared and mismatch examples |
 //! | `gap` | capture | `stream`, `start`, `end` (ms), `reason`, as delivered to the core |
 //! | `sealed` | capture | the files sealed |
 //! | `normalize_error` | capture | stream, `receive_seq`, error |
@@ -37,7 +37,7 @@
 use mie_adapter_binance::live::ChannelStats;
 use mie_adapter_binance::{
     BinanceStream, BookStats, BookTransition, CaptureEvent, CaptureObserver, CheckpointResult,
-    LiveRun, PipelineStats, SnapshotTrigger,
+    LiveRun, MIN_SIDE_LEVELS, PipelineStats, SideCoverage, SnapshotTrigger,
 };
 use mie_app::equivalence::StateCheckpoint;
 use mie_domain::book::{Invalidation, Side};
@@ -607,16 +607,12 @@ fn book_json(transition: &BookTransition, receive_seq: u64) -> Value {
 /// A checkpoint verdict as journal JSON.
 fn checkpoint_json(result: &CheckpointResult) -> Value {
     match result {
-        CheckpointResult::Matched {
-            levels,
-            window_bid_bps,
-            window_ask_bps,
-        } => json!({
-            "result": "matched",
-            "levels": levels,
-            "window_bid_bps": window_bid_bps,
-            "window_ask_bps": window_ask_bps,
-        }),
+        CheckpointResult::Matched { bid, ask } => coverage_json("matched", bid, ask),
+        CheckpointResult::Inconclusive { bid, ask } => {
+            let mut value = coverage_json("inconclusive", bid, ask);
+            value["min_side_levels"] = json!(MIN_SIDE_LEVELS);
+            value
+        }
         CheckpointResult::Mismatched {
             levels,
             mismatches,
@@ -658,6 +654,20 @@ fn checkpoint_json(result: &CheckpointResult) -> Value {
             },
         }),
     }
+}
+
+/// A verdict that carries per-side coverage: the total level count (kept for
+/// continuity with pre-ADR-049 lines), the per-side counts and the window
+/// widths in hundredths of a basis point (ADR-049 D5).
+fn coverage_json(result: &str, bid: &SideCoverage, ask: &SideCoverage) -> Value {
+    json!({
+        "result": result,
+        "levels": bid.levels + ask.levels,
+        "levels_bid": bid.levels,
+        "levels_ask": ask.levels,
+        "window_bid_cbps": bid.width_cbps,
+        "window_ask_cbps": ask.width_cbps,
+    })
 }
 
 fn side(side: Side) -> &'static str {

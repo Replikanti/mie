@@ -30,9 +30,12 @@
 //!    `stats` line). A stream fails when its late fraction
 //!    `late / (events + late)` exceeds `max_late_fraction` (default 0: the
 //!    hold-back is sized so that nothing is late, ADR-032).
-//! 6. **Order book** (ADR-038): no journaled checkpoint is `mismatched` or
-//!    `invalidated`, and every run whose `depth` records span more than
-//!    twice its checkpoint interval has at least one `matched` checkpoint.
+//! 6. **Order book** (ADR-038, ADR-049): no journaled checkpoint is
+//!    `mismatched` or `invalidated`, and every run whose `depth` records span
+//!    more than twice its checkpoint interval has at least one `matched`
+//!    checkpoint. An `inconclusive` checkpoint (a side compared fewer levels
+//!    than the audit's floor) is counted but is not a problem, and it does
+//!    not count as `matched`.
 //! 7. **Kline reconciliation** (ADR-048, detector C3 in [`crate::reconcile`]):
 //!    within each run, closed `kline_1m` minutes and `aggTrade` records are
 //!    linked in trade-id space (`k.f..k.L` against `f..l`) into blocks of
@@ -47,7 +50,10 @@
 //!
 //! It prints per-stream rows (raw records, then delivery: events, gaps by
 //! reason, late fraction, maximum lateness), an order-book row (syncs,
-//! desyncs, rejected snapshots, checkpoints, trusted-window width), a
+//! desyncs, rejected snapshots, checkpoints by verdict, the narrower side's
+//! trusted-window width over matched checkpoints, in bps with two decimals,
+//! from `window_*_cbps`; a pre-ADR-049 line with only `window_*_bps` adds
+//! nothing to it, so units never mix), a
 //! kline-reconciliation totals row (blocks, conclusive, inconclusive by
 //! reason, flagged blocks and minutes, total difference), then one line per
 //! failed check and a final `PASS` or `FAIL`.
@@ -549,7 +555,7 @@ fn check_book(
     let io = |e: std::io::Error| e.to_string();
     let mut counters: BTreeMap<String, u64> = BTreeMap::new();
     let mut add = |key: String, n: u64| *counters.entry(key).or_default() += n;
-    let (mut matched, mut unverifiable) = (0_u64, 0_u64);
+    let (mut matched, mut inconclusive, mut unverifiable) = (0_u64, 0_u64, 0_u64);
     let mut windows = Vec::new();
     for (run, journal) in runs {
         let book = journal
@@ -572,11 +578,17 @@ fn check_book(
             match checkpoint["result"].as_str().unwrap_or_default() {
                 "matched" => {
                     run_matched += 1;
-                    let sides = [&checkpoint["window_bid_bps"], &checkpoint["window_ask_bps"]];
+                    // Hundredths of a bp (ADR-049); a pre-ADR-049 line has
+                    // only whole-bp keys and is left out of the statistic.
+                    let sides = [
+                        &checkpoint["window_bid_cbps"],
+                        &checkpoint["window_ask_cbps"],
+                    ];
                     if let Some(narrowest) = sides.iter().filter_map(|v| v.as_u64()).min() {
                         windows.push(narrowest);
                     }
                 }
+                "inconclusive" => inconclusive += 1,
                 "unverifiable" => unverifiable += 1,
                 other => problems.push(format!("run {run}: book checkpoint {other}: {checkpoint}")),
             }
@@ -595,7 +607,12 @@ fn check_book(
             ));
         }
     }
-    if counters.is_empty() && matched == 0 && unverifiable == 0 && depth_spans.is_empty() {
+    if counters.is_empty()
+        && matched == 0
+        && inconclusive == 0
+        && unverifiable == 0
+        && depth_spans.is_empty()
+    {
         return Ok(());
     }
     let group = |prefix: &str| {
@@ -615,14 +632,18 @@ fn check_book(
         .map(|(_, n)| n)
         .sum();
     windows.sort_unstable();
+    let bps = |cbps: u64| format!("{}.{:02}", cbps / 100, cbps % 100);
     let window = match (windows.first(), windows.get(windows.len() / 2)) {
-        (Some(min), Some(median)) => format!("min {min} bps, median {median} bps"),
+        (Some(&min), Some(&median)) => {
+            format!("min {} bps, median {} bps", bps(min), bps(median))
+        }
         _ => "-".to_owned(),
     };
     writeln!(
         out,
         "order book: syncs {} | desyncs {} | rejected snapshots {} | checkpoints emitted {}, \
-         skipped {skipped}, matched {matched}, unverifiable {unverifiable} | window {window}",
+         skipped {skipped}, matched {matched}, inconclusive {inconclusive}, \
+         unverifiable {unverifiable} | window {window}",
         counters.get("syncs").copied().unwrap_or(0),
         group("desyncs."),
         group("snapshots_rejected."),
