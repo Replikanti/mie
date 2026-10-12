@@ -601,6 +601,53 @@ fn an_uncrossable_hole_in_the_prefix_moves_the_effective_origin() {
 }
 
 #[test]
+fn an_uncrossable_hole_in_the_sample_restarts_after_one_in_the_prefix() {
+    // Each hole is a trade at the bound after the end of the 1m bar the
+    // trade before it opened (ADR-031 D11): one at `first` in the prefix,
+    // one at `second` in the sample. The sample's restart is the later one
+    // and wins.
+    let hop = i64::try_from(MAX_BARS_PER_EVENT).unwrap() * 60_000 + 60_000;
+    let first = hop;
+    let second = first + hop;
+    let events = vec![
+        trade(1_000, 1, 6_354_200_000_000),
+        trade(first, 2, 6_354_210_000_000),
+        trade(first + 2_000, 3, 6_354_190_000_000),
+        trade(first + 3_000, 4, 6_354_180_000_000),
+        trade(second, 5, 6_354_230_000_000),
+        trade(second + 1_000, 6, 6_354_220_000_000),
+    ];
+    let end = second + 10_000;
+    let spec = spec((first + 1_000, end));
+    let mut service =
+        ExperimentService::on_chain(Recorded(events.clone()), MemoryStore::default(), bounds());
+    let run = service.run(&spec).unwrap();
+    let summary = summary(&run);
+    assert_eq!(
+        summary.effective_origin,
+        Some(EventTime::from_millis(second))
+    );
+    assert_eq!(summary.prefix_stream.events, 2);
+    assert_eq!(summary.prefix_rejections, 0);
+    assert_eq!(summary.stream.events, 4);
+    // The sample's hole restarts the engine; it is not a rejection.
+    assert_eq!(summary.rejections, 0);
+    // The state at the sample's end is one chain drive's over
+    // [origin, sample end), which restarts at both holes.
+    let mut union = MarketStateEngine::new();
+    let mut stream = Recorded(events).replay(window(ORIGIN, end)).unwrap().stream;
+    let drive = drive_chain(&mut stream, &mut union, |e| panic!("{e}")).unwrap();
+    assert_eq!(
+        drive.restarts,
+        [
+            EventTime::from_millis(first),
+            EventTime::from_millis(second)
+        ]
+    );
+    assert_eq!(summary.state_end, union.state().state_hash());
+}
+
+#[test]
 fn a_stored_result_of_another_engine_leaves_the_run_recorded_under_this_one() {
     let spec = spec((2_000, 10_000));
     let ExperimentRun::Recorded(this) =

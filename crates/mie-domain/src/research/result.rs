@@ -291,9 +291,10 @@ impl ExperimentResult {
     ///
     /// # Errors
     ///
-    /// [`ResultParseError`]: a malformed line, an invalid embedded spec, an
-    /// `experiment` line that differs from the embedded spec's id, or text
-    /// that is valid but not canonical.
+    /// [`ResultParseError`]: a malformed line (an `outcome` line of another
+    /// kind than its pipeline's is one, [`PIPELINE_KINDS`]), an invalid
+    /// embedded spec, an `experiment` line that differs from the embedded
+    /// spec's id, or text that is valid but not canonical.
     pub fn parse(text: &str, registry: &FeatureRegistry) -> Result<Self, ResultParseError> {
         let mut lines = Lines {
             rest: text,
@@ -339,6 +340,12 @@ impl ExperimentResult {
             }
             other => return Err(malformed(4, format!("unknown outcome line {other:?}"))),
         };
+        if let Some(kind) = kind_of(&pipeline).filter(|kind| *kind != outcome.kind()) {
+            return Err(malformed(
+                4,
+                format!("expected `outcome {kind}`: the outcome of {pipeline}"),
+            ));
+        }
         if lines.next("spec")? != "spec" {
             return Err(malformed(lines.line, "expected `spec`".to_owned()));
         }
@@ -359,6 +366,24 @@ impl ExperimentResult {
         }
         Ok(result)
     }
+}
+
+/// The outcome kind of each pipeline version that has one (ADR-040,
+/// ADR-052 D10). A result pairing one of them with another kind is no
+/// pipeline's output, and its key would be impossible: `@2` without an
+/// engine, `@1` with one.
+const PIPELINE_KINDS: [(&str, u32, &str); 2] = [
+    ("research.replay_summary", 1, "replay-summary"),
+    ("research.replay_summary", 2, "history-replay-summary"),
+];
+
+/// The outcome kind `pipeline` produces; `None` for a pipeline version not
+/// in [`PIPELINE_KINDS`].
+fn kind_of(pipeline: &PipelineKey) -> Option<&'static str> {
+    PIPELINE_KINDS
+        .iter()
+        .find(|(id, version, _)| pipeline.id() == *id && pipeline.version() == *version)
+        .map(|(_, _, kind)| *kind)
 }
 
 /// The text before the embedded spec, line by line.
@@ -833,6 +858,47 @@ mod tests {
                 line: 13,
                 reason: "expected `state-start <16 hex>`, found the end of the text".to_owned()
             })
+        );
+    }
+
+    #[test]
+    fn the_pipeline_version_fixes_the_outcome_kind() {
+        // No pipeline writes either text, and their keys would be
+        // impossible: `@2` without an engine, `@1` with one.
+        let v2_replay_summary = result().canonical_text().replace(
+            "pipeline research.replay_summary@1",
+            "pipeline research.replay_summary@2",
+        );
+        assert_eq!(
+            parse(&v2_replay_summary),
+            Err(ResultParseError::Malformed {
+                line: 4,
+                reason: "expected `outcome history-replay-summary`: the outcome of \
+                         research.replay_summary@2"
+                    .to_owned()
+            })
+        );
+        let v1_history = history_result().canonical_text().replace(
+            "pipeline research.replay_summary@2",
+            "pipeline research.replay_summary@1",
+        );
+        assert_eq!(
+            parse(&v1_history),
+            Err(ResultParseError::Malformed {
+                line: 4,
+                reason: "expected `outcome replay-summary`: the outcome of \
+                         research.replay_summary@1"
+                    .to_owned()
+            })
+        );
+        // A pipeline version without a kind of its own is not checked.
+        let other = result().canonical_text().replace(
+            "pipeline research.replay_summary@1",
+            "pipeline research.backtest@1",
+        );
+        assert_eq!(
+            parse(&other).map(|result| result.pipeline),
+            Ok(PipelineKey::new("research.backtest", 1))
         );
     }
 

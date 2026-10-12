@@ -112,7 +112,10 @@
 //! The `outcome` line tags the kind and the kind's own lines follow it; a
 //! new kind adds a tag, and the lines of an existing kind never change. A
 //! result whose `experiment` line differs from the id of its embedded spec
-//! does not parse, and neither does any text that is not canonical.
+//! does not parse, and neither does any text that is not canonical. A
+//! pipeline version with a kind of its own fixes the `outcome` line:
+//! `research.replay_summary@1` records `replay-summary`, `@2`
+//! `history-replay-summary`, and any other pairing does not parse.
 //!
 //! `history-replay-summary` (`research.replay_summary@2`, ADR-052 D10)
 //! replaces the two `replay-summary` lines with these, in this order:
