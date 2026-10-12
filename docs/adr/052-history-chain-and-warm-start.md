@@ -109,12 +109,27 @@ deferred option D are under *Alternatives considered*.
 3. **Holes and chain seeds** (#106 plan D1). For runs with a history, each
    stream's seed is the newest event of the same domain stream in the
    chain, archive included, instead of the newest sealed event of the last
-   7 days (ADR-032 decision 5). So the seam and every hole between runs
-   carry a `Disconnected` gap, and since seeds are journaled in
-   `run_start` (ADR-032 decision 4), replay reproduces them.
+   7 days (ADR-032 decision 5). So every hole between runs carries a
+   `Disconnected` gap, and the seam carries one per seeded stream. Seeds
+   are journaled in `run_start` (ADR-032 decision 4), so replay
+   reproduces them.
    - Why: under the 7-day lookback, a pause of more than 7 days gets no
      gap, and the engine would treat the bars across it as complete. A
      chain seed has no window, so every hole is marked.
+   - **At the seam, only streams the archive carries are seeded:**
+     `Trades` (aggTrades), `Klines` and `OpenInterest` (metrics)
+     (`docs/data-availability.md`). `MarkPrice`, `Liquidations` and
+     `OrderBook` have no archive dataset, so the chain holds no earlier
+     event of theirs: the first live run's first event of each is
+     unseeded and yields no gap, as in a first capture on an empty store
+     today. That is correct, because their chain history has no hole,
+     only a start, and their features stay `WarmingUp` until it (the
+     liquidation windows by design, ADR-042). Inventing a seed, for
+     example the origin, would put a year-long `Disconnected` gap into the
+     canonical state of the mark, liquidation and book features. From the
+     first live run on, these streams have chain events and are seeded
+     like every other, so every later hole is marked. `Funding` has no
+     live stream (ADR-042 decision 4) and needs no seed.
    - Runs without a history keep the lookback (decision 8).
 
 4. **Uncrossable holes and the effective origin** (#106 plan D8). A hole
@@ -291,23 +306,45 @@ deferred option D are under *Alternatives considered*.
       updates it.
 
 13. **Debt 2: one live run in memory** (#106 plan D7). `LiveReplay` holds
-    one run's records and output at a time (ADR-039 Consequences: about
-    1.5 M records per 24 h). With the warm-start every live start replays
-    every run since the cutover, so the longest of them must fit in memory
-    at the next start. A run long enough not to fit makes every later
-    start fail its warm-up and run cold (decision 8).
-    - **No value is written now.** The trigger is a run length, derived at
-      #106 from three inputs: the bytes per record, measured as the peak
-      memory of an offline `LiveReplay` of the longest journaled run on
-      record divided by its record count; ADR-039's about 1.5 M records
-      per 24 h; and the memory the host leaves to the warm-up, recorded at
-      #106 with its source. Why an offline replay: no journaled run is
-      known to reach 24 h (#9's about 30 h include a restart, #10 ran
-      13.7 h in two runs, #13's runs were under 3 h), so a per-day
-      measurement could not be reached, while bytes per record can.
-    - When a run since the cutover reaches that length, a streaming
-      per-run recompute in `LiveReplay` becomes due; no issue is filed
-      before that.
+    one run's records and output at a time (ADR-039 Consequences). With
+    the warm-start every live start replays every run since the cutover,
+    so the longest of them must fit in memory at the next start.
+    - **What breaks if it does not fit.** The warm-up runs inside the
+      `mie ingest` process (decision 7). An allocation failure aborts the
+      whole process (Rust aborts on a failed allocation, and the OOM killer
+      kills the process), so the capture dies with the warm-up, and every
+      restart replays the same run and aborts again: a crash loop that
+      loses raw data. That would break decision 8, so it must never
+      happen.
+    - **The guard (W3, #117).** Before it replays the live segment, the
+      warm-up predicts the largest run's memory from that run's journaled
+      record count times the bytes per record below. When the prediction
+      exceeds the memory the host leaves to the warm-up, it journals an
+      `error` in `warm_start` and the run starts cold (decision 8),
+      without allocating the prefix. The capture never dies from the
+      run's size.
+    - **The trigger, in records.** `N_max` = the memory the host leaves to
+      the warm-up ÷ the bytes per record. The bytes per record are
+      measured as the peak memory of an offline `LiveReplay` of the
+      longest journaled run on record divided by its record count; the
+      host memory is recorded at #106 with its source. Why an offline
+      replay: no journaled run is known to reach 24 h (#9's about 30 h
+      include a restart, #10 ran 13.7 h in two runs, #13's runs were under
+      3 h), so a per-day memory measurement cannot be reached, while bytes
+      per record can. The trigger fires when a run since the cutover
+      reaches `N_max` records (`run_end.records`, or the sealed count of an
+      open run), which is before the guard has to refuse a warm start.
+    - **The run length it allows**, a forecast only: `N_max` ÷ 2.40 M
+      records per 24 h. 2.40 M is the largest per-day rate of any journaled
+      run (table below: #9 run 2, against 1.96 M for #10's seven-stream
+      run). The rate follows the day's trading more than the stream set
+      (the aggTrades yearly mean alone is 1.65 M a day), so the largest
+      measured rate is the conservative basis: a lower one would overstate
+      the safe run length. A busier day exceeds 2.40 M; that brings the
+      date forward but never past the limit, because the trigger and the
+      guard count records, not days.
+    - When the trigger fires, a streaming per-run recompute in
+      `LiveReplay` becomes due; no issue is filed before that.
     - Rejected, a streaming-recompute sub-issue now: it builds a
       replacement for a limit no run has reached, before the limit is
       known.
@@ -328,7 +365,7 @@ deferred option D are under *Alternatives considered*.
 | The 90 min trigger (105 min rejected) | `Samples(7)` (ADR-037 decision 10; `SWING_WINDOW` = 2·3 + 1). The first bar is `partial_start` (ADR-031 decision 6), and `TimeframeTracker::confirm` counts it. Pinned by `a_cold_start_mid_bar_is_ready_at_the_seventh_15m_close` | The 7th close falls 105 min after the first bar's open, so a cold engine is `Ready` 105 min − offset after the start, with offset ∈ [0, 15 min): (90, 105] min | Above 90: for a start late in a 15m bar, the warm engine becomes current later than a cold engine would have had 15m structure `Ready`, the regression #95 defined; 105 holds only for a start on a 15m boundary. Below 90: the snapshot gets built while the replay still beats every cold structure warm-up (#95, "Why not lower") |
 | `ready_after_ms` is wall time; the cold warm-up is event time | ADR-031 decision 4 (a bar closes at the next trades-stream event); ADR-032 decision 6 (2 000 ms hold-back) | Both delay a cold engine's 7th close in wall time | So the 90 min comparison errs on the safe side. A live run's first trades-stream event is its seed gap, which opens the partial bar the same way (`partial_start_marks_the_first_bar_of_every_timeframe`, `bars.rs`) |
 | Fire estimates: about 4.7 years at 90 min, about 5.5 years at 105 min | The two rows above | 90 / 19.2 ≈ 4.7; 105 / 19.2 ≈ 5.5, at archive rates and r = 1 | The live segment is unmeasured: it replays depth diffs and every run's pipeline. The estimate can be far off, and #106 updates it |
-| About 1.5 M records per 24 h | ADR-039 Consequences | — | Debt 2's input (decision 13). Records per day scale the run memory linearly; the trigger value itself comes from #106 |
+| 2.40 M records per 24 h (debt 2's day forecast) | Capture journals, `run_end.records` over the run's duration (measured in the PR #121 review): #9 run `20261008T035138Z` 1 811 583 records in 18.14 h (five streams, no depth); #10 run `20261008T231852Z` 1 055 736 in 12.93 h (all seven streams); the aggTrades yearly mean 603 218 226 / 365 days | 1 811 583 / 18.14 × 24 ≈ 2.40 M; 1 055 736 / 12.93 × 24 ≈ 1.96 M; 603 218 226 / 365 ≈ 1.65 M a day. The maximum is taken (decision 13). ADR-039's "about 1.5 M for a 24 h run" is below both measured runs and is not used | Lower: the forecast overstates the safe run length (1.5 M would by 2.40 / 1.5 = 1.6 ×). Higher: the forecast comes too early. Neither moves the limit: the trigger and the guard count records (`N_max`), so the rate only dates the forecast |
 | 6.7 days (the rejected 2026-10-01 cutover) | ADR-031's justification addendum, decision 11: archive end 2026-09-30, live start 2026-10-07 15:50 UTC | — | It would pull the seam and the October soak holes into the canonical state |
 
 ## Consequences
@@ -342,8 +379,10 @@ deferred option D are under *Alternatives considered*.
   prefix)`, with the changed dataset version printed next to the journaled
   one.
 - For warm runs, live now covers what ADR-041's *What the run cannot
-  cover* lists: the long-warm-up features are `Ready` at the handoff, and
-  #106's acceptance shows it.
+  cover* lists, except `derivatives.funding.settled@1`, which stays
+  archive-only (no live settlement event, ADR-042 decision 4): the
+  long-warm-up features are `Ready` at the handoff, and #106's acceptance
+  shows it.
 - During the warm-up the live engine is current for no feature, including
   those a cold engine has `Ready` within minutes: bars, flow and the
   UTC-day VWAP. #95's *Limits* left this point to W. No consumer of live
@@ -426,7 +465,8 @@ coverage list, as in ADR-041, not a duration):
 Two values are written into the Acceptance section with it:
 
 - the concrete cutover date (decision 2);
-- debt 2's trigger value (decision 13): the bytes per record from an
-  offline `LiveReplay` of the longest journaled run on record, times about
-  1.5 M records per 24 h, against the host memory left to the warm-up,
-  each with its source. Reachable without a 24 h run.
+- debt 2's trigger value (decision 13): `N_max`, the host memory left to
+  the warm-up ÷ the bytes per record from an offline `LiveReplay` of the
+  longest journaled run on record, each with its source, and the run
+  length it allows at 2.40 M records per 24 h (or the largest per-day rate
+  of #106's runs, if higher). Reachable without a 24 h run.
