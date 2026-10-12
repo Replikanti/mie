@@ -11,8 +11,10 @@
 //! archive import deliver the same sequence. All values are exact fixed point
 //! (ADR-027).
 
+use crate::fingerprint::Fingerprinter;
 use crate::num::{Price, Qty, Rate};
 use crate::order::EventKind;
+use crate::state_hash::StateEncode;
 use crate::time::EventTime;
 
 /// One market observation, in the order the core consumes it.
@@ -112,6 +114,17 @@ pub enum Aggressor {
     Buy,
     /// An aggressive sell hit the bid.
     Sell,
+}
+
+impl StateEncode for Aggressor {
+    /// `write_u8` in declaration order: Buy 0, Sell 1 (ADR-041, ADR-051
+    /// D1).
+    fn encode(&self, f: &mut Fingerprinter) {
+        f.write_u8(match self {
+            Self::Buy => 0,
+            Self::Sell => 1,
+        });
+    }
 }
 
 /// One price level of an order-book change or snapshot (Data Plane order-flow

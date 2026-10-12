@@ -50,6 +50,7 @@ pub use auction::{
     ACCEPTANCE_CLOSES, AuctionClassifier, AuctionStatus, Classified, Failure, Origin, Position,
     Probe, Region,
 };
+pub(crate) use registry::zone_contains;
 pub use registry::{ClusterStrength, EnterCause, LeaveCause, LevelSet, LevelSide, LocationLevel};
 pub use vwap::Vwap;
 pub(crate) use vwap::{VwapStep, VwapTracker};

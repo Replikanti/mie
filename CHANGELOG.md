@@ -12,6 +12,18 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
 
 ### Added
 
+- **Order-flow candidates: CVD and open-interest divergences (ADR-051,
+  #22).** `candidate.divergence.cvd.<15m|1h|4h|1d>@1` and
+  `candidate.divergence.oi.<15m|1h|4h|1d>@1` compare consecutive confirmed
+  swings of one side at their anchors, the first trade that set each swing
+  bar's extreme: a further extreme with the CVD the other way, or (on
+  either side) with lower open interest, is a candidate. No magnitude
+  threshold; each comparison carries its price, CVD and OI changes, the
+  trades gaps between the anchors and the span. Values are appended last
+  to `MarketState` as `candidates`; the facts, with a location context
+  (registry levels at the swing price and the auction state), are exposed
+  by `MarketStateEngine::candidate_events`. Candidates carry no direction
+  and never gate on location.
 - **`--trade-correction fold|none` (ADR-050, #102)** on `mie replay`,
   `mie experiment run` (both with `--source archive`) and
   `mie archive-kline-check` (with `--trade-source aggTrades`). `none`

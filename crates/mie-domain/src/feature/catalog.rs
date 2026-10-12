@@ -1554,6 +1554,243 @@ pub const LOCATION_AUCTION_PRIOR_DAY_V1: FeatureDefinition = FeatureDefinition {
     warm_up: WarmUp::Samples(1),
 };
 
+/// A `candidate.divergence.<cvd|oi>.<label>@1` definition (ADR-051 D4):
+/// swing pairs of one structure timeframe compared at their anchors.
+const fn candidate_divergence_v1(
+    id: &'static str,
+    params: &'static [Param],
+    inputs: &'static [Input],
+) -> FeatureDefinition {
+    FeatureDefinition {
+        key: FeatureKey::new(id, 1),
+        params,
+        inputs,
+        warm_up: WarmUp::Samples(1),
+    }
+}
+
+/// The parameters of a divergence on the timeframe of `timeframe_ms`
+/// (ADR-051 D4), sorted by name.
+const fn divergence_params(timeframe_ms: i64) -> [Param; 3] {
+    [
+        Param {
+            name: "anchor_rule",
+            value: ParamValue::Text("first_trade_at_extreme"),
+        },
+        Param {
+            name: "compare_rule",
+            value: ParamValue::Text("strict"),
+        },
+        Param {
+            name: "timeframe_ms",
+            value: ParamValue::Int(timeframe_ms),
+        },
+    ]
+}
+
+/// The divergence parameters of the 15m timeframe.
+const DIVERGENCE_PARAMS_15M: [Param; 3] = divergence_params(900_000);
+
+/// The divergence parameters of the 1h timeframe.
+const DIVERGENCE_PARAMS_1H: [Param; 3] = divergence_params(3_600_000);
+
+/// The divergence parameters of the 4h timeframe.
+const DIVERGENCE_PARAMS_4H: [Param; 3] = divergence_params(14_400_000);
+
+/// The divergence parameters of the 1d timeframe.
+const DIVERGENCE_PARAMS_1D: [Param; 3] = divergence_params(86_400_000);
+
+/// `candidate.divergence.cvd.15m@1`: CVD divergence on confirmed 15m
+/// swings (ADR-051 D4). Each confirmed swing is anchored at the first trade
+/// that set the swing bar's extreme, with `flow.cvd.continuous@1` after it.
+/// Two consecutive anchored swings of one side form a pair; the pair is
+/// divergent when the later one is a strictly higher high with a strictly
+/// lower CVD, or a strictly lower low with a strictly higher CVD. The value
+/// is the last pair of each side; a divergent pair is a candidate event,
+/// emitted by the event that confirms the later swing. No magnitude
+/// threshold. A candidate, never a signal (ADR-012).
+///
+/// - Parameters: `anchor_rule` = `first_trade_at_extreme` (a strictly
+///   further price replaces the record, a tie keeps the first),
+///   `compare_rule` = `strict`, `timeframe_ms` = 900 000.
+/// - Inputs: `structure.swing.15m@1`, `bars.time.15m@1`,
+///   `flow.cvd.continuous@1` and trades.
+/// - Warm-up: one sample, where a sample is an anchored confirmed swing;
+///   each side's pair stays `None` until that side's second one.
+/// - Gap policy: nothing resets on a gap. A pair carries the OR of both
+///   swings' coverage, plus `feed_gap` when trades gaps fall between its
+///   anchors (`gaps_between > 0`, the CVD's gap count).
+pub const CANDIDATE_DIVERGENCE_CVD_15M_V1: FeatureDefinition = candidate_divergence_v1(
+    "candidate.divergence.cvd.15m",
+    &DIVERGENCE_PARAMS_15M,
+    &[
+        Input::Feature(STRUCTURE_SWING_15M_V1.key),
+        Input::Feature(BARS_TIME_15M_V1.key),
+        Input::Feature(FLOW_CVD_CONTINUOUS_V1.key),
+        Input::Stream(Stream::Trades),
+    ],
+);
+
+/// `candidate.divergence.cvd.1h@1`: CVD divergence on confirmed 1h swings
+/// (ADR-051 D4).
+///
+/// Parameters as [`CANDIDATE_DIVERGENCE_CVD_15M_V1`] with `timeframe_ms` =
+/// 3 600 000. Inputs: `structure.swing.1h@1`, `bars.time.1h@1`,
+/// `flow.cvd.continuous@1` and trades. Warm-up (one anchored confirmed
+/// swing) and gap policy as [`CANDIDATE_DIVERGENCE_CVD_15M_V1`].
+pub const CANDIDATE_DIVERGENCE_CVD_1H_V1: FeatureDefinition = candidate_divergence_v1(
+    "candidate.divergence.cvd.1h",
+    &DIVERGENCE_PARAMS_1H,
+    &[
+        Input::Feature(STRUCTURE_SWING_1H_V1.key),
+        Input::Feature(BARS_TIME_1H_V1.key),
+        Input::Feature(FLOW_CVD_CONTINUOUS_V1.key),
+        Input::Stream(Stream::Trades),
+    ],
+);
+
+/// `candidate.divergence.cvd.4h@1`: CVD divergence on confirmed 4h swings
+/// (ADR-051 D4).
+///
+/// Parameters as [`CANDIDATE_DIVERGENCE_CVD_15M_V1`] with `timeframe_ms` =
+/// 14 400 000. Inputs: `structure.swing.4h@1`, `bars.time.4h@1`,
+/// `flow.cvd.continuous@1` and trades. Warm-up (one anchored confirmed
+/// swing) and gap policy as [`CANDIDATE_DIVERGENCE_CVD_15M_V1`].
+pub const CANDIDATE_DIVERGENCE_CVD_4H_V1: FeatureDefinition = candidate_divergence_v1(
+    "candidate.divergence.cvd.4h",
+    &DIVERGENCE_PARAMS_4H,
+    &[
+        Input::Feature(STRUCTURE_SWING_4H_V1.key),
+        Input::Feature(BARS_TIME_4H_V1.key),
+        Input::Feature(FLOW_CVD_CONTINUOUS_V1.key),
+        Input::Stream(Stream::Trades),
+    ],
+);
+
+/// `candidate.divergence.cvd.1d@1`: CVD divergence on confirmed 1d swings
+/// (ADR-051 D4).
+///
+/// Parameters as [`CANDIDATE_DIVERGENCE_CVD_15M_V1`] with `timeframe_ms` =
+/// 86 400 000. Inputs: `structure.swing.1d@1`, `bars.time.1d@1`,
+/// `flow.cvd.continuous@1` and trades. Warm-up (one anchored confirmed
+/// swing) and gap policy as [`CANDIDATE_DIVERGENCE_CVD_15M_V1`].
+pub const CANDIDATE_DIVERGENCE_CVD_1D_V1: FeatureDefinition = candidate_divergence_v1(
+    "candidate.divergence.cvd.1d",
+    &DIVERGENCE_PARAMS_1D,
+    &[
+        Input::Feature(STRUCTURE_SWING_1D_V1.key),
+        Input::Feature(BARS_TIME_1D_V1.key),
+        Input::Feature(FLOW_CVD_CONTINUOUS_V1.key),
+        Input::Stream(Stream::Trades),
+    ],
+);
+
+/// `candidate.divergence.oi.15m@1`: open-interest divergence on confirmed
+/// 15m swings (ADR-051 D4). Swings are anchored and paired as in
+/// [`CANDIDATE_DIVERGENCE_CVD_15M_V1`], and each anchor also records the
+/// ready `derivatives.oi.5m@1` point at its trade, unless the point's
+/// boundary lies more than 360 000 ms (one grid interval plus the grid's
+/// `max_age_ms`) before the trade. The pair is divergent
+/// when the later swing is a further extreme on either side (a strictly
+/// higher high or a strictly lower low) with strictly lower open interest:
+/// open interest counts positions on both sides, so the rule does not
+/// mirror. Without a ready grid point at either anchor the pair has no OI
+/// change and is never divergent. A candidate, never a signal (ADR-012).
+///
+/// - Parameters: those of [`CANDIDATE_DIVERGENCE_CVD_15M_V1`].
+/// - Inputs: `structure.swing.15m@1`, `bars.time.15m@1`,
+///   `flow.cvd.continuous@1`, trades and `derivatives.oi.5m@1`.
+/// - Warm-up: one sample, where a sample is an anchored confirmed swing.
+/// - Gap policy: as [`CANDIDATE_DIVERGENCE_CVD_15M_V1`]; an open-interest
+///   gap shows only as a missing grid point at an anchor: an `Unavailable`
+///   point, or a ready one older than the bound above.
+pub const CANDIDATE_DIVERGENCE_OI_15M_V1: FeatureDefinition = candidate_divergence_v1(
+    "candidate.divergence.oi.15m",
+    &DIVERGENCE_PARAMS_15M,
+    &[
+        Input::Feature(STRUCTURE_SWING_15M_V1.key),
+        Input::Feature(BARS_TIME_15M_V1.key),
+        Input::Feature(FLOW_CVD_CONTINUOUS_V1.key),
+        Input::Stream(Stream::Trades),
+        Input::Feature(DERIVATIVES_OI_5M_V1.key),
+    ],
+);
+
+/// `candidate.divergence.oi.1h@1`: open-interest divergence on confirmed
+/// 1h swings (ADR-051 D4).
+///
+/// Parameters as [`CANDIDATE_DIVERGENCE_CVD_15M_V1`] with `timeframe_ms` =
+/// 3 600 000. Inputs: `structure.swing.1h@1`, `bars.time.1h@1`,
+/// `flow.cvd.continuous@1`, trades and `derivatives.oi.5m@1`. Warm-up and
+/// gap policy as [`CANDIDATE_DIVERGENCE_OI_15M_V1`].
+pub const CANDIDATE_DIVERGENCE_OI_1H_V1: FeatureDefinition = candidate_divergence_v1(
+    "candidate.divergence.oi.1h",
+    &DIVERGENCE_PARAMS_1H,
+    &[
+        Input::Feature(STRUCTURE_SWING_1H_V1.key),
+        Input::Feature(BARS_TIME_1H_V1.key),
+        Input::Feature(FLOW_CVD_CONTINUOUS_V1.key),
+        Input::Stream(Stream::Trades),
+        Input::Feature(DERIVATIVES_OI_5M_V1.key),
+    ],
+);
+
+/// `candidate.divergence.oi.4h@1`: open-interest divergence on confirmed
+/// 4h swings (ADR-051 D4).
+///
+/// Parameters as [`CANDIDATE_DIVERGENCE_CVD_15M_V1`] with `timeframe_ms` =
+/// 14 400 000. Inputs: `structure.swing.4h@1`, `bars.time.4h@1`,
+/// `flow.cvd.continuous@1`, trades and `derivatives.oi.5m@1`. Warm-up and
+/// gap policy as [`CANDIDATE_DIVERGENCE_OI_15M_V1`].
+pub const CANDIDATE_DIVERGENCE_OI_4H_V1: FeatureDefinition = candidate_divergence_v1(
+    "candidate.divergence.oi.4h",
+    &DIVERGENCE_PARAMS_4H,
+    &[
+        Input::Feature(STRUCTURE_SWING_4H_V1.key),
+        Input::Feature(BARS_TIME_4H_V1.key),
+        Input::Feature(FLOW_CVD_CONTINUOUS_V1.key),
+        Input::Stream(Stream::Trades),
+        Input::Feature(DERIVATIVES_OI_5M_V1.key),
+    ],
+);
+
+/// `candidate.divergence.oi.1d@1`: open-interest divergence on confirmed
+/// 1d swings (ADR-051 D4).
+///
+/// Parameters as [`CANDIDATE_DIVERGENCE_CVD_15M_V1`] with `timeframe_ms` =
+/// 86 400 000. Inputs: `structure.swing.1d@1`, `bars.time.1d@1`,
+/// `flow.cvd.continuous@1`, trades and `derivatives.oi.5m@1`. Warm-up and
+/// gap policy as [`CANDIDATE_DIVERGENCE_OI_15M_V1`].
+pub const CANDIDATE_DIVERGENCE_OI_1D_V1: FeatureDefinition = candidate_divergence_v1(
+    "candidate.divergence.oi.1d",
+    &DIVERGENCE_PARAMS_1D,
+    &[
+        Input::Feature(STRUCTURE_SWING_1D_V1.key),
+        Input::Feature(BARS_TIME_1D_V1.key),
+        Input::Feature(FLOW_CVD_CONTINUOUS_V1.key),
+        Input::Stream(Stream::Trades),
+        Input::Feature(DERIVATIVES_OI_5M_V1.key),
+    ],
+);
+
+/// The CVD divergence of each structure timeframe, shortest first, in
+/// [`STRUCTURE_SWING`] order.
+pub const CANDIDATE_DIVERGENCE_CVD: [(Timeframe, &FeatureDefinition); 4] = [
+    (Timeframe::M15, &CANDIDATE_DIVERGENCE_CVD_15M_V1),
+    (Timeframe::H1, &CANDIDATE_DIVERGENCE_CVD_1H_V1),
+    (Timeframe::H4, &CANDIDATE_DIVERGENCE_CVD_4H_V1),
+    (Timeframe::D1, &CANDIDATE_DIVERGENCE_CVD_1D_V1),
+];
+
+/// The open-interest divergence of each structure timeframe, shortest
+/// first, in [`STRUCTURE_SWING`] order.
+pub const CANDIDATE_DIVERGENCE_OI: [(Timeframe, &FeatureDefinition); 4] = [
+    (Timeframe::M15, &CANDIDATE_DIVERGENCE_OI_15M_V1),
+    (Timeframe::H1, &CANDIDATE_DIVERGENCE_OI_1H_V1),
+    (Timeframe::H4, &CANDIDATE_DIVERGENCE_OI_4H_V1),
+    (Timeframe::D1, &CANDIDATE_DIVERGENCE_OI_1D_V1),
+];
+
 /// Every version of every feature. Never shrinks.
 pub const DEFINITIONS: &[&FeatureDefinition] = &[
     &TRADE_LAST_PRICE_V1,
@@ -1605,6 +1842,14 @@ pub const DEFINITIONS: &[&FeatureDefinition] = &[
     &LOCATION_LEVELS_V1,
     &LOCATION_LEVELS_V2,
     &LOCATION_AUCTION_PRIOR_DAY_V1,
+    &CANDIDATE_DIVERGENCE_CVD_15M_V1,
+    &CANDIDATE_DIVERGENCE_CVD_1H_V1,
+    &CANDIDATE_DIVERGENCE_CVD_4H_V1,
+    &CANDIDATE_DIVERGENCE_CVD_1D_V1,
+    &CANDIDATE_DIVERGENCE_OI_15M_V1,
+    &CANDIDATE_DIVERGENCE_OI_1H_V1,
+    &CANDIDATE_DIVERGENCE_OI_4H_V1,
+    &CANDIDATE_DIVERGENCE_OI_1D_V1,
 ];
 
 /// The fingerprint each published `id@version` must keep. Append-only: one
@@ -1659,6 +1904,14 @@ pub const LOCK: &[LockEntry] = &[
     LockEntry::new("location.auction.prior_day", 1, 0x1017_20ac_f993_c63a),
     LockEntry::new("profile.volume.composite_7d", 1, 0x9d86_e7fc_b93c_bb7e),
     LockEntry::new("location.levels", 2, 0x4216_e2ee_3ce1_d483),
+    LockEntry::new("candidate.divergence.cvd.15m", 1, 0x4a95_6fd0_c881_f046),
+    LockEntry::new("candidate.divergence.cvd.1h", 1, 0xf55d_46f8_f9ee_511f),
+    LockEntry::new("candidate.divergence.cvd.4h", 1, 0xee6a_e2c9_7af0_aff9),
+    LockEntry::new("candidate.divergence.cvd.1d", 1, 0x9beb_d9d6_babe_5b44),
+    LockEntry::new("candidate.divergence.oi.15m", 1, 0x3a25_68a5_dfc4_8801),
+    LockEntry::new("candidate.divergence.oi.1h", 1, 0xed72_db8d_55a5_b120),
+    LockEntry::new("candidate.divergence.oi.4h", 1, 0x8661_6833_ab6f_e39e),
+    LockEntry::new("candidate.divergence.oi.1d", 1, 0xb8a9_ad9b_7bc9_7d5b),
 ];
 
 /// The default feature set: the latest version of each computed feature.
@@ -1711,6 +1964,14 @@ pub const CURRENT: &[FeatureKey] = &[
     LOCATION_VWAP_UTC_DAY_V1.key,
     LOCATION_LEVELS_V2.key,
     LOCATION_AUCTION_PRIOR_DAY_V1.key,
+    CANDIDATE_DIVERGENCE_CVD_15M_V1.key,
+    CANDIDATE_DIVERGENCE_CVD_1H_V1.key,
+    CANDIDATE_DIVERGENCE_CVD_4H_V1.key,
+    CANDIDATE_DIVERGENCE_CVD_1D_V1.key,
+    CANDIDATE_DIVERGENCE_OI_15M_V1.key,
+    CANDIDATE_DIVERGENCE_OI_1H_V1.key,
+    CANDIDATE_DIVERGENCE_OI_4H_V1.key,
+    CANDIDATE_DIVERGENCE_OI_1D_V1.key,
 ];
 
 /// Older versions the engine still computes on request, each in place of
@@ -1806,10 +2067,10 @@ mod tests {
             hasher.write_u32(entry.key.version.get());
             hasher.write_u64(entry.fingerprint.value());
         }
-        assert_eq!(LOCK.len(), 49, "lock lines");
+        assert_eq!(LOCK.len(), 57, "lock lines");
         assert_eq!(
             hasher.finish().to_string(),
-            "c2ea10471718bc54",
+            "04992581d5bdce97",
             "lock digest"
         );
     }
@@ -2345,6 +2606,69 @@ mod tests {
     }
 
     #[test]
+    fn candidate_divergences_match_their_timeframes() {
+        // ADR-051 D4: one CVD and one OI divergence per structure timeframe,
+        // on that timeframe's swings and bars, with no location input
+        // (decision 3).
+        use crate::structure::STRUCTURE_TIMEFRAMES;
+        assert_eq!(
+            CANDIDATE_DIVERGENCE_CVD.map(|(timeframe, _)| timeframe),
+            STRUCTURE_TIMEFRAMES
+        );
+        assert_eq!(
+            CANDIDATE_DIVERGENCE_OI.map(|(timeframe, _)| timeframe),
+            STRUCTURE_TIMEFRAMES
+        );
+        for (((timeframe, cvd), (_, oi)), (_, swing)) in CANDIDATE_DIVERGENCE_CVD
+            .into_iter()
+            .zip(CANDIDATE_DIVERGENCE_OI)
+            .zip(STRUCTURE_SWING)
+        {
+            let bars = BARS_TIME
+                .iter()
+                .find(|(bars, _)| *bars == timeframe)
+                .unwrap()
+                .1;
+            let params = [
+                Param {
+                    name: "anchor_rule",
+                    value: ParamValue::Text("first_trade_at_extreme"),
+                },
+                Param {
+                    name: "compare_rule",
+                    value: ParamValue::Text("strict"),
+                },
+                Param {
+                    name: "timeframe_ms",
+                    value: ParamValue::Int(timeframe.millis()),
+                },
+            ];
+            let inputs = [
+                Input::Feature(swing.key),
+                Input::Feature(bars.key),
+                Input::Feature(FLOW_CVD_CONTINUOUS_V1.key),
+                Input::Stream(Stream::Trades),
+            ];
+            assert_eq!(
+                cvd.key.id.as_str(),
+                format!("candidate.divergence.cvd.{}", timeframe.label())
+            );
+            assert_eq!(
+                oi.key.id.as_str(),
+                format!("candidate.divergence.oi.{}", timeframe.label())
+            );
+            for definition in [cvd, oi] {
+                assert_eq!(definition.params, &params, "{}", definition.key);
+                assert_eq!(definition.warm_up, WarmUp::Samples(1), "{}", definition.key);
+                assert_eq!(&definition.inputs[..4], &inputs, "{}", definition.key);
+                assert!(CURRENT.contains(&definition.key), "{}", definition.key);
+            }
+            assert_eq!(cvd.inputs.len(), 4);
+            assert_eq!(oi.inputs[4..], [Input::Feature(DERIVATIVES_OI_5M_V1.key)]);
+        }
+    }
+
+    #[test]
     fn selectable_versions_are_older_than_current() {
         // ADR-029 D3, ADR-044 D10: each selectable version is registered,
         // older than the CURRENT version of its id, and substitutes into
@@ -2389,6 +2713,10 @@ mod tests {
              bars.time.1h@1,bars.time.1m@1,bars.time.4h@1,bars.time.5m@1,\
              book.clusters@1,book.depth@1,book.l2@1,book.liquidity.window.15m@1,\
              book.liquidity.window.1h@1,book.liquidity.window.5m@1,\
+             candidate.divergence.cvd.15m@1,candidate.divergence.cvd.1d@1,\
+             candidate.divergence.cvd.1h@1,candidate.divergence.cvd.4h@1,\
+             candidate.divergence.oi.15m@1,candidate.divergence.oi.1d@1,\
+             candidate.divergence.oi.1h@1,candidate.divergence.oi.4h@1,\
              derivatives.funding.settled@1,derivatives.liq.window.15m@1,\
              derivatives.liq.window.1h@1,derivatives.liq.window.5m@1,\
              derivatives.mark@1,derivatives.oi.5m@1,derivatives.oi.sample@1,\
@@ -2402,6 +2730,6 @@ mod tests {
              structure.swing.1h@1,structure.swing.4h@1,trade.last_price@1,\
              volatility.atr.1h@1,volatility.regime.1h@1"
         );
-        assert_eq!(set.version().to_string(), "685b83d7bf13b54c");
+        assert_eq!(set.version().to_string(), "17fec2c17e164179");
     }
 }
