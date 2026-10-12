@@ -350,7 +350,9 @@ tf = 15m, 1h, 4h, 1d.
       ruled out (D9), and it leaves more window lengths without an
       evaluable combination, so R1b stops more often for want of data.
     - A non-evaluable combination is recorded and does not count against
-      `B`; a window length without one stops R1b (below).
+      `B`. A window length without one stops R1b only for a candidate that
+      fails no evaluable combination of that half (the order is under Stop
+      rules, below).
   - **Threshold.** `X² ≤ χ²₂₃(1 − 0.05/k)`, where `k` is the number of
     evaluable (window length, `q`) combinations of that `B` and half, at
     most 3 × 6 = 18. The critical value is 35.172 at k = 1 and 46.258 at
@@ -392,9 +394,22 @@ tf = 15m, 1h, 4h, 1d.
     follows a change of volatility sooner; once the hour-of-day profile is
     kept, a longer baseline buys nothing R1b measures. The second half
     checks the chosen `B` with the same test.
-  - **Stop rules.** Stop and report on #22 if no candidate passes on the
-    first half, if a window length has no evaluable combination, or if the
-    chosen `B` fails on the second half. `B_ref` is never picked by
+  - **Stop rules.** The candidates are taken smallest first, and each `B`
+    is decided by the first of these steps that applies:
+    1. `B` fails an evaluable combination on the first half: `B` is out and
+       the next candidate is taken. A window length of `B` without an
+       evaluable combination does not matter then: a failing combination
+       already rules `B` out.
+    2. A window length has no evaluable combination on the first half:
+       stop. A larger `B` is not taken: it would be picked while this one
+       may still pass.
+    3. `B` fails an evaluable combination on the second half: stop.
+    4. A window length has no evaluable combination on the second half:
+       stop.
+    5. Otherwise `B` is fixed.
+
+    If every candidate leaves at step 1, no candidate passes on the first
+    half: stop. Every stop is reported on #22. `B_ref` is never picked by
     default: it cannot be tested against itself, and its 7× state and
     7-day warm-up are costs a human accepts, not a rule.
 - **`q_hi`: fixed by R1 (M3), at the `B` R1b fixed.** `q_hi` is the
@@ -671,7 +686,15 @@ run on the same clock (ADR-043 D6).
    - a missing `aggTrades` or `metrics` daily file in the coverage probe
      (730 files expected: 365 days × 2 streams);
    - a file the importer rejects;
-   - a trade-id break in `aggTrades` reported by `mie archive-verify`.
+   - a trade-id break in `aggTrades` reported by `mie archive-verify`;
+   - any other `mie archive-verify` failure over the window: a normalize
+     error, a hash mismatch on read, a row count or ledger that disagrees
+     with the store, or a file not imported — `archive-verify` must print
+     PASS;
+   - an error of the measurement run's archive replay caused by such data
+     (a file that does not read, a record that does not normalize). The
+     run panics on it before its report is printed, so no R0, R1b or R1
+     outcome exists yet.
 
    Holes over 60 s without an id break are recorded, not stops: consecutive
    ids mean nothing is missing. *Why a human may remedy these stops:* they
