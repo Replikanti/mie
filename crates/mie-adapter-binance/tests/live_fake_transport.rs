@@ -21,11 +21,17 @@ use mie_ports::raw::{RawRecord, RawRecordSink, RawStoreError, RawStreamKey, Seal
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// 2026-10-06T00:00:00Z in ms.
 const D0: i64 = 1_791_244_800_000;
 const MS: i64 = 1_000_000;
+
+/// How long a scripted wait may take in real time before the test fails
+/// with a diagnostic instead of hanging. Healthy waits take milliseconds and
+/// a whole test about 40 ms, so a starved runner does not trip it; a stall
+/// then costs 30 s instead of the 15 min `check` job timeout.
+const WAIT_DEADLINE: Duration = Duration::from_secs(30);
 
 /// A clock that only the thread named `driver` advances; other threads'
 /// sleeps are short real sleeps.
@@ -87,6 +93,10 @@ enum Step {
     /// Wait (in real time) until the sink holds this many records, then
     /// time out: lets the capture thread catch up with the clock.
     AwaitRecords(usize),
+    /// Wait (in real time) until the capture has observed this many
+    /// depth snapshot fetches, then time out: the fetcher journals a fetch
+    /// only after it has read the clock for it.
+    AwaitFetches(usize),
 }
 
 /// One scripted connect attempt.
@@ -103,6 +113,8 @@ struct WsLog {
     pings: Vec<(String, f64)>,
     /// (stream path, clock seconds) of every close.
     closes: Vec<(String, f64)>,
+    /// Scripted waits that hit [`WAIT_DEADLINE`]; [`run`] fails on any.
+    stalls: Vec<String>,
 }
 
 struct FakeConnector {
@@ -112,6 +124,8 @@ struct FakeConnector {
     log: Arc<Mutex<WsLog>>,
     /// The capture's sink, for [`Step::AwaitRecords`].
     sink: Mutex<Option<Arc<Mutex<SinkLog>>>>,
+    /// The capture's observer, for [`Step::AwaitFetches`].
+    observed: Mutex<Option<Recorder>>,
 }
 
 impl FakeConnector {
@@ -131,6 +145,7 @@ impl FakeConnector {
             shutdown: Arc::clone(shutdown),
             log: Arc::default(),
             sink: Mutex::default(),
+            observed: Mutex::default(),
         })
     }
 }
@@ -153,6 +168,7 @@ impl WsConnector for FakeConnector {
                 shutdown: Arc::clone(&self.shutdown),
                 log: Arc::clone(&self.log),
                 sink: self.sink.lock().unwrap().clone(),
+                observed: self.observed.lock().unwrap().clone(),
             })),
             Some(Connect::Fail) => Err("scripted connect failure".to_owned()),
             None => Err("script exhausted".to_owned()),
@@ -167,6 +183,34 @@ struct FakeConnection {
     shutdown: Arc<AtomicBool>,
     log: Arc<Mutex<WsLog>>,
     sink: Option<Arc<Mutex<SinkLog>>>,
+    observed: Option<Recorder>,
+}
+
+impl FakeConnection {
+    /// Waits (in real time) until `count` reaches `n`. Past
+    /// [`WAIT_DEADLINE`] it logs a stall and requests shutdown, so that the
+    /// capture ends and the test fails instead of hanging.
+    fn await_count(&self, what: &str, n: usize, count: impl Fn() -> usize) {
+        let deadline = Instant::now() + WAIT_DEADLINE;
+        loop {
+            let seen = count();
+            if seen >= n {
+                return;
+            }
+            if Instant::now() >= deadline {
+                let stall = format!(
+                    "{}: awaited {n} {what}, saw {seen} after {WAIT_DEADLINE:?} \
+                     (fake mono clock {:.3} s)",
+                    self.path,
+                    self.clock.mono_secs()
+                );
+                self.log.lock().unwrap().stalls.push(stall);
+                self.shutdown.store(true, Ordering::Relaxed);
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
 }
 
 impl WsConnection for FakeConnection {
@@ -188,9 +232,18 @@ impl WsConnection for FakeConnection {
             }
             Some(Step::AwaitRecords(n)) => {
                 let sink = self.sink.as_ref().expect("sink registered");
-                while sink.lock().unwrap().records.len() < n {
-                    std::thread::sleep(Duration::from_millis(1));
-                }
+                self.await_count("records", n, || sink.lock().unwrap().records.len());
+                ReadOutcome::Timeout
+            }
+            Some(Step::AwaitFetches(n)) => {
+                let observed = self.observed.as_ref().expect("observer registered");
+                self.await_count("snapshot fetches", n, || {
+                    let events = observed.0.lock().unwrap();
+                    events
+                        .iter()
+                        .filter(|e| matches!(e, CaptureEvent::DepthSnapshotFetch { .. }))
+                        .count()
+                });
                 ReadOutcome::Timeout
             }
             // An idle but healthy connection.
@@ -406,6 +459,8 @@ fn run(
         fail_at,
     };
     let recorder = Recorder::default();
+    *connector.observed.lock().unwrap() = Some(recorder.clone());
+    let ws_log = Arc::clone(&connector.log);
     let (mut provider, handle) = start(
         config,
         sink,
@@ -450,6 +505,8 @@ fn run(
     };
     drop(provider);
     let joined = handle.join();
+    let stalls = std::mem::take(&mut ws_log.lock().unwrap().stalls);
+    assert!(stalls.is_empty(), "scripted waits stalled: {stalls:#?}");
     let observed = recorder.0.lock().unwrap().clone();
     Outcome {
         events,
@@ -1310,6 +1367,9 @@ struct LaggedOi {
     clock: Arc<FakeClock>,
     sent_upto: Arc<std::sync::atomic::AtomicI64>,
     shutdown: Arc<AtomicBool>,
+    /// Polls whose wait hit [`WAIT_DEADLINE`]; [`lagged_oi_run`] fails on
+    /// any.
+    stalls: Mutex<Vec<String>>,
 }
 
 impl HttpGet for LaggedOi {
@@ -1319,7 +1379,24 @@ impl HttpGet for LaggedOi {
             self.shutdown.store(true, Ordering::Relaxed);
             return Err("script exhausted".to_owned());
         };
-        while self.sent_upto.load(Ordering::SeqCst) < slot {
+        let deadline = Instant::now() + WAIT_DEADLINE;
+        loop {
+            let sent = self.sent_upto.load(Ordering::SeqCst);
+            if sent >= slot {
+                break;
+            }
+            if Instant::now() >= deadline {
+                let stall = format!(
+                    "open interest poll at slot +{} ms: marks sent up to +{} ms after \
+                     {WAIT_DEADLINE:?}",
+                    slot - D0,
+                    sent - D0
+                );
+                self.stalls.lock().unwrap().push(stall);
+                // A panic here would leave the provider blocked.
+                self.shutdown.store(true, Ordering::Relaxed);
+                return Err("scripted wait stalled".to_owned());
+            }
             std::thread::sleep(Duration::from_millis(1));
         }
         self.clock.advance(Duration::from_millis(37));
@@ -1345,7 +1422,9 @@ fn lagged_oi_run(lags_ms: &[i64], oi_retime_ms: Option<i64>) -> (Outcome, LiveCo
         clock: Arc::clone(&clock),
         sent_upto,
         shutdown: Arc::clone(&shutdown),
+        stalls: Mutex::default(),
     });
+    let polls = Arc::clone(&http);
     let connector = Arc::new(PacedConnector(Mutex::new(Some(marks))));
     // The shipped defaults: 2000 ms hold-back, 10 000 ms re-time allowance.
     let mut cfg = config(&[BinanceStream::MarkPrice, BinanceStream::OpenInterest]);
@@ -1377,6 +1456,8 @@ fn lagged_oi_run(lags_ms: &[i64], oi_retime_ms: Option<i64>) -> (Outcome, LiveCo
     };
     drop(provider);
     let joined = handle.join();
+    let stalls = std::mem::take(&mut *polls.stalls.lock().unwrap());
+    assert!(stalls.is_empty(), "scripted waits stalled: {stalls:#?}");
     let observed = recorder.0.lock().unwrap().clone();
     let outcome = Outcome {
         events,
@@ -1586,6 +1667,12 @@ fn depth_syncs_on_requested_snapshots_and_audits_a_checkpoint() {
         Step::Frame(depth(41, 50, 40, D0 + 300, "", &bid("101.00", "3.000"))),
         Step::AwaitRecords(6),
         Step::Frame(depth(51, 60, 50, D0 + 400, &bid("100.00", "4.000"), "")),
+        // The fetcher stamps its last success only after it has sent the
+        // snapshot frame, so the record above does not order the stamp
+        // before the tick; its third fetch event does. A tick that overtook
+        // the stamp would leave the checkpoint due past the last clock
+        // advance, and the run would wait forever for it.
+        Step::AwaitFetches(3),
         // The checkpoint cadence.
         Step::Tick(Duration::from_secs(6)),
         Step::AwaitRecords(8),
