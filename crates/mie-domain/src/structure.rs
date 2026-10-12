@@ -1481,6 +1481,105 @@ mod tests {
         }
     }
 
+    /// A cold engine's first 15m bar is `partial_start` (ADR-031 D6) and
+    /// counts toward `Samples(7)` (ADR-037 D10) like every closed bar. So an
+    /// engine whose first trade falls `offset` into a 15m bar has 15m
+    /// structure `Ready` at the 7th close, `7 · 15 min − offset` after its
+    /// start: more than 90 and at most 105 min. This is the evidence for
+    /// the 90 min snapshot trigger of ADR-052 decision 12; if that ADR is
+    /// renumbered, this comment follows.
+    #[test]
+    fn a_cold_start_mid_bar_is_ready_at_the_seventh_15m_close() {
+        // One price throughout, so no swing forms.
+        let price = usdt(60_000);
+        let mut ready_after = Vec::new();
+        for offset in [0, M15 / 2, M15 - 1] {
+            // The first trade `offset` into bar 0, one trade 1 s into each
+            // of bars 1 to 6 (each closes the bar before it), one 1 ms
+            // before bar 6 ends and one at its end, which closes it.
+            let mut tape = Tape::default();
+            tape.trade(offset, price);
+            for k in 1..=6 {
+                tape.trade(k * M15 + 1_000, price);
+            }
+            tape.trade(7 * M15 - 1, price).trade(7 * M15, price);
+
+            let mut engine = MarketStateEngine::new();
+            let mut closed: Vec<Bar> = Vec::new();
+            let mut warming = Vec::new();
+            let mut ready = None;
+            for (index, event) in tape.events.iter().enumerate() {
+                engine.apply(event).unwrap();
+                closed.extend(
+                    engine
+                        .closed_bars()
+                        .iter()
+                        .filter(|bar| bar.timeframe == Timeframe::M15),
+                );
+                let current = structure(&engine, Timeframe::M15);
+                if let FeatureValue::Ready(registry) = &current.levels {
+                    // Both features turn `Ready` at the same event.
+                    assert_eq!(
+                        current.swings,
+                        FeatureValue::Ready(LastSwings {
+                            high: None,
+                            low: None
+                        }),
+                        "offset {offset}"
+                    );
+                    assert!(registry.highs().is_empty(), "offset {offset}");
+                    ready = Some(index);
+                    break;
+                }
+                // Every closed 15m bar counts, the partial first one too.
+                let observed = u64::try_from(closed.len()).unwrap();
+                assert_eq!(
+                    current.levels,
+                    FeatureValue::WarmingUp {
+                        observed,
+                        required: 7
+                    },
+                    "offset {offset}, event {index}"
+                );
+                assert_eq!(
+                    current.swings,
+                    FeatureValue::WarmingUp {
+                        observed,
+                        required: 7
+                    },
+                    "offset {offset}, event {index}"
+                );
+                warming.push(observed);
+            }
+            // The event that closes bar k − 1 makes k bars observed; the
+            // trade 1 ms before bar 6 ends still leaves 6.
+            assert_eq!(warming, [0, 1, 2, 3, 4, 5, 6, 6], "offset {offset}");
+            // The scan found `Ready` at the trade that closes bar 6.
+            let ready = ready.expect("15m structure turns Ready");
+            assert_eq!(ready, tape.events.len() - 1, "offset {offset}");
+            let ready_time = tape.events[ready].time();
+            assert_eq!(ready_time, t(7 * M15), "offset {offset}");
+            // Exactly seven closed bars: the partial first one, opened at
+            // 0, then six complete ones.
+            assert_eq!(closed.len(), SWING_WINDOW, "offset {offset}");
+            assert_eq!(closed[0].open_time, t(0), "offset {offset}");
+            assert_eq!(closed[0].coverage, PARTIAL, "offset {offset}");
+            for (index, bar) in (1..).zip(&closed[1..]) {
+                assert_eq!(bar.open_time, t(index * M15), "offset {offset}");
+                assert_eq!(bar.coverage, COMPLETE, "offset {offset}");
+            }
+            let after = ready_time.as_millis() - offset;
+            assert!(
+                after > 6 * M15 && after <= 7 * M15,
+                "offset {offset}: Ready {after} ms after the start"
+            );
+            ready_after.push(after);
+        }
+        // Both bounds of (90, 105] min: exactly 105 min for a start on a 15m
+        // boundary, 90 min + 1 ms for a start 1 ms before one ends.
+        assert_eq!(ready_after, [7 * M15, 7 * M15 - M15 / 2, 6 * M15 + 1]);
+    }
+
     /// The bar indices of the 15m swing highs and lows of `bars` (`None` is
     /// an empty bar, `(high, low)` in whole USDT), and the swings.
     fn swings_of(bars: &[Option<(i64, i64)>]) -> (Vec<i64>, Vec<i64>, Vec<Swing>) {
