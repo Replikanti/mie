@@ -60,6 +60,50 @@ pub const TOUCH_TOLERANCE_BPS: i64 = 5;
 /// resolved sweeps: parameter `max_levels` (decision 5).
 pub const MAX_LEVELS: usize = 20;
 
+/// How a timeframe's level registry bounds its lists: the rule of one
+/// `structure.levels.<tf>` version (decision 5).
+///
+/// Engine state, not hashed: the stamped feature set names the rule through
+/// the registry's feature key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LevelsRule {
+    /// `structure.levels.<tf>@1`: at most [`MAX_LEVELS`] active highs,
+    /// active lows and resolved sweeps, evicting the oldest.
+    V1,
+}
+
+impl LevelsRule {
+    /// Every rule the engine computes.
+    pub(crate) const ALL: [Self; 1] = [Self::V1];
+
+    /// The `structure.levels.<tf>` version of this rule on `timeframe`: the
+    /// matching entry of [`catalog::STRUCTURE_LEVELS`], or `None` for a
+    /// timeframe without structure.
+    pub(crate) fn key(self, timeframe: Timeframe) -> Option<FeatureKey> {
+        match self {
+            Self::V1 => catalog::STRUCTURE_LEVELS
+                .iter()
+                .find(|(candidate, _)| *candidate == timeframe)
+                .map(|(_, definition)| definition.key),
+        }
+    }
+
+    /// The most active highs, and the most active lows; `None` keeps every
+    /// level until it is swept.
+    pub(crate) fn active_cap(self) -> Option<usize> {
+        match self {
+            Self::V1 => Some(MAX_LEVELS),
+        }
+    }
+
+    /// The most resolved sweeps.
+    pub(crate) fn resolved_cap(self) -> usize {
+        match self {
+            Self::V1 => MAX_LEVELS,
+        }
+    }
+}
+
 /// Which extreme a swing or level is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Side {
@@ -543,13 +587,15 @@ impl LevelRegistry {
             || self.lows.last().is_some_and(|low| price < low.price)
     }
 
-    /// Adds a confirmed level, evicting the oldest of its list when full.
-    fn add(&mut self, level: Level) {
+    /// Adds a confirmed level, evicting the oldest of its list when `rule`
+    /// caps it and it is full.
+    fn add(&mut self, level: Level, rule: LevelsRule) {
         let list = match level.side {
             Side::High => &mut self.highs,
             Side::Low => &mut self.lows,
         };
-        if list.len() >= MAX_LEVELS
+        if let Some(cap) = rule.active_cap()
+            && list.len() >= cap
             && let Some(oldest) = oldest(list, |level| (level.confirmed_bar_end, level.price))
         {
             list.remove(oldest);
@@ -559,9 +605,9 @@ impl LevelRegistry {
         list.insert(at, level);
     }
 
-    /// Records a resolved sweep, evicting the oldest when full.
-    fn push_resolved(&mut self, sweep: Sweep) {
-        if self.resolved.len() >= MAX_LEVELS
+    /// Records a resolved sweep, evicting the oldest when full under `rule`.
+    fn push_resolved(&mut self, sweep: Sweep, rule: LevelsRule) {
+        if self.resolved.len() >= rule.resolved_cap()
             && let Some(oldest) = oldest(&self.resolved, |sweep| (sweep.time, sweep.level.price))
         {
             self.resolved.remove(oldest);
@@ -781,10 +827,18 @@ struct TimeframeTracker {
     closed_bars: u64,
     swings: LastSwings,
     registry: LevelRegistry,
+    /// How `registry` bounds its lists. Engine state, not hashed: the
+    /// registry's feature key names it.
+    rule: LevelsRule,
 }
 
 impl TimeframeTracker {
-    fn new(timeframe: Timeframe, swing: &FeatureDefinition, levels: &FeatureDefinition) -> Self {
+    /// An empty tracker of `timeframe`, a structure timeframe, computing
+    /// `swing` and the `structure.levels` version of `rule`.
+    fn new(timeframe: Timeframe, swing: &FeatureDefinition, rule: LevelsRule) -> Self {
+        let levels = rule
+            .key(timeframe)
+            .expect("every rule has a key on every structure timeframe (see levels_rule_matches_the_catalog)");
         Self {
             swing_feature: swing.key,
             window: VecDeque::with_capacity(SWING_WINDOW),
@@ -793,7 +847,8 @@ impl TimeframeTracker {
                 high: None,
                 low: None,
             },
-            registry: LevelRegistry::new(levels.key, timeframe),
+            registry: LevelRegistry::new(levels, timeframe),
+            rule,
         }
     }
 
@@ -874,7 +929,7 @@ impl TimeframeTracker {
                 StructureEvent::Break(sweep)
             };
             events.push(event);
-            self.registry.push_resolved(sweep);
+            self.registry.push_resolved(sweep, self.rule);
         }
         Ok(())
     }
@@ -956,15 +1011,18 @@ impl TimeframeTracker {
                 Side::High => self.swings.high = Some(swing),
                 Side::Low => self.swings.low = Some(swing),
             }
-            self.registry.add(Level {
-                side,
-                price,
-                swing_time: swing.swing_time,
-                confirmed_bar_end: swing.confirmed_bar_end,
-                known_at,
-                touches: 0,
-                coverage,
-            });
+            self.registry.add(
+                Level {
+                    side,
+                    price,
+                    swing_time: swing.swing_time,
+                    confirmed_bar_end: swing.confirmed_bar_end,
+                    known_at,
+                    touches: 0,
+                    coverage,
+                },
+                self.rule,
+            );
             events.push(StructureEvent::Swing(swing));
         }
         Ok(())
@@ -1027,22 +1085,23 @@ pub(crate) struct StructureStep {
     events: Vec<StructureEvent>,
 }
 
-impl Default for StructureTracker {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl StructureTracker {
-    /// An empty tracker for [`catalog::STRUCTURE_SWING`] and
-    /// [`catalog::STRUCTURE_LEVELS`].
-    pub(crate) fn new() -> Self {
+    /// An empty tracker for [`catalog::STRUCTURE_SWING`] and, per
+    /// timeframe, the `structure.levels` version of its rule in `rules`,
+    /// given in [`STRUCTURE_TIMEFRAMES`] order.
+    pub(crate) fn new(rules: [LevelsRule; 4]) -> Self {
         Self {
             timeframes: std::array::from_fn(|index| {
                 let (timeframe, swing) = catalog::STRUCTURE_SWING[index];
-                TimeframeTracker::new(timeframe, swing, catalog::STRUCTURE_LEVELS[index].1)
+                TimeframeTracker::new(timeframe, swing, rules[index])
             }),
         }
+    }
+
+    /// The rule of every timeframe, in [`STRUCTURE_TIMEFRAMES`] order.
+    #[cfg(test)]
+    pub(crate) fn rules(&self) -> [LevelsRule; 4] {
+        self.timeframes.each_ref().map(|tracker| tracker.rule)
     }
 
     /// Steps the structure with `event`, given the bars it closed (`closed`,
@@ -1151,6 +1210,7 @@ mod tests {
     use crate::fingerprint::Fingerprinter;
     use crate::num::SCALE;
     use crate::state::MarketStateEngine;
+    use std::collections::BTreeMap;
 
     const M15: i64 = 900_000;
     const DAY: i64 = 86_400_000;
@@ -1225,6 +1285,29 @@ mod tests {
                 tape.bar(index, high, high - 5, high - 2);
             }
             tape.trade(11 * M15 + 1_000, confirm_price);
+            tape
+        }
+
+        /// `count` strictly descending 15m swing highs, one every
+        /// `SWING_BARS + 1` bars, the tightest spacing the tie rule allows:
+        /// peak `k` on bar `SWING_BARS + k (SWING_BARS + 1)` at
+        /// 61 000 − 10k USDT. Every other bar's high is 60 000, below the
+        /// last peak, and every low is 59 000, so no swing low is
+        /// confirmed. The tape closes the last peak's confirming bar.
+        fn descending_highs(count: i64) -> Self {
+            let step = SWING_BARS as i64 + 1;
+            let last = SWING_BARS as i64 + (count - 1) * step + SWING_BARS as i64;
+            let mut tape = Self::default();
+            for index in 0..=last {
+                let offset = index - SWING_BARS as i64;
+                let high = if offset >= 0 && offset % step == 0 {
+                    61_000 - 10 * (offset / step)
+                } else {
+                    60_000
+                };
+                tape.bar(index, high, 59_000, 59_500);
+            }
+            tape.close_at((last + 1) * M15);
             tape
         }
     }
@@ -2066,7 +2149,7 @@ mod tests {
 
     /// A tracker whose 15m and 1h registries hold `levels`, ready.
     fn tracker_with(levels: &[(Timeframe, Level)]) -> StructureTracker {
-        let mut tracker = StructureTracker::new();
+        let mut tracker = StructureTracker::new([LevelsRule::V1; 4]);
         for timeframe in &mut tracker.timeframes {
             timeframe.closed_bars = SWING_WINDOW as u64;
         }
@@ -2076,7 +2159,7 @@ mod tests {
                 .iter_mut()
                 .find(|tracker| tracker.timeframe() == *timeframe)
                 .unwrap();
-            tracker.registry.add(*level);
+            tracker.registry.add(*level, LevelsRule::V1);
         }
         tracker
     }
@@ -2169,6 +2252,39 @@ mod tests {
     }
 
     #[test]
+    fn levels_rule_matches_the_catalog() {
+        for (timeframe, definition) in catalog::STRUCTURE_LEVELS {
+            assert_eq!(LevelsRule::V1.key(timeframe), Some(definition.key));
+        }
+        for timeframe in [Timeframe::M1, Timeframe::M5] {
+            assert_eq!(LevelsRule::V1.key(timeframe), None);
+        }
+        // With `structure_features_match_their_timeframes`, which pins
+        // `max_levels` = `MAX_LEVELS`, this ties both caps to the locked
+        // parameter.
+        assert_eq!(LevelsRule::V1.active_cap(), Some(MAX_LEVELS));
+        assert_eq!(LevelsRule::V1.resolved_cap(), MAX_LEVELS);
+        // Every computed `structure.levels.<tf>` version has exactly one
+        // rule: none can enter `CURRENT` or `SELECTABLE` without one.
+        for (timeframe, current) in catalog::STRUCTURE_LEVELS {
+            let versions: Vec<FeatureKey> = catalog::CURRENT
+                .iter()
+                .chain(catalog::SELECTABLE)
+                .filter(|key| key.id == current.key.id)
+                .copied()
+                .collect();
+            assert!(!versions.is_empty(), "{timeframe}");
+            for key in versions {
+                let rules = LevelsRule::ALL
+                    .into_iter()
+                    .filter(|rule| rule.key(timeframe) == Some(key))
+                    .count();
+                assert_eq!(rules, 1, "{key}");
+            }
+        }
+    }
+
+    #[test]
     fn full_lists_evict_their_oldest_entry_but_never_a_pending_sweep() {
         let mut registry = LevelRegistry::new(catalog::STRUCTURE_LEVELS_15M_V1.key, Timeframe::M15);
         // 21 highs at distinct prices 60 000..=60 020, confirmed at their
@@ -2181,7 +2297,7 @@ mod tests {
             (60_010, 60_002, 60_000, 60_020)
         );
         for index in 0..=20 {
-            registry.add(active(Side::High, whole(index), index));
+            registry.add(active(Side::High, whole(index), index), LevelsRule::V1);
         }
         let mut kept: Vec<Level> = (1..=20)
             .map(|index| active(Side::High, whole(index), index))
@@ -2194,10 +2310,10 @@ mod tests {
             .into_iter()
             .chain((1..=18).map(|index| (59_900 + index, index)))
         {
-            registry.add(active(Side::Low, whole, confirmed));
+            registry.add(active(Side::Low, whole, confirmed), LevelsRule::V1);
         }
         assert_eq!(registry.lows().len(), MAX_LEVELS);
-        registry.add(active(Side::Low, 59_800, 19));
+        registry.add(active(Side::Low, 59_800, 19), LevelsRule::V1);
         assert_eq!(registry.lows().len(), MAX_LEVELS);
         assert!(
             registry
@@ -2225,22 +2341,22 @@ mod tests {
             known_at: t(time + M15),
             coverage: COMPLETE,
         };
-        registry.push_resolved(sweep(60_002, 1));
-        registry.push_resolved(sweep(60_001, 1));
+        registry.push_resolved(sweep(60_002, 1), LevelsRule::V1);
+        registry.push_resolved(sweep(60_001, 1), LevelsRule::V1);
         for time in 2..=19 {
-            registry.push_resolved(sweep(60_100 + time, time));
+            registry.push_resolved(sweep(60_100 + time, time), LevelsRule::V1);
         }
         assert_eq!(registry.resolved().len(), MAX_LEVELS);
-        registry.push_resolved(sweep(60_200, 30));
+        registry.push_resolved(sweep(60_200, 30), LevelsRule::V1);
         assert_eq!(registry.resolved().len(), MAX_LEVELS);
         assert_eq!(registry.resolved()[0].level.price, usdt(60_002));
-        registry.push_resolved(sweep(60_201, 31));
+        registry.push_resolved(sweep(60_201, 31), LevelsRule::V1);
         assert_eq!(registry.resolved()[0].time, t(2));
         // Pending sweeps are not capped: a trade sweeps every active high.
         let mut tracker = TimeframeTracker::new(
             Timeframe::M15,
             &catalog::STRUCTURE_SWING_15M_V1,
-            &catalog::STRUCTURE_LEVELS_15M_V1,
+            LevelsRule::V1,
         );
         tracker.registry = registry;
         let pending = MAX_LEVELS;
@@ -2737,6 +2853,163 @@ mod tests {
         // Every sweep resolved, or is pending at the end.
         assert_eq!(sweeps, sfps + breaks + pending, "{counts:?}");
         assert!(multi > 50 && touched > 200, "{counts:?}");
+    }
+
+    /// Asserts the staircase of every ready level registry of `engine`: in
+    /// confirmation order, active highs at non-increasing prices and active
+    /// lows at non-decreasing ones. Returns the adjacent pairs compared and
+    /// how many of them are at one price.
+    fn assert_staircase(engine: &MarketStateEngine, context: fmt::Arguments<'_>) -> (usize, usize) {
+        let (mut pairs, mut ties) = (0, 0);
+        for (timeframe, structure) in engine.state().structure.iter() {
+            let Some(registry) = structure.levels.ready() else {
+                continue;
+            };
+            for (side, levels) in [(Side::High, registry.highs()), (Side::Low, registry.lows())] {
+                let mut ordered: Vec<&Level> = levels.iter().collect();
+                ordered.sort_by_key(|level| level.confirmed_bar_end);
+                for pair in ordered.windows(2) {
+                    let (earlier, later) = (pair[0].price, pair[1].price);
+                    let monotone = match side {
+                        Side::High => later <= earlier,
+                        Side::Low => later >= earlier,
+                    };
+                    assert!(
+                        monotone,
+                        "{context}: {timeframe} {side} {earlier} confirmed before {later}"
+                    );
+                    pairs += 1;
+                    if earlier == later {
+                        ties += 1;
+                    }
+                }
+            }
+        }
+        (pairs, ties)
+    }
+
+    /// The registry's active levels form a staircase: in confirmation
+    /// order, highs at non-increasing prices, lows at non-decreasing ones.
+    ///
+    /// A later active high's swing bar opens at least `SWING_BARS + 1` bars
+    /// after an earlier one's (see
+    /// `random_tapes_keep_same_side_swings_apart`), which is after the
+    /// earlier level became active: a higher price on that bar would have
+    /// swept the earlier level (decision 6). Evicting the oldest leaves a
+    /// subsequence of a monotone sequence, which is still monotone. Lows
+    /// mirror it.
+    #[test]
+    fn random_tapes_keep_the_staircase() {
+        let mut ties = 0;
+        for (tape_index, tape) in random_tapes().iter().enumerate() {
+            let mut engine = MarketStateEngine::new();
+            let mut pairs = 0;
+            for (index, event) in tape.iter().enumerate() {
+                engine.apply(event).unwrap();
+                let (compared, equal) =
+                    assert_staircase(&engine, format_args!("tape {tape_index}, event {index}"));
+                pairs += compared;
+                ties += equal;
+            }
+            assert!(pairs > 0, "tape {tape_index}");
+        }
+        // The walk tapes put same-side levels at one price: the non-strict
+        // order is exercised.
+        assert!(ties > 0);
+    }
+
+    /// Same-side swings of one timeframe are at least `SWING_BARS + 1` bars
+    /// apart. At `j − i ≤ SWING_BARS`, bar `i` lies in `j`'s left window,
+    /// which needs `high(j) > high(i)`, and bar `j` lies in `i`'s right
+    /// window, which needs `high(i) ≥ high(j)`: both cannot hold. Lows
+    /// mirror it.
+    #[test]
+    fn random_tapes_keep_same_side_swings_apart() {
+        let bound = SWING_BARS as i64 + 1;
+        for (tape_index, tape) in random_tapes().iter().enumerate() {
+            let (_, facts) = run(tape);
+            let mut last: BTreeMap<(Timeframe, Side), EventTime> = BTreeMap::new();
+            let mut closest = i64::MAX;
+            for fact in facts.iter().flatten() {
+                let StructureEvent::Swing(swing) = fact else {
+                    continue;
+                };
+                let Some(previous) = last.insert((swing.timeframe, swing.side), swing.swing_time)
+                else {
+                    continue;
+                };
+                let millis = swing.timeframe.millis();
+                let gap = swing.swing_time.as_millis() - previous.as_millis();
+                assert_eq!(gap % millis, 0, "tape {tape_index}: {swing}");
+                assert!(gap >= bound * millis, "tape {tape_index}: {swing}");
+                closest = closest.min(gap / millis);
+            }
+            // The bound is attained: an off-by-one in the tie rule fails.
+            assert_eq!(closest, bound, "tape {tape_index}");
+        }
+    }
+
+    #[test]
+    fn eviction_keeps_the_staircase() {
+        let count = 25;
+        let tape = Tape::descending_highs(count);
+        for mirrored_side in [false, true] {
+            let (events, side) = if mirrored_side {
+                (mirror(&tape.events), Side::Low)
+            } else {
+                (tape.events.clone(), Side::High)
+            };
+            let mut engine = MarketStateEngine::new();
+            let mut swings = Vec::new();
+            let mut pairs = 0;
+            for (index, event) in events.iter().enumerate() {
+                engine.apply(event).unwrap();
+                swings.extend(
+                    engine
+                        .structure_events()
+                        .iter()
+                        .filter_map(|fact| match fact {
+                            StructureEvent::Swing(swing) if swing.timeframe == Timeframe::M15 => {
+                                Some(swing.side)
+                            }
+                            _ => None,
+                        }),
+                );
+                pairs += assert_staircase(
+                    &engine,
+                    format_args!("mirrored: {mirrored_side}, event {index}"),
+                )
+                .0;
+            }
+            assert_eq!(
+                swings,
+                vec![side; count as usize],
+                "mirrored: {mirrored_side}"
+            );
+            assert!(pairs > 0, "mirrored: {mirrored_side}");
+            // The list holds the `MAX_LEVELS` newest peaks: the five oldest
+            // were evicted.
+            let registry = registry_of(&engine, Timeframe::M15);
+            let (kept, other) = match side {
+                Side::High => (registry.highs(), registry.lows()),
+                Side::Low => (registry.lows(), registry.highs()),
+            };
+            assert!(other.is_empty(), "mirrored: {mirrored_side}");
+            let mut prices: Vec<Price> = kept.iter().map(|level| level.price).collect();
+            let mut expected: Vec<Price> = (count - MAX_LEVELS as i64..count)
+                .map(|k| usdt(61_000 - 10 * k))
+                .map(|price| {
+                    if mirrored_side {
+                        mirrored(price)
+                    } else {
+                        price
+                    }
+                })
+                .collect();
+            prices.sort();
+            expected.sort();
+            assert_eq!(prices, expected, "mirrored: {mirrored_side}");
+        }
     }
 
     #[test]
