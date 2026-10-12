@@ -1238,7 +1238,9 @@ struct HalfTest {
     k: usize,
     /// The first window length without an evaluable combination.
     unevaluable_window: Option<usize>,
-    /// Every evaluable combination has `U_B ≤ c_k · σ0`.
+    /// Some evaluable combination has `U_B > c_k · σ0`.
+    fails: bool,
+    /// No evaluable combination fails and every window length has one.
     pass: bool,
 }
 
@@ -1264,15 +1266,15 @@ fn half_test(b: &HourTable, reference: &HourTable) -> HalfTest {
         combinations,
         k,
         unevaluable_window,
+        fails: false,
         pass: false,
     };
-    test.pass = unevaluable_window.is_none()
-        && test
-            .combinations
-            .iter()
-            .flatten()
-            .filter(|combination| combination.evaluable)
-            .all(|combination| test.passes(combination));
+    test.fails = test
+        .combinations
+        .iter()
+        .flatten()
+        .any(|combination| combination.evaluable && !test.passes(combination));
+    test.pass = !test.fails && unevaluable_window.is_none();
     test
 }
 
@@ -1282,8 +1284,10 @@ enum R1b {
     /// `B` is the candidate at this index.
     Fixed { candidate: usize },
     /// Stop: a window length of this candidate has no evaluable combination
-    /// in this half. A larger `B` is not tried past it: that would pick a
-    /// value without testing the smaller one.
+    /// in this half, and no evaluable combination fails. A larger `B` is not
+    /// tried past it: that would pick a value while the smaller one may still
+    /// pass. A candidate that fails an evaluable combination is out whatever
+    /// its untestable window would show, so it never stops the rule.
     NotEvaluable {
         candidate: usize,
         half: usize,
@@ -1298,11 +1302,16 @@ enum R1b {
 /// R1b (decision 5): `B` is the smallest candidate that passes in every
 /// evaluable combination on the first half, checked on the second.
 /// `tables` holds every baseline's hour tables per half; the last is the
-/// reference.
+/// reference. Per candidate and half, a failing evaluable combination decides
+/// first (the next candidate, or a second-half failure); only a candidate
+/// without one stops on a window length that has no evaluable combination.
 fn r1b(tables: &[[HourTable; 2]; NB]) -> R1b {
     let reference = &tables[REFERENCE];
     for (candidate, table) in tables.iter().enumerate().take(REFERENCE) {
         let first = half_test(&table[0], &reference[0]);
+        if first.fails {
+            continue;
+        }
         if let Some(window) = first.unevaluable_window {
             return R1b::NotEvaluable {
                 candidate,
@@ -1310,10 +1319,10 @@ fn r1b(tables: &[[HourTable; 2]; NB]) -> R1b {
                 window,
             };
         }
-        if !first.pass {
-            continue;
-        }
         let second = half_test(&table[1], &reference[1]);
+        if second.fails {
+            return R1b::SecondHalfFails { candidate };
+        }
         if let Some(window) = second.unevaluable_window {
             return R1b::NotEvaluable {
                 candidate,
@@ -1321,11 +1330,7 @@ fn r1b(tables: &[[HourTable; 2]; NB]) -> R1b {
                 window,
             };
         }
-        return if second.pass {
-            R1b::Fixed { candidate }
-        } else {
-            R1b::SecondHalfFails { candidate }
-        };
+        return R1b::Fixed { candidate };
     }
     R1b::NoCandidatePasses
 }
@@ -1693,9 +1698,9 @@ fn report_r1b(flow: &FlowModel) {
                 half_label(Some(half)),
                 test.k,
                 match test.unevaluable_window {
+                    _ if test.fails => "FAIL".to_owned(),
                     Some(window) => format!("{} has no evaluable combination", WINDOWS[window]),
-                    None if test.pass => "PASS".to_owned(),
-                    None => "FAIL".to_owned(),
+                    None => "PASS".to_owned(),
                 }
             );
         }
@@ -2157,6 +2162,8 @@ fn r1b_stops_on_a_window_without_an_evaluable_combination() {
     for hours in &mut empty[2] {
         hours[7] = 0;
     }
+    // No evaluable combination fails, so the untestable window stops R1b.
+    assert!(!half_test(&empty, &like).fails);
     let tables = hour_tables([[empty, like], [like, like], [like, like]]);
     assert_eq!(
         r1b(&tables),
@@ -2166,6 +2173,35 @@ fn r1b_stops_on_a_window_without_an_evaluable_combination() {
             window: 2
         }
     );
+}
+
+#[test]
+fn r1b_skips_a_failing_baseline_with_a_window_without_an_evaluable_combination() {
+    let like = hour_table(profile());
+    // B = 60 fails all 12 evaluable combinations (5m and 15m) on the first
+    // half, and 1h has an empty hour at every q.
+    let mut failing = hour_table([500; HOURS]);
+    for hours in &mut failing[2] {
+        hours[7] = 0;
+    }
+    let test = half_test(&failing, &like);
+    assert_eq!(test.k, 2 * Q);
+    assert!(test.fails);
+    assert_eq!(test.unevaluable_window, Some(2));
+    // The failure decides, so R1b goes on to B = 240, which passes both halves.
+    let tables = hour_tables([[failing, like], [like, like], [like, like]]);
+    assert_eq!(r1b(&tables), R1b::Fixed { candidate: 1 });
+}
+
+#[test]
+fn r1b_stops_on_a_second_half_failure_before_an_unevaluable_window() {
+    let like = hour_table(profile());
+    let mut failing = hour_table([500; HOURS]);
+    for hours in &mut failing[2] {
+        hours[7] = 0;
+    }
+    let tables = hour_tables([[like, failing], [like, like], [like, like]]);
+    assert_eq!(r1b(&tables), R1b::SecondHalfFails { candidate: 0 });
 }
 
 #[test]
