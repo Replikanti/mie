@@ -1,5 +1,7 @@
 //! The ingest configuration file.
 
+mod common;
+
 use mie_adapter_binance::BinanceStream;
 use mie_cli::config::IngestConfig;
 use std::collections::BTreeMap;
@@ -49,6 +51,10 @@ fn the_example_file_parses_with_the_documented_defaults() {
     // Every stream by default, depth included.
     assert_eq!(live.streams.len(), 7);
     assert!(live.streams.contains(&BinanceStream::Depth));
+    // The `[history]` block is commented out: the example stays cold
+    // (ADR-052 D8).
+    assert_eq!(example.history, None);
+    assert_eq!(example.history_archive(), Ok(None));
 }
 
 #[test]
@@ -162,6 +168,128 @@ fn invalid_values_are_rejected() {
     ] {
         let text = format!("{REQUIRED}[capture]\n{capture}\n");
         assert!(IngestConfig::parse(&text).is_err(), "{capture}");
+    }
+}
+
+mod history {
+    use super::REQUIRED;
+    use mie_cli::config::{ConfigError, IngestConfig};
+    use std::path::Path;
+
+    const HISTORY: &str = "\n[history]\norigin = \"2025-10-01\"\ncutover = \"2026-10-20\"\n\
+                           archive_config = \"archive.toml\"\n";
+
+    #[test]
+    fn the_history_section_parses() {
+        let config = IngestConfig::parse(&format!("{REQUIRED}{HISTORY}")).expect("valid");
+        let history = config.history.expect("present");
+        assert_eq!(history.origin, "2025-10-01");
+        assert_eq!(history.archive_config, Path::new("archive.toml"));
+        // 2025-10-01 and 2026-10-20, 00:00 UTC.
+        assert_eq!(history.origin_ms(), Ok(1_759_276_800_000));
+        assert_eq!(history.cutover_ms(), Ok(1_792_454_400_000));
+        assert_eq!(IngestConfig::parse(REQUIRED).unwrap().history, None);
+    }
+
+    #[test]
+    fn invalid_history_sections_are_rejected() {
+        for (from, to, expected) in [
+            (
+                "origin = \"2025-10-01\"",
+                "origin = \"2025-10-01T00:00:00Z\"",
+                "not a UTC date",
+            ),
+            (
+                "cutover = \"2026-10-20\"",
+                "cutover = \"2026-10-20 00:00\"",
+                "not a UTC date",
+            ),
+            (
+                "cutover = \"2026-10-20\"",
+                "cutover = \"2025-10-01\"",
+                "not before",
+            ),
+            (
+                "cutover = \"2026-10-20\"",
+                "cutover = \"2025-09-30\"",
+                "not before",
+            ),
+            (
+                "archive_config = \"archive.toml\"",
+                "archive_config = \"archive.toml\"\nstreams = [\"aggTrades\"]",
+                "unknown field",
+            ),
+            ("archive_config = \"archive.toml\"", "", "missing field"),
+            ("origin = \"2025-10-01\"", "", "missing field"),
+        ] {
+            let text = format!("{REQUIRED}{}", HISTORY.replace(from, to));
+            let error = IngestConfig::parse(&text).expect_err(to).0;
+            assert!(error.contains(expected), "{to}: {error}");
+        }
+    }
+
+    /// An ingest configuration under `dir` with a `[history]` naming the
+    /// archive configuration `archive.toml` there, whose raw root is
+    /// `archive_root` and symbol `symbol`.
+    fn configs(dir: &Path, archive_root: &Path, symbol: &str) -> IngestConfig {
+        std::fs::create_dir_all(dir.join("raw")).unwrap();
+        std::fs::create_dir_all(archive_root).unwrap();
+        std::fs::write(
+            dir.join("archive.toml"),
+            format!(
+                "[instrument]\nsymbol = \"{symbol}\"\n[paths]\nraw_root = \"{}\"\n\
+                 import_ledger = \"{}\"\nstaging = \"{}\"\n",
+                archive_root.display(),
+                dir.join("ledger").display(),
+                dir.join("staging").display()
+            ),
+        )
+        .unwrap();
+        IngestConfig::parse(&format!(
+            "[instrument]\nsymbol = \"BTCUSDT\"\nsource = \"binance-um\"\n[paths]\n\
+             raw_root = \"{}\"\njournal = \"{}\"\n[binance]\n\
+             ws_base_url = \"wss://fake.invalid/ws\"\nrest_base_url = \"https://fake.invalid\"\n\
+             [history]\norigin = \"2025-10-01\"\ncutover = \"2026-10-20\"\n\
+             archive_config = \"{}\"\n",
+            dir.join("raw").display(),
+            dir.join("journal.jsonl").display(),
+            dir.join("archive.toml").display()
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn the_archive_configuration_shares_the_raw_store_and_the_symbol() {
+        let dir = crate::common::TempDir::new("config-history");
+        let dir = dir.path();
+        // The same root, spelled differently.
+        let config = configs(dir, &dir.join("sub").join("..").join("raw"), "BTCUSDT");
+        let (history, archive) = config.history_archive().unwrap().expect("present");
+        assert_eq!(Some(history), config.history);
+        assert_eq!(archive.instrument.symbol, "BTCUSDT");
+
+        // Another raw root: the error names both.
+        let other = dir.join("other-raw");
+        let error = configs(dir, &other, "BTCUSDT")
+            .history_archive()
+            .unwrap_err()
+            .0;
+        assert!(
+            error.contains(&other.display().to_string())
+                && error.contains(&dir.join("raw").display().to_string()),
+            "{error}"
+        );
+        // Another symbol.
+        let error = configs(dir, &dir.join("raw"), "ETHUSDT")
+            .history_archive()
+            .unwrap_err()
+            .0;
+        assert!(error.contains("ETHUSDT"), "{error}");
+        // An unreadable archive configuration.
+        let config = configs(dir, &dir.join("raw"), "BTCUSDT");
+        std::fs::remove_file(dir.join("archive.toml")).unwrap();
+        let error: ConfigError = config.history_archive().unwrap_err();
+        assert!(error.0.contains("archive.toml"), "{}", error.0);
     }
 }
 

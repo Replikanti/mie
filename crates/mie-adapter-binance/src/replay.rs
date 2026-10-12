@@ -50,6 +50,15 @@
 //!   without a window: exactly what that run's live provider delivered to
 //!   its fresh engine, for the equivalence harness.
 //!
+//! - **History chain hooks** (ADR-052 D2, crate-private, off by default).
+//!   [`chaining_only`](LiveReplay::chaining_only) restricts the replay to
+//!   the runs of the history chain: extents are still computed over every
+//!   journaled run, but only the chained runs are recomputed, and records of
+//!   the other journaled runs are skipped wherever they are read.
+//!   [`continue_after`](LiveReplayStream::continue_after) seeds the chaining
+//!   of D3 with the archive segment's last event, so the first run joins the
+//!   seam through the same `HoldBack` that joins runs.
+//!
 //! Memory: one run's records and output at a time (about 1.5 M records for
 //! a 24 h run).
 
@@ -121,6 +130,10 @@ pub struct LiveReplay<'a> {
     raw_source: String,
     symbol: String,
     runs: Vec<LiveRun>,
+    /// The runs [`replay`](Self::replay) recomputes, when restricted to a
+    /// history chain ([`chaining_only`](Self::chaining_only)); `None`: every
+    /// run.
+    chain: Option<BTreeSet<String>>,
 }
 
 impl fmt::Debug for LiveReplay<'_> {
@@ -150,12 +163,39 @@ impl<'a> LiveReplay<'a> {
             raw_source: raw_source.to_owned(),
             symbol: symbol.to_owned(),
             runs,
+            chain: None,
         }
     }
 
     /// The runs, in start order.
     pub fn runs(&self) -> &[LiveRun] {
         &self.runs
+    }
+
+    /// Restricts [`replay`](Self::replay) to the runs `ids` of a history
+    /// chain (ADR-052 D2). Extents are still computed over every journaled
+    /// run, so a crashed run ends at its journaled successor's start (D2)
+    /// even when that successor is outside the chain. Records of the other
+    /// journaled runs are skipped wherever they are read: each run had its
+    /// own pipeline (D1), so they never affected a chained run. Records of
+    /// chained runs and of runs the journal does not know keep every check.
+    pub(crate) fn chaining_only(mut self, ids: BTreeSet<String>) -> Self {
+        self.chain = Some(ids);
+        self
+    }
+
+    /// Each run's end under D2, aligned with [`runs`](Self::runs): its
+    /// `run_end`, else the next journaled run's start (a crash), else `None`
+    /// (open).
+    pub(crate) fn run_ends(&self) -> Vec<Option<i64>> {
+        self.runs
+            .iter()
+            .enumerate()
+            .map(|(i, run)| {
+                run.ended_at_ms
+                    .or_else(|| self.runs.get(i + 1).map(|next| next.started_at_ms))
+            })
+            .collect()
     }
 
     /// Exactly what one cleanly ended run's live provider delivered, for the
@@ -244,11 +284,8 @@ impl<'a> LiveReplay<'a> {
     fn extents(&self) -> Vec<(i64, i64)> {
         self.runs
             .iter()
-            .enumerate()
-            .map(|(i, run)| {
-                let end = run
-                    .ended_at_ms
-                    .or_else(|| self.runs.get(i + 1).map(|next| next.started_at_ms));
+            .zip(self.run_ends())
+            .map(|(run, end)| {
                 (
                     run.started_at_ms.saturating_sub(RUN_MARGIN_MS),
                     end.map_or(i64::MAX, |end| end.saturating_add(RUN_MARGIN_MS)),
@@ -305,6 +342,11 @@ impl<'a> HistoricalDataProvider for LiveReplay<'a> {
             .iter()
             .cloned()
             .zip(self.extents())
+            .filter(|(run, _)| {
+                self.chain
+                    .as_ref()
+                    .is_none_or(|chain| chain.contains(&run.run_id))
+            })
             .filter(|(_, (start, end))| {
                 *start < window.end.as_millis() && window.start.as_millis() < *end
             })
@@ -355,6 +397,7 @@ impl<'a> HistoricalDataProvider for LiveReplay<'a> {
             window,
             files: dataset.files,
             journaled: self.runs.iter().map(|run| run.run_id.clone()).collect(),
+            chain: self.chain.clone(),
             selected: selected.iter().map(|(run, _)| run.run_id.clone()).collect(),
             read_paths: BTreeSet::new(),
             unattributed_checked: false,
@@ -382,6 +425,10 @@ pub struct LiveReplayStream<'a> {
     files: Vec<SealedFile>,
     /// Every run of the journal.
     journaled: BTreeSet<String>,
+    /// The runs of the history chain, when the replay is restricted to one
+    /// ([`LiveReplay::chaining_only`]): records of the other journaled runs
+    /// are skipped.
+    chain: Option<BTreeSet<String>>,
     /// The runs this replay recomputes.
     selected: BTreeSet<String>,
     /// Files the runs read.
@@ -426,6 +473,20 @@ impl LiveReplayStream<'_> {
     /// Gaps still open at the window's end: not delivered (module docs).
     pub fn trailing_gaps(&self) -> &[FeedGap] {
         &self.trailing
+    }
+
+    /// Chains the first run after `last`, the last event of an earlier
+    /// segment, with `newest_oi` as the newest open-interest time it
+    /// delivered (ADR-052 D2, the seam): the first run then passes the same
+    /// zero hold-back [`HoldBack::after`] as every later run (D3). Valid only
+    /// before the first [`next_event`](MarketDataProvider::next_event).
+    pub(crate) fn continue_after(&mut self, last: MarketEvent, newest_oi: Option<EventTime>) {
+        debug_assert!(
+            self.stats.is_empty() && self.out.is_empty(),
+            "continue_after after the first run was loaded"
+        );
+        self.last = Some(last);
+        self.newest_oi = newest_oi;
     }
 
     /// Loads, checks and recomputes one run, then queues its in-window
@@ -551,6 +612,15 @@ impl LiveReplayStream<'_> {
                 };
                 let owner = run_of(&capture.session_id);
                 let known = self.journaled.contains(owner);
+                if known
+                    && self
+                        .chain
+                        .as_ref()
+                        .is_some_and(|chain| !chain.contains(owner))
+                {
+                    // A run outside the history chain (ADR-052 D2).
+                    continue;
+                }
                 if !self.window.contains(record.event_time) {
                     if !known {
                         *self
@@ -705,113 +775,12 @@ impl MarketDataProvider for LiveReplayStream<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::normalize::record_time;
-    use crate::testing::MemorySource;
+    use crate::testing::{MemorySource, RunBuilder, SOURCE, agg, mark, oi};
     use mie_domain::event::{GapReason, Stream};
     use mie_domain::state::MarketStateEngine;
-    use mie_ports::raw::Capture;
 
     /// 2026-10-06T01:00:00Z.
     const T0: i64 = 1_791_248_400_000;
-    const SOURCE: &str = "binance-um";
-
-    fn agg(id: u64, time: i64) -> String {
-        format!(
-            r#"{{"e":"aggTrade","E":{},"a":{id},"s":"BTCUSDT","p":"85000.10","q":"0.010","f":1,"l":1,"T":{time},"m":false}}"#,
-            time + 50
-        )
-    }
-
-    fn mark(time: i64) -> String {
-        format!(
-            r#"{{"e":"markPriceUpdate","E":{time},"s":"BTCUSDT","p":"85001.00000000","i":"85002.50000000","r":"0.00010000","T":1791273600000}}"#
-        )
-    }
-
-    fn oi(time: i64) -> String {
-        format!(r#"{{"symbol":"BTCUSDT","openInterest":"95253.475","time":{time}}}"#)
-    }
-
-    /// The records of one capture run, in processing order.
-    struct RunBuilder {
-        run_id: String,
-        records: Vec<(BinanceStream, RawRecord)>,
-    }
-
-    impl RunBuilder {
-        fn new(run_id: &str) -> Self {
-            Self {
-                run_id: run_id.to_owned(),
-                records: Vec::new(),
-            }
-        }
-
-        fn push(&mut self, stream: BinanceStream, session: u32, payload: String) -> &mut Self {
-            let event_time = record_time(stream, payload.as_bytes()).unwrap();
-            let record = RawRecord {
-                event_time,
-                capture: Some(Capture {
-                    receive_time_ns: event_time.as_millis() * 1_000_000,
-                    receive_seq: self.records.len() as u64,
-                    session_id: format!("{}/{}/{session}", self.run_id, stream.raw_name()),
-                }),
-                payload: payload.into_bytes(),
-            };
-            self.records.push((stream, record));
-            self
-        }
-
-        /// The records of `stream`, without the `skip`ped `receive_seq`s.
-        fn of(&self, stream: BinanceStream, skip: &[u64]) -> Vec<RawRecord> {
-            self.records
-                .iter()
-                .filter(|(s, r)| {
-                    *s == stream && !skip.contains(&r.capture.as_ref().unwrap().receive_seq)
-                })
-                .map(|(_, r)| r.clone())
-                .collect()
-        }
-
-        /// Seals one file per stream.
-        fn seal(&self, source: &mut MemorySource, skip: &[u64]) {
-            for stream in BinanceStream::ALL {
-                let records = self.of(stream, skip);
-                if !records.is_empty() {
-                    source.seal(SOURCE, stream.raw_name(), records);
-                }
-            }
-        }
-
-        fn run(&self, started: i64, ended: Option<i64>, clean: Option<u64>) -> LiveRun {
-            LiveRun {
-                run_id: self.run_id.clone(),
-                symbol: "BTCUSDT".to_owned(),
-                hold_back_ms: 750,
-                oi_retime_ms: 10_000,
-                seeds: BTreeMap::new(),
-                streams: vec![
-                    BinanceStream::AggTrade,
-                    BinanceStream::MarkPrice,
-                    BinanceStream::OpenInterest,
-                ],
-                started_at_ms: started,
-                ended_at_ms: ended,
-                clean_records: clean,
-            }
-        }
-
-        /// What live delivered: the run's pipeline over its records.
-        fn live(&self, run: &LiveRun) -> Vec<MarketEvent> {
-            let mut pipeline =
-                Pipeline::new(&run.symbol, run.hold_back_ms, run.oi_retime_ms, &run.seeds);
-            let mut out = Vec::new();
-            for (stream, record) in &self.records {
-                out.extend(pipeline.push(*stream, record).events);
-            }
-            out.extend(pipeline.finish());
-            out
-        }
-    }
 
     fn window(start: i64, end: i64) -> ReplayWindow {
         ReplayWindow {
