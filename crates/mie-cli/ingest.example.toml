@@ -64,3 +64,17 @@ depth_snapshot_min_spacing_ms = 2000
 # equivalence harness (`mie equivalence`, ADR-041): ordinal, event-stream
 # hash and Market State hash, about 1440 lines per day.
 state_checkpoint_interval_secs = 60
+
+# The history chain (ADR-052), read by `mie replay --source history`.
+# Optional: without it every run starts cold (ADR-052 D8).
+# [history]
+# # The chain's origin and the cutover between the archive and the live
+# # runs, UTC dates; 00:00 UTC is implied (ADR-052 D1, D2). The origin is
+# # the first day of the archive backfill; the cutover is the first day of
+# # continuous capture, with the archive imported through the day before
+# # (this date is illustrative).
+# origin = "2025-10-01"
+# cutover = "2026-11-01"
+# # The `mie archive-*` configuration of the archive segment: the same
+# # raw_root and symbol as this file.
+# archive_config = "archive.toml"

@@ -2,10 +2,11 @@
 //! the `mie archive-*` commands ([`ArchiveConfig`]).
 //!
 //! Ingest: `[instrument]`, `[paths]` and `[binance]` are required; `[capture]`
-//! and `binance.streams` have defaults. Unknown keys are rejected. Public market
-//! data needs no secrets; a future secret is read from the environment,
-//! never from this file.
+//! and `binance.streams` have defaults; `[history]` is optional (ADR-052 D6,
+//! D8). Unknown keys are rejected. Public market data needs no secrets; a
+//! future secret is read from the environment, never from this file.
 
+use mie_adapter_binance::archive::catalog::{DAY_MS, parse_day};
 use mie_adapter_binance::archive::{ARCHIVE_SOURCE, ArchiveStream};
 use mie_adapter_binance::{BinanceStream, DEPTH_SNAPSHOT_LIMITS, LiveConfig, OI_POLL_INTERVAL_MS};
 use mie_domain::bars::Timeframe;
@@ -33,6 +34,54 @@ pub struct IngestConfig {
     /// Capture tuning; every key has a default.
     #[serde(default)]
     pub capture: CaptureSettings,
+    /// The history chain (ADR-052); absent: every run is cold (D8).
+    #[serde(default)]
+    pub history: Option<History>,
+}
+
+/// `[history]` (ADR-052 D6): the history chain's origin and cutover, and the
+/// archive configuration of its archive segment.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct History {
+    /// The chain's origin, a UTC date `YYYY-MM-DD`; 00:00 UTC is implied
+    /// (ADR-052 D1).
+    pub origin: String,
+    /// The cutover between the archive and the live segment, a UTC date
+    /// `YYYY-MM-DD`, after the origin (ADR-052 D2).
+    pub cutover: String,
+    /// The `mie archive-*` configuration of the archive segment: the same
+    /// raw store and symbol as this configuration.
+    pub archive_config: PathBuf,
+}
+
+impl History {
+    /// The origin, 00:00 UTC, in epoch ms.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError`] when it is not a date `YYYY-MM-DD`.
+    pub fn origin_ms(&self) -> Result<i64, ConfigError> {
+        day_ms("history.origin", &self.origin)
+    }
+
+    /// The cutover, 00:00 UTC, in epoch ms.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError`] when it is not a date `YYYY-MM-DD`.
+    pub fn cutover_ms(&self) -> Result<i64, ConfigError> {
+        day_ms("history.cutover", &self.cutover)
+    }
+}
+
+/// 00:00 UTC of the date `value` of the key `name`, in epoch ms.
+fn day_ms(name: &str, value: &str) -> Result<i64, ConfigError> {
+    parse_day(value).map(|day| day * DAY_MS).ok_or_else(|| {
+        ConfigError(format!(
+            "{name} {value:?} is not a UTC date YYYY-MM-DD (00:00 UTC is implied, ADR-052 D1)"
+        ))
+    })
 }
 
 /// `[instrument]`.
@@ -271,7 +320,69 @@ impl IngestConfig {
                  exchange's {CONNECTION_LIMIT_SECS} s connection limit"
             )));
         }
+        if let Some(history) = &self.history {
+            let (origin, cutover) = (history.origin_ms()?, history.cutover_ms()?);
+            if origin >= cutover {
+                return Err(ConfigError(format!(
+                    "history.origin {:?} is not before history.cutover {:?}",
+                    history.origin, history.cutover
+                )));
+            }
+        }
         Ok(())
+    }
+
+    /// The `[history]` section and the archive configuration it names, or
+    /// `None` without one (ADR-052 D8). Loaded here, not in
+    /// [`parse`](Self::parse), which reads text only.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError`] when the archive configuration cannot be loaded, when
+    /// its raw root and this one's cannot be resolved or differ (compared
+    /// after `canonicalize`; the error names both), or when its symbol
+    /// differs: both segments of the chain are read from one store, for one
+    /// instrument (ADR-052 D6).
+    pub fn history_archive(&self) -> Result<Option<(History, ArchiveConfig)>, ConfigError> {
+        let Some(history) = &self.history else {
+            return Ok(None);
+        };
+        let path = &history.archive_config;
+        let archive = ArchiveConfig::load(path)
+            .map_err(|e| ConfigError(format!("history.archive_config: {}", e.0)))?;
+        let (live_root, archive_root) = (&self.paths.raw_root, &archive.paths.raw_root);
+        let resolved = std::fs::canonicalize(live_root)
+            .and_then(|live| Ok((live, std::fs::canonicalize(archive_root)?)));
+        match resolved {
+            Ok((live, archived)) if live == archived => {}
+            Ok(_) => {
+                return Err(ConfigError(format!(
+                    "history.archive_config {}: its raw_root {} is not this configuration's \
+                     raw_root {}: both segments of the history chain are read from one store \
+                     (ADR-052 D6)",
+                    path.display(),
+                    archive_root.display(),
+                    live_root.display()
+                )));
+            }
+            Err(e) => {
+                return Err(ConfigError(format!(
+                    "history.archive_config {}: cannot resolve the raw roots {} and {}: {e}",
+                    path.display(),
+                    live_root.display(),
+                    archive_root.display()
+                )));
+            }
+        }
+        if archive.instrument.symbol != self.instrument.symbol {
+            return Err(ConfigError(format!(
+                "history.archive_config {}: its symbol {:?} is not this configuration's {:?}",
+                path.display(),
+                archive.instrument.symbol,
+                self.instrument.symbol
+            )));
+        }
+        Ok(Some((history.clone(), archive)))
     }
 
     /// The state checkpoint interval in event-time milliseconds (ADR-041).

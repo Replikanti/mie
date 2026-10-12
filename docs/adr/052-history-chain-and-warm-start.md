@@ -105,6 +105,101 @@ deferred option D are under *Alternatives considered*.
      it would pull the October soak runs, their multi-day holes and the
      6.7-day archive-to-live hole (2026-09-30 to 2026-10-07 15:50 UTC,
      ADR-031's justification addendum) into the canonical state.
+   - **Every request replays from the origin and is restricted
+     afterwards** by ADR-039 decision 4: an event is delivered when its
+     time lies in the window, a gap counts at its end, and a gap still
+     open at the window's end is withheld and listed as trailing. The
+     archive segment spans `[origin, cutover)` for every request, even for
+     a window that ends before the cutover.
+     - Why: only this makes adjacent windows concatenate exactly, and
+       makes the "through run k" prefix below a prefix of the windowed
+       chain. W3 to W5 rely on both. Events concatenate without exception.
+       The trailing list of a window holds the gaps the next window
+       delivers that start before the split, with one exception, below.
+     - **The exception: the seed gaps of a run the window does not read.**
+       A chain run whose extent (its start minus `RUN_MARGIN_MS`) begins at
+       or after the window's end is not part of the window's live segment.
+       Its seed gaps (decision 3) start at the chain's last event before it,
+       inside the window, and end at its first event, after it: the next
+       window delivers them, this one does not list them. The same holds
+       for the first chain run when the window ends at or before the live
+       segment's start. Listing them needs that run's records, since a seed
+       gap ends at the run's first event of its series. The window's
+       dataset version would then cover the run's files and move when the
+       run starts: a closed window's version would change when a later run
+       starts capturing, which breaks the rule that it does not (decision 5,
+       ADR-039 decision 2). Reading the files without covering them in the
+       version would break the version's provenance instead. When the
+       window is replayed before that run exists, no replay can list them
+       at all. So the trailing list is what the data read for the window
+       announces, and nothing delivered depends on it.
+     - Rejected, replaying a window from its own start: cheaper, but
+       missing-day and fold gaps are then placed "from the window start"
+       and the sequencers start without a predecessor, so the gaps at a
+       split differ from the union's and W5's two-window drive would
+       diverge.
+     - Rejected, an archive segment that ends at the window's end when
+       that is before the cutover: cheaper for early windows, but its
+       missing-day and fold gaps then end at the window's end, while the
+       next window delivers them ending at the resumed event, so the gaps
+       one window withholds are no longer those the next delivers.
+     - The cost: every request replays the whole archive segment (about
+       19.2 min per year at r = 1, decision 11), even a short window.
+       `--source live|archive` stay for cheap ad-hoc windows.
+   - **The live segment starts at the first chain run's start minus
+     `RUN_MARGIN_MS`** (300 000 ms) and ends at the window's end. ADR-039
+     decision 2 bounds a record's distance from its run's span by 300 s
+     (open klines filed at their close, open interest trailing its poll).
+     A later start would cut the first run's early records, for example
+     open interest trailing its poll, out of the chain. An earlier one
+     only adds files of runs outside the chain to the version. A window
+     that ends at or before this start has no live segment; the first
+     chain run's seed gaps are then the exception above.
+   - **The cutover rule reads the journal only.** A run without `run_end`
+     ends, for the rule, at its journaled successor's start (ADR-039
+     decision 2), and an open run (no successor) ends after any cutover.
+     Why: the rule then never depends on the window. Rejected, refusing
+     only when the store holds a record of the run at or after the
+     cutover: more permissive, but window-dependent, since a window that
+     ends before those records would pass while a longer one fails. A
+     crashed last run before the cutover therefore blocks that cutover;
+     #106's runbook ends that run with `run_end` or picks a later cutover.
+   - **Records of runs outside the chain are skipped** wherever the live
+     segment reads them. Extents are still computed over every journaled
+     run, so a crashed chain run ends at its successor's start even when
+     that successor is outside the chain. Why skipping is exact: each run
+     had its own pipeline (ADR-039 decision 1), so a run outside the chain
+     never affected a chain run. Records of chain runs and of runs the
+     journal does not know keep every ADR-039 decision 2 check.
+   - **The "through run k" prefix**, for the warm start and its
+     equivalence check: the archive segment and every chain run that
+     started before k, over `[origin, end + RUN_MARGIN_MS)`, where `end`
+     is the ADR-039 decision 2 end of k's predecessor; by that decision
+     every record of the predecessor lies inside it, so none is cut. Run
+     k and every later run are skipped, never recomputed. For the first
+     chain run the prefix is the archive segment alone. A run that started
+     before the cutover has no prefix.
+   - **The archive's last metrics row** (23:55 of the day before the
+     cutover) is ordered at 00:00 of the cutover day (ADR-034 decision 3),
+     so the half-open archive segment excludes it. Open interest after the
+     archive's last included row reaches the chain only through the live
+     poller.
+   - **The archive segment's trailing gaps** (missing days at its end, the
+     fold's unchecked tail at the cutover) are reported with the segment,
+     not delivered as such: the live segment takes over at the seam, and
+     the first chain run's seed gaps (decision 3) carry them over it. A
+     series with an archive event whose data ends with a trailing gap
+     ends, for its chain seed, where that gap starts, so the seed gap
+     covers the whole hole up to the run's first event of the series. A
+     series the archive segment holds no event of (configured but never
+     imported) gets no chain seed, as decision 3 rules for series the
+     chain holds no event of: no seed is invented at the origin. Rejected, delivering
+     the archive's trailing gap at the seam: it ends at the cutover or at
+     the archive's last day, so it either sorts after live events of the
+     overlap, turning them late, or stops short of the first live event,
+     leaving the bars in between complete. `Funding` has no live stream,
+     so its trailing gap stays reported only; no later chain event reads
+     across it.
 
 3. **Holes and chain seeds** (#106 plan D1). For runs with a history, each
    stream's seed is the newest event of the same domain stream in the
@@ -130,6 +225,24 @@ deferred option D are under *Alternatives considered*.
      first live run on, these streams have chain events and are seeded
      like every other, so every later hole is marked. `Funding` has no
      live stream (ADR-042 decision 4) and needs no seed.
+   - **Replay applies the chain seeds** (W2). The history chain
+     recomputes every chain run with, per series except the order book,
+     the chain's newest event time of the series as its seed, unless the
+     run's journaled seed is at or before it, which is then kept. Why:
+     runs journaled before the warm start (W3) carry the 7-day lookback,
+     whose seed is missing after a longer pause, or comes from a run
+     outside the chain that captured after the archive's last event (a
+     run before the cutover), so the hole since the chain's last event
+     would stay unmarked or partly unmarked. A journaled chain seed equals
+     the chain's newest event, so a warm-started run recomputes exactly as
+     journaled. A journaled seed of a series the chain holds no event of
+     is kept as journaled. The order book keeps its journaled seed: its
+     sequencer takes one seed from two streams, `depth` and
+     `depthSnapshot` (ADR-038), which this per-stream rule does not
+     cover, and the archive carries no book, so the seam never needs it;
+     its chain seed comes with W3's journal. Rejected, refusing a chain whose seam is unmarked: the
+     production cutover follows #99's cold sessions, so every chain would
+     be refused until W3.
    - Runs without a history keep the lookback (decision 8).
 
 4. **Uncrossable holes and the effective origin** (#106 plan D8). A hole
@@ -148,16 +261,65 @@ deferred option D are under *Alternatives considered*.
      trades-stream event would be rejected too.
    - Rejected, a cold start after an uncrossable hole: a single
      month-long outage would disable the warm-start at every later start.
+   - **Where the rule lives:** `mie_app::drive_chain`, the drive of every
+     chain consumer. When the engine returns `StateError::TimeJump`, it is
+     replaced by a fresh engine with the same feature set, which then
+     applies the event; any other rejection is counted as before. The
+     effective origin is the time of that event, the first after the hole
+     (for an archive hole, the end of the resuming `MissingData` gap). The
+     provider's sequence is unchanged.
+   - Rejected, detecting holes in the provider: it would need a second
+     derivation of the bar arithmetic; it cannot restart an engine it does
+     not own; and moving its start needs the latest hole before the first
+     event, so a second pass or a pre-scan of the sealed-file manifests,
+     which is exact for archive files but not for holes between live runs,
+     whose edges are known only after the recompute.
+   - Consequence: the effective origin a report prints is that of its
+     drive. A window that starts after a hole drives a fresh engine from
+     its first event and does not see that hole; only a drive from the
+     origin (the warm-up, the experiment prefix) sees every restart.
 
 5. **The chain's dataset version** covers both segments' selections: the
    archive files `ArchiveReplay` selects and the live files of the chained
    runs. An archive correction (#102, ADR-050) therefore changes it
    visibly, and so does a newly sealed run.
+   - **Encoding 1:** the lowercase hex SHA-256 of the text
+
+     ```text
+     mie-history-chain-dataset 1
+     origin <ms>
+     cutover <ms>
+     archive <archive segment version>
+     live <live segment version, or - without a live segment>
+     ```
+
+     with every line ending in `\n`. A change to the text is a new
+     encoding.
+   - Why a hash over the segments' versions: each already identifies its
+     selection (ADR-039 decisions 2 and 5), so the chain's version is a
+     function of the two selections alone, and it needs no selection rule
+     of its own. A closed window therefore keeps its version while a later
+     run goes on capturing, once that run has sealed past the window's end
+     plus `RUN_MARGIN_MS` (ADR-039 decision 2). The origin and the cutover
+     are in the text because the same files make another chain under
+     another cutover.
 
 6. **Configuration and journal.**
    - `[history]` in the ingest configuration: `origin` and `cutover` as
      UTC dates (00:00 UTC is implied, decision 1), plus the path of the
      archive configuration. Unknown keys are rejected, as elsewhere.
+     - The keys are `origin`, `cutover` and `archive_config`. Both dates
+       accept `YYYY-MM-DD` only, so a time of day is rejected, and the
+       origin must be before the cutover.
+     - The archive configuration must name the same raw root (compared
+       after resolving both paths) and the same symbol: both segments are
+       read from one store, for one instrument, and the chain's version
+       covers one selection of it. It is loaded when the chain is used, so
+       parsing the ingest configuration stays text-only.
+     - The origin is configurable, not pinned to 2025-10-01 in code:
+       fixtures need other dates, and decision 1 binds production. W3
+       journals it with every run. Rejected, refusing any other origin at
+       validation: no fixture could build a chain.
    - `run_start` gains `history_origin_ms` and `history_cutover_ms`. They
      are comparability keys, like those ADR-041 decision 3 added, not
      pipeline parameters: ADR-032 decision 4 is unchanged.
@@ -304,6 +466,14 @@ deferred option D are under *Alternatives considered*.
       of history (105 min would be about 5.5 years). The live segment is
       not measured yet (decision 11), so the estimate can be far off; #106
       updates it.
+    - **The trigger does not see research.** Every state-reading research
+      request (`mie replay --source history`, W5's experiments) replays the
+      same prefix from the origin (decision 2), at the same cost per year
+      of history, while the trigger watches only live starts
+      (`ready_after_ms`). Research iteration can therefore become the
+      binding cost before the 90 min trigger fires. The trigger and its
+      number stay unchanged: no research-cost threshold has been measured,
+      so this paragraph records the debt, not a second number.
 
 13. **Debt 2: one live run in memory** (#106 plan D7). `LiveReplay` holds
     one run's records and output at a time (ADR-039 Consequences). With
@@ -356,6 +526,7 @@ deferred option D are under *Alternatives considered*.
 | Origin 2025-10-01 00:00 UTC | The first day of the #12 backfill (ADR-034 Acceptance; `docs/data-availability.md`) and the start of the #80, #94 and #96 full-year runs | — | Earlier: there is no data. Later: stored history is discarded, the skew reopens for the levels before it, and the full-year runs no longer computed the canonical state |
 | 00:00 UTC for the origin and the cutover | ADR-031 decision 1: every timeframe divides a day and is epoch-aligned. ADR-034: daily archive files. ADR-030 decision 4: UTC-date partitions | — | Any other time of day splits a bar, an archive file or a date partition at the seam |
 | The seam hole is under 1 day | The cutover rule (decision 2) | The archive ends the day before the cutover, and the first chain run starts on the cutover day | The seam can never move the effective origin, because it is far below the 31-day bound |
+| The live segment starts at the first chain run's start − 300 000 ms (`RUN_MARGIN_MS`); the "through run k" prefix ends 300 000 ms after the predecessor's end | ADR-039 decision 2: a record lies at most `RUN_MARGIN_MS` outside its run's span (open klines filed at their close, up to a minute ahead; open interest trailing its poll by seconds) | — | A later start, or an earlier prefix end, cuts the run's edge records, for example open interest trailing its poll, out of the chain. An earlier start, or a later end, only adds files of runs outside the chain to the version: their records are skipped |
 | 31 days = 44 640 1m bars | `MAX_BARS_PER_EVENT` (ADR-031 decision 11, `bars.rs`) | 31 × 1 440 = 44 640. Not chosen here: ADR-031's justification addendum calls 31 days "a round margin over a one-week hole" | Decision 4 follows the domain's bound, not a number of its own. A smaller chain threshold discards history the engine could cross. A larger one leaves a warm engine that rejects every later trades-stream event, because a rejected event leaves the developing bar, and so the jump, unchanged |
 | The 7-day seed lookback (superseded for runs with a history) | ADR-032 decision 5, `SEED_LOOKBACK_MS`; ADR-032's justification table marks it "engineering default, not measured" | — | Under the lookback, a pause of more than 7 days gets no `Disconnected` gap. Chain seeds have no window, so every hole is marked (decision 3) |
 | 65 536 slots, about 27 s | ADR-026 (`core_channel_capacity`, *Why 65 536*) | Peak rate 60 015 / 25 s + 19/s = 2 419.6/s; 65 536 / 2 419.6 ≈ 27.1 s | Any fixed capacity blocks once the warm-up outlasts capacity / arrival rate. Holding one year's warm-up (1 152.2 s at r = 1) at the peak rate takes 1 152.2 × 2 419.6 ≈ 2.79 M slots, about 245 MB pre-allocated at 88 B per core slot (ADR-026), and that need grows with the history. The quiet side: at the archive's mean aggTrades rate (603 218 226 / 365 days ≈ 19.1/s) plus the other six streams at their p99 rate (19/s, ADR-026), 65 536 slots last about 29 min. So the rejection rests on a burst during the warm-up, since one blocked millisecond fails ADR-041's 0 ms gate, and on the growth with the history, not on the 27 s alone |

@@ -12,6 +12,25 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
 
 ### Added
 
+- **The history chain and `mie replay --source history` (ADR-052, #116).**
+  An optional `[history]` section of the ingest configuration (`origin`,
+  `cutover`, `archive_config`; the archive configuration must share the raw
+  root and the symbol) names the chain: the archive backfill from the origin
+  up to the cutover (default streams, `aggTrades` folded), then the
+  journaled capture runs that started at or after the cutover, the first
+  continuing after the archive's last event as runs continue after each
+  other. Every chain run is recomputed with the chain's newest event of
+  each series as its seed when its journaled seed does not reach back that
+  far, so every hole, the seam included, opens with a `Disconnected` gap,
+  also when the archive's last days are missing. A run the cutover falls
+  inside is refused by name. Every request
+  replays from the origin and is restricted to its window, so adjacent
+  windows concatenate exactly; the report has one line per segment, and the
+  chain's dataset version covers both. An uncrossable hole (more than
+  `MAX_BARS_PER_EVENT` one-minute bars) restarts a fresh engine through the
+  new `mie_app::drive_chain`; each restart and the effective origin are
+  printed. `--source live|archive` reports are unchanged; `mie experiment
+  run` refuses `--source history`.
 - **Order-flow candidates: CVD and open-interest divergences (ADR-051,
   #22).** `candidate.divergence.cvd.<15m|1h|4h|1d>@1` and
   `candidate.divergence.oi.<15m|1h|4h|1d>@1` compare consecutive confirmed

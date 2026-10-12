@@ -12,7 +12,9 @@
 //!   only place that hands the writable store to the pipeline (ADR-020).
 //!   A data-version mismatch of an archive run that folds `aggTrades`
 //!   (ADR-050) adds a hint: `--trade-correction none` opens the data
-//!   versions recorded before ADR-050.
+//!   versions recorded before ADR-050. `--source history` is refused: the
+//!   history chain reaches experiments with `research.replay_summary@2`
+//!   (ADR-052 D10).
 
 use crate::journal::read_runs;
 use crate::replay::{ReplaySource, archive_replay};
@@ -27,6 +29,9 @@ use mie_ports::inbound::{ExperimentRun, ResearchError, RunResearchExperiment};
 use mie_ports::outbound::HistoricalDataProvider;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+
+/// Why `mie experiment run` refuses `--source history` (module docs).
+const HISTORY_REFUSED: &str = "--source history applies to `mie replay` only";
 
 /// One `mie experiment run` invocation.
 #[derive(Debug, Clone)]
@@ -69,9 +74,14 @@ pub fn validate(path: &Path, out: &mut dyn Write) -> Result<bool, String> {
 ///
 /// # Errors
 ///
-/// A description when the spec file cannot be read or the output written.
-/// Every run failure is reported in the output.
+/// A description when the source is `history`, which `mie experiment run`
+/// does not take yet (ADR-052 D10 adds it with `research.replay_summary@2`),
+/// or when the spec file cannot be read or the output written. Every run
+/// failure is reported in the output.
 pub fn run(request: &ExperimentRequest, out: &mut dyn Write) -> Result<bool, String> {
+    if let ReplaySource::History(_) = request.source {
+        return Err(HISTORY_REFUSED.to_owned());
+    }
     let mut report = Vec::new();
     let spec = match load(&request.spec)? {
         Ok(spec) => spec,
@@ -111,6 +121,7 @@ pub fn run(request: &ExperimentRequest, out: &mut dyn Write) -> Result<bool, Str
                 archive_replay(&store, config, streams.as_deref(), *correction)
                     .and_then(|replay| execute(replay, results, &spec, folding))
             }
+            ReplaySource::History(_) => Err(HISTORY_REFUSED.to_owned()),
         },
         Err(error) => Err(error.to_string()),
     };

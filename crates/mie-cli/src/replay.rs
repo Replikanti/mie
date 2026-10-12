@@ -2,18 +2,25 @@
 //! deterministic report (#11, ADR-039).
 //!
 //! 1. Open the replay: [`LiveReplay`] over the journaled capture runs of the
-//!    live source, or [`ArchiveReplay`] over the archive backfill (one
-//!    source per replay, ADR-039 D6).
+//!    live source, [`ArchiveReplay`] over the archive backfill (one source
+//!    per replay, ADR-039 D6), or [`HistoryChain`] over both, the archive up
+//!    to the cutover and the live runs from it (ADR-052 D2, which supersedes
+//!    ADR-039 D6 for the chain).
 //! 2. Drive a fresh [`MarketStateEngine`] through
 //!    [`mie_app::drive_tolerant`] — the drive of live ingestion — with the
 //!    stream wrapped in a [`HashingProvider`]: a domain rejection is counted
-//!    and driving resumes.
+//!    and driving resumes. The history chain is driven through
+//!    [`mie_app::drive_chain`] instead: an uncrossable hole restarts a fresh
+//!    engine, which is not a rejection (ADR-052 D4).
 //! 3. Print the window, the source (with the archive's `aggTrades` fold
 //!    correction, ADR-050), the dataset version, one line per run (live) or
 //!    per stream (archive), the fold's provenance ([`fold_lines`]), the
 //!    delivered events and gaps by stream and reason, trailing gaps,
 //!    missing days, domain rejections, the final state and
-//!    `event-stream <events>:<hex>`, then `PASS` or `FAIL: …`.
+//!    `event-stream <events>:<hex>`, then `PASS` or `FAIL: …`. The history
+//!    chain prints one line per segment, each followed by that segment's
+//!    lines as its own source prints them, and after the rejections one
+//!    `restart at` line per restart and the `effective origin`.
 //!
 //! The report carries no wall-clock field, so replaying the same window of
 //! the same store twice prints identical bytes. It passes when the replay
@@ -27,13 +34,14 @@ use mie_adapter_binance::archive::fold::TradeCorrection;
 use mie_adapter_binance::archive::replay::ArchiveReplay;
 use mie_adapter_binance::archive::replay::{ArchiveReplayStream, DayStatus, FoldReport};
 use mie_adapter_binance::archive::{ARCHIVE_SOURCE, ArchiveStream};
-use mie_adapter_binance::{LiveReplay, LiveReplayStream};
+use mie_adapter_binance::{HistoryChain, HistoryChainStream, LiveReplay, LiveReplayStream};
 use mie_adapter_parquet::ParquetRawStore;
-use mie_app::{HashingProvider, drive_tolerant};
+use mie_app::{HashingProvider, drive_chain, drive_tolerant};
 use mie_domain::event::{FeedGap, GapReason, MarketEvent, Stream};
 use mie_domain::event_hash::EventStreamHash;
 use mie_domain::num::Qty;
-use mie_domain::state::MarketStateEngine;
+use mie_domain::state::{MarketStateEngine, StateError};
+use mie_domain::time::EventTime;
 use mie_ports::outbound::{
     HistoricalDataProvider, MarketDataProvider, ProviderError, Replay, ReplayWindow,
 };
@@ -43,6 +51,9 @@ use std::io::Write;
 
 /// Domain rejections printed as samples.
 const MAX_REJECTION_SAMPLES: usize = 10;
+
+/// The failure of `--source history` without a `[history]` section.
+const NO_HISTORY: &str = "the ingest configuration has no [history] section (ADR-052 D6)";
 
 /// Where a replay reads.
 #[derive(Debug, Clone)]
@@ -60,6 +71,10 @@ pub enum ReplaySource {
         /// The `aggTrades` fold (`--trade-correction`, ADR-050).
         correction: TradeCorrection,
     },
+    /// The history chain of an `mie ingest` configuration with `[history]`
+    /// (ADR-052): its archive configuration's backfill up to the cutover,
+    /// then its journaled runs from it.
+    History(IngestConfig),
 }
 
 /// One `mie replay` invocation.
@@ -86,6 +101,9 @@ pub struct ReplayOutcome {
     pub domain_rejections: u64,
     /// The provider failure, if any.
     pub error: Option<String>,
+    /// The times (epoch ms) of the history chain's restarts after an
+    /// uncrossable hole (ADR-052 D4); empty for `live` and `archive`.
+    pub restarts: Vec<i64>,
 }
 
 impl ReplayOutcome {
@@ -118,7 +136,7 @@ pub fn run(request: &ReplayRequest, out: &mut dyn Write) -> Result<ReplayOutcome
                     let store = ParquetRawStore::new(&config.paths.raw_root);
                     let runs = runs.iter().map(|run| run.live_run()).collect();
                     let live = LiveReplay::new(&store, source, symbol, runs);
-                    drive(live.replay(window), &mut report, describe_live)
+                    drive(live.replay(window), &mut report, describe_live, false)
                 }
                 Err(error) => failed(&mut report, error),
             }
@@ -142,16 +160,70 @@ pub fn run(request: &ReplayRequest, out: &mut dyn Write) -> Result<ReplayOutcome
                             names.join(",")
                         ),
                     );
-                    drive(replay.replay(window), &mut report, describe_archive)
+                    drive(replay.replay(window), &mut report, describe_archive, false)
                 }
                 Err(error) => failed(&mut report, error),
             }
         }
+        ReplaySource::History(config) => history(config, window, &mut report),
     };
     out.write_all(&report)
         .and_then(|()| out.flush())
         .map_err(|e| format!("write the report: {e}"))?;
     Ok(outcome)
+}
+
+/// The `mie replay --source history` report of `config` over `window`.
+fn history(config: &IngestConfig, window: ReplayWindow, report: &mut Vec<u8>) -> ReplayOutcome {
+    let Some(section) = &config.history else {
+        return failed(report, NO_HISTORY.to_owned());
+    };
+    line(
+        report,
+        format!(
+            "replay {} source history origin {} cutover {}",
+            span(window),
+            section.origin,
+            section.cutover
+        ),
+    );
+    let (history, archive) = match config.history_archive() {
+        Ok(Some(loaded)) => loaded,
+        Ok(None) => return failed(report, NO_HISTORY.to_owned()),
+        Err(error) => return failed(report, error.to_string()),
+    };
+    let (origin, cutover, streams) =
+        match (history.origin_ms(), history.cutover_ms(), archive.streams()) {
+            (Ok(origin), Ok(cutover), Ok(streams)) => (origin, cutover, streams),
+            (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
+                return failed(report, error.to_string());
+            }
+        };
+    let source = &config.instrument.source;
+    let symbol = &config.instrument.symbol;
+    let runs = match read_runs(&config.paths.journal, source) {
+        Ok(runs) => runs.iter().map(|run| run.live_run()).collect(),
+        Err(error) => return failed(report, error),
+    };
+    let store = ParquetRawStore::new(&config.paths.raw_root);
+    let chain = match HistoryChain::new(
+        &store,
+        symbol,
+        &streams,
+        source,
+        runs,
+        EventTime::from_millis(origin),
+        EventTime::from_millis(cutover),
+    ) {
+        Ok(chain) => chain,
+        Err(error) => return failed(report, error.to_string()),
+    };
+    drive(
+        chain.replay(window),
+        report,
+        |stream, report| describe_history(&chain, source, symbol, stream, report),
+        true,
+    )
 }
 
 /// The archive replay of `config`: `streams` when given, else the
@@ -198,6 +270,7 @@ fn failed(report: &mut Vec<u8>, error: String) -> ReplayOutcome {
         events: 0,
         domain_rejections: 0,
         error: Some(error),
+        restarts: Vec::new(),
     }
 }
 
@@ -221,11 +294,14 @@ impl<P: MarketDataProvider> MarketDataProvider for Tally<P> {
     }
 }
 
-/// Drives an opened replay into a fresh engine and reports it.
+/// Drives an opened replay into a fresh engine and reports it; `chained`:
+/// through [`drive_chain`], whose restarts are reported (ADR-052 D4), else
+/// through [`drive_tolerant`].
 fn drive<S: MarketDataProvider>(
     opened: Result<Replay<S>, ProviderError>,
     report: &mut Vec<u8>,
     describe: impl FnOnce(&S, &mut Vec<u8>),
+    chained: bool,
 ) -> ReplayOutcome {
     let Replay { stream, dataset } = match opened {
         Ok(opened) => opened,
@@ -239,12 +315,17 @@ fn drive<S: MarketDataProvider>(
     let mut engine = MarketStateEngine::new();
     let mut domain_rejections = 0_u64;
     let mut samples = Vec::new();
-    let driven = drive_tolerant(&mut hashing, &mut engine, |rejected| {
+    let on_rejection = |rejected: &StateError| {
         domain_rejections += 1;
         if samples.len() < MAX_REJECTION_SAMPLES {
             samples.push(rejected.to_string());
         }
-    });
+    };
+    let driven = if chained {
+        drive_chain(&mut hashing, &mut engine, on_rejection).map(|drive| drive.restarts)
+    } else {
+        drive_tolerant(&mut hashing, &mut engine, on_rejection).map(|_| Vec::new())
+    };
     let stream_hash = hashing.hash();
     let tally = hashing.into_inner();
     describe(&tally.inner, report);
@@ -268,6 +349,27 @@ fn drive<S: MarketDataProvider>(
     line(report, format!("domain rejections: {domain_rejections}"));
     for sample in &samples {
         line(report, format!("  rejected: {sample}"));
+    }
+    let restarts: Vec<i64> = driven
+        .as_ref()
+        .map(|restarts| restarts.iter().map(|t| t.as_millis()).collect())
+        .unwrap_or_default();
+    if chained {
+        for restart in &restarts {
+            line(
+                report,
+                format!("restart at {restart} after an uncrossable hole (ADR-052 D4)"),
+            );
+        }
+        line(
+            report,
+            format!(
+                "effective origin {}",
+                restarts
+                    .last()
+                    .map_or_else(|| "-".to_owned(), ToString::to_string)
+            ),
+        );
     }
     let state = engine.state();
     line(
@@ -300,6 +402,7 @@ fn drive<S: MarketDataProvider>(
         events: stream_hash.events,
         domain_rejections,
         error,
+        restarts,
     }
 }
 
@@ -319,6 +422,12 @@ fn trailing(report: &mut Vec<u8>, gaps: &[FeedGap]) {
 }
 
 fn describe_live(stream: &LiveReplayStream<'_>, report: &mut Vec<u8>) {
+    describe_runs(stream, report);
+    trailing(report, stream.trailing_gaps());
+}
+
+/// The run and unjournaled-run lines of a live replay.
+fn describe_runs(stream: &LiveReplayStream<'_>, report: &mut Vec<u8>) {
     for run in stream.runs() {
         line(
             report,
@@ -340,6 +449,57 @@ fn describe_live(stream: &LiveReplayStream<'_>, report: &mut Vec<u8>) {
                  (no run_start in the journal)"
             ),
         );
+    }
+}
+
+/// The segments of a history chain, each followed by its own source's
+/// lines, then the chain's trailing gaps (ADR-052 D2). The archive
+/// segment's own trailing gaps, open at the cutover and never delivered,
+/// are among its lines.
+fn describe_history(
+    chain: &HistoryChain<'_>,
+    source: &str,
+    symbol: &str,
+    stream: &HistoryChainStream<'_>,
+    report: &mut Vec<u8>,
+) {
+    let archive = stream.archive();
+    let names: Vec<_> = chain
+        .archive()
+        .streams()
+        .iter()
+        .map(|s| s.raw_name())
+        .collect();
+    line(
+        report,
+        format!(
+            "segment archive {ARCHIVE_SOURCE}/{symbol} {}: dataset {}, streams {}, correction {}, \
+             delivered {}",
+            span(archive.window()),
+            archive.dataset(),
+            names.join(","),
+            chain.archive().correction(),
+            archive.delivered()
+        ),
+    );
+    describe_archive(archive.stream(), report);
+    match stream.live() {
+        Some(live) => {
+            line(
+                report,
+                format!(
+                    "segment live {source}/{symbol} {}: dataset {}, runs chained {}, runs before \
+                     the cutover {}, delivered {}",
+                    span(live.window()),
+                    live.dataset(),
+                    live.stream().runs().len(),
+                    chain.runs_before_cutover(),
+                    live.delivered()
+                ),
+            );
+            describe_runs(live.stream(), report);
+        }
+        None => line(report, "segment live: none".to_owned()),
     }
     trailing(report, stream.trailing_gaps());
 }

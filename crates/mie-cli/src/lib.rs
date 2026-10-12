@@ -7,7 +7,7 @@
 //!   ([`report`]): verifies a capture window (the soak acceptance of #9);
 //! - `mie archive-import`, `mie archive-verify`, `mie archive-kline-check`
 //!   ([`archive`]): backfill from the Binance public data archive (#12);
-//! - `mie replay --config <path> --from … --to … [--source live|archive]`
+//! - `mie replay --config <path> --from … --to … [--source live|archive|history]`
 //!   ([`replay`]): replays a window of raw data through the core with a
 //!   deterministic report (#11);
 //! - `mie equivalence --config <path> --from … --to …` ([`equivalence`]):

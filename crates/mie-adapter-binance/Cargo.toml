@@ -38,7 +38,8 @@ zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
 # zlib and no Zlib-licensed zlib-rs enter the tree. Not used directly.
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 # SHA-256 of downloaded zips against the archive's published `.CHECKSUM`
-# (already in the tree through the raw-store adapter).
+# (already in the tree through the raw-store adapter), and of the history
+# chain's dataset-version text (ADR-052 D5).
 sha2 = "0.11"
 
 [lints]

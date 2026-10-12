@@ -1,7 +1,8 @@
 # ADR-039: Replay over the raw store — per-run recompute for live data, canonical merge for the archive
 
 - Status: accepted; in decision 5, delivering every aggTrades row exactly
-  as normalized is superseded by ADR-050 (fold)
+  as normalized is superseded by ADR-050 (fold); decision 6 is superseded
+  by ADR-052 for the history chain
 - Date: 2026-10-07
 
 ## Context

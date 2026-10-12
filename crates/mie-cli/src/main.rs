@@ -79,7 +79,7 @@ USAGE:
         under --trade-source trades.
 
     mie replay --config <path> --from <ms|YYYY-MM-DD> --to <ms|YYYY-MM-DD>
-               [--source live|archive] [--streams <a,b,...>]
+               [--source live|archive|history] [--streams <a,b,...>]
                [--trade-correction fold|none]
         Replay [from, to) of the raw store through the core (a date is a
         UTC day: --from its start, --to its end, inclusive). live (default)
@@ -90,12 +90,21 @@ USAGE:
         replay folds the trades the aggTrades archive omits back in from
         imported trades files (ADR-050, --trade-correction fold, the
         default); none delivers aggTrades as published and reproduces data
-        versions and hashes from before ADR-050. Prints the dataset
-        version, runs or streams, the fold summary with one line per
-        corrected day and per corrected minute, delivered events and gaps,
-        trailing gaps, missing days, domain rejections, the final state and
-        the event-stream hash; the same window prints the same bytes. Exits
-        0 on PASS; 1 when the replay failed, the domain rejected an event or
+        versions and hashes from before ADR-050. history reads an ingest
+        config with a [history] section and replays the history chain
+        (ADR-052): the archive backfill of its archive config from the
+        origin up to the cutover (default streams, folded), then the
+        journaled runs that started at or after the cutover, always from
+        the origin, restricted to the window; --streams and
+        --trade-correction do not apply, and a run the cutover falls inside
+        fails the replay. An uncrossable hole restarts a fresh engine
+        (ADR-052 D4): each restart and the effective origin are printed.
+        Prints the dataset version, runs or streams (one line per segment
+        for history), the fold summary with one line per corrected day and
+        per corrected minute, delivered events and gaps, trailing gaps,
+        missing days, domain rejections, the final state and the
+        event-stream hash; the same window prints the same bytes. Exits 0
+        on PASS; 1 when the replay failed, the domain rejected an event or
         the window holds no event.
 
     mie equivalence --config <path> --from <ms|YYYY-MM-DD> --to <ms|YYYY-MM-DD>
@@ -458,20 +467,24 @@ impl Options {
             .ok_or_else(|| format!("--trade-correction {value:?} is neither fold nor none"))
     }
 
-    /// The replay source of `--source live|archive` (default live) over the
-    /// configuration at `config_path`, with `--streams` and
-    /// `--trade-correction` for the archive.
+    /// The replay source of `--source live|archive|history` (default live)
+    /// over the configuration at `config_path`, with `--streams` and
+    /// `--trade-correction` for the archive. The history chain fixes both
+    /// (ADR-052 D2).
     fn replay_source(&self, config_path: &Path) -> Result<ReplaySource, String> {
         match self.optional("--source").unwrap_or("live") {
-            "live" => {
+            source @ ("live" | "history") => {
                 for flag in ["--streams", "--trade-correction"] {
                     if self.optional(flag).is_some() {
                         return Err(format!("{flag} applies to --source archive only"));
                     }
                 }
-                Ok(ReplaySource::Live(
-                    IngestConfig::load(config_path).map_err(|e| e.to_string())?,
-                ))
+                let config = IngestConfig::load(config_path).map_err(|e| e.to_string())?;
+                Ok(if source == "live" {
+                    ReplaySource::Live(config)
+                } else {
+                    ReplaySource::History(config)
+                })
             }
             "archive" => {
                 let correction = self.correction()?;
@@ -492,7 +505,9 @@ impl Options {
                     correction,
                 })
             }
-            other => Err(format!("--source {other:?} is neither live nor archive")),
+            other => Err(format!(
+                "--source {other:?} is not live, archive or history"
+            )),
         }
     }
 

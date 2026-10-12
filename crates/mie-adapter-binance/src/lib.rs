@@ -20,6 +20,7 @@
 //! | [`transport`] | WebSocket, HTTP and clock seams with their real implementations |
 //! | [`live`] | Capture threads, raw-first persistence and the live provider |
 //! | [`replay`] | Replay of live capture runs: per-run recompute from the raw store (#11) |
+//! | [`history`] | The history chain: the archive up to the cutover, then the live runs from it (ADR-052) |
 //! | [`archive`] | Archive import and replay: catalog, checksummed downloads, import ledger, archive normalization, canonical merge |
 //!
 //! Live capture runs on plain threads, without an async runtime (ADR-026
@@ -38,6 +39,7 @@ pub mod archive;
 pub mod book_audit;
 pub mod book_sync;
 mod depth_rest;
+pub mod history;
 pub mod holdback;
 pub mod live;
 pub mod normalize;
@@ -53,6 +55,9 @@ mod ws;
 
 pub use book_audit::{BookAudit, CheckpointResult, MIN_SIDE_LEVELS, SideCoverage};
 pub use book_sync::{BookSequencer, BookStats, BookTransition};
+pub use history::{
+    CHAIN_DATASET_ENCODING, HistoryChain, HistoryChainStream, Segment, chain_dataset,
+};
 pub use live::{
     BinanceLiveProvider, CaptureEvent, CaptureHandle, CaptureObserver, CaptureSummary, LiveConfig,
     SnapshotTrigger, run_id, start,
