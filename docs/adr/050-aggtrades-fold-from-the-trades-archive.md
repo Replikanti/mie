@@ -492,7 +492,9 @@ all five:
      and `trades`, which are in the store, so the tail of 2026-06-09's
      last aggregate is checked and no `fold unchecked tail` line appears.
      06-10's status is listed with the window's days but is not one of
-     them: it is not counted in the 252-day totals. An edge fold on it is
+     them. The `fold summary` line sums every reported day, 06-10
+     included, so the 252-day totals are the summary minus 06-10's
+     per-day `fold` line. An edge fold on it is
      06-09's last aggregate's tail and is recorded with the edge folds; an
      inner fold, unattributed or unresolved trade on it fails control 5.
      Before #109 re-review N1 this tail was not checked at all.
