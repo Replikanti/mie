@@ -188,9 +188,12 @@ deferred option D are under *Alternatives considered*.
      fold's unchecked tail at the cutover) are reported with the segment,
      not delivered as such: the live segment takes over at the seam, and
      the first chain run's seed gaps (decision 3) carry them over it. A
-     series whose archive data ends with a trailing gap ends, for its
-     chain seed, where that gap starts, so the seed gap covers the whole
-     hole up to the run's first event of the series. Rejected, delivering
+     series with an archive event whose data ends with a trailing gap
+     ends, for its chain seed, where that gap starts, so the seed gap
+     covers the whole hole up to the run's first event of the series. A
+     series the archive segment holds no event of (configured but never
+     imported) gets no chain seed, as decision 3 rules for series the
+     chain holds no event of: no seed is invented at the origin. Rejected, delivering
      the archive's trailing gap at the seam: it ends at the cutover or at
      the archive's last day, so it either sorts after live events of the
      overlap, turning them late, or stops short of the first live event,

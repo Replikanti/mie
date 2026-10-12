@@ -25,11 +25,14 @@
 //!   chain's newest event of each series as its seed, unless its journaled
 //!   seed reaches back at least that far, so every hole in the chain opens
 //!   with a `Disconnected` gap: between runs, and at the seam, where the
-//!   archive segment's data of a series ends. A series the archive segment
-//!   ends with a trailing gap (missing days at its end, the fold's unchecked
-//!   tail, no event at all) ends where that gap starts, so the first run's
-//!   seed gap covers the whole hole up to its first event of the series, and
-//!   no bar across it reads as complete.
+//!   archive segment's data of a series ends ([`seam_seeds`]). A series
+//!   whose archive data ends with a trailing gap (missing days at its end,
+//!   the fold's unchecked tail) ends where that gap starts, so the first
+//!   run's seed gap covers the whole hole up to its first event of the
+//!   series, and no bar across it reads as complete. A series the archive
+//!   segment holds no event of (configured but never imported, say) gets
+//!   no chain seed: the run keeps its journaled seed, and no seed is
+//!   invented at the origin.
 //! - **Window** (ADR-039 D4). Every request replays the chain from the
 //!   origin and restricts it afterwards: an event is delivered when its
 //!   ordering time lies in the window, and a gap counts at its `end`. A gap
@@ -111,6 +114,31 @@ pub fn chain_dataset(
     );
     DatasetVersion::from_hex(&hex(&Sha256::digest(text.as_bytes())))
         .expect("a SHA-256 digest is 64 lowercase hex digits")
+}
+
+/// The chain seeds at the seam (ADR-052 D3), per domain series: where the
+/// archive segment's data of the series ends. `newest` holds the archive
+/// segment's newest event time per series, `trailing` its trailing gaps
+/// ([`ArchiveReplayStream::trailing_gaps`]). A series with an event whose
+/// data ends with a trailing gap (missing days at its end, the fold's
+/// unchecked tail) ends where that gap starts, so the first chain run's
+/// seed gap covers the whole hole up to its first event of the series. A
+/// series without an event in the segment gets no seed: the chain holds no
+/// earlier event of it, so the run keeps its journaled seed, and no seed is
+/// invented at the origin.
+///
+/// The one computation of the seam seeds: the warm start (W3) journals the
+/// same seeds for the first chain run.
+pub(crate) fn seam_seeds(
+    mut newest: BTreeMap<Stream, EventTime>,
+    trailing: &[FeedGap],
+) -> BTreeMap<Stream, EventTime> {
+    for gap in trailing {
+        if let Some(time) = newest.get_mut(&gap.stream) {
+            *time = (*time).min(gap.start);
+        }
+    }
+    newest
 }
 
 /// [`HistoricalDataProvider`] over the history chain of one instrument
@@ -510,22 +538,15 @@ impl<'a> HistoryChainStream<'a> {
 
     /// Hands the archive segment over to the live segment (module docs):
     /// its last event and newest open-interest time continue the run
-    /// chaining, and where its data of each series ends seeds the first
-    /// chain run. A series the archive segment ends with a trailing gap (a
-    /// missing day at its end, the fold's unchecked tail, or no event at
-    /// all) ends where that gap starts, so the first run's seed gap covers
-    /// the whole hole up to its first event of the series.
+    /// chaining, and [`seam_seeds`] seed the first chain run.
     fn seam(&mut self) {
         let Some(live) = self.live.as_mut() else {
             return;
         };
-        let mut newest = std::mem::take(&mut self.newest);
-        for gap in self.archive.stream.trailing_gaps() {
-            newest
-                .entry(gap.stream)
-                .and_modify(|time| *time = (*time).min(gap.start))
-                .or_insert(gap.start);
-        }
+        let newest = seam_seeds(
+            std::mem::take(&mut self.newest),
+            self.archive.stream.trailing_gaps(),
+        );
         live.stream
             .continue_after(self.last.clone(), self.newest_oi, newest);
     }
@@ -1188,6 +1209,54 @@ mod tests {
             .map(|g| (g.start.as_millis(), g.end.as_millis()))
             .collect();
         assert_eq!(trade_gaps, [(archive_last_trade, c + 10_000)]);
+    }
+
+    #[test]
+    fn a_series_the_archive_never_held_keeps_the_journaled_seed() {
+        // Review re-check (PR #123): metrics configured, none imported, and
+        // the first chain run captures open interest. The chain holds no
+        // open interest before the run, so no seed is invented at the origin
+        // (ADR-052 D3): no year-long gap.
+        let mut source = MemorySource::default();
+        let mut id = 1;
+        archive_day(
+            &mut source,
+            cutover() - DAY_MS,
+            &mut id,
+            Some(archive_last()),
+        );
+        let fixture = Fixture::new();
+        fixture.builders[1].seal(&mut source, &[]);
+        let chain = chain(&source, vec![fixture.runs[1].clone()]);
+        let mut stream = chain.replay(window(origin(), far())).unwrap().stream;
+        let events = drain(&mut stream);
+        // The archive segment reports metrics missing from the origin.
+        assert!(
+            stream
+                .archive()
+                .stream()
+                .trailing_gaps()
+                .iter()
+                .any(|g| g.stream == Stream::OpenInterest && g.start == time(origin()))
+        );
+        let oi_gaps: Vec<FeedGap> = events
+            .iter()
+            .filter_map(gap_of)
+            .filter(|g| g.stream == Stream::OpenInterest)
+            .collect();
+        assert!(oi_gaps.is_empty(), "{oi_gaps:?}");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, MarketEvent::OpenInterest(_)))
+        );
+        // The trades seam is still marked from the archive's last trade.
+        assert!(
+            events
+                .iter()
+                .filter_map(gap_of)
+                .any(|g| g.stream == Stream::Trades && g.reason == GapReason::Disconnected)
+        );
     }
 
     #[test]
