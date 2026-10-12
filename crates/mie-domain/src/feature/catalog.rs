@@ -1741,29 +1741,18 @@ pub fn current_set() -> FeatureSet {
 
 /// [`CURRENT`] with each key of `older` in place of the [`CURRENT`] key of
 /// the same id, such as the set of the `location.levels@1` engine
-/// ([`SELECTABLE`]). A key whose id is not in [`CURRENT`] is added.
+/// ([`SELECTABLE`]). Each key of `older` comes in together with every
+/// version in its dependency closure ([`FeatureRegistry::closure`]), each in
+/// place of the [`CURRENT`] key of its id (ADR-044 D10). A key whose id is
+/// not in [`CURRENT`] is added.
 ///
 /// # Errors
 ///
 /// As [`FeatureSet::new`]: an unknown key, an id given twice, or a missing
-/// upstream version.
+/// upstream version; also two keys or closures that need one id at
+/// different versions ([`FeatureSetError::DuplicateId`]).
 pub fn current_set_with(older: &[FeatureKey]) -> Result<FeatureSet, FeatureSetError> {
-    let mut keys: Vec<FeatureKey> = CURRENT
-        .iter()
-        .map(|key| {
-            older
-                .iter()
-                .find(|other| other.id == key.id)
-                .copied()
-                .unwrap_or(*key)
-        })
-        .collect();
-    keys.extend(
-        older
-            .iter()
-            .filter(|key| CURRENT.iter().all(|current| current.id != key.id)),
-    );
-    FeatureSet::new(&registry(), &keys)
+    FeatureSet::substituted(&registry(), CURRENT, older)
 }
 
 #[cfg(test)]

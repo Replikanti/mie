@@ -874,6 +874,53 @@ impl FeatureSet {
         Ok(Self { members, version })
     }
 
+    /// `base` with each key of `older` substituted together with its
+    /// dependency closure ([`FeatureRegistry::closure`]): every closure
+    /// member replaces the `base` key of its id, or is added if `base` has
+    /// none (ADR-044 D10). A selected key is in its own closure, so
+    /// substituting a key alone is the case of a one-element closure.
+    ///
+    /// # Errors
+    ///
+    /// - [`FeatureSetError::Unknown`] — a key of `older` that is not
+    ///   registered;
+    /// - [`FeatureSetError::DuplicateId`] — two keys or closures that need
+    ///   one id at different versions;
+    /// - as [`FeatureSet::new`] on the substituted keys.
+    pub(crate) fn substituted(
+        registry: &FeatureRegistry,
+        base: &[FeatureKey],
+        older: &[FeatureKey],
+    ) -> Result<Self, FeatureSetError> {
+        let mut selected: BTreeMap<FeatureId, FeatureKey> = BTreeMap::new();
+        for &key in older {
+            let closure = registry
+                .closure(key)
+                .ok_or(FeatureSetError::Unknown { key })?;
+            for member in closure {
+                match selected.get(&member.id) {
+                    Some(&other) if other != member => {
+                        return Err(FeatureSetError::DuplicateId { id: member.id });
+                    }
+                    Some(_) => {}
+                    None => {
+                        selected.insert(member.id, member);
+                    }
+                }
+            }
+        }
+        let mut keys: Vec<FeatureKey> = base
+            .iter()
+            .map(|key| selected.get(&key.id).copied().unwrap_or(*key))
+            .collect();
+        keys.extend(
+            selected
+                .values()
+                .filter(|key| base.iter().all(|other| other.id != key.id)),
+        );
+        Self::new(registry, &keys)
+    }
+
     /// The set's fingerprint: independent of the order the keys were given
     /// in, changed by any member's id, version or definition.
     pub fn version(&self) -> FeatureSetVersion {
@@ -2078,6 +2125,53 @@ mod tests {
         set(&registry, &[Y_V1.key, X_V1.key]);
         set(&registry, &[Y_V2.key, X_V2.key]);
         set(&registry, &[X_V2.key]);
+    }
+
+    /// `y@1` reads `x@1`, older than the base's `x@2`: substituting `y@1`
+    /// alone would leave `x@2` in place and fail as `MissingDependency {
+    /// feature: y@1, requires: x@1 }`, so its closure comes in with it.
+    #[test]
+    fn substitution_takes_the_dependency_closure() {
+        let registry = registry(ALL);
+        let base = [X_V2.key, Y_V2.key];
+        let substituted = |base: &[FeatureKey], older: &[FeatureKey]| {
+            FeatureSet::substituted(&registry, base, older)
+        };
+        assert_eq!(
+            substituted(&base, &[Y_V1.key]).unwrap(),
+            set(&registry, &[X_V1.key, Y_V1.key])
+        );
+        // The closure goes upstream only: a downstream member stays at its
+        // base version.
+        assert_eq!(
+            substituted(&base, &[X_V1.key]).unwrap_err(),
+            FeatureSetError::MissingDependency {
+                feature: Y_V2.key,
+                requires: X_V2.key,
+            }
+        );
+        // Two selections that need one id at different versions.
+        assert_eq!(
+            substituted(&base, &[Y_V1.key, X_V2.key]).unwrap_err(),
+            FeatureSetError::DuplicateId {
+                id: FeatureId::new("x")
+            }
+        );
+        // One id at one version, from a closure and a selection: one member.
+        assert_eq!(
+            substituted(&base, &[Y_V1.key, X_V1.key]).unwrap(),
+            set(&registry, &[X_V1.key, Y_V1.key])
+        );
+        assert_eq!(substituted(&base, &[]).unwrap(), set(&registry, &base));
+        assert_eq!(
+            substituted(&base, &[X3]).unwrap_err(),
+            FeatureSetError::Unknown { key: X3 }
+        );
+        // An id that is not in the base is added, with its closure.
+        assert_eq!(
+            substituted(&[X_V2.key], &[Y_V1.key]).unwrap(),
+            set(&registry, &[X_V1.key, Y_V1.key])
+        );
     }
 
     #[test]
