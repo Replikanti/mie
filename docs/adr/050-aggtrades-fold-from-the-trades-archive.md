@@ -260,8 +260,9 @@ one dataset that holds both versions of the aggregate.
   for every window whose days have `trades` files and an `aggTrades`
   request; recorded results reproduce with `--trade-correction none`. The
   ADR-040 acceptance spec, which expects
-  `stream 604001515:20929b98dfd17a44` (the ADR-039 12-month run), needs
-  `none` once `trades` is imported for that window. `mie experiment run`
+  `stream 604001515:20929b98dfd17a44` (the ADR-039 12-month run), runs
+  with `none` (ADR-040 is still proposed, so its Accept-when steps 1 and 2
+  are edited in place). `mie experiment run`
   adds a hint to a data-version mismatch under `fold`.
 - `mie replay` and `archive-kline-check` reports gain the correction in
   their header line and the fold lines, so their bytes differ from earlier

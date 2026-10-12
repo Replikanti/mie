@@ -187,11 +187,14 @@ accepted ADR fixed before this one. It passes when all four hold:
 
 1. The spec's `sample` is `1759276800000 1790812800000` (2025-10-01 up to
    2026-10-01, the 12-month archive backfill of #12), and its `data` is the
-   dataset version `mie replay --source archive` prints for that window.
+   dataset version `mie replay --source archive --trade-correction none`
+   prints for that window.
 2. `mie experiment run <spec> --config <archive config> --results <empty
-   dir> --source archive`, without `--streams`, prints `recorded <key>` and
-   exits 0. The default streams are aggTrades, the six klines, fundingRate
-   and metrics: the nine streams of the ADR-039 run.
+   dir> --source archive --trade-correction none`, without `--streams`,
+   prints `recorded <key>` and exits 0. The default streams are aggTrades, the six klines, fundingRate
+   and metrics: the nine streams of the ADR-039 run. `none` delivers the
+   aggTrades as published, as in the ADR-039 run; the default `fold`
+   (ADR-050) changes the hash once `trades` is imported for the window.
 3. The stored result carries `stream 604001515:20929b98dfd17a44` and
    `rejections 0`, the event-stream hash and rejection count that the
    ADR-039 acceptance recorded for the same window and streams.
