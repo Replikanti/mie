@@ -14,8 +14,9 @@
 //! L2 book itself, banded depth and imbalance, liquidity flow windows and
 //! concentration (ADR-043, [`liquidity`]), and location: the UTC-day VWAP
 //! the level registry with its zone events, and the auction state against
-//! the prior day's value (ADR-044, [`location`]);
-//! every other kind passes through.
+//! the prior day's value (ADR-044, [`location`]), and the order-flow
+//! candidates: CVD and open-interest divergences on confirmed swings
+//! (ADR-051, [`candidate`]); every other kind passes through.
 //! Further feature families are added by the Market State issues, each as a
 //! registered, versioned definition (ADR-029, [`feature`]).
 //! The engine computes one [`FeatureSet`] and stamps its
@@ -25,6 +26,7 @@
 //! ([`MarketStateEngine::with_features`], ADR-044 D10).
 //!
 //! [`bars`]: crate::bars
+//! [`candidate`]: crate::candidate
 //! [`derivatives`]: crate::derivatives
 //! [`feature`]: crate::feature
 //! [`flow`]: crate::flow
@@ -35,6 +37,7 @@
 //! [`volatility`]: crate::volatility
 
 use crate::bars::{Bar, BarError, BarSet, MAX_BARS_PER_EVENT, Timeframe};
+use crate::candidate::{self, CandidateEvent, CandidateTracker, Candidates};
 use crate::derivatives::{Derivatives, DerivativesError, DerivativesTracker};
 use crate::event::{MarketEvent, Stream};
 use crate::feature::{FeatureKey, FeatureSet, FeatureSetVersion, FeatureValue, catalog};
@@ -133,6 +136,14 @@ pub struct MarketState {
     /// depends on where consumption started, so it is not reproducible
     /// across replay windows.
     pub trade_count: u64,
+    /// Order-flow candidates (ADR-051): `candidate.divergence.cvd.<tf>@1`
+    /// and `candidate.divergence.oi.<tf>@1`
+    /// ([`catalog::CANDIDATE_DIVERGENCE_CVD`],
+    /// [`catalog::CANDIDATE_DIVERGENCE_OI`]) for 15m, 1h, 4h and 1d — the
+    /// last comparison of consecutive swing highs and of swing lows at
+    /// their anchors. Candidates, never signals (ADR-012). The last field,
+    /// appended after `trade_count` (ADR-051 D1).
+    pub candidates: Candidates,
 }
 
 /// Builds [`MarketState`] incrementally from an event stream in canonical
@@ -181,6 +192,13 @@ pub struct MarketStateEngine {
     /// Scratch buffer for an event's location facts, swapped with
     /// `location_events` once the event is accepted.
     location_pending: Vec<LocationEvent>,
+    /// The swing anchors and last comparisons of the candidates.
+    candidates: CandidateTracker,
+    /// The candidate facts of the last accepted event.
+    candidate_events: Vec<CandidateEvent>,
+    /// Scratch buffer for an event's candidate facts, swapped with
+    /// `candidate_events` once the event is accepted.
+    candidate_pending: Vec<CandidateEvent>,
 }
 
 /// Volatility state after the bars an event closed, committed with them.
@@ -378,6 +396,7 @@ impl MarketStateEngine {
             book: BookState::new(),
             location: LocationState::new(),
             trade_count: 0,
+            candidates: Candidates::new(),
         };
         Self {
             features,
@@ -398,6 +417,9 @@ impl MarketStateEngine {
             location: LocationTracker::new(levels),
             location_events: Vec::new(),
             location_pending: Vec::new(),
+            candidates: CandidateTracker::new(),
+            candidate_events: Vec::new(),
+            candidate_pending: Vec::new(),
         }
     }
 
@@ -607,6 +629,29 @@ impl MarketStateEngine {
             &mut self.location_pending,
         );
         std::mem::swap(&mut self.location_events, &mut self.location_pending);
+        // The infallible candidate stage, after location, on the committed
+        // state (ADR-051 decision 2).
+        self.candidate_pending.clear();
+        let MarketState {
+            flow,
+            derivatives,
+            location,
+            candidates,
+            ..
+        } = &mut self.state;
+        self.candidates.detect(
+            event,
+            &self.pending,
+            &self.structure_events,
+            candidate::Inputs {
+                flow,
+                derivatives,
+                location,
+            },
+            candidates,
+            &mut self.candidate_pending,
+        );
+        std::mem::swap(&mut self.candidate_events, &mut self.candidate_pending);
         self.state.as_of = Some(event.time());
         self.last = Some(event.clone());
         self.ids = ids;
@@ -665,6 +710,13 @@ impl MarketStateEngine {
     /// leaves them unchanged.
     pub fn location_events(&self) -> &[LocationEvent] {
         &self.location_events
+    }
+
+    /// The candidate facts of the last accepted event, in emission order
+    /// (ADR-051, decision 2); empty when it produced none. A rejected event
+    /// leaves them unchanged.
+    pub fn candidate_events(&self) -> &[CandidateEvent] {
+        &self.candidate_events
     }
 }
 
@@ -900,6 +952,7 @@ mod tests {
                 book: BookState::new(),
                 location: LocationState::new(),
                 trade_count: 3,
+                candidates: Candidates::new(),
             }
         );
         assert!(engine.state().bars.iter().all(|series| {
@@ -1100,6 +1153,10 @@ mod tests {
              bars.time.1h@1,bars.time.1m@1,bars.time.4h@1,bars.time.5m@1,\
              book.clusters@1,book.depth@1,book.l2@1,book.liquidity.window.15m@1,\
              book.liquidity.window.1h@1,book.liquidity.window.5m@1,\
+             candidate.divergence.cvd.15m@1,candidate.divergence.cvd.1d@1,\
+             candidate.divergence.cvd.1h@1,candidate.divergence.cvd.4h@1,\
+             candidate.divergence.oi.15m@1,candidate.divergence.oi.1d@1,\
+             candidate.divergence.oi.1h@1,candidate.divergence.oi.4h@1,\
              derivatives.funding.settled@1,derivatives.liq.window.15m@1,\
              derivatives.liq.window.1h@1,derivatives.liq.window.5m@1,\
              derivatives.mark@1,derivatives.oi.5m@1,derivatives.oi.sample@1,\

@@ -7,7 +7,7 @@
 //! [`Fingerprint`] over an explicit byte encoding of every public field of
 //! [`MarketState`], written with the [`Fingerprinter`] writers (ADR-029). The
 //! engine's internal trackers (ATR window, flow, profile, structure,
-//! derivatives, liquidity and location trackers) are not hashed: the public state is
+//! derivatives, liquidity, location and candidate trackers) are not hashed: the public state is
 //! the contract, and a hidden divergence shows up in it at a later
 //! checkpoint. The order book is public state (`book.l2@1`, ADR-043), so
 //! every level of it is hashed.
@@ -16,9 +16,9 @@
 //! `write_u32(`[`STATE_HASH_ENCODING`]`)`, then the fields of
 //! [`MarketState`] in declaration order: `feature_set`, `as_of`,
 //! `last_trade_price`, `bars`, `motion`, `atr`, `regime`, `flow`, `profile`,
-//! `structure`, `derivatives`, `book`, `location`, `trade_count`. Every
-//! value is written
-//! by these rules:
+//! `structure`, `derivatives`, `book`, `location`, `trade_count`,
+//! `candidates` (appended last by ADR-051 D1). Every value is written by
+//! these rules:
 //!
 //! | Type | Encoding |
 //! |---|---|
@@ -31,7 +31,7 @@
 //! | arrays, `Vec`, slices | `write_len`, then the elements in stored order |
 //! | `FeatureKey` | the ADR-029 encoding: `write_str` of the id, `write_u32` of the version |
 //! | `FeatureSetVersion` | `write_u64` of the fingerprint value |
-//! | enums | an explicit match, never a cast, with codes in declaration order: `Timeframe` M1 0, M5 1, M15 2, H1 3, H4 4, D1 5; `RegimeLabel` Low 0, Medium 1, High 2, Extreme 3; `Side` High 0, Low 1; `SweepOutcome` Pending 0, Sfp 1, Break 2; `book::Side` Bid 0, Ask 1; `LevelKind` Poc 0, Vah 1, Val 2, Hvn 3, Lvn 4, StructuralHigh 5, StructuralLow 6, LiquidityCluster 7, PriorSweep 8, SfpRejectionZone 9, Vwap 10, ValidatedReference 11; `AuctionState` InsideValue 0, AtValueEdge 1, OutsideValue 2, Breakout 3, FailedBreakout 4, FailedReclaim 5, Acceptance 6; `LevelSide` High 0, Low 1, Bid 2, Ask 3; `Region` Below 0, In 1, Above 2; `Position` Below 0, LowEdge 1, In 2, HighEdge 3, Above 4; `Origin` Start 0, Acceptance 1 |
+//! | enums | an explicit match, never a cast, with codes in declaration order: `Timeframe` M1 0, M5 1, M15 2, H1 3, H4 4, D1 5; `RegimeLabel` Low 0, Medium 1, High 2, Extreme 3; `Side` High 0, Low 1; `SweepOutcome` Pending 0, Sfp 1, Break 2; `book::Side` Bid 0, Ask 1; `Aggressor` Buy 0, Sell 1; `LevelKind` Poc 0, Vah 1, Val 2, Hvn 3, Lvn 4, StructuralHigh 5, StructuralLow 6, LiquidityCluster 7, PriorSweep 8, SfpRejectionZone 9, Vwap 10, ValidatedReference 11; `AuctionState` InsideValue 0, AtValueEdge 1, OutsideValue 2, Breakout 3, FailedBreakout 4, FailedReclaim 5, Acceptance 6; `LevelSide` High 0, Low 1, Bid 2, Ask 3; `Region` Below 0, In 1, Above 2; `Position` Below 0, LowEdge 1, In 2, HighEdge 3, Above 4; `Origin` Start 0, Acceptance 1 |
 //! | `OrderBook` | the chain (`write_u8`: `Straddle` 0, `Chained` 1, `Invalid` 2, then the id as `u64` unless invalid), the trusted window (two `Option<Price>`), then the bids and the asks, each best first as `write_len` followed by price and quantity per level |
 //! | `Level` (in the book features) | price, then quantity |
 //! | structs | every field, through exhaustive destructuring, in declaration order as of encoding v1 |
@@ -107,6 +107,7 @@ impl MarketState {
             book,
             location,
             trade_count,
+            candidates,
         } = self;
         feature_set.encode(&mut f);
         as_of.encode(&mut f);
@@ -122,6 +123,7 @@ impl MarketState {
         book.encode(&mut f);
         location.encode(&mut f);
         trade_count.encode(&mut f);
+        candidates.encode(&mut f);
         StateHash(f.finish())
     }
 }
@@ -196,6 +198,9 @@ impl<T: StateEncode> StateEncode for Vec<T> {
 mod tests {
     use super::*;
     use crate::book::{OrderBook, Side};
+    use crate::candidate::divergence::{
+        CvdComparison, Divergence, OiComparison, SwingAnchor, SwingPair,
+    };
     use crate::derivatives::{LiquidationWindows, MarkState, OiSample, OiStep, SettledFunding};
     use crate::event::samples::{one_of_each, trade};
     use crate::event::{BookSnapshot, BookUpdate, Level, MarketEvent};
@@ -241,17 +246,18 @@ mod tests {
         // change), and otherwise only with an encoding bump (module docs).
         assert_eq!(
             MarketStateEngine::new().state().state_hash().to_string(),
-            "212f9b3749af5471"
+            "e2aca87e4aac6b23"
         );
         assert_eq!(
             engine_after(&tape()).state().state_hash().to_string(),
-            "2e1f872d7f95c19f"
+            "6cf59149d5522d75"
         );
     }
 
-    /// The hash `state` has without `profile.composite_7d`: every other
-    /// field written exactly as [`MarketState::state_hash`] writes it. This
-    /// is encoding v1 as it stood before #96 appended the field.
+    /// The hash `state` has without `profile.composite_7d` and
+    /// `candidates`: every other field written exactly as
+    /// [`MarketState::state_hash`] writes it. This is encoding v1 as it
+    /// stood before #96 appended the composite.
     fn hash_without_composite_7d(state: &MarketState) -> StateHash {
         let mut f = header();
         let MarketState {
@@ -269,6 +275,7 @@ mod tests {
             book,
             location,
             trade_count,
+            candidates: _,
         } = state;
         let VolumeProfiles {
             utc_day,
@@ -298,13 +305,14 @@ mod tests {
     #[test]
     fn appending_composite_7d_leaves_the_pre_96_hashes_intact() {
         // The default set before #96: `location.levels@1` and no
-        // `profile.volume.composite_7d@1`. It still builds, to the version
-        // the pre-#96 pins recorded.
+        // `profile.volume.composite_7d@1` (nor the candidates of #22). It
+        // still builds, to the version the pre-#96 pins recorded.
         let keys: Vec<FeatureKey> = catalog::current_set_with(&[catalog::LOCATION_LEVELS_V1.key])
             .unwrap()
             .definitions()
             .map(|definition| definition.key)
             .filter(|key| *key != catalog::PROFILE_VOLUME_COMPOSITE_7D_V1.key)
+            .filter(|key| !is_candidate(*key))
             .collect();
         let pre_96 = FeatureSet::new(&catalog::registry(), &keys).unwrap();
         assert_eq!(pre_96.version().to_string(), "be668af626d0ce5a");
@@ -325,6 +333,77 @@ mod tests {
             assert_eq!(hash_without_composite_7d(&state).to_string(), golden);
             // The appended field is written: the full hash differs.
             assert_ne!(state.state_hash(), hash_without_composite_7d(&state));
+        }
+    }
+
+    /// Whether `key` is an order-flow candidate (#22, ADR-051).
+    fn is_candidate(key: FeatureKey) -> bool {
+        key.id.as_str().starts_with("candidate.")
+    }
+
+    /// The hash `state` has without `candidates`: every other field written
+    /// exactly as [`MarketState::state_hash`] writes it. This is encoding v1
+    /// as it stood before #22 appended the field.
+    fn hash_without_candidates(state: &MarketState) -> StateHash {
+        let mut f = header();
+        let MarketState {
+            feature_set,
+            as_of,
+            last_trade_price,
+            bars,
+            motion,
+            atr,
+            regime,
+            flow,
+            profile,
+            structure,
+            derivatives,
+            book,
+            location,
+            trade_count,
+            candidates: _,
+        } = state;
+        feature_set.encode(&mut f);
+        as_of.encode(&mut f);
+        last_trade_price.encode(&mut f);
+        bars.encode(&mut f);
+        motion.encode(&mut f);
+        atr.encode(&mut f);
+        regime.encode(&mut f);
+        flow.encode(&mut f);
+        profile.encode(&mut f);
+        structure.encode(&mut f);
+        derivatives.encode(&mut f);
+        book.encode(&mut f);
+        location.encode(&mut f);
+        trade_count.encode(&mut f);
+        StateHash(f.finish())
+    }
+
+    #[test]
+    fn appending_candidates_leaves_the_pre_22_hashes_intact() {
+        // ADR-041 D2, ADR-051 D1: the set before #22 is CURRENT without the
+        // candidate keys. It still builds, to the version pinned before #22.
+        let keys: Vec<FeatureKey> = catalog::CURRENT
+            .iter()
+            .copied()
+            .filter(|key| !is_candidate(*key))
+            .collect();
+        assert_eq!(keys.len() + 8, catalog::CURRENT.len());
+        let pre_22 = FeatureSet::new(&catalog::registry(), &keys).unwrap();
+        assert_eq!(pre_22.version().to_string(), "685b83d7bf13b54c");
+        // The engine reaches the pre-#22 state on every other field: under
+        // the pre-#22 stamp and without the appended field, it gives the
+        // two encoding-v1 goldens pinned before #22.
+        for (events, golden) in [
+            (Vec::new(), "212f9b3749af5471"),
+            (tape(), "2e1f872d7f95c19f"),
+        ] {
+            let mut state = engine_after(&events).state().clone();
+            state.feature_set = pre_22.version();
+            assert_eq!(hash_without_candidates(&state).to_string(), golden);
+            // The appended field is written: the full hash differs.
+            assert_ne!(state.state_hash(), hash_without_candidates(&state));
         }
     }
 
@@ -570,6 +649,23 @@ mod tests {
         assert!(base.derivatives.mark.is_ready());
         assert!(base.derivatives.funding_settled.is_ready());
         assert_ne!(base.derivatives.liquidations, LiquidationWindows::new());
+        // The tape confirms no swing: every candidate is still warming up.
+        assert_eq!(base.candidates, crate::candidate::Candidates::new());
+        let comparisons = candidate_comparisons();
+        for (name, timeframe, cvd, oi) in comparisons {
+            edits.push((
+                name,
+                Box::new(move |s| {
+                    let divergences = s.candidates.divergences_mut(timeframe).unwrap();
+                    if let Some(cvd) = cvd {
+                        divergences.cvd = cvd;
+                    }
+                    if let Some(oi) = oi {
+                        divergences.oi = oi;
+                    }
+                }),
+            ));
+        }
         let mut seen = vec![("base", reference)];
         for (name, edit) in &edits {
             let mut state = base.clone();
@@ -580,6 +676,101 @@ mod tests {
             }
             seen.push((name, hash));
         }
+    }
+
+    /// One candidate value per edit, each differing from the others in one
+    /// respect only: the family, the timeframe, readiness, a side's
+    /// comparison, or one field of that comparison.
+    #[allow(clippy::type_complexity)]
+    fn candidate_comparisons() -> Vec<(
+        &'static str,
+        crate::bars::Timeframe,
+        Option<FeatureValue<Divergence<CvdComparison>>>,
+        Option<FeatureValue<Divergence<OiComparison>>>,
+    )> {
+        use crate::bars::{Coverage, Timeframe};
+        use crate::structure::Side;
+        let anchor = |price: i64| SwingAnchor {
+            swing_time: EventTime::from_millis(0),
+            known_at: EventTime::from_millis(1),
+            price: Price::from_units(price),
+            time: EventTime::from_millis(2),
+            cvd: Qty::from_units(3),
+            gaps: 0,
+            coverage: Coverage::default(),
+        };
+        let pair = |price: i64, span_ms: u64| SwingPair {
+            side: Side::High,
+            previous: anchor(1),
+            current: anchor(price),
+            price_change: Price::from_units(price - 1),
+            cvd_change: Qty::from_units(0),
+            gaps_between: 0,
+            span_ms,
+            coverage: Coverage::default(),
+        };
+        let cvd = |high: Option<CvdComparison>, low: Option<CvdComparison>| {
+            Some(FeatureValue::Ready(Divergence {
+                feature: catalog::CANDIDATE_DIVERGENCE_CVD_15M_V1.key,
+                high,
+                low,
+            }))
+        };
+        let compared = |price: i64, span_ms: u64, divergent: bool| CvdComparison {
+            pair: pair(price, span_ms),
+            divergent,
+        };
+        let oi = Some(FeatureValue::Ready(Divergence {
+            feature: catalog::CANDIDATE_DIVERGENCE_OI_15M_V1.key,
+            high: Some(OiComparison {
+                pair: pair(2, 0),
+                previous_oi: None,
+                current_oi: None,
+                oi_change: None,
+                divergent: false,
+            }),
+            low: None,
+        }));
+        vec![
+            (
+                "candidates cvd ready",
+                Timeframe::M15,
+                cvd(None, None),
+                None,
+            ),
+            ("candidates cvd 1h", Timeframe::H1, cvd(None, None), None),
+            ("candidates oi", Timeframe::M15, None, oi),
+            (
+                "candidates cvd high",
+                Timeframe::M15,
+                cvd(Some(compared(2, 0, false)), None),
+                None,
+            ),
+            (
+                "candidates cvd low",
+                Timeframe::M15,
+                cvd(None, Some(compared(2, 0, false))),
+                None,
+            ),
+            (
+                "candidates cvd price",
+                Timeframe::M15,
+                cvd(Some(compared(3, 0, false)), None),
+                None,
+            ),
+            (
+                "candidates cvd span",
+                Timeframe::M15,
+                cvd(Some(compared(2, 1, false)), None),
+                None,
+            ),
+            (
+                "candidates cvd divergent",
+                Timeframe::M15,
+                cvd(Some(compared(2, 0, true)), None),
+                None,
+            ),
+        ]
     }
 
     /// Five valid books, each differing from the first in one respect only:
@@ -654,6 +845,16 @@ mod tests {
         invalid.write_len(0);
         invalid.write_len(0);
         assert_eq!(encoded(&OrderBook::new()), invalid.finish());
+    }
+
+    #[test]
+    fn aggressor_codes_follow_the_declaration_order() {
+        use crate::event::Aggressor;
+        for (aggressor, code) in [(Aggressor::Buy, 0), (Aggressor::Sell, 1)] {
+            let mut expected = Fingerprinter::new();
+            expected.write_u8(code);
+            assert_eq!(encoded(&aggressor), expected.finish(), "{aggressor:?}");
+        }
     }
 
     #[test]

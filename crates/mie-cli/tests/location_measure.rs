@@ -296,6 +296,7 @@ fn equal_but_registry(a: &MarketState, b: &MarketState) -> bool {
         book,
         location,
         trade_count,
+        candidates,
     } = a;
     let LocationState {
         vwap,
@@ -316,6 +317,7 @@ fn equal_but_registry(a: &MarketState, b: &MarketState) -> bool {
         && *vwap == b.location.vwap
         && *auction == b.location.auction
         && *trade_count == b.trade_count
+        && *candidates == b.candidates
 }
 
 /// The auction facts of the last event.

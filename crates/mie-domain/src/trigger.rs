@@ -31,6 +31,10 @@ pub enum TriggerFamily {
     /// Aggression without price progress (effort vs result).
     EffortVsResult,
     /// Cumulative volume delta diverging from price.
+    ///
+    /// The candidate fact is [`CandidateEvent::CvdDivergence`](crate::candidate::CandidateEvent::CvdDivergence)
+    /// of `candidate.divergence.cvd.<tf>@1` (ADR-051); the trigger rule is
+    /// owned by the bias/trigger issue.
     CvdDivergence,
     /// Open-interest expansion followed by rejection.
     OiExpansionRejection,

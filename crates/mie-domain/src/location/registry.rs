@@ -502,9 +502,23 @@ fn clusters_of(clusters: &BookClusters, levels: &mut Vec<LocationLevel>) {
 /// Whether the bar's range overlaps `level`'s zone padded by the tolerance
 /// of the level's price, exact in `i128` (decision 7).
 fn overlaps(ohlc: &Ohlc, level: &LocationLevel, tolerance_bps: i64) -> bool {
-    let below = i128::from(level.low.units()) - i128::from(ohlc.high.units());
-    let above = i128::from(ohlc.low.units()) - i128::from(level.high.units());
+    overlaps_range(ohlc.low, ohlc.high, level, tolerance_bps)
+}
+
+/// Whether the range `[low, high]` overlaps `level`'s zone padded by the
+/// tolerance of the level's price, exact in `i128` (decision 7).
+fn overlaps_range(low: Price, high: Price, level: &LocationLevel, tolerance_bps: i64) -> bool {
+    let below = i128::from(level.low.units()) - i128::from(high.units());
+    let above = i128::from(low.units()) - i128::from(level.high.units());
     within(below, level.price, tolerance_bps) && within(above, level.price, tolerance_bps)
+}
+
+/// Whether `price` lies in `level`'s zone padded by the registry's own
+/// tolerance ([`TOLERANCE_BPS`]): the in-zone test of decision 7 applied to
+/// the point `[price, price]`. The location context of an order-flow
+/// candidate (ADR-051 D3).
+pub(crate) fn zone_contains(level: &LocationLevel, price: Price) -> bool {
+    overlaps_range(price, price, level, TOLERANCE_BPS)
 }
 
 /// The signed distance from `close` to the zone of `level`, saturating at
