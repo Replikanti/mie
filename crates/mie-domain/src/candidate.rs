@@ -409,7 +409,7 @@ mod tests {
             &catalog::CANDIDATE_DIVERGENCE_CVD_15M_V1,
             961,
             GOLDEN_CVD_15M,
-            "22443a2a51f78f65",
+            "4f4d7236e5ef3d6e",
         );
     }
 
@@ -419,7 +419,7 @@ mod tests {
             &catalog::CANDIDATE_DIVERGENCE_CVD_1H_V1,
             233,
             GOLDEN_CVD_1H,
-            "321778e43ceeea84",
+            "8f8c74676e526e86",
         );
     }
 
@@ -447,9 +447,9 @@ mod tests {
     fn golden_candidate_divergence_oi_15m_v1() {
         assert_golden(
             &catalog::CANDIDATE_DIVERGENCE_OI_15M_V1,
-            986,
+            984,
             GOLDEN_OI_15M,
-            "82233641718d94ce",
+            "cbf50ccc3590c65c",
         );
     }
 
@@ -459,7 +459,7 @@ mod tests {
             &catalog::CANDIDATE_DIVERGENCE_OI_1H_V1,
             234,
             GOLDEN_OI_1H,
-            "3332598df044be46",
+            "206e41e0e7be6838",
         );
     }
 
@@ -469,7 +469,7 @@ mod tests {
             &catalog::CANDIDATE_DIVERGENCE_OI_4H_V1,
             53,
             GOLDEN_OI_4H,
-            "f8a2b70d7a53c4b1",
+            "8c76cfff3a887542",
         );
     }
 

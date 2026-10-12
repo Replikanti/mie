@@ -720,18 +720,97 @@ mod tests {
             pair: pair(price, span_ms),
             divergent,
         };
-        let oi = Some(FeatureValue::Ready(Divergence {
-            feature: catalog::CANDIDATE_DIVERGENCE_OI_15M_V1.key,
-            high: Some(OiComparison {
-                pair: pair(2, 0),
-                previous_oi: None,
-                current_oi: None,
-                oi_change: None,
-                divergent: false,
-            }),
-            low: None,
-        }));
-        vec![
+        let base_oi = OiComparison {
+            pair: pair(2, 0),
+            previous_oi: None,
+            current_oi: None,
+            oi_change: None,
+            divergent: false,
+        };
+        let oi_of = |comparison: OiComparison| {
+            Some(FeatureValue::Ready(Divergence {
+                feature: catalog::CANDIDATE_DIVERGENCE_OI_15M_V1.key,
+                high: Some(comparison),
+                low: None,
+            }))
+        };
+        let oi = oi_of(base_oi);
+        let point = crate::derivatives::OiGridPoint {
+            feature: catalog::DERIVATIVES_OI_5M_V1.key,
+            boundary: EventTime::from_millis(0),
+            open_interest: Qty::from_units(5),
+            sample_time: EventTime::from_millis(0),
+            resolution_ms: 300_000,
+            delta: None,
+        };
+        let with_pair = |edit: fn(&mut SwingPair)| {
+            let mut comparison = compared(2, 0, false);
+            edit(&mut comparison.pair);
+            cvd(Some(comparison), None)
+        };
+        let mut edits = vec![
+            (
+                "candidates oi previous point",
+                Timeframe::M15,
+                None,
+                oi_of(OiComparison {
+                    previous_oi: Some(point),
+                    ..base_oi
+                }),
+            ),
+            (
+                "candidates oi current point",
+                Timeframe::M15,
+                None,
+                oi_of(OiComparison {
+                    current_oi: Some(point),
+                    ..base_oi
+                }),
+            ),
+            (
+                "candidates oi change",
+                Timeframe::M15,
+                None,
+                oi_of(OiComparison {
+                    oi_change: Some(Qty::from_units(0)),
+                    ..base_oi
+                }),
+            ),
+            (
+                "candidates oi divergent",
+                Timeframe::M15,
+                None,
+                oi_of(OiComparison {
+                    divergent: true,
+                    ..base_oi
+                }),
+            ),
+            (
+                "candidates anchor cvd",
+                Timeframe::M15,
+                with_pair(|pair| pair.current.cvd = Qty::from_units(4)),
+                None,
+            ),
+            (
+                "candidates anchor coverage",
+                Timeframe::M15,
+                with_pair(|pair| pair.current.coverage.feed_gap = true),
+                None,
+            ),
+            (
+                "candidates pair coverage",
+                Timeframe::M15,
+                with_pair(|pair| pair.coverage.partial_start = true),
+                None,
+            ),
+            (
+                "candidates gaps between",
+                Timeframe::M15,
+                with_pair(|pair| pair.gaps_between = 1),
+                None,
+            ),
+        ];
+        edits.extend(vec![
             (
                 "candidates cvd ready",
                 Timeframe::M15,
@@ -770,7 +849,8 @@ mod tests {
                 cvd(Some(compared(2, 0, true)), None),
                 None,
             ),
-        ]
+        ]);
+        edits
     }
 
     /// Five valid books, each differing from the first in one respect only:

@@ -130,11 +130,19 @@ effort vs result, exhaustion and absorption.
     crate-private helper on the same code. Warming up or unavailable when
     the registry is.
   - `auction`: a copy of `state.location.auction`.
-- For a divergence the anchor is the swing price, and the structural level
-  anchored at the candidate's own swing bar (same kind, same
-  `structure.levels.<tf>` source, same swing time) is left out: the event
-  that confirms a swing also enters it into the registry, so every context
-  would list it. For the other candidates (M3) the anchor is the last
+- For a divergence the anchor is the swing price, and every registry level
+  derived from the candidate's own swing is left out, whatever its kind:
+  same `structure.levels.<tf>` source, same side, anchored at the same
+  swing bar. That is its structural level, and the prior sweep and SFP
+  zone it becomes once a trade goes beyond it. *Why:* the context says
+  where the candidate happened, and the candidate's own swing is the
+  candidate, not a place. The event that confirms a swing also enters it
+  into the registry, so every context would list it; and when the
+  confirming trade itself trades beyond the swing price, structure sweeps
+  the new level in the same event, so a kind-bound exclusion would list it
+  as a prior sweep or not depending on that one trade's price. Levels of
+  the same swing bar from other timeframes' registries stay: they are
+  other swings. For the other candidates (M3) the anchor is the last
   close.
 - *Why no location input:* if a candidate definition declared
   `location.levels@2`, then `catalog::current_set_with(&[location.levels@1])`
@@ -156,7 +164,24 @@ tf = 15m, 1h, 4h, 1d.
   low. A strictly higher price (lower, for the low) replaces the record,
   so a tie keeps the first. At that trade it records
   `flow.cvd.continuous@1` after the trade (its `cvd` and `gaps`), the ready
-  `derivatives.oi.5m@1` point if there is one, and the trade time.
+  `derivatives.oi.5m@1` point if there is one and its boundary lies at most
+  360 000 ms before the trade, and the trade time.
+- **Why 360 000 ms for the OI point.** A grid point stays ready until an
+  open-interest event closes the next boundary, so during an open-interest
+  outage the ready point can be arbitrarily old, and an anchor would read
+  an hours-old open interest as the open interest at the swing (the
+  review of #120 found two such divergences on the golden tape, at 26 and
+  96 minutes). The bound is one grid interval (300 000 ms: until the next
+  boundary is due) plus the grid's `max_age_ms` of 60 000 ms. *Why the
+  slack:* a live boundary closes only on the first 10 s poll after it, so
+  for a few seconds of every interval the newest ready point is just over
+  one interval old although the feed is healthy; without the slack those
+  anchors would lose their point live but not in the archive, whose
+  samples sit on the boundaries. *Why 60 000 ms and no more:* it is the lag
+  `derivatives.oi.5m@1` itself accepts between a boundary and its sample
+  (ADR-042 D2); a feed that has not delivered within it leaves the next
+  boundary `Unavailable` anyway, so a point older than 360 000 ms means an
+  outage, and the anchor has no point.
 - **Lookup.** Closed bars' records sit in a ring of `SWING_BARS + 1` = 4
   per timeframe. *Why 4:* the swing bar is exactly `SWING_BARS` closed bars
   before the confirming bar, because every elapsed interval yields a bar,
@@ -192,7 +217,8 @@ tf = 15m, 1h, 4h, 1d.
   extreme reached on fewer open positions is the non-confirmation on
   either side. *Why the 5-minute grid:* both the archive and live capture
   produce it (ADR-042 D2), so the feature means the same in both. If
-  either anchor has no ready grid point, the OI comparison has no change
+  either anchor has no grid point (none ready, or one older than the
+  anchor bound above), the OI comparison has no change
   and is not divergent; the value records the missing point.
 - **No magnitude threshold in `@1`.** Each comparison carries its changes,
   the gaps and the span, so #28 and #31 can threshold on measured
@@ -488,6 +514,7 @@ run on the same clock (ADR-043 D6).
 |---|---|---|
 | Divergence timeframes 15m, 1h, 4h, 1d | Swings exist only on the structure timeframes (ADR-037 D1) | derivation |
 | Effort windows 5m, 15m, 1h | The aggression windows ADR-035 built for this judgment; a new horizon is a new id | inherited input, own reason |
+| OI point age at an anchor ≤ 360 000 ms | One grid interval plus the 60 s lag `derivatives.oi.5m@1` accepts (ADR-042 D2); less loses healthy live anchors, more reads an outage's stale point | derivation |
 | Ring of 4 closed-bar records | `SWING_BARS + 1`: the swing bar is exactly `SWING_BARS` bars before the confirming one (ADR-031, ADR-037 D3) | derivation |
 | R1b before R1 | `q_hi` names a tail only under a fixed `B` | derivation |
 | `B` ∈ {60, 240, 1440} | The 1h, 4h and 1d bar spans in one-minute evaluations; 1440 is the shortest baseline holding every UTC hour | derivation; **value fixed by R1b (M3)** |
@@ -519,9 +546,11 @@ run on the same clock (ADR-043 D6).
 - The per-trade cost is up to 8 comparisons (high and low on four
   timeframes) and, on a new extreme, one small record copy. Comparisons
   happen only when a swing is confirmed.
-- The OI comparison on archive data reads a grid point that can be up to
-  one 5-minute interval old at the anchor; live, the point is fresher.
-  `resolution_ms` on each point tells them apart.
+- The OI comparison reads a grid point at most 360 000 ms old at the
+  anchor (D4); archive points are up to one 5-minute interval old, live
+  ones are fresher. `resolution_ms` on each point tells them apart. An
+  open-interest outage longer than that leaves the anchors inside it
+  without a point, so no OI comparison crosses it.
 - In archive replays the location context lists no cluster levels (ADR-043
   is live only), so contexts from archive and live differ by those levels.
 - A divergence across a trades gap carries `feed_gap`: the CVD change

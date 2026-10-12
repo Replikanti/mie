@@ -103,12 +103,15 @@ impl LocationContext {
     }
 }
 
-/// A registry level left out of a context: the structural level of the
-/// candidate's own swing, which would otherwise always be listed.
+/// The registry levels left out of a context: every level derived from the
+/// candidate's own swing (ADR-051 D3) — its structural level, and the prior
+/// sweep and SFP zone it becomes when a trade goes beyond it, the
+/// confirming trade included. The swing is the candidate itself, not a
+/// place it happened at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Exclude {
-    /// `StructuralHigh` or `StructuralLow`.
-    pub(crate) kind: LevelKind,
+    /// The swing's side.
+    pub(crate) side: LevelSide,
     /// The id of the `structure.levels.<tf>` registry the swing entered.
     pub(crate) source_id: &'static str,
     /// Open time of the swing bar.
@@ -116,8 +119,17 @@ pub(crate) struct Exclude {
 }
 
 impl Exclude {
-    fn matches(&self, kind: LevelKind, source: FeatureKey, anchor: Option<EventTime>) -> bool {
-        kind == self.kind && anchor == Some(self.anchor) && source.id.as_str() == self.source_id
+    /// Whether a level of any kind is derived from the swing: same
+    /// registry, same side, anchored at the swing bar.
+    fn matches(
+        &self,
+        side: Option<LevelSide>,
+        source: FeatureKey,
+        anchor: Option<EventTime>,
+    ) -> bool {
+        side == Some(self.side)
+            && anchor == Some(self.anchor)
+            && source.id.as_str() == self.source_id
     }
 }
 
@@ -131,7 +143,7 @@ fn levels_at(set: &LevelSet, anchor: Price, exclude: Option<Exclude>) -> Context
             .filter(|level| zone_contains(level, anchor))
             .filter(|level| {
                 !exclude
-                    .is_some_and(|exclude| exclude.matches(level.kind, level.source, level.anchor))
+                    .is_some_and(|exclude| exclude.matches(level.side, level.source, level.anchor))
             })
             .map(|level| ContextLevel {
                 kind: level.kind,

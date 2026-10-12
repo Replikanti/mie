@@ -1688,7 +1688,9 @@ pub const CANDIDATE_DIVERGENCE_CVD_1D_V1: FeatureDefinition = candidate_divergen
 /// `candidate.divergence.oi.15m@1`: open-interest divergence on confirmed
 /// 15m swings (ADR-051 D4). Swings are anchored and paired as in
 /// [`CANDIDATE_DIVERGENCE_CVD_15M_V1`], and each anchor also records the
-/// ready `derivatives.oi.5m@1` point at its trade. The pair is divergent
+/// ready `derivatives.oi.5m@1` point at its trade, unless the point's
+/// boundary lies more than 360 000 ms (one grid interval plus the grid's
+/// `max_age_ms`) before the trade. The pair is divergent
 /// when the later swing is a further extreme on either side (a strictly
 /// higher high or a strictly lower low) with strictly lower open interest:
 /// open interest counts positions on both sides, so the rule does not
@@ -1700,7 +1702,8 @@ pub const CANDIDATE_DIVERGENCE_CVD_1D_V1: FeatureDefinition = candidate_divergen
 ///   `flow.cvd.continuous@1`, trades and `derivatives.oi.5m@1`.
 /// - Warm-up: one sample, where a sample is an anchored confirmed swing.
 /// - Gap policy: as [`CANDIDATE_DIVERGENCE_CVD_15M_V1`]; an open-interest
-///   gap shows only as a missing or `Unavailable` grid point at an anchor.
+///   gap shows only as a missing grid point at an anchor: an `Unavailable`
+///   point, or a ready one older than the bound above.
 pub const CANDIDATE_DIVERGENCE_OI_15M_V1: FeatureDefinition = candidate_divergence_v1(
     "candidate.divergence.oi.15m",
     &DIVERGENCE_PARAMS_15M,

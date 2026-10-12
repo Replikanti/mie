@@ -23,18 +23,37 @@
 use super::Inputs;
 use super::context::{Exclude, LocationContext};
 use crate::bars::{Bar, Coverage, Timeframe};
-use crate::derivatives::OiGridPoint;
+use crate::derivatives::{OI_GRID, OI_MAX_AGE_MS, OiGridPoint};
 use crate::event::Trade;
 use crate::feature::{FeatureKey, FeatureValue, Unavailability, catalog};
 use crate::fingerprint::Fingerprinter;
 use crate::flow::Cvd;
-use crate::location::LevelKind;
+use crate::location::LevelSide;
 use crate::num::{Price, Qty};
 use crate::state_hash::StateEncode;
 use crate::structure::{SWING_BARS, Side, Swing};
 use crate::time::EventTime;
 use std::collections::VecDeque;
 use std::fmt;
+
+/// The oldest `derivatives.oi.5m@1` point an anchor reads, in milliseconds
+/// from the point's boundary to the anchor trade (ADR-051 D4): one grid
+/// interval, until the next boundary is due, plus `max_age_ms` of
+/// `derivatives.oi.5m@1`, the lag ADR-042 D2 accepts between a boundary and
+/// its sample. A live boundary closes only on the first poll after it, so
+/// without the slack every anchor in that lag would lose its point; an
+/// older point means the next boundary is overdue — an open-interest
+/// outage — and the anchor has no point.
+pub const OI_ANCHOR_MAX_AGE_MS: i64 = OI_GRID.millis() + OI_MAX_AGE_MS;
+
+/// The ready grid point an anchor trade at `time` reads: `point` unless it
+/// is older than [`OI_ANCHOR_MAX_AGE_MS`].
+pub(crate) fn current_oi(point: Option<&OiGridPoint>, time: EventTime) -> Option<&OiGridPoint> {
+    point.filter(|point| {
+        i128::from(time.as_millis()) - i128::from(point.boundary.as_millis())
+            <= i128::from(OI_ANCHOR_MAX_AGE_MS)
+    })
+}
 
 /// Closed-bar records kept per timeframe: the swing bar and the
 /// [`SWING_BARS`] bars up to the confirming one.
@@ -472,7 +491,8 @@ impl DivergenceTracker {
     }
 
     /// Records `trade` if it sets the developing bar's high or low, with the
-    /// CVD after it and the ready OI point.
+    /// CVD after it and the ready OI point, if it is current
+    /// ([`current_oi`]).
     pub(crate) fn trade(&mut self, trade: &Trade, cvd: &Cvd, oi: Option<&OiGridPoint>) {
         let Some(open_time) = self.timeframe.open_of(trade.time) else {
             return;
@@ -490,7 +510,7 @@ impl DivergenceTracker {
             time: trade.time,
             cvd: cvd.cvd,
             gaps: cvd.gaps,
-            oi: oi.copied(),
+            oi: current_oi(oi, trade.time).copied(),
         };
         if extremes.high.is_none_or(|high| trade.price > high.price) {
             extremes.high = Some(mark());
@@ -595,9 +615,9 @@ impl DivergenceTracker {
         let context = LocationContext::read(
             swing.price,
             Some(Exclude {
-                kind: match swing.side {
-                    Side::High => LevelKind::StructuralHigh,
-                    Side::Low => LevelKind::StructuralLow,
+                side: match swing.side {
+                    Side::High => LevelSide::High,
+                    Side::Low => LevelSide::Low,
                 },
                 source_id: self.levels_id,
                 anchor: swing.swing_time,
@@ -697,6 +717,7 @@ pub(crate) mod tests {
     use crate::candidate::CandidateEvent;
     use crate::event::samples::t;
     use crate::event::{Aggressor, FeedGap, GapReason, MarketEvent, OpenInterest, Stream};
+    use crate::location::{LevelKind, LevelSide};
     use crate::num::SCALE;
     use crate::state::MarketStateEngine;
     use crate::structure::StructureEvent;
@@ -1225,6 +1246,19 @@ pub(crate) mod tests {
         assert_eq!(fired[0].known_at, events.last().unwrap().time());
     }
 
+    /// The scenario's tape with the confirming trade at `price`.
+    fn confirmed_at(scenario: Scenario, price: i64) -> Vec<MarketEvent> {
+        let mut events = scenario.tape();
+        let Some(MarketEvent::Trade(trade)) = events.pop() else {
+            unreachable!("the tape ends with the confirming trade")
+        };
+        events.push(MarketEvent::Trade(Trade {
+            price: Price::from_units(price),
+            ..trade
+        }));
+        events
+    }
+
     #[test]
     fn the_context_lists_the_levels_at_the_swing_but_its_own() {
         let scenario = Scenario::divergent(Side::High);
@@ -1232,11 +1266,31 @@ pub(crate) mod tests {
             let features = catalog::current_set_with(&[catalog::LOCATION_LEVELS_V1.key]).unwrap();
             MarketStateEngine::with_features(features).unwrap()
         };
-        for (mut engine, version) in [
-            (MarketStateEngine::new(), catalog::LOCATION_LEVELS_V2.key),
-            (levels_v1(), catalog::LOCATION_LEVELS_V1.key),
+        // The default confirming trade stays below B; the other one trades
+        // 1 USDT beyond it, so structure sweeps B's own level in the event
+        // that confirms it, and the registry holds it as a prior sweep.
+        let beyond_b = scenario.beyond(A + 1) + SCALE;
+        for (mut engine, version, events, swept) in [
+            (
+                MarketStateEngine::new(),
+                catalog::LOCATION_LEVELS_V2.key,
+                scenario.tape(),
+                false,
+            ),
+            (
+                levels_v1(),
+                catalog::LOCATION_LEVELS_V1.key,
+                scenario.tape(),
+                false,
+            ),
+            (
+                MarketStateEngine::new(),
+                catalog::LOCATION_LEVELS_V2.key,
+                confirmed_at(scenario, beyond_b),
+                true,
+            ),
         ] {
-            let facts = run(&mut engine, &scenario.tape());
+            let facts = run(&mut engine, &events);
             let fired = cvd_facts(&facts, Side::High);
             assert_eq!(fired.len(), 1);
             let context = &fired[0].context;
@@ -1244,25 +1298,35 @@ pub(crate) mod tests {
             assert_eq!(context.anchor, swing.price);
             let levels = context.levels.ready().unwrap();
             assert_eq!(levels.feature, version);
-            // The registry holds B's own structural level at the swing price…
-            let registry = engine.state().location.levels.ready().unwrap();
-            let own = |kind: LevelKind, source: FeatureKey, anchor: Option<EventTime>| {
-                kind == LevelKind::StructuralHigh
+            // A level of any kind derived from B's own swing.
+            let own = |side: Option<LevelSide>, source: FeatureKey, anchor: Option<EventTime>| {
+                side == Some(LevelSide::High)
                     && source == catalog::STRUCTURE_LEVELS_15M_V1.key
                     && anchor == Some(swing.swing_time)
             };
-            assert!(registry.levels().iter().any(|level| own(
-                level.kind,
-                level.source,
-                level.anchor
-            )));
-            // …which the context leaves out, while it lists A's level, swept
-            // one unit below, as a prior sweep.
+            // The registry holds B's own level at the swing price, active
+            // or, when the confirming trade swept it, as a prior sweep…
+            let registry = engine.state().location.levels.ready().unwrap();
+            let kinds: Vec<LevelKind> = registry
+                .levels()
+                .iter()
+                .filter(|level| own(level.side, level.source, level.anchor))
+                .map(|level| level.kind)
+                .collect();
+            let expected = if swept {
+                LevelKind::PriorSweep
+            } else {
+                LevelKind::StructuralHigh
+            };
+            assert!(kinds.contains(&expected), "{kinds:?}");
+            // …which the context leaves out whatever its kind, while it
+            // lists A's level, swept one unit below, as a prior sweep.
             assert!(
                 levels
                     .levels
                     .iter()
-                    .all(|level| !own(level.kind, level.source, level.anchor))
+                    .all(|level| !own(level.side, level.source, level.anchor)),
+                "{context}"
             );
             assert!(levels.levels.iter().any(|level| {
                 level.kind == LevelKind::PriorSweep
@@ -1280,6 +1344,55 @@ pub(crate) mod tests {
             }
             assert_eq!(context.auction, engine.state().location.auction);
         }
+    }
+
+    #[test]
+    fn an_open_interest_outage_leaves_the_anchor_without_a_point() {
+        // The reviewer's case: samples stop after bar 7's first boundary, so
+        // B's anchor (bar 10) would read a point 45 minutes old.
+        let scenario = Scenario {
+            oi: Some((80_000, 79_999)),
+            ..Scenario::divergent(Side::High)
+        };
+        let events: Vec<MarketEvent> = scenario
+            .tape()
+            .into_iter()
+            .filter(|event| {
+                !matches!(event, MarketEvent::OpenInterest(oi) if oi.time.as_millis() > 7 * M15)
+            })
+            .collect();
+        let mut engine = MarketStateEngine::new();
+        let facts = run(&mut engine, &events);
+        assert!(oi_facts(&facts, Side::High).is_empty(), "{facts:?}");
+        // The stale point is still ready in the state, but not at the anchor.
+        assert!(engine.state().derivatives.oi_5m.is_ready());
+        let comparison = oi_of(&engine, Side::High).unwrap();
+        assert!(comparison.previous_oi.is_some());
+        assert_eq!((comparison.current_oi, comparison.oi_change), (None, None));
+        assert!(!comparison.divergent);
+        // The CVD divergence does not depend on open interest.
+        assert_eq!(cvd_facts(&facts, Side::High).len(), 1);
+    }
+
+    #[test]
+    fn an_anchor_reads_a_point_up_to_one_interval_plus_the_sample_lag_old() {
+        let point = OiGridPoint {
+            feature: catalog::DERIVATIVES_OI_5M_V1.key,
+            boundary: t(300_000),
+            open_interest: Qty::from_units(1),
+            sample_time: t(300_000),
+            resolution_ms: 300_000,
+            delta: None,
+        };
+        assert_eq!(OI_ANCHOR_MAX_AGE_MS, 360_000);
+        for (time, kept) in [
+            (300_000, true),
+            (300_000 + 360_000, true),
+            (300_000 + 360_001, false),
+        ] {
+            assert_eq!(current_oi(Some(&point), t(time)).is_some(), kept, "{time}");
+        }
+        assert_eq!(current_oi(None, t(300_000)), None);
     }
 
     #[test]
