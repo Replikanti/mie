@@ -190,9 +190,14 @@ one dataset that holds both versions of the aggregate.
    - Grounds: 2109 of 2109 tail, 0 head-only, 0 neither; 97 of 97 live
      truncations reproduced exactly; consecutive aggregate ids.
    - The folded quantity lands in `P.transact_time`'s bar, not the trade's
-     own minute. 26 of the 2109 trades sit in another minute than `P`; the
-     February prediction shows 0 new mismatches from the rule. Placing them
-     in their own minute would need an event of their own (next bullet).
+     own minute. 26 of the 2109 trades sit in another minute than `P`, all
+     on 2026-06-08; the February window holds none of them, so its
+     prediction does not exercise this. Placed in `P`'s bar, such a trade
+     restores the aggregate live delivered (97 of 97 above), and the kline,
+     which counts the trade in its own minute, disagrees with that bar: the
+     #102 M3 kline check shows 2 bars that match under `none` and mismatch
+     under `fold` for this reason (Accept when, item 4). Placing them in
+     their own minute would need an event of their own (next bullet).
    - Rejected, one synthetic `Trade` per lost trade: consecutive aggregate
      ids leave no free id between two aggregates, and the engine requires
      strictly increasing trade ids (ADR-028 D5), so it needs a change to the
@@ -506,8 +511,28 @@ all five:
    2026-02-05 --to 2026-02-07` reproduces 1658 mismatches under `none` and
    gives exactly 1608 under `fold`, and the mismatch set under `fold` is a
    subset of the set under `none`.
-4. **Kline check, the 32 days.** On each day, one 1-day check per mode: the
-   mismatch set under `fold` is a subset of the set under `none`.
+4. **Kline check, the 32 days.** On each day, one 1-day check per mode:
+   every bar in the mismatch set under `fold` and not under `none` is a
+   cross-boundary bar. A cross-boundary bar, per timeframe, is the bar of
+   `P.transact_time` for a lost trade `u` whose own time lies in another bar
+   of that timeframe. The set is computed from the raw `trades` and
+   `aggTrades` rows, independently of either kline check.
+   - Why not a plain subset: a cross-boundary fold moves quantity out of
+     the bar the kline counts it in and into `P`'s bar, which can then
+     disagree with a kline that matched under `none`. The trade's own bar
+     mismatches in both modes (the quantity is missing there either way).
+     This follows from D3's placement and is not a defect of the fold.
+   - Amended after observation: the plan and the first version of this
+     ADR required a plain subset, which overlooked this shape. The #102 M3
+     run found 2 new mismatches on 2026-06-08 (1m 13:32 `volume`; 1m 13:44
+     `volume`, `taker_buy_volume`). Both bars match under `none`: trades by
+     time, aggregates by `T` and the kline all give 617.675 and 184.202
+     BTC. The independent computation over all 32 days gives 26 lost
+     trades in another minute than `P` (all on 2026-06-08, the M0 count),
+     5 cross-boundary bars, 3 of them already mismatched under `none`.
+     The 2 new mismatches are both cross-boundary bars, and no day has a
+     new mismatch outside the set. The amendment would not pass a fold
+     that mismatches a bar for any other reason.
 5. **Controls 2026-06-10 and 2026-10-09.** Precondition: the store holds
    the `trades` of D and the `aggTrades` and `klines` of D−1 and D (D6).
    Per control day D, a fold replay `--from D−1 --to D` reports D `clean`,
