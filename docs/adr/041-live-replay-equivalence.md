@@ -1,6 +1,6 @@
 # ADR-041: Live/replay equivalence — Market State hash and checkpoints
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-10-09
 
 ## Context
@@ -319,3 +319,29 @@ one arrives within a few minutes, which leaves about 70 minutes of `Ready`
 boundary. Run 1 (45 minutes) is too short for the 1h window to turn
 `Ready`, which is why item 5 is checked in run 2. A schedule that does not
 meet the list is extended, not accepted.
+
+## Acceptance
+
+Accepted 2026-10-12 after the #13 acceptance run on main `d3f518c` (feature
+set `e7c6601562a8c62d`, all seven streams, `max_connection_age_secs` 300).
+Run 1 went from 22:30:18Z to SIGTERM at 23:15:19Z on 2026-10-09; run 2 from
+23:15:20Z to SIGTERM at 01:30:03Z on 2026-10-10. `mie equivalence` reports
+both runs `EQUIVALENT` with state compared: run 1 has 39 141 events and 46
+checkpoints, run 2 has 123 841 events and 136 checkpoints, both with 0
+rejections. A second invocation printed a byte-identical report.
+
+Every coverage item is present:
+
+1. Both runs ended with a clean `run_end`, and run 2 seeds all seven
+   streams.
+2. Every rotated stream logged a `planned_rotation` and then a
+   `Disconnected` gap: 17 rotations in run 1 and 57 in run 2.
+3. Book desync and resync: 2 pairs in run 1, 5 in run 2. Run 2 also has 2
+   `LateEvent` gaps, on klines.
+4. Run 2 spans 00:00 UTC, and the raw store holds both date partitions.
+5. Run 2's first liquidation came 15 s after its start, so its 1h window
+   was `Ready` for about 74 min.
+
+Capacity gate: 0 ms blocked over 181 `stats` records. High-water peaked at
+416 on the core channel and 160 inbound, against 65 536. Full results:
+https://github.com/Replikanti/mie/issues/13#issuecomment-6122464897
