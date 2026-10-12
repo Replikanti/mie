@@ -47,7 +47,9 @@ use crate::num::Price;
 use crate::order::CanonicalKey;
 use crate::profile::{ProfileError, ProfileTracker, VolumeProfiles};
 use crate::regime::Regime;
-use crate::structure::{StructureError, StructureEvent, StructureSet, StructureTracker};
+use crate::structure::{
+    LevelsRule, StructureError, StructureEvent, StructureSet, StructureTracker,
+};
 use crate::time::EventTime;
 use crate::volatility::{AtrRegimeSeries, MotionAnchors, MotionSet, VolatilityError};
 use std::cmp::Ordering;
@@ -268,7 +270,11 @@ impl MarketStateEngine {
     /// Creates an engine with an empty state that computes the current
     /// feature set ([`catalog::CURRENT`]).
     pub fn new() -> Self {
-        Self::build(catalog::current_set(), LevelsVersion::V2)
+        Self::build(
+            catalog::current_set(),
+            LevelsVersion::V2,
+            [LevelsRule::V1; 4],
+        )
     }
 
     /// Creates an engine with an empty state that computes `features`:
@@ -326,12 +332,30 @@ impl MarketStateEngine {
         } else {
             LevelsVersion::V2
         };
-        Ok(Self::build(features, levels))
+        // Each structure timeframe's registry rule, from the set's
+        // `structure.levels.<tf>` version: engine state, which the stamp
+        // names through that version.
+        let mut rules = [LevelsRule::V1; 4];
+        for (rule, (timeframe, current)) in rules.iter_mut().zip(catalog::STRUCTURE_LEVELS) {
+            let member = features
+                .definitions()
+                .find(|definition| definition.key.id == current.key.id)
+                .ok_or(UnsupportedFeatureSet::Missing {
+                    feature: current.key,
+                })?
+                .key;
+            *rule = LevelsRule::ALL
+                .into_iter()
+                .find(|candidate| candidate.key(timeframe) == Some(member))
+                .ok_or(UnsupportedFeatureSet::NotComputed { feature: member })?;
+        }
+        Ok(Self::build(features, levels, rules))
     }
 
     /// An engine with an empty state that computes `features`, its registry
-    /// at `levels`.
-    fn build(features: FeatureSet, levels: LevelsVersion) -> Self {
+    /// at `levels` and each structure timeframe's level registry under its
+    /// rule in `rules`, in [`crate::structure::STRUCTURE_TIMEFRAMES`] order.
+    fn build(features: FeatureSet, levels: LevelsVersion, rules: [LevelsRule; 4]) -> Self {
         let volatility = AtrRegimeSeries::new();
         let flow = FlowTracker::new();
         let derivatives = DerivativesTracker::new();
@@ -366,7 +390,7 @@ impl MarketStateEngine {
             volatility,
             flow,
             profile: ProfileTracker::new(),
-            structure: StructureTracker::new(),
+            structure: StructureTracker::new(rules),
             structure_events: Vec::new(),
             structure_pending: Vec::new(),
             derivatives,
@@ -1919,6 +1943,18 @@ mod tests {
             built.apply(&event).unwrap();
             new.apply(&event).unwrap();
             assert_eq!(built.state(), new.state());
+        }
+    }
+
+    #[test]
+    fn with_features_derives_the_structure_rules() {
+        let engines = [
+            MarketStateEngine::new(),
+            MarketStateEngine::with_features(catalog::current_set()).unwrap(),
+            levels_v1_engine(),
+        ];
+        for engine in &engines {
+            assert_eq!(engine.structure.rules(), [LevelsRule::V1; 4]);
         }
     }
 

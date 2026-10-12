@@ -418,8 +418,21 @@ of #12, 2025-10-01 … 2026-09-30 (`docs/data-availability.md`).
     engine computes every family on every event, so such a stamp would not
     name every value the state holds. The experiment service builds its
     engine this way from the spec's feature set (ADR-040 D4), so a spec on
-    `location.levels@1` runs and reproduces. The engine keeps the
-    registry version as state (not hashed: the stamp names it), and the two
+    `location.levels@1` runs and reproduces. `catalog::current_set_with`,
+    which builds that set, also puts in every version in each selected
+    key's dependency closure (`FeatureRegistry::closure`) in place of the
+    `CURRENT` versions of those ids, and refuses two selections whose
+    closures need one id at different versions (`DuplicateId`): once a
+    selectable version reads an upstream older than `CURRENT`'s (after
+    #95, `location.levels@1` and `@2` over `structure.levels.<tf>@1`),
+    substituting the selected key alone would leave that upstream at the
+    `CURRENT` version and fail as `MissingDependency`. *Rejected:* making
+    each caller list those upstream versions itself — every call site that
+    selects `location.levels@1` alone, and
+    `selectable_versions_are_older_than_current`, which substitutes one
+    `SELECTABLE` key at a time, would have to walk the dependency graph.
+    The engine keeps the registry version as state (not hashed: the stamp
+    names it), and the two
     versions differ only in the composite the registry reads, which
     `v1_and_v2_differ_only_in_the_registry` checks on a ten-day tape. This
     is the selector ADR-029 *Consequences* announced for the first `@2`.
