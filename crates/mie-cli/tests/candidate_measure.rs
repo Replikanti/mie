@@ -40,8 +40,12 @@
 //!   OI-divergent share.
 //! - **R1b**: per `B`, half, window length and `q`, the episodes per UTC
 //!   hour of `B` and of the reference, counted while the reference baseline
-//!   is ready, with `U_B`, `σ0`, `c_k` (k evaluable combinations), the
-//!   evaluable flag and the per-combination verdict; then the selection
+//!   is ready, with the statistic of decision 5 as revised for #124:
+//!   Pearson's X² of the 2 × 24 table (`B`, reference) × UTC hour, its `p`
+//!   under χ²₂₃, the cells whose expected count is below 5 and below 1,
+//!   Cochran's evaluability (no expected count below 1, at most 9 of 48
+//!   below 5), the critical value `χ²₂₃(1 − 0.05/k)` over the k evaluable
+//!   combinations and the per-combination verdict; then the selection
 //!   ([`r1b`]).
 //! - **R1**, at R1b's `B`, or at every `B` without a verdict if R1b stops:
 //!   per window length, half and `q`, the 12 regime × location cells, the
@@ -50,21 +54,34 @@
 //! - Recorded only: exhaustion episodes per `B`, `q` and half; the replay's
 //!   wall time.
 //!
-//! The halves split at the window's midpoint: 2026-04-01 12:00 UTC for the
-//! #12 year 2025-10-01 … 2026-09-30. An episode or a pair belongs to the half
-//! of its emission time. Run it with `MIE_MEASURE_RAW_ROOT=<raw root>
-//! MIE_MEASURE_FROM=<YYYY-MM-DD> MIE_MEASURE_TO=<YYYY-MM-DD> cargo test
-//! --release -p mie-cli --test candidate_measure -- --ignored --nocapture`;
-//! `MIE_MEASURE_TO` is included, as in `mie replay`. An optional
-//! `MIE_MEASURE_EVENTS` asserts the replay's event count (R0). The replay
-//! reads `aggTrades` with the ADR-050 fold (its D8 default) and `metrics`
-//! for the open interest.
+//! The halves split at the window's midpoint, `from + (to − from) / 2`. The
+//! fixing rules run on the measurement year of ADR-051 D9, the hold-out
+//! year 2024-10-01 … 2025-09-30, split at 2025-04-01 12:00 UTC; the #12 year
+//! 2025-10-01 … 2026-09-30 (split 2026-04-01 12:00 UTC) is the development
+//! year. An episode or a pair belongs to the half of its emission time. Run
+//! it with `MIE_MEASURE_RAW_ROOT=<raw root> MIE_MEASURE_FROM=<YYYY-MM-DD>
+//! MIE_MEASURE_TO=<YYYY-MM-DD> cargo test --release -p mie-cli --test
+//! candidate_measure -- --ignored --nocapture measure_candidates`;
+//! `MIE_MEASURE_TO` is included, as in `mie replay`. The hold-out run reads
+//! the hold-out raw root with `MIE_MEASURE_FROM=2024-10-01` and
+//! `MIE_MEASURE_TO=2025-09-30`. An optional `MIE_MEASURE_EVENTS` asserts the
+//! replay's event count (R0). The replay reads `aggTrades` with the ADR-050
+//! fold (its D8 default) and `metrics` for the open interest.
+//!
+//! `r1b_from_a_logged_run` (also `--ignored`) re-reads the R1b hour lines of
+//! a saved `measure_candidates` output, in M2's format or this one's, from
+//! the file `MIE_MEASURE_LOG`, and prints the same R1b report and verdict.
+//! It exists for ADR-051 D9's diagnosis table on the #22 M2 log and never
+//! replaces a run.
 //!
 //! `model_reproduces_the_engine_on_a_synthetic_tape` runs the same R0
 //! comparison and every report section in CI on a seeded tape, and asserts
 //! that every compared kind occurred, so R0 cannot pass vacuously. The two
 //! selection rules are pure functions over count tables, unit-tested on
-//! constructed tables.
+//! constructed tables; R1b's statistic is also pinned on three
+//! development-year tables from the #22 M2 log, as a check that the code
+//! computes what decision 5 says (ADR-051 D9 limits what they may be used
+//! for).
 
 use mie_adapter_binance::archive::ArchiveStream;
 use mie_adapter_binance::archive::fold::TradeCorrection;
@@ -1182,51 +1199,85 @@ fn chi_square_quantile(p: f64, degrees: f64) -> f64 {
     0.5 * (low + high)
 }
 
-/// R1b's critical factor for `k` evaluable combinations:
-/// `sqrt(χ²₂₃(1 − 0.05/k) / 23)`.
-fn c_k(k: usize) -> f64 {
-    let degrees = (HOURS - 1) as f64;
-    (chi_square_quantile(1.0 - FAMILY_LEVEL / k as f64, degrees) / degrees).sqrt()
+/// R1b's degrees of freedom: (2 − 1) baselines × (24 − 1) hours.
+const DEGREES: usize = HOURS - 1;
+
+/// Cochran's rule (decision 5): an expected count below this makes a
+/// combination not evaluable.
+const MIN_EXPECTED: u128 = 1;
+
+/// Cochran's rule: the expected count below which a cell is sparse.
+const SPARSE_EXPECTED: u128 = 5;
+
+/// Cochran's rule: at most 20 % of the 48 cells may be sparse, 9 of 48.
+const MAX_SPARSE: usize = 9;
+
+/// R1b's critical value for `k` evaluable combinations:
+/// `χ²₂₃(1 − 0.05/k)`.
+fn critical(k: usize) -> f64 {
+    chi_square_quantile(1.0 - FAMILY_LEVEL / k as f64, DEGREES as f64)
 }
 
-/// R1b's statistic of one combination: `U_B`, the coefficient of variation
-/// of the 24 ratios `n_B(h) / n_ref(h)` (sample deviation, divisor 23), and
-/// `σ0`. Not evaluable when an hour has no episode of `B` or of the
-/// reference.
+/// R1b's statistic of one combination (decision 5): Pearson's X² of the
+/// 2 × 24 table (`B`, reference) × UTC hour, its upper-tail `p` under χ²₂₃,
+/// and Cochran's evaluability. With `m(h) = n_B(h) + n_ref(h)` and `N` the
+/// table's total, the expected count of `B` in hour `h` is `m(h)·N_B/N`, of
+/// the reference `m(h)·N_ref/N`; the cell counts and the evaluability are
+/// exact in integers. Not evaluable when either baseline has no episode,
+/// when an expected count is below 1 (so also when an hour has no episode
+/// of either), or when more than 9 of the 48 expected counts are below 5.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Combination {
-    u: f64,
-    sigma0: f64,
+    x2: f64,
+    p: f64,
+    /// Cells with an expected count below 5.
+    below_five: usize,
+    /// Cells with an expected count below 1.
+    below_one: usize,
     evaluable: bool,
 }
 
 fn combination(n_b: &[u64; HOURS], n_ref: &[u64; HOURS]) -> Combination {
-    if n_b.iter().chain(n_ref).any(|n| *n == 0) {
+    let total_b: u128 = n_b.iter().map(|n| u128::from(*n)).sum();
+    let total_ref: u128 = n_ref.iter().map(|n| u128::from(*n)).sum();
+    let total = total_b + total_ref;
+    let mut below_five = 0;
+    let mut below_one = 0;
+    for (b, reference) in n_b.iter().zip(n_ref) {
+        let m = u128::from(*b) + u128::from(*reference);
+        for side in [total_b, total_ref] {
+            // `m(h)·N_side / N < c` ⇔ `m(h)·N_side < c·N`.
+            below_five += usize::from(m * side < SPARSE_EXPECTED * total);
+            below_one += usize::from(m * side < MIN_EXPECTED * total);
+        }
+    }
+    if total_b == 0 || total_ref == 0 {
         return Combination {
-            u: f64::NAN,
-            sigma0: f64::NAN,
+            x2: f64::NAN,
+            p: f64::NAN,
+            below_five,
+            below_one,
             evaluable: false,
         };
     }
-    let ratios: Vec<f64> = n_b
+    // `Σ (n_B(h)·N_ref − n_ref(h)·N_B)² / (m(h)·N_B·N_ref)`, the 48-cell
+    // `Σ (O − E)²/E`; an hour without episodes adds nothing.
+    let x2: f64 = n_b
         .iter()
         .zip(n_ref)
-        .map(|(b, reference)| *b as f64 / *reference as f64)
-        .collect();
-    let hours = HOURS as f64;
-    let mean = ratios.iter().sum::<f64>() / hours;
-    let variance = ratios.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / (hours - 1.0);
-    let sigma0 = (n_b
-        .iter()
-        .zip(n_ref)
-        .map(|(b, reference)| 1.0 / *b as f64 + 1.0 / *reference as f64)
-        .sum::<f64>()
-        / hours)
-        .sqrt();
+        .filter(|(b, reference)| **b + **reference > 0)
+        .map(|(b, reference)| {
+            let m = u128::from(*b) + u128::from(*reference);
+            let numerator = (u128::from(*b) * total_ref).abs_diff(u128::from(*reference) * total_b);
+            (numerator as f64).powi(2) / (m * total_b * total_ref) as f64
+        })
+        .sum();
     Combination {
-        u: variance.sqrt() / mean,
-        sigma0,
-        evaluable: true,
+        x2,
+        p: 1.0 - lower_gamma(DEGREES as f64 / 2.0, x2 / 2.0),
+        below_five,
+        below_one,
+        evaluable: below_one == 0 && below_five <= MAX_SPARSE,
     }
 }
 
@@ -1238,7 +1289,7 @@ struct HalfTest {
     k: usize,
     /// The first window length without an evaluable combination.
     unevaluable_window: Option<usize>,
-    /// Some evaluable combination has `U_B > c_k · σ0`.
+    /// Some evaluable combination has `X² > χ²₂₃(1 − 0.05/k)`.
     fails: bool,
     /// No evaluable combination fails and every window length has one.
     pass: bool,
@@ -1246,7 +1297,7 @@ struct HalfTest {
 
 impl HalfTest {
     fn passes(&self, combination: &Combination) -> bool {
-        combination.evaluable && combination.u <= c_k(self.k) * combination.sigma0
+        combination.evaluable && combination.x2 <= critical(self.k)
     }
 }
 
@@ -1645,50 +1696,91 @@ fn report_divergences(run: &Run) {
     }
 }
 
+/// The first line of R1b's report: which statistic the lines below carry.
+const R1B_STATISTIC: &str =
+    "R1b statistic: Pearson X² homogeneity, 2 × 24, Cochran evaluability (ADR-051 D5, #124)";
+
+/// The reference's hour line of one combination. [`parse_r1b_line`] reads it
+/// back; M2's log has the same prefix.
+fn reference_line(half: usize, window: usize, q: usize, n_ref: &[u64; HOURS]) -> String {
+    format!(
+        "R1b n_ref B={} {} {} q={}: [{}]",
+        BASELINES[REFERENCE],
+        half_label(Some(half)),
+        WINDOWS[window],
+        q_label(q),
+        hours_line(n_ref)
+    )
+}
+
+/// A candidate's line of one combination, with its statistic and verdict
+/// under the half's `k`. [`parse_r1b_line`] reads its hours back; M2's log
+/// has the same prefix up to the hours.
+fn combination_line(
+    candidate: usize,
+    half: usize,
+    window: usize,
+    q: usize,
+    n_b: &[u64; HOURS],
+    test: &HalfTest,
+) -> String {
+    let combination = &test.combinations[window][q];
+    let crit = if test.k > 0 {
+        critical(test.k)
+    } else {
+        f64::NAN
+    };
+    format!(
+        "R1b B={} {} {} q={}: n_B [{}] X2 {:.3} p {:.4} below5 {} below1 {} crit {:.3} (k={}) {}",
+        BASELINES[candidate],
+        half_label(Some(half)),
+        WINDOWS[window],
+        q_label(q),
+        hours_line(n_b),
+        combination.x2,
+        combination.p,
+        combination.below_five,
+        combination.below_one,
+        crit,
+        test.k,
+        if !combination.evaluable {
+            "not evaluable"
+        } else if test.passes(combination) {
+            "PASS"
+        } else {
+            "FAIL"
+        }
+    )
+}
+
 fn report_r1b(flow: &FlowModel) {
+    println!("{R1B_STATISTIC}");
     println!(
         "R1b: evaluations per window {:?}; episodes counted while the reference B={} is ready",
         flow.evaluations, BASELINES[REFERENCE]
     );
-    for half in 0..2 {
-        for (window, timeframe) in WINDOWS.iter().enumerate() {
-            for q in 0..Q {
-                println!(
-                    "R1b n_ref B={} {} {} q={}: [{}]",
-                    BASELINES[REFERENCE],
-                    half_label(Some(half)),
-                    timeframe,
-                    q_label(q),
-                    hours_line(&flow.hours[REFERENCE][half][window][q])
-                );
+    report_r1b_tables(&flow.hours);
+}
+
+/// R1b's per-combination lines, the per-half summaries and the verdict, from
+/// the hour tables alone (a run, or a logged run's tables).
+fn report_r1b_tables(hours: &[[HourTable; 2]; NB]) {
+    for (half, table) in hours[REFERENCE].iter().enumerate() {
+        for (window, rows) in table.iter().enumerate() {
+            for (q, n_ref) in rows.iter().enumerate() {
+                println!("{}", reference_line(half, window, q, n_ref));
             }
         }
     }
     for (candidate, baseline) in BASELINES.iter().enumerate().take(REFERENCE) {
-        for half in 0..2 {
-            let test = half_test(&flow.hours[candidate][half], &flow.hours[REFERENCE][half]);
-            let c = if test.k > 0 { c_k(test.k) } else { f64::NAN };
-            for (window, timeframe) in WINDOWS.iter().enumerate() {
-                for q in 0..Q {
-                    let combination = &test.combinations[window][q];
+        for (half, (table, reference)) in hours[candidate].iter().zip(&hours[REFERENCE]).enumerate()
+        {
+            let test = half_test(table, reference);
+            for (window, rows) in table.iter().enumerate() {
+                for (q, n_b) in rows.iter().enumerate() {
                     println!(
-                        "R1b B={} {} {} q={}: n_B [{}] U_B {:.4} σ0 {:.4} c_k {:.4} (k={}) {}",
-                        baseline,
-                        half_label(Some(half)),
-                        timeframe,
-                        q_label(q),
-                        hours_line(&flow.hours[candidate][half][window][q]),
-                        combination.u,
-                        combination.sigma0,
-                        c,
-                        test.k,
-                        if !combination.evaluable {
-                            "not evaluable"
-                        } else if test.passes(combination) {
-                            "PASS"
-                        } else {
-                            "FAIL"
-                        }
+                        "{}",
+                        combination_line(candidate, half, window, q, n_b, &test)
                     );
                 }
             }
@@ -1707,7 +1799,7 @@ fn report_r1b(flow: &FlowModel) {
     }
     println!(
         "R1b verdict: {}",
-        match r1b(&flow.hours) {
+        match r1b(hours) {
             R1b::Fixed { candidate } => format!("PASS, B = {}", BASELINES[candidate]),
             R1b::NotEvaluable {
                 candidate,
@@ -1726,6 +1818,54 @@ fn report_r1b(flow: &FlowModel) {
             ),
         }
     );
+}
+
+/// One combination's hour line of a logged run, in M2's format or this
+/// one's: `R1b n_ref B=… <half> <tf> q=…: [..]` for the reference and
+/// `R1b B=… <half> <tf> q=…: n_B [..] …` for a candidate. Returns the
+/// baseline's index, the half, the window, `q` and the 24 counts; `None` for
+/// every other line.
+fn parse_r1b_line(line: &str) -> Option<(usize, usize, usize, usize, [u64; HOURS])> {
+    let rest = line.trim();
+    let rest = rest
+        .strip_prefix("R1b n_ref ")
+        .or_else(|| rest.strip_prefix("R1b "))?;
+    let (head, tail) = rest.split_once(": ")?;
+    let mut fields = head.split(' ');
+    let baseline: usize = fields.next()?.strip_prefix("B=")?.parse().ok()?;
+    let b = BASELINES.iter().position(|value| *value == baseline)?;
+    let half = match fields.next()? {
+        "first" => 0,
+        "second" => 1,
+        _ => return None,
+    };
+    let timeframe = fields.next()?;
+    let window = WINDOWS
+        .iter()
+        .position(|window| window.to_string() == timeframe)?;
+    let q_text = fields.next()?.strip_prefix("q=")?;
+    let q = (0..Q).position(|q| q_label(q) == q_text)?;
+    if fields.next().is_some() {
+        return None;
+    }
+    let tail = tail.strip_prefix("n_B ").unwrap_or(tail);
+    let (list, _) = tail.strip_prefix('[')?.split_once(']')?;
+    let counts: Vec<u64> = list
+        .split(',')
+        .map(|count| count.parse().ok())
+        .collect::<Option<_>>()?;
+    Some((b, half, window, q, counts.try_into().ok()?))
+}
+
+/// The hour tables of a logged run, and the number of hour lines read.
+fn parse_r1b_log(text: &str) -> ([[HourTable; 2]; NB], usize) {
+    let mut tables = [[[[[0; HOURS]; Q]; W]; 2]; NB];
+    let mut lines = 0;
+    for (b, half, window, q, counts) in text.lines().filter_map(parse_r1b_line) {
+        tables[b][half][window][q] = counts;
+        lines += 1;
+    }
+    (tables, lines)
 }
 
 fn report_r1(flow: &FlowModel) {
@@ -1893,6 +2033,18 @@ fn measure_candidates() {
         run.check.mismatches, 0,
         "the model disagrees with the engine"
     );
+}
+
+#[test]
+#[ignore = "re-reads a logged run's R1b tables for the ADR-051 D9 diagnosis; see the module docs"]
+fn r1b_from_a_logged_run() {
+    let path = env("MIE_MEASURE_LOG");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("{path}: {error}"));
+    let (tables, lines) = parse_r1b_log(&text);
+    assert_eq!(lines, NB * 2 * W * Q, "the log holds every R1b hour line");
+    println!("{R1B_STATISTIC}");
+    println!("R1b: tables read from a logged run, {lines} hour lines");
+    report_r1b_tables(&tables);
 }
 
 /// A seeded generator, so the tape needs no `rand`.
@@ -2115,16 +2267,258 @@ fn hour_tables(candidates: [[HourTable; 2]; REFERENCE]) -> [[HourTable; 2]; NB] 
     ]
 }
 
+/// Hour tables in which `B` ranks like the reference everywhere except
+/// window `window` and grid value `q`, which hold `n_b` and `n_ref`.
+fn one_combination(
+    window: usize,
+    q: usize,
+    n_b: [u64; HOURS],
+    n_ref: [u64; HOURS],
+) -> (HourTable, HourTable) {
+    let mut b = hour_table(profile());
+    let mut reference = hour_table(profile());
+    b[window][q] = n_b;
+    reference[window][q] = n_ref;
+    (b, reference)
+}
+
+/// An hour table whose window `window` holds one episode per hour at every
+/// `q`: against [`profile`], every expected count of `B` is below 1.
+fn sparse_window(mut table: HourTable, window: usize) -> HourTable {
+    table[window].fill([1; HOURS]);
+    table
+}
+
 #[test]
-fn c_k_pins_its_two_ends() {
-    assert_eq!(format!("{:.3}", c_k(1)), "1.237");
-    assert_eq!(format!("{:.3}", c_k(18)), "1.418");
+fn critical_pins_its_two_ends() {
+    assert_eq!(format!("{:.3}", critical(1)), "35.172");
+    assert_eq!(format!("{:.3}", critical(18)), "46.258");
+}
+
+/// A reference with 4× the base count in 13–16 UTC (#124's concentration).
+fn concentrated() -> [u64; HOURS] {
+    std::array::from_fn(|h| if (13..=16).contains(&h) { 400 } else { 100 })
+}
+
+#[test]
+fn a_concentration_both_baselines_share_is_no_failure() {
+    let reference = concentrated();
+    let combination = combination(&reference.map(|n| 2 * n), &reference);
+    assert!(combination.evaluable);
+    assert_eq!(format!("{:.3}", combination.x2), "0.000");
+    assert!(combination.x2 <= critical(18));
+    let b = hour_table(reference.map(|n| 2 * n));
+    let reference = hour_table(reference);
+    let tables = [[b, b], [b, b], [b, b], [reference, reference]];
+    assert!(half_test(&b, &reference).pass);
+    assert_eq!(r1b(&tables), R1b::Fixed { candidate: 0 });
+}
+
+#[test]
+fn a_concentration_only_b_has_fails() {
+    let reference = concentrated();
+    // The reference profile, with 13–16 UTC a further 1.5× higher.
+    let b: [u64; HOURS] = std::array::from_fn(|h| if (13..=16).contains(&h) { 600 } else { 100 });
+    let combination = combination(&b, &reference);
+    assert!(combination.evaluable);
+    assert!(combination.x2 > critical(18), "X² {}", combination.x2);
+    let test = half_test(&hour_table(b), &hour_table(reference));
+    assert_eq!(test.k, W * Q);
+    assert!(test.fails);
+}
+
+#[test]
+fn flat_raw_rates_against_a_concentrated_reference_fail() {
+    // B = 60's behaviour: every hour ranked against itself.
+    let combination = combination(&[160; HOURS], &concentrated());
+    assert!(combination.evaluable);
+    assert!(combination.x2 > critical(18), "X² {}", combination.x2);
+}
+
+// Three development-year tables (#22 M2, second half), diagnosis pins only
+// (ADR-051 D9): `B` first, then the reference.
+
+/// B = 1440, 1h, q = 0.950: M2's failing combination.
+const M2_1440_1H_950: ([u64; HOURS], [u64; HOURS]) = (
+    [
+        5, 19, 8, 4, 13, 6, 12, 9, 9, 7, 5, 21, 6, 23, 29, 30, 39, 13, 13, 16, 8, 12, 8, 12,
+    ],
+    [
+        3, 14, 8, 3, 3, 6, 12, 1, 4, 8, 5, 24, 8, 20, 24, 27, 19, 11, 12, 11, 11, 8, 13, 2,
+    ],
+);
+
+/// B = 240, 15m, q = 0.975.
+const M2_240_15M_975: ([u64; HOURS], [u64; HOURS]) = (
+    [
+        27, 16, 21, 20, 14, 21, 29, 24, 15, 12, 30, 13, 31, 41, 29, 15, 11, 6, 8, 10, 23, 22, 15, 8,
+    ],
+    [
+        4, 5, 6, 5, 2, 8, 9, 3, 12, 8, 11, 9, 11, 32, 32, 14, 15, 7, 6, 3, 7, 7, 10, 6,
+    ],
+);
+
+/// B = 1440, 1h, q = 0.975.
+const M2_1440_1H_975: ([u64; HOURS], [u64; HOURS]) = (
+    [
+        3, 9, 2, 1, 6, 2, 0, 5, 4, 4, 2, 11, 2, 13, 16, 24, 11, 0, 1, 5, 1, 7, 2, 0,
+    ],
+    [
+        1, 4, 0, 1, 0, 2, 5, 1, 2, 0, 1, 17, 1, 10, 12, 14, 5, 1, 1, 2, 8, 3, 7, 2,
+    ],
+);
+
+#[test]
+fn m2_failing_combination_is_evaluable_and_passes() {
+    let (n_b, n_ref) = M2_1440_1H_950;
+    let combination = combination(&n_b, &n_ref);
+    assert_eq!(format!("{:.3}", combination.x2), "26.998");
+    assert_eq!(format!("{:.3}", combination.p), "0.256");
+    assert_eq!((combination.below_five, combination.below_one), (6, 0));
+    assert!(combination.evaluable);
+    assert_eq!(format!("{:.3}", critical(14)), "45.378");
+    assert!(combination.x2 <= critical(14));
+}
+
+#[test]
+fn m2_sparse_hour_ranking_baseline_fails() {
+    let (n_b, n_ref) = M2_240_15M_975;
+    let combination = combination(&n_b, &n_ref);
+    assert_eq!(format!("{:.3}", combination.x2), "56.107");
+    assert_eq!((combination.below_five, combination.below_one), (4, 0));
+    assert!(combination.evaluable);
+    assert!(combination.x2 > critical(14));
+}
+
+#[test]
+fn m2_sparsest_combination_is_not_evaluable_and_not_counted() {
+    let (n_b, n_ref) = M2_1440_1H_975;
+    let combination = combination(&n_b, &n_ref);
+    assert_eq!((combination.below_five, combination.below_one), (33, 6));
+    assert!(!combination.evaluable);
+    let (b, reference) = one_combination(2, 4, n_b, n_ref);
+    let test = half_test(&b, &reference);
+    assert_eq!(test.k, W * Q - 1);
+    assert!(test.pass);
+}
+
+/// A table split 1 : 4 between `B` and the reference in every hour, so
+/// X² = 0: `light` hours of 10 episodes (expected 2 and 8), one hour of 25
+/// (expected exactly 5 and 20), the others of 50.
+fn split_one_to_four(light: usize) -> ([u64; HOURS], [u64; HOURS]) {
+    let m = |h: usize| -> u64 {
+        if h < light {
+            10
+        } else if h == light {
+            25
+        } else {
+            50
+        }
+    };
+    (
+        std::array::from_fn(|h| m(h) / 5),
+        std::array::from_fn(|h| 4 * m(h) / 5),
+    )
+}
+
+#[test]
+fn at_most_nine_of_forty_eight_expected_counts_below_five() {
+    let (n_b, n_ref) = split_one_to_four(9);
+    let nine = combination(&n_b, &n_ref);
+    // An expected count of exactly 5 is not below 5.
+    assert_eq!((nine.below_five, nine.below_one), (9, 0));
+    assert!(nine.evaluable);
+    let (n_b, n_ref) = split_one_to_four(10);
+    let ten = combination(&n_b, &n_ref);
+    assert_eq!((ten.below_five, ten.below_one), (10, 0));
+    assert!(!ten.evaluable);
+}
+
+#[test]
+fn an_expected_count_of_exactly_one_is_evaluable() {
+    // Hour 0 splits 1 : 4 at 5 episodes, the others at 50: N_B = 231,
+    // N = 1155 and m(0)·N_B = 5 · 231 = N.
+    let mut n_b = [10; HOURS];
+    let mut n_ref = [40; HOURS];
+    n_b[0] = 1;
+    n_ref[0] = 4;
+    let one = combination(&n_b, &n_ref);
+    assert_eq!((one.below_five, one.below_one), (2, 0));
+    assert!(one.evaluable);
+    // One more reference episode elsewhere: m(0)·N_B = N − 1.
+    n_ref[1] += 1;
+    let below = combination(&n_b, &n_ref);
+    assert_eq!(below.below_one, 1);
+    assert!(!below.evaluable);
+}
+
+#[test]
+fn a_baseline_without_episodes_is_not_evaluable() {
+    let empty = combination(&[0; HOURS], &profile());
+    assert!(!empty.evaluable);
+    assert!(empty.x2.is_nan());
+    assert!(!combination(&profile(), &[0; HOURS]).evaluable);
+    assert!(!combination(&[0; HOURS], &[0; HOURS]).evaluable);
+}
+
+#[test]
+fn an_hour_without_episodes_of_either_is_not_evaluable() {
+    let mut n_b = profile();
+    let mut n_ref = profile();
+    n_b[3] = 0;
+    n_ref[3] = 0;
+    let combination = combination(&n_b, &n_ref);
+    assert_eq!(combination.below_one, 2);
+    assert!(!combination.evaluable);
+}
+
+#[test]
+fn an_empty_hour_of_b_beside_a_large_reference_is_evaluable_and_fails() {
+    let mut n_b = profile();
+    n_b[7] = 0;
+    let combination = combination(&n_b, &profile());
+    assert!(combination.evaluable);
+    assert!(combination.x2 > critical(18));
+}
+
+#[test]
+fn logged_r1b_lines_parse_in_both_formats() {
+    let (n_b, n_ref) = M2_1440_1H_950;
+    // M2's format (#22), with lines the parser skips.
+    let m2 = format!(
+        "R1b: evaluations per window [525590, 525582, 525539]; episodes counted while \
+         the reference B=10080 is ready\n\
+         R1b n_ref B=10080 second 1h q=0.950: [{}]\n\
+         R1b B=1440 second 1h q=0.950: n_B [{}] U_B 1.0472 σ0 0.5374 c_k 1.4046 (k=14) FAIL\n\
+         R1b B=1440 second: k 14 -> FAIL\n\
+         R1b verdict: STOP, B = 1440 fails on the second half\n",
+        hours_line(&n_ref),
+        hours_line(&n_b)
+    );
+    // This format, from the report's own line builders.
+    let (b, reference) = one_combination(2, 3, n_b, n_ref);
+    let test = half_test(&b, &reference);
+    let new = format!(
+        "{R1B_STATISTIC}\n{}\n{}\n",
+        reference_line(1, 2, 3, &n_ref),
+        combination_line(2, 1, 2, 3, &n_b, &test)
+    );
+    let (from_m2, lines_m2) = parse_r1b_log(&m2);
+    let (from_new, lines_new) = parse_r1b_log(&new);
+    assert_eq!((lines_m2, lines_new), (2, 2));
+    assert_eq!(from_m2, from_new);
+    assert_eq!(from_new[2][1][2][3], n_b);
+    assert_eq!(from_new[REFERENCE][1][2][3], n_ref);
+    assert_eq!(
+        parse_r1b_line(&combination_line(0, 0, 1, 5, &n_b, &test)),
+        Some((0, 0, 1, 5, n_b))
+    );
 }
 
 #[test]
 fn r1b_picks_the_smallest_passing_baseline() {
     let like = hour_table(profile());
-    // Flat raw rates against a cycling reference: a non-flat ratio.
+    // Flat raw rates against a cycling reference: a non-flat split.
     let flat = hour_table([500; HOURS]);
     let tables = hour_tables([[flat, flat], [like, like], [like, like]]);
     assert!(!half_test(&flat, &tables[REFERENCE][0]).pass);
@@ -2137,11 +2531,13 @@ fn r1b_picks_the_smallest_passing_baseline() {
 fn r1b_ignores_combinations_that_are_not_evaluable() {
     let like = hour_table(profile());
     let mut partly = like;
-    // One combination has an empty hour, and its ratio is far from flat;
-    // the window keeps other evaluable combinations.
+    // One combination has 3 episodes, all in one hour: far from the
+    // reference's split, but every expected count of `B` is below 1. The
+    // window keeps other evaluable combinations.
     partly[1][3] = [0; HOURS];
-    partly[1][3][5] = 9_000;
+    partly[1][3][5] = 3;
     let test = half_test(&partly, &like);
+    assert!(!test.combinations[1][3].evaluable);
     assert_eq!(test.k, W * Q - 1);
     assert!(test.pass);
     let tables = hour_tables([[partly, like], [like, like], [like, like]]);
@@ -2158,13 +2554,10 @@ fn r1b_stops_when_no_candidate_passes() {
 #[test]
 fn r1b_stops_on_a_window_without_an_evaluable_combination() {
     let like = hour_table(profile());
-    let mut empty = like;
-    for hours in &mut empty[2] {
-        hours[7] = 0;
-    }
+    let sparse = sparse_window(like, 2);
     // No evaluable combination fails, so the untestable window stops R1b.
-    assert!(!half_test(&empty, &like).fails);
-    let tables = hour_tables([[empty, like], [like, like], [like, like]]);
+    assert!(!half_test(&sparse, &like).fails);
+    let tables = hour_tables([[sparse, like], [like, like], [like, like]]);
     assert_eq!(
         r1b(&tables),
         R1b::NotEvaluable {
@@ -2179,11 +2572,8 @@ fn r1b_stops_on_a_window_without_an_evaluable_combination() {
 fn r1b_skips_a_failing_baseline_with_a_window_without_an_evaluable_combination() {
     let like = hour_table(profile());
     // B = 60 fails all 12 evaluable combinations (5m and 15m) on the first
-    // half, and 1h has an empty hour at every q.
-    let mut failing = hour_table([500; HOURS]);
-    for hours in &mut failing[2] {
-        hours[7] = 0;
-    }
+    // half, and 1h is too sparse to evaluate at every q.
+    let failing = sparse_window(hour_table([500; HOURS]), 2);
     let test = half_test(&failing, &like);
     assert_eq!(test.k, 2 * Q);
     assert!(test.fails);
@@ -2196,10 +2586,7 @@ fn r1b_skips_a_failing_baseline_with_a_window_without_an_evaluable_combination()
 #[test]
 fn r1b_stops_on_a_second_half_failure_before_an_unevaluable_window() {
     let like = hour_table(profile());
-    let mut failing = hour_table([500; HOURS]);
-    for hours in &mut failing[2] {
-        hours[7] = 0;
-    }
+    let failing = sparse_window(hour_table([500; HOURS]), 2);
     let tables = hour_tables([[like, failing], [like, like], [like, like]]);
     assert_eq!(r1b(&tables), R1b::SecondHalfFails { candidate: 0 });
 }
