@@ -1,6 +1,6 @@
 # ADR-050: The aggTrades fold — trades the `aggTrades` archive omits, restored from the `trades` archive at replay time
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-10-12
 
 Relation to earlier ADRs: this ADR supersedes ADR-047 decision 2 (the loss
@@ -563,6 +563,26 @@ all five:
      such a trade on D+1, not on D, and D+1 would then be a checked last
      day whose own tail needs D+2, so the line would move by a day rather
      than go away.
+
+## Acceptance
+
+Accepted 2026-10-12 after the #102 M3 run on the PR branch (`c18ffa1`), with
+item 4 amended as recorded there. The fold replay of 2025-10-01 …
+2026-06-09 passed with 0 unchecked days, 0 gaps and 0 domain rejections.
+All 32 measured days match M0 exactly (2109 inner trades, 541.622 BTC),
+with 0 edge folds and 0 unattributed or unresolved trades on every day,
+2025-10-01 included. Over the window the fold corrects 164 of 252 days:
+4572 aggregates, 38 312 trades, 6002.815 BTC. The 220 unsampled days
+contribute 132 corrected days, 36 203 trades and 5461.193 BTC, again with 0
+unattributed and 0 unresolved. A second replay printed byte-identical
+output (event-stream `466071660:dc99967b06f94ba9`). `none` delivers the
+same 466 071 660 events under a different hash
+(`466071660:6b9fbcee00530d30`). Peak RSS was 390 MiB and wall time 35–44
+min. The kline check gives 1658 → 1608 on the February window. On the 32
+days, every new mismatch is a cross-boundary bar: 2 bars on 2026-06-08.
+Both controls are `clean`, with identical hashes, final states and kline
+mismatch lists in both modes. Full results:
+https://github.com/Replikanti/mie/issues/102#issuecomment-6120345486
 
 References: ADR-003, ADR-022, ADR-028, ADR-030, ADR-031, ADR-034, ADR-038,
 ADR-039, ADR-040, ADR-045, ADR-047, ADR-048. Issues: #88, #90, #102.
