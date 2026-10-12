@@ -1,6 +1,6 @@
 # ADR-042: Derivatives context — open interest, funding and liquidations
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-10-09
 
 ## Context
@@ -331,6 +331,37 @@ Earlier decisions constrain the answer:
    uses; a count above 0 is recorded with the maximum, and the follow-up
    (which would be `derivatives.oi.sample@2`, ADR-029) is filed by the
    session that runs the acceptance.
+
+## Acceptance
+
+Accepted 2026-10-12. All three items of *Accept when* pass.
+
+1. **Archive versus live open interest: the archive measures T + 5 min.**
+   The query ran over the #9 soak overlap: 362 archive rows, 1 excluded
+   (no live sample within 10 000 ms), 0 excluded as ties, so n = 361. Of
+   those, 284 rows (78.67 %) lie nearer T + 5 min, against a threshold of
+   57.89 % (50 % + 1.5/√361).
+   - The absolute difference at T + 5 min has a median of 6.787 BTC and a
+     p99 of 274.154 BTC; at T, 28.317 and 470.435.
+   - Both series are in BTC.
+   - Archive dataset `6954c79c…`.
+   - Per the outcome table, ADR-034 D3 stands and the grid lag risk is
+     closed.
+   - Source: https://github.com/Replikanti/mie/issues/19#issuecomment-6084534723
+2. **Equivalence coverage.** The #13 run (main `d3f518c`, all seven
+   streams, ADR-041 *Acceptance*) reports both runs `EQUIVALENT` with state
+   compared. The 1h liquidation window was `Ready` for about 74 min of run
+   2.
+3. **Delivered OI spacing: 0 missing steps.** The run delivered 1078 OI
+   events, read from the same per-run recompute `mie equivalence` uses.
+   - Run 1: 270 events, no OI gap, spacing p50 9 996 ms, p99 10 734 ms,
+     max 15 049 ms.
+   - Run 2: 808 events, one `Disconnected` OI gap, spacing p50 9 996 ms,
+     p99 11 241 ms, max 11 924 ms.
+   - No spacing exceeds 25 000 ms without a gap. `step_tolerance_ms` 15 000
+     is therefore confirmed on the delivered quantity, with 9 951 ms of
+     margin, and no `derivatives.oi.sample@2` follows.
+   - Source: https://github.com/Replikanti/mie/issues/19#issuecomment-6122543501
 
 References: ADR-012, ADR-013, ADR-019, ADR-022, ADR-023, ADR-024, ADR-027,
 ADR-028, ADR-029, ADR-031, ADR-032, ADR-034, ADR-035, ADR-039, ADR-041.
