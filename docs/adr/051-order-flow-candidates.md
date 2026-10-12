@@ -40,7 +40,9 @@ What exists, and what each detector is built from:
 The design keeps tuned numbers to a minimum. Divergences are sign rules and
 need no threshold. Effort vs result needs two numbers, a baseline length
 `B` and one high quantile `q_hi`, fixed by two rules registered here in
-advance and run on the archive year of #12. Exhaustion and absorption are
+advance. The rules were first run on the archive year of #12 (M2); since
+#124 they run on a hold-out year that no run had read (D9), and the #12
+year is the development year. Exhaustion and absorption are
 built on effort vs result and add no tuned number of their own. The
 alternative, an independent threshold per detector set by judgment (a "top
 decile" effort, a 2× replenishment ratio, a minimum divergence size), means
@@ -50,8 +52,10 @@ forbids it.
 
 Delivery is in three steps under #22: M1 ships this ADR, the candidate
 framework and the divergences; M2 ships the measurement tool that runs
-R1b and R1 (below); M3 fixes `B` and `q_hi` from the M2 run and ships
-effort vs result, exhaustion and absorption.
+R1b and R1 (below); M3 fixes `B` and `q_hi` from the hold-out run of D9 and
+ships effort vs result, exhaustion and absorption. The M2 run on the #12
+year stopped on R1b; D9 records that result, the revision of R1b's
+statistic it led to (#124) and the hold-out year the revised rules run on.
 
 ## Decision
 
@@ -276,10 +280,14 @@ tf = 15m, 1h, 4h, 1d.
   the 3 × 6 (`B`, `q`) pairs. It would let the episode floor choose `B`
   for the count it happens to yield rather than for what `B` is for, and
   it fits two numbers to one half.
-- **Halves (both rules).** Split at 2026-04-01 12:00 UTC, the midpoint of
-  the 365-day window (the split ADR-037 and ADR-044 use). The first half
-  sets the value; the second half only checks it. One continuous replay;
-  an episode belongs to the half of its emission time.
+- **Halves (both rules).** Split at the midpoint of the measurement year
+  (D9): 2025-04-01 12:00 UTC for the hold-out year 2024-10-01 … 2025-09-30.
+  *Why the midpoint:* it gives two equal halves of the 365-day window, so
+  the half that sets a value and the half that checks it carry the same
+  exposure (the split ADR-037 and ADR-044 use on the #12 year, at
+  2026-04-01 12:00 UTC). The first half sets the value; the second half
+  only checks it. One continuous replay; an episode belongs to the half of
+  its emission time.
 - **`B`: fixed by R1b (M3).** `B` exists so that a rank does not depend on
   which hours of the day filled the baseline. R1b measures exactly that.
   - **Candidates.** `B` ∈ {60, 240, 1440}: the spans of the 1h, 4h and 1d
@@ -290,65 +298,123 @@ tf = 15m, 1h, 4h, 1d.
   - **Reference.** `B_ref` = 10 080, one week. It holds every UTC hour 7
     times and every weekday once, so neither the hour nor the weekday that
     filled it decides a rank. It is the longest baseline in the grid.
-  - **Statistic.** For each window length, each grid `q` and each half,
-    `n_B(h)` is the number of episodes emitted in UTC hour `h` (0–23) and
-    `r(h) = n_B(h) / n_ref(h)`. `U_B` is the coefficient of variation of
-    the 24 values of `r(h)`: the sample standard deviation (divisor 23)
-    over the mean. If `B` ranks every hour the way the reference does,
-    `r(h)` is the same in every hour and `U_B` is counting noise.
-  - *Why the ratio, not the raw per-hour rate.* A short baseline makes raw
+  - **Statistic (revised for #124; M2 used the coefficient of variation,
+    D9).** For each window length, each grid `q` and each half, `n_B(h)` and
+    `n_ref(h)` are the episodes of `B` and of the reference emitted in UTC
+    hour `h` (0–23), with `m(h) = n_B(h) + n_ref(h)`, `N_B = Σ n_B`,
+    `N_ref = Σ n_ref` and `N = N_B + N_ref`. The statistic is Pearson's X²
+    of the 2 × 24 table (`B`, reference) × hour:
+    `X² = Σ_h (n_B(h)·N_ref − n_ref(h)·N_B)² / (m(h)·N_B·N_ref)`, which
+    equals `Σ (O − E)²/E` over the 48 cells with `E_B(h) = m(h)·N_B/N` and
+    `E_ref(h) = m(h)·N_ref/N`.
+    - If `B` ranks every hour the way the reference does, each hour's
+      `m(h)` episodes split between the two baselines with the same
+      probability in every hour, whatever that hour's level, and X² follows
+      χ² with (2 − 1)(24 − 1) = 23 degrees of freedom. A different number
+      of hours or of baselines gives a different count; 23 is not a choice.
+  - *Why the split, not the raw per-hour rate.* A short baseline makes raw
     rates nearly uniform by construction: `B` = 60 ranks each window
     against its own hour, so "high effort" fires about as often in the
     quietest hour as in the busiest. That is the behaviour `B` must avoid,
-    so a uniformity test on raw rates would select the `B` this rule
-    exists to reject. The ratio is flat when `B` keeps the reference's
-    hour-of-day profile, whatever that profile is.
-  - *Why the coefficient of variation, not max/min.* Max/min depends on
-    the two most extreme of 24 noisy ratios, so its noise depends on the
-    smallest hourly count and has no simple null distribution. The
-    coefficient of variation uses all 24 hours, and its null distribution
-    is the one below.
+    so a uniformity test on raw rates would select the `B` this rule exists
+    to reject. The hour's own level cancels in the split, so an hour-of-day
+    profile the reference also has is never a failure, whatever that
+    profile is.
+  - *Why count-weighted, not the coefficient of variation of the ratios
+    `n_B(h)/n_ref(h)` (M2's statistic).* In X² each hour enters with the
+    information its count carries. The coefficient of variation gave an
+    hour of 10 episodes the weight of an hour of 58, and at `n_ref(h)` = 1–3
+    a ratio of Poisson counts is heavy-tailed, so its χ²-scaled null did not
+    hold there. One sparse hour decided M2's verdict (D9).
+  - *Why Pearson's X², not the likelihood-ratio G.* X² follows χ² more
+    closely at small expected counts (Larntz 1978; Koehler and Larntz
+    1980). On the #12 year's 1h, q = 0.975, second-half table of `B` = 1440,
+    which the evaluability rule below excludes, the two statistics give
+    p = 0.0097 and 0.00087, on either side of α/k: with G the verdict would
+    depend on the formula, not on the data.
   - *Why UTC hours.* They resolve the daily activity cycle, and M2 counts
     by them. A finer bin divides the counts and adds noise without asking
     a finer question.
-  - **Threshold.** `U_B ≤ c_k · σ0`, with
-    `σ0² = (1/24) · Σ_h (1/n_B(h) + 1/n_ref(h))` and
-    `c_k = sqrt(χ²₂₃(1 − 0.05/k) / 23)`.
-    - `σ0`: a count's Poisson variance equals its mean, so the relative
-      standard error of `r(h)` is `sqrt(1/n_B(h) + 1/n_ref(h))` when `B`
-      ranks like the reference.
-    - `c_k`: the sample variance of 24 such values is approximately
-      `σ0² · χ²₂₃ / 23` (23 = 24 hours − 1).
-    - `k` is the number of evaluable (window length, `q`) combinations of
-      that `B` and half, at most 3 × 6 = 18. The Bonferroni split keeps at
-      5 % the chance that a `B` which ranks like the reference fails
-      anywhere. 5 % is the level of `n_min`'s 1.96 (R1), so the two rules
-      share one error rate. `c_1` = 1.237, `c_18` = 1.418.
-    - Two approximations pull in opposite directions. Episodes cluster, so
-      the true noise is larger than Poisson and the test is stricter. `B`
-      and the reference read the same tape, so their counts are
-      correlated, the true noise of `r(h)` is smaller and the test is more
-      lenient. The ADR records `U_B` and `σ0` for every combination, so
-      the margin is visible.
+  - **Evaluability (Cochran 1954).** A combination is evaluable when no
+    expected count is below 1 and at most 9 of its 48 expected counts
+    (20 %) are below 5. Computed exactly in integers: `E_B(h) < c` ⇔
+    `m(h)·N_B < c·N`, and the same for `N_ref`. A combination with
+    `N_B = 0` or `N_ref = 0` is not evaluable, and so is one with an hour
+    where `m(h) = 0` (its expected counts are 0).
+    - *Why:* it is the standard condition under which X²'s χ² tail can be
+      trusted; 9 is the largest count that is at most 20 % of 48.
+    - *Looser:* the error of the asymptotic tail at α/k grows to the size of
+      the G example above, so a verdict can flip on the approximation.
+    - *Stricter (every expected count ≥ 5):* it removes M2's failing
+      combination (6 of 48 below 5), which is the carve-out the maintainer
+      ruled out (D9), and it leaves more window lengths without an
+      evaluable combination, so R1b stops more often for want of data.
+    - A non-evaluable combination is recorded and does not count against
+      `B`. A window length without one stops R1b only for a candidate that
+      fails no evaluable combination of that half (the order is under Stop
+      rules, below).
+  - **Threshold.** `X² ≤ χ²₂₃(1 − 0.05/k)`, where `k` is the number of
+    evaluable (window length, `q`) combinations of that `B` and half, at
+    most 3 × 6 = 18. The critical value is 35.172 at k = 1 and 46.258 at
+    k = 18.
+    - *Why 0.05:* the Bonferroni split keeps at 5 % the chance that a `B`
+      which ranks like the reference fails anywhere in its half. 5 % is
+      also the level of `n_min`'s 1.96 (R1), so the two rules share one
+      error rate.
+    - *What breaks at 0.01:* a distorting `B` passes more often, which is
+      the error R1b exists to prevent. *At 0.10:* a `B` that ranks like the
+      reference fails somewhere one time in ten, and R1b stops for nothing.
+  - **Approximations.** Two pull in opposite directions.
+    - Episodes cluster, so the true noise is larger than the multinomial
+      one and the test is stricter.
+    - `B` and the reference read the same tape, so their hour tables are
+      positively correlated, while X²'s homogeneity test assumes two
+      independent samples. The variance of the split is then smaller than
+      the test assumes, and the test is conservative toward PASS. On the
+      #12 year this side dominates near the reference: `B` = 1440's
+      evaluable X² lie between 8.6 and 27.0, with means of 16.8 (first
+      half) and 14.9 (second), well below the 23 degrees of freedom a
+      χ²₂₃ variable averages, and its median p is 0.84 on the first half
+      and 0.92 on the second, where 0.5 would be expected.
+    - Consequence, recorded before the hold-out run: a hold-out PASS of
+      `B` is weaker evidence than its nominal p says; a mild hour
+      distortion at 1440 could pass. This is recorded, not corrected. The
+      selection itself is unaffected: the test's job is to reject baselines
+      that rank by hour, and on the #12 year `B` = 60 and 240 fail every
+      evaluable combination with X² from 56.1 to 501.9 against critical
+      values of at most 45.4 (D9).
   - **Counting.** An episode belongs to the UTC hour of its emission time.
     Only episodes emitted while the reference baseline is ready count, so
-    every `B` is compared over the same minutes. A combination with an
-    hour where `n_B(h)` or `n_ref(h)` is 0 is not evaluable: it is
-    recorded and does not count against `B`.
+    every `B` is compared over the same minutes. The tool records, for
+    every combination, X², p, the cells below 5 and below 1, the
+    evaluability, k and the critical value.
   - **Selection.** `B` is the smallest candidate that passes in every
     evaluable combination on the first half. *Why the smallest:* a shorter
     baseline holds fewer values, warms up sooner (`Samples(B)`) and
     follows a change of volatility sooner; once the hour-of-day profile is
     kept, a longer baseline buys nothing R1b measures. The second half
     checks the chosen `B` with the same test.
-  - **Stop rules.** Stop and report on #22 if no candidate passes on the
-    first half, if a window length has no evaluable combination, or if the
-    chosen `B` fails on the second half. `B_ref` is never picked by
+  - **Stop rules.** The candidates are taken smallest first, and each `B`
+    is decided by the first of these steps that applies:
+    1. `B` fails an evaluable combination on the first half: `B` is out and
+       the next candidate is taken. A window length of `B` without an
+       evaluable combination does not matter then: a failing combination
+       already rules `B` out.
+    2. A window length has no evaluable combination on the first half:
+       stop. A larger `B` is not taken: it would be picked while this one
+       may still pass.
+    3. `B` fails an evaluable combination on the second half: stop.
+    4. A window length has no evaluable combination on the second half:
+       stop.
+    5. Otherwise `B` is fixed.
+
+    If every candidate leaves at step 1, no candidate passes on the first
+    half: stop. Every stop is reported on #22. `B_ref` is never picked by
     default: it cannot be tested against itself, and its 7× state and
     7-day warm-up are costs a human accepts, not a rule.
 - **`q_hi`: fixed by R1 (M3), at the `B` R1b fixed.** `q_hi` is the
   highest value of {0.80, 0.85, 0.90, 0.95, 0.975, 0.99} at which, on the
-  first half of the #12 year, every window length yields at least
+  first half of the measurement year (D9), every window length yields at least
   `n_min` = 97 episodes in every floor cell (MC below).
   - **Cells.** #28 splits its comparisons by regime and by location (its
     scope: "regime/location splits", with location named as "VAH/VAL,
@@ -520,9 +586,12 @@ run on the same clock (ADR-043 D6).
 | `B` ∈ {60, 240, 1440} | The 1h, 4h and 1d bar spans in one-minute evaluations; 1440 is the shortest baseline holding every UTC hour | derivation; **value fixed by R1b (M3)** |
 | `B_ref` 10 080 | One week: every hour 7×, every weekday once; the longest baseline in the grid | derivation |
 | R1b's 24 UTC hours | The daily activity cycle's resolution; M2 counts by them | judgment |
-| R1b's `σ0` | Poisson relative error of a ratio of two counts | derivation |
-| `c_k`, 23 degrees of freedom | Sample variance of 24 values ~ `σ0² χ²₂₃ / 23` | derivation |
-| 5 % family level, k ≤ 18 | Bonferroni over at most 3 windows × 6 `q`; the level of `n_min`'s 1.96 | derivation + shared level |
+| R1b's statistic: Pearson X² of the 2 × 24 table (`B`, reference) × hour | The count-weighted test of "the same hour profile, up to scale"; the hour's level cancels in the split, and each hour weighs by its count (M2's coefficient of variation did not, D9) | derivation |
+| 23 degrees of freedom | (2 − 1) baselines × (24 − 1) hours | derivation |
+| Critical value χ²₂₃(1 − 0.05/k): 35.172 at k = 1, 46.258 at k = 18 | The χ²₂₃ quantile at the Bonferroni-split family level | derivation |
+| Evaluability: no expected count below 1, at most 9 of 48 below 5 | Cochran's rule (1954): where X²'s χ² tail can be trusted; 9 is the largest count ≤ 20 % of 48. Looser lets the tail error flip a verdict at α/k; stricter (all ≥ 5) carves out M2's failing combination and stops R1b for want of data | published rule + what breaks |
+| Pearson's X² rather than G | X² follows χ² more closely at small expected counts (Larntz 1978; Koehler and Larntz 1980); G gives p 0.00087 where X² gives 0.0097 on a #12-year table, either side of α/k | published comparison |
+| 5 % family level, k ≤ 18 | Bonferroni over at most 3 windows × 6 `q` evaluable combinations, so a `B` that ranks like the reference fails anywhere in a half at most 5 % of the time; the same level as `n_min`'s 1.96, so both rules share one error rate. 1 % lets a distorting `B` pass more often; 10 % stops R1b for nothing one time in ten | derivation + shared level |
 | `q_hi` grid {0.80 … 0.99} | Tail roughly halved per step; finer would fit the sample | judgment + derivation; **value fixed by R1 (M3)** |
 | `n_min` 97 | 1.96² · 0.25 / 0.10² = 96.04 in the regime × location cells #28 estimates | derivation from the 10 pp judgment |
 | 10 pp half-width | The coarsest contrast worth testing against the baseline | judgment |
@@ -533,7 +602,164 @@ run on the same clock (ADR-043 D6).
 | 6 bps at the extreme | One ordinary minute's move (ADR-044 M1 first-half p75 5.93 bps) | measurement + own reason |
 | 5 bps absorption band | ADR-043 D8's cluster band, ≥ 90 % available; 1 bps holds only 42–68 levels | inherited band, own reason |
 | Replenishment `added ≥ filled` | "At least as much came back"; any other ratio is tuned | derivation |
-| Halves split 2026-04-01 12:00 UTC | Midpoint of the 365-day window | derivation |
+| Halves split 2025-04-01 12:00 UTC | The measurement year's midpoint: two equal halves of the 365-day window | derivation |
+| Measurement year 2024-10-01 … 2025-09-30 | The most recent year no run, fixture or constant had read (attested on #124), with the development year's 365 days, so the per-half counts the evaluability rule and R1's floor of 97 depend on are at the scale those rules were written for | derivation, with an attestation |
+| 730 expected files | 365 days × 2 streams (`aggTrades`, `metrics`) | derivation |
+
+### D9. The R1b revision and the hold-out year (#124)
+
+1. **The M2 result is a valid STOP.** The M2 run of the measurement tool
+   on the #12 year (2025-10-01 … 2026-09-30, [result on #22](https://github.com/Replikanti/mie/issues/22#issuecomment-6132263629))
+   reproduced the engine with 0 mismatches (R0) and stopped R1b by its own
+   rule: `B` = 1440 failed on the second half. Under the statistic M2 ran
+   (the coefficient of variation `U_B` of the 24 ratios `n_B(h)/n_ref(h)`
+   against `c_k · σ0`):
+
+   | B | first half | second half |
+   |---|---|---|
+   | 60 | FAIL | FAIL |
+   | 240 | FAIL | FAIL |
+   | 1440 | PASS (k = 13) | FAIL (k = 14) |
+
+   `B` = 1440's second half failed on one combination, 1h at q = 0.950:
+   `U_B` = 1.0472 against `c_k · σ0` = 1.4046 × 0.5374 = 0.755. Its hour
+   tables, UTC hours 0–23:
+
+   - `n_B`: 5, 19, 8, 4, 13, 6, 12, 9, 9, 7, 5, 21, 6, 23, 29, 30, 39, 13,
+     13, 16, 8, 12, 8, 12 (327 episodes);
+   - `n_ref`: 3, 14, 8, 3, 3, 6, 12, 1, 4, 8, 5, 24, 8, 20, 24, 27, 19, 11,
+     12, 11, 11, 8, 13, 2 (257 episodes).
+
+   The failure is not a 13–16 UTC shift. Split by hour, the squared
+   deviations of the ratios from their mean of 1.86 (which make `U_B²`)
+   come from:
+
+   - UTC 7, 9 against 1 (ratio 9.0): 59 %;
+   - UTC 23, 12 against 2 (ratio 6.0): 20 %;
+   - UTC 4, 13 against 3 (ratio 4.33): 7 %;
+   - UTC 13–16, 23, 29, 30 and 39 against 20, 24, 27 and 19 (ratios 1.15,
+     1.21, 1.11 and 2.05): 1.7 % together.
+
+   The busy hours are busy for both baselines, so their ratio stays near
+   the mean. The coefficient of variation gave every hour the same weight
+   whatever its count (hour 7 holds 10 episodes, hour 16 holds 58), and a
+   ratio of Poisson counts with a denominator of 1–3 is heavy-tailed, so
+   `σ0`'s χ² scaling did not hold there: one sparse hour decided the
+   verdict.
+2. **No carve-out.** The failing combination stays in the test. Under the
+   revised statistic (D5) it is evaluable: 6 of its 48 expected counts are
+   below 5 and none is below 1.
+3. **Where the revision came from.** The revised statistic was chosen on
+   the #12 year only, after that year's result was seen. That year is the
+   development year from here on and carries no evidential weight for the
+   revision.
+4. **Attestation.** No run, fixture or constant of #22 read 2024-10-01 …
+   2025-09-30 before this revision; the check is posted on #124. The
+   repository's only market data from before 2025-10 is the ATR reference
+   fixture, which covers 2024-07-01 … 2024-08-31.
+5. **The measurement year is 2024-10-01 … 2025-09-30.**
+   - *Why this year:* no run, fixture or constant has read it. It has the
+     same 365 days as the development year, so the per-half counts that
+     the evaluability rule and R1's floor of 97 depend on are at the scale
+     those rules were written for. It is also the most recent untouched
+     year, the closest to the market the constants will run on.
+   - *What breaks otherwise:* a shorter window makes more combinations
+     non-evaluable and more R1 cells non-servable. An older year is just as
+     untouched but further from the live market. Two years double the
+     import and the replay and mix more regimes.
+6. **Data.** `aggTrades` and `metrics` only, imported with
+   `mie archive-import` (ADR-034). No `trades`, so the fold (ADR-050, D8
+   default) leaves every day unchecked and delivers the aggregates as
+   published.
+   - *Why no `trades`:* R1b compares two baselines on one tape. The
+     omission the fold repairs was measured on the #12 year at no more than
+     478 uncovered trades a day (ADR-047), against about 1.65 M aggregates a
+     day (603 218 226 rows over 365 days, `docs/data-availability.md`),
+     which cannot move that comparison. R1's counts move only through the
+     rare rising edge such a trade flips. A year of `trades` costs about
+     23–29 GB stored (ADR-050's 16–20 GB per 252 days, scaled to 365) and
+     hours of download.
+   - The fold report's unchecked line is recorded with the result.
+7. **Pre-measurement stop rules.** Any one of these stops the process and
+   is reported on #124 and #22. The window is never shifted, shortened or
+   filled.
+   - a missing `aggTrades` or `metrics` daily file in the coverage probe
+     (730 files expected: 365 days × 2 streams);
+   - a file the importer rejects;
+   - a trade-id break in `aggTrades` reported by `mie archive-verify`;
+   - any other `mie archive-verify` failure over the window: a normalize
+     error, a hash mismatch on read, a row count or ledger that disagrees
+     with the store, or a file not imported — `archive-verify` must print
+     PASS;
+   - an error of the measurement run's archive replay caused by such data
+     (a file that does not read, a record that does not normalize). The
+     run panics on it before its report is printed, so no R0, R1b or R1
+     outcome exists yet.
+
+   Holes over 60 s without an id break are recorded, not stops: consecutive
+   ids mean nothing is missing. *Why a human may remedy these stops:* they
+   happen before any episode is counted, so a remedy cannot tune on R1b or
+   R1 outcomes.
+8. **One run.** R0, R1b and R1 run once on the hold-out year, at a recorded
+   commit.
+   - A re-run is allowed only after an infrastructure failure (the process
+     killed, out of memory, out of disk). It uses the same commit and the
+     same store, and the failed attempt is reported.
+   - A result is never re-run to change it.
+9. **Verdict.**
+   - *Pass:* R0 with 0 mismatches and 0 rejections, R1b fixes `B`, and R1
+     fixes `q_hi`. #22 M3 then uses those two values.
+   - *Anything else:* M3 stays blocked, and the result is recorded here and
+     on #22. Neither year is used to re-tune. A remedy is a new human
+     decision, and it would need data that neither year can provide.
+   - *What a PASS of R1b means:* the test is conservative toward PASS near
+     the reference, because `B`'s and the reference's hour tables come from
+     the same tape and are positively correlated while X² assumes
+     independent samples (D5, Approximations). On the development year
+     `B` = 1440 gives X² of 8.6–27.0, means 16.8 and 14.9 per half, well
+     below the 23 a χ²₂₃ variable averages. A hold-out PASS of `B` is
+     therefore weaker evidence than its nominal p. The selection of `B` is
+     unaffected: `B` = 60 and 240 fail by X² 56.1–501.9 against critical
+     values of at most 45.4.
+10. **The use of the development-year re-run.** The revised statistic is a
+    pure function of the per-hour tables M2 printed, so it was re-run on
+    them without a replay (the tool's `r1b_from_a_logged_run` on the M2
+    log). Diagnosis only, not a verdict:
+
+    | B | half | evaluable (k) | X² of the evaluable combinations | critical | diagnosis |
+    |---|---|---|---|---|---|
+    | 60 | first | 14 | 106.2 – 465.0, all fail | 45.378 | fails |
+    | 60 | second | 14 | 119.3 – 501.9, all fail | 45.378 | fails |
+    | 240 | first | 14 | 68.4 – 341.9, all fail | 45.378 | fails |
+    | 240 | second | 14 | 56.1 – 373.5, all fail | 45.378 | fails |
+    | 1440 | first | 12 | 9.8 – 23.2, all pass | 44.833 | passes |
+    | 1440 | second | 14 | 8.6 – 27.0, all pass | 45.378 | passes |
+
+    The formerly failing combination (1440, second half, 1h, q = 0.950)
+    gives X² = 27.0, p = 0.256. `B` = 1440's median p is 0.84 on the first
+    half and 0.92 on the second.
+
+    The re-run **may** be used for:
+    1. checking that the implementation computes what this ADR says,
+       through unit-test pins on three real tables;
+    2. showing that the failing combination is still tested, not carved
+       out;
+    3. showing that the test still has power against hour-ranking
+       baselines (60, 240);
+    4. this diagnosis table, labelled as diagnosis.
+
+    It **may not** be used for:
+    1. fixing `B` or `q_hi`;
+    2. meeting any *Accept when* item;
+    3. claiming that R1b passes;
+    4. choosing or adjusting any constant after the hold-out year is
+       touched (the evaluability rule, the family level, the `B` set, the
+       grid, `n_min`, the bins, the halves).
+
+    R1 is not evaluated as a fixing rule on the development year. The
+    revised rule was chosen after the #12-year result was seen, so that
+    year carries no evidential weight for it. The hold-out run decides,
+    once.
 
 ## Consequences
 
@@ -555,8 +781,20 @@ run on the same clock (ADR-043 D6).
   is live only), so contexts from archive and live differ by those levels.
 - A divergence across a trades gap carries `feed_gap`: the CVD change
   misses whatever traded inside the gap.
-- Effort vs result, exhaustion and absorption wait for M2's measurement;
-  until M3 the engine computes only the divergences.
+- Effort vs result, exhaustion and absorption wait for the hold-out run
+  (D9); until M3 the engine computes only the divergences. If that run
+  stops, M3 stays blocked until a new human decision.
+- R1b's test is lenient near the reference: both baselines read the same
+  tape, so their hour tables are positively correlated and X² is
+  conservative toward PASS (D5, D9). A mild hour distortion of `B` = 1440
+  could pass; a baseline that ranks by hour fails with a wide margin.
+- The hold-out year lives in its own raw store, with its own import ledger
+  and staging. The development year's replays and their dataset versions
+  are untouched, and the hold-out replay reads no development-year
+  lookahead day (ADR-050 D6). That store lacks the 2025-09-30 23:55
+  open-interest sample, which Binance files in the 2025-10-01 `metrics`
+  file: the year's last 5-minute open-interest point is missing. It
+  touches no R1b or R1 count, and it is recorded.
 - Without a magnitude threshold, the divergence event rate is set by the
   swing rate and the share of pairs that diverge, which M2 records per
   timeframe on the archive year. #25 owns episode de-duplication.
@@ -584,6 +822,33 @@ run on the same clock (ADR-043 D6).
   fits two numbers to one half (D5). Rejected.
 - **Raw per-hour rates or max/min for R1b.** Select the baseline R1b
   exists to reject, or have no simple null (D5). Rejected.
+- **The coefficient of variation of the ratios `n_B(h)/n_ref(h)`** (M2's
+  statistic). Weighs every hour alike whatever its count, and a ratio with
+  a denominator of 1–3 is heavy-tailed; one sparse hour decided M2's
+  verdict (D9). Rejected.
+- **The coefficient of variation with a higher zero-floor.** Any floor that
+  drops hours with `n_ref(h)` ≤ 3 drops exactly M2's failing combination:
+  a carve-out by another name. Rejected.
+- **The likelihood-ratio statistic G.** Follows χ² less closely at small
+  expected counts; on a #12-year table it puts p on the other side of α/k
+  than X² (D5). Rejected.
+- **An exact conditional (Monte Carlo) test.** Valid at any count, but it
+  needs a seeded sampler and a draw count, and its Monte Carlo error sits
+  right at α/k. The evaluability rule makes the χ² tail adequate wherever
+  the test is used. Rejected.
+- **A time-of-day-aware baseline** (ranking each window against the same
+  hour of earlier days). `B` exists so that a rank does not depend on which
+  hours filled the baseline; a per-hour baseline makes raw rates uniform
+  across hours, the `B` = 60 behaviour R1b rejects, so it fails against
+  the one-week reference by construction. M2 shows no hour-of-day
+  distortion at 1440 that would need correcting (D9). Rejected.
+- **A different `B` set.** The M2 failure is a property of the statistic,
+  not of `B` (D9), so a new set would be chosen on an artifact. Rejected.
+- **Carving out 1h at q ≥ 0.950.** It would choose the test by its result
+  on the year being tested. Rejected.
+- **Taking the #12-year re-run as the verdict.** The revised statistic was
+  chosen after that year's result was seen, so the year carries no
+  evidential weight for it (D9). Rejected; the hold-out year decides.
 - **A cooldown or hysteresis on emission.** Parameters; the rising edge
   needs none, and episodes are #25's. Rejected for `@1`.
 
@@ -593,23 +858,30 @@ run on the same clock (ADR-043 D6).
   reproduces the engine with 0 mismatches:
   - divergences, effort vs result and exhaustion over the full #12 year
     (2025-10-01 … 2026-09-30), including the location bin of every
-    effort-vs-result episode;
+    effort-vs-result episode (done for the divergences in M2), and over
+    the hold-out year (2024-10-01 … 2025-09-30, D9);
   - absorption over every live raw store with depth available at run time
     (the #10 soak, the #13 runs).
-- **R1b.** The `B` rule passes on both halves.
-- **R1.** The `q_hi` rule passes on both halves, at R1b's `B`.
+- **R1b.** The `B` rule passes on both halves of the hold-out year.
+- **R1.** The `q_hi` rule passes on both halves of the hold-out year, at
+  R1b's `B`.
 - **Recorded, not criteria:**
   - divergence shares per timeframe: consecutive same-side swing pairs,
     the share at a further extreme, the CVD-divergent share and the
     OI-divergent share;
-  - R1b's per-hour episode counts, `U_B`, `σ0` and `c_k` for every `B`,
-    window length and `q`, per half;
+  - R1b's per-hour episode counts and, for every `B`, window length and
+    `q`, per half: X², p, the cells below 5 and below 1, the evaluability,
+    k and the critical value;
   - R1's per-cell counts per half for every grid `q` at the chosen `B`,
     each cell marked floor, pooled or unpowered, plus the unlabelled and
     unlocated counts;
   - exhaustion and absorption rates;
-  - the year's replay wall time, against ADR-037's 1 166.6 s.
+  - the year's replay wall time, against ADR-037's 1 166.6 s;
+  - for the hold-out run: the coverage table, the `archive-verify`
+    summary, the fold report's unchecked line, the dataset version and the
+    commit.
 - No clause lets a mismatch be explained away.
 
-Every criterion is reachable on this host: the #12 archive year is local,
-and the live stores exist from the #10 soak on.
+Every criterion is reachable once the hold-out import completes, and
+otherwise settled by the D9 stop rules; the live stores exist from the #10
+soak on.
