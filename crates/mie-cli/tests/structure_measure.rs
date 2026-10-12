@@ -91,6 +91,7 @@
 
 use mie_adapter_binance::archive::ArchiveStream;
 use mie_adapter_binance::archive::catalog::{Period, PeriodKind, day_label};
+use mie_adapter_binance::archive::fold::TradeCorrection;
 use mie_adapter_binance::archive::replay::ArchiveReplay;
 use mie_adapter_parquet::ParquetRawStore;
 use mie_cli::replay::parse_bound;
@@ -1962,7 +1963,13 @@ fn measure_structure() {
         end: EventTime::from_millis(to),
     };
     let store = ParquetRawStore::new(&raw_root);
-    let replay = ArchiveReplay::new(&store, "BTCUSDT", &[ArchiveStream::AggTrades]);
+    // As measured: aggTrades as published, without the ADR-050 fold.
+    let replay = ArchiveReplay::new(
+        &store,
+        "BTCUSDT",
+        &[ArchiveStream::AggTrades],
+        TradeCorrection::None,
+    );
     let mut stream = replay.replay(window).unwrap().stream;
     // S6: 00:00 UTC on the 1st of every month strictly inside the window.
     let cold_starts: Vec<EventTime> = PeriodKind::Monthly

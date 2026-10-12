@@ -12,6 +12,13 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
 
 ### Added
 
+- **`--trade-correction fold|none` (ADR-050, #102)** on `mie replay`,
+  `mie experiment run` (both with `--source archive`) and
+  `mie archive-kline-check` (with `--trade-source aggTrades`). `none`
+  delivers `aggTrades` exactly as published and reproduces the dataset
+  versions and event-stream hashes recorded before ADR-050; `mie replay`
+  prints a fold summary, one line per corrected day and one per corrected
+  1m minute.
 - **`capture-report` check 7, kline reconciliation (ADR-048).** Closed
   `kline_1m` minutes and `aggTrade` records are reconciled in trade-id
   space per run; a block of minutes whose kline volume differs from its
@@ -51,6 +58,24 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
 
 ### Changed
 
+- **Breaking: archive replays, experiments and the aggTrades kline check
+  fold by default (ADR-050, #102).** Trades the `aggTrades` archive omits
+  (2025-10-01 … 2026-06-09, ADR-047) are restored from imported `trades`
+  files: each is added to the quantity of the aggregate right below it,
+  also across a day boundary, or becomes a `MissingData` gap when its price
+  or side differs, when an earlier trade of the same gap did not fold, or
+  when the aggregate below lies in a day the replay does not have
+  (`unresolved`); a gap the window ends inside is a trailing gap. The day
+  after the window is read for the tail of the window's last aggregate and
+  never delivered, so a folded quantity does not depend on where the window
+  ends; when the store lacks that day's `trades` or `aggTrades`, the tail is
+  a trailing gap and a `fold unchecked tail` report line. Where
+  `trades` files exist for a window, its archive dataset version and
+  event-stream hash change; experiment specs pinned to an earlier version
+  run with `--trade-correction none`, and a mismatch under the fold prints
+  that hint. `ArchiveReplay::new`, `with_defaults` and `open_requests` take
+  an explicit `TradeCorrection`. Reports of `mie replay --source archive`
+  and `archive-kline-check` name the correction in their first line.
 - **Breaking: the order-book checkpoint audit has a per-side level floor
   and an exact window width (ADR-049, #98).** A checkpoint without a
   mismatch whose bid or ask side compared fewer than `MIN_SIDE_LEVELS` (1)

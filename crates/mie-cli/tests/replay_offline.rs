@@ -16,6 +16,7 @@ use common::{
     depth_snapshot, depth_transports, ingest, ingest_depth, journal,
 };
 use mie_adapter_binance::archive::catalog::{DAY_MS, parse_day};
+use mie_adapter_binance::archive::fold::TradeCorrection;
 use mie_adapter_binance::archive::normalize::record_time as archive_record_time;
 use mie_adapter_binance::archive::{ARCHIVE_SOURCE, ArchiveStream};
 use mie_adapter_binance::transport::{Clock, HttpGet};
@@ -678,6 +679,7 @@ fn an_archive_replay_is_exact_deterministic_and_marks_a_missing_day() {
         source: ReplaySource::Archive {
             config: config.clone(),
             streams: None,
+            correction: TradeCorrection::Fold,
         },
         window: window(d0 * DAY_MS, (d2 + 1) * DAY_MS),
     };
@@ -687,7 +689,16 @@ fn an_archive_replay_is_exact_deterministic_and_marks_a_missing_day() {
     assert!(outcome.pass, "{text}");
     // `trades` is configured but opt-in for replay.
     assert!(
-        text.contains("streams aggTrades,fundingRate,metrics\n"),
+        text.contains("streams aggTrades,fundingRate,metrics correction fold\n"),
+        "{text}"
+    );
+    // No `trades` file was imported: the days are unchecked (ADR-050).
+    assert!(
+        text.contains(
+            "fold summary: corrected 0 [-], clean 0 [-], unchecked 2 \
+             [2026-10-06,2026-10-08]; aggregates 0, trades folded 0, qty 0.00000000, \
+             unattributed 0, edge trades folded 0, edge qty 0.00000000, unresolved 0\n"
+        ),
         "{text}"
     );
     assert!(text.contains("  missing day 2026-10-07"), "{text}");
@@ -709,6 +720,7 @@ fn an_archive_replay_is_exact_deterministic_and_marks_a_missing_day() {
             ArchiveStream::FundingRate,
             ArchiveStream::Metrics,
         ],
+        TradeCorrection::Fold,
     );
     let opened = archive.replay(request.window).unwrap();
     assert_eq!(Some(&opened.dataset), outcome.dataset.as_ref());
@@ -751,6 +763,7 @@ fn an_archive_replay_is_exact_deterministic_and_marks_a_missing_day() {
         source: ReplaySource::Archive {
             config,
             streams: Some(vec![ArchiveStream::BookDepth]),
+            correction: TradeCorrection::Fold,
         },
         window: request.window,
     });
@@ -771,4 +784,224 @@ fn bounds_take_epoch_ms_or_inclusive_days() {
     );
     assert_eq!(replay::parse_bound("--to", "1234", true), Ok(1_234));
     assert!(replay::parse_bound("--to", "06.10.2026", true).is_err());
+}
+
+/// Three archive days for the aggTrades fold (ADR-050), filed as the
+/// importer files them: 2026-02-05 with `aggTrades` and `trades` and three
+/// uncovered tail trades (two after aggregate 1002, one after 1003 in the
+/// next minute), 2026-02-06 with `aggTrades` only (unchecked) and
+/// 2026-02-07 with both and nothing uncovered (clean); 2026-02-08, which
+/// would hold the tail of 2026-02-07's last aggregate, is not imported.
+fn fold_fixture(config: &ArchiveConfig) -> (i64, i64) {
+    let d = parse_day("2026-02-05").unwrap();
+    let m0 = d * DAY_MS + 10 * 60_000;
+    let agg = |id: u64, price: &str, qty: &str, first: u64, last: u64, time: i64, maker: bool| {
+        (
+            ArchiveStream::AggTrades,
+            format!("{id},{price},{qty},{first},{last},{time},{maker}"),
+        )
+    };
+    let trade = |id: u64, price: &str, qty: &str, time: i64, maker: bool| {
+        (
+            ArchiveStream::Trades,
+            format!("{id},{price},{qty},0,{time},{maker}"),
+        )
+    };
+    let rows = vec![
+        agg(1001, "70000.10", "0.010", 5001, 5001, m0 + 100, false),
+        agg(1002, "70000.20", "0.020", 5002, 5003, m0 + 200, true),
+        agg(1003, "70000.30", "0.030", 5006, 5006, m0 + 59_990, false),
+        agg(1004, "70000.40", "0.040", 5008, 5008, m0 + 60_020, false),
+        agg(1005, "70000.50", "0.050", 5009, 5009, m0 + 300_000, true),
+        trade(5001, "70000.10", "0.010", m0 + 100, false),
+        trade(5002, "70000.20", "0.015", m0 + 200, true),
+        trade(5003, "70000.20", "0.005", m0 + 210, true),
+        trade(5004, "70000.20", "0.005", m0 + 250, true),
+        trade(5005, "70000.20", "0.001", m0 + 260, true),
+        trade(5006, "70000.30", "0.030", m0 + 59_990, false),
+        trade(5007, "70000.30", "0.002", m0 + 60_010, false),
+        trade(5008, "70000.40", "0.040", m0 + 60_020, false),
+        trade(5009, "70000.50", "0.050", m0 + 300_000, true),
+        agg(
+            1006,
+            "70000.60",
+            "0.060",
+            5010,
+            5010,
+            (d + 1) * DAY_MS + 5,
+            false,
+        ),
+        agg(
+            1007,
+            "70000.70",
+            "0.070",
+            5011,
+            5011,
+            (d + 2) * DAY_MS + 5,
+            true,
+        ),
+        trade(5011, "70000.70", "0.070", (d + 2) * DAY_MS + 5, true),
+    ];
+    import_rows(config, &rows);
+    (d * DAY_MS, (d + 3) * DAY_MS)
+}
+
+/// `mie replay` before ADR-050 on [`fold_fixture`], aggTrades only: the
+/// dataset version and event-stream hash `--trade-correction none` must
+/// reproduce.
+const PRE_FOLD_DATASET: &str = "7df5e33928d036b47e31c3bf76d9c17adb193c20e349e6ebdd8df00dc39e2920";
+const PRE_FOLD_EVENT_STREAM: &str = "7:2bdd81c9f56a0580";
+
+#[test]
+fn an_archive_replay_folds_uncovered_trades_and_none_reproduces_the_published_data() {
+    let dir = TempDir::new("replay-fold");
+    let config = archive_config(dir.path());
+    let (start, end) = fold_fixture(&config);
+    let request = |correction| ReplayRequest {
+        source: ReplaySource::Archive {
+            config: config.clone(),
+            streams: Some(vec![ArchiveStream::AggTrades]),
+            correction,
+        },
+        window: window(start, end),
+    };
+
+    let (none, none_text) = run_replay(&request(TradeCorrection::None));
+    assert!(none.pass, "{none_text}");
+    assert_eq!(
+        none.dataset.as_ref().map(|v| v.as_str()),
+        Some(PRE_FOLD_DATASET)
+    );
+    assert_eq!(
+        none.stream_hash.map(|h| h.to_string()).as_deref(),
+        Some(PRE_FOLD_EVENT_STREAM)
+    );
+    assert!(none_text.contains(" correction none\n"), "{none_text}");
+    assert!(!none_text.contains("\nfold"), "{none_text}");
+
+    let (fold, text) = run_replay(&request(TradeCorrection::Fold));
+    assert_eq!(
+        run_replay(&request(TradeCorrection::Fold)),
+        (fold.clone(), text.clone())
+    );
+    assert!(fold.pass, "{text}");
+    assert_eq!(fold.events, none.events);
+    assert_ne!(fold.dataset, none.dataset);
+    assert_ne!(fold.stream_hash, none.stream_hash);
+    assert!(text.contains(" correction fold\n"), "{text}");
+    // 1002 gains trades 5004 and 5005, 1003 gains 5007, whose own minute
+    // is the next one: a fold is reported in its aggregate's minute.
+    let fold_lines: Vec<&str> = text.lines().filter(|l| l.starts_with("fold")).collect();
+    assert_eq!(
+        fold_lines,
+        [
+            "fold summary: corrected 1 [2026-02-05], clean 1 [2026-02-07], unchecked 1 \
+             [2026-02-06]; aggregates 2, trades folded 3, qty 0.00800000, unattributed 0, \
+             edge trades folded 0, edge qty 0.00000000, unresolved 0",
+            "fold unchecked tail 2026-02-07: aggregate 1007, the store lacks the trades or \
+             aggTrades of 2026-02-08 that would hold its tail",
+            "fold 2026-02-05: aggregates 2, trades 3, qty 0.00800000, unattributed 0, edge \
+             trades 0, edge qty 0.00000000, unresolved 0",
+            "fold minute 1770250200000: aggregates 2, trades 3, qty 0.00800000",
+        ],
+        "{text}"
+    );
+    // The window's last aggregate (1007, checked day 2026-02-07) has no
+    // next day to check its tail: gapped to the window end, not delivered.
+    assert!(
+        text.contains(
+            "\ntrailing gap Trades [1770422400005, 1770508800000] ms MissingData (open at the \
+             window end, not delivered)\n"
+        ),
+        "{text}"
+    );
+    assert!(!none_text.contains("trailing gap"), "{none_text}");
+    // The provenance precedes the delivery lines.
+    let summary = text.find("fold summary").unwrap();
+    assert!(summary < text.find("delivered Trades").unwrap(), "{text}");
+    assert!(summary > text.find("stream aggTrades").unwrap(), "{text}");
+
+    // The folded quantities, exactly.
+    let store = ParquetRawStore::new(&config.paths.raw_root);
+    let qty_of = |correction| -> BTreeMap<u64, Qty> {
+        let replay = mie_adapter_binance::archive::replay::ArchiveReplay::new(
+            &store,
+            "BTCUSDT",
+            &[ArchiveStream::AggTrades],
+            correction,
+        );
+        let mut stream = replay.replay(window(start, end)).unwrap().stream;
+        drain(&mut stream)
+            .into_iter()
+            .filter_map(|e| match e {
+                MarketEvent::Trade(t) => Some((t.trade_id, t.qty)),
+                _ => None,
+            })
+            .collect()
+    };
+    let (published, folded) = (qty_of(TradeCorrection::None), qty_of(TradeCorrection::Fold));
+    let changed: Vec<(u64, String, String)> = published
+        .iter()
+        .filter(|(id, q)| folded[id] != **q)
+        .map(|(id, q)| (*id, q.to_string(), folded[id].to_string()))
+        .collect();
+    assert_eq!(
+        changed,
+        [
+            (1002, "0.02000000".to_owned(), "0.02600000".to_owned()),
+            (1003, "0.03000000".to_owned(), "0.03200000".to_owned()),
+        ]
+    );
+}
+
+/// Runs the `mie` binary; returns its exit code and standard error.
+fn mie(args: &[&str]) -> (Option<i32>, String) {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_mie"))
+        .args(args)
+        .output()
+        .expect("mie runs");
+    (
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn the_trade_correction_is_an_archive_option() {
+    let (code, stderr) = mie(&[
+        "replay",
+        "--config",
+        "absent.toml",
+        "--from",
+        "2026-02-05",
+        "--to",
+        "2026-02-05",
+        "--source",
+        "live",
+        "--trade-correction",
+        "none",
+    ]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(
+        stderr.contains("--trade-correction applies to --source archive only"),
+        "{stderr}"
+    );
+    let (code, stderr) = mie(&[
+        "replay",
+        "--config",
+        "absent.toml",
+        "--from",
+        "2026-02-05",
+        "--to",
+        "2026-02-05",
+        "--source",
+        "archive",
+        "--trade-correction",
+        "kline",
+    ]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(
+        stderr.contains("--trade-correction \"kline\" is neither fold nor none"),
+        "{stderr}"
+    );
 }

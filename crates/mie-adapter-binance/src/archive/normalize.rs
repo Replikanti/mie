@@ -22,7 +22,7 @@
 //! | `fundingRate` | `FundingSettlement` | `calc_time` |
 //! | `metrics` | `OpenInterest`, resolution [`METRICS_RESOLUTION_MS`] | `create_time` + one resolution step |
 //! | `bookDepth` | none (raw only) | `timestamp` |
-//! | `trades` | `Trade` with the raw trade id (kline cross-check only) | `time` |
+//! | `trades` | `Trade` with the raw trade id (kline cross-check and the aggTrades fold, ADR-050) | `time` |
 //!
 //! The metrics rule (ADR-034): the archive carries no publication time, and
 //! a five-minute open-interest value is ordered at the end of its interval,
@@ -30,6 +30,7 @@
 //! known.
 
 use super::catalog::{ArchiveStream, DAY_MS, digits};
+use super::fold::AggRange;
 use crate::normalize::{NormalizeError, decimal, positive_trade_qty};
 use mie_domain::event::{Aggressor, FundingSettlement, Kline, MarketEvent, OpenInterest, Trade};
 use mie_domain::num::{DECIMALS, ParseDecimalError, Price, Qty, Rate};
@@ -383,17 +384,42 @@ pub fn parse(
     Ok(Some(event))
 }
 
+/// The aggregate and its constituent trade-id range of one `aggTrades` row
+/// (columns 0, 1, 3, 4, 5 and 6), for the fold (ADR-050). [`parse`] drops
+/// the range; the aggressor follows the same buyer-is-maker rule.
+///
+/// # Errors
+///
+/// [`NormalizeError`] when the row has the wrong column count or one of
+/// these fields does not parse.
+pub fn agg_range(row: &[u8]) -> Result<AggRange, NormalizeError> {
+    let fields = Row::split(row, AGG_TRADES)?;
+    Ok(AggRange {
+        agg_id: fields.integer(0)?,
+        price: fields.decimal::<Price>(1)?,
+        first_trade_id: fields.integer(3)?,
+        last_trade_id: fields.integer(4)?,
+        time: fields.millis(5)?,
+        aggressor: aggressor(&fields, 6)?,
+    })
+}
+
+/// The side that crossed the spread, from a buyer-is-maker column: the
+/// buyer is the maker, so the seller crossed (live `m`).
+fn aggressor(row: &Row<'_>, maker: usize) -> Result<Aggressor, NormalizeError> {
+    Ok(if row.boolean(maker)? {
+        Aggressor::Sell
+    } else {
+        Aggressor::Buy
+    })
+}
+
 /// A trade from the id, price, quantity, time and buyer-is-maker columns.
 fn trade(
     row: &Row<'_>,
     [id, price, qty, time, maker]: [usize; 5],
 ) -> Result<MarketEvent, NormalizeError> {
-    // The buyer is the maker, so the seller crossed the spread (live `m`).
-    let aggressor = if row.boolean(maker)? {
-        Aggressor::Sell
-    } else {
-        Aggressor::Buy
-    };
+    let aggressor = aggressor(row, maker)?;
     Ok(MarketEvent::Trade(Trade {
         time: row.millis(time)?,
         trade_id: row.integer(id)?,
@@ -451,6 +477,51 @@ mod tests {
             record_time(ArchiveStream::Klines(Timeframe::M1), b""),
             Err(NormalizeError::Missing("open"))
         );
+    }
+
+    #[test]
+    fn agg_range_reads_the_constituent_trade_ids() {
+        let row = b"2879105104,62000.10,0.150,7221144700,7221144707,1770335999987,true";
+        assert_eq!(
+            agg_range(row),
+            Ok(AggRange {
+                agg_id: 2_879_105_104,
+                first_trade_id: 7_221_144_700,
+                last_trade_id: 7_221_144_707,
+                price: "62000.10".parse().unwrap(),
+                aggressor: Aggressor::Sell,
+                time: EventTime::from_millis(1_770_335_999_987),
+            })
+        );
+        // The delivered event of the same row agrees on id, price, side, time.
+        let Ok(Some(MarketEvent::Trade(trade))) = parse(ArchiveStream::AggTrades, "BTCUSDT", row)
+        else {
+            panic!("an aggTrades row is a trade");
+        };
+        let range = agg_range(row).unwrap();
+        assert_eq!(
+            (trade.trade_id, trade.price, trade.aggressor, trade.time),
+            (range.agg_id, range.price, range.aggressor, range.time)
+        );
+        assert_eq!(
+            agg_range(b"1,62000.10,0.150,7,7,1770335999987"),
+            Err(NormalizeError::Missing("is_buyer_maker"))
+        );
+        assert!(matches!(
+            agg_range(b"1,62000.10,0.150,7,7,1770335999987,true,x"),
+            Err(NormalizeError::Unexpected(_))
+        ));
+        for bad in [
+            &b"1,62000.10,0.150,-7,7,1770335999987,true"[..],
+            b"1,62000.10,0.150,7,7a,1770335999987,true",
+            b"x,62000.10,0.150,7,7,1770335999987,true",
+        ] {
+            assert!(
+                matches!(agg_range(bad), Err(NormalizeError::Unexpected(detail)) if detail.contains("ASCII digits")),
+                "{}",
+                String::from_utf8_lossy(bad)
+            );
+        }
     }
 
     #[test]

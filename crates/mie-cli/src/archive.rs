@@ -10,6 +10,7 @@
 use crate::config::ArchiveConfig;
 use mie_adapter_binance::archive::catalog::{DAY_MS, day_label};
 use mie_adapter_binance::archive::fetch::{FetchPolicy, Fetcher};
+use mie_adapter_binance::archive::fold::TradeCorrection;
 use mie_adapter_binance::archive::import::{ImportOptions, ImportSummary, Importer};
 use mie_adapter_binance::archive::ledger::{ImportLedger, LedgerDir};
 use mie_adapter_binance::archive::normalize::{parse, record_time};
@@ -447,6 +448,9 @@ fn check_stream(
 
 /// Runs `archive-kline-check` over the inclusive day range with trades from
 /// `trade_stream`, printing the report and the dataset versions to `out`.
+/// `aggTrades` are folded with the `trades` archive under
+/// [`TradeCorrection::Fold`] (ADR-050), whose summary line precedes the
+/// report.
 ///
 /// It replays the archive (ADR-039 D5) with trades over
 /// `[start − 60 s, end + 60 s)` and the six kline streams over the window,
@@ -463,13 +467,14 @@ fn check_stream(
 ///
 /// # Errors
 ///
-/// A description when the window cannot be loaded or the domain rejects an
-/// event.
+/// A description when the window cannot be loaded, the domain rejects an
+/// event, or `trades` is to be folded (it has nothing to correct).
 pub fn kline_check(
     config: &ArchiveConfig,
     from_day: i64,
     to_day: i64,
     trade_stream: ArchiveStream,
+    correction: TradeCorrection,
     out: &mut dyn Write,
 ) -> Result<KlineVerdict, String> {
     if !matches!(
@@ -477,6 +482,11 @@ pub fn kline_check(
         ArchiveStream::AggTrades | ArchiveStream::Trades
     ) {
         return Err(format!("{trade_stream} is not a trade stream"));
+    }
+    if trade_stream == ArchiveStream::Trades && correction == TradeCorrection::Fold {
+        return Err(
+            "the trades fold applies to aggTrades only: trades has nothing to correct".to_owned(),
+        );
     }
     let store = ParquetRawStore::new(&config.paths.raw_root);
     let window = day_window(from_day, to_day);
@@ -490,8 +500,8 @@ pub fn kline_check(
             .into_iter()
             .map(|timeframe| (ArchiveStream::Klines(timeframe), window)),
     );
-    let mut provider =
-        open_requests(&store, &config.instrument.symbol, &requests).map_err(|e| e.to_string())?;
+    let mut provider = open_requests(&store, &config.instrument.symbol, &requests, correction)
+        .map_err(|e| e.to_string())?;
     let versions: Vec<(String, _)> = provider
         .dataset_versions()
         .iter()
@@ -509,12 +519,18 @@ pub fn kline_check(
         .map_err(|e| e.to_string())?;
     let _ = writeln!(
         out,
-        "window {} .. {} (UTC days, inclusive), trades from {trade_stream}",
+        "window {} .. {} (UTC days, inclusive), trades from {trade_stream}, correction \
+         {correction}",
         day_label(from_day),
         day_label(to_day)
     );
     for (name, version) in &versions {
         let _ = writeln!(out, "dataset {name} {version}");
+    }
+    if let Some(fold) = provider.fold_report() {
+        for line in crate::replay::fold_lines(fold, false) {
+            let _ = writeln!(out, "{line}");
+        }
     }
     let _ = writeln!(out, "{report}");
     let expected = window_bars(window.start, window.end);

@@ -6,6 +6,7 @@ mod common;
 
 use common::{HOUR, TempDir};
 use mie_adapter_binance::archive::catalog::{DAY_MS, parse_day};
+use mie_adapter_binance::archive::fold::TradeCorrection;
 use mie_adapter_binance::archive::normalize::record_time;
 use mie_adapter_binance::archive::replay::ArchiveReplay;
 use mie_adapter_binance::archive::{ARCHIVE_SOURCE, ArchiveStream};
@@ -43,15 +44,38 @@ streams = ["aggTrades", "fundingRate"]
 /// Files one day of hourly trades and three funding settlements the way
 /// the importer does (ADR-034 D3); returns the day's window.
 fn import_day(config: &ArchiveConfig) -> ReplayWindow {
+    import_day_with(config, false)
+}
+
+/// [`import_day`], with `trades` rows when `with_trades`: one per
+/// aggregate, plus one uncovered tail trade after aggregate 3 that the
+/// fold restores (ADR-050).
+fn import_day_with(config: &ArchiveConfig, with_trades: bool) -> ReplayWindow {
     let day = parse_day("2026-10-06").unwrap();
     let mut rows = Vec::new();
+    if with_trades {
+        for h in 0..24 {
+            let time = day * DAY_MS + h * HOUR + 3;
+            rows.push((
+                ArchiveStream::Trades,
+                format!("{},85000.10,0.010,0,{time},true", 10 * (h + 1)),
+            ));
+            if h == 2 {
+                rows.push((
+                    ArchiveStream::Trades,
+                    format!("{},85000.10,0.004,0,{},true", 10 * (h + 1) + 1, time + 5),
+                ));
+            }
+        }
+    }
     for h in 0..24 {
         rows.push((
             ArchiveStream::AggTrades,
             format!(
-                "{id},85000.10,0.010,{id},{id},{},true",
+                "{id},85000.10,0.010,{first},{first},{},true",
                 day * DAY_MS + h * HOUR + 3,
-                id = h + 1
+                id = h + 1,
+                first = 10 * (h + 1)
             ),
         ));
     }
@@ -81,11 +105,11 @@ fn import_day(config: &ArchiveConfig) -> ReplayWindow {
     }
 }
 
-/// The dataset version a replay of `window` opens.
-fn dataset_of(config: &ArchiveConfig, window: ReplayWindow) -> String {
+/// The dataset version a replay of `window` opens under `correction`.
+fn dataset_of(config: &ArchiveConfig, window: ReplayWindow, correction: TradeCorrection) -> String {
     let store = ParquetRawStore::new(&config.paths.raw_root);
     let streams = config.streams().unwrap();
-    let replay = ArchiveReplay::with_defaults(&store, "BTCUSDT", &streams);
+    let replay = ArchiveReplay::with_defaults(&store, "BTCUSDT", &streams, correction);
     replay.replay(window).unwrap().dataset.to_string()
 }
 
@@ -234,12 +258,13 @@ fn a_rerun_reproduces_the_recorded_result_and_never_rewrites_it() {
     let dir = TempDir::new("experiment-run");
     let config = archive_config(dir.path());
     let window = import_day(&config);
-    let data = dataset_of(&config, window);
+    let data = dataset_of(&config, window, TradeCorrection::Fold);
     let request = ExperimentRequest {
         spec: write_spec(dir.path(), "a.spec", &spec_text(window, &data)),
         source: ReplaySource::Archive {
             config: config.clone(),
             streams: None,
+            correction: TradeCorrection::Fold,
         },
         results: dir.path().join("results"),
     };
@@ -265,12 +290,13 @@ fn another_data_version_fails_the_run() {
     let dir = TempDir::new("experiment-mismatch");
     let config = archive_config(dir.path());
     let window = import_day(&config);
-    let data = dataset_of(&config, window);
+    let data = dataset_of(&config, window, TradeCorrection::Fold);
     let request = ExperimentRequest {
         spec: write_spec(dir.path(), "a.spec", &spec_text(window, &"0e".repeat(32))),
         source: ReplaySource::Archive {
             config,
             streams: None,
+            correction: TradeCorrection::Fold,
         },
         results: dir.path().join("results"),
     };
@@ -279,11 +305,57 @@ fn another_data_version_fails_the_run() {
     assert_eq!(
         text,
         format!(
-            "FAIL: data version mismatch: the spec names {}, the sample opened {data}\n",
+            "FAIL: data version mismatch: the spec names {}, the sample opened {data}\n{HINT}\n",
             "0e".repeat(32)
         )
     );
     assert!(files(&request.results).is_empty());
+}
+
+/// The hint a folding archive run adds to a data-version mismatch.
+const HINT: &str = "hint: --trade-correction none reproduces data versions recorded before \
+                    ADR-050 (the aggTrades fold)";
+
+#[test]
+fn a_spec_pinned_to_the_unfolded_data_runs_under_none_and_mismatches_under_fold() {
+    let dir = TempDir::new("experiment-fold");
+    let config = archive_config(dir.path());
+    let window = import_day_with(&config, true);
+    let none = dataset_of(&config, window, TradeCorrection::None);
+    let fold = dataset_of(&config, window, TradeCorrection::Fold);
+    assert_ne!(none, fold, "the trades files join the folding version");
+    let request = |correction| ExperimentRequest {
+        spec: write_spec(dir.path(), "a.spec", &spec_text(window, &none)),
+        source: ReplaySource::Archive {
+            config: config.clone(),
+            streams: None,
+            correction,
+        },
+        results: dir.path().join("results"),
+    };
+
+    let (pass, text) = run(&request(TradeCorrection::None));
+    assert!(pass, "{text}");
+    assert!(text.starts_with("recorded "), "{text}");
+    let stored = files(&dir.path().join("results"));
+
+    let (pass, text) = run(&request(TradeCorrection::Fold));
+    assert!(!pass);
+    assert_eq!(
+        text,
+        format!(
+            "FAIL: data version mismatch: the spec names {none}, the sample opened {fold}\n{HINT}\n"
+        )
+    );
+    assert_eq!(files(&dir.path().join("results")), stored);
+
+    // `none` still reproduces the result recorded before the fold.
+    let (pass, text) = run(&request(TradeCorrection::None));
+    assert_eq!(
+        (pass, text.starts_with("reproduced ")),
+        (true, true),
+        "{text}"
+    );
 }
 
 #[test]
@@ -296,12 +368,13 @@ fn an_empty_sample_fails_the_run() {
         start: EventTime::from_millis(day.start.as_millis() + 30 * 60_000),
         end: EventTime::from_millis(day.start.as_millis() + 60 * 60_000),
     };
-    let data = dataset_of(&config, window);
+    let data = dataset_of(&config, window, TradeCorrection::Fold);
     let request = ExperimentRequest {
         spec: write_spec(dir.path(), "a.spec", &spec_text(window, &data)),
         source: ReplaySource::Archive {
             config,
             streams: None,
+            correction: TradeCorrection::Fold,
         },
         results: dir.path().join("results"),
     };

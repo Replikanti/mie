@@ -21,8 +21,12 @@ staging = "data/archive-staging"
 base_url = "https://data.binance.vision"
 # Datasets: aggTrades, klines (every interval below), fundingRate (monthly
 # files), metrics (5-minute open interest), bookDepth (raw only). The
-# individual-trades dataset `trades` is opt-in: raw only, used by
-# `archive-kline-check --trade-source trades`.
+# individual-trades dataset `trades` is opt-in and never delivered: it feeds
+# `archive-kline-check --trade-source trades` and the aggTrades fold of
+# archive replays (ADR-050), which restores the trades the aggTrades archive
+# omits on 2025-10-01 … 2026-06-09. Import it for that window with
+#   mie archive-import --config <this file> --streams trades \
+#       --from 2025-10-01 --to 2026-06-09
 streams = ["aggTrades", "klines", "fundingRate", "metrics", "bookDepth"]
 kline_intervals = ["1m", "5m", "15m", "1h", "4h", "1d"]
 # Network etiquette (ADR-034 D6): one request at a time, at least this long
