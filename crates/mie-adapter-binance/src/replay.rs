@@ -58,6 +58,17 @@
 //!   [`continue_after`](LiveReplayStream::continue_after) seeds the chaining
 //!   of D3 with the archive segment's last event, so the first run joins the
 //!   seam through the same `HoldBack` that joins runs.
+//! - **Chain seeds** (ADR-052 D3, history chain only). Each chain run is
+//!   recomputed with, per non-book stream, the newest event time of its
+//!   domain series in the chain so far (the archive segment included) as
+//!   its seed, unless its journaled seed is at or before that time: a
+//!   missing seed, or one newer than the chain's newest event (a seed from a
+//!   run outside the chain, say), would leave the hole since the chain's
+//!   last event of the series unmarked. A journaled seed that reaches back
+//!   at least that far is kept, so a run whose journal already carries chain
+//!   seeds recomputes exactly as journaled. The order book keeps its
+//!   journaled seed: its sequencer takes one seed from `depth` and
+//!   `depthSnapshot` together (ADR-038).
 //!
 //! Memory: one run's records and output at a time (about 1.5 M records for
 //! a 24 h run).
@@ -65,7 +76,7 @@
 use crate::holdback::HoldBack;
 use crate::pipeline::{Pipeline, PipelineStats};
 use crate::stream::BinanceStream;
-use mie_domain::event::{FeedGap, MarketEvent};
+use mie_domain::event::{FeedGap, MarketEvent, Stream};
 use mie_domain::time::EventTime;
 use mie_ports::outbound::{
     HistoricalDataProvider, MarketDataProvider, ProviderError, Replay, ReplayWindow,
@@ -406,6 +417,7 @@ impl<'a> HistoricalDataProvider for LiveReplay<'a> {
             out: VecDeque::new(),
             last: None,
             newest_oi: None,
+            newest: BTreeMap::new(),
             trailing: Vec::new(),
             stats: Vec::new(),
             failed: None,
@@ -442,6 +454,10 @@ pub struct LiveReplayStream<'a> {
     last: Option<MarketEvent>,
     /// The newest open-interest time of the chained output.
     newest_oi: Option<EventTime>,
+    /// The newest event time per domain series of the chained output and
+    /// of the segment before it: the chain seeds (module docs). Used only
+    /// when the replay is restricted to a history chain.
+    newest: BTreeMap<Stream, EventTime>,
     trailing: Vec<FeedGap>,
     stats: Vec<RunStats>,
     failed: Option<ProviderError>,
@@ -478,22 +494,34 @@ impl LiveReplayStream<'_> {
     /// Chains the first run after `last`, the last event of an earlier
     /// segment, with `newest_oi` as the newest open-interest time it
     /// delivered (ADR-052 D2, the seam): the first run then passes the same
-    /// zero hold-back [`HoldBack::after`] as every later run (D3). Valid only
+    /// zero hold-back [`HoldBack::after`] as every later run (D3). `newest`
+    /// holds, per domain series, where the earlier segment's data of it
+    /// ends: the chain seeds of the first run (module docs). Valid only
     /// before the first [`next_event`](MarketDataProvider::next_event).
-    pub(crate) fn continue_after(&mut self, last: MarketEvent, newest_oi: Option<EventTime>) {
+    pub(crate) fn continue_after(
+        &mut self,
+        last: Option<MarketEvent>,
+        newest_oi: Option<EventTime>,
+        newest: BTreeMap<Stream, EventTime>,
+    ) {
         debug_assert!(
             self.stats.is_empty() && self.out.is_empty(),
             "continue_after after the first run was loaded"
         );
-        self.last = Some(last);
+        self.last = last;
         self.newest_oi = newest_oi;
+        self.newest = newest;
     }
 
     /// Loads, checks and recomputes one run, then queues its in-window
     /// events.
     fn load(&mut self, run: &LiveRun, extent: (i64, i64)) -> Result<(), ProviderError> {
         let records = self.read_run(run, extent)?;
-        let (events, stats) = recompute(run, records)?;
+        let (events, stats) = if self.chain.is_some() {
+            recompute(&with_chain_seeds(run, &self.newest), records)?
+        } else {
+            recompute(run, records)?
+        };
 
         let events = match &self.last {
             Some(last) => {
@@ -513,6 +541,9 @@ impl LiveReplayStream<'_> {
         for event in events {
             if let MarketEvent::OpenInterest(oi) = &event {
                 self.newest_oi = Some(self.newest_oi.map_or(oi.time, |n| n.max(oi.time)));
+            }
+            if !matches!(event, MarketEvent::FeedGap(_)) {
+                self.newest.insert(event.stream(), event.time());
             }
             if let MarketEvent::FeedGap(gap) = &event
                 && gap.end >= self.window.end
@@ -650,6 +681,24 @@ impl LiveReplayStream<'_> {
         }
         Ok(())
     }
+}
+
+/// `run` with the chain seeds of `newest` (module docs): per non-book
+/// stream, the chain's newest event time of its domain series replaces a
+/// journaled seed that is missing or newer.
+fn with_chain_seeds(run: &LiveRun, newest: &BTreeMap<Stream, EventTime>) -> LiveRun {
+    let mut run = run.clone();
+    for stream in BinanceStream::ALL {
+        if matches!(stream, BinanceStream::Depth | BinanceStream::DepthSnapshot) {
+            continue;
+        }
+        if let Some(&chain) = newest.get(&stream.domain_stream())
+            && run.seeds.get(&stream).is_none_or(|&seed| seed > chain)
+        {
+            run.seeds.insert(stream, chain);
+        }
+    }
+    run
 }
 
 /// A run's records with their stream, keyed by `receive_seq`.

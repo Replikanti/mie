@@ -19,7 +19,11 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   up to the cutover (default streams, `aggTrades` folded), then the
   journaled capture runs that started at or after the cutover, the first
   continuing after the archive's last event as runs continue after each
-  other. A run the cutover falls inside is refused by name. Every request
+  other. Every chain run is recomputed with the chain's newest event of
+  each series as its seed when its journaled seed does not reach back that
+  far, so every hole, the seam included, opens with a `Disconnected` gap,
+  also when the archive's last days are missing. A run the cutover falls
+  inside is refused by name. Every request
   replays from the origin and is restricted to its window, so adjacent
   windows concatenate exactly; the report has one line per segment, and the
   chain's dataset version covers both. An uncrossable hole (more than

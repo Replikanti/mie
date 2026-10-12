@@ -1189,7 +1189,10 @@ fn a_history_replay_chains_the_live_runs_after_the_archive() {
         ", runs chained 2, runs before the cutover 1, delivered ".to_owned(),
         "run 20261006T000010Z: clean, records 11, replayed 11, ignored 0\n".to_owned(),
         "run 20261006T003000Z: clean, records 10, replayed 10, ignored 0\n".to_owned(),
-        "delivered Trades: events 93, gaps LateEvent 1\n".to_owned(),
+        // R1's first trade is late after the archive's last one, and so is
+        // its chain seed gap from that trade; R2's chain seed gap spans the
+        // hole after R1 (ADR-052 D3).
+        "delivered Trades: events 93, gaps Disconnected 2, LateEvent 1\n".to_owned(),
         "domain rejections: 0\neffective origin -\n".to_owned(),
     ] {
         assert!(text.contains(&expected), "{expected:?} in\n{text}");

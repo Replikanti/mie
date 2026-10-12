@@ -21,6 +21,15 @@
 //!   through the same zero hold-back `HoldBack` that joins runs: an overlap
 //!   becomes a `LateEvent` gap or re-timed open interest, never an engine
 //!   `OutOfOrder`. The output is strictly increasing.
+//! - **Chain seeds** (ADR-052 D3). Every chain run is recomputed with the
+//!   chain's newest event of each series as its seed, unless its journaled
+//!   seed reaches back at least that far, so every hole in the chain opens
+//!   with a `Disconnected` gap: between runs, and at the seam, where the
+//!   archive segment's data of a series ends. A series the archive segment
+//!   ends with a trailing gap (missing days at its end, the fold's unchecked
+//!   tail, no event at all) ends where that gap starts, so the first run's
+//!   seed gap covers the whole hole up to its first event of the series, and
+//!   no bar across it reads as complete.
 //! - **Window** (ADR-039 D4). Every request replays the chain from the
 //!   origin and restricts it afterwards: an event is delivered when its
 //!   ordering time lies in the window, and a gap counts at its `end`. A gap
@@ -28,11 +37,18 @@
 //!   [`trailing_gaps`](HistoryChainStream::trailing_gaps) when it starts
 //!   before it. The archive segment always spans `[origin, cutover)`, so
 //!   adjacent windows concatenate exactly, and the gaps one window withholds
-//!   are exactly those the next delivers that start before it. A window that
-//!   ends at or before `L0` has no live segment.
+//!   are those the next delivers that start before it, with one exception:
+//!   a chain run whose extent starts at or after the window's end is not
+//!   read, so its seed gaps, which start at the chain's last event before
+//!   it, are delivered by the next window but not listed. Listing them would
+//!   need that run's records, so a closed window's dataset version would
+//!   move when the run starts. A window that ends at or before `L0` has no
+//!   live segment.
 //! - **The archive segment's own trailing gaps** (missing days at its end,
 //!   the fold's unchecked tail at the cutover) are reported by its stream,
-//!   never delivered: the seam is where the live segment takes over.
+//!   not delivered as such: the first chain run's seed gaps carry them over
+//!   the seam (chain seeds above). A series without a live stream
+//!   (funding) has no seam to carry it over.
 //! - **Prefix.** [`HistoryChain::before_run`] is the chain through a run's
 //!   predecessor, unwindowed at the end, for the warm start and its
 //!   equivalence check: the named run and every later one are skipped, never
@@ -53,14 +69,14 @@ use crate::archive::fetch::hex;
 use crate::archive::fold::TradeCorrection;
 use crate::archive::replay::{ArchiveReplay, ArchiveReplayStream};
 use crate::replay::{LiveReplay, LiveReplayStream, LiveRun, RUN_MARGIN_MS};
-use mie_domain::event::{FeedGap, MarketEvent};
+use mie_domain::event::{FeedGap, MarketEvent, Stream};
 use mie_domain::time::EventTime;
 use mie_ports::outbound::{
     HistoricalDataProvider, MarketDataProvider, ProviderError, Replay, ReplayWindow,
 };
 use mie_ports::raw::{DatasetVersion, RawRecordSource};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 /// The encoding of the chain's dataset-version text ([`chain_dataset`]). A
@@ -351,6 +367,7 @@ impl<'a> HistoryChain<'a> {
                 live_done: false,
                 last: None,
                 newest_oi: None,
+                newest: BTreeMap::new(),
                 trailing: Vec::new(),
                 failed: None,
             },
@@ -434,6 +451,8 @@ pub struct HistoryChainStream<'a> {
     last: Option<MarketEvent>,
     /// The archive segment's newest open-interest time.
     newest_oi: Option<EventTime>,
+    /// Per domain series, the archive segment's newest event time.
+    newest: BTreeMap<Stream, EventTime>,
     trailing: Vec<FeedGap>,
     failed: Option<ProviderError>,
 }
@@ -489,17 +508,40 @@ impl<'a> HistoryChainStream<'a> {
         self.window.contains(event.time())
     }
 
+    /// Hands the archive segment over to the live segment (module docs):
+    /// its last event and newest open-interest time continue the run
+    /// chaining, and where its data of each series ends seeds the first
+    /// chain run. A series the archive segment ends with a trailing gap (a
+    /// missing day at its end, the fold's unchecked tail, or no event at
+    /// all) ends where that gap starts, so the first run's seed gap covers
+    /// the whole hole up to its first event of the series.
+    fn seam(&mut self) {
+        let Some(live) = self.live.as_mut() else {
+            return;
+        };
+        let mut newest = std::mem::take(&mut self.newest);
+        for gap in self.archive.stream.trailing_gaps() {
+            newest
+                .entry(gap.stream)
+                .and_modify(|time| *time = (*time).min(gap.start))
+                .or_insert(gap.start);
+        }
+        live.stream
+            .continue_after(self.last.clone(), self.newest_oi, newest);
+    }
+
     fn advance(&mut self) -> Result<Option<MarketEvent>, ProviderError> {
         while !self.archive_done {
             let Some(event) = self.archive.stream.next_event()? else {
                 self.archive_done = true;
-                if let (Some(live), Some(last)) = (self.live.as_mut(), self.last.clone()) {
-                    live.stream.continue_after(last, self.newest_oi);
-                }
+                self.seam();
                 break;
             };
             if let MarketEvent::OpenInterest(oi) = &event {
                 self.newest_oi = Some(self.newest_oi.map_or(oi.time, |n| n.max(oi.time)));
+            }
+            if !matches!(event, MarketEvent::FeedGap(_)) {
+                self.newest.insert(event.stream(), event.time());
             }
             self.last = Some(event.clone());
             if self.admit(&event) {
@@ -963,6 +1005,10 @@ mod tests {
             // Inside R2's reconnect, and at R3's fast restart.
             s2 + 4 * MIN + 30_000,
             s2 + 10 * MIN + 1_000,
+            // Before L0, after the archive's newest open interest; inside the
+            // R1 → R2 hole, beyond R2's margin.
+            c - 295_000,
+            c + HOUR,
         ] {
             let (mut head, trailing) = replay(&chain, window(origin(), split));
             let (tail, _) = replay(&chain, window(split, far()));
@@ -973,10 +1019,23 @@ mod tests {
                 .collect();
             head.extend(tail);
             assert_eq!(head, union, "split at {split}");
+            // The head lists what the tail delivers from before the split,
+            // except (ADR-052 D2) the seed gaps of a chain run whose extent
+            // starts after the split, which the head does not read.
+            let unread = unread_from(&fixture.runs, split);
             let mut trailing = trailing;
             trailing.sort();
             resumed.sort();
-            assert_eq!(trailing, resumed, "split at {split}");
+            let (listed, missing): (Vec<FeedGap>, Vec<FeedGap>) =
+                resumed.into_iter().partition(|g| trailing.contains(g));
+            assert_eq!(trailing, listed, "split at {split}");
+            assert!(
+                missing
+                    .iter()
+                    .all(|g| g.reason == GapReason::Disconnected
+                        && unread.is_some_and(|u| g.end >= u)),
+                "split at {split}: {missing:?}"
+            );
         }
         // The splits that cut a gap: the missing days, the seam, the
         // reconnect.
@@ -990,6 +1049,147 @@ mod tests {
         }
     }
 
+    /// Where the first chain run not read by a window ending at `split`
+    /// starts its extent: the first whose start minus the margin is at or
+    /// after `split`.
+    fn unread_from(runs: &[LiveRun], split: i64) -> Option<EventTime> {
+        runs.iter()
+            .filter(|run| run.started_at_ms >= cutover())
+            .map(|run| run.started_at_ms - RUN_MARGIN_MS)
+            .find(|&start| start >= split)
+            .map(time)
+    }
+
+    #[test]
+    fn a_window_ending_in_a_hole_between_runs_does_not_list_the_next_seed_gap() {
+        // Review repro 1 (PR #123): a split inside the R1 → R2 hole, more
+        // than the margin before R2. R2's seed gaps reach back before the
+        // split; the tail delivers them, the head cannot list them, because
+        // it does not read R2 (ADR-052 D2): its version stays that of a store
+        // without R2 (I6).
+        let fixture = Fixture::new();
+        let source = fixture.source();
+        let chain = chain(&source, fixture.runs.clone());
+        let split = cutover() + HOUR;
+        let r1_last_trade = cutover() + 10_000 + 29 * 30_000;
+        let (_, trailing) = replay(&chain, window(origin(), split));
+        assert!(trailing.is_empty(), "{trailing:?}");
+        let (tail, _) = replay(&chain, window(split, far()));
+        let reaching_back: Vec<(Stream, i64, GapReason)> = tail
+            .iter()
+            .filter_map(gap_of)
+            .filter(|g| g.start < time(split))
+            .map(|g| (g.stream, g.start.as_millis(), g.reason))
+            .collect();
+        assert_eq!(
+            reaching_back,
+            [
+                // From R1's last trade (ordered at R2's first trade), then
+                // from its retimed open interest (at R2's first sample).
+                (Stream::Trades, r1_last_trade, GapReason::Disconnected),
+                (
+                    Stream::OpenInterest,
+                    archive_last() + 1,
+                    GapReason::Disconnected
+                ),
+            ]
+        );
+        let mut without_later = MemorySource::default();
+        seal_archive(&mut without_later);
+        for b in &fixture.builders[..2] {
+            b.seal(&mut without_later, &[]);
+        }
+        let head = window(origin(), split);
+        assert_eq!(
+            chain.replay(head).unwrap().dataset,
+            self::chain(&without_later, fixture.runs[..2].to_vec())
+                .replay(head)
+                .unwrap()
+                .dataset
+        );
+    }
+
+    #[test]
+    fn the_seam_marks_an_archive_that_ends_early() {
+        // Review repro 2 (PR #123): the archive holds only its first day;
+        // the four days before the cutover are missing, and the first chain
+        // run is unseeded. Its first trade's seed gap covers the hole from
+        // the archive's last trade.
+        let mut source = MemorySource::default();
+        let mut id = 1;
+        archive_day(&mut source, origin(), &mut id, None);
+        let archive_last_trade = origin() + 23 * HOUR + 7;
+        let c = cutover();
+        let mut r1 = RunBuilder::new("20261005T000010Z");
+        for i in 0..10 {
+            r1.push(
+                BinanceStream::AggTrade,
+                1,
+                agg(10_000 + i as u64, c + 10_000 + i * 30_000),
+            );
+        }
+        r1.seal(&mut source, &[]);
+        let runs = vec![r1.run(c + 10_000, Some(c + 20 * MIN), Some(10))];
+        let chain = chain(&source, runs.clone());
+        let mut stream = chain.replay(window(origin(), far())).unwrap().stream;
+        let events = drain(&mut stream);
+        let archive_trailing: Vec<Stream> = stream
+            .archive()
+            .stream()
+            .trailing_gaps()
+            .iter()
+            .map(|g| g.stream)
+            .collect();
+        assert_eq!(archive_trailing, [Stream::Trades, Stream::OpenInterest]);
+        let trade_gaps: Vec<(i64, i64, GapReason)> = events
+            .iter()
+            .filter_map(gap_of)
+            .filter(|g| g.stream == Stream::Trades)
+            .map(|g| (g.start.as_millis(), g.end.as_millis(), g.reason))
+            .collect();
+        assert_eq!(
+            trade_gaps,
+            [(archive_last_trade, c + 10_000, GapReason::Disconnected)]
+        );
+        // Every bar across the hole is marked, none read as complete.
+        let mut engine = MarketStateEngine::new();
+        let mut closed = Vec::new();
+        for event in &events {
+            engine.apply(event).unwrap_or_else(|e| panic!("{e}"));
+            closed.extend_from_slice(engine.closed_bars());
+        }
+        let across: Vec<_> = closed
+            .iter()
+            .filter(|bar| bar.open_time > time(archive_last_trade) && bar.end() <= time(c))
+            .collect();
+        assert!(across.len() > 4 * 1_440, "{}", across.len());
+        assert!(across.iter().all(|bar| bar.coverage.feed_gap));
+
+        // Partial loss: a run before the cutover captured after the
+        // archive's last trade, and the first chain run's journaled seed is
+        // that run's last trade. The chain does not hold it, so the seam gap
+        // still starts at the archive's last trade.
+        let mut r0 = RunBuilder::new("20261004T233000Z");
+        r0.push(BinanceStream::AggTrade, 1, agg(5_000, c - 20 * MIN));
+        r0.seal(&mut source, &[]);
+        let mut seeded = runs[0].clone();
+        seeded
+            .seeds
+            .insert(BinanceStream::AggTrade, time(c - 20 * MIN));
+        let partial = self::chain(
+            &source,
+            vec![r0.run(c - 30 * MIN, Some(c - 10 * MIN), Some(1)), seeded],
+        );
+        let (events, _) = replay(&partial, window(origin(), far()));
+        let trade_gaps: Vec<(i64, i64)> = events
+            .iter()
+            .filter_map(gap_of)
+            .filter(|g| g.stream == Stream::Trades)
+            .map(|g| (g.start.as_millis(), g.end.as_millis()))
+            .collect();
+        assert_eq!(trade_gaps, [(archive_last_trade, c + 10_000)]);
+    }
+
     #[test]
     fn the_prefix_before_a_run_is_the_chain_through_its_predecessor() {
         let fixture = Fixture::new();
@@ -1000,14 +1200,11 @@ mod tests {
 
         let mut prefix = chain.before_run("20261005T021001Z").unwrap().stream;
         let events = drain(&mut prefix);
-        // Everything up to R3's first chained event, R3's late mark gap.
+        // Everything up to R3's first chained events, its mark-price gaps
+        // (the seed gap and the late mark, both late after R2's last event).
         let n = union
             .iter()
-            .position(|e| {
-                gap_of(e).is_some_and(|g| {
-                    g.stream == Stream::MarkPrice && g.reason == GapReason::LateEvent
-                })
-            })
+            .position(|e| gap_of(e).is_some_and(|g| g.stream == Stream::MarkPrice))
             .unwrap();
         assert_eq!(events, union[..n]);
         assert!(prefix.trailing_gaps().is_empty());

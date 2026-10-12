@@ -111,9 +111,28 @@ deferred option D are under *Alternatives considered*.
      open at the window's end is withheld and listed as trailing. The
      archive segment spans `[origin, cutover)` for every request, even for
      a window that ends before the cutover.
-     - Why: only this makes adjacent windows concatenate exactly, events
-       and trailing gaps alike, and makes the "through run k" prefix below
-       a prefix of the windowed chain. W3 to W5 rely on both.
+     - Why: only this makes adjacent windows concatenate exactly, and
+       makes the "through run k" prefix below a prefix of the windowed
+       chain. W3 to W5 rely on both. Events concatenate without exception.
+       The trailing list of a window holds the gaps the next window
+       delivers that start before the split, with one exception, below.
+     - **The exception: the seed gaps of a run the window does not read.**
+       A chain run whose extent (its start minus `RUN_MARGIN_MS`) begins at
+       or after the window's end is not part of the window's live segment.
+       Its seed gaps (decision 3) start at the chain's last event before it,
+       inside the window, and end at its first event, after it: the next
+       window delivers them, this one does not list them. The same holds
+       for the first chain run when the window ends at or before the live
+       segment's start. Listing them needs that run's records, since a seed
+       gap ends at the run's first event of its series. The window's
+       dataset version would then cover the run's files and move when the
+       run starts: a closed window's version would change when a later run
+       starts capturing, which breaks the rule that it does not (decision 5,
+       ADR-039 decision 2). Reading the files without covering them in the
+       version would break the version's provenance instead. When the
+       window is replayed before that run exists, no replay can list them
+       at all. So the trailing list is what the data read for the window
+       announces, and nothing delivered depends on it.
      - Rejected, replaying a window from its own start: cheaper, but
        missing-day and fold gaps are then placed "from the window start"
        and the sequencers start without a predecessor, so the gaps at a
@@ -134,10 +153,8 @@ deferred option D are under *Alternatives considered*.
      A later start would cut the first run's early records, for example
      open interest trailing its poll, out of the chain. An earlier one
      only adds files of runs outside the chain to the version. A window
-     that ends at or before this start has no live segment. Such a window
-     then does not list as trailing a gap of the first chain run that
-     starts before its end (a seed gap, decision 3); nothing delivered
-     changes.
+     that ends at or before this start has no live segment; the first
+     chain run's seed gaps are then the exception above.
    - **The cutover rule reads the journal only.** A run without `run_end`
      ends, for the rule, at its journaled successor's start (ADR-039
      decision 2), and an open run (no successor) ends after any cutover.
@@ -168,9 +185,18 @@ deferred option D are under *Alternatives considered*.
      archive's last included row reaches the chain only through the live
      poller.
    - **The archive segment's trailing gaps** (missing days at its end, the
-     fold's unchecked tail at the cutover) are reported, not delivered:
-     the live segment takes over at the seam, and the seam's seed gaps
-     (decision 3) mark that hole.
+     fold's unchecked tail at the cutover) are reported with the segment,
+     not delivered as such: the live segment takes over at the seam, and
+     the first chain run's seed gaps (decision 3) carry them over it. A
+     series whose archive data ends with a trailing gap ends, for its
+     chain seed, where that gap starts, so the seed gap covers the whole
+     hole up to the run's first event of the series. Rejected, delivering
+     the archive's trailing gap at the seam: it ends at the cutover or at
+     the archive's last day, so it either sorts after live events of the
+     overlap, turning them late, or stops short of the first live event,
+     leaving the bars in between complete. `Funding` has no live stream,
+     so its trailing gap stays reported only; no later chain event reads
+     across it.
 
 3. **Holes and chain seeds** (#106 plan D1). For runs with a history, each
    stream's seed is the newest event of the same domain stream in the
@@ -196,6 +222,24 @@ deferred option D are under *Alternatives considered*.
      first live run on, these streams have chain events and are seeded
      like every other, so every later hole is marked. `Funding` has no
      live stream (ADR-042 decision 4) and needs no seed.
+   - **Replay applies the chain seeds** (W2). The history chain
+     recomputes every chain run with, per series except the order book,
+     the chain's newest event time of the series as its seed, unless the
+     run's journaled seed is at or before it, which is then kept. Why:
+     runs journaled before the warm start (W3) carry the 7-day lookback,
+     whose seed is missing after a longer pause, or comes from a run
+     outside the chain that captured after the archive's last event (a
+     run before the cutover), so the hole since the chain's last event
+     would stay unmarked or partly unmarked. A journaled chain seed equals
+     the chain's newest event, so a warm-started run recomputes exactly as
+     journaled. A journaled seed of a series the chain holds no event of
+     is kept as journaled. The order book keeps its journaled seed: its
+     sequencer takes one seed from two streams, `depth` and
+     `depthSnapshot` (ADR-038), which this per-stream rule does not
+     cover, and the archive carries no book, so the seam never needs it;
+     its chain seed comes with W3's journal. Rejected, refusing a chain whose seam is unmarked: the
+     production cutover follows #99's cold sessions, so every chain would
+     be refused until W3.
    - Runs without a history keep the lookback (decision 8).
 
 4. **Uncrossable holes and the effective origin** (#106 plan D8). A hole
