@@ -790,7 +790,8 @@ fn bounds_take_epoch_ms_or_inclusive_days() {
 /// importer files them: 2026-02-05 with `aggTrades` and `trades` and three
 /// uncovered tail trades (two after aggregate 1002, one after 1003 in the
 /// next minute), 2026-02-06 with `aggTrades` only (unchecked) and
-/// 2026-02-07 with both and nothing uncovered (clean).
+/// 2026-02-07 with both and nothing uncovered (clean); 2026-02-08, which
+/// would hold the tail of 2026-02-07's last aggregate, is not imported.
 fn fold_fixture(config: &ArchiveConfig) -> (i64, i64) {
     let d = parse_day("2026-02-05").unwrap();
     let m0 = d * DAY_MS + 10 * 60_000;
@@ -897,12 +898,24 @@ fn an_archive_replay_folds_uncovered_trades_and_none_reproduces_the_published_da
             "fold summary: corrected 1 [2026-02-05], clean 1 [2026-02-07], unchecked 1 \
              [2026-02-06]; aggregates 2, trades folded 3, qty 0.00800000, unattributed 0, \
              edge trades folded 0, edge qty 0.00000000, unresolved 0",
+            "fold unchecked tail 2026-02-07: aggregate 1007, the store lacks the trades or \
+             aggTrades of 2026-02-08 that would hold its tail",
             "fold 2026-02-05: aggregates 2, trades 3, qty 0.00800000, unattributed 0, edge \
              trades 0, edge qty 0.00000000, unresolved 0",
             "fold minute 1770250200000: aggregates 2, trades 3, qty 0.00800000",
         ],
         "{text}"
     );
+    // The window's last aggregate (1007, checked day 2026-02-07) has no
+    // next day to check its tail: gapped to the window end, not delivered.
+    assert!(
+        text.contains(
+            "\ntrailing gap Trades [1770422400005, 1770508800000] ms MissingData (open at the \
+             window end, not delivered)\n"
+        ),
+        "{text}"
+    );
+    assert!(!none_text.contains("trailing gap"), "{none_text}");
     // The provenance precedes the delivery lines.
     let summary = text.find("fold summary").unwrap();
     assert!(summary < text.find("delivered Trades").unwrap(), "{text}");

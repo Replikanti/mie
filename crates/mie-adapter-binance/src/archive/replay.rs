@@ -42,16 +42,23 @@
 //!   reported in [`trailing_gaps`](ArchiveReplayStream::trailing_gaps)
 //!   only, as a live gap still open at the window's end would be.
 //! - **Fold** ([`TradeCorrection::Fold`], ADR-050). When `aggTrades` is
-//!   requested, the `trades` files of the same days join its selection, so
-//!   its dataset version covers them (unless the store holds none: then the
-//!   data, and the version, are those of [`TradeCorrection::None`]). They
-//!   are a side input, indexed by source day, never delivered: no gap, no
-//!   sequencer, no missing day of their own. When the first `aggTrades` file
-//!   of a source day opens, [`fold_day`] runs over that day's `aggTrades`
-//!   parts and then its `trades` parts, each in `(min_event_time, path)`
-//!   order and one sealed part at a time, for that day and the next one:
-//!   the next day's head trades may fold into this day's last aggregate,
-//!   so they are known before it is delivered. Days fold in order, each
+//!   requested, the `trades` files of the same days and of the day after
+//!   the window join its selection, so its dataset version covers them
+//!   (unless the store holds none: then the data, and the version, are
+//!   those of [`TradeCorrection::None`]); the `aggTrades` of the day after
+//!   join the side input too. They are a side input, indexed by source
+//!   day, never delivered: no gap, no sequencer, no missing day of their
+//!   own. When the first `aggTrades` file of a source day opens,
+//!   [`fold_day`] runs over that day's `aggTrades` parts and then its
+//!   `trades` parts, each in `(min_event_time, path)` order and one sealed
+//!   part at a time, for that day and the next one: the next day's head
+//!   trades may fold into this day's last aggregate, so they are known
+//!   before it is delivered. On the window's last day the next day is the
+//!   **lookahead** day, folded only when it has `trades` files and only
+//!   for that tail; it is reported, not delivered. When the store lacks its
+//!   `trades` or `aggTrades` and the window delivers the last aggregate of
+//!   a checked last day, that aggregate's tail is unchecked: a trailing gap
+//!   and [`FoldReport::unchecked_tail`]. Days fold in order, each
 //!   from the [`Carry`] of the day before when the replay has that day
 //!   (the last range of a day without `trades` files is read for it). A
 //!   delivered aggregate with a fold carries its folded quantity. An
@@ -215,11 +222,25 @@ pub struct MinuteFold {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FoldReport {
     /// Per source day (UTC days since 1970-01-01) whose `aggTrades` were
-    /// opened, the fold status of the whole day.
+    /// opened, and the day after the window when it was folded for the
+    /// window's last aggregate, the fold status of the whole day.
     pub days: BTreeMap<i64, DayStatus>,
     /// Per 1m minute (open time, epoch ms), the folded aggregates delivered
     /// in the window.
     pub minutes: BTreeMap<i64, MinuteFold>,
+    /// The window's last aggregate, when its tail could not be checked.
+    pub unchecked_tail: Option<UncheckedTail>,
+}
+
+/// The last aggregate of a checked day delivered last in the window, whose
+/// tail may lie in the next day's `trades`, which the store lacks (with
+/// that day's `aggTrades`, ADR-050 D4): gapped and reported, not checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UncheckedTail {
+    /// The aggregate's source day (UTC days since 1970-01-01).
+    pub day: i64,
+    /// The aggregate id.
+    pub aggregate: u64,
 }
 
 /// The fold's side input and state (module docs).
@@ -239,6 +260,9 @@ struct FoldState {
     gaps_after: BTreeMap<u64, EventTime>,
     /// What each folded day hands to the next.
     carries: BTreeMap<i64, Option<Carry>>,
+    /// The day after the window: folded only for the tail of the window's
+    /// last aggregate, never delivered (module docs).
+    lookahead: i64,
     report: FoldReport,
 }
 
@@ -348,30 +372,53 @@ pub fn open_requests<'a>(
         };
         let folding =
             correction == TradeCorrection::Fold && streams.contains(&ArchiveStream::AggTrades);
-        let mut dataset = None;
+        let selection = RawSelection::new(keys.clone(), widened).map_err(source_error)?;
+        let dataset = source.select(&selection).map_err(source_error)?;
+        let mut version = dataset.version;
         if folding {
-            fold = Some(FoldState::default());
-            // The side input joins the selection, so the version covers it.
+            let mut state = FoldState {
+                lookahead: end_day,
+                ..FoldState::default()
+            };
+            // The side input joins the selection, one day beyond the window:
+            // that day's `trades` may hold the tail of the window's last
+            // aggregate (module docs). The version covers all of it.
             let trades =
                 RawStreamKey::new(ARCHIVE_SOURCE, symbol, ArchiveStream::Trades.raw_name())
                     .map_err(source_error)?;
             let mut with_trades = keys.clone();
             with_trades.insert(trades.clone());
-            let selection = RawSelection::new(with_trades, widened).map_err(source_error)?;
+            let ahead = ReplayWindow {
+                start: widened.start,
+                end: EventTime::from_millis((end_day + 1) * DAY_MS),
+            };
+            let selection = RawSelection::new(with_trades, ahead).map_err(source_error)?;
             let selected = source.select(&selection).map_err(source_error)?;
             // Without a `trades` file the fold reads nothing and delivers
             // the data of `none`, so it keeps that version.
             if selected.files.iter().any(|f| f.stream == trades) {
-                dataset = Some(selected);
+                for file in selected.files {
+                    let Some(stream) = ArchiveStream::from_raw_name(file.stream.stream()) else {
+                        continue;
+                    };
+                    let (first, last) = (
+                        source_day(stream, file.min_event_time),
+                        source_day(stream, file.max_event_time),
+                    );
+                    let (index, from) = match stream {
+                        ArchiveStream::Trades => (&mut state.trades, first),
+                        // The window's own `aggTrades` are indexed below.
+                        ArchiveStream::AggTrades => (&mut state.aggregates, first.max(end_day)),
+                        _ => continue,
+                    };
+                    for day in from..=last {
+                        index.entry(day).or_default().push(file.clone());
+                    }
+                }
+                version = selected.version;
             }
+            fold = Some(state);
         }
-        let dataset = match dataset {
-            Some(dataset) => dataset,
-            None => {
-                let selection = RawSelection::new(keys, widened).map_err(source_error)?;
-                source.select(&selection).map_err(source_error)?
-            }
-        };
         let mut present: BTreeMap<ArchiveStream, BTreeSet<i64>> = BTreeMap::new();
         for file in dataset.files {
             let stream = ArchiveStream::from_raw_name(file.stream.stream())
@@ -382,19 +429,12 @@ pub fn open_requests<'a>(
                 source_day(stream, file.min_event_time),
                 source_day(stream, file.max_event_time),
             );
-            if folding && let Some(fold) = fold.as_mut() {
-                let index = match stream {
-                    ArchiveStream::AggTrades => Some(&mut fold.aggregates),
-                    ArchiveStream::Trades => Some(&mut fold.trades),
-                    _ => None,
-                };
-                if let Some(index) = index {
-                    for day in first..=last {
-                        index.entry(day).or_default().push(file.clone());
-                    }
-                }
-                if stream == ArchiveStream::Trades {
-                    continue;
+            if folding
+                && stream == ArchiveStream::AggTrades
+                && let Some(fold) = fold.as_mut()
+            {
+                for day in first..=last {
+                    fold.aggregates.entry(day).or_default().push(file.clone());
                 }
             }
             let held = present.entry(stream).or_default();
@@ -417,7 +457,7 @@ pub fn open_requests<'a>(
             stats.entry(stream).or_default().missing_days = days;
             windows.insert(stream, window);
         }
-        versions.push((streams, dataset.version));
+        versions.push((streams, version));
     }
     planned.sort_by(|a, b| {
         (a.file.min_event_time, &a.file.relative_path)
@@ -534,6 +574,9 @@ impl ArchiveReplayStream<'_> {
             .range(..=through)
             .map(|(&day, _)| day)
             .filter(|day| !fold.report.days.contains_key(day))
+            // The day after the window only to check the window's last
+            // aggregate: without `trades` there is nothing to check.
+            .filter(|day| *day != fold.lookahead || fold.trades.contains_key(day))
             .collect();
         for day in days {
             self.fold_once(day)?;
@@ -545,6 +588,7 @@ impl ArchiveReplayStream<'_> {
     fn fold_once(&mut self, day: i64) -> Result<(), ProviderError> {
         let source = self.source;
         let symbol = self.symbol.clone();
+        let window = self.windows.get(&ArchiveStream::AggTrades).copied();
         let Some(fold) = self.fold.as_mut() else {
             return Ok(());
         };
@@ -586,6 +630,24 @@ impl ArchiveReplayStream<'_> {
         })?;
         fold.report.days.insert(day, status);
         fold.carries.insert(day, folded.carry);
+        let next = day + 1;
+        if next == fold.lookahead
+            && !(fold.aggregates.contains_key(&next) && fold.trades.contains_key(&next))
+            && let Some(carry) = folded.carry
+            && !carry.broken
+            && window.is_some_and(|w| w.contains(carry.range.time))
+        {
+            // The window delivers this day's last aggregate, and the store
+            // cannot tell whether a trade of the next day is its tail: gap
+            // and report it, as an unresolved trade (ADR-050 D4).
+            fold.gaps_after
+                .entry(carry.range.agg_id)
+                .or_insert(carry.range.time);
+            fold.report.unchecked_tail = Some(UncheckedTail {
+                day,
+                aggregate: carry.range.agg_id,
+            });
+        }
         for u in &folded.unattributed {
             match u.before {
                 Some(n) => {
@@ -1576,6 +1638,11 @@ mod tests {
                         qty: qty("0.005")
                     }
                 )]),
+                // No `trades` of the next day to check aggregate 4's tail.
+                unchecked_tail: Some(UncheckedTail {
+                    day: d,
+                    aggregate: 4
+                }),
             })
         );
         assert!(gaps(&fold.events).is_empty());
@@ -1619,6 +1686,7 @@ mod tests {
         let unchecked = FoldReport {
             days: BTreeMap::from([(d0, DayStatus::Unchecked)]),
             minutes: BTreeMap::new(),
+            unchecked_tail: None,
         };
         assert_eq!(fold.report.as_ref(), Some(&unchecked));
 
@@ -1974,8 +2042,8 @@ mod tests {
     /// Day `d` ends with aggregate 2 over trades 12 ..= 13 at `late`, whose
     /// trade 13 is timed on `d + 1` (the ADR-047 706/707 shape); trade 14,
     /// lost from it, is timed on `d + 1` too. `d` has `trades` iff
-    /// `d_trades`.
-    fn cross_midnight_source(d: i64, d_trades: bool) -> MemorySource {
+    /// `d_trades`, `d + 1` iff `next_trades`.
+    fn cross_midnight_source(d: i64, d_trades: bool, next_trades: bool) -> MemorySource {
         let late = (d + 1) * DAY_MS - 10;
         let next = (d + 1) * DAY_MS;
         let mut source = MemorySource::default();
@@ -2005,16 +2073,18 @@ mod tests {
                 ],
             );
         }
-        seal_rows(
-            &mut source,
-            ArchiveStream::Trades,
-            &[
-                raw_trade(13, "85000.20", "0.000001", next + 12, true),
-                raw_trade(14, "85000.20", "0.005", next + 15, true),
-                raw_trade(15, "85000.30", "0.030", next + 20, false),
-                raw_trade(16, "85000.40", "0.040", next + 30, false),
-            ],
-        );
+        if next_trades {
+            seal_rows(
+                &mut source,
+                ArchiveStream::Trades,
+                &[
+                    raw_trade(13, "85000.20", "0.000001", next + 12, true),
+                    raw_trade(14, "85000.20", "0.005", next + 15, true),
+                    raw_trade(15, "85000.30", "0.030", next + 20, false),
+                    raw_trade(16, "85000.40", "0.040", next + 30, false),
+                ],
+            );
+        }
         source
     }
 
@@ -2026,7 +2096,7 @@ mod tests {
         let d = day("2026-05-15");
         let next = (d + 1) * DAY_MS;
         let both = window(d * DAY_MS, (d + 2) * DAY_MS);
-        let source = cross_midnight_source(d, true);
+        let source = cross_midnight_source(d, true, true);
         let fold = open(
             &source,
             &[ArchiveStream::AggTrades],
@@ -2045,7 +2115,7 @@ mod tests {
 
         // The previous day without `trades` files: its last range still
         // resolves the next day's head.
-        let source = cross_midnight_source(d, false);
+        let source = cross_midnight_source(d, false, true);
         let fold = open(
             &source,
             &[ArchiveStream::AggTrades],
@@ -2118,5 +2188,105 @@ mod tests {
             TradeCorrection::Fold,
         );
         assert!(fold.trailing.is_empty());
+    }
+
+    /// N1 (#109 re-review): on the window's last day, the next day's
+    /// `trades` are read for the tail of its last aggregate and nothing of
+    /// that day is delivered, so the folded quantity does not depend on
+    /// where the window ends. Without them, the tail is gapped and
+    /// reported, never silent.
+    #[test]
+    fn the_window_s_last_aggregate_folds_from_the_next_day_or_reports_its_tail() {
+        let d = day("2026-05-15");
+        let late = (d + 1) * DAY_MS - 10;
+        let next = (d + 1) * DAY_MS;
+        let wide = window(d * DAY_MS, (d + 2) * DAY_MS);
+        let one = window(d * DAY_MS, next);
+        let trailing = |start: i64, end: i64| FeedGap {
+            stream: Stream::Trades,
+            start: EventTime::from_millis(start),
+            end: EventTime::from_millis(end),
+            reason: GapReason::MissingData,
+        };
+        for d_trades in [true, false] {
+            let source = cross_midnight_source(d, d_trades, true);
+            let wide = open(
+                &source,
+                &[ArchiveStream::AggTrades],
+                wide,
+                TradeCorrection::Fold,
+            );
+            let one = open(
+                &source,
+                &[ArchiveStream::AggTrades],
+                one,
+                TradeCorrection::Fold,
+            );
+            assert_eq!(qty_by_id(&wide.events)[&2], qty("0.025"));
+            assert_eq!(qty_by_id(&one.events)[&2], qty("0.025"));
+            assert_eq!(
+                qty_by_id(&one.events).into_keys().collect::<Vec<_>>(),
+                [1, 2]
+            );
+            assert!(gaps(&one.events).is_empty());
+            assert!(one.trailing.is_empty());
+            let (wide_report, one_report) = (wide.report.unwrap(), one.report.unwrap());
+            // Trade 14 is counted on its trades file's day in both windows.
+            assert_eq!(one_report.days, wide_report.days);
+            assert_eq!(one_report.days[&(d + 1)], corrected(1, "0.005", 0, 1, 0));
+            assert_eq!(one_report.minutes, wide_report.minutes);
+            assert_eq!(one_report.unchecked_tail, None);
+            // The wide window's last aggregate has no next day to check it.
+            assert_eq!(wide.trailing, [trailing(next + 30, (d + 2) * DAY_MS)]);
+            assert_eq!(
+                wide_report.unchecked_tail,
+                Some(UncheckedTail {
+                    day: d + 1,
+                    aggregate: 4
+                })
+            );
+        }
+
+        // Without the next day's `trades`: aggregate 2 stays as published,
+        // its tail is a trailing gap and the report names it.
+        let with_next = open(
+            &cross_midnight_source(d, true, true),
+            &[ArchiveStream::AggTrades],
+            one,
+            TradeCorrection::Fold,
+        );
+        let source = cross_midnight_source(d, true, false);
+        let fold = open(
+            &source,
+            &[ArchiveStream::AggTrades],
+            one,
+            TradeCorrection::Fold,
+        );
+        assert_ne!(fold.version, with_next.version);
+        assert_eq!(qty_by_id(&fold.events)[&2], qty("0.020"));
+        assert!(gaps(&fold.events).is_empty());
+        assert_eq!(fold.trailing, [trailing(late, next)]);
+        let report = fold.report.unwrap();
+        assert_eq!(report.days, BTreeMap::from([(d, DayStatus::Clean)]));
+        assert_eq!(
+            report.unchecked_tail,
+            Some(UncheckedTail {
+                day: d,
+                aggregate: 2
+            })
+        );
+
+        // An unchecked day claims nothing about its last aggregate.
+        let source = cross_midnight_source(d, false, false);
+        let fold = open(
+            &source,
+            &[ArchiveStream::AggTrades],
+            one,
+            TradeCorrection::Fold,
+        );
+        assert!(fold.trailing.is_empty());
+        let report = fold.report.unwrap();
+        assert_eq!(report.days, BTreeMap::from([(d, DayStatus::Unchecked)]));
+        assert_eq!(report.unchecked_tail, None);
     }
 }

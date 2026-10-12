@@ -403,6 +403,10 @@ fn day_ranges(days: &[i64]) -> String {
 ///   days; the edge part of the folds (ADR-050 D3) is named apart, since
 ///   ADR-047 measured inner trades only, and unresolved trades are gapped,
 ///   not folded (D4);
+/// - `fold unchecked tail <day>: aggregate <id>, …` when the window's last
+///   aggregate is from a checked day and the store lacks the next day's
+///   `trades` or `aggTrades` that would hold its tail (D4); its trailing
+///   gap is printed with the others;
 /// - with `detail`, one `fold <day>: …` line per corrected day (the whole
 ///   source day) and one `fold minute <open ms>: …` line per 1m minute
 ///   holding a folded aggregate delivered in the window. A bar of any
@@ -458,6 +462,15 @@ pub fn fold_lines(fold: &FoldReport, detail: bool) -> Vec<String> {
         unchecked.len(),
         day_ranges(&unchecked),
     )];
+    if let Some(tail) = fold.unchecked_tail {
+        lines.push(format!(
+            "fold unchecked tail {}: aggregate {}, the store lacks the trades or aggTrades of {} \
+             that would hold its tail",
+            day_label(tail.day),
+            tail.aggregate,
+            day_label(tail.day + 1)
+        ));
+    }
     if detail {
         lines.extend(days);
         lines.extend(fold.minutes.iter().map(|(open, m)| {

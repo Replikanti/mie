@@ -65,7 +65,11 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   also across a day boundary, or becomes a `MissingData` gap when its price
   or side differs, when an earlier trade of the same gap did not fold, or
   when the aggregate below lies in a day the replay does not have
-  (`unresolved`); a gap the window ends inside is a trailing gap. Where
+  (`unresolved`); a gap the window ends inside is a trailing gap. The day
+  after the window is read for the tail of the window's last aggregate and
+  never delivered, so a folded quantity does not depend on where the window
+  ends; when the store lacks that day's `trades` or `aggTrades`, the tail is
+  a trailing gap and a `fold unchecked tail` report line. Where
   `trades` files exist for a window, its archive dataset version and
   event-stream hash change; experiment specs pinned to an earlier version
   run with `--trade-correction none`, and a mismatch under the fold prints
