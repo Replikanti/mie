@@ -858,12 +858,16 @@ fn the_kline_check_matches_consistent_days_and_counts_an_altered_kline() {
     let archive = Arc::new(FakeArchive::default());
     let (from, to) = (day("2026-09-28"), day("2026-09-30"));
     let published = publish_all(&archive, from, to, 30_000);
-    // The raw trades skip ids, as the real dataset does: no gap (#85).
+    // The raw trades skip ids, as the real dataset does: no gap (#85). The
+    // aggregates' ranges name the same ids, as they do in the archive, so
+    // the fold finds every trade covered (ADR-050 D3).
     for d in from..=to {
+        let sparse = sparse_trade_ids(&ticks(d, 30_000));
+        archive.publish(ArchiveStream::Trades, Period::Day(d), &trades_csv(&sparse));
         archive.publish(
-            ArchiveStream::Trades,
+            ArchiveStream::AggTrades,
             Period::Day(d),
-            &trades_csv(&sparse_trade_ids(&ticks(d, 30_000))),
+            &agg_trades_csv(&sparse),
         );
     }
     run_import(&config, &archive, from, to, false);
@@ -1168,7 +1172,8 @@ fn the_fold_clears_a_pure_gap_bar_and_adds_no_mismatch() {
     assert!(
         fold.contains(
             "fold summary: corrected 1 [2026-09-29], clean 2 [2026-09-28,2026-09-30], \
-             unchecked 0 [-]; aggregates 1, trades folded 1, qty 0.00700000, unattributed 0\n"
+             unchecked 0 [-]; aggregates 1, trades folded 1, qty 0.00700000, unattributed 0, \
+             edge trades folded 0, edge qty 0.00000000, unresolved 0\n"
         ),
         "{fold}"
     );

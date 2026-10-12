@@ -697,7 +697,7 @@ fn an_archive_replay_is_exact_deterministic_and_marks_a_missing_day() {
         text.contains(
             "fold summary: corrected 0 [-], clean 0 [-], unchecked 2 \
              [2026-10-06,2026-10-08]; aggregates 0, trades folded 0, qty 0.00000000, \
-             unattributed 0\n"
+             unattributed 0, edge trades folded 0, edge qty 0.00000000, unresolved 0\n"
         ),
         "{text}"
     );
@@ -895,8 +895,10 @@ fn an_archive_replay_folds_uncovered_trades_and_none_reproduces_the_published_da
         fold_lines,
         [
             "fold summary: corrected 1 [2026-02-05], clean 1 [2026-02-07], unchecked 1 \
-             [2026-02-06]; aggregates 2, trades folded 3, qty 0.00800000, unattributed 0",
-            "fold 2026-02-05: aggregates 2, trades 3, qty 0.00800000, unattributed 0",
+             [2026-02-06]; aggregates 2, trades folded 3, qty 0.00800000, unattributed 0, \
+             edge trades folded 0, edge qty 0.00000000, unresolved 0",
+            "fold 2026-02-05: aggregates 2, trades 3, qty 0.00800000, unattributed 0, edge \
+             trades 0, edge qty 0.00000000, unresolved 0",
             "fold minute 1770250200000: aggregates 2, trades 3, qty 0.00800000",
         ],
         "{text}"

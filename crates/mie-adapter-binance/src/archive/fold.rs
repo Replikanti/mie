@@ -7,15 +7,27 @@
 //! missing: the lost trades are the tail of the aggregate right below them
 //! (ADR-050 D3, measured on all 2109 known ones).
 //!
-//! [`fold_day`] is a pure pass over one source day, both inputs in id order:
+//! [`fold_day`] is a pure pass over one source day, both inputs in id order.
+//! For a trade `u`, `P` is the aggregate with the largest
+//! `last_trade_id < u` and `N` the one with the smallest
+//! `first_trade_id > u`:
 //!
 //! - **Covered.** A trade inside some aggregate's range is already counted.
-//! - **Uncovered.** A trade strictly between two ranges is folded into the
-//!   preceding aggregate `P` when its price and aggressor equal `P`'s: `P`
-//!   keeps its id, price, time and side, its quantity grows. Otherwise it is
+//! - **Uncovered.** A trade strictly between two ranges of the day (the
+//!   population ADR-047 measured) is folded into `P` when its price and
+//!   aggressor equal `P`'s and every earlier uncovered trade between `P`
+//!   and `N` was folded too: `P` keeps its id, price, time and side, its
+//!   quantity grows, and its restored range stays contiguous. From the
+//!   first trade that does not match on, the rest of that gap is
 //!   [`Unattributed`] and the replay marks the span with a gap (ADR-050 D4).
-//! - **Edge ids.** A trade before the first or after the last range belongs
-//!   to a neighbouring day's aggregates and is ignored (ADR-047 D3).
+//! - **Edge ids.** A trade after the day's last range has that range as
+//!   `P` (its `N` opens a later day) and follows the same rule. A trade
+//!   before the day's first range belongs to the previous day's last range
+//!   when it is inside it (covered, the ADR-047 706/707 shape), or has it as
+//!   `P` when it is above it; the replay hands that range over as a
+//!   [`Carry`], with whether the run above it already broke. Without a
+//!   carry `P` is unknown, and the trade is **unresolved**: counted and
+//!   gapped, never folded (ADR-050 D3).
 //! - **Repeats.** An aggregate or trade id at or below the previous one is
 //!   skipped and counted, as the live [`StreamSequencer`] drops it, so
 //!   overlapping sealed files fold as they deliver.
@@ -100,32 +112,81 @@ pub struct Fold {
     pub last_trade_id: u64,
 }
 
-/// An uncovered trade whose price or aggressor differs from the preceding
-/// aggregate's: not folded (ADR-050 D4).
+/// An uncovered trade that folds nowhere: its price or aggressor differs
+/// from `P`'s, or an earlier trade of the same gap did not fold (ADR-050
+/// D4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Unattributed {
     /// The trade id.
     pub trade_id: u64,
     /// The trade's time.
     pub time: EventTime,
-    /// The aggregate right below it (`P`).
-    pub after_agg_id: u64,
+    /// The aggregate right below it (`P`), possibly the previous day's last.
+    pub after: AggRange,
     /// The aggregate right above it (`N`), before which the replay
-    /// delivers the gap.
-    pub before_agg_id: u64,
+    /// delivers the gap; `None` after the day's last range, where `N` opens
+    /// a later day and the gap goes before the next aggregate after `P`.
+    pub before: Option<AggRange>,
+}
+
+/// What the fold of one day hands to the next (module docs): the day's
+/// last range and whether the run of uncovered trades above it broke.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Carry {
+    /// The day's last aggregate range: `P` of the next day's head trades.
+    pub range: AggRange,
+    /// An uncovered trade above `range` was unattributed, so no later one
+    /// of that gap folds.
+    pub broken: bool,
 }
 
 /// The fold of one source day.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DayFold {
-    /// Per aggregate id, what is folded into it.
+    /// Per aggregate id, what is folded into it (an edge fold may target
+    /// the previous day's last aggregate).
     pub folds: BTreeMap<u64, Fold>,
     /// Uncovered trades that fold nowhere, in id order.
     pub unattributed: Vec<Unattributed>,
-    /// Uncovered trades: folded plus unattributed.
+    /// Uncovered trades with a known `P`: folded plus unattributed, edge
+    /// ids included.
     pub uncovered: u64,
+    /// Of `uncovered`, the edge ids: after the day's last range, or before
+    /// its first and above the carried range.
+    pub edge: u64,
+    /// Of the folded trades, the edge ids.
+    pub edge_folded: u64,
+    /// Their summed quantity.
+    pub edge_qty: Qty,
+    /// Trades before the day's first range whose `P` the fold does not
+    /// have (no carry, or below the carried range), and every trade of a
+    /// day without ranges: neither covered nor folded.
+    pub unresolved: u64,
+    /// The day's first range when an unresolved trade lies below it: the
+    /// replay delivers their gap before it.
+    pub unresolved_before: Option<AggRange>,
     /// Aggregate and trade rows skipped as repeated or regressing ids.
     pub repeats: u64,
+    /// What the next day's fold starts from; `None` for a day without
+    /// ranges.
+    pub carry: Option<Carry>,
+}
+
+impl Default for DayFold {
+    fn default() -> Self {
+        Self {
+            folds: BTreeMap::new(),
+            unattributed: Vec::new(),
+            uncovered: 0,
+            edge: 0,
+            edge_folded: 0,
+            edge_qty: Qty::from_units(0),
+            unresolved: 0,
+            unresolved_before: None,
+            repeats: 0,
+            carry: None,
+        }
+    }
 }
 
 impl DayFold {
@@ -202,12 +263,14 @@ impl<I: Iterator<Item = Result<AggRange, FoldError>>> Ranges<I> {
 }
 
 /// Folds one source day: `ranges` are the day's `aggTrades` rows, `trades`
-/// its `trades` rows, each in id order (module docs).
+/// its `trades` rows, each in id order, and `carry` what the previous
+/// source day's fold handed over, if the replay has that day (module docs).
 ///
 /// # Errors
 ///
 /// The first input error, a broken range contract, or a quantity overflow.
 pub fn fold_day(
+    carry: Option<Carry>,
     ranges: impl Iterator<Item = Result<AggRange, FoldError>>,
     trades: impl Iterator<Item = Result<Trade, FoldError>>,
 ) -> Result<DayFold, FoldError> {
@@ -220,6 +283,9 @@ pub fn fold_day(
     // `previous` ends below the current trade; `current` ends at or above it.
     let mut previous: Option<AggRange> = None;
     let mut current = ranges.next()?;
+    let first = current;
+    // The `P` of the gap being folded, and whether that gap's run broke.
+    let mut run: Option<(u64, bool)> = carry.map(|c| (c.range.agg_id, c.broken));
     let mut last_trade: Option<u64> = None;
     for trade in trades {
         let trade = trade?;
@@ -232,37 +298,62 @@ pub fn fold_day(
             previous = Some(range);
             current = ranges.next()?;
         }
-        // After the last range, or before the first one: an edge id.
-        let (Some(below), Some(above)) = (previous, current) else {
-            continue;
-        };
-        if above.first_trade_id <= trade.trade_id {
+        if current.is_some_and(|above| above.first_trade_id <= trade.trade_id) {
             continue;
         }
+        let (below, edge) = match (previous, carry) {
+            // A day without ranges has no aggregate to fold into.
+            _ if first.is_none() => {
+                day.unresolved += 1;
+                continue;
+            }
+            (Some(below), _) => (below, current.is_none()),
+            // Below the day's first range: the carried range's, if any.
+            (None, Some(c)) if trade.trade_id > c.range.last_trade_id => (c.range, true),
+            (None, Some(c)) if trade.trade_id >= c.range.first_trade_id => continue,
+            _ => {
+                day.unresolved += 1;
+                day.unresolved_before = first;
+                continue;
+            }
+        };
         day.uncovered += 1;
-        if trade.price == below.price && trade.aggressor == below.aggressor {
+        day.edge += u64::from(edge);
+        let broken = run.is_some_and(|(p, broken)| p == below.agg_id && broken);
+        if !broken && trade.price == below.price && trade.aggressor == below.aggressor {
+            let overflow = || FoldError::Overflow {
+                agg_id: below.agg_id,
+            };
             let fold = day.folds.entry(below.agg_id).or_insert(Fold {
                 qty: Qty::from_units(0),
                 trades: 0,
                 last_trade_id: below.last_trade_id,
             });
-            fold.qty = fold.qty.checked_add(trade.qty).ok_or(FoldError::Overflow {
-                agg_id: below.agg_id,
-            })?;
+            fold.qty = fold.qty.checked_add(trade.qty).ok_or_else(overflow)?;
             fold.trades += 1;
             fold.last_trade_id = trade.trade_id;
+            if edge {
+                day.edge_folded += 1;
+                day.edge_qty = day.edge_qty.checked_add(trade.qty).ok_or_else(overflow)?;
+            }
+            run = Some((below.agg_id, false));
         } else {
             day.unattributed.push(Unattributed {
                 trade_id: trade.trade_id,
                 time: trade.time,
-                after_agg_id: below.agg_id,
-                before_agg_id: above.agg_id,
+                after: below,
+                before: current,
             });
+            run = Some((below.agg_id, true));
         }
     }
     // The rest of the ranges: their contract and repeats still count.
     while ranges.next()?.is_some() {}
     day.repeats += ranges.repeats;
+    day.carry = ranges.last.map(|range| Carry {
+        range,
+        broken: run.is_some_and(|(p, broken)| p == range.agg_id && broken),
+    });
     Ok(day)
 }
 
@@ -300,10 +391,30 @@ mod tests {
     }
 
     fn run(ranges: &[AggRange], trades: &[Trade]) -> Result<DayFold, FoldError> {
+        run_after(None, ranges, trades)
+    }
+
+    fn run_after(
+        carry: Option<Carry>,
+        ranges: &[AggRange],
+        trades: &[Trade],
+    ) -> Result<DayFold, FoldError> {
         fold_day(
+            carry,
             ranges.iter().copied().map(Ok),
             trades.iter().copied().map(Ok),
         )
+    }
+
+    /// The fold of a day where nothing is uncovered: only the carry.
+    fn nothing(ranges: &[AggRange]) -> DayFold {
+        DayFold {
+            carry: ranges.last().map(|&range| Carry {
+                range,
+                broken: false,
+            }),
+            ..DayFold::default()
+        }
     }
 
     use Aggressor::{Buy, Sell};
@@ -326,7 +437,7 @@ mod tests {
             trade(8, "101.0", "0.3", Buy),
             trade(9, "101.0", "0.3", Buy),
         ];
-        assert_eq!(run(&three(), &trades), Ok(DayFold::default()));
+        assert_eq!(run(&three(), &trades), Ok(nothing(&three())));
     }
 
     #[test]
@@ -375,7 +486,7 @@ mod tests {
         // Ids 3, 4, 6 and 7 lie between ranges, but the sparse `trades`
         // file has no row for them (ADR-045).
         let trades = [trade(1, "100.0", "0.1", Buy), trade(9, "101.0", "0.1", Buy)];
-        assert_eq!(run(&three(), &trades), Ok(DayFold::default()));
+        assert_eq!(run(&three(), &trades), Ok(nothing(&three())));
     }
 
     #[test]
@@ -390,31 +501,169 @@ mod tests {
                 Unattributed {
                     trade_id: 3,
                     time: EventTime::from_millis(30),
-                    after_agg_id: 10,
-                    before_agg_id: 11
+                    after: three()[0],
+                    before: Some(three()[1])
                 },
                 Unattributed {
                     trade_id: 6,
                     time: EventTime::from_millis(60),
-                    after_agg_id: 11,
-                    before_agg_id: 12
+                    after: three()[1],
+                    before: Some(three()[2])
                 }
             ]
         );
     }
 
+    /// #109 review R3: once a trade of a gap is unattributed, a later one
+    /// of the same gap at `P`'s price and side does not fold either, or
+    /// `P`'s restored range would skip the unattributed id (ADR-050 D3).
     #[test]
-    fn edge_ids_before_the_first_and_after_the_last_range_are_ignored() {
+    fn a_gap_folds_only_its_matching_run_right_above_the_aggregate() {
+        let trades = [
+            trade(3, "100.1", "0.1", Buy),
+            trade(4, "100.0", "0.2", Buy),
+            // The next gap starts a new run.
+            trade(6, "100.5", "0.3", Sell),
+        ];
+        let day = run(&three(), &trades).unwrap();
+        assert_eq!(
+            day.unattributed
+                .iter()
+                .map(|u| u.trade_id)
+                .collect::<Vec<_>>(),
+            [3, 4]
+        );
+        assert!(day.unattributed.iter().all(|u| u.after == three()[0]));
+        assert_eq!(
+            day.folds,
+            BTreeMap::from([(
+                11,
+                Fold {
+                    qty: qty("0.3"),
+                    trades: 1,
+                    last_trade_id: 6
+                }
+            )])
+        );
+        assert_eq!(day.uncovered, 3);
+
+        // A matching run folds up to the first mismatch only.
+        let trades = [trade(3, "100.0", "0.1", Buy), trade(4, "100.1", "0.1", Buy)];
+        let day = run(&three(), &trades).unwrap();
+        assert_eq!(day.folds[&10].last_trade_id, 3);
+        assert_eq!(day.unattributed[0].trade_id, 4);
+    }
+
+    /// #109 review R1: a trade after the day's last range has that range as
+    /// `P` and is folded or unattributed within the day, never ignored.
+    #[test]
+    fn a_trade_after_the_last_range_is_its_tail() {
+        let trades = [
+            trade(10, "101.0", "0.1", Buy),
+            trade(11, "101.1", "0.1", Buy),
+            trade(12, "101.0", "0.1", Buy),
+        ];
+        let day = run(&three(), &trades).unwrap();
+        assert_eq!(
+            day.folds,
+            BTreeMap::from([(
+                12,
+                Fold {
+                    qty: qty("0.1"),
+                    trades: 1,
+                    last_trade_id: 10
+                }
+            )])
+        );
+        assert_eq!(
+            day.unattributed
+                .iter()
+                .map(|u| (u.trade_id, u.after.agg_id, u.before))
+                .collect::<Vec<_>>(),
+            [(11, 12, None), (12, 12, None)]
+        );
+        assert_eq!((day.uncovered, day.edge), (3, 3));
+        assert_eq!((day.edge_folded, day.edge_qty), (1, qty("0.1")));
+        assert_eq!(
+            day.carry,
+            Some(Carry {
+                range: three()[2],
+                broken: true
+            })
+        );
+    }
+
+    /// #109 review R2: a trade before the day's first range is covered by,
+    /// or the tail of, the previous day's last range; without that range
+    /// it is unresolved.
+    #[test]
+    fn a_trade_before_the_first_range_resolves_with_the_carry() {
+        let previous = range(9, 0, 0, "99.0", Sell);
         let ranges = [range(10, 5, 5, "100.0", Buy), range(11, 6, 6, "100.0", Buy)];
         let trades = [
-            trade(3, "100.0", "0.1", Buy),
-            trade(4, "100.0", "0.1", Buy),
-            trade(7, "100.0", "0.1", Buy),
-            trade(8, "100.0", "0.1", Buy),
+            trade(0, "99.0", "0.1", Sell),
+            trade(1, "99.0", "0.2", Sell),
+            trade(2, "99.0", "0.3", Sell),
+            trade(5, "100.0", "0.1", Buy),
         ];
-        assert_eq!(run(&ranges, &trades), Ok(DayFold::default()));
-        // No range at all: every trade is an edge id.
-        assert_eq!(run(&[], &trades), Ok(DayFold::default()));
+        let carry = Carry {
+            range: previous,
+            broken: false,
+        };
+        let day = run_after(Some(carry), &ranges, &trades).unwrap();
+        // Trade 0 is the carried range's own; 1 and 2 are its tail.
+        assert_eq!(
+            day.folds,
+            BTreeMap::from([(
+                9,
+                Fold {
+                    qty: qty("0.5"),
+                    trades: 2,
+                    last_trade_id: 2
+                }
+            )])
+        );
+        assert_eq!((day.uncovered, day.edge, day.edge_folded), (2, 2, 2));
+        assert_eq!((day.unresolved, day.unresolved_before), (0, None));
+
+        // The previous day's run already broke: nothing of the gap folds.
+        let broken = Carry {
+            broken: true,
+            ..carry
+        };
+        let day = run_after(Some(broken), &ranges, &trades).unwrap();
+        assert!(day.folds.is_empty());
+        assert_eq!(
+            day.unattributed
+                .iter()
+                .map(|u| (u.trade_id, u.after.agg_id, u.before.map(|n| n.agg_id)))
+                .collect::<Vec<_>>(),
+            [(1, 9, Some(10)), (2, 9, Some(10))]
+        );
+
+        // No carry: `P` is unknown, so all three are unresolved, gapped
+        // before the day's first range.
+        let day = run_after(None, &ranges, &trades).unwrap();
+        assert!(day.folds.is_empty() && day.unattributed.is_empty());
+        assert_eq!(day.uncovered, 0);
+        assert_eq!(
+            (day.unresolved, day.unresolved_before),
+            (3, Some(ranges[0]))
+        );
+
+        // Below the carried range: unresolved as well.
+        let later = Carry {
+            range: range(9, 1, 1, "99.0", Sell),
+            broken: false,
+        };
+        let day = run_after(Some(later), &ranges, &trades).unwrap();
+        assert_eq!(day.unresolved, 1);
+        assert_eq!(day.folds[&9].last_trade_id, 2);
+
+        // A day without ranges folds nothing: every trade is unresolved.
+        let day = run_after(Some(carry), &[], &trades).unwrap();
+        assert_eq!((day.unresolved, day.unresolved_before), (4, None));
+        assert_eq!((day.uncovered, day.carry), (0, None));
     }
 
     #[test]
@@ -465,7 +714,7 @@ mod tests {
     fn an_input_error_fails_the_fold() {
         let failing = [Err(FoldError::Input("part-00000: bad row".to_owned()))];
         assert_eq!(
-            fold_day(failing.into_iter(), std::iter::empty()),
+            fold_day(None, failing.into_iter(), std::iter::empty()),
             Err(FoldError::Input("part-00000: bad row".to_owned()))
         );
     }

@@ -398,8 +398,11 @@ fn day_ranges(days: &[i64]) -> String {
 ///
 /// - `fold summary: corrected <n> [<days>], clean <n> [<days>], unchecked
 ///   <n> [<days>]; aggregates <a>, trades folded <t>, qty <q>,
-///   unattributed <u>` — the day statuses as day ranges and the totals of
-///   the corrected days;
+///   unattributed <u>, edge trades folded <e>, edge qty <eq>, unresolved
+///   <r>` — the day statuses as day ranges and the totals of the corrected
+///   days; the edge part of the folds (ADR-050 D3) is named apart, since
+///   ADR-047 measured inner trades only, and unresolved trades are gapped,
+///   not folded (D4);
 /// - with `detail`, one `fold <day>: …` line per corrected day (the whole
 ///   source day) and one `fold minute <open ms>: …` line per 1m minute
 ///   holding a folded aggregate delivered in the window. A bar of any
@@ -409,7 +412,9 @@ pub fn fold_lines(fold: &FoldReport, detail: bool) -> Vec<String> {
     let mut clean = Vec::new();
     let mut unchecked = Vec::new();
     let (mut aggregates, mut trades, mut unattributed) = (0_u64, 0_u64, 0_u64);
+    let (mut edge_trades, mut unresolved) = (0_u64, 0_u64);
     let mut qty = Some(Qty::from_units(0));
+    let mut edge_qty = Some(Qty::from_units(0));
     let mut days = Vec::new();
     for (&day, status) in &fold.days {
         match *status {
@@ -418,14 +423,21 @@ pub fn fold_lines(fold: &FoldReport, detail: bool) -> Vec<String> {
                 trades: t,
                 qty: q,
                 unattributed: u,
+                edge_trades: e,
+                edge_qty: eq,
+                unresolved: r,
             } => {
                 corrected.push(day);
                 aggregates += a;
                 trades += t;
                 unattributed += u;
+                edge_trades += e;
+                unresolved += r;
                 qty = qty.and_then(|sum| sum.checked_add(q));
+                edge_qty = edge_qty.and_then(|sum| sum.checked_add(eq));
                 days.push(format!(
-                    "fold {}: aggregates {a}, trades {t}, qty {q}, unattributed {u}",
+                    "fold {}: aggregates {a}, trades {t}, qty {q}, unattributed {u}, edge \
+                     trades {e}, edge qty {eq}, unresolved {r}",
                     day_label(day)
                 ));
             }
@@ -433,10 +445,12 @@ pub fn fold_lines(fold: &FoldReport, detail: bool) -> Vec<String> {
             DayStatus::Unchecked => unchecked.push(day),
         }
     }
-    let qty = qty.map_or_else(|| "overflow".to_owned(), |q| q.to_string());
+    let total = |q: Option<Qty>| q.map_or_else(|| "overflow".to_owned(), |q| q.to_string());
+    let (qty, edge_qty) = (total(qty), total(edge_qty));
     let mut lines = vec![format!(
         "fold summary: corrected {} [{}], clean {} [{}], unchecked {} [{}]; aggregates \
-         {aggregates}, trades folded {trades}, qty {qty}, unattributed {unattributed}",
+         {aggregates}, trades folded {trades}, qty {qty}, unattributed {unattributed}, edge \
+         trades folded {edge_trades}, edge qty {edge_qty}, unresolved {unresolved}",
         corrected.len(),
         day_ranges(&corrected),
         clean.len(),

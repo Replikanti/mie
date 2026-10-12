@@ -67,6 +67,13 @@ For an uncovered trade `u`, `P` is the aggregate with the largest
 | `P` and `N` inside the same day file | 2109 | 2109 |
 | folded quantity, summed over the 32 per-day values | 541.622 BTC | — |
 
+The population is ADR-047's: trades **inside** the day's aggregate span,
+strictly between two ranges of the same day (the **inner** trades). An
+**edge id**, a trade before the day's first range or after its last, is
+outside it by definition, so "same day file 2109 of 2109" says nothing
+about edges, and how often a lost trade sits at a day's edge was not
+measured (#109 review).
+
 **Live ground truth.** The only data in which the complete aggregate is
 known is the live truncation of 2026-10-08 (#90 M0.3(b), ADR-048): 97 live
 aggregates of run `20261008T035138Z` start at the archive aggregate's first
@@ -137,17 +144,46 @@ one dataset that holds both versions of the aggregate.
      `trades` ids (ADR-045) turn off sequence-break detection.
 
 3. **The tail fold (D3).** Per source day, both inputs in id order: a trade
-   inside some range is covered; a trade strictly between two ranges is
-   uncovered and is **folded into the preceding aggregate `P`** when its
-   price and aggressor equal `P`'s. `P` keeps its id, price, `transact_time`
-   and side; only its quantity grows (exact `Qty` addition, an overflow
-   fails the replay). A trade before the first or after the last range of
-   the day is an edge id and is ignored (ADR-047 D3). A trade that matches
-   both `P` and `N` (313 of 2109) is folded into `P`, because all 97 live
-   truncations were tails. A repeated or regressing id is skipped and
-   counted, as the live `StreamSequencer` drops it; a range with
-   `first > last`, or one that overlaps the previous range, fails the
-   replay naming the day and the aggregate.
+   inside some range is covered; any other trade whose `P` is known is
+   uncovered and is **folded into `P`** when its price and aggressor equal
+   `P`'s **and every earlier uncovered trade between `P` and `N` was
+   folded**. From the first trade of a gap that does not match on, the
+   rest of that gap is unattributed (D4). `P` keeps its id, price,
+   `transact_time` and side; only its quantity grows (exact `Qty`
+   addition, an overflow fails the replay), and its restored range stays
+   contiguous. A trade that matches both `P` and `N` (313 of 2109) is
+   folded into `P`, because all 97 live truncations were tails. A repeated
+   or regressing id is skipped and counted, as the live `StreamSequencer`
+   drops it; a range with `first > last`, or one that overlaps the previous
+   range, fails the replay naming the day and the aggregate.
+   - **Edge ids.** After the day's last range, `P` is that range and `N`
+     opens a later day: the trade is folded or gapped within the day.
+     Before the day's first range, the trade is resolved against the
+     previous source day's last range when the replay has that day (from
+     its fold, or, for a day without `trades` files, from its `aggTrades`
+     ranges): inside that range it is covered (ADR-047 D3's ids 706/707);
+     above it, it is that range's tail, and whether the run above the
+     range already broke is carried across midnight. Otherwise `P` is
+     unknown and the trade is **unresolved**: counted and gapped (D4),
+     never folded.
+   - Why edge ids are not ignored: ADR-047 D3 could ignore 706/707 because
+     they were measured covered by the neighbouring day's range. A lost
+     tail trade of a day's last aggregate is an edge id too: in the same
+     day's file when it is timed before midnight, in the next day's when
+     the aggregate spans midnight (the 706/707 shape with one trade lost).
+     Ignored, it is dropped and the day reports `clean`, which breaks
+     "anything it cannot fold surfaces as a gap and in the report"
+     (Consequences). The tail rule needs only `P`, which is known in both
+     cases.
+   - Why only the run right above `P`: an aggregate is a contiguous id
+     range, so once a trade of the gap is not `P`'s, no later id of that
+     gap can be `P`'s either; folding it would give `P` a range that skips
+     an id, a guessed composition (D4). M0 found 0 unattributed trades on
+     the 32 days, so the restriction changes none of its numbers.
+   - Why unresolved and not folded or ignored: without `P`'s row the fold
+     cannot tell a trade covered by `P` (carried, not missing, ADR-047 D3)
+     from one lost after it; folding would guess, ignoring would hide a
+     possible loss.
    - Grounds: 2109 of 2109 tail, 0 head-only, 0 neither; 97 of 97 live
      truncations reproduced exactly; consecutive aggregate ids.
    - The folded quantity lands in `P.transact_time`'s bar, not the trade's
@@ -159,17 +195,30 @@ one dataset that holds both versions of the aggregate.
      strictly increasing trade ids (ADR-028 D5), so it needs a change to the
      domain event model for 2109 trades the fold places exactly.
 
-4. **An unattributed trade becomes a `MissingData` gap (D4).** An uncovered
-   trade whose price or side differs from `P`'s is not folded. The replay
-   delivers `FeedGap { stream: Trades, start: T(P), end: T(N), reason:
-   MissingData }` right before `N` (from the window start when `P` lies
-   before the window), unless a gap already stands there.
+4. **An unattributed or unresolved trade becomes a `MissingData` gap
+   (D4).** An uncovered trade that does not fold (D3), and an unresolved
+   edge id, is not folded. Per run the replay delivers one `FeedGap {
+   stream: Trades, start: T(P), end: T(N), reason: MissingData }` right
+   before `N` (from the window start when `P` lies before the window or is
+   unknown), unless a gap already stands there. When `N` opens a later
+   day, the gap goes before the first aggregate delivered above `P`. When
+   the window ends before `N`, the gap is a trailing gap from the last
+   delivered aggregate (or the window start) to the window end, the way a
+   missing day or a live gap still open at the window's end is reported
+   (ADR-039 D5); a window that ends before `T(P)` has none.
    - Why: a guessed fold would invent the aggregate's composition; a gap
      marks the touched bars `feed_gap` with no change to the event model or
-     its hash encoding. M0 found 0 such trades on the 32 days, so this
-     applies only to the 220 unmeasured days of the window.
+     its hash encoding. M0 found 0 such inner trades on the 32 days, so
+     this applies to the 220 unmeasured days of the window, to edge ids,
+     and to a window's first day (unresolved, Consequences).
    - Why `MissingData` and not `SequenceBreak`: the aggregate-id sequence
      did not jump; data the source should hold is missing.
+   - Why a trailing gap: a millisecond window (`--from`/`--to` in ms, an
+     experiment's sample period) can end between `T(P)` and `T(N)`.
+     Without it, the bars in the window after `P` would be unmarked while
+     the report counts the trade (#109 review). A day-aligned window never
+     ends there, since `N` lies in the same day file or opens the next
+     day.
    - Rejected, failing the replay (human decision 4 at STOP 1 of #102): one
      unexpected trade on an unmeasured day would stop a 252-day replay.
 
@@ -192,17 +241,33 @@ one dataset that holds both versions of the aggregate.
      acceptance) × 252/365 = 14.2 min, × 3.8 for the delivery pass (1), the
      fold's second `aggTrades` pass (1) and `trades` at up to 1.80 × the
      `aggTrades` bytes (ADR-031 addendum). The Accept-when run measures
-     both; a slower replay costs time, not correctness.
+     both; a slower replay costs time, not correctness. One more read is
+     needed only where a day with `trades` files follows one without (D3's
+     edge ids): that earlier day's `aggTrades` are read once for its last
+     range. Inside the import that happens at most at the window's first
+     day and at the control 2026-10-09, so it does not change the
+     estimate.
 
-6. **Scope is the source day (D6).** Every `P` and `N` of the 2109 lay in
-   the same day file as the trade (#102 M0), so no fold state crosses a day
-   and a day's fold is complete when its files are. `trades` stays opt-in
-   at import (ADR-034 D2) and is imported for the 252-day defect window
-   plus the controls 2026-06-10 and 2026-10-09 (human decision 3 at STOP 1
-   of #102). A day without `trades` files is **unchecked** and delivered as
-   normalized: the days from 2026-06-10 on, where ADR-047 D4 and #90 M0.1
-   measured 0 uncovered trades on 23 of 23 sampled days, stay unchecked
-   unless imported.
+6. **Scope is the source day, with a one-range carry (D6).** Every `P` and
+   `N` of the 2109 lay in the same day file as the trade (#102 M0), so a
+   day's inner fold is complete when its files are. Only edge ids cross a
+   day (D3). The fold of day D starts from D−1's last range and whether
+   the run above it broke. D+1 is folded when D's first `aggTrades` file
+   opens, so a head trade of D+1 that folds into D's last aggregate is
+   known before that aggregate is delivered. Days fold in order, each
+   once. `trades` stays opt-in at import (ADR-034 D2) and is imported for
+   the 252-day defect window plus the controls 2026-06-10 and 2026-10-09
+   (human decision 3 at STOP 1 of #102). A day without `trades` files is
+   **unchecked** and delivered as normalized: the days from 2026-06-10 on,
+   where ADR-047 D4 and #90 M0.1 measured 0 uncovered trades on 23 of 23
+   sampled days, stay unchecked unless imported.
+   - Why one range and a flag: they are all an edge id needs (`P`, and
+     whether D3's run already broke), so the fold stays one sealed part at
+     a time (D5).
+   - Why fold D+1 ahead rather than hold D's last aggregate back: the
+     replay is a streaming merge (ADR-039 D5) with a zero hold-back, so D's
+     last aggregate is delivered as soon as it is merged; folding D+1 one
+     day early costs no extra read, since every day is folded once anyway.
 
 7. **Provenance is out of band (D7).** A consumer tells original from
    corrected data by three things, none of them in the event stream:
@@ -213,14 +278,18 @@ one dataset that holds both versions of the aggregate.
      version: every version recorded on a store without `trades` stays
      valid.
    - **The fold report.** `mie replay` prints a summary (days corrected,
-     clean and unchecked as day ranges; aggregates, trades folded, quantity
-     and unattributed trades of the corrected days), one `fold <day>` line
-     per corrected day (the whole source day) and one
+     clean and unchecked as day ranges; aggregates, trades folded, quantity,
+     unattributed trades, the edge part of the folds (trades and quantity)
+     and unresolved trades of the corrected days), one `fold <day>` line
+     per corrected day (the whole source day, edge ids counted on the day
+     of their `trades` file) and one
      `fold minute <open ms>` line per 1m minute holding a folded aggregate
      delivered in the window, in a fixed order without a wall-clock field
      (ADR-039 D9). **A bar of any timeframe carries folded data iff it
      contains a reported minute.** `archive-kline-check` prints the summary
-     line.
+     line. The edge part is named apart because M0's numbers cover inner
+     trades only (Context): Accept-when compares the inner part (folds
+     minus edge folds) with them exactly.
    - **`--trade-correction none`**, which delivers `aggTrades` as published.
    - Rejected, an in-band flag on `Trade` or `Bar`: it needs event-stream
      hash encoding v2 (ADR-039 D7), a `Bar` state-hash change, and a field
@@ -253,6 +322,7 @@ one dataset that holds both versions of the aggregate.
 | 1 000 000 rows per part | writer `max_rows`, ADR-030 D4 | The fold's memory per input; a larger part raises it proportionally |
 | about 54 min per 252-day replay | D5's derivation | Time only |
 | 541.622 BTC folded on the 32 days | sum of #102 M0's per-day column | The Accept-when quantity check |
+| 0 edge ids in M0 | ADR-047's population is inner by definition (Context) | Nothing to predict: edge folds are recorded by the Accept-when run, not compared |
 
 ## Consequences
 
@@ -270,16 +340,23 @@ one dataset that holds both versions of the aggregate.
   event-stream hash are the earlier ones (pinned by a test).
 - Event count, ids, prices, times and sides are unchanged by a fold; only
   folded aggregates' quantities differ, plus one gap per run of
-  unattributed trades.
+  unattributed or unresolved trades (a trailing gap when the window ends
+  inside one).
+- A window's first day has no previous day in the replay. If its `trades`
+  file starts inside the previous day's last aggregate (the 706/707 shape),
+  those trades are unresolved: one gap at the window start and a nonzero
+  `unresolved` count, though nothing may be lost. A window one day wider
+  resolves them; the controls in Accept-when are judged that way.
 - The 2025-10-10 `trades` file is truncated at 22:03 UTC (ADR-031). The
   fold can only under-correct there: a trade absent from the file is never
   uncovered, so a loss in the missing part stays lost and the day status
   cannot show it.
 - Negative: a folded replay reads `aggTrades` twice and `trades` once (D5),
   about 3.8 × the I/O of the window's `aggTrades`.
-- Negative: the tail rule is measured on 32 days; on the 220 unsampled days
-  it is applied on that evidence. Anything it cannot fold surfaces as a gap
-  and in the report, and the Accept-when run records the totals.
+- Negative: the tail rule is measured on the inner trades of 32 days; on
+  the 220 unsampled days, and on edge ids everywhere, it is applied on
+  that evidence. Anything it cannot fold surfaces as a gap and in the
+  report, and the Accept-when run records the totals.
 - Negative: on a partial window the `fold <day>` line describes the whole
   source day; only the minute lines are restricted to delivered
   aggregates. `archive-kline-check` reads one minute beyond each window
@@ -316,25 +393,53 @@ The #102 M3 acceptance run on the PR branch, after `trades` is imported for
 all five:
 
 1. **Coverage (rule A).** `mie replay --source archive --from 2025-10-01
-   --to 2026-06-09` (fold) reports 0 unchecked days in the window; on each
-   of the 32 measured days, trades folded equals the M0 count (2109 in
-   total), the folded quantity equals the M0 quantity exactly (541.622 BTC
-   in total), and unattributed is 0. With no uncovered trade left, rule A's
-   lost set is empty, so A1, A2 and A3 pass on all 32 days. The totals of
-   the 220 unsampled days are recorded, unattributed trades included.
+   --to 2026-06-09` (fold) reports 0 unchecked days in the window. On each
+   of the 32 measured days, trades folded minus edge trades folded equals
+   the M0 count (2109 in total), the folded quantity minus the edge
+   quantity equals the M0 quantity exactly (541.622 BTC in total), and
+   unattributed is 0. With no uncovered trade left, rule A's lost set is
+   empty, so A1, A2 and A3 pass on all 32 days. Unresolved is 0 on every
+   day after 2025-10-01. The edge folds of every day and the totals of the
+   220 unsampled days are recorded, unattributed and unresolved trades
+   included.
+   - Why the inner part: M0 measured inner trades only (Context), so the
+     edge folds that D3 adds (#109 review) are not part of its 2109 trades
+     or 541.622 BTC. Subtracting them keeps M0's numbers an exact check of
+     the inner fold. Edge folds are recorded, not compared, because nothing
+     predicts them.
+   - Why unattributed 0 includes edge ids: an edge trade is the same kind
+     of trade, the tail of `P`. One that does not match `P` would falsify
+     D3 at the edge, and acceptance stops to examine it instead of
+     accepting it as a gap.
+   - Why unresolved 0 after the first day: every later day has its
+     previous day in the replay, so its head trades resolve against that
+     day's last range (D3). A nonzero count there means the carry failed,
+     or a trade filed on D belongs below D−1's last aggregate, a shape no
+     measured day has shown. Either stops acceptance. 2025-10-01's count,
+     whose previous day is outside the replay (Consequences), is recorded.
 2. **Determinism.** The same replay a second time prints byte-identical
    output. With `--trade-correction none` the event count is the same (plus
-   one gap per unattributed run, if any) and the event-stream hash differs.
-   Peak RSS is recorded.
+   one gap per unattributed or unresolved run, if any) and the
+   event-stream hash differs. Peak RSS is recorded.
 3. **Kline check, February window.** `mie archive-kline-check --from
    2026-02-05 --to 2026-02-07` reproduces 1658 mismatches under `none` and
    gives exactly 1608 under `fold`, and the mismatch set under `fold` is a
    subset of the set under `none`.
 4. **Kline check, the 32 days.** On each day, one 1-day check per mode: the
    mismatch set under `fold` is a subset of the set under `none`.
-5. **Controls 2026-06-10 and 2026-10-09.** Per day, the fold status is
-   `clean`, and the event-stream hash, the final state and the kline-check
-   mismatch lists are identical in both modes.
+5. **Controls 2026-06-10 and 2026-10-09.** Per control day D, a fold
+   replay `--from D−1 --to D` reports D `clean`, with 0 unresolved. The
+   kline-check mismatch lists of D are identical in both modes. The
+   one-day replays of D in both modes have identical event-stream hashes
+   and final states, unless the one-day fold reports unresolved head
+   trades. In that case, the only difference is their one gap at the
+   window start and the bars it marks.
+   - Why D−1 in the window: D's first trades may lie in D−1's last
+     aggregate (the 706/707 shape). A one-day replay cannot see that range,
+     so it reports them unresolved by design (D3), which does not mean
+     anything is lost. `clean` is judged where the range is in the
+     replay. The kline check needs no wider window, because it already
+     reads the minute before D (Consequences).
 
 References: ADR-003, ADR-022, ADR-028, ADR-030, ADR-031, ADR-034, ADR-038,
 ADR-039, ADR-040, ADR-045, ADR-047, ADR-048. Issues: #88, #90, #102.
