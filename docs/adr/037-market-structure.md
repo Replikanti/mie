@@ -50,12 +50,21 @@ Every measured number below cites one of these.
   `measure_structure`) replays the aggTrades of the #12 backfill through
   `MarketStateEngine`. Next to it, it runs an independent model of
   decisions 2–7, written from this text, on the engine's closed bars, with
-  `N`, `K`, the tolerance and the cap as runtime parameters. At the
-  engine's values the model must reproduce the engine (R0, Accept when);
-  at other values it gives the sensitivity tables. The CI test
-  `model_reproduces_the_engine_on_a_synthetic_tape` runs the same
-  comparison on a seeded 40-day tape and asserts that every compared kind
-  occurs, so R0 cannot pass vacuously.
+  `N`, `K`, the tolerance, the active-list rule and `max_resolved` as
+  runtime parameters, plus an optional cold start. The active-list rule
+  is a count cap (`max_active`), a distance threshold (`max_distance_bps`:
+  a level retires at a closed bar whose close lies more than `D` bps of
+  that close from it, exact in `i128`), or none (`until_swept`). A cold
+  start `X` makes the model ignore the bars before `X`, as an engine
+  started at `X` would. At the engine's values the model must reproduce
+  the engine (R0, Accept when); at other values it gives the sensitivity
+  tables. The CI test `model_reproduces_the_engine_on_a_synthetic_tape`
+  runs the same comparison on a seeded 40-day tape and asserts that every
+  compared kind occurs, so R0 cannot pass vacuously. Further CI tests pin
+  distance retirement at its boundary and at 10 000 bps, check a cold
+  cap-20 model against a fresh engine started at `X` under R0's
+  comparison, check that a cold `until_swept` model holds a subset of the
+  full model's levels, and pin the `A*` and premise-P helpers.
 - **Run.** 2025-10-01 … 2026-09-30, 365 UTC days, aggTrades only; halves
   split at 2026-04-01 12:00 UTC. 603 218 226 events, 0 domain rejections,
   wall time 1 166.6 s (19.4 min). Full output:
@@ -458,8 +467,71 @@ per day and per bar at `N` = 1 … 5 against `u_N²`, and the confirmation
 delay; S2 level life at `N` = 1 … 5; S3 sweeps per day, the SFP share at
 `K` = 1, 2, 3, 4, 6, the first-reclaim bar, and the sweep position in its
 bar; S4 touches at 1–20 bps; S5 the uncapped list sizes, evictions, `lost`
-at caps 10, 20 and 40, the evicted levels' distance, and the resolved
-history depth; run facts (events, rejections, wall time).
+at caps 10, 20, 40, 80 and 160, the evicted levels' distance, and the
+resolved history depth; run facts (events, rejections, wall time).
+
+S5 also records the alternatives to the cap (#104). For every cap of 10,
+20, 40, 80 and 160, every distance threshold of 500, 1 000, 2 000, 5 000
+and 10 000 bps, and `until_swept`, each with `max_resolved` 20, per
+timeframe: the active evictions, `lost` against the uncapped registry, the
+R2 verdict the rule would get (printed as "alternative", not a gate), and
+the active-list p99 and maximum per side. From those, premise P of #95 (no
+cap or distance that evicts at least one active level passes R2 on all
+four timeframes) is printed as `HOLDS` or `FAILS`. S5 further records the
+TTL age `A*`, the smallest level age at which the uncapped registry's
+sweeps of older levels fit R2's bound, and the growth: the uncapped
+active-list maximum per UTC calendar month. Why each value:
+
+- **Caps.** 10, 20 and 40 are #80's, kept so the numbers stay comparable.
+  80 and 160 continue the doubling to the first value above the year's
+  largest uncapped list (148, 15m highs). A larger cap binds nowhere in
+  this year and would repeat the uncapped result.
+- **Distances.** 500 bps sits just below the 15m p10 of the distance at
+  which cap 20 evicted (556.7), and 1 000 at its p50 (1 051.7). 2 000 and
+  5 000 sit below the 1h and 4h p50 (2 520.6 and 5 270.5). 10 000 is the
+  value at which a low can never retire: the denominator is the close,
+  so a low `0 < L < close` is always less than 10 000 bps away. Below
+  500, the threshold would retire levels nearer to the close than about
+  90 % of those cap 20 evicted on 15m, where no cap acted. Above 10 000,
+  it retires no low at all.
+- **`max_resolved` 20 for every alternative.** The resolved list changes
+  no sweep, so no alternative's `lost` or R2 depends on it. It stays at
+  the `@1` value so that each alternative differs from `@1` in its active
+  rule only.
+- **`A*` is exact,** because a TTL removes exactly the sweeps of the
+  levels that outlive it; no TTL model is run.
+- **Twelve calendar months** tell √T growth (about 0.71 of the year-end
+  size at mid-year) from linear growth (0.5).
+
+S6 records the live/replay skew (#104): cold models of cap 20 and of
+`until_swept`, started at 00:00 UTC on the 1st of each month after the
+window start, are compared after every closed bar with the full-window
+model of the same rule by level identity (side, price, `swing_time`).
+Per rule, timeframe, side and start it records the active levels and the
+pending and resolved sweeps only the full model holds (`extra`,
+`extra_swept`) or only the cold one holds (`missing`, `missing_swept`),
+and the days until all four stay 0; per rule and timeframe the median and
+maximum of those days over the starts, and how many starts never
+converge. Why:
+
+- **Starts.** 00:00 UTC on the 1st of a month is a bar boundary of every
+  structure timeframe, so a cold model's bars equal the replay's from `X`
+  on and the record measures memory, not bar alignment. At another hour
+  the 4h and 1d bars would not line up. The window's first month start is
+  the replay start itself, which has no skew; that leaves 11 starts spread
+  over both halves.
+- **Rules.** Cap 20 is measured next to `until_swept` because on 4h and
+  1d it already evicts almost nothing (21 and 0 active levels in the
+  year, S5), so it shows the skew that exists today.
+- **Validity.** `missing` must be 0 under `until_swept`: from `X` on, a
+  cold model confirms a subset of the same swings and sweeps them at the
+  same trades. `missing_swept` is not part of validity: both resolved
+  lists keep only their 20 newest sweeps, so the cold list can still hold
+  a sweep the full list has already dropped, and `missing_swept` can be
+  non-zero under `until_swept`.
+- **Recorded only.** The skew record has no threshold: the warm-start
+  (#106) is needed whatever the skew, and how long a skew lasts is a
+  property of the path.
 
 Measured 2026-10-11, not met. R0 valid: 0 engine/model mismatches over
 9 249 swings, 4 334 sweeps of highs, 4 403 sweeps of lows, 5 631 SFPs,
