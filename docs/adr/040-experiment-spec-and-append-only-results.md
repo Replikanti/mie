@@ -85,8 +85,12 @@ deciding them.
    `DataVersionMismatch` before anything is stored.
 6. **Results keyed by experiment and pipeline (D6).** A result is
    `ExperimentResult { spec, pipeline, outcome }`, keyed by
-   `(experiment id, pipeline id@N)`. A new pipeline version records next to
-   the old result; the same key is never rewritten. Result text v1 is
+   `(experiment id, pipeline id@N)` and, when its outcome kind reads Market
+   State, its engine key: the feature-set version and the state-hash
+   encoding (ADR-041), read from the outcome's own lines. A new pipeline
+   version records next to the old result, and so does a build with
+   another engine, instead of being refused (ADR-052 decision 10); the
+   same key is never rewritten. The `@1` key is unchanged. Result text v1 is
    `mie-result 1`, `experiment`, `pipeline`, `outcome <kind>` and the kind's
    lines, then `spec` and the canonical spec text verbatim. Outcome kinds
    are tagged; a new kind adds a tag and never changes the lines of an
@@ -98,8 +102,12 @@ deciding them.
    hash (ADR-039 D7) and the domain-rejection count. A run whose result is
    already stored compares it: identical is `Reproduced`, different is
    `Diverged` and nothing is written; a new result is appended and
-   `Recorded`. An empty sample fails. #30 adds the backtest pipeline and
-   its outcome kind.
+   `Recorded`. An empty sample fails. `research.replay_summary@2` (ADR-052
+   decision 10) runs the sample on the history chain after its prefix and
+   records the prefix's provenance and the state hashes; it reproduces and
+   compares under its key by the same rules, and a run under another
+   engine records a new result. #30 adds the backtest pipeline and its
+   outcome kind.
 8. **Ports (D8).** `ResearchResultReader` (`get`, `by_hypothesis`) and
    `ResearchResultStore: ResearchResultReader` (`append`) are outbound
    ports; `RunResearchExperiment` is the inbound port. The store contract:
@@ -112,7 +120,9 @@ deciding them.
    hands the writable store to `ExperimentService`; readers get
    `ResearchResultReader` only.
 9. **Append-only file adapter (D9).** `mie-adapter-fs` stores
-   `<root>/<experiment hex>/<pipeline id>@<N>.result`: the result text and
+   `<root>/<experiment hex>/<pipeline id>@<N>[-<feature-set hex>-<state
+   encoding>].result` (the engine part for a key with an engine, D6): the
+   result text and
    the trailer line `sha256 <64 hex>` over every byte before it. A write
    goes to a dot-prefixed temporary file (`create_new`, synced, made
    read-only) that is hard-linked to the final name; a link never replaces
@@ -127,14 +137,18 @@ deciding them.
    never deleted.
 10. **CLI (D10).** `mie experiment validate <spec>` prints the id and the
     canonical text, or every error; `mie experiment run <spec> --config …
-    --results <dir> [--source live|archive] [--streams …]` prints
+    --results <dir> [--source live|archive|history] [--streams …]` prints
     `recorded <key>` or `reproduced <key>`, or `FAIL: <reason>` and exits 1.
+    `live|archive` run `research.replay_summary@1`; `history`, with an
+    ingest config that has `[history]`, runs `research.replay_summary@2`
+    (ADR-052 decision 10).
 
 ## Consequences
 
 - A re-run of a spec on the same data version reproduces the stored result
   byte for byte, and a stored result cannot be overwritten — the store
-  refuses, and the files are read-only.
+  refuses, and the files are read-only. For a pipeline that reads Market
+  State, "the same data version" also needs the same engine key (D6).
 - Spec text v1, result text v1 and the id become history once results
   exist. Golden texts and pinned ids guard them; any change is a new
   version and a new ADR.
@@ -173,6 +187,9 @@ deciding them.
   depend on the writer library rule out byte-exact reproduction checks.
 - **Results keyed by experiment id alone** — a new pipeline version would
   have to overwrite or be refused.
+- **State-reading results keyed by experiment and pipeline alone** —
+  ADR-052 decision 10: every catalog change or state-hash encoding bump
+  would block the key for good.
 - **The engine's whole default set as the spec's feature version** — every
   feature added to the default set would orphan every existing spec.
 - **Store only, AC 2 deferred to #30** — leaves reproduction unproven until

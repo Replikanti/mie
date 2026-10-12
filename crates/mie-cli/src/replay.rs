@@ -187,43 +187,62 @@ fn history(config: &IngestConfig, window: ReplayWindow, report: &mut Vec<u8>) ->
             section.cutover
         ),
     );
-    let (history, archive) = match config.history_archive() {
-        Ok(Some(loaded)) => loaded,
-        Ok(None) => return failed(report, NO_HISTORY.to_owned()),
-        Err(error) => return failed(report, error.to_string()),
-    };
-    let (origin, cutover, streams) =
-        match (history.origin_ms(), history.cutover_ms(), archive.streams()) {
-            (Ok(origin), Ok(cutover), Ok(streams)) => (origin, cutover, streams),
-            (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
-                return failed(report, error.to_string());
-            }
-        };
-    let source = &config.instrument.source;
-    let symbol = &config.instrument.symbol;
-    let runs = match read_runs(&config.paths.journal, source) {
-        Ok(runs) => runs.iter().map(|run| run.live_run()).collect(),
+    let store = ParquetRawStore::new(&config.paths.raw_root);
+    let chain = match history_chain(config, &store) {
+        Ok(chain) => chain,
         Err(error) => return failed(report, error),
     };
-    let store = ParquetRawStore::new(&config.paths.raw_root);
-    let chain = match HistoryChain::new(
-        &store,
-        symbol,
-        &streams,
-        source,
-        runs,
-        EventTime::from_millis(origin),
-        EventTime::from_millis(cutover),
-    ) {
-        Ok(chain) => chain,
-        Err(error) => return failed(report, error.to_string()),
-    };
+    let source = &config.instrument.source;
+    let symbol = &config.instrument.symbol;
     drive(
         chain.replay(window),
         report,
         |stream, report| describe_history(&chain, source, symbol, stream, report),
         true,
     )
+}
+
+/// The history chain of `config` over `store` (ADR-052 D2): the archive
+/// configuration of its `[history]` section up to the cutover, then its
+/// journaled runs from it. `mie replay --source history` and
+/// `mie experiment run --source history` both build it here.
+///
+/// # Errors
+///
+/// A description when `config` has no `[history]` section, the archive
+/// configuration or the journal cannot be read, or the chain refuses its
+/// bounds or runs ([`HistoryChain::new`]).
+pub(crate) fn history_chain<'a>(
+    config: &IngestConfig,
+    store: &'a ParquetRawStore,
+) -> Result<HistoryChain<'a>, String> {
+    let (history, archive) = match config.history_archive() {
+        Ok(Some(loaded)) => loaded,
+        Ok(None) => return Err(NO_HISTORY.to_owned()),
+        Err(error) => return Err(error.to_string()),
+    };
+    let (origin, cutover, streams) =
+        match (history.origin_ms(), history.cutover_ms(), archive.streams()) {
+            (Ok(origin), Ok(cutover), Ok(streams)) => (origin, cutover, streams),
+            (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
+                return Err(error.to_string());
+            }
+        };
+    let source = &config.instrument.source;
+    let runs = read_runs(&config.paths.journal, source)?
+        .iter()
+        .map(|run| run.live_run())
+        .collect();
+    HistoryChain::new(
+        store,
+        &config.instrument.symbol,
+        &streams,
+        source,
+        runs,
+        EventTime::from_millis(origin),
+        EventTime::from_millis(cutover),
+    )
+    .map_err(|error| error.to_string())
 }
 
 /// The archive replay of `config`: `streams` when given, else the

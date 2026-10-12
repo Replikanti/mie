@@ -9,7 +9,7 @@ engine as the comparison unit) for warm-started runs, ADR-039 decision 6
 7-day seed lookback for runs with a history. Each keeps its status line
 until the PR that changes the behaviour: ADR-039 in W2 (#116), ADR-032 in
 W3 (#117) and ADR-041 in W4 (#118). W5 (#119) edits ADR-040 (`proposed`)
-decisions 7 and 10 in place. ADR-041's *What the run cannot cover* says
+decisions 6, 7, 9 and 10 in place. ADR-041's *What the run cannot cover* says
 "105 minutes at 15m"; that is the upper bound, true only for a start on a
 15m boundary (decision 12). It is accepted text, so it stays as it is and
 the correction lives here.
@@ -398,6 +398,110 @@ deferred option D are under *Alternatives considered*.
     - Rejected, changing `@1` in place: it would void ADR-040's pending
       acceptance run, for the same reason W waited for #13 before changing
       ADR-041's comparison unit.
+    - **The outcome kind** is `history-replay-summary`. Its lines, in this
+      order, follow the `outcome` line: `origin <ms>`,
+      `effective-origin <ms|->`, `cutover <ms>`, `prefix-data <64 hex|->`,
+      `prefix-stream <events>:<16 hex>`, `prefix-rejections <n>`,
+      `engine-features <16 hex>`, `state-encoding <n>`,
+      `state-start <16 hex>`, `stream <events>:<16 hex>`, `rejections <n>`
+      and `state-end <16 hex>`. `-` means no restart, or an empty prefix.
+      The `replay-summary` lines of `@1` do not change (ADR-040 decision 6).
+    - **The run order.** `mie experiment run --source history --config
+      <ingest config>` builds the chain and passes its origin and cutover
+      to `mie_app::ExperimentService::on_chain`, so the core stays pure. A
+      run makes two requests to the chain: it opens the sample and checks
+      `data` (`DataVersionMismatch`) before anything is driven, then drives
+      `[origin, sample start)` through `mie_app::drive_chain`, takes
+      `state-start`, and drives the sample into the same engine through
+      `drive_chain`. The two windows are adjacent, so the two drives are the
+      union's drive (W2 pins it:
+      `two_adjacent_history_windows_drive_one_engine_to_the_union_state`).
+      A sample that starts at the origin has an empty prefix: no replay is
+      opened, because the adapters refuse an empty window, and the result
+      records `prefix-data -`, the empty stream's hash and 0 rejections. A
+      sample that starts before the origin has no prefix window and fails
+      with `SampleBeforeOrigin`, before any replay.
+    - **The effective origin** is the last restart of either drive
+      (decision 4): the origin of the state at the sample's end. `@1` and
+      `@2` treat an uncrossable hole inside the sample differently: `@1`
+      counts the event after it as a rejection, while `@2` restarts the
+      engine there, as every consumer of the chain does.
+    - **A changed prefix gives `DataVersionMismatch`** on the real chain,
+      not `Diverged`: the sample's dataset version already covers the
+      prefix, because the chain's version holds the archive segment over
+      `[origin, cutover)` and the live segment from `L0` (decision 5). So
+      `Diverged` is left for the same version with another result: a
+      determinism failure.
+    - **The engine joins the result key.** The engine computes every family
+      of `catalog::CURRENT` (`MarketStateEngine::with_features` refuses a
+      set that omits a current id, `UnsupportedFeatureSet::Missing`), so
+      `state-start` and `state-end` cover the whole catalog, and every
+      catalog change (#95 S3's flip is next) or `STATE_HASH_ENCODING` bump
+      changes them. Keyed by experiment and pipeline alone, the store, which
+      never replaces a key (ADR-040 decisions 6 and 8), would then block
+      the experiment under `@2` for good, and its stored result would name
+      a build that no longer exists, against invariant 4 (derived results
+      reproducible from versioned raw data plus versioned definitions).
+      - Shape: the key is `(experiment id, pipeline id@N, engine)`, with
+        the engine `(feature-set version, state-hash encoding)`: exactly
+        the pair that makes two state hashes comparable (ADR-041;
+        `crates/mie-domain/src/state_hash.rs`, *Versioning*). A result's
+        key is read from its own text (`engine-features`,
+        `state-encoding`), so the store's check that a file sits at its own
+        key's path still holds.
+      - Name: `<pipeline id>@<N>-<feature-set 16 hex>-<state encoding>`,
+        for example `research.replay_summary@2-0123456789abcdef-1`, in the
+        experiment's directory (ADR-040 decision 9). A pipeline id holds no
+        `-`, so the name splits at its first `-`; only canonical names are
+        keys. `@1` results carry no engine, and their names, paths and
+        texts do not change.
+      - A build with another engine prints `recorded <new key>`, and the
+        old result stays as the record of its build, reproducible by any
+        build with that engine. No check runs across engine keys: `data`
+        already pins the raw data, and `@1` reproduces the stream.
+      - Within one key a different result is `Diverged`: a determinism
+        failure, or a definition change without a version bump (an ADR-029
+        breach). Both must fail.
+      - Rejected, the key without the engine and a `StateNotComparable`
+        error for a run under another engine: the error is permanent,
+        because the store never replaces a key, so after #95 S3's flip no
+        `@2` experiment could be recorded again.
+      - Rejected, the feature-set version alone in the key: the same
+        permanent block at every `STATE_HASH_ENCODING` bump.
+      - Rejected, an engine of only the spec's features: the engine cannot
+        run it (`Missing` above), and making families optional is engine
+        work far beyond W5. Research would then run an engine configuration
+        live never runs, whose parity ADR-041's harness does not cover,
+        which reopens the skew this ADR removes; and an encoding bump would
+        still block the key.
+      - Rejected, a pipeline version bump per catalog change: `@N` names
+        the pipeline's code. Every feature PR would have to remember it, and
+        a forgotten bump re-creates the blocked key.
+    - **Rejected, one replay of `[origin, sample end)` split at the sample
+      start inside the app.** It saves one archive read (441.4 s per year,
+      decision 11), but it re-derives ADR-039 decision 4's window rule (a
+      gap counts at its end; trailing gaps) in the app while the rule lives
+      in the provider. It also takes `data` from the union's version, which
+      equals the sample's only by a property of the chain adapter (a
+      window's version depends on its end alone, decisions 2 and 5) that
+      the port does not promise. And the prefix's dataset version would
+      still need a second open.
+    - **The cost, a forecast, not a measurement.** Every request replays
+      the chain from the origin (decision 2), so the sample's read repeats
+      the prefix's archive read, while the engine runs once over the union:
+
+      `T_experiment ≈ Y · (2 · 441.4 s + r · 710.8 s)`
+
+      plus the live segment, whose runs before the sample start are
+      replayed twice. At r = 1 that is 1 593.6 s, about 26.6 min per year.
+      The forecast is low on three known counts: (1) R and E come from
+      aggTrades-only runs, while `@2` reads the default streams plus the
+      ADR-050 fold, which also reads `trades` files over its 252-day
+      defect window; (2) the #11 replay of the same window over the default
+      streams measured 20.5 min (ADR-044), against the 19.2 min decision
+      11's formula gives for one read and one engine; (3) the live segment
+      is unmeasured. #106's acceptance run replaces the forecast with a
+      measured `@2` wall time (*Accept when*, item 6).
 
 11. **The startup cost per segment.**
     - **Archive.** Two full-year runs of one tool
@@ -468,8 +572,9 @@ deferred option D are under *Alternatives considered*.
       updates it.
     - **The trigger does not see research.** Every state-reading research
       request (`mie replay --source history`, W5's experiments) replays the
-      same prefix from the origin (decision 2), at the same cost per year
-      of history, while the trigger watches only live starts
+      same prefix from the origin (decision 2): a replay at a live start's
+      cost per year of history, an experiment at about 1.4 times it (a
+      forecast, decision 10), while the trigger watches only live starts
       (`ready_after_ms`). Research iteration can therefore become the
       binding cost before the 90 min trigger fires. The trigger and its
       number stay unchanged: no research-cost threshold has been measured,
@@ -532,6 +637,7 @@ deferred option D are under *Alternatives considered*.
 | 65 536 slots, about 27 s | ADR-026 (`core_channel_capacity`, *Why 65 536*) | Peak rate 60 015 / 25 s + 19/s = 2 419.6/s; 65 536 / 2 419.6 ≈ 27.1 s | Any fixed capacity blocks once the warm-up outlasts capacity / arrival rate. Holding one year's warm-up (1 152.2 s at r = 1) at the peak rate takes 1 152.2 × 2 419.6 ≈ 2.79 M slots, about 245 MB pre-allocated at 88 B per core slot (ADR-026), and that need grows with the history. The quiet side: at the archive's mean aggTrades rate (603 218 226 / 365 days ≈ 19.1/s) plus the other six streams at their p99 rate (19/s, ADR-026), 65 536 slots last about 29 min. So the rejection rests on a burst during the warm-up, since one blocked millisecond fails ADR-041's 0 ms gate, and on the growth with the history, not on the 27 s alone |
 | 1 863.0 s and 1 152.2 s, giving 710.8 s and 441.4 s | #96 (two engines) and ADR-044 (one engine): the same tool (`location_measure.rs`), the same 365-day window, the same host | E = 1 863.0 − 1 152.2 = 710.8 s per engine; R = 1 152.2 − 710.8 = 441.4 s for the rest | Caveats: (1) both runs read aggTrades only (ADR-044), while the chain reads the default streams plus the ADR-050 fold, which also reads `trades` files over its 252-day defect window. (2) ADR-044 also records the #11 replay of the same window over the default streams: 20.5 min. (3) "Per year" means per the 603.2 M aggTrades of that year, so a busier year costs more. The formula only dates the forecast; the trigger fires on the measured `ready_after_ms`, so a wrong estimate never makes it fire wrongly |
 | 19.2 min per year at r = 1 | The row above | 1 152.2 s / 60 ≈ 19.2 min | r is #95 S3's measured engine-time ratio; at r > 1 a year costs more and the trigger fires sooner |
+| 1 593.6 s, about 26.6 min per year (a `@2` experiment; forecast) | Decision 11's R and E. Pending: the measured `@2` wall time of #106's acceptance (*Accept when*, item 6) | 2 · 441.4 + 710.8 = 1 593.6 s at r = 1; 1 593.6 / 1 152.2 ≈ 1.4 times a live start's archive warm-up | It is a forecast, low on the three counts of decision 10; nothing fires on it. One read would save 441.4 s per year, at the price decision 10 states |
 | The live segment's rate | Not measured | #106 measures the per-day rate | Borrowing the archive's rate would misdate the trigger: the live replay recomputes every run's pipeline and replays depth diffs, which the archive replay does not |
 | The 90 min trigger (105 min rejected) | `Samples(7)` (ADR-037 decision 10; `SWING_WINDOW` = 2·3 + 1). The first bar is `partial_start` (ADR-031 decision 6), and `TimeframeTracker::confirm` counts it. Pinned by `a_cold_start_mid_bar_is_ready_at_the_seventh_15m_close` | The 7th close falls 105 min after the first bar's open, so a cold engine is `Ready` 105 min − offset after the start, with offset ∈ [0, 15 min): (90, 105] min | Above 90: for a start late in a 15m bar, the warm engine becomes current later than a cold engine would have had 15m structure `Ready`, the regression #95 defined; 105 holds only for a start on a 15m boundary. Below 90: the snapshot gets built while the replay still beats every cold structure warm-up (#95, "Why not lower") |
 | `ready_after_ms` is wall time; the cold warm-up is event time | ADR-031 decision 4 (a bar closes at the next trades-stream event); ADR-032 decision 6 (2 000 ms hold-back) | Both delay a cold engine's 7th close in wall time | So the 90 min comparison errs on the safe side. A live run's first trades-stream event is its seed gap, which opens the partial bar the same way (`partial_start_marks_the_first_bar_of_every_timeframe`, `bars.rs`) |
@@ -541,8 +647,10 @@ deferred option D are under *Alternatives considered*.
 
 ## Consequences
 
-- Every experiment on the chain replays its prefix: about 19.2 min per
-  year of history at r = 1, plus the live segment's measured rate.
+- Every experiment on the chain replays its prefix and reads the archive
+  twice: about 26.6 min per year of history at r = 1, a forecast that
+  #106's acceptance measures (decision 10), plus the live segment's
+  measured rate.
 - Every equivalence check of warm-started runs replays the chain once per
   invocation.
 - A correction of archive days before the cutover (#102, ADR-050) changes
@@ -597,6 +705,15 @@ deferred option D are under *Alternatives considered*.
   prefix cannot be replayed.
 - **Changing `@1` in place** — decision 10: voids ADR-040's pending
   acceptance run.
+- **One replay of `[origin, sample end)`, split at the sample start in the
+  app** — decision 10: re-derives ADR-039 decision 4's window rule in the
+  app, and takes `data` from the union's version.
+- **`@2` results keyed without the engine** — decision 10: after any
+  catalog change or encoding bump, the never-replaced key blocks the
+  experiment for good.
+- **An engine of only the spec's features** — decision 10: the engine
+  computes all of `catalog::CURRENT`, and research would run a
+  configuration live never runs.
 - **Keeping the 105 min trigger** — decision 12: a regression for a start
   late in a 15m bar.
 - **A streaming per-run recompute now** — decision 13: before its limit is
@@ -630,7 +747,9 @@ coverage list, as in ADR-041, not a duration):
    is filed then.
 6. A `--source history` experiment on a sample after the cutover prints
    `recorded`, then `reproduced`, and the result file's SHA-256 is
-   unchanged.
+   unchanged. The wall time of both runs, with the prefix's archive and
+   live days, goes into the Acceptance section and replaces decision 10's
+   forecast in the Numbers table.
 7. The results are posted on #106, and this ADR is flipped to `accepted`.
 
 Two values are written into the Acceptance section with it:

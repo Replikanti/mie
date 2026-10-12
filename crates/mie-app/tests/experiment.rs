@@ -2,18 +2,31 @@
 //! result is recorded once, a re-run on the same data reproduces it
 //! exactly, and a stored result is never replaced. The in-memory providers
 //! and store stand in for the raw-store replay and the file adapter.
+//!
+//! `research.replay_summary@2` (ADR-052 D10) runs on an in-memory stand-in
+//! for the history chain: `mie-app` may not depend on an adapter
+//! (ADR-025), so the CLI's offline test pins the real chain.
 
-use mie_app::{ExperimentService, REPLAY_SUMMARY_V1};
+use mie_app::{
+    ChainBounds, ExperimentService, REPLAY_SUMMARY_V1, REPLAY_SUMMARY_V2, ReplayService,
+    drive_chain,
+};
+use mie_domain::bars::MAX_BARS_PER_EVENT;
 use mie_domain::event::{Aggressor, MarketEvent, Stream, Trade};
 use mie_domain::feature::{
-    FeatureDefinition, FeatureKey, FeatureRegistry, FeatureSet, Input, WarmUp, catalog,
+    FeatureDefinition, FeatureKey, FeatureRegistry, FeatureSet, FeatureSetVersion, Input, WarmUp,
+    catalog,
 };
+use mie_domain::fingerprint::Fingerprint;
 use mie_domain::num::{Price, Qty};
 use mie_domain::research::{
-    DataVersion, ExperimentResult, ExperimentSpec, HypothesisId, Outcome, ResultKey,
+    DataVersion, EngineKey, ExperimentResult, ExperimentSpec, HistoryReplaySummary, HypothesisId,
+    Outcome, ResultKey,
 };
+use mie_domain::state::MarketStateEngine;
+use mie_domain::state_hash::STATE_HASH_ENCODING;
 use mie_domain::time::EventTime;
-use mie_ports::inbound::{ExperimentRun, ResearchError, RunResearchExperiment};
+use mie_ports::inbound::{ExperimentRun, ReplayMarket, ResearchError, RunResearchExperiment};
 use mie_ports::outbound::{
     HistoricalDataProvider, MarketDataProvider, ProviderError, Replay, ReplayWindow,
     ResearchResultReader, ResearchResultStore, ResultStoreError,
@@ -175,7 +188,10 @@ fn a_rerun_reproduces_the_stored_result_exactly() {
     let Outcome::ReplaySummary {
         stream,
         domain_rejections,
-    } = recorded.outcome;
+    } = recorded.outcome
+    else {
+        panic!("{:?}", recorded.outcome);
+    };
     assert_eq!(stream.events, 4);
     assert_eq!(domain_rejections, 1);
     let key = recorded.key();
@@ -319,4 +335,315 @@ fn a_provider_failure_is_reported() {
         error.to_string(),
         "market data source failed: the replay must not open"
     );
+}
+
+// ---------------------------------------------------------------------------
+// `research.replay_summary@2` on the history chain (ADR-052 D10).
+
+/// The origin of the stand-in chain.
+const ORIGIN: i64 = 0;
+
+fn bounds() -> ChainBounds {
+    ChainBounds {
+        origin: EventTime::from_millis(ORIGIN),
+        cutover: EventTime::from_millis(1_500),
+    }
+}
+
+fn window(start: i64, end: i64) -> ReplayWindow {
+    ReplayWindow {
+        start: EventTime::from_millis(start),
+        end: EventTime::from_millis(end),
+    }
+}
+
+/// Two prefix trades before 2 000 ms, three sample trades after.
+fn chain_tape() -> Vec<MarketEvent> {
+    vec![
+        trade(1_000, 1, 6_354_200_000_000),
+        trade(1_250, 2, 6_354_210_000_000),
+        trade(2_000, 3, 6_354_190_000_000),
+        trade(3_000, 4, 6_354_180_000_000),
+        trade(4_000, 5, 6_354_230_000_000),
+    ]
+}
+
+/// The history summary of a run's result.
+fn summary(run: &ExperimentRun) -> &HistoryReplaySummary {
+    match &run.result().outcome {
+        Outcome::HistoryReplaySummary(summary) => summary,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// The engine key of this build for a spec without `catalog::SELECTABLE`
+/// members.
+fn this_engine() -> EngineKey {
+    EngineKey {
+        features: MarketStateEngine::new().feature_set().version(),
+        state_encoding: STATE_HASH_ENCODING,
+    }
+}
+
+/// The `@1` outcome of `spec` over `events`.
+fn v1_outcome(events: Vec<MarketEvent>, spec: &ExperimentSpec) -> Outcome {
+    let mut service = ExperimentService::new(Recorded(events), MemoryStore::default());
+    service.run(spec).unwrap().result().outcome.clone()
+}
+
+#[test]
+fn a_history_run_records_the_prefix_and_reproduces_byte_for_byte() {
+    let spec = spec((2_000, 10_000));
+    let mut service =
+        ExperimentService::on_chain(Recorded(chain_tape()), MemoryStore::default(), bounds());
+
+    let first = service.run(&spec).unwrap();
+    let ExperimentRun::Recorded(recorded) = &first else {
+        panic!("{first:?}");
+    };
+    assert_eq!(recorded.pipeline, REPLAY_SUMMARY_V2);
+    let key = recorded.key();
+    assert_eq!(key.engine, Some(this_engine()));
+    assert_eq!(
+        key.to_string(),
+        format!(
+            "{}/research.replay_summary@2-{}-{STATE_HASH_ENCODING}",
+            spec.id(),
+            this_engine().features
+        )
+    );
+    let stored_text = service.store().results[&key].clone();
+    assert_eq!(stored_text, recorded.canonical_text());
+
+    let summary = summary(&first);
+    assert_eq!(summary.origin, bounds().origin);
+    assert_eq!(summary.cutover, bounds().cutover);
+    assert_eq!(summary.effective_origin, None);
+    assert_eq!(summary.prefix_data, Some(spec.data_version().clone()));
+    // The prefix is the chain's replay of [origin, sample start).
+    let prefix = ReplayService::new(Recorded(chain_tape()))
+        .replay(window(ORIGIN, 2_000))
+        .unwrap();
+    assert_eq!(summary.prefix_stream, prefix.stream_hash);
+    assert_eq!(summary.prefix_stream.events, 2);
+    assert_eq!(summary.prefix_rejections, 0);
+    // The sample's lines are `@1`'s over the same provider and sample.
+    assert_eq!(
+        v1_outcome(chain_tape(), &spec),
+        Outcome::ReplaySummary {
+            stream: summary.stream,
+            domain_rejections: summary.rejections,
+        }
+    );
+    assert_eq!(summary.stream.events, 3);
+    // The state at the sample's end is the union's: one engine over
+    // [origin, sample end).
+    let mut union = MarketStateEngine::new();
+    let mut stream = Recorded(chain_tape())
+        .replay(window(ORIGIN, 10_000))
+        .unwrap()
+        .stream;
+    drive_chain(&mut stream, &mut union, |e| panic!("{e}")).unwrap();
+    assert_eq!(summary.state_end, union.state().state_hash());
+    assert_ne!(
+        summary.state_start,
+        MarketStateEngine::new().state().state_hash()
+    );
+
+    let second = service.run(&spec).unwrap();
+    assert_eq!(second, ExperimentRun::Reproduced(recorded.clone()));
+    assert_eq!(service.store().appends, 1);
+    assert_eq!(service.store().results[&key], stored_text);
+}
+
+#[test]
+fn a_sample_at_the_origin_has_an_empty_prefix_and_the_v1_stream() {
+    // `tape` holds an out-of-order trade: both pipelines count it.
+    let spec = spec((ORIGIN, 10_000));
+    let mut service =
+        ExperimentService::on_chain(Recorded(tape()), MemoryStore::default(), bounds());
+    let run = service.run(&spec).unwrap();
+    let summary = summary(&run);
+    assert_eq!(summary.prefix_data, None);
+    assert_eq!(summary.prefix_stream.events, 0);
+    assert_eq!(summary.prefix_rejections, 0);
+    assert_eq!(
+        summary.state_start,
+        MarketStateEngine::new().state().state_hash()
+    );
+    assert_eq!(
+        v1_outcome(tape(), &spec),
+        Outcome::ReplaySummary {
+            stream: summary.stream,
+            domain_rejections: summary.rejections,
+        }
+    );
+    assert_eq!(summary.rejections, 1);
+    assert!(
+        run.result()
+            .canonical_text()
+            .contains("\neffective-origin -\n"),
+    );
+}
+
+#[test]
+fn changed_prefix_events_under_the_same_data_version_diverge() {
+    let spec = spec((2_000, 10_000));
+    let mut service =
+        ExperimentService::on_chain(Recorded(chain_tape()), MemoryStore::default(), bounds());
+    let ExperimentRun::Recorded(recorded) = service.run(&spec).unwrap() else {
+        panic!("the first run records");
+    };
+    let (_, store) = service.into_parts();
+    let stored = store.results.clone();
+
+    let mut altered = chain_tape();
+    altered.remove(1);
+    let mut service = ExperimentService::on_chain(Recorded(altered), store, bounds());
+    assert_eq!(
+        service.run(&spec),
+        Err(ResearchError::Diverged {
+            key: recorded.key()
+        })
+    );
+    assert_eq!(service.store().results, stored);
+    assert_eq!(service.store().appends, 1);
+}
+
+/// Opens `window` only, under the fixed dataset version `0f…0f`: proves
+/// which windows a run opens, and in which order.
+struct OnlyWindow(ReplayWindow);
+
+impl HistoricalDataProvider for OnlyWindow {
+    type Stream = Feed;
+
+    fn replay(&self, window: ReplayWindow) -> Result<Replay<Feed>, ProviderError> {
+        if window != self.0 {
+            return Err(ProviderError::Source(format!(
+                "the replay must not open [{}, {})",
+                window.start, window.end
+            )));
+        }
+        Recorded(chain_tape()).replay(window)
+    }
+}
+
+#[test]
+fn a_data_mismatch_is_reported_before_the_prefix_opens() {
+    let spec = spec_with(
+        &catalog::registry(),
+        "trade.last_price@1",
+        (2_000, 10_000),
+        &"0e".repeat(32),
+    );
+    let mut service = ExperimentService::on_chain(
+        OnlyWindow(window(2_000, 10_000)),
+        MemoryStore::default(),
+        bounds(),
+    );
+    assert_eq!(
+        service.run(&spec),
+        Err(ResearchError::DataVersionMismatch {
+            declared: DataVersion::from_hex(&"0e".repeat(32)).unwrap(),
+            opened: DataVersion::from_hex(&"0f".repeat(32)).unwrap(),
+        })
+    );
+    assert!(service.store().results.is_empty());
+}
+
+#[test]
+fn a_sample_before_the_origin_is_refused_before_any_replay() {
+    let spec = spec((2_000, 10_000));
+    let origin = EventTime::from_millis(2_001);
+    let mut service = ExperimentService::on_chain(
+        Unopenable,
+        MemoryStore::default(),
+        ChainBounds {
+            origin,
+            cutover: EventTime::from_millis(5_000),
+        },
+    );
+    let error = service.run(&spec).unwrap_err();
+    assert_eq!(
+        error,
+        ResearchError::SampleBeforeOrigin {
+            start: EventTime::from_millis(2_000),
+            origin,
+        }
+    );
+    assert_eq!(
+        error.to_string(),
+        "the sample starts at 2000 ms, before the history origin 2001 ms (ADR-052 D10)"
+    );
+    assert!(service.store().results.is_empty());
+}
+
+#[test]
+fn an_uncrossable_hole_in_the_prefix_moves_the_effective_origin() {
+    // The first trade opens the 1m bar [0, 60 s); a trade at the bound
+    // after that bar's end is an uncrossable hole (ADR-031 D11).
+    let at = 60_000 + i64::try_from(MAX_BARS_PER_EVENT).unwrap() * 60_000;
+    let events = vec![
+        trade(1_000, 1, 6_354_200_000_000),
+        trade(at, 2, 6_354_210_000_000),
+        trade(at + 2_000, 3, 6_354_190_000_000),
+        trade(at + 3_000, 4, 6_354_180_000_000),
+    ];
+    let spec = spec((at + 1_000, at + 10_000));
+    let mut service =
+        ExperimentService::on_chain(Recorded(events), MemoryStore::default(), bounds());
+    let run = service.run(&spec).unwrap();
+    let summary = summary(&run);
+    assert_eq!(summary.effective_origin, Some(EventTime::from_millis(at)));
+    assert_eq!(summary.prefix_rejections, 0);
+    assert_eq!(summary.prefix_stream.events, 2);
+    assert_eq!(summary.rejections, 0);
+}
+
+#[test]
+fn a_stored_result_of_another_engine_leaves_the_run_recorded_under_this_one() {
+    let spec = spec((2_000, 10_000));
+    let ExperimentRun::Recorded(this) =
+        ExperimentService::on_chain(Recorded(chain_tape()), MemoryStore::default(), bounds())
+            .run(&spec)
+            .unwrap()
+    else {
+        panic!("the first run records");
+    };
+    let others = [
+        EngineKey {
+            features: FeatureSetVersion::from_fingerprint(Fingerprint::from_raw(0xabc)),
+            ..this_engine()
+        },
+        EngineKey {
+            state_encoding: STATE_HASH_ENCODING + 1,
+            ..this_engine()
+        },
+    ];
+    for other in others {
+        let mut foreign = this.clone();
+        let Outcome::HistoryReplaySummary(summary) = &mut foreign.outcome else {
+            unreachable!();
+        };
+        summary.engine = other;
+        summary.state_end = summary.state_start;
+        let mut store = MemoryStore::default();
+        store.append(&foreign).unwrap();
+        let before = store.results.clone();
+
+        let mut service = ExperimentService::on_chain(Recorded(chain_tape()), store, bounds());
+        assert_eq!(
+            service.run(&spec),
+            Ok(ExperimentRun::Recorded(this.clone()))
+        );
+        let store = service.store();
+        assert_eq!(store.results.len(), 2);
+        assert_eq!(store.results[&foreign.key()], before[&foreign.key()]);
+        assert_eq!(store.results[&this.key()], this.canonical_text());
+        assert_eq!(store.by_hypothesis(spec.hypothesis()).unwrap(), {
+            let mut keys = vec![foreign.key(), this.key()];
+            keys.sort();
+            keys
+        });
+    }
 }

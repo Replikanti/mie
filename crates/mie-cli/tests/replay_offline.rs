@@ -16,13 +16,14 @@
 mod common;
 
 use common::{
-    Connections, D0, DepthConnection, DrivenClock, HOUR, TempDir, agg, config, config_with, depth,
-    depth_snapshot, depth_transports, ingest, ingest_depth, journal,
+    CUTOVER, Connections, D0, DepthConnection, DrivenClock, HOUR, ORIGIN, TempDir, agg,
+    archive_trades, config, config_with, depth, depth_snapshot, depth_transports,
+    history_archive_config, history_config, import_rows, ingest, ingest_depth, journal,
+    journaled_run, seam_fixture,
 };
+use mie_adapter_binance::archive::ArchiveStream;
 use mie_adapter_binance::archive::catalog::{DAY_MS, parse_day};
 use mie_adapter_binance::archive::fold::TradeCorrection;
-use mie_adapter_binance::archive::normalize::record_time as archive_record_time;
-use mie_adapter_binance::archive::{ARCHIVE_SOURCE, ArchiveStream};
 use mie_adapter_binance::transport::{Clock, HttpGet};
 use mie_adapter_binance::{
     BinanceStream, CaptureEvent, CaptureObserver, HistoryChain, LiveConfig, LiveReplay, LiveRun,
@@ -30,7 +31,7 @@ use mie_adapter_binance::{
 };
 use mie_adapter_parquet::{ParquetRawStore, RotationPolicy};
 use mie_app::{HashingProvider, drive_chain, drive_chain_observed};
-use mie_cli::config::{ArchiveConfig, History};
+use mie_cli::config::ArchiveConfig;
 use mie_cli::journal::read_runs;
 use mie_cli::replay::{self, ReplayOutcome, ReplayRequest, ReplaySource};
 use mie_domain::book::{BookStep, Invalidation, OrderBook};
@@ -40,7 +41,7 @@ use mie_domain::num::{Price, Qty, Rate};
 use mie_domain::state::MarketStateEngine;
 use mie_domain::time::EventTime;
 use mie_ports::outbound::{HistoricalDataProvider, MarketDataProvider, ReplayWindow};
-use mie_ports::raw::{RawRecord, RawRecordSink, RawRecordSource, RawSelection, RawStreamKey};
+use mie_ports::raw::{RawRecord, RawRecordSource, RawSelection, RawStreamKey};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -617,24 +618,6 @@ streams = ["aggTrades", "fundingRate", "metrics", "trades"]
     .expect("valid archive config")
 }
 
-/// Appends archive rows the way the importer files them (ADR-034 D3).
-fn import_rows(config: &ArchiveConfig, rows: &[(ArchiveStream, String)]) {
-    let store = ParquetRawStore::new(&config.paths.raw_root);
-    let mut writer = store
-        .writer(ARCHIVE_SOURCE, mie_cli::archive::rotation_policy())
-        .unwrap();
-    for (stream, row) in rows {
-        let key = RawStreamKey::new(ARCHIVE_SOURCE, "BTCUSDT", stream.raw_name()).unwrap();
-        let record = RawRecord {
-            event_time: archive_record_time(*stream, row.as_bytes()).unwrap(),
-            capture: None,
-            payload: row.as_bytes().to_vec(),
-        };
-        writer.append(&key, record).unwrap();
-    }
-    writer.close().unwrap();
-}
-
 #[test]
 fn an_archive_replay_is_exact_deterministic_and_marks_a_missing_day() {
     let dir = TempDir::new("replay-archive");
@@ -1017,147 +1000,11 @@ fn the_trade_correction_is_an_archive_option() {
 // The history chain (ADR-052): the archive up to the cutover, then the live
 // runs from it.
 
-/// An archive configuration under `dir` replaying `streams`, written to
-/// `dir/archive.toml` as `[history]` names it.
-fn history_archive_config(dir: &Path, streams: &str) -> ArchiveConfig {
-    let text = format!(
-        r#"
-[instrument]
-symbol = "BTCUSDT"
-[paths]
-raw_root = "{}"
-import_ledger = "{}"
-staging = "{}"
-[archive]
-base_url = "https://fake.invalid"
-streams = [{streams}]
-"#,
-        dir.join("raw").display(),
-        dir.join("ledger").display(),
-        dir.join("staging").display()
-    );
-    std::fs::write(dir.join("archive.toml"), &text).unwrap();
-    ArchiveConfig::parse(&text).expect("valid archive config")
-}
-
-/// The ingest configuration of `dir` with `[history]` from `origin` to
-/// `cutover` over `dir/archive.toml`.
-fn history_config(dir: &Path, origin: &str, cutover: &str) -> mie_cli::config::IngestConfig {
-    let mut config = config(dir);
-    config.history = Some(History {
-        origin: origin.to_owned(),
-        cutover: cutover.to_owned(),
-        archive_config: dir.join("archive.toml"),
-    });
-    config
-}
-
 fn history_request(config: &mie_cli::config::IngestConfig, w: ReplayWindow) -> ReplayRequest {
     ReplayRequest {
         source: ReplaySource::History(config.clone()),
         window: w,
     }
-}
-
-/// Hourly archive aggregate trades over the day `d`, ids from `*id`, plus
-/// one at `last` when given.
-fn archive_trades(
-    rows: &mut Vec<(ArchiveStream, String)>,
-    d: i64,
-    id: &mut u64,
-    last: Option<i64>,
-) {
-    let times = (0..24).map(|h| d * DAY_MS + h * HOUR + 7).chain(last);
-    for time in times {
-        rows.push((
-            ArchiveStream::AggTrades,
-            format!("{id},85000.10,0.010,{id},{id},{time},false"),
-        ));
-        *id += 1;
-    }
-}
-
-/// A clean run's journal lines and its aggTrade records at `times`, ids
-/// from `first_id`.
-fn journaled_run(
-    run_id: &str,
-    started: i64,
-    ended: i64,
-    first_id: u64,
-    times: &[i64],
-) -> (Vec<serde_json::Value>, Vec<common::RawLine>) {
-    let records: Vec<common::RawLine> = times
-        .iter()
-        .enumerate()
-        .map(|(i, &time)| common::RawLine {
-            stream: "aggTrade",
-            receive_seq: i as u64,
-            session_id: format!("{run_id}/aggTrade/1"),
-            event_time_ms: time,
-            payload: agg(first_id + i as u64, time),
-        })
-        .collect();
-    let lines = vec![
-        serde_json::json!({"type": "run_start", "run_id": run_id, "at_ms": started,
-            "symbol": "BTCUSDT", "source": "binance-um", "streams": ["aggTrade"],
-            "hold_back_ms": 750, "oi_retime_ms": 10_000, "seeds": {}}),
-        serde_json::json!({"type": "run_end", "run_id": run_id, "at_ms": ended, "exit_code": 0,
-            "records": records.len()}),
-    ];
-    (lines, records)
-}
-
-/// 2026-10-06, the cutover of the seam fixture, three archive days after
-/// its origin.
-const CUTOVER: i64 = D0;
-const ORIGIN: i64 = D0 - 3 * DAY_MS;
-
-/// The seam fixture in a Parquet store: three archive days whose last
-/// trade lies 200 ms before the cutover, plus metrics on the last day; R0
-/// before the cutover; R1 right after it, whose first trade is older than
-/// the archive's last one; R2 half an hour later.
-fn seam_fixture(dir: &Path) -> mie_cli::config::IngestConfig {
-    let archive = history_archive_config(dir, r#""aggTrades", "metrics""#);
-    let mut rows = Vec::new();
-    let mut id = 1;
-    for d in 0..3 {
-        let last = (d == 2).then_some(CUTOVER - 200);
-        archive_trades(&mut rows, ORIGIN / DAY_MS + d, &mut id, last);
-    }
-    rows.push((
-        ArchiveStream::Metrics,
-        "2026-10-05 12:00:00,BTCUSDT,93000.0000000000000000,7734131259.6348000000000000,1.45,1.93,1.38,0.41"
-            .to_owned(),
-    ));
-    import_rows(&archive, &rows);
-
-    let config = history_config(dir, "2026-10-03", "2026-10-06");
-    let c = CUTOVER;
-    let mut journal = Vec::new();
-    let mut records = Vec::new();
-    let r0: Vec<i64> = (0..5).map(|i| c - 29 * 60_000 + i * 60_000).collect();
-    let mut r1 = vec![c - 1_000];
-    r1.extend((0..10).map(|i| c + 10_000 + i * 30_000));
-    let r2: Vec<i64> = (0..10)
-        .map(|i| c + 30 * 60_000 + 5_000 + i * 10_000)
-        .collect();
-    for (run_id, started, ended, first_id, times) in [
-        ("20261005T233000Z", c - 30 * 60_000, c - 60_000, 500, r0),
-        ("20261006T000010Z", c + 10_000, c + 20 * 60_000, 10_000, r1),
-        (
-            "20261006T003000Z",
-            c + 30 * 60_000,
-            c + 40 * 60_000,
-            20_000,
-            r2,
-        ),
-    ] {
-        let (lines, run) = journaled_run(run_id, started, ended, first_id, &times);
-        journal.extend(lines);
-        records.extend(run);
-    }
-    common::write_records(&config, &records, &journal);
-    config
 }
 
 #[test]
@@ -1370,7 +1217,7 @@ fn two_adjacent_history_windows_drive_one_engine_to_the_union_state() {
 }
 
 #[test]
-fn the_history_source_fixes_streams_and_correction_and_is_for_replay_only() {
+fn the_history_source_fixes_streams_and_correction() {
     for flag in [["--streams", "aggTrades"], ["--trade-correction", "none"]] {
         let (code, stderr) = mie(&[
             "replay",
@@ -1391,30 +1238,25 @@ fn the_history_source_fixes_streams_and_correction_and_is_for_replay_only() {
             "{stderr}"
         );
     }
-    let dir = TempDir::new("experiment-history");
-    let config = dir.path().join("ingest.toml");
-    std::fs::write(
-        &config,
-        "[instrument]\nsymbol = \"BTCUSDT\"\nsource = \"binance-um\"\n[paths]\n\
-         raw_root = \"raw\"\njournal = \"journal.jsonl\"\n[binance]\n\
-         ws_base_url = \"wss://fake.invalid/ws\"\nrest_base_url = \"https://fake.invalid\"\n",
-    )
-    .unwrap();
+    // `mie experiment run --source history` fixes them too.
+    let dir = TempDir::new("experiment-history-streams");
     let results = dir.path().join("results");
     let (code, stderr) = mie(&[
         "experiment",
         "run",
         "absent.spec",
         "--config",
-        config.to_str().unwrap(),
+        "absent.toml",
         "--results",
         results.to_str().unwrap(),
         "--source",
         "history",
+        "--streams",
+        "aggTrades",
     ]);
     assert_eq!(code, Some(2), "{stderr}");
     assert!(
-        stderr.contains("--source history applies to `mie replay` only"),
+        stderr.contains("--streams applies to --source archive only"),
         "{stderr}"
     );
     assert!(!results.exists());

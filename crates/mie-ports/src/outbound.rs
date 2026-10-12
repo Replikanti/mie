@@ -242,6 +242,7 @@ mod tests {
         let key = ResultKey {
             experiment,
             pipeline: PipelineKey::new("research.replay_summary", 1),
+            engine: None,
         };
         let cases = [
             (

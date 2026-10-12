@@ -10,6 +10,7 @@ use mie_domain::event_hash::EventStreamHash;
 use mie_domain::feature::FeatureKey;
 use mie_domain::research::{DataVersion, ExperimentResult, ExperimentSpec, ResultKey};
 use mie_domain::state::{MarketState, StateError};
+use mie_domain::time::EventTime;
 use std::fmt;
 
 /// Replays recorded market data through the domain (brief §5).
@@ -130,6 +131,14 @@ pub enum ResearchError {
     },
     /// The sample period holds no event.
     EmptySample,
+    /// A sample on the history chain starts before the chain's origin, so
+    /// no prefix window `[origin, sample start)` exists (ADR-052 D10).
+    SampleBeforeOrigin {
+        /// The sample's start.
+        start: EventTime,
+        /// The chain's origin.
+        origin: EventTime,
+    },
     /// The run produced another result than the one stored under its key:
     /// the run is not reproducible, and the stored result stays.
     Diverged {
@@ -165,6 +174,12 @@ impl fmt::Display for ResearchError {
                 "feature {feature} is not computed by this build of the engine"
             ),
             Self::EmptySample => f.write_str("the sample period holds no event"),
+            Self::SampleBeforeOrigin { start, origin } => write!(
+                f,
+                "the sample starts at {} ms, before the history origin {} ms (ADR-052 D10)",
+                start.as_millis(),
+                origin.as_millis()
+            ),
             Self::Diverged { key } => write!(
                 f,
                 "result {key} diverged: the run differs from the stored result, which stays"

@@ -53,7 +53,7 @@ enforces the boundary (ADR-025):
 | [`mie-app`](crates/mie-app) | Use-case services that drive the domain through ports. |
 | [`mie-adapter-parquet`](crates/mie-adapter-parquet) | Immutable raw store: verbatim messages in sealed Parquet files with manifests and dataset versions (ADR-030). |
 | [`mie-adapter-binance`](crates/mie-adapter-binance) | Binance USDⓈ-M live capture: raw-first persistence, shared normalization, feed gaps, canonical merge (ADR-032); order-book sync from depth diffs and REST snapshots with audited checkpoints (ADR-038, ADR-049); public-archive backfill: checksum-verified, exactly-once import (ADR-034); replay of both from the raw store (ADR-039), and the history chain over both (ADR-052). |
-| [`mie-adapter-fs`](crates/mie-adapter-fs) | Research result store: append-only, read-only result files with SHA-256 trailers, keyed by experiment and pipeline (ADR-040). |
+| [`mie-adapter-fs`](crates/mie-adapter-fs) | Research result store: append-only, read-only result files with SHA-256 trailers, keyed by experiment, pipeline and, for state-reading pipelines, engine (ADR-040, ADR-052). |
 | `mie-adapter-*` *(planned)* | DuckDB, Telegram, LLM operators, backtest engine. |
 | [`mie-cli`](crates/mie-cli) | Composition root, the `mie` binary: wires adapters to ports. Today `ingest`, `capture-report`, `archive-import` / `archive-verify` / `archive-kline-check`, `replay`, `equivalence` and `experiment validate` / `experiment run`; report follows. |
 
@@ -155,6 +155,18 @@ version prints `reproduced` instead of `recorded`:
 cargo run --release -p mie-cli -- experiment validate crates/mie-cli/experiment.example.spec
 cargo run --release -p mie-cli -- experiment run crates/mie-cli/experiment.example.spec \
     --source archive --config crates/mie-cli/archive.example.toml --results data/results
+```
+
+`--source history` runs `research.replay_summary@2` on the history chain
+(ADR-052 D10): the chain from the origin up to the sample's start drives the
+engine first, and the result adds the prefix's provenance and the state
+hashes at the sample's start and end. Its key ends in the engine's
+feature-set version and state-hash encoding, so a build with another engine
+records next to the old result:
+
+```sh
+cargo run --release -p mie-cli -- experiment run <spec> \
+    --source history --config <ingest config with [history]> --results data/results
 ```
 
 ## Out of scope for now

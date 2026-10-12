@@ -65,7 +65,8 @@ depth_snapshot_min_spacing_ms = 2000
 # hash and Market State hash, about 1440 lines per day.
 state_checkpoint_interval_secs = 60
 
-# The history chain (ADR-052), read by `mie replay --source history`.
+# The history chain (ADR-052), read by `mie replay --source history` and
+# `mie experiment run --source history`.
 # Optional: without it every run starts cold (ADR-052 D8).
 # [history]
 # # The chain's origin and the cutover between the archive and the live

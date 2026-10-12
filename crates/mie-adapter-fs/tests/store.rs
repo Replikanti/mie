@@ -3,11 +3,15 @@
 
 use mie_adapter_fs::FsResultStore;
 use mie_domain::event_hash::EventStreamHash;
+use mie_domain::feature::FeatureSetVersion;
 use mie_domain::feature::{FeatureSet, catalog};
 use mie_domain::fingerprint::Fingerprint;
 use mie_domain::research::{
-    ExperimentResult, ExperimentSpec, HypothesisId, Outcome, PipelineKey, ResultKey,
+    DataVersion, EngineKey, ExperimentResult, ExperimentSpec, HistoryReplaySummary, HypothesisId,
+    Outcome, PipelineKey, ResultKey,
 };
+use mie_domain::state_hash::StateHash;
+use mie_domain::time::EventTime;
 use mie_ports::outbound::{ResearchResultReader, ResearchResultStore, ResultStoreError};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -90,6 +94,124 @@ fn result(events: u64) -> ExperimentResult {
     )
 }
 
+const HISTORY_SUMMARY: PipelineKey = PipelineKey::new("research.replay_summary", 2);
+
+fn engine(features: u64, state_encoding: u32) -> EngineKey {
+    EngineKey {
+        features: FeatureSetVersion::from_fingerprint(Fingerprint::from_raw(features)),
+        state_encoding,
+    }
+}
+
+/// A `research.replay_summary@2` result computed by `engine`.
+fn history_result(engine: EngineKey) -> ExperimentResult {
+    let hash = |raw| StateHash::from_fingerprint(Fingerprint::from_raw(raw));
+    ExperimentResult {
+        spec: spec("vah.failed_auction.short", 250),
+        pipeline: HISTORY_SUMMARY,
+        outcome: Outcome::HistoryReplaySummary(HistoryReplaySummary {
+            origin: EventTime::from_millis(0),
+            effective_origin: None,
+            cutover: EventTime::from_millis(5_000),
+            prefix_data: DataVersion::from_hex(&"0f".repeat(32)),
+            prefix_stream: EventStreamHash {
+                events: 3,
+                fingerprint: Fingerprint::from_raw(0xbeef),
+            },
+            prefix_rejections: 0,
+            engine,
+            state_start: hash(0x1234),
+            stream: EventStreamHash {
+                events: 4,
+                fingerprint: Fingerprint::from_raw(0xfeed),
+            },
+            rejections: 0,
+            state_end: hash(0x5678),
+        }),
+    }
+}
+
+#[test]
+fn a_history_result_is_stored_under_its_engine_key() {
+    let dir = TempDir::new("engine-key");
+    let mut store = FsResultStore::open(dir.path()).unwrap();
+    let result = history_result(engine(0x0123_4567_89ab_cdef, 1));
+    let key = store.append(&result).unwrap();
+    assert_eq!(key, result.key());
+    let path = store.path_of(&key);
+    assert_eq!(
+        path,
+        dir.path()
+            .join(key.experiment.to_string())
+            .join("research.replay_summary@2-0123456789abcdef-1.result")
+    );
+    assert_eq!(store.get(&key), Ok(Some(result)));
+    let without_engine = ResultKey {
+        engine: None,
+        ..key
+    };
+    assert_eq!(store.get(&without_engine), Ok(None));
+}
+
+#[test]
+fn the_results_of_two_engines_store_alongside() {
+    let dir = TempDir::new("two-engines");
+    let mut store = FsResultStore::open(dir.path()).unwrap();
+    let v1 = store.append(&result(4)).unwrap();
+    let new_build = history_result(engine(0xfff, 1));
+    let old_build = history_result(engine(0x00a, 1));
+    let new_key = store.append(&new_build).unwrap();
+    let old_key = store.append(&old_build).unwrap();
+    assert_eq!(store.get(&new_key), Ok(Some(new_build)));
+    assert_eq!(store.get(&old_key), Ok(Some(old_build)));
+    assert_eq!(
+        store
+            .by_hypothesis(&HypothesisId::new("vah.failed_auction.short").unwrap())
+            .unwrap(),
+        [v1, old_key, new_key]
+    );
+}
+
+#[test]
+fn a_history_result_under_another_engines_name_is_corrupt() {
+    let dir = TempDir::new("engine-misplaced");
+    let mut store = FsResultStore::open(dir.path()).unwrap();
+    let key = store
+        .append(&history_result(engine(0x0123_4567_89ab_cdef, 1)))
+        .unwrap();
+    let other = ResultKey {
+        engine: Some(engine(0x0123_4567_89ab_cdef, 2)),
+        ..key.clone()
+    };
+    fs::copy(store.path_of(&key), store.path_of(&other)).unwrap();
+    let Err(ResultStoreError::Corrupt(detail)) = store.get(&other) else {
+        panic!("a misplaced result is corrupt");
+    };
+    assert!(
+        detail.ends_with(&format!("holds the result {key}, not {other}")),
+        "{detail}"
+    );
+
+    // A non-canonical name is not a key: the listing ignores it.
+    let dir2 = TempDir::new("engine-non-canonical");
+    let mut store = FsResultStore::open(dir2.path()).unwrap();
+    let key = store
+        .append(&history_result(engine(0x0123_4567_89ab_cdef, 1)))
+        .unwrap();
+    let experiment_dir = store.path_of(&key).parent().unwrap().to_owned();
+    fs::copy(
+        store.path_of(&key),
+        experiment_dir.join("research.replay_summary@2-0123456789ABCDEF-1.result"),
+    )
+    .unwrap();
+    assert_eq!(
+        store
+            .by_hypothesis(&HypothesisId::new("vah.failed_auction.short").unwrap())
+            .unwrap(),
+        [key]
+    );
+}
+
 #[test]
 fn appends_and_reads_back_a_read_only_file_at_the_key_path() {
     let dir = TempDir::new("round-trip");
@@ -117,6 +239,7 @@ fn appends_and_reads_back_a_read_only_file_at_the_key_path() {
     let other = ResultKey {
         experiment: key.experiment,
         pipeline: PipelineKey::new("research.backtest", 1),
+        engine: None,
     };
     assert_eq!(store.get(&other), Ok(None));
 }
@@ -275,6 +398,7 @@ fn a_file_at_another_keys_path_is_corrupt() {
     let other = ResultKey {
         experiment: key.experiment,
         pipeline: PipelineKey::new("research.backtest", 1),
+        engine: None,
     };
     fs::copy(store.path_of(&key), store.path_of(&other)).unwrap();
     let Err(ResultStoreError::Corrupt(detail)) = store.get(&other) else {
