@@ -5,7 +5,10 @@
 //!
 //! | `type` | Written by | Content |
 //! |---|---|---|
-//! | `run_start` | ingest | symbol, streams, hold-back, open-interest re-time allowance, seeds per stream: the run's pipeline parameters ([`RunParameters`]); depth snapshot limit and checkpoint interval (informational); the state checkpoint interval (`state_checkpoint_interval_ms`), the state and event-stream hash encodings and the engine's feature set (16 hex digits): the comparability keys of the equivalence harness ([`Checkpointing`], ADR-041) |
+//! | `run_start` | ingest | symbol, streams, hold-back, open-interest re-time allowance, seeds per stream: the run's pipeline parameters ([`RunParameters`]); depth snapshot limit and checkpoint interval (informational); the state checkpoint interval (`state_checkpoint_interval_ms`), the state and event-stream hash encodings and the engine's feature set (16 hex digits): the comparability keys of the equivalence harness ([`Checkpointing`], ADR-041); `history_origin_ms` and `history_cutover_ms`, the history chain's bounds (null without `[history]`, [`RunHistory`], ADR-052 D6) |
+//! | `warm_start` | ingest | how the core's engine started, one per run ([`WarmStart`], ADR-052 D6): `warm` true with `origin_ms`, `effective_origin_ms` (ms or null), `cutover_ms`, the prefix's `prefix_dataset` (64 hex), `prefix_last_event_ms` (ms or null), `prefix_events`, `prefix_event_hash` (16 hex) and `prefix_rejections`, the `handoff_state_hash` (16 hex), the `seeds` the core's pipeline uses (raw stream → ms), the queue's `queue_high_water` (records) and `queue_high_water_bytes` (payload bytes), and `warming_up`, the long-warm-up features of ADR-041 still warming up at the handoff; or `warm` false with `cold` (`no-history`, `before-cutover`, `warm-up-failed`), `error` (text or null) and, with `[history]`, `origin_ms` and `cutover_ms` |
+//! | `warm_ready` | ingest | `ready_after_ms`: wall time from `run_start` until the warm engine has applied the queue (ADR-052 D6, D12) |
+//! | `chain_restart` | ingest | `time` (ms): an uncrossable hole restarted the warm engine in the run's live part (ADR-052 D4) |
 //! | `recovery` | ingest | parts rolled forward and discarded by the store |
 //! | `connected`, `connect_failed`, `disconnected`, `planned_rotation`, `backoff` | capture | connection lifecycle per stream |
 //! | `oi_poll` | capture | request/response time (ns), status, whether persisted |
@@ -23,7 +26,8 @@
 //! The journal is flushed on every `stats` line and at the end of a run, and
 //! synced to stable storage right after `run_start` and at the end of a run:
 //! replay needs a run's `run_start` for every record the run seals
-//! (ADR-039 D2).
+//! (ADR-039 D2). A warm `warm_start` is synced before the core uses its
+//! seeds, and a cold one after a failed warm-up before the core drives.
 //!
 //! The raw store alone does not determine what live delivered: the
 //! pipeline's `hold_back_ms`, `oi_retime_ms` and per-stream seeds are run
@@ -32,7 +36,18 @@
 //! configuration defaults (ADR-032). [`read_runs`] joins every run's
 //! `run_start` with its `run_end` into the [`LiveRun`]s `mie replay`
 //! recomputes (ADR-039 D1), and collects the run's `state_checkpoint`
-//! lines for `mie equivalence` (ADR-041).
+//! lines for `mie equivalence` (ADR-041) and its `warm_start`, `warm_ready`
+//! and `chain_restart` lines (ADR-052).
+//!
+//! **Warm runs** (ADR-052 D3). The core of a warm-started run recomputes the
+//! run's records with the history chain's seeds, journaled in `warm_start`,
+//! while `run_start` keeps the seeds of the capture's own pipeline (the
+//! 7-day lookback). That pipeline still writes the `gap` lines, so a warm
+//! run's `gap` lines describe the capture's pipeline, not what reached the
+//! engine. [`JournaledRun::live_run`] takes a warm run's seeds from
+//! `warm_start`: they are the seeds of the pipeline whose output reached the
+//! engine, and the history chain keeps them, so it recomputes the run
+//! exactly as it was consumed.
 
 use mie_adapter_binance::live::ChannelStats;
 use mie_adapter_binance::{
@@ -46,7 +61,7 @@ use mie_domain::feature::FeatureSetVersion;
 use mie_domain::fingerprint::Fingerprint;
 use mie_domain::state_hash::StateHash;
 use mie_domain::time::EventTime;
-use mie_ports::raw::SealedFile;
+use mie_ports::raw::{DatasetVersion, SealedFile};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
@@ -93,16 +108,7 @@ impl RunParameters {
         let oi_retime_ms = line["oi_retime_ms"]
             .as_i64()
             .ok_or("run_start without oi_retime_ms")?;
-        let mut seeds = BTreeMap::new();
-        let journaled = line["seeds"].as_object().ok_or("run_start without seeds")?;
-        for (name, millis) in journaled {
-            let stream = BinanceStream::from_raw_name(name)
-                .ok_or_else(|| format!("run_start seed of unknown stream {name:?}"))?;
-            let millis = millis
-                .as_i64()
-                .ok_or_else(|| format!("run_start seed of {name} is not an integer"))?;
-            seeds.insert(stream, EventTime::from_millis(millis));
-        }
+        let seeds = seeds_from_json(&line["seeds"], "run_start")?;
         Ok(Self {
             run_id: text("run_id")?,
             symbol: text("symbol")?,
@@ -132,6 +138,137 @@ pub struct JournaledRun {
     pub checkpointing: Option<Checkpointing>,
     /// The run's `state_checkpoint` lines, in journal order.
     pub checkpoints: Vec<StateCheckpoint>,
+    /// The history chain's bounds from `run_start`; `None` without
+    /// `[history]` or for a run journaled before ADR-052.
+    pub history: Option<RunHistory>,
+    /// How the core's engine started; `None` for a run journaled before
+    /// ADR-052, or one that crashed before its `warm_start`.
+    pub warm_start: Option<WarmStart>,
+    /// `warm_ready`'s `ready_after_ms`, for a warm run that drained its
+    /// queue.
+    pub ready_after_ms: Option<i64>,
+    /// The times of the run's `chain_restart` lines, in journal order.
+    pub chain_restarts: Vec<EventTime>,
+}
+
+/// The history chain's bounds a run journaled in `run_start` (ADR-052 D6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunHistory {
+    /// The chain's origin, epoch ms.
+    pub origin_ms: i64,
+    /// The cutover between the archive and the live segment, epoch ms.
+    pub cutover_ms: i64,
+}
+
+impl RunHistory {
+    /// Reads `history_origin_ms` and `history_cutover_ms` from a `run_start`
+    /// line: `None` when both are null or absent.
+    ///
+    /// # Errors
+    ///
+    /// A description when only one is set or one is not an integer.
+    pub fn from_run_start(line: &Value) -> Result<Option<Self>, String> {
+        let field = |name: &str| match &line[name] {
+            Value::Null => Ok(None),
+            value => value
+                .as_i64()
+                .map(Some)
+                .ok_or_else(|| format!("run_start with a malformed {name}")),
+        };
+        match (field("history_origin_ms")?, field("history_cutover_ms")?) {
+            (None, None) => Ok(None),
+            (Some(origin_ms), Some(cutover_ms)) => Ok(Some(Self {
+                origin_ms,
+                cutover_ms,
+            })),
+            _ => Err(
+                "run_start with only one of history_origin_ms and history_cutover_ms".to_owned(),
+            ),
+        }
+    }
+}
+
+/// Why a run's core started with a cold engine (ADR-052 D8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColdReason {
+    /// The configuration has no `[history]`.
+    NoHistory,
+    /// The run started before the history cutover: it is not a chain run.
+    BeforeCutover,
+    /// A chain run whose warm-up failed, panicked, was refused by the memory
+    /// guard (D13) or had not finished when the run ended.
+    WarmUpFailed,
+}
+
+impl ColdReason {
+    /// The journal's name of the reason.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NoHistory => "no-history",
+            Self::BeforeCutover => "before-cutover",
+            Self::WarmUpFailed => "warm-up-failed",
+        }
+    }
+
+    fn parse(name: &str) -> Option<Self> {
+        [Self::NoHistory, Self::BeforeCutover, Self::WarmUpFailed]
+            .into_iter()
+            .find(|reason| reason.as_str() == name)
+    }
+}
+
+/// How a run's core started its engine: a run's `warm_start` line
+/// (ADR-052 D6, module docs).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WarmStart {
+    /// From the history chain through the run's predecessor.
+    Warm(WarmHandoff),
+    /// With a fresh engine.
+    Cold(ColdStart),
+}
+
+/// A warm start's handoff: the prefix the warm engine was built from and
+/// what the run's own records were recomputed with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WarmHandoff {
+    /// The chain's origin, epoch ms.
+    pub origin_ms: i64,
+    /// The prefix's last restart after an uncrossable hole (ADR-052 D4);
+    /// `None`: the origin itself.
+    pub effective_origin_ms: Option<i64>,
+    /// The cutover, epoch ms.
+    pub cutover_ms: i64,
+    /// The prefix's dataset version.
+    pub prefix_dataset: DatasetVersion,
+    /// The warm engine's `as_of` at the handoff; `None` for an empty prefix.
+    pub prefix_last_event_ms: Option<i64>,
+    /// The event-stream hash of the prefix (ADR-039 D7).
+    pub prefix_stream: EventStreamHash,
+    /// The prefix's events the domain rejected.
+    pub prefix_rejections: u64,
+    /// The Market State hash at the handoff (ADR-041 D1).
+    pub handoff_state: StateHash,
+    /// The seeds of the core's pipeline: the chain seeds (ADR-052 D3).
+    pub seeds: BTreeMap<BinanceStream, EventTime>,
+    /// Records queued during the warm-up, at its largest.
+    pub queue_high_water: u64,
+    /// Payload bytes queued during the warm-up, at its largest.
+    pub queue_high_water_bytes: u64,
+    /// ADR-041's long-warm-up features still warming up at the handoff.
+    pub warming_up: Vec<String>,
+}
+
+/// A cold start's reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColdStart {
+    /// Why the engine started cold.
+    pub reason: ColdReason,
+    /// What failed, for [`ColdReason::WarmUpFailed`].
+    pub error: Option<String>,
+    /// The chain's origin, epoch ms, with `[history]`.
+    pub origin_ms: Option<i64>,
+    /// The cutover, epoch ms, with `[history]`.
+    pub cutover_ms: Option<i64>,
 }
 
 /// The comparability keys of a run's state checkpoints, from `run_start`
@@ -210,6 +347,161 @@ pub fn state_checkpoint_json(checkpoint: &StateCheckpoint) -> Value {
     })
 }
 
+/// A `warm_start` journal line as JSON fields (module docs).
+pub fn warm_start_json(start: &WarmStart) -> Value {
+    match start {
+        WarmStart::Warm(warm) => json!({
+            "warm": true,
+            "origin_ms": warm.origin_ms,
+            "effective_origin_ms": warm.effective_origin_ms,
+            "cutover_ms": warm.cutover_ms,
+            "prefix_dataset": warm.prefix_dataset.as_str(),
+            "prefix_last_event_ms": warm.prefix_last_event_ms,
+            "prefix_events": warm.prefix_stream.events,
+            "prefix_event_hash": warm.prefix_stream.fingerprint.to_string(),
+            "prefix_rejections": warm.prefix_rejections,
+            "handoff_state_hash": warm.handoff_state.to_string(),
+            "seeds": seeds_json(&warm.seeds),
+            "queue_high_water": warm.queue_high_water,
+            "queue_high_water_bytes": warm.queue_high_water_bytes,
+            "warming_up": warm.warming_up,
+        }),
+        WarmStart::Cold(cold) => {
+            let mut value = json!({
+                "warm": false,
+                "cold": cold.reason.as_str(),
+                "error": cold.error,
+            });
+            if let Some(origin_ms) = cold.origin_ms {
+                value["origin_ms"] = json!(origin_ms);
+            }
+            if let Some(cutover_ms) = cold.cutover_ms {
+                value["cutover_ms"] = json!(cutover_ms);
+            }
+            value
+        }
+    }
+}
+
+/// A `warm_ready` journal line as JSON fields (module docs).
+pub fn warm_ready_json(ready_after_ms: i64) -> Value {
+    json!({ "ready_after_ms": ready_after_ms })
+}
+
+/// A `chain_restart` journal line as JSON fields (module docs).
+pub fn chain_restart_json(time: EventTime) -> Value {
+    json!({ "time": time.as_millis() })
+}
+
+/// Seeds per stream as journal JSON: raw stream name → ms.
+pub fn seeds_json(seeds: &BTreeMap<BinanceStream, EventTime>) -> Value {
+    Value::Object(
+        seeds
+            .iter()
+            .map(|(s, t)| (s.raw_name().to_owned(), json!(t.as_millis())))
+            .collect(),
+    )
+}
+
+/// Reads seeds per stream from journal JSON (raw stream name → ms); `what`
+/// names the line in errors.
+fn seeds_from_json(
+    value: &Value,
+    what: &str,
+) -> Result<BTreeMap<BinanceStream, EventTime>, String> {
+    let journaled = value
+        .as_object()
+        .ok_or_else(|| format!("{what} without seeds"))?;
+    let mut seeds = BTreeMap::new();
+    for (name, millis) in journaled {
+        let stream = BinanceStream::from_raw_name(name)
+            .ok_or_else(|| format!("{what} seed of unknown stream {name:?}"))?;
+        let millis = millis
+            .as_i64()
+            .ok_or_else(|| format!("{what} seed of {name} is not an integer"))?;
+        seeds.insert(stream, EventTime::from_millis(millis));
+    }
+    Ok(seeds)
+}
+
+/// Reads a `warm_start` journal line.
+///
+/// # Errors
+///
+/// A description of a missing or malformed field.
+pub fn warm_start_from_json(line: &Value) -> Result<WarmStart, String> {
+    let optional_ms = |name: &str| match &line[name] {
+        Value::Null => Ok(None),
+        value => value
+            .as_i64()
+            .map(Some)
+            .ok_or_else(|| format!("warm_start with a malformed {name}")),
+    };
+    let warm = line["warm"].as_bool().ok_or("warm_start without warm")?;
+    if !warm {
+        let reason = line["cold"]
+            .as_str()
+            .and_then(ColdReason::parse)
+            .ok_or("warm_start without a cold reason")?;
+        let error = match &line["error"] {
+            Value::Null => None,
+            Value::String(error) => Some(error.clone()),
+            _ => return Err("warm_start with a malformed error".to_owned()),
+        };
+        return Ok(WarmStart::Cold(ColdStart {
+            reason,
+            error,
+            origin_ms: optional_ms("origin_ms")?,
+            cutover_ms: optional_ms("cutover_ms")?,
+        }));
+    }
+    let ms = |name: &str| {
+        line[name]
+            .as_i64()
+            .ok_or_else(|| format!("warm_start without {name}"))
+    };
+    let count = |name: &str| {
+        line[name]
+            .as_u64()
+            .ok_or_else(|| format!("warm_start without {name}"))
+    };
+    let hash = |name: &str| {
+        line[name]
+            .as_str()
+            .and_then(parse_hex)
+            .ok_or_else(|| format!("warm_start without a {name} of 16 hex digits"))
+    };
+    let prefix_dataset = line["prefix_dataset"]
+        .as_str()
+        .and_then(|hex| DatasetVersion::from_hex(hex).ok())
+        .ok_or("warm_start without a prefix_dataset of 64 hex digits")?;
+    let warming_up = line["warming_up"]
+        .as_array()
+        .and_then(|ids| {
+            ids.iter()
+                .map(|id| id.as_str().map(str::to_owned))
+                .collect::<Option<Vec<_>>>()
+        })
+        .ok_or("warm_start without warming_up")?;
+    Ok(WarmStart::Warm(WarmHandoff {
+        origin_ms: ms("origin_ms")?,
+        effective_origin_ms: optional_ms("effective_origin_ms")?,
+        cutover_ms: ms("cutover_ms")?,
+        prefix_dataset,
+        prefix_last_event_ms: optional_ms("prefix_last_event_ms")?,
+        prefix_stream: EventStreamHash {
+            events: count("prefix_events")?,
+            fingerprint: hash("prefix_event_hash")?,
+        },
+        prefix_rejections: count("prefix_rejections")?,
+        handoff_state: StateHash::from_fingerprint(hash("handoff_state_hash")?),
+        seeds: seeds_from_json(&line["seeds"], "warm_start")?,
+        queue_high_water: count("queue_high_water")?,
+        queue_high_water_bytes: count("queue_high_water_bytes")?,
+        warming_up,
+    }))
+}
+
 /// Reads a `state_checkpoint` journal line.
 ///
 /// # Errors
@@ -262,14 +554,20 @@ fn parse_hex(text: &str) -> Option<Fingerprint> {
 
 impl JournaledRun {
     /// The run as the live replay takes it: a clean end (exit code 0)
-    /// carries the record count the replay checks.
+    /// carries the record count the replay checks. The seeds are those of
+    /// the pipeline whose output reached the engine: `warm_start`'s for a
+    /// warm run, `run_start`'s otherwise (module docs).
     pub fn live_run(&self) -> LiveRun {
+        let seeds = match &self.warm_start {
+            Some(WarmStart::Warm(warm)) => warm.seeds.clone(),
+            _ => self.parameters.seeds.clone(),
+        };
         LiveRun {
             run_id: self.parameters.run_id.clone(),
             symbol: self.parameters.symbol.clone(),
             hold_back_ms: self.parameters.hold_back_ms,
             oi_retime_ms: self.parameters.oi_retime_ms,
-            seeds: self.parameters.seeds.clone(),
+            seeds,
             streams: self.streams.clone(),
             started_at_ms: self.started_at_ms,
             ended_at_ms: self.end.map(|end| end.at_ms),
@@ -285,12 +583,12 @@ impl JournaledRun {
 /// order.
 ///
 /// A line that is not JSON is skipped: a crash can leave a partial line,
-/// which the next run's first line then follows. A `run_start`, `run_end`
-/// or `state_checkpoint` that does not carry its fields is an error, and so
-/// are two `run_start`s of one run id — a restart within the same second,
-/// whose records the session prefix could not tell apart (ADR-032) — a
-/// second `run_end`, and a `run_end` or `state_checkpoint` without a
-/// `run_start`.
+/// which the next run's first line then follows. A `run_start`, `run_end`,
+/// `state_checkpoint`, `warm_start`, `warm_ready` or `chain_restart` that
+/// does not carry its fields is an error, and so are two `run_start`s of
+/// one run id — a restart within the same second, whose records the session
+/// prefix could not tell apart (ADR-032) — a second `run_end`, `warm_start`
+/// or `warm_ready`, and any of these lines without a `run_start`.
 ///
 /// # Errors
 ///
@@ -333,6 +631,7 @@ pub fn read_runs(path: &Path, source: &str) -> Result<Vec<JournaledRun>, String>
                     .as_i64()
                     .ok_or_else(|| at("run_start without at_ms".to_owned()))?;
                 let checkpointing = Checkpointing::from_run_start(&value).map_err(at)?;
+                let history = RunHistory::from_run_start(&value).map_err(at)?;
                 runs.push(JournaledRun {
                     parameters,
                     source: run_source.to_owned(),
@@ -341,20 +640,46 @@ pub fn read_runs(path: &Path, source: &str) -> Result<Vec<JournaledRun>, String>
                     end: None,
                     checkpointing,
                     checkpoints: Vec::new(),
+                    history,
+                    warm_start: None,
+                    ready_after_ms: None,
+                    chain_restarts: Vec::new(),
                 });
             }
-            Some("state_checkpoint") => {
-                let checkpoint = state_checkpoint_from_json(&value).map_err(at)?;
+            Some(kind @ ("state_checkpoint" | "warm_start" | "warm_ready" | "chain_restart")) => {
                 let run_id = value["run_id"].as_str().unwrap_or_default();
                 let run = runs
                     .iter_mut()
                     .find(|r| r.parameters.run_id == run_id)
-                    .ok_or_else(|| {
-                        at(format!(
-                            "state_checkpoint of run {run_id:?} without run_start"
-                        ))
-                    })?;
-                run.checkpoints.push(checkpoint);
+                    .ok_or_else(|| at(format!("{kind} of run {run_id:?} without run_start")))?;
+                match kind {
+                    "state_checkpoint" => {
+                        run.checkpoints
+                            .push(state_checkpoint_from_json(&value).map_err(at)?);
+                    }
+                    "warm_start" => {
+                        let start = warm_start_from_json(&value).map_err(at)?;
+                        if run.warm_start.is_some() {
+                            return Err(at(format!("run {run_id} has a second warm_start")));
+                        }
+                        run.warm_start = Some(start);
+                    }
+                    "warm_ready" => {
+                        let ready = value["ready_after_ms"]
+                            .as_i64()
+                            .ok_or_else(|| at("warm_ready without ready_after_ms".to_owned()))?;
+                        if run.ready_after_ms.is_some() {
+                            return Err(at(format!("run {run_id} has a second warm_ready")));
+                        }
+                        run.ready_after_ms = Some(ready);
+                    }
+                    _ => {
+                        let time = value["time"]
+                            .as_i64()
+                            .ok_or_else(|| at("chain_restart without time".to_owned()))?;
+                        run.chain_restarts.push(EventTime::from_millis(time));
+                    }
+                }
             }
             Some("run_end") => {
                 let field = |name: &str| {
@@ -929,6 +1254,186 @@ mod tests {
         keys["state_checkpoint_interval_ms"] = json!(10_000);
         let error = read(&[keys.to_string()]).unwrap_err();
         assert!(error.contains("state_hash_encoding"), "{error}");
+    }
+
+    fn line(kind: &str, run_id: &str, fields: Value) -> String {
+        let mut value = fields;
+        value["type"] = json!(kind);
+        value["run_id"] = json!(run_id);
+        value["at_ms"] = json!(1_500);
+        value.to_string()
+    }
+
+    fn handoff() -> WarmHandoff {
+        WarmHandoff {
+            origin_ms: 100,
+            effective_origin_ms: Some(400),
+            cutover_ms: 1_000,
+            prefix_dataset: DatasetVersion::from_hex(&"ab".repeat(32)).unwrap(),
+            prefix_last_event_ms: Some(990),
+            prefix_stream: EventStreamHash {
+                events: 77,
+                fingerprint: Fingerprint::from_raw(0x1234),
+            },
+            prefix_rejections: 2,
+            handoff_state: StateHash::from_fingerprint(Fingerprint::from_raw(0xfeed)),
+            seeds: BTreeMap::from([
+                (BinanceStream::AggTrade, EventTime::from_millis(980)),
+                (BinanceStream::OpenInterest, EventTime::from_millis(960)),
+            ]),
+            queue_high_water: 12,
+            queue_high_water_bytes: 3_456,
+            warming_up: vec!["volatility.regime.1h@1".to_owned()],
+        }
+    }
+
+    #[test]
+    fn warm_and_cold_starts_round_trip_and_set_the_seeds_replay_takes() {
+        let mut history: Value = serde_json::from_str(&start("W", 2_000, "binance-um")).unwrap();
+        history["history_origin_ms"] = json!(100);
+        history["history_cutover_ms"] = json!(1_000);
+        let warm = WarmStart::Warm(handoff());
+        let cold = WarmStart::Cold(ColdStart {
+            reason: ColdReason::WarmUpFailed,
+            error: Some("memory guard".to_owned()),
+            origin_ms: Some(100),
+            cutover_ms: Some(1_000),
+        });
+        let no_history = WarmStart::Cold(ColdStart {
+            reason: ColdReason::NoHistory,
+            error: None,
+            origin_ms: None,
+            cutover_ms: None,
+        });
+        let runs = read(&[
+            start("A", 1_000, "binance-um"),
+            history.to_string(),
+            line("warm_start", "W", warm_start_json(&warm)),
+            line("warm_ready", "W", warm_ready_json(1_234)),
+            line(
+                "chain_restart",
+                "W",
+                chain_restart_json(EventTime::from_millis(5_000)),
+            ),
+            line(
+                "chain_restart",
+                "W",
+                chain_restart_json(EventTime::from_millis(6_000)),
+            ),
+            start("C", 3_000, "binance-um"),
+            line("warm_start", "C", warm_start_json(&cold)),
+            start("N", 4_000, "binance-um"),
+            line("warm_start", "N", warm_start_json(&no_history)),
+        ])
+        .unwrap();
+        // A run journaled before ADR-052 has none of it.
+        let a = &runs[0];
+        assert_eq!(
+            (&a.history, &a.warm_start, a.ready_after_ms),
+            (&None, &None, None)
+        );
+        assert!(a.chain_restarts.is_empty());
+        let w = &runs[1];
+        assert_eq!(
+            w.history,
+            Some(RunHistory {
+                origin_ms: 100,
+                cutover_ms: 1_000
+            })
+        );
+        assert_eq!(w.warm_start, Some(warm));
+        assert_eq!(w.ready_after_ms, Some(1_234));
+        assert_eq!(
+            w.chain_restarts,
+            [EventTime::from_millis(5_000), EventTime::from_millis(6_000)]
+        );
+        assert_eq!(runs[2].warm_start, Some(cold));
+        assert_eq!(runs[3].warm_start, Some(no_history.clone()));
+        let shown = warm_start_json(&no_history);
+        assert!(shown.get("origin_ms").is_none(), "{shown}");
+        assert_eq!(shown["cold"], "no-history");
+
+        // The seeds of the pipeline whose output reached the engine: the
+        // warm start's for a warm run, run_start's otherwise.
+        assert_eq!(
+            w.parameters.seeds[&BinanceStream::AggTrade],
+            EventTime::from_millis(5)
+        );
+        assert_eq!(w.live_run().seeds, handoff().seeds);
+        assert_eq!(runs[2].live_run().seeds, runs[2].parameters.seeds);
+    }
+
+    #[test]
+    fn malformed_or_repeated_warm_starts_are_errors() {
+        let good = warm_start_json(&WarmStart::Warm(handoff()));
+        for (field, value) in [
+            ("warm", json!("yes")),
+            ("cutover_ms", json!(null)),
+            ("prefix_dataset", json!("abc")),
+            ("prefix_event_hash", json!("XYZ")),
+            ("handoff_state_hash", json!(7)),
+            ("seeds", json!({"bookTicker": 1})),
+            ("queue_high_water", json!(-1)),
+            ("warming_up", json!([1])),
+            ("effective_origin_ms", json!("later")),
+        ] {
+            let mut bad = good.clone();
+            bad[field] = value;
+            let error = read(&[
+                start("A", 1_000, "binance-um"),
+                line("warm_start", "A", bad),
+            ])
+            .unwrap_err();
+            assert!(
+                error.starts_with("journal line 2: warm_start "),
+                "{field}: {error}"
+            );
+        }
+        let mut cold = warm_start_json(&WarmStart::Cold(ColdStart {
+            reason: ColdReason::BeforeCutover,
+            error: None,
+            origin_ms: None,
+            cutover_ms: None,
+        }));
+        cold["cold"] = json!("lukewarm");
+        let error = read(&[
+            start("A", 1_000, "binance-um"),
+            line("warm_start", "A", cold),
+        ])
+        .unwrap_err();
+        assert!(error.contains("cold reason"), "{error}");
+
+        let twice = read(&[
+            start("A", 1_000, "binance-um"),
+            line("warm_start", "A", good.clone()),
+            line("warm_start", "A", good.clone()),
+        ])
+        .unwrap_err();
+        assert!(twice.contains("second warm_start"), "{twice}");
+        let orphan = read(&[line("warm_start", "A", good)]).unwrap_err();
+        assert!(
+            orphan.contains("warm_start of run \"A\" without run_start"),
+            "{orphan}"
+        );
+        let ready = read(&[
+            start("A", 1_000, "binance-um"),
+            line("warm_ready", "A", json!({})),
+        ])
+        .unwrap_err();
+        assert!(
+            ready.contains("warm_ready without ready_after_ms"),
+            "{ready}"
+        );
+        let restart = read(&[
+            start("A", 1_000, "binance-um"),
+            line("chain_restart", "A", json!({"time": "now"})),
+        ])
+        .unwrap_err();
+        assert!(restart.contains("chain_restart without time"), "{restart}");
+        let mut half: Value = serde_json::from_str(&start("A", 1_000, "binance-um")).unwrap();
+        half["history_origin_ms"] = json!(100);
+        let error = read(&[half.to_string()]).unwrap_err();
+        assert!(error.contains("only one of history_origin_ms"), "{error}");
     }
 
     #[test]

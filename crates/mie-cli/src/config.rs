@@ -39,8 +39,9 @@ pub struct IngestConfig {
     pub history: Option<History>,
 }
 
-/// `[history]` (ADR-052 D6): the history chain's origin and cutover, and the
-/// archive configuration of its archive segment.
+/// `[history]` (ADR-052 D6): the history chain's origin and cutover, the
+/// archive configuration of its archive segment, and the warm start's
+/// memory guard (D13).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct History {
@@ -53,6 +54,14 @@ pub struct History {
     /// The `mie archive-*` configuration of the archive segment: the same
     /// raw store and symbol as this configuration.
     pub archive_config: PathBuf,
+    /// The warm start's memory guard (ADR-052 D13, its `N_max`): the most
+    /// records a chain run before the starting one may hold. The warm-up
+    /// replays one run at a time in memory, so a larger run starts this run
+    /// cold instead. No default: the bytes per record are measured by #106,
+    /// so a missing key starts every chain run cold, with the reason
+    /// journaled. Only `mie ingest` reads it.
+    #[serde(default)]
+    pub max_run_records: Option<u64>,
 }
 
 impl History {
@@ -327,6 +336,11 @@ impl IngestConfig {
                     "history.origin {:?} is not before history.cutover {:?}",
                     history.origin, history.cutover
                 )));
+            }
+            if history.max_run_records == Some(0) {
+                return Err(ConfigError(
+                    "history.max_run_records must be positive (ADR-052 D13)".to_owned(),
+                ));
             }
         }
         Ok(())

@@ -41,6 +41,7 @@ use mie_domain::event::{FeedGap, GapReason, MarketEvent, Stream};
 use mie_domain::event_hash::EventStreamHash;
 use mie_domain::num::Qty;
 use mie_domain::state::{MarketStateEngine, StateError};
+use mie_domain::state_hash::StateHash;
 use mie_domain::time::EventTime;
 use mie_ports::outbound::{
     HistoricalDataProvider, MarketDataProvider, ProviderError, Replay, ReplayWindow,
@@ -104,6 +105,10 @@ pub struct ReplayOutcome {
     /// The times (epoch ms) of the history chain's restarts after an
     /// uncrossable hole (ADR-052 D4); empty for `live` and `archive`.
     pub restarts: Vec<i64>,
+    /// The Market State hash of the final engine state, when the replay
+    /// opened. Not printed: the report's bytes stay as they are; the warm
+    /// start's tests compare against it (ADR-052 W3).
+    pub state_hash: Option<StateHash>,
 }
 
 impl ReplayOutcome {
@@ -290,6 +295,7 @@ fn failed(report: &mut Vec<u8>, error: String) -> ReplayOutcome {
         domain_rejections: 0,
         error: Some(error),
         restarts: Vec::new(),
+        state_hash: None,
     }
 }
 
@@ -422,6 +428,7 @@ fn drive<S: MarketDataProvider>(
         domain_rejections,
         error,
         restarts,
+        state_hash: Some(state.state_hash()),
     }
 }
 
