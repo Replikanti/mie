@@ -518,13 +518,15 @@ deferred option D are under *Alternatives considered*.
      selection ends at the predecessor's end plus `RUN_MARGIN_MS`
      (300 000 ms, ADR-039 decision 2). The current version differs from
      the journaled one, without any data change, once the run has sealed a
-     file whose first record lies before that end plus 300 000 ms: the
-     file then falls inside the prefix's selection (decision 5: a window's
-     version is stable only once later runs have sealed past its end plus
-     the margin). What decides is when the run's first records lie, not
-     when the run starts: a restart 299 s after the predecessor's end
-     whose first record arrives 2 s after its start keeps the version.
-     ADR-039 decision 2 puts a run's records at most 300 000 ms before its
+     file whose earliest event time lies before that end plus 300 000 ms:
+     the file then falls inside the prefix's selection (decision 5: a
+     window's version is stable only once later runs have sealed past its
+     end plus the margin). What decides is the event time of the run's
+     earliest records, not when the run starts or when a record is
+     received: a restart 299 s after the predecessor's end keeps the
+     version when its earliest event time is 2 s after its start, and
+     moves it when that record is an open-interest sample stamped before
+     its start. ADR-039 decision 2 puts a run's records at most 300 000 ms before its
      start, so the version can move only for a run that starts less than
      600 000 ms after its predecessor's end, and never for one at or above
      it, as long as that premise holds; the replay does not check it for

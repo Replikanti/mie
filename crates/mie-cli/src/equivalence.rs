@@ -44,9 +44,9 @@
 //!    state only when the run's feature set is this binary's). A mismatch is
 //!    `DIVERGED (warm prefix)`; the report prints the journaled and the
 //!    current prefix dataset version beside it, never comparing them: a
-//!    fast restart whose first records lie before its predecessor's end plus
-//!    `RUN_MARGIN_MS` moves the version without a data change once it has
-//!    sealed them (ADR-052 D5, D9).
+//!    fast restart whose earliest records carry an event time before its
+//!    predecessor's end plus `RUN_MARGIN_MS` moves the version without a
+//!    data change once it has sealed them (ADR-052 D5, D9).
 //! 4. The run's own part, the chain's recompute of the run joined to the
 //!    prefix through the ADR-039 D3 `HoldBack` (what the run's core
 //!    consumed), is driven into the same engine through
