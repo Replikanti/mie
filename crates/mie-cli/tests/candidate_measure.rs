@@ -1,10 +1,11 @@
-//! The ADR-051 measurements (issue #22, M2): an independent model of the
-//! ADR-051 decision text, run next to one `MarketStateEngine`, that checks
-//! the engine's divergences and runs the two pre-registered fixing rules of
-//! effort vs result, R1b (the baseline length `B`) and R1 (the high
+//! The ADR-051 measurements (issue #22, M2 and M3): an independent model of
+//! the ADR-051 decision text, run next to one `MarketStateEngine`, that
+//! checks the engine's candidates and runs the two pre-registered fixing
+//! rules of effort vs result, R1b (the baseline length `B`) and R1 (the high
 //! quantile `q_hi`), with `B` ∈ [`BASELINES`] and `q` ∈ [`GRID`] as runtime
-//! parameters. No engine change: effort vs result and exhaustion exist only
-//! in this model until M3 fixes their constants from this run.
+//! parameters. The hold-out run fixed `B` = 1 440 and `q_hi` = 0.800 (D9);
+//! since M3 the engine computes effort vs result, exhaustion and absorption
+//! at those values, and R0 compares them at [`ENGINE_B`] and [`ENGINE_Q`].
 //!
 //! The model is written from decisions 3–6, not from the engine's
 //! internals. Its inputs:
@@ -16,13 +17,16 @@
 //! - the 5-minute open interest, from the state's `derivatives.oi.5m@1`;
 //! - effort vs result and exhaustion: the state's `flow.window.<5m|15m|1h>@1`
 //!   after every event that closes a 1m bar, and the closed 1m bars;
+//! - absorption: the state's `book.liquidity.window.<5m|15m|1h>@1` at the
+//!   same minute, its 5 bps band on the passive side opposite the
+//!   aggressor;
 //! - the location bin of each effort-vs-result episode: decision 3's
 //!   point-in-zone test at the anchor (the last close), written here from the
 //!   ADR text over the state's `location.levels` (the domain helper is
 //!   crate-private), and the regime label from `volatility.regime.1h@1`.
 //!
-//! Two readings the ADR leaves open are fixed here, and M3's engine must
-//! match them for R0: a minute without an evaluation (`delta == 0`, no
+//! Two readings the ADR leaves open are fixed here, and the engine matches
+//! them (R0): a minute without an evaluation (`delta == 0`, no
 //! displacement, a window or a baseline not ready, a missing expansion)
 //! leaves `active` as it was, so it neither emits nor re-arms; and the
 //! exhaustion extreme reads the closed 1m bars with trades.
@@ -32,8 +36,13 @@
 //! - **R0** (asserted): no domain rejection, and at every event the
 //!   engine's candidate facts equal the model's — kind, feature, timeframe,
 //!   `known_at`, both anchors, every change, coverage and the location
-//!   context — and after every event that closes a structure bar, every
-//!   divergence value equals the model's.
+//!   context; for effort vs result, exhaustion and absorption the value at
+//!   `B` = 1 440 and `q_hi` = 0.800, its inputs and the context at the last
+//!   close, and the location bin each effort-vs-result fact's context gives
+//!   equals the model's — and after every event that closes a structure
+//!   bar, every divergence value equals the model's, and after every event
+//!   that closes a 1m bar, every effort-vs-result, exhaustion and absorption
+//!   value equals the model's (warm-up counts included).
 //! - **D9 records**: per structure timeframe, half and in total, the
 //!   consecutive same-side swing pairs, the share at a further extreme, the
 //!   CVD-divergent share, the pairs with both OI points and the
@@ -51,8 +60,10 @@
 //!   per window length, half and `q`, the 12 regime × location cells, the
 //!   regime-pooled cells and the unlabelled and unlocated counts; the
 //!   minimum-cell classification and the verdict ([`r1`]).
-//! - Recorded only: exhaustion episodes per `B`, `q` and half; the replay's
-//!   wall time.
+//! - Recorded only: exhaustion episodes per `B`, `q` and half; at the
+//!   engine's `B` and `q_hi`, the effort-vs-result, exhaustion and absorption
+//!   episodes per half and the minutes absorption was evaluated; the
+//!   replay's wall time.
 //!
 //! The halves split at the window's midpoint, `from + (to − from) / 2`. The
 //! fixing rules run on the measurement year of ADR-051 D9, the hold-out
@@ -68,6 +79,17 @@
 //! replay's event count (R0). The replay reads `aggTrades` with the ADR-050
 //! fold (its D8 default) and `metrics` for the open interest.
 //!
+//! `measure_candidates_live` (also `--ignored`) runs the same R0 over every
+//! cleanly ended run of a `mie ingest` capture, each recomputed alone with
+//! `LiveReplay::run_replay` into a fresh engine (the `book_liquidity_measure`
+//! pattern), so absorption is checked where depth exists: run it with
+//! `MIE_MEASURE_RAW_ROOT=<raw root> MIE_MEASURE_JOURNAL=<journal> cargo test
+//! --release -p mie-cli --test candidate_measure -- --ignored --nocapture
+//! measure_candidates_live`. A run shorter than the 1 440 evaluations effort
+//! vs result warms up over evaluates no absorption; the per-run report shows
+//! the evaluated minutes, and the test fails when no run evaluated any, so
+//! it never passes on a store too short to prove anything.
+//!
 //! `r1b_from_a_logged_run` (also `--ignored`) re-reads the R1b hour lines of
 //! a saved `measure_candidates` output, in M2's format or this one's, from
 //! the file `MIE_MEASURE_LOG`, and prints the same R1b report and verdict.
@@ -76,28 +98,41 @@
 //!
 //! `model_reproduces_the_engine_on_a_synthetic_tape` runs the same R0
 //! comparison and every report section in CI on a seeded tape, and asserts
-//! that every compared kind occurred, so R0 cannot pass vacuously. The two
+//! that every compared kind occurred, so R0 cannot pass vacuously;
+//! `model_reproduces_absorption_on_a_synthetic_book_tape` does the same for
+//! absorption on a seeded tape with a book. The two
 //! selection rules are pure functions over count tables, unit-tested on
 //! constructed tables; R1b's statistic is also pinned on three
 //! development-year tables from the #22 M2 log, as a check that the code
 //! computes what decision 5 says (ADR-051 D9 limits what they may be used
 //! for).
 
+use mie_adapter_binance::LiveReplay;
 use mie_adapter_binance::archive::ArchiveStream;
 use mie_adapter_binance::archive::fold::TradeCorrection;
 use mie_adapter_binance::archive::replay::ArchiveReplay;
 use mie_adapter_parquet::ParquetRawStore;
+use mie_cli::journal::{JournaledRun, read_runs};
 use mie_cli::replay::parse_bound;
 use mie_domain::bars::{Coverage, Timeframe};
+use mie_domain::book::Side as BookSide;
+use mie_domain::candidate::absorption::Absorption;
 use mie_domain::candidate::divergence::{
     CvdComparison, Divergence, DivergenceEvent, OiComparison, SwingAnchor, SwingPair,
     TimeframeDivergences,
 };
-use mie_domain::candidate::{CandidateEvent, ContextLevel, ContextLevels, LocationContext};
+use mie_domain::candidate::effort::{EffortResult, Exhaustion as ExhaustionValue};
+use mie_domain::candidate::{
+    CandidateEvent, ContextLevel, ContextLevels, EdgeEvent, LocationContext,
+};
 use mie_domain::derivatives::OiGridPoint;
-use mie_domain::event::{Aggressor, FeedGap, GapReason, MarketEvent, OpenInterest, Stream, Trade};
+use mie_domain::event::{
+    Aggressor, BookSnapshot, BookUpdate, FeedGap, GapReason, Level, MarketEvent, OpenInterest,
+    Stream, Trade,
+};
 use mie_domain::feature::{FeatureValue, Unavailability, catalog};
 use mie_domain::flow::AggressionWindow;
+use mie_domain::liquidity::LiquidityWindow;
 use mie_domain::location::{LevelKind, LevelSide, LocationLevel, LocationState};
 use mie_domain::num::{Price, Qty, SCALE};
 use mie_domain::regime::RegimeLabel;
@@ -145,6 +180,21 @@ const Q: usize = GRID.len();
 
 /// The median, in thousandths: nearest rank ⌈B/2⌉, the lower median.
 const MEDIAN: u32 = 500;
+
+/// The engine's `B`, fixed by R1b on the hold-out year (decision 5, D9):
+/// 1 440, at this index of [`BASELINES`].
+const ENGINE_B: usize = 2;
+
+/// The engine's `q_hi`, fixed by R1 at that `B` (decision 5, D9): 0.800,
+/// at this index of [`GRID`].
+const ENGINE_Q: usize = 0;
+
+/// Decision 6: exhaustion warms up over six judged 1h evaluations.
+const EXHAUSTION_SAMPLES: u64 = 6;
+
+/// Decision 7: absorption reads the 5 bps band, in rate units (1 bps =
+/// 10 000).
+const ABSORPTION_BAND_UNITS: i64 = 50_000;
 
 /// The effort windows of decision 5, shortest first.
 const WINDOWS: [Timeframe; 3] = [Timeframe::M5, Timeframe::M15, Timeframe::H1];
@@ -215,6 +265,14 @@ fn side_index(side: Side) -> usize {
         Side::High => 0,
         Side::Low => 1,
     }
+}
+
+/// The position of the window of length `timeframe` in [`WINDOWS`].
+fn window_index(timeframe: Timeframe) -> usize {
+    WINDOWS
+        .iter()
+        .position(|window| *window == timeframe)
+        .expect("an effort window")
 }
 
 fn label_index(label: RegimeLabel) -> usize {
@@ -695,6 +753,15 @@ struct Check {
     located: u64,
     /// Matched ready divergence values.
     values: u64,
+    /// Matched effort-vs-result facts per window, exhaustion facts and
+    /// absorption facts per window.
+    effort: [u64; W],
+    exhaustion: u64,
+    absorption: [u64; W],
+    /// Matched effort-vs-result facts per location bin of their context.
+    effort_bins: [u64; BINS],
+    /// Matched ready effort-vs-result, exhaustion and absorption values.
+    flow_values: u64,
 }
 
 impl Check {
@@ -705,7 +772,16 @@ impl Check {
         }
     }
 
-    fn facts(&mut self, known_at: EventTime, engine: &[CandidateEvent], model: &[CandidateEvent]) {
+    /// Compares the facts of one event. `bins` is the model's location bins
+    /// at the last close, which every effort-vs-result fact's context must
+    /// give (R1's cells, decision 5).
+    fn facts(
+        &mut self,
+        known_at: EventTime,
+        engine: &[CandidateEvent],
+        model: &[CandidateEvent],
+        bins: Option<[bool; BINS]>,
+    ) {
         if engine.len() != model.len() {
             self.mismatch(format!(
                 "{known_at}: engine emitted {} candidate facts, the model {}",
@@ -727,6 +803,31 @@ impl Check {
                     self.oi[side_index(event.comparison.pair.side)] += 1;
                     event.comparison.pair.gaps_between > 0
                 }
+                CandidateEvent::EffortVsResult(event) => {
+                    self.effort[window_index(event.value.timeframe)] += 1;
+                    let theirs = event
+                        .context
+                        .levels
+                        .ready()
+                        .map(|levels| bins_of(levels.levels.iter().map(|level| level.kind)));
+                    if theirs != bins {
+                        self.mismatch(format!(
+                            "{known_at}: effort-vs-result context bins {theirs:?}, model {bins:?}"
+                        ));
+                    }
+                    for (bin, inside) in theirs.unwrap_or_default().iter().enumerate() {
+                        self.effort_bins[bin] += u64::from(*inside);
+                    }
+                    false
+                }
+                CandidateEvent::Exhaustion(_) => {
+                    self.exhaustion += 1;
+                    false
+                }
+                CandidateEvent::Absorption(event) => {
+                    self.absorption[window_index(event.value.effort.timeframe)] += 1;
+                    false
+                }
             };
             self.gapped += u64::from(gapped);
             if theirs
@@ -737,6 +838,41 @@ impl Check {
             {
                 self.located += 1;
             }
+        }
+    }
+
+    /// Compares the effort-vs-result, exhaustion and absorption values after
+    /// an event that closed a 1m bar.
+    fn flow_values(&mut self, known_at: EventTime, model: &EngineModel, state: &MarketState) {
+        let candidates = &state.candidates;
+        for (window, timeframe) in WINDOWS.iter().enumerate() {
+            match candidates.effort_result(*timeframe) {
+                Some(theirs) if *theirs == model.effort[window] => {
+                    self.flow_values += u64::from(theirs.is_ready());
+                }
+                theirs => self.mismatch(format!(
+                    "{known_at} {timeframe}: engine effort {theirs:?}, model {:?}",
+                    model.effort[window]
+                )),
+            }
+            match candidates.absorption(*timeframe) {
+                Some(theirs) if *theirs == model.absorption[window] => {
+                    self.flow_values += u64::from(theirs.is_ready());
+                }
+                theirs => self.mismatch(format!(
+                    "{known_at} {timeframe}: engine absorption {theirs:?}, model {:?}",
+                    model.absorption[window]
+                )),
+            }
+        }
+        if *candidates.exhaustion() == model.exhaustion {
+            self.flow_values += u64::from(model.exhaustion.is_ready());
+        } else {
+            self.mismatch(format!(
+                "{known_at}: engine exhaustion {:?}, model {:?}",
+                candidates.exhaustion(),
+                model.exhaustion
+            ));
         }
     }
 
@@ -770,24 +906,71 @@ struct Evaluation {
     progress: i128,
     /// `|displacement|`.
     movement: i128,
+    /// The window's coverage, which the engine's value carries.
+    coverage: Coverage,
 }
 
 /// Decision 5: the evaluation of a ready window, none when `delta == 0` or
-/// the displacement is missing.
-fn evaluation(window: &FeatureValue<AggressionWindow>) -> Option<Evaluation> {
-    let window = window.ready()?;
-    let displacement = i128::from(window.displacement?.units());
+/// the displacement is missing. `Err` when effort or progress does not fit
+/// an `i64` (decision 2): the engine's value is then `Unavailable`, and the
+/// evaluation is no sample.
+fn evaluation(window: &FeatureValue<AggressionWindow>) -> Result<Option<Evaluation>, ()> {
+    let Some(window) = window.ready() else {
+        return Ok(None);
+    };
+    let Some(displacement) = window.displacement else {
+        return Ok(None);
+    };
+    let displacement = i128::from(displacement.units());
     let delta = i128::from(window.delta.units());
     if delta == 0 {
-        return None;
+        return Ok(None);
     }
-    Some(Evaluation {
+    let evaluation = Evaluation {
         end: window.end.as_millis(),
         delta,
         effort: delta.abs(),
         progress: displacement * delta.signum(),
         movement: displacement.abs(),
-    })
+        coverage: window.coverage,
+    };
+    let fits = |value: i128| i64::try_from(value).is_ok();
+    if fits(evaluation.effort) && fits(evaluation.progress) {
+        Ok(Some(evaluation))
+    } else {
+        Err(())
+    }
+}
+
+/// The engine's value of one judged evaluation at grid value `q` (decision
+/// 5): the quantiles it was judged against and its condition.
+fn effort_result(
+    window: usize,
+    evaluation: &Evaluation,
+    quantiles: &Quantiles,
+    q: usize,
+) -> EffortResult {
+    let units = |value: i128| i64::try_from(value).expect("a fitting evaluation");
+    let (_, definition) = catalog::CANDIDATE_EFFORT_RESULT[window];
+    EffortResult {
+        feature: definition.key,
+        timeframe: WINDOWS[window],
+        end: EventTime::from_millis(evaluation.end),
+        aggressor: if evaluation.delta > 0 {
+            Aggressor::Buy
+        } else {
+            Aggressor::Sell
+        },
+        effort: Qty::from_units(units(evaluation.effort)),
+        progress: Price::from_units(units(evaluation.progress)),
+        effort_high: Qty::from_units(units(quantiles.effort_high[q])),
+        effort_median: Qty::from_units(units(quantiles.effort_median)),
+        move_high: Price::from_units(units(quantiles.move_high[q])),
+        move_median: Price::from_units(units(quantiles.move_median)),
+        coverage: evaluation.coverage,
+        active: evaluation.effort >= quantiles.effort_high[q]
+            && evaluation.progress <= quantiles.move_median,
+    }
 }
 
 /// The previous `capacity` values in arrival order, and sorted, so every
@@ -863,6 +1046,11 @@ impl Judge {
         self.effort.ready()
     }
 
+    /// Evaluations in the baseline, at most `B`.
+    fn len(&self) -> usize {
+        self.effort.arrival.len()
+    }
+
     /// Judges `evaluation` against the previous evaluations, then adds it to
     /// them. Returns the quantiles it was judged against (none while the
     /// baseline fills) and the rising edges per `q`.
@@ -893,28 +1081,45 @@ impl Judge {
 struct Exhaustion {
     /// The latest 1h evaluations and their quantiles, oldest first.
     expansions: VecDeque<(Evaluation, Quantiles)>,
+    /// Judged 1h evaluations, up to [`EXHAUSTION_SAMPLES`].
+    samples: u64,
     active: [bool; Q],
+}
+
+/// The inputs of one exhaustion evaluation, the same at every `q`.
+#[derive(Debug, Clone, Copy)]
+struct ExhaustionReading {
+    expansion: (Evaluation, Quantiles),
+    decay: (Evaluation, Quantiles),
+    extreme: Price,
+    close: Price,
+    decayed: bool,
+    at_extreme: bool,
 }
 
 impl Exhaustion {
     /// Decision 6 at the 5m evaluation `decay` ending at `t`; returns the
-    /// rising edges per `q`.
+    /// rising edges per `q` and the evaluation's inputs, if it was
+    /// evaluated.
     fn step(
         &mut self,
         expansion: Option<(Evaluation, Quantiles)>,
         decay: Option<(Evaluation, Quantiles)>,
         extreme: impl Fn(bool) -> Option<Price>,
         close: Option<Price>,
-    ) -> [bool; Q] {
+    ) -> ([bool; Q], Option<ExhaustionReading>) {
         let mut edges = [false; Q];
         if let Some(expansion) = expansion {
             self.expansions.push_back(expansion);
             if self.expansions.len() > 16 {
                 self.expansions.pop_front();
             }
+            self.samples = (self.samples + 1).min(EXHAUSTION_SAMPLES);
         }
-        let Some((decay, decay_q)) = decay else {
-            return edges;
+        // No evaluation before six samples, even with the expansion at
+        // `t − 5 min` in reach after a multi-minute close.
+        let Some((decay, decay_q)) = decay.filter(|_| self.samples == EXHAUSTION_SAMPLES) else {
+            return (edges, None);
         };
         let Some((expansion, expansion_q)) = self
             .expansions
@@ -922,13 +1127,13 @@ impl Exhaustion {
             .find(|(evaluation, _)| evaluation.end == decay.end - EXPANSION_OFFSET_MS)
             .copied()
         else {
-            return edges;
+            return (edges, None);
         };
         let up = expansion.delta > 0;
-        let (Some(extreme), Some(close)) = (extreme(up), close) else {
-            return edges;
+        let (Some(extreme_price), Some(close)) = (extreme(up), close) else {
+            return (edges, None);
         };
-        let extreme = i128::from(extreme.units());
+        let extreme = i128::from(extreme_price.units());
         let at_extreme =
             (extreme - i128::from(close.units())).abs() * 10_000 <= extreme.abs() * EXTREME_BPS;
         let decayed = decay.delta * expansion.delta.signum() <= decay_q.effort_median;
@@ -940,8 +1145,136 @@ impl Exhaustion {
             *edge = active && !self.active[q];
             self.active[q] = active;
         }
-        edges
+        let reading = ExhaustionReading {
+            expansion: (expansion, expansion_q),
+            decay: (decay, decay_q),
+            extreme: extreme_price,
+            close,
+            decayed,
+            at_extreme,
+        };
+        (edges, Some(reading))
     }
+}
+
+/// The values and facts the engine must show at its fixed `B` and `q_hi`
+/// ([`ENGINE_B`], [`ENGINE_Q`]): effort vs result, exhaustion and absorption
+/// (R0 of decisions 5–7).
+#[derive(Debug)]
+struct EngineModel {
+    effort: [FeatureValue<EffortResult>; W],
+    exhaustion: FeatureValue<ExhaustionValue>,
+    /// Judged 1h evaluations, up to [`EXHAUSTION_SAMPLES`].
+    expansions: u64,
+    absorption: [FeatureValue<Absorption>; W],
+    absorbing: [bool; W],
+    /// Evaluated absorption minutes and rising edges per window and half.
+    absorption_evaluations: [[u64; W]; 2],
+    absorption_edges: [[u64; W]; 2],
+    /// Judged minutes per window whose book window had no fills on the
+    /// passive side: not evaluated.
+    absorption_unfilled: [u64; W],
+    /// Rising edges of effort vs result per window and half, and of
+    /// exhaustion per half.
+    effort_edges: [[u64; W]; 2],
+    exhaustion_edges: [u64; 2],
+}
+
+impl EngineModel {
+    fn new() -> Self {
+        Self {
+            effort: [0; W].map(|_| FeatureValue::WarmingUp {
+                observed: 0,
+                required: BASELINES[ENGINE_B] as u64,
+            }),
+            exhaustion: FeatureValue::WarmingUp {
+                observed: 0,
+                required: EXHAUSTION_SAMPLES,
+            },
+            expansions: 0,
+            absorption: [0; W].map(|_| FeatureValue::WarmingUp {
+                observed: 0,
+                required: 1,
+            }),
+            absorbing: [false; W],
+            absorption_evaluations: [[0; W]; 2],
+            absorption_edges: [[0; W]; 2],
+            absorption_unfilled: [0; W],
+            effort_edges: [[0; W]; 2],
+            exhaustion_edges: [0; 2],
+        }
+    }
+}
+
+/// Decision 6: an exhaustion evaluation as the engine's value, at grid
+/// value `q`.
+fn exhaustion_value(reading: &ExhaustionReading, active: bool, q: usize) -> ExhaustionValue {
+    let (expansion, expansion_q) = reading.expansion;
+    let (decay, decay_q) = reading.decay;
+    let decay_aggression = decay.delta * expansion.delta.signum();
+    ExhaustionValue {
+        feature: catalog::CANDIDATE_EXHAUSTION_V1.key,
+        end: EventTime::from_millis(decay.end),
+        expansion: effort_result(EXPANSION, &expansion, &expansion_q, q),
+        decay: effort_result(DECAY, &decay, &decay_q, q),
+        decay_aggression: Qty::from_units(
+            i64::try_from(decay_aggression).expect("a fitting evaluation"),
+        ),
+        extreme: reading.extreme,
+        close: reading.close,
+        expanded: expansion.effort >= expansion_q.effort_high[q]
+            && expansion.progress >= expansion_q.move_high[q],
+        decayed: reading.decayed,
+        at_extreme: reading.at_extreme,
+        active,
+    }
+}
+
+/// Decision 7: absorption of `effort`, judged at this minute, against the
+/// book window of the same length; `None` without a window to read (not
+/// ready or of another minute, or the 5 bps band beyond the trusted
+/// window). The caller drops a reading with nothing filled.
+fn absorption_of(
+    window: usize,
+    effort: &EffortResult,
+    book: Option<&FeatureValue<LiquidityWindow>>,
+) -> Option<Absorption> {
+    let book = book?.ready()?;
+    if book.end != effort.end {
+        return None;
+    }
+    let band = book
+        .bands
+        .iter()
+        .find(|band| band.band.units() == ABSORPTION_BAND_UNITS)?;
+    if band.beyond_window {
+        return None;
+    }
+    // Net buying lifts the ask; net selling hits the bid.
+    let passive = match effort.aggressor {
+        Aggressor::Buy => BookSide::Ask,
+        Aggressor::Sell => BookSide::Bid,
+    };
+    let flow = match passive {
+        BookSide::Bid => band.bid,
+        BookSide::Ask => band.ask,
+    };
+    let replenished = flow.added.units() >= flow.filled.units();
+    let (_, definition) = catalog::CANDIDATE_ABSORPTION[window];
+    Some(Absorption {
+        feature: definition.key,
+        effort: *effort,
+        passive,
+        band: band.band,
+        added: flow.added,
+        filled: flow.filled,
+        book_coverage: Coverage {
+            partial_start: book.partial_start,
+            feed_gap: book.feed_gap,
+        },
+        replenished,
+        active: effort.active && replenished,
+    })
 }
 
 /// Where an episode happened: its regime label and location bins, `None`
@@ -989,6 +1322,8 @@ struct FlowModel {
     episodes: [[GridCounts; 2]; NB],
     exhausted: [[[u64; Q]; 2]; NB],
     evaluations: [u64; W],
+    /// The engine's values and facts at its fixed `B` and `q_hi` (R0).
+    engine: EngineModel,
 }
 
 impl FlowModel {
@@ -1009,12 +1344,20 @@ impl FlowModel {
             episodes: [[[[0; Q]; W]; 2]; NB],
             exhausted: [[[0; Q]; 2]; NB],
             evaluations: [0; W],
+            engine: EngineModel::new(),
         }
     }
 
     /// One accepted event: evaluates every window once if it closed a 1m
-    /// bar.
-    fn step(&mut self, engine: &MarketStateEngine, time: EventTime) {
+    /// bar, and appends the facts the engine must emit at its fixed `B` and
+    /// `q_hi`: effort vs result per window, exhaustion, absorption per
+    /// window (decision 2's order). Returns whether it closed a 1m bar.
+    fn step(
+        &mut self,
+        engine: &MarketStateEngine,
+        time: EventTime,
+        expected: &mut Vec<CandidateEvent>,
+    ) -> bool {
         let mut closed = false;
         for bar in engine.closed_bars() {
             if bar.timeframe != Timeframe::M1 {
@@ -1028,16 +1371,34 @@ impl FlowModel {
             }
         }
         if !closed {
-            return;
+            return false;
         }
         let state = engine.state();
-        let evaluations: [Option<Evaluation>; W] =
-            WINDOWS.map(|timeframe| state.flow.windows.get(timeframe).and_then(evaluation));
+        let readings: [Result<Option<Evaluation>, ()>; W] = WINDOWS.map(|timeframe| {
+            state
+                .flow
+                .windows
+                .get(timeframe)
+                .map_or(Ok(None), evaluation)
+        });
+        for (window, reading) in readings.iter().enumerate() {
+            if reading.is_err() {
+                // Decision 2: out of range, no sample.
+                self.engine.effort[window] = FeatureValue::Unavailable {
+                    reason: Unavailability::OutOfRange,
+                };
+            }
+        }
+        let evaluations: [Option<Evaluation>; W] = readings.map(|reading| reading.ok().flatten());
         let reference_ready: [bool; W] =
             std::array::from_fn(|window| self.judges[REFERENCE][window].ready());
         let half = half(time, self.mid);
         let hour = hour(time);
         let mut place: Option<Place> = None;
+        let context =
+            |close: Option<Price>| close.map(|close| context(close, None, &state.location));
+        let mut facts: Vec<CandidateEvent> = Vec::new();
+        let mut engine_judged: [Option<EffortResult>; W] = [None; W];
         for b in 0..NB {
             let mut judged: [Option<(Evaluation, Quantiles)>; W] = [None; W];
             for window in 0..W {
@@ -1047,8 +1408,37 @@ impl FlowModel {
                 if b == 0 {
                     self.evaluations[window] += 1;
                 }
+                let earlier = self.judges[b][window].len();
                 let (quantiles, edges) = self.judges[b][window].judge(evaluation);
                 judged[window] = quantiles.map(|quantiles| (*evaluation, quantiles));
+                if b == ENGINE_B {
+                    match &quantiles {
+                        Some(quantiles) => {
+                            let result = effort_result(window, evaluation, quantiles, ENGINE_Q);
+                            self.engine.effort[window] = FeatureValue::Ready(result);
+                            engine_judged[window] = Some(result);
+                            if edges[ENGINE_Q] {
+                                self.engine.effort_edges[half][window] += 1;
+                                if let Some(context) = context(self.last_close) {
+                                    let (_, definition) = catalog::CANDIDATE_EFFORT_RESULT[window];
+                                    facts.push(CandidateEvent::EffortVsResult(EdgeEvent {
+                                        feature: definition.key,
+                                        known_at: time,
+                                        inputs: definition.inputs,
+                                        value: result,
+                                        context,
+                                    }));
+                                }
+                            }
+                        }
+                        None => {
+                            self.engine.effort[window] = FeatureValue::WarmingUp {
+                                observed: earlier as u64,
+                                required: BASELINES[ENGINE_B] as u64,
+                            };
+                        }
+                    }
+                }
                 for q in (0..Q).filter(|q| edges[*q]) {
                     self.episodes[b][half][window][q] += 1;
                     if reference_ready[window] {
@@ -1076,12 +1466,80 @@ impl FlowModel {
                     span.map(|(_, _, low)| *low).min()
                 }
             };
-            let edges =
+            let (edges, reading) =
                 self.exhaustion[b].step(judged[EXPANSION], judged[DECAY], extreme, self.last_close);
             for q in (0..Q).filter(|q| edges[*q]) {
                 self.exhausted[b][half][q] += 1;
             }
+            if b != ENGINE_B {
+                continue;
+            }
+            // The engine's exhaustion: warming up over the judged 1h
+            // evaluations until the first evaluation.
+            if judged[EXPANSION].is_some() {
+                self.engine.expansions = (self.engine.expansions + 1).min(EXHAUSTION_SAMPLES);
+                if !self.engine.exhaustion.is_ready() {
+                    self.engine.exhaustion = FeatureValue::WarmingUp {
+                        observed: self.engine.expansions,
+                        required: EXHAUSTION_SAMPLES,
+                    };
+                }
+            }
+            if let Some(reading) = reading {
+                let value =
+                    exhaustion_value(&reading, self.exhaustion[b].active[ENGINE_Q], ENGINE_Q);
+                self.engine.exhaustion = FeatureValue::Ready(value);
+                if edges[ENGINE_Q] {
+                    self.engine.exhaustion_edges[half] += 1;
+                    if let Some(context) = context(self.last_close) {
+                        let definition = &catalog::CANDIDATE_EXHAUSTION_V1;
+                        facts.push(CandidateEvent::Exhaustion(EdgeEvent {
+                            feature: definition.key,
+                            known_at: time,
+                            inputs: definition.inputs,
+                            value,
+                            context,
+                        }));
+                    }
+                }
+            }
+            for (window, effort) in engine_judged.iter().enumerate() {
+                let Some(effort) = effort else {
+                    continue;
+                };
+                let Some(absorption) =
+                    absorption_of(window, effort, state.book.windows.get(WINDOWS[window]))
+                else {
+                    continue;
+                };
+                // No aggression into the level, no evaluation: a window over
+                // a depth outage has no fills.
+                if absorption.filled.units() == 0 {
+                    self.engine.absorption_unfilled[window] += 1;
+                    continue;
+                }
+                self.engine.absorption_evaluations[half][window] += 1;
+                self.engine.absorption[window] = FeatureValue::Ready(absorption);
+                let edge = absorption.active && !self.engine.absorbing[window];
+                self.engine.absorbing[window] = absorption.active;
+                if edge {
+                    self.engine.absorption_edges[half][window] += 1;
+                    if let Some(context) = context(self.last_close) {
+                        let (_, definition) = catalog::CANDIDATE_ABSORPTION[window];
+                        facts.push(CandidateEvent::Absorption(EdgeEvent {
+                            feature: definition.key,
+                            known_at: time,
+                            inputs: definition.inputs,
+                            value: absorption,
+                            context,
+                        }));
+                    }
+                }
+            }
         }
+        // Pushed in decision 2's order: effort vs result per window,
+        // exhaustion, absorption per window.
+        expected.extend(facts);
         if let Some(latest) = self.minutes.back().map(|(end, _, _)| *end) {
             while self
                 .minutes
@@ -1091,6 +1549,7 @@ impl FlowModel {
                 self.minutes.pop_front();
             }
         }
+        true
     }
 
     /// The regime label and the location bins at the last close.
@@ -1585,15 +2044,30 @@ impl Run {
                 model.trade(trade, &self.cvd, oi);
             }
         }
-        self.check
-            .facts(known_at, self.engine.candidate_events(), &self.expected);
+        // Effort vs result, exhaustion and absorption follow the
+        // divergences (decision 2).
+        let minute = self.flow.step(&self.engine, known_at, &mut self.expected);
+        let bins = self
+            .expected
+            .iter()
+            .any(|fact| matches!(fact, CandidateEvent::EffortVsResult(_)))
+            .then(|| self.flow.place(state).bins)
+            .flatten();
+        self.check.facts(
+            known_at,
+            self.engine.candidate_events(),
+            &self.expected,
+            bins,
+        );
         for (position, done) in closed.iter().enumerate() {
             if *done {
                 self.check
                     .value(known_at, &self.divergences[position], state);
             }
         }
-        self.flow.step(&self.engine, known_at);
+        if minute {
+            self.check.flow_values(known_at, &self.flow.engine, state);
+        }
     }
 }
 
@@ -1639,7 +2113,16 @@ fn report(run: &Run, from: i64, to: i64, wall: Duration) {
         run.rejections,
         wall.as_secs_f64()
     );
-    let check = &run.check;
+    report_r0(&run.check);
+    report_divergences(run);
+    report_r1b(&run.flow);
+    report_r1(&run.flow);
+    report_exhaustion(&run.flow);
+    report_engine_rates(&run.flow);
+}
+
+/// R0's counts and the first mismatches.
+fn report_r0(check: &Check) {
     println!(
         "R0: mismatches {}; matched facts cvd high {} low {}, oi high {} low {}, \
          across a trades gap {}, with a located context {}; ready values {}",
@@ -1652,13 +2135,41 @@ fn report(run: &Run, from: i64, to: i64, wall: Duration) {
         check.located,
         check.values
     );
+    println!(
+        "R0 (M3, B={} q={}): matched facts effort_result 5m/15m/1h {:?}, exhaustion {}, \
+         absorption 5m/15m/1h {:?}; effort_result facts per bin value_edge/structural_extreme/\
+         neither {:?}; ready values {}",
+        BASELINES[ENGINE_B],
+        q_label(ENGINE_Q),
+        check.effort,
+        check.exhaustion,
+        check.absorption,
+        check.effort_bins,
+        check.flow_values
+    );
     for note in &check.notes {
         println!("R0 mismatch: {note}");
     }
-    report_divergences(run);
-    report_r1b(&run.flow);
-    report_r1(&run.flow);
-    report_exhaustion(&run.flow);
+}
+
+/// The rates decision 9 records at the engine's fixed `B` and `q_hi`:
+/// effort-vs-result, exhaustion and absorption episodes per half, and the
+/// minutes absorption was evaluated.
+fn report_engine_rates(flow: &FlowModel) {
+    let engine = &flow.engine;
+    for half in 0..2 {
+        println!(
+            "M3 rates B={} q={} {}: effort_result 5m/15m/1h {:?}, exhaustion {}, \
+             absorption 5m/15m/1h {:?} of evaluated minutes {:?}",
+            BASELINES[ENGINE_B],
+            q_label(ENGINE_Q),
+            half_label(Some(half)),
+            engine.effort_edges[half],
+            engine.exhaustion_edges[half],
+            engine.absorption_edges[half],
+            engine.absorption_evaluations[half]
+        );
+    }
 }
 
 fn report_divergences(run: &Run) {
@@ -2036,6 +2547,71 @@ fn measure_candidates() {
 }
 
 #[test]
+#[ignore = "checks the candidates against a live capture for ADR-051; see the module docs"]
+fn measure_candidates_live() {
+    let raw_root = env("MIE_MEASURE_RAW_ROOT");
+    let journal = std::path::PathBuf::from(env("MIE_MEASURE_JOURNAL"));
+    let runs: Vec<JournaledRun> = read_runs(&journal, "binance-um").unwrap();
+    let store = ParquetRawStore::new(&raw_root);
+    let live = LiveReplay::new(
+        &store,
+        "binance-um",
+        "BTCUSDT",
+        runs.iter().map(JournaledRun::live_run).collect(),
+    );
+    let (mut mismatches, mut rejections, mut absorbed) = (0, 0, 0);
+    for journaled in &runs {
+        let id = &journaled.parameters.run_id;
+        let Ok(mut replay) = live.run_replay(id) else {
+            println!("run {id}: not replayable, skipped");
+            continue;
+        };
+        // One run, no halves: every count lands in the first.
+        let mut run = Run::new(i64::MAX);
+        let started = Instant::now();
+        while let Some(event) = replay.next_event().unwrap() {
+            run.step(&event);
+        }
+        println!(
+            "run {id}: events {}, rejections {}, wall {:.1} s",
+            run.events,
+            run.rejections,
+            started.elapsed().as_secs_f64()
+        );
+        report_r0(&run.check);
+        let engine = &run.flow.engine;
+        println!(
+            "run {id}: absorption 5m/15m/1h {:?} of evaluated minutes {:?} (unfilled, not \
+             evaluated: {:?}); effort_result 5m/15m/1h {:?}; exhaustion {}",
+            engine.absorption_edges[0],
+            engine.absorption_evaluations[0],
+            engine.absorption_unfilled,
+            engine.effort_edges[0],
+            engine.exhaustion_edges[0]
+        );
+        mismatches += run.check.mismatches;
+        rejections += run.rejections;
+        absorbed += engine.absorption_evaluations[0].iter().sum::<u64>();
+    }
+    println!(
+        "live R0: mismatches {mismatches}, rejections {rejections}, evaluated absorption \
+         minutes {absorbed}"
+    );
+    assert_eq!(rejections, 0, "the engine rejected events");
+    assert_eq!(mismatches, 0, "the model disagrees with the engine");
+    // R0 for absorption must compare something: a run reaches its first
+    // evaluation only after B + 1 minutes of effort-vs-result warm-up (a
+    // day and an hour on the 1h window), so a store of shorter runs proves
+    // nothing.
+    assert!(
+        absorbed > 0,
+        "no absorption minute was evaluated: the store needs a run of at least B + 1 = {} \
+         minutes (plus the window) for R0 to compare absorption",
+        BASELINES[ENGINE_B] + 1
+    );
+}
+
+#[test]
 #[ignore = "re-reads a logged run's R1b tables for the ADR-051 D9 diagnosis; see the module docs"]
 fn r1b_from_a_logged_run() {
     let path = env("MIE_MEASURE_LOG");
@@ -2174,6 +2750,161 @@ fn synthetic_tape() -> Vec<MarketEvent> {
     events
 }
 
+/// About 34 hours from 2026-01-01 00:00 UTC of a book 0.1 USDT wide around
+/// 62 000 USDT, twelve levels a side 3 USDT apart (the trusted window
+/// reaches beyond the 5 bps band), and up to five trades a minute that lift
+/// the best ask or hit the best bid. One book update a minute, at second
+/// 50, shows each best level's fills and a refill of 0 to 2 times them,
+/// in halves; a level below 20 BTC is topped up to 40. The depth stream
+/// is lost for the last two hours: no updates, an order-book gap, no
+/// resync. The book windows over it have no fills, so R0 compares the
+/// minutes decision 7 leaves unevaluated.
+fn book_tape() -> Vec<MarketEvent> {
+    let mut lcg = Lcg(0x6d69_6500_0022_0005);
+    let minutes = 34 * 60;
+    let outage = 32 * 60;
+    let bid = 62_000 * SCALE;
+    let ask = bid + SCALE / 10;
+    let step = 3 * SCALE;
+    let level = |price: i64, qty: i64| Level {
+        price: Price::from_units(price),
+        qty: Qty::from_units(qty),
+    };
+    let levels = |best: i64, sign: i64| -> Vec<Level> {
+        (0..12)
+            .map(|k| level(best + sign * k * step, 40 * SCALE))
+            .collect()
+    };
+    let mut last_id = 5_000;
+    let mut events = vec![MarketEvent::BookSnapshot(BookSnapshot {
+        time: EventTime::from_millis(TAPE_START),
+        last_update_id: last_id,
+        bids: levels(bid, -1),
+        asks: levels(ask, 1),
+    })];
+    let mut resting = [40 * SCALE; 2];
+    let mut trade_id = 0;
+    for minute in 0..minutes {
+        let open = TAPE_START + minute * MINUTE_MS;
+        let mut filled = [0; 2];
+        for slot in 0..1 + lcg.below(5) {
+            let buy = lcg.below(2) == 0;
+            let side = usize::from(buy);
+            let mut size = (1 + lcg.below(200)) * SCALE / 100;
+            if lcg.below(8) == 0 {
+                size *= 8;
+            }
+            let size = size.min(resting[side] - filled[side] - SCALE);
+            if size <= 0 {
+                continue;
+            }
+            filled[side] += size;
+            trade_id += 1;
+            events.push(MarketEvent::Trade(Trade {
+                time: EventTime::from_millis(open + 1_000 + slot * 9_000 + lcg.below(8_000)),
+                trade_id,
+                price: Price::from_units(if buy { ask } else { bid }),
+                qty: Qty::from_units(size),
+                aggressor: if buy { Aggressor::Buy } else { Aggressor::Sell },
+            }));
+        }
+        let mut changes = [Vec::new(), Vec::new()];
+        for (side, price) in [bid, ask].into_iter().enumerate() {
+            let refill = filled[side] * lcg.below(5) / 2;
+            let mut next = resting[side] - filled[side] + refill;
+            if next < 20 * SCALE {
+                next = 40 * SCALE;
+            }
+            if next != resting[side] {
+                changes[side].push(level(price, next));
+            }
+            resting[side] = next;
+        }
+        let (first, previous) = if minute == 0 {
+            (last_id - 5, 0)
+        } else {
+            (last_id + 1, last_id)
+        };
+        last_id += 5;
+        let [bids, asks] = changes;
+        if minute == outage {
+            events.push(MarketEvent::FeedGap(FeedGap {
+                stream: Stream::OrderBook,
+                start: EventTime::from_millis(open),
+                end: EventTime::from_millis(open + 10 * MINUTE_MS),
+                reason: GapReason::Disconnected,
+            }));
+        }
+        if minute >= outage {
+            continue;
+        }
+        events.push(MarketEvent::BookUpdate(BookUpdate {
+            time: EventTime::from_millis(open + 50_000),
+            first_update_id: first,
+            last_update_id: last_id,
+            prev_update_id: previous,
+            bids,
+            asks,
+        }));
+    }
+    events.push(MarketEvent::Trade(Trade {
+        time: EventTime::from_millis(TAPE_START + minutes * MINUTE_MS + 1_000),
+        trade_id: trade_id + 1,
+        price: Price::from_units(bid),
+        qty: Qty::from_units(SCALE),
+        aggressor: Aggressor::Sell,
+    }));
+    events.sort();
+    events
+}
+
+#[test]
+fn model_reproduces_absorption_on_a_synthetic_book_tape() {
+    let mut run = Run::new(i64::MAX);
+    for event in book_tape() {
+        run.step(&event);
+    }
+    report_r0(&run.check);
+    report_engine_rates(&run.flow);
+    assert_eq!(run.rejections, 0, "the engine rejected the tape");
+    assert_eq!(run.check.mismatches, 0, "{:#?}", run.check.notes);
+    // Every window's absorption was compared, so R0 did not pass vacuously.
+    let engine = &run.flow.engine;
+    for window in 0..W {
+        assert!(run.check.absorption[window] > 0, "absorption {window}");
+        assert!(
+            engine.absorption_evaluations[0][window] > 0,
+            "evaluated {window}"
+        );
+        // The depth outage left judged minutes without fills.
+        assert!(engine.absorption_unfilled[window] > 0, "unfilled {window}");
+    }
+}
+
+#[test]
+fn the_engine_parameters_are_the_fixed_ones() {
+    // ADR-051 D9 item 11: B = 1 440 and q_hi = 0.800, which R0 compares at.
+    use mie_domain::feature::ParamValue;
+    use mie_domain::num::Rate;
+    assert_eq!(BASELINES[ENGINE_B], 1_440);
+    assert_eq!(GRID[ENGINE_Q], 800);
+    for (_, definition) in catalog::CANDIDATE_EFFORT_RESULT {
+        let param = |name: &str| {
+            definition
+                .params
+                .iter()
+                .find(|param| param.name == name)
+                .map(|param| param.value)
+        };
+        assert_eq!(param("baseline_evaluations"), Some(ParamValue::Int(1_440)));
+        assert_eq!(
+            param("effort_quantile"),
+            Some(ParamValue::Rate(Rate::from_units(80_000_000)))
+        );
+    }
+    assert_eq!(catalog::ABSORPTION_BAND.units(), ABSORPTION_BAND_UNITS);
+}
+
 #[test]
 fn model_reproduces_the_engine_on_a_synthetic_tape() {
     let mid = TAPE_START + TAPE_DAYS * DAY_MS / 2;
@@ -2234,6 +2965,14 @@ fn model_reproduces_the_engine_on_a_synthetic_tape() {
         (
             "exhaustion episodes",
             flow.exhausted.iter().flatten().flatten().sum(),
+        ),
+        ("engine effort_result 5m facts", check.effort[0]),
+        ("engine effort_result 15m facts", check.effort[1]),
+        ("engine effort_result 1h facts", check.effort[2]),
+        ("engine exhaustion facts", check.exhaustion),
+        (
+            "ready effort_result and exhaustion values",
+            check.flow_values,
         ),
     ];
     for (kind, count) in kinds {

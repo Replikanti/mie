@@ -1986,6 +1986,27 @@ mod tests {
     }
 
     #[test]
+    fn inferred_fills_leave_added_minus_filled_unchanged() {
+        // Absorption reads `added ≥ filled` (ADR-051 D7): a fill the book
+        // showed and the same fill inferred from a level replenished within
+        // one batch give the same difference.
+        let mut shown = Harness::standard();
+        shown.apply(&sell(T0 + 50, 1, BID, BTC));
+        shown.update(T0 + 100, &[(BID, 4 * BTC)], &[]);
+        shown.update(T0 + 200, &[(BID, 6 * BTC)], &[]);
+        let mut inferred = Harness::standard();
+        inferred.apply(&sell(T0 + 50, 1, BID, BTC));
+        inferred.update(T0 + 100, &[(BID, 6 * BTC)], &[]);
+        inferred.update(T0 + 200, &[], &[]);
+        let shown = shown.flow(T0, 0, Side::Bid);
+        let inferred = inferred.flow(T0, 0, Side::Bid);
+        assert_eq!(shown, flow(2 * BTC, 0, BTC, 0));
+        assert_eq!(inferred, flow(2 * BTC, 0, BTC, BTC));
+        let difference = |flow: SideFlow| flow.added.units() - flow.filled.units();
+        assert_eq!(difference(shown), difference(inferred));
+    }
+
+    #[test]
     fn fresh_fills_are_matched_after_carried_ones() {
         let mut h = Harness::standard();
         h.apply(&sell(T0 + 50, 1, BID, BTC));
