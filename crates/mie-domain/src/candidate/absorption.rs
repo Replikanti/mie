@@ -5,16 +5,19 @@
 //! liquidity window of the same length and the same minute is read on the
 //! passive side opposite the aggressor (net buying lifts the ask, net
 //! selling hits the bid), inside the [`BAND`]: the condition is the
-//! effort-vs-result condition and `added ≥ filled`, at least as much
-//! resting size came back as aggression took. ADR-043 D5 books an inferred
-//! fill into both `added` and `filled`, so `added − filled` does not depend
-//! on how much of the flow was inferred.
+//! effort-vs-result condition, `filled > 0` and `added ≥ filled`, at least
+//! as much resting size came back as aggression took. ADR-043 D5 books an
+//! inferred fill into both `added` and `filled`, so `added − filled` does
+//! not depend on how much of the flow was inferred.
 //!
 //! No evaluation when the book window is warming up or unavailable, ends at
 //! another minute, or its band saw an edge beyond the trusted window
-//! (`beyond_window`): part of the flow was not observed. Such a minute
-//! leaves the value as it was. Archive replays have no book, so absorption
-//! stays warming up there.
+//! (`beyond_window`): part of the flow was not observed. None either when
+//! nothing was filled on the passive side in the band: absorption needs
+//! aggression into the level, and a window over a depth outage, where
+//! trades on an unready book are booked as no fills, reads `added =
+//! filled = 0`. Such a minute leaves the value as it was. Archive replays
+//! have no book, so absorption stays warming up there.
 
 use super::effort::EffortResult;
 use crate::bars::Coverage;
@@ -61,7 +64,7 @@ pub struct Absorption {
     /// The book window's coverage: `partial_start` and `feed_gap` as
     /// `book.liquidity.window.<tf>@1` flags them.
     pub book_coverage: Coverage,
-    /// `added ≥ filled`.
+    /// `added ≥ filled` (evaluated only with `filled > 0`).
     pub replenished: bool,
     /// The effort-vs-result condition and `replenished`.
     pub active: bool,
@@ -155,6 +158,11 @@ impl AbsorptionJudge {
             Aggressor::Sell => Side::Bid,
         };
         let flow = band.side(passive);
+        // No aggression observed in the band (a depth outage books no
+        // fills): `added ≥ filled` would hold for nothing.
+        if flow.filled.units() == 0 {
+            return None;
+        }
         let replenished = flow.added >= flow.filled;
         let active = effort.active && replenished;
         let edge = active && !self.active;
@@ -287,6 +295,31 @@ mod tests {
     fn a_band_beyond_the_window_is_not_evaluated() {
         let window = book(END, flow(0, 0, 0), flow(500, 500, 0), true);
         assert_eq!(step(&effort(20), &window), None);
+    }
+
+    #[test]
+    fn a_band_without_fills_on_the_passive_side_is_not_evaluated() {
+        // A depth outage: no flow at all, `0 ≥ 0` would count as
+        // replenished. Size added but none taken is no absorption either.
+        for ask in [flow(0, 0, 0), flow(500, 0, 0)] {
+            let window = book(END, flow(900, 900, 0), ask, false);
+            assert_eq!(step(&effort(20), &window), None);
+        }
+        // One unit filled is aggression into the level.
+        let window = book(END, flow(0, 0, 0), flow(1, 1, 0), false);
+        let (absorption, edge) = step(&effort(20), &window).unwrap();
+        assert!(absorption.active && edge);
+        // A minute without fills leaves the value and the edge state as they
+        // were.
+        let mut judge = AbsorptionJudge::new(0);
+        let mut value = AbsorptionJudge::initial();
+        let effort = effort(20);
+        assert!(judge.step(Some(&effort), &window, &mut value).unwrap().1);
+        let before = value;
+        let empty = book(END, flow(0, 0, 0), flow(0, 0, 0), false);
+        assert_eq!(judge.step(Some(&effort), &empty, &mut value), None);
+        assert_eq!(value, before);
+        assert!(!judge.step(Some(&effort), &window, &mut value).unwrap().1);
     }
 
     #[test]

@@ -1943,9 +1943,10 @@ pub const EXHAUSTION_EXTREME_TOLERANCE: Rate = Rate::from_units(60_000);
 ///   and `bars.time.1m@1`, so recalibrating effort vs result re-versions
 ///   exhaustion through its inputs.
 /// - Warm-up: 6 samples, where a sample is a judged 1h evaluation: the first
-///   with an expansion to read is the sixth. The value stays warming up
-///   until the first evaluation, at 6 of 6 when the minute that completes
-///   the count has none.
+///   with an expansion to read is the sixth. No evaluation before the
+///   sixth, even when a multi-minute close puts the expansion in reach
+///   earlier. The value stays warming up until the first evaluation, at
+///   6 of 6 when the minute that completes the count has none.
 /// - Gap policy: nothing resets on a gap; a minute without an evaluation
 ///   leaves the value as it was. The expansion is looked up by its end, so
 ///   a gap that skips `t − 5 min` gives no evaluation at `t`.
@@ -2005,9 +2006,9 @@ const fn candidate_absorption_v1(id: &'static str, inputs: &'static [Input]) -> 
 /// judged evaluation of `candidate.effort_result.5m@1`, the book window
 /// ending at the same minute is read on the passive side opposite the
 /// aggressor (net buying means the ask, net selling the bid) inside the
-/// 5 bps band: the condition is the effort-vs-result condition and
-/// `added ≥ filled`, at least as much resting size came back as aggression
-/// took. Inferred fills count in both `added` and `filled` (ADR-043 D5), so
+/// 5 bps band: the condition is the effort-vs-result condition, `filled >
+/// 0` and `added ≥ filled`, at least as much resting size came back as
+/// aggression took. Inferred fills count in both `added` and `filled` (ADR-043 D5), so
 /// `added − filled` does not depend on them. The "level" is where the fills
 /// rest and refill; registry-level gating is a trigger rule's. The value is
 /// the last evaluation; a candidate event is emitted when the condition
@@ -2020,8 +2021,9 @@ const fn candidate_absorption_v1(id: &'static str, inputs: &'static [Input]) -> 
 /// - Warm-up: one sample, where a sample is an evaluated minute: both inputs
 ///   ready at the same minute and the band fully observed.
 /// - Gap policy: no evaluation while the book window is warming up or
-///   unavailable, or when the band's `beyond_window` is set; such a minute
-///   leaves the value as it was. Archive replays have no book, so the value
+///   unavailable, when the band's `beyond_window` is set, or when nothing
+///   was filled on the passive side in the band (a depth outage books no
+///   fills); such a minute leaves the value as it was. Archive replays have no book, so the value
 ///   stays warming up there.
 pub const CANDIDATE_ABSORPTION_5M_V1: FeatureDefinition = candidate_absorption_v1(
     "candidate.absorption.5m",

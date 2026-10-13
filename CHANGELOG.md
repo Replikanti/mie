@@ -56,7 +56,8 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   whose 5m aggression decayed to at most its median while the last close
   stays within 6 bps of the extreme; `candidate.absorption.<5m|15m|1h>@1`
   (live only) is effort vs result with the passive side opposite the
-  aggressor replenished (`added ≥ filled` within 5 bps). Each emits on the
+  aggressor replenished (fills and `added ≥ filled` within 5 bps; a depth
+  outage, which books no fills, is not evaluated). Each emits on the
   rising edge, with a location context at the last close, through
   `MarketStateEngine::candidate_events`; values are part of
   `MarketState.candidates`. Every state hash and the feature-set version

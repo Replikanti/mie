@@ -87,7 +87,8 @@
 //! --release -p mie-cli --test candidate_measure -- --ignored --nocapture
 //! measure_candidates_live`. A run shorter than the 1 440 evaluations effort
 //! vs result warms up over evaluates no absorption; the per-run report shows
-//! the evaluated minutes.
+//! the evaluated minutes, and the test fails when no run evaluated any, so
+//! it never passes on a store too short to prove anything.
 //!
 //! `r1b_from_a_logged_run` (also `--ignored`) re-reads the R1b hour lines of
 //! a saved `measure_candidates` output, in M2's format or this one's, from
@@ -1080,6 +1081,8 @@ impl Judge {
 struct Exhaustion {
     /// The latest 1h evaluations and their quantiles, oldest first.
     expansions: VecDeque<(Evaluation, Quantiles)>,
+    /// Judged 1h evaluations, up to [`EXHAUSTION_SAMPLES`].
+    samples: u64,
     active: [bool; Q],
 }
 
@@ -1111,8 +1114,11 @@ impl Exhaustion {
             if self.expansions.len() > 16 {
                 self.expansions.pop_front();
             }
+            self.samples = (self.samples + 1).min(EXHAUSTION_SAMPLES);
         }
-        let Some((decay, decay_q)) = decay else {
+        // No evaluation before six samples, even with the expansion at
+        // `t − 5 min` in reach after a multi-minute close.
+        let Some((decay, decay_q)) = decay.filter(|_| self.samples == EXHAUSTION_SAMPLES) else {
             return (edges, None);
         };
         let Some((expansion, expansion_q)) = self
@@ -1165,6 +1171,9 @@ struct EngineModel {
     /// Evaluated absorption minutes and rising edges per window and half.
     absorption_evaluations: [[u64; W]; 2],
     absorption_edges: [[u64; W]; 2],
+    /// Judged minutes per window whose book window had no fills on the
+    /// passive side: not evaluated.
+    absorption_unfilled: [u64; W],
     /// Rising edges of effort vs result per window and half, and of
     /// exhaustion per half.
     effort_edges: [[u64; W]; 2],
@@ -1190,6 +1199,7 @@ impl EngineModel {
             absorbing: [false; W],
             absorption_evaluations: [[0; W]; 2],
             absorption_edges: [[0; W]; 2],
+            absorption_unfilled: [0; W],
             effort_edges: [[0; W]; 2],
             exhaustion_edges: [0; 2],
         }
@@ -1221,9 +1231,9 @@ fn exhaustion_value(reading: &ExhaustionReading, active: bool, q: usize) -> Exha
 }
 
 /// Decision 7: absorption of `effort`, judged at this minute, against the
-/// book window of the same length; `None` without an evaluation (the book
-/// window not ready or of another minute, or the 5 bps band beyond the
-/// trusted window).
+/// book window of the same length; `None` without a window to read (not
+/// ready or of another minute, or the 5 bps band beyond the trusted
+/// window). The caller drops a reading with nothing filled.
 fn absorption_of(
     window: usize,
     effort: &EffortResult,
@@ -1502,6 +1512,12 @@ impl FlowModel {
                 else {
                     continue;
                 };
+                // No aggression into the level, no evaluation: a window over
+                // a depth outage has no fills.
+                if absorption.filled.units() == 0 {
+                    self.engine.absorption_unfilled[window] += 1;
+                    continue;
+                }
                 self.engine.absorption_evaluations[half][window] += 1;
                 self.engine.absorption[window] = FeatureValue::Ready(absorption);
                 let edge = absorption.active && !self.engine.absorbing[window];
@@ -2565,10 +2581,11 @@ fn measure_candidates_live() {
         report_r0(&run.check);
         let engine = &run.flow.engine;
         println!(
-            "run {id}: absorption 5m/15m/1h {:?} of evaluated minutes {:?}; effort_result \
-             5m/15m/1h {:?}; exhaustion {}",
+            "run {id}: absorption 5m/15m/1h {:?} of evaluated minutes {:?} (unfilled, not \
+             evaluated: {:?}); effort_result 5m/15m/1h {:?}; exhaustion {}",
             engine.absorption_edges[0],
             engine.absorption_evaluations[0],
+            engine.absorption_unfilled,
             engine.effort_edges[0],
             engine.exhaustion_edges[0]
         );
@@ -2582,6 +2599,16 @@ fn measure_candidates_live() {
     );
     assert_eq!(rejections, 0, "the engine rejected events");
     assert_eq!(mismatches, 0, "the model disagrees with the engine");
+    // R0 for absorption must compare something: a run reaches its first
+    // evaluation only after B + 1 minutes of effort-vs-result warm-up (a
+    // day and an hour on the 1h window), so a store of shorter runs proves
+    // nothing.
+    assert!(
+        absorbed > 0,
+        "no absorption minute was evaluated: the store needs a run of at least B + 1 = {} \
+         minutes (plus the window) for R0 to compare absorption",
+        BASELINES[ENGINE_B] + 1
+    );
 }
 
 #[test]
@@ -2723,15 +2750,19 @@ fn synthetic_tape() -> Vec<MarketEvent> {
     events
 }
 
-/// About 32 hours from 2026-01-01 00:00 UTC of a book 0.1 USDT wide around
+/// About 34 hours from 2026-01-01 00:00 UTC of a book 0.1 USDT wide around
 /// 62 000 USDT, twelve levels a side 3 USDT apart (the trusted window
 /// reaches beyond the 5 bps band), and up to five trades a minute that lift
 /// the best ask or hit the best bid. One book update a minute, at second
 /// 50, shows each best level's fills and a refill of 0 to 2 times them,
-/// in halves; a level below 20 BTC is topped up to 40.
+/// in halves; a level below 20 BTC is topped up to 40. The depth stream
+/// is lost for the last two hours: no updates, an order-book gap, no
+/// resync. The book windows over it have no fills, so R0 compares the
+/// minutes decision 7 leaves unevaluated.
 fn book_tape() -> Vec<MarketEvent> {
     let mut lcg = Lcg(0x6d69_6500_0022_0005);
-    let minutes = 32 * 60;
+    let minutes = 34 * 60;
+    let outage = 32 * 60;
     let bid = 62_000 * SCALE;
     let ask = bid + SCALE / 10;
     let step = 3 * SCALE;
@@ -2796,6 +2827,17 @@ fn book_tape() -> Vec<MarketEvent> {
         };
         last_id += 5;
         let [bids, asks] = changes;
+        if minute == outage {
+            events.push(MarketEvent::FeedGap(FeedGap {
+                stream: Stream::OrderBook,
+                start: EventTime::from_millis(open),
+                end: EventTime::from_millis(open + 10 * MINUTE_MS),
+                reason: GapReason::Disconnected,
+            }));
+        }
+        if minute >= outage {
+            continue;
+        }
         events.push(MarketEvent::BookUpdate(BookUpdate {
             time: EventTime::from_millis(open + 50_000),
             first_update_id: first,
@@ -2834,6 +2876,8 @@ fn model_reproduces_absorption_on_a_synthetic_book_tape() {
             engine.absorption_evaluations[0][window] > 0,
             "evaluated {window}"
         );
+        // The depth outage left judged minutes without fills.
+        assert!(engine.absorption_unfilled[window] > 0, "unfilled {window}");
     }
 }
 

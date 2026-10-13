@@ -22,3 +22,15 @@ mie-adapter-fs = { path = "crates/mie-adapter-fs" }
 [workspace.lints.rust]
 unsafe_code = "forbid"
 missing_docs = "warn"
+
+# Debug test builds optimize the domain crate only. The engine replays
+# multi-day tapes in many tests (the 45-day candidate golden tape, the
+# structure and liquidity goldens), and since #22 M3 every replayed minute
+# judges three windows against 1 440-value baselines. Measured on four
+# cores, `cargo test --workspace`: opt-level 0 builds the workspace crates in
+# 43 s and runs the tests in 687 s; 2 builds in 79 s and runs in 56 s; 1
+# (100 s, 60 s) and 3 (106 s, 56 s) are no better. The test profile inherits
+# this; overflow checks and debug assertions stay on, so the tests check the
+# same arithmetic.
+[profile.dev.package.mie-domain]
+opt-level = 2

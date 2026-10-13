@@ -562,7 +562,13 @@ Emission is on the rising edge. Warm-up is `Samples(6)` 1h evaluations:
 the expansion is read at `t − 5 min` and evaluations come one per minute,
 so the first `t` with an expansion to read is the sixth 1h evaluation (the
 one at `t − 5 min` and the five after it). A sample is a judged 1h
-evaluation; the value stays warming up until the first exhaustion
+evaluation, and there is no evaluation before the sixth. The count is
+checked, not only implied by the offset: one event that closes several
+minutes (a trades gap, a quiet tape) gives one evaluation for all of them,
+so after the first judged 1h evaluation at `E` a single close of `E+1 …
+E+5` brings the expansion at `t − 5 min` in reach at the second sample.
+Evaluating there would make the value ready on 2 of the 6 samples the
+definition declares. The value stays warming up until the first exhaustion
 evaluation, at 6 of 6 when the minute that completes the count has none.
 The value is the last evaluation: the 1h and 5m evaluations it read, the
 decay's aggression in the expansion's direction, the extreme and the
@@ -578,7 +584,8 @@ run on the same clock (ADR-043 D6).
 
 - **Condition.** The effort-vs-result condition holds for the window, and
   on the passive side opposite the aggressor (Buy aggression means Ask,
-  Sell means Bid), inside the 5 bps band, `added ≥ filled`. The "level" of
+  Sell means Bid), inside the 5 bps band, `filled > 0` and `added ≥
+  filled`. The "level" of
   "aggression into a level" is the price where the fills rest and refill,
   an order-flow fact; registry-level gating is #24's.
 - **Why `added ≥ filled`.** "Replenished" means at least as much resting
@@ -586,14 +593,30 @@ run on the same clock (ADR-043 D6).
   number. ADR-043 D5 books inferred fills into both `added` and `filled`,
   so `added − filled` does not depend on the inferred share; a test pins
   this.
+- **Why `filled > 0`.** Absorption is aggression absorbed at a level; with
+  nothing filled there is no aggression to absorb, and `0 ≥ 0` would call
+  the side replenished. That is what a depth outage produces: after an
+  order-book gap `book.l2` is unavailable until a resync, trades on an
+  unready book are booked as no fills, and `book.liquidity.window.<tf>@1`
+  stays ready, flagged `feed_gap`, over empty minutes. Without the rule
+  every judged minute of the outage would read `added = filled = 0` and
+  fire. A window whose observed minutes do have fills is evaluated and
+  carries `feed_gap` in its book coverage.
+- **Why not skip every window flagged `feed_gap`.** The #10 soak (ADR-038)
+  had 4 depth desyncs after the initial syncs in 13 h 41 min, each resynced
+  within 1.2 s. Each one flags the 60 minutes of 1h windows that contain
+  it: about 4 × 60 of 821 minutes, close to 30 % of the 1h evaluations,
+  dropped for seconds of missing depth. A window with fills but a short gap is observed well
+  enough; the rule drops only windows where no aggression was observed.
 - **Why 5 bps.** ADR-043 D8 puts its cluster candidates, the passive
   walls, inside 5 bps of mid by construction, and its *Accept when* holds
   that band to ≥ 90 % availability. The 1 bps band holds only 42–68 levels
   per side (ADR-043 M3), so it misses refills just behind the touch.
 - **No evaluation** when the band's `beyond_window` is set (part of the
   flow was not observed), when the book window is warming up or
-  unavailable, or when it ends at another minute than the judged
-  effort-vs-result evaluation, and none in a minute without one. Such a
+  unavailable, when it ends at another minute than the judged
+  effort-vs-result evaluation, or when nothing was filled on the passive
+  side in the band, and none in a minute without one. Such a
   minute leaves the value as it was. Archive replays therefore keep it
   warming up.
 - Emission is on the rising edge. Warm-up is `Samples(1)`: a minute with
@@ -631,6 +654,8 @@ run on the same clock (ADR-043 D6).
 | 6 bps at the extreme | One ordinary minute's move (ADR-044 M1 first-half p75 5.93 bps) | measurement + own reason |
 | 5 bps absorption band | ADR-043 D8's cluster band, ≥ 90 % available; 1 bps holds only 42–68 levels | inherited band, own reason |
 | Replenishment `added ≥ filled` | "At least as much came back"; any other ratio is tuned | derivation |
+| Absorption needs `filled > 0` | No aggression, nothing absorbed; a depth outage reads `added = filled = 0`. Skipping every `feed_gap` window instead drops close to 30 % of 1h evaluations (4 depth desyncs × 60 of 821 minutes, ADR-038) | derivation |
+| Exhaustion evaluates at 6 of 6 samples, checked | A multi-minute close reaches the expansion at the second sample; less than 6 is a value on an undeclared warm-up | derivation |
 | Halves split 2025-04-01 12:00 UTC | The measurement year's midpoint: two equal halves of the 365-day window | derivation |
 | Measurement year 2024-10-01 … 2025-09-30 | The most recent year no run, fixture or constant had read (attested on #124), with the development year's 365 days, so the per-half counts the evaluability rule and R1's floor of 97 depend on are at the scale those rules were written for | derivation, with an attestation |
 | 730 expected files | 365 days × 2 streams (`aggTrades`, `metrics`) | derivation |
@@ -897,6 +922,9 @@ run on the same clock (ADR-043 D6).
   is warming up for the first 1 440 evaluations of a window, a day of
   minutes; exhaustion for six judged 1h evaluations after that; absorption
   needs a live run longer than that day before its first evaluation.
+- Absorption is silent where no aggression into the band was observed: a
+  depth outage leaves the value as it was, and a window partly over one is
+  judged on its observed minutes, flagged `feed_gap` (D7).
 - The R1 floor binds at the bottom of the grid: #28 has no head-room to
   split the regime × location cells further at ±10 pp, and
   `structural_extreme` is unpowered on every window (D9 item 11).
@@ -977,7 +1005,13 @@ run on the same clock (ADR-043 D6).
     effort-vs-result episode (done for the divergences in M2), and over
     the hold-out year (2024-10-01 … 2025-09-30, D9);
   - absorption over every live raw store with depth available at run time
-    (the #10 soak, the #13 runs).
+    (the #10 soak, the #13 runs), with at least one evaluated absorption
+    minute: a run reaches its first evaluation only after the 1 440
+    earlier evaluations effort vs result warms up over (`B`, D9) plus the
+    window, 25 h on the 1h window. The #10 store (13 h 41 min in two runs,
+    ADR-038) is too short and evaluates none, so this item needs a live
+    store with a run of at least 25 h; `measure_candidates_live` fails
+    when no minute is evaluated.
 - **R1b.** The `B` rule passes on both halves of the hold-out year.
 - **R1.** The `q_hi` rule passes on both halves of the hold-out year, at
   R1b's `B`.
@@ -999,5 +1033,6 @@ run on the same clock (ADR-043 D6).
 - No clause lets a mismatch be explained away.
 
 Every criterion is reachable once the hold-out import completes, and
-otherwise settled by the D9 stop rules; the live stores exist from the #10
-soak on.
+otherwise settled by the D9 stop rules, except the absorption part of R0:
+no live store holds a run of 25 h yet (the #10 soak's longest run is
+shorter), so it waits for one.

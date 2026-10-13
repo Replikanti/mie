@@ -472,7 +472,8 @@ impl ExhaustionTracker {
     /// Exhaustion at the minute closed last (ADR-051 D6): `expansion` is the
     /// 1h evaluation judged at this minute, `decay` the 5m one, `close` the
     /// last close. Updates `value` and returns the evaluation and whether
-    /// its condition just turned true; `None` without an evaluation.
+    /// its condition just turned true; `None` without an evaluation, and
+    /// before [`EXHAUSTION_SAMPLES`] judged 1h evaluations.
     pub(crate) fn step(
         &mut self,
         expansion: Option<&EffortResult>,
@@ -493,7 +494,13 @@ impl ExhaustionTracker {
                 };
             }
         }
-        let evaluated = self.evaluate(decay, close);
+        // Warm-up is all six samples, even when one event closes several
+        // minutes and the expansion at `t − 5 min` is in the ring earlier.
+        let evaluated = if self.samples == EXHAUSTION_SAMPLES {
+            self.evaluate(decay, close)
+        } else {
+            None
+        };
         if let Some(latest) = self.minutes.back().map(|(end, _, _)| end.as_millis()) {
             while self.minutes.front().is_some_and(|(end, _, _)| {
                 i128::from(end.as_millis()) <= i128::from(latest) - i128::from(EXTREME_SPAN_MS)
@@ -942,6 +949,8 @@ pub(crate) mod tests {
                 );
             }
         }
+        // Warmed up: the near-miss tests read one expansion, not six.
+        tracker.samples = EXHAUSTION_SAMPLES;
         tracker
     }
 
@@ -1023,6 +1032,41 @@ pub(crate) mod tests {
         let early = result(Timeframe::H1, T - M5 - 60_000, 100, 50, [100, 60, 50, 20]);
         let mut tracker = exhaustion_at(early);
         assert_eq!(evaluate(&mut tracker, decay(30), EXTREME), None);
+    }
+
+    #[test]
+    fn exhaustion_waits_for_six_samples_when_one_event_closes_five_minutes() {
+        let mut tracker = ExhaustionTracker::new();
+        let mut value = ExhaustionTracker::initial();
+        for minute in 1..=6 {
+            tracker.minute(
+                t(minute * 60_000),
+                Price::from_units(EXTREME),
+                Price::from_units(EXTREME),
+            );
+        }
+        // The first judged 1h evaluation, at minute 1.
+        let first = result(Timeframe::H1, 60_000, 100, 50, [100, 60, 50, 20]);
+        assert_eq!(tracker.step(Some(&first), None, None, &mut value), None);
+        // One event closes minutes 2..6 (a gap): one evaluation, at minute 6.
+        // The expansion at `t − 5 min` is in the ring, but 2 of 6 samples
+        // are no warm-up.
+        let second = result(Timeframe::H1, 6 * 60_000, 100, 50, [100, 60, 50, 20]);
+        let decay = result(Timeframe::M5, 6 * 60_000, 30, 0, [80, 30, 10, 5]);
+        let evaluated = tracker.step(
+            Some(&second),
+            Some(&decay),
+            Some(Price::from_units(EXTREME)),
+            &mut value,
+        );
+        assert_eq!(evaluated, None);
+        assert_eq!(
+            value,
+            FeatureValue::WarmingUp {
+                observed: 2,
+                required: 6
+            }
+        );
     }
 
     #[test]

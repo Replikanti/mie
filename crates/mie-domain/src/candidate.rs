@@ -1051,6 +1051,77 @@ mod tests {
     }
 
     #[test]
+    fn a_depth_outage_is_no_absorption() {
+        // The book tape loses its depth stream 25 hours in, after every
+        // window has warmed up, and the book stays unavailable; trades go
+        // on. The liquidity windows stay ready over minutes without book
+        // updates (flagged `feed_gap` once the gap is known), and no fill
+        // is booked there: windows over the outage read `added = filled =
+        // 0`, which `added ≥ filled` alone counts as replenished. ADR-051
+        // D7: no evaluation without fills.
+        let outage = DAY + 25 * 3_600_000;
+        let mut events: Vec<MarketEvent> = book_tape()
+            .into_iter()
+            .filter(|event| {
+                !matches!(event, MarketEvent::BookUpdate(update) if update.time.as_millis() >= outage)
+            })
+            .collect();
+        events.push(crate::event::samples::gap(
+            Stream::OrderBook,
+            outage,
+            outage + 20 * 60_000,
+            GapReason::Disconnected,
+        ));
+        events.sort();
+        let mut engine = MarketStateEngine::new();
+        let (mut unfilled, mut evaluated) = (0, 0);
+        for event in events {
+            let before = engine.state().candidates.clone();
+            engine.apply(&event).unwrap();
+            let state = engine.state();
+            for ((timeframe, old_effort, old_absorption), (_, new_effort, new_absorption)) in
+                before.iter_windows().zip(state.candidates.iter_windows())
+            {
+                if let FeatureValue::Ready(absorption) = new_absorption
+                    && new_absorption != old_absorption
+                {
+                    assert!(absorption.filled.units() > 0, "{absorption}");
+                    evaluated += 1;
+                }
+                // A judged minute whose book window of the same minute has
+                // no fills on the passive side: the value stays.
+                let FeatureValue::Ready(effort) = new_effort else {
+                    continue;
+                };
+                let Some(FeatureValue::Ready(window)) = state.book.windows.get(timeframe) else {
+                    continue;
+                };
+                let passive = match effort.aggressor {
+                    Aggressor::Buy => crate::book::Side::Ask,
+                    Aggressor::Sell => crate::book::Side::Bid,
+                };
+                let band = window.band(absorption::BAND).unwrap();
+                if new_effort != old_effort
+                    && window.end == effort.end
+                    && !band.beyond_window
+                    && band.side(passive).filled.units() == 0
+                {
+                    assert_eq!(new_absorption, old_absorption);
+                    unfilled += 1;
+                }
+            }
+            for fact in engine.candidate_events() {
+                if let CandidateEvent::Absorption(fact) = fact {
+                    assert!(fact.value.filled.units() > 0, "{fact}");
+                }
+            }
+        }
+        // The outage produced judged minutes without fills, and absorption
+        // was still evaluated where fills were observed.
+        assert!(unfilled > 0 && evaluated > 0, "{unfilled} {evaluated}");
+    }
+
+    #[test]
     fn a_tape_without_a_book_keeps_absorption_warming_up() {
         let mut engine = MarketStateEngine::new();
         for event in crate::bars::tests::random_tape(0x6d69_6500_0022_0004, 20_000) {
