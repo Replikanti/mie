@@ -246,11 +246,11 @@ mod tests {
         // change), and otherwise only with an encoding bump (module docs).
         assert_eq!(
             MarketStateEngine::new().state().state_hash().to_string(),
-            "e2aca87e4aac6b23"
+            "cb45d06de49e3e6d"
         );
         assert_eq!(
             engine_after(&tape()).state().state_hash().to_string(),
-            "6cf59149d5522d75"
+            "4df7c63b5cecaeb7"
         );
     }
 
@@ -389,7 +389,7 @@ mod tests {
             .copied()
             .filter(|key| !is_candidate(*key))
             .collect();
-        assert_eq!(keys.len() + 8, catalog::CURRENT.len());
+        assert_eq!(keys.len() + 15, catalog::CURRENT.len());
         let pre_22 = FeatureSet::new(&catalog::registry(), &keys).unwrap();
         assert_eq!(pre_22.version().to_string(), "685b83d7bf13b54c");
         // The engine reaches the pre-#22 state on every other field: under
@@ -666,6 +666,7 @@ mod tests {
                 }),
             ));
         }
+        edits.extend(flow_candidate_edits());
         let mut seen = vec![("base", reference)];
         for (name, edit) in &edits {
             let mut state = base.clone();
@@ -850,6 +851,343 @@ mod tests {
                 None,
             ),
         ]);
+        edits
+    }
+
+    /// One effort-vs-result, exhaustion or absorption value per edit
+    /// (ADR-051 D5–D7), each differing from the others in one respect only:
+    /// the family, the window, readiness, or one field of the value.
+    fn flow_candidate_edits() -> Vec<(&'static str, Edit<'static>)> {
+        use crate::bars::{Coverage, Timeframe};
+        use crate::candidate::absorption::Absorption;
+        use crate::candidate::effort::{EffortResult, Exhaustion};
+        use crate::event::Aggressor;
+        use crate::num::Rate;
+        let result = EffortResult {
+            feature: catalog::CANDIDATE_EFFORT_RESULT_5M_V1.key,
+            timeframe: Timeframe::M5,
+            end: EventTime::from_millis(300_000),
+            aggressor: Aggressor::Buy,
+            effort: Qty::from_units(10),
+            progress: Price::from_units(1),
+            effort_high: Qty::from_units(8),
+            effort_median: Qty::from_units(4),
+            move_high: Price::from_units(6),
+            move_median: Price::from_units(2),
+            coverage: Coverage::default(),
+            active: true,
+        };
+        let efforts = [
+            ("candidates effort ready", result),
+            (
+                "candidates effort end",
+                EffortResult {
+                    end: EventTime::from_millis(360_000),
+                    ..result
+                },
+            ),
+            (
+                "candidates effort aggressor",
+                EffortResult {
+                    aggressor: Aggressor::Sell,
+                    ..result
+                },
+            ),
+            (
+                "candidates effort effort",
+                EffortResult {
+                    effort: Qty::from_units(11),
+                    ..result
+                },
+            ),
+            (
+                "candidates effort progress",
+                EffortResult {
+                    progress: Price::from_units(0),
+                    ..result
+                },
+            ),
+            (
+                "candidates effort high",
+                EffortResult {
+                    effort_high: Qty::from_units(9),
+                    ..result
+                },
+            ),
+            (
+                "candidates effort median",
+                EffortResult {
+                    effort_median: Qty::from_units(5),
+                    ..result
+                },
+            ),
+            (
+                "candidates move high",
+                EffortResult {
+                    move_high: Price::from_units(7),
+                    ..result
+                },
+            ),
+            (
+                "candidates move median",
+                EffortResult {
+                    move_median: Price::from_units(3),
+                    ..result
+                },
+            ),
+            (
+                "candidates effort coverage",
+                EffortResult {
+                    coverage: Coverage {
+                        partial_start: false,
+                        feed_gap: true,
+                    },
+                    ..result
+                },
+            ),
+            (
+                "candidates effort active",
+                EffortResult {
+                    active: false,
+                    ..result
+                },
+            ),
+            (
+                "candidates effort timeframe",
+                EffortResult {
+                    timeframe: Timeframe::M15,
+                    ..result
+                },
+            ),
+            (
+                "candidates effort feature",
+                EffortResult {
+                    feature: catalog::CANDIDATE_EFFORT_RESULT_15M_V1.key,
+                    ..result
+                },
+            ),
+        ];
+        let mut edits: Vec<(&'static str, Edit<'static>)> = Vec::new();
+        for (name, value) in efforts {
+            edits.push((
+                name,
+                Box::new(move |s| {
+                    *s.candidates.windows_mut(Timeframe::M5).unwrap().0 =
+                        FeatureValue::Ready(value);
+                }),
+            ));
+        }
+        edits.push((
+            "candidates effort 1h",
+            Box::new(move |s| {
+                *s.candidates.windows_mut(Timeframe::H1).unwrap().0 = FeatureValue::Ready(result);
+            }),
+        ));
+        edits.push((
+            "candidates effort warming",
+            Box::new(|s| {
+                *s.candidates.windows_mut(Timeframe::M5).unwrap().0 = FeatureValue::WarmingUp {
+                    observed: 1,
+                    required: 1_440,
+                };
+            }),
+        ));
+        let exhaustion = Exhaustion {
+            feature: catalog::CANDIDATE_EXHAUSTION_V1.key,
+            end: EventTime::from_millis(300_000),
+            expansion: result,
+            decay: result,
+            decay_aggression: Qty::from_units(3),
+            extreme: Price::from_units(100),
+            close: Price::from_units(99),
+            expanded: true,
+            decayed: true,
+            at_extreme: true,
+            active: true,
+        };
+        let other = EffortResult {
+            effort: Qty::from_units(12),
+            ..result
+        };
+        let exhaustions = [
+            ("candidates exhaustion ready", exhaustion),
+            (
+                "candidates exhaustion end",
+                Exhaustion {
+                    end: EventTime::from_millis(360_000),
+                    ..exhaustion
+                },
+            ),
+            (
+                "candidates exhaustion expansion",
+                Exhaustion {
+                    expansion: other,
+                    ..exhaustion
+                },
+            ),
+            (
+                "candidates exhaustion decay",
+                Exhaustion {
+                    decay: other,
+                    ..exhaustion
+                },
+            ),
+            (
+                "candidates exhaustion decay aggression",
+                Exhaustion {
+                    decay_aggression: Qty::from_units(-3),
+                    ..exhaustion
+                },
+            ),
+            (
+                "candidates exhaustion extreme",
+                Exhaustion {
+                    extreme: Price::from_units(101),
+                    ..exhaustion
+                },
+            ),
+            (
+                "candidates exhaustion close",
+                Exhaustion {
+                    close: Price::from_units(98),
+                    ..exhaustion
+                },
+            ),
+            (
+                "candidates exhaustion expanded",
+                Exhaustion {
+                    expanded: false,
+                    ..exhaustion
+                },
+            ),
+            (
+                "candidates exhaustion decayed",
+                Exhaustion {
+                    decayed: false,
+                    ..exhaustion
+                },
+            ),
+            (
+                "candidates exhaustion at extreme",
+                Exhaustion {
+                    at_extreme: false,
+                    ..exhaustion
+                },
+            ),
+            (
+                "candidates exhaustion active",
+                Exhaustion {
+                    active: false,
+                    ..exhaustion
+                },
+            ),
+        ];
+        for (name, value) in exhaustions {
+            edits.push((
+                name,
+                Box::new(move |s| {
+                    *s.candidates.exhaustion_mut() = FeatureValue::Ready(value);
+                }),
+            ));
+        }
+        edits.push((
+            "candidates exhaustion warming",
+            Box::new(|s| {
+                *s.candidates.exhaustion_mut() = FeatureValue::WarmingUp {
+                    observed: 1,
+                    required: 6,
+                };
+            }),
+        ));
+        let absorption = Absorption {
+            feature: catalog::CANDIDATE_ABSORPTION_5M_V1.key,
+            effort: result,
+            passive: Side::Ask,
+            band: Rate::from_units(50_000),
+            added: Qty::from_units(5),
+            filled: Qty::from_units(4),
+            book_coverage: Coverage::default(),
+            replenished: true,
+            active: true,
+        };
+        let absorptions = [
+            ("candidates absorption ready", absorption),
+            (
+                "candidates absorption effort",
+                Absorption {
+                    effort: other,
+                    ..absorption
+                },
+            ),
+            (
+                "candidates absorption passive",
+                Absorption {
+                    passive: Side::Bid,
+                    ..absorption
+                },
+            ),
+            (
+                "candidates absorption band",
+                Absorption {
+                    band: Rate::from_units(20_000),
+                    ..absorption
+                },
+            ),
+            (
+                "candidates absorption added",
+                Absorption {
+                    added: Qty::from_units(6),
+                    ..absorption
+                },
+            ),
+            (
+                "candidates absorption filled",
+                Absorption {
+                    filled: Qty::from_units(3),
+                    ..absorption
+                },
+            ),
+            (
+                "candidates absorption book coverage",
+                Absorption {
+                    book_coverage: Coverage {
+                        partial_start: true,
+                        feed_gap: false,
+                    },
+                    ..absorption
+                },
+            ),
+            (
+                "candidates absorption replenished",
+                Absorption {
+                    replenished: false,
+                    ..absorption
+                },
+            ),
+            (
+                "candidates absorption active",
+                Absorption {
+                    active: false,
+                    ..absorption
+                },
+            ),
+        ];
+        for (name, value) in absorptions {
+            edits.push((
+                name,
+                Box::new(move |s| {
+                    *s.candidates.windows_mut(Timeframe::M5).unwrap().1 =
+                        FeatureValue::Ready(value);
+                }),
+            ));
+        }
+        edits.push((
+            "candidates absorption 15m",
+            Box::new(move |s| {
+                *s.candidates.windows_mut(Timeframe::M15).unwrap().1 =
+                    FeatureValue::Ready(absorption);
+            }),
+        ));
         edits
     }
 

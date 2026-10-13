@@ -25,10 +25,22 @@ pub enum TriggerFamily {
     /// owned by the bias/trigger issue.
     Sfp,
     /// Aggression absorbed by passive liquidity.
+    ///
+    /// The candidate fact is [`CandidateEvent::Absorption`](crate::candidate::CandidateEvent::Absorption)
+    /// of `candidate.absorption.<tf>@1` (ADR-051); the trigger rule is owned
+    /// by the bias/trigger issue.
     Absorption,
     /// Aggression fading out at an extreme.
+    ///
+    /// The candidate fact is [`CandidateEvent::Exhaustion`](crate::candidate::CandidateEvent::Exhaustion)
+    /// of `candidate.exhaustion@1` (ADR-051); the trigger rule is owned by
+    /// the bias/trigger issue.
     Exhaustion,
     /// Aggression without price progress (effort vs result).
+    ///
+    /// The candidate fact is [`CandidateEvent::EffortVsResult`](crate::candidate::CandidateEvent::EffortVsResult)
+    /// of `candidate.effort_result.<tf>@1` (ADR-051); the trigger rule is
+    /// owned by the bias/trigger issue.
     EffortVsResult,
     /// Cumulative volume delta diverging from price.
     ///

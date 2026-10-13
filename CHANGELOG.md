@@ -46,6 +46,24 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   new `mie_app::drive_chain`; each restart and the effective origin are
   printed. `--source live|archive` reports are unchanged; `mie experiment
   run` refused `--source history` until #119 (above).
+- **Order-flow candidates: effort vs result, exhaustion and absorption
+  (ADR-051, #22).** `candidate.effort_result.<5m|15m|1h>@1` judges each
+  aggression window, once per closed minute, against its own previous
+  1 440 evaluations: aggression at or above the 0.800 quantile with no more
+  progress than the median move is a candidate. `B` = 1 440 and `q_hi` =
+  0.800 were fixed by the pre-registered rules R1b and R1 on the hold-out
+  year 2024-10-01 … 2025-09-30. `candidate.exhaustion@1` is a 1h expansion
+  whose 5m aggression decayed to at most its median while the last close
+  stays within 6 bps of the extreme; `candidate.absorption.<5m|15m|1h>@1`
+  (live only) is effort vs result with the passive side opposite the
+  aggressor replenished (fills and `added ≥ filled` within 5 bps; a depth
+  outage, which books no fills, is not evaluated). Each emits on the
+  rising edge, with a location context at the last close, through
+  `MarketStateEngine::candidate_events`; values are part of
+  `MarketState.candidates`. Every state hash and the feature-set version
+  change. The `candidate_measure` tool checks all three against its model
+  (R0), on archive replays and, with `measure_candidates_live`, on live
+  captures.
 - **Order-flow candidates: CVD and open-interest divergences (ADR-051,
   #22).** `candidate.divergence.cvd.<15m|1h|4h|1d>@1` and
   `candidate.divergence.oi.<15m|1h|4h|1d>@1` compare consecutive confirmed
