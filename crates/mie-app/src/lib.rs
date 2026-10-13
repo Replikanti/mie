@@ -180,7 +180,24 @@ where
 pub fn drive_chain_observed<P>(
     provider: &mut P,
     engine: &mut MarketStateEngine,
+    on_rejection: impl FnMut(&StateError),
+    observe: impl FnMut(&MarketEvent, &MarketStateEngine),
+) -> Result<ChainDrive, ProviderError>
+where
+    P: MarketDataProvider + ?Sized,
+{
+    drive_chain_with(provider, engine, on_rejection, |_| {}, observe)
+}
+
+/// [`drive_chain_observed`], calling `on_restart` with the time of each
+/// restart as it happens, right after the fresh engine took the event and
+/// before `observe`: a consumer can record a restart even when the provider
+/// fails later and the [`ChainDrive`] is lost.
+pub(crate) fn drive_chain_with<P>(
+    provider: &mut P,
+    engine: &mut MarketStateEngine,
     mut on_rejection: impl FnMut(&StateError),
+    mut on_restart: impl FnMut(EventTime),
     mut observe: impl FnMut(&MarketEvent, &MarketStateEngine),
 ) -> Result<ChainDrive, ProviderError>
 where
@@ -195,7 +212,9 @@ where
                 *engine = MarketStateEngine::with_features(engine.feature_set().clone())
                     .expect("an engine's own feature set is computable");
                 drive.restarts.push(event.time());
-                if let Err(rejected) = engine.apply(&event) {
+                let applied = engine.apply(&event);
+                on_restart(event.time());
+                if let Err(rejected) = applied {
                     on_rejection(&rejected);
                 }
             }

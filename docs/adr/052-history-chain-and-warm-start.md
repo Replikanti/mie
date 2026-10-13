@@ -395,7 +395,14 @@ deferred option D are under *Alternatives considered*.
      after the drain: the seeds would stay unjournaled while the queue
      drains.
    - A new `chain_restart` record holds `time`, one per uncrossable hole in
-     the run's live part (decision 4).
+     the run's live part (decision 4). It is written and synced when the
+     restart happens, before the checkpoints that follow it, so a capture
+     failure or a crash later in the run does not lose it.
+     `mie_app::equivalence::drive_chain_checkpointed` reports each restart
+     as it happens for that.
+     Rejected, writing the restarts when the drive returns: a drive that
+     ends in a provider failure returns no restarts, and a crash writes
+     nothing.
    - A second or malformed `warm_start` of a run is a journal error, as a
      second `run_end` is.
 
@@ -440,9 +447,11 @@ deferred option D are under *Alternatives considered*.
      time is before the cutover, the history chain's own rule); and
      `warm-up-failed`, with the error: the chain refuses its bounds or
      runs (decision 2), the replay fails, the warm-up thread panics, the
-     memory guard refuses (decision 13), or the run ends before the
-     warm-up finishes (the core cancels it at the next prefix event, so a
-     shutdown waits for at most one run's load).
+     memory guard refuses (decision 13), the queue passes its limit
+     (decision 13; the core cancels the warm-up and does not wait for it,
+     so it keeps draining the capture), or the run ends before the warm-up
+     finishes (the core cancels it at the next prefix event, so a shutdown
+     waits for at most one run's load).
    - A `warm-up-failed` run's core drives a fresh engine over the queue,
      then the live records, through a `RunContinuation` without a join,
      seeded with `run_start`'s seeds: exactly what the capture's own
@@ -694,9 +703,29 @@ deferred option D are under *Alternatives considered*.
         bound, since adjacent runs share files, so the guard can refuse
         early but never too late.
       - The key has no default. Without it every chain run starts cold
-        with the error "not configured". Why: any default would be a number
-        without the measurement below, and a default too high is the crash
-        loop above. #106 sets the value with its source.
+        with the error "not configured", and no warm-up starts. Why: any
+        default would be a number without the measurement below, and a
+        default too high is the crash loop above. #106 sets the value with
+        its source.
+      - **The queue shares the budget.** While the warm-up runs, the core
+        queues the run's records (decision 7), and the queue grows with the
+        warm-up's length times the arrival rate, so the peak memory is the
+        replayed run's load plus the queue. The queue may therefore hold at
+        most `max_run_records` minus the largest run the guard found: the
+        records in memory, replayed and queued, never exceed
+        `max_run_records`. Until the guard has run, nothing is replayed, and
+        the queue may hold all of `max_run_records`. Why this bound holds
+        within the budget: `N_max` is sized from the bytes per record of a
+        `LiveReplay`, which holds a run's records and its output events
+        (below), while a queued item is one record without output, so it
+        costs at most one replayed record's share. A queue past its limit
+        abandons the warm-up and starts the run cold with the error, over
+        the queue already taken (decision 8), so the process neither crashes
+        nor stops capturing.
+      - Rejected, a separate queue key or a constant: a second number
+        without a measurement, while the one budget `N_max` already bounds
+        both. Rejected, an unbounded queue: a warm-up long enough at a high
+        arrival rate reaches the crash loop above.
     - **The trigger, in records.** `N_max` = the memory the host leaves to
       the warm-up ÷ the bytes per record. The bytes per record are
       measured as the peak memory of an offline `LiveReplay` of the
@@ -770,7 +799,11 @@ deferred option D are under *Alternatives considered*.
   above). Each item is a raw record (its payload bytes plus the capture
   envelope), not a decoded event, so it is larger than a core-channel
   slot; no size is assumed here. `warm_start` records the high-water in
-  records and payload bytes, and #106 measures the bytes.
+  records and payload bytes (the envelope is not counted), and #106
+  measures the bytes. The queue shares the guard's budget (decision 13): a
+  history long enough to fill it at the run's arrival rate makes every
+  start cold, which `warm_start` records, until #106's value, or the
+  engine snapshot (decision 12), moves the bound.
 
 ## Alternatives considered
 

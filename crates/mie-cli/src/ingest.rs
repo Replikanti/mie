@@ -30,14 +30,19 @@
 //!      chain run before this one, by its `run_end` record count or, for a
 //!      run without a clean end, the rows of the sealed files over its
 //!      ADR-039 D2 extent (an upper bound), must not exceed `[history]
-//!      max_run_records`; a missing key fails the warm-up;
+//!      max_run_records`; without the key no warm-up starts;
 //!    - the history chain through this run's predecessor
 //!      ([`HistoryChain::before_run`]), driven into a fresh engine through
 //!      [`mie_app::drive_chain`], hashed, and checked for cancellation on
 //!      every event.
 //!
-//!    Meanwhile this thread moves the records into an in-memory queue. When
-//!    the warm-up has finished (checked after every record), the handoff
+//!    Meanwhile this thread moves the records into an in-memory queue,
+//!    bounded by what `max_run_records` leaves beside the largest run the
+//!    warm-up replays (all of it until the guard has run): the queued and
+//!    the replayed records together never exceed the guard's budget. A
+//!    queue past its limit abandons the warm-up (cancelled, not waited for)
+//!    and starts the run cold. When the warm-up has finished (checked after
+//!    every record), the handoff
 //!    journals a warm `warm_start` with the chain seeds
 //!    ([`ChainTail::run_seeds`]) and syncs it before the seeds are used.
 //!    Then the warm engine is driven through
@@ -48,11 +53,12 @@
 //!    joined to the prefix through the chain's zero hold-back `HoldBack`.
 //!    A fast-restart overlap therefore becomes a `LateEvent` gap or
 //!    re-timed open interest, never an `OutOfOrder`. `warm_ready` records
-//!    when the queue is drained, `chain_restart` every uncrossable hole in
-//!    the live part (ADR-052 D4).
+//!    when the queue is drained; `chain_restart` records every uncrossable
+//!    hole in the live part (ADR-052 D4) and is synced as it happens.
 //!
-//!    A warm-up that fails, panics, is refused by the guard, or has not
-//!    finished when the capture ends (the core then cancels it) gives a
+//!    A warm-up that fails, panics, is refused by the guard, overflows the
+//!    queue, or has not finished when the capture ends (the core then
+//!    cancels it) gives a
 //!    cold `warm-up-failed` run: the reason is journaled and synced, and a
 //!    fresh engine is driven through `drive_checkpointed` from a
 //!    [`RunContinuation`] without a join, seeded with `run_start`'s seeds,
@@ -92,7 +98,7 @@ use mie_ports::raw::{DatasetVersion, RawRecord, RawRecordSource, RawSelection, R
 use serde_json::{Value, json};
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
@@ -313,17 +319,36 @@ pub fn run_with_hold(
     };
     let (driven, events) = if chained {
         // The warm-up: the chain through this run's predecessor, on its own
-        // thread, while the core queues the records.
+        // thread, while the core queues the records. The queue's limit is
+        // what `max_run_records` leaves beside the run the warm-up replays
+        // (`QueueLimit`); without the key the warm-up cannot start.
         let cancel = Arc::new(AtomicBool::new(false));
-        let warm_up = spawn_warm_up(config, &run_id, &cancel, hold);
+        let max_run_records = config.history.as_ref().and_then(|h| h.max_run_records);
+        let queue_limit = Arc::new(AtomicU64::new(max_run_records.unwrap_or(0)));
+        let warm_up = match max_run_records {
+            Some(max) => spawn_warm_up(config, &run_id, &cancel, &queue_limit, max, hold),
+            None => Err(NOT_CONFIGURED.to_owned()),
+        };
         let mut queue = VecDeque::new();
         let mut queued_bytes = 0_u64;
+        let mut overflow = None;
         if let Ok(warm_up) = &warm_up {
             while !warm_up.is_finished() {
                 match provider.next_record() {
                     Ok(Some((stream, record))) => {
                         queued_bytes += record.payload.len() as u64;
                         queue.push_back((stream, record));
+                        let limit = queue_limit.load(Ordering::SeqCst);
+                        if queue.len() as u64 > limit {
+                            overflow = Some(format!(
+                                "warm-up queue (ADR-052 D13): {} records queued, more than the \
+                                 {limit} that [history] max_run_records {} leaves beside the run \
+                                 the warm-up replays",
+                                queue.len(),
+                                max_run_records.unwrap_or(0),
+                            ));
+                            break;
+                        }
                     }
                     // The capture ended or failed first: the warm-up is
                     // cancelled, and the drive below sees the end or the
@@ -333,14 +358,19 @@ pub fn run_with_hold(
             }
         }
         cancel.store(true, Ordering::Relaxed);
-        let warmed = warm_up.and_then(|warm_up| {
-            warm_up.join().unwrap_or_else(|panic| {
-                Err(format!(
-                    "the warm-up thread panicked: {}",
-                    panic_message(panic.as_ref())
-                ))
-            })
-        });
+        let warmed = match overflow {
+            // Abandoned, not joined: the warm-up stops at its next prefix
+            // event, and the core goes on draining the capture meanwhile.
+            Some(error) => Err(error),
+            None => warm_up.and_then(|warm_up| {
+                warm_up.join().unwrap_or_else(|panic| {
+                    Err(format!(
+                        "the warm-up thread panicked: {}",
+                        panic_message(panic.as_ref())
+                    ))
+                })
+            }),
+        };
         // The queue only grows during the warm-up: its length now is its
         // high-water mark.
         let queue_high_water = queue.len() as u64;
@@ -387,20 +417,20 @@ pub fn run_with_hold(
                     inner: &mut feed,
                     events: 0,
                 };
+                // Each restart is journaled and synced as it happens, so a
+                // later failure or crash does not lose it (ADR-052 D6).
                 let driven = mie_app::equivalence::drive_chain_checkpointed(
                     &mut counting,
                     &mut engine,
                     checkpoint_interval_ms,
                     on_rejection,
+                    |time| {
+                        log("chain_restart", chain_restart_json(time));
+                        sync();
+                    },
                     on_checkpoint,
                 );
-                let events = counting.events;
-                let driven = driven.map(|drive| {
-                    for time in drive.restarts {
-                        log("chain_restart", chain_restart_json(time));
-                    }
-                });
-                (driven, events)
+                (driven.map(|_| ()), counting.events)
             }
             Err(error) => {
                 log(
@@ -578,16 +608,27 @@ impl Drop for AfterHook {
     }
 }
 
-/// Spawns the `mie-warm-up` thread of run `run_id` (module docs).
+/// The error of a chain run without `[history] max_run_records`.
+const NOT_CONFIGURED: &str = "memory guard (ADR-052 D13): [history] max_run_records is not \
+                              configured, so the warm-up cannot bound what it holds in memory";
+
+/// Spawns the `mie-warm-up` thread of run `run_id` (module docs), with the
+/// memory guard's `max_run_records`. Once the guard knows the largest run
+/// the warm-up will replay, the thread lowers `queue_limit` from `max` to
+/// what `max` leaves beside that run (ADR-052 D13): the replayed run's
+/// records and the queued ones together never exceed `max`.
 fn spawn_warm_up(
     config: &IngestConfig,
     run_id: &str,
     cancel: &Arc<AtomicBool>,
+    queue_limit: &Arc<AtomicU64>,
+    max: u64,
     hold: WarmUpHold,
 ) -> Result<JoinHandle<Result<WarmUp, String>>, String> {
     let config = config.clone();
     let run_id = run_id.to_owned();
     let cancel = Arc::clone(cancel);
+    let queue_limit = Arc::clone(queue_limit);
     thread::Builder::new()
         .name("mie-warm-up".to_owned())
         .spawn(move || {
@@ -595,16 +636,24 @@ fn spawn_warm_up(
             if let Some(before) = hold.before {
                 before();
             }
-            warm_up(&config, &run_id, &cancel)
+            warm_up(&config, &run_id, &cancel, &queue_limit, max)
         })
         .map_err(|e| format!("spawn the warm-up thread: {e}"))
 }
 
-/// The warm-up of run `run_id`: the memory guard, then the history chain
-/// through its predecessor into a fresh engine.
-fn warm_up(config: &IngestConfig, run_id: &str, cancel: &AtomicBool) -> Result<WarmUp, String> {
+/// The warm-up of run `run_id`: the memory guard, which also sets the
+/// queue's limit, then the history chain through its predecessor into a
+/// fresh engine.
+fn warm_up(
+    config: &IngestConfig,
+    run_id: &str,
+    cancel: &AtomicBool,
+    queue_limit: &AtomicU64,
+    max: u64,
+) -> Result<WarmUp, String> {
     let store = ParquetRawStore::new(&config.paths.raw_root);
-    memory_guard(config, &store, run_id)?;
+    let largest = memory_guard(config, &store, run_id, max)?;
+    queue_limit.store(max - largest, Ordering::SeqCst);
     let chain: HistoryChain<'_> = history_chain(config, &store)?;
     let Replay { stream, dataset } = chain.before_run(run_id).map_err(|e| e.to_string())?;
     let mut hashing = HashingProvider::new(Cancellable {
@@ -634,24 +683,22 @@ fn warm_up(config: &IngestConfig, run_id: &str, cancel: &AtomicBool) -> Result<W
 }
 
 /// The memory guard (ADR-052 D13): the largest chain run before `run_id`
-/// must not hold more records than `[history] max_run_records`, because the
-/// warm-up holds one run's records and output in memory at a time. A run
-/// that ended cleanly counts its `run_end` records; any other counts the
-/// rows of the sealed files of its streams that overlap its ADR-039 D2
-/// extent, an upper bound (adjacent runs share files).
+/// must not hold more records than `max` (`[history] max_run_records`),
+/// because the warm-up holds one run's records and output in memory at a
+/// time. A run that ended cleanly counts its `run_end` records; any other
+/// counts the rows of the sealed files of its streams that overlap its
+/// ADR-039 D2 extent, an upper bound (adjacent runs share files). Returns
+/// that largest count (0 without a chain run before `run_id`).
 fn memory_guard(
     config: &IngestConfig,
     store: &ParquetRawStore,
     run_id: &str,
-) -> Result<(), String> {
+    max: u64,
+) -> Result<u64, String> {
     let history = config
         .history
         .as_ref()
         .ok_or("memory guard (ADR-052 D13): no [history] section")?;
-    let max = history.max_run_records.ok_or(
-        "memory guard (ADR-052 D13): [history] max_run_records is not configured, so the \
-         warm-up cannot bound the largest run it would replay",
-    )?;
     let cutover = history.cutover_ms().map_err(|e| e.to_string())?;
     let source = &config.instrument.source;
     let symbol = &config.instrument.symbol;
@@ -691,7 +738,7 @@ fn memory_guard(
              max_run_records {max}",
             run.run_id
         )),
-        _ => Ok(()),
+        _ => Ok(largest.map_or(0, |(_, records)| records)),
     }
 }
 

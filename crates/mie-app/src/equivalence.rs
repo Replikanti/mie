@@ -30,7 +30,7 @@
 //! event-stream hash against the replay's hash after as many events
 //! ([`EventPrefixes`]), which no engine change can move (ADR-041).
 
-use crate::{ChainDrive, drive_chain_observed, drive_tolerant_observed};
+use crate::{ChainDrive, drive_chain_with, drive_tolerant_observed};
 use mie_domain::event::MarketEvent;
 use mie_domain::event_hash::{EventStreamHash, EventStreamHasher};
 use mie_domain::state::{MarketStateEngine, StateError};
@@ -165,13 +165,17 @@ where
 }
 
 /// [`drive_checkpointed`] for a consumer of the history chain (ADR-052 D4):
-/// [`drive_chain_observed`] with a fresh [`CheckpointRecorder`], so an
-/// uncrossable hole restarts a fresh engine instead of having every later
-/// trades-stream event rejected, and the checkpoints go on with the fresh
-/// engine's state. `on_checkpoint` gets every checkpoint as it is recorded,
-/// and the `last` one when the provider ends without a failure, exactly as
-/// in [`drive_checkpointed`]. The live part of a warm-started run drives
-/// its warm engine through it; the recorder starts at its first event.
+/// [`drive_chain_observed`](crate::drive_chain_observed) with a fresh
+/// [`CheckpointRecorder`], so an uncrossable hole restarts a fresh engine
+/// instead of having every later trades-stream event rejected, and the
+/// checkpoints go on with the fresh engine's state. `on_restart` gets each
+/// restart's time as it happens, before that event's checkpoint, so a
+/// restart is known even when the provider fails later (the returned
+/// [`ChainDrive`] is lost then). `on_checkpoint` gets every checkpoint as it
+/// is recorded, and the `last` one when the provider ends without a
+/// failure, exactly as in [`drive_checkpointed`]. The live part of a
+/// warm-started run drives its warm engine through it; the recorder starts
+/// at its first event.
 ///
 /// # Errors
 ///
@@ -185,17 +189,24 @@ pub fn drive_chain_checkpointed<P>(
     engine: &mut MarketStateEngine,
     interval_ms: i64,
     on_rejection: impl FnMut(&StateError),
+    on_restart: impl FnMut(EventTime),
     mut on_checkpoint: impl FnMut(&StateCheckpoint),
 ) -> Result<ChainDrive, ProviderError>
 where
     P: MarketDataProvider + ?Sized,
 {
     let mut recorder = CheckpointRecorder::new(interval_ms);
-    let drive = drive_chain_observed(provider, engine, on_rejection, |event, engine| {
-        if let Some(checkpoint) = recorder.observe(event, engine) {
-            on_checkpoint(&checkpoint);
-        }
-    })?;
+    let drive = drive_chain_with(
+        provider,
+        engine,
+        on_rejection,
+        on_restart,
+        |event, engine| {
+            if let Some(checkpoint) = recorder.observe(event, engine) {
+                on_checkpoint(&checkpoint);
+            }
+        },
+    )?;
     if let Some(checkpoint) = recorder.finish(engine) {
         on_checkpoint(&checkpoint);
     }
@@ -518,24 +529,27 @@ mod tests {
         ]);
         let mut checkpoints = Vec::new();
         let mut rejections = 0;
+        let mut restarted = Vec::new();
         let mut engine = MarketStateEngine::new();
         let drive = drive_chain_checkpointed(
             &mut Feed(events.iter().cloned().collect()),
             &mut engine,
             10_000,
             |_| rejections += 1,
+            |time| restarted.push(time),
             |c| checkpoints.push(*c),
         )
         .unwrap();
         assert_eq!(drive.events, 7);
         assert_eq!(drive.restarts, [EventTime::from_millis(at)]);
+        assert_eq!(restarted, drive.restarts);
         assert_eq!(rejections, 0, "no rejection storm after the hole");
 
         // The checkpoints of `drive_chain_observed` plus a recorder.
         let mut recorder = CheckpointRecorder::new(10_000);
         let mut expected = Vec::new();
         let mut plain = MarketStateEngine::new();
-        drive_chain_observed(
+        crate::drive_chain_observed(
             &mut Feed(events.iter().cloned().collect()),
             &mut plain,
             |_| {},
@@ -561,6 +575,54 @@ mod tests {
         }
         assert_eq!(last.state, fresh.state().state_hash());
         assert_eq!(last.events, hash_of(&events));
+    }
+
+    /// Delivers its events, then fails.
+    struct Failing(VecDeque<MarketEvent>);
+
+    impl MarketDataProvider for Failing {
+        fn next_event(&mut self) -> Result<Option<MarketEvent>, ProviderError> {
+            match self.0.pop_front() {
+                Some(event) => Ok(Some(event)),
+                None => Err(ProviderError::Source("the capture failed".to_owned())),
+            }
+        }
+    }
+
+    #[test]
+    fn a_restart_is_reported_as_it_happens_even_when_the_provider_fails_later() {
+        let bound_ms = i64::try_from(mie_domain::bars::MAX_BARS_PER_EVENT).unwrap() * 60_000;
+        let at = 60_000 + bound_ms;
+        let mut events = tape()[..2].to_vec();
+        events.extend([trade(at, 3, 1_000_000), trade(at + 15_000, 4, 1_000_000)]);
+        // What each callback saw, in order.
+        let seen = std::cell::RefCell::new(Vec::new());
+        let failed = drive_chain_checkpointed(
+            &mut Failing(events.iter().cloned().collect()),
+            &mut MarketStateEngine::new(),
+            10_000,
+            |e| panic!("{e}"),
+            |time| {
+                seen.borrow_mut()
+                    .push(format!("restart {}", time.as_millis()))
+            },
+            |c| seen.borrow_mut().push(format!("checkpoint {}", c.ordinal)),
+        )
+        .unwrap_err();
+        assert_eq!(
+            failed,
+            ProviderError::Source("the capture failed".to_owned())
+        );
+        // The restart came before the checkpoint its event recorded, and
+        // no `last` checkpoint follows the failure.
+        assert_eq!(
+            seen.into_inner(),
+            [
+                format!("restart {at}"),
+                "checkpoint 3".to_owned(),
+                "checkpoint 4".to_owned()
+            ]
+        );
     }
 
     #[test]

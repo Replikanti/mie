@@ -105,7 +105,8 @@ the warm-up are queued and recomputed with the chain's seeds at the
 handoff. The journal's `warm_start` record holds the prefix's provenance
 and the seeds, or why the run started cold (no `[history]`, a start before
 the cutover, a failed warm-up, or `[history] max_run_records` missing or
-exceeded, the memory guard). `mie equivalence` compares warm runs from #118
+exceeded by the largest run or by the records queued during the warm-up,
+the memory guard). `mie equivalence` compares warm runs from #118
 on; until then it reports them diverged.
 
 Historical backfill from the Binance public data archive (source

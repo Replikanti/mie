@@ -83,7 +83,8 @@ state_checkpoint_interval_secs = 60
 # archive_config = "archive.toml"
 # # The warm start's memory guard (ADR-052 D13): the most records a chain
 # # run before the starting one may hold, since the warm-up holds one run
-# # in memory at a time. No default: without it every warm start falls back
+# # in memory at a time; the records queued while it runs share the limit
+# # with the largest run. No default: without it every warm start falls back
 # # to a cold run, with the reason journaled. The value is the host memory
 # # left to the warm-up divided by the bytes per record, both measured by
 # # #106; none is given here.

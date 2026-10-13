@@ -413,6 +413,8 @@ enum Step {
     Advance(i64),
     /// Waits until the warm-up has its result ([`WarmUpHold::after`]).
     Gate,
+    /// Runs a test action in the script's order.
+    Run(Box<dyn FnOnce() + Send>),
 }
 
 /// The shared script: steps, the path whose frame was handed out but not yet
@@ -487,6 +489,12 @@ impl WsConnection for Scripted {
                 }
                 Some(Step::Gate) if script.gate.load(Ordering::SeqCst) => {
                     steps.pop_front();
+                }
+                Some(Step::Run(_)) => {
+                    let Some(Step::Run(action)) = steps.pop_front() else {
+                        unreachable!()
+                    };
+                    action();
                 }
                 Some(_) => return idle(guard),
             }
@@ -1082,7 +1090,9 @@ fn runs_without_history_or_before_the_cutover_or_after_a_failed_warm_up_start_co
 #[test]
 fn the_memory_guard_starts_the_run_cold_and_the_capture_goes_on() {
     let t = CUTOVER + 2 * HOUR;
-    let frames = || vec![vec![agg(1, t + 10), agg(2, t + 20), agg(3, t + 30)]];
+    // Two records: never more than the queue may hold before the guard has
+    // run (max_run_records 2), so the guard's own error is the one journaled.
+    let frames = || vec![vec![agg(1, t + 10), agg(2, t + 20)]];
     let predecessor = |dir: &Path, max: Option<u64>, clean: bool| {
         import_archive(dir);
         let mut config = history_config(dir, "2026-10-03", "2026-10-06");
@@ -1141,9 +1151,9 @@ fn the_memory_guard_starts_the_run_cold_and_the_capture_goes_on() {
         "{cold}"
     );
 
-    // At the guard: warm.
-    let dir = TempDir::new("guard-at");
-    let config = predecessor(dir.path(), Some(3), true);
+    // Within the guard, with room for the queue beside the run: warm.
+    let dir = TempDir::new("guard-within");
+    let config = predecessor(dir.path(), Some(103), true);
     let outcome = warm_ingest(
         &config,
         t,
@@ -1199,8 +1209,184 @@ fn an_uncrossable_hole_restarts_the_warm_engine_in_the_live_part() {
         .map(|l| l["time"].as_i64().unwrap())
         .collect();
     assert_eq!(restarts, [t + 10]);
+    // Journaled when it happened, before the checkpoints that followed.
+    let position = |kind: &str| {
+        lines
+            .iter()
+            .position(|l| l["type"] == kind && l["run_id"] == run)
+            .unwrap()
+    };
+    assert!(position("chain_restart") < position("state_checkpoint"));
     assert_final_state(&lines, &config, run);
     let end_ms = one(&lines, run, "run_end")["at_ms"].as_i64().unwrap();
     let (through, _) = history_replay(&config, ORIGIN, end_ms + RUN_MARGIN_MS);
     assert_eq!(through.restarts, [t + 10]);
+}
+
+/// Whether this process can create entries in a read-only directory (it
+/// runs as root): the capture failure below cannot be provoked then.
+fn ignores_permissions(dir: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let probe = dir.join("probe");
+    std::fs::create_dir_all(&probe).unwrap();
+    std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let ignored = std::fs::create_dir(probe.join("inside")).is_ok();
+    std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::remove_dir_all(&probe).unwrap();
+    ignored
+}
+
+#[test]
+fn a_restart_is_journaled_when_it_happens_even_if_the_run_then_fails() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new("warm-hole-failed");
+    if ignores_permissions(dir.path()) {
+        eprintln!("skipped: a read-only directory cannot fail the capture for this user");
+        return;
+    }
+    import_archive(dir.path());
+    let config = warm_config(dir.path(), Some(1_000));
+    let times = [
+        CUTOVER + HOUR,
+        CUTOVER + HOUR + 1_000,
+        CUTOVER + HOUR + 2_000,
+    ];
+    let (lines, records) = journaled_run(
+        "20261006T010000Z",
+        CUTOVER + HOUR,
+        CUTOVER + HOUR + 60_000,
+        500,
+        &times,
+    );
+    write_records(&config, &records, &lines);
+    let t = CUTOVER + 40 * DAY_MS;
+    // The trades' stream directory turns read-only once the restart is due:
+    // the next day's partition cannot be created, the append fails, and so
+    // does the capture and with it the core's drive.
+    let stream_dir = config
+        .paths
+        .raw_root
+        .join("source=binance-um/instrument=BTCUSDT/stream=aggTrade");
+    let locked = stream_dir.clone();
+    let steps = vec![
+        Step::Frame(AGG, agg(1_000, t + 10)),
+        Step::Gate,
+        Step::Frame(AGG, agg(1_001, t + 20)),
+        // Releases the first two trades from the hold-back: the hole's gap
+        // restarts the engine.
+        Step::Frame(AGG, agg(1_002, t + 65_000)),
+        Step::Run(Box::new(move || {
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+        })),
+        Step::Frame(AGG, agg(1_003, t + DAY_MS + 1_000)),
+    ];
+    let outcome = warm_ingest(&config, t, steps, Vec::new(), None);
+    std::fs::set_permissions(&stream_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(outcome.exit_code(), 1, "the capture failed");
+    assert!(
+        outcome
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("append")),
+        "{:?}",
+        outcome.error
+    );
+    let lines = journal(&config);
+    let run = outcome.run_id.as_str();
+    assert_eq!(one(&lines, run, "warm_start")["warm"], true);
+    let restarts: Vec<i64> = lines_of(&lines, run, "chain_restart")
+        .iter()
+        .map(|l| l["time"].as_i64().unwrap())
+        .collect();
+    assert_eq!(restarts, [t + 10]);
+    assert_eq!(one(&lines, run, "run_end")["exit_code"], 1);
+}
+
+#[test]
+fn a_queue_past_its_limit_abandons_the_warm_up_and_starts_cold() {
+    let dir = TempDir::new("warm-queue-overflow");
+    import_archive(dir.path());
+    let mut config = history_config(dir.path(), "2026-10-03", "2026-10-06");
+    // The predecessor holds 3 records; the guard admits it.
+    config.history.as_mut().unwrap().max_run_records = Some(5);
+    let times = [
+        CUTOVER + HOUR,
+        CUTOVER + HOUR + 1_000,
+        CUTOVER + HOUR + 2_000,
+    ];
+    let (lines, records) = journaled_run(
+        "20261006T010000Z",
+        CUTOVER + HOUR,
+        CUTOVER + HOUR + 60_000,
+        500,
+        &times,
+    );
+    write_records(&config, &records, &lines);
+    let t = CUTOVER + 2 * HOUR;
+    // The warm-up is held before its guard, so the queue may hold all 5
+    // records `max_run_records` allows; the 6th overflows it. The warm-up is
+    // released only after that.
+    let release = Arc::new(AtomicBool::new(false));
+    let released = Arc::clone(&release);
+    let before: Box<dyn FnOnce() + Send> = Box::new(move || {
+        let deadline = Instant::now() + WAIT_DEADLINE;
+        while !released.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "the warm-up was never released");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    });
+    let mut steps: Vec<Step> = (0..8)
+        .map(|i| Step::Frame(AGG, agg(1 + i, t + 10 + 1_000 * i as i64)))
+        .collect();
+    steps.push(Step::Run(Box::new(move || {
+        // Let the capture hand the 8 records to the core first.
+        std::thread::sleep(Duration::from_millis(50));
+        release.store(true, Ordering::SeqCst);
+    })));
+    steps.extend((8..10).map(|i| Step::Frame(AGG, agg(1 + i, t + 10 + 1_000 * i as i64))));
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let script = Arc::new(Script {
+        steps: Mutex::new((steps.into(), None)),
+        clock: ScriptClock(Mutex::new(t * 1_000_000)),
+        bodies: Mutex::new(VecDeque::new()),
+        polled: AtomicU64::new(0),
+        gate: AtomicBool::new(false),
+        shutdown: Arc::clone(&shutdown),
+    });
+    let transports = Transports {
+        connector: Arc::new(Ws(Arc::clone(&script))),
+        http: Arc::new(Oi(Arc::clone(&script))),
+        clock: Arc::new(ClockOf(Arc::clone(&script))),
+    };
+    let hold = WarmUpHold {
+        before: Some(before),
+        after: None,
+    };
+    let outcome =
+        mie_cli::ingest::run_with_hold(&config, transports, shutdown, hold).expect("ingest starts");
+    let cold = assert_cold(&config, &outcome, "warm-up-failed");
+    let error = cold["error"].as_str().unwrap();
+    assert!(
+        error.contains("warm-up queue") && error.contains("max_run_records 5"),
+        "{error}"
+    );
+    // Overflowed at the first record past the limit: all 5 while the
+    // warm-up was held, or, when the core took the records only after the
+    // release, the 2 that the guard's largest run (3) leaves.
+    let number = |after: &str| -> u64 {
+        error
+            .split(after)
+            .next()
+            .and_then(|head| head.rsplit(' ').next())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("{error}"))
+    };
+    let (queued, limit) = (number(" records queued"), number(" that [history]"));
+    assert!(queued == limit + 1 && (limit == 5 || limit == 2), "{error}");
+    // Every trade reached the cold engine: the queued ones, then the rest.
+    let lines = journal(&config);
+    let end = one(&lines, &outcome.run_id, "run_end");
+    assert_eq!(end["records"], 10);
+    assert_eq!(outcome.domain_rejections, 0);
+    assert!(outcome.events >= 10, "{}", outcome.events);
 }

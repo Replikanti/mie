@@ -57,7 +57,8 @@ pub struct History {
     /// The warm start's memory guard (ADR-052 D13, its `N_max`): the most
     /// records a chain run before the starting one may hold. The warm-up
     /// replays one run at a time in memory, so a larger run starts this run
-    /// cold instead. No default: the bytes per record are measured by #106,
+    /// cold instead; the records queued during the warm-up share the same
+    /// limit with the largest run. No default: the bytes per record are measured by #106,
     /// so a missing key starts every chain run cold, with the reason
     /// journaled. Only `mie ingest` reads it.
     #[serde(default)]

@@ -31,8 +31,12 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   `history_origin_ms` and `history_cutover_ms`. A warm run's replay takes
   its seeds from `warm_start`. The memory guard reads the new optional
   `[history] max_run_records`, which has no default: without it every
-  chain run starts cold, with the reason journaled. A failed, refused or
-  unfinished warm-up starts the run cold; the capture never waits for it.
+  chain run starts cold, with the reason journaled. The same limit bounds
+  the warm-up's record queue (what it leaves beside the largest replayed
+  run); a queue past it abandons the warm-up. `chain_restart` is journaled
+  and synced when the restart happens (`drive_chain_checkpointed` takes an
+  `on_restart` callback). A failed, refused, overflowing or unfinished
+  warm-up starts the run cold; the capture never waits for it.
   Runs without `[history]` capture and feed the core as before. `mie
   equivalence` reports warm runs diverged until #118.
 - **Research on the history chain: `research.replay_summary@2` and
