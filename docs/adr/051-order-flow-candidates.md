@@ -761,6 +761,41 @@ run on the same clock (ADR-043 D6).
     year carries no evidential weight for it. The hold-out run decides,
     once.
 
+11. **Hold-out run.** The run of items 8 and 9 happened once on the
+    hold-out year 2024-10-01 … 2025-09-30 (split 2025-04-01 12:00 UTC). No
+    attempt was repeated for a result. This item records it and changes no
+    rule above.
+    - *Commits.* The import, `archive-verify` and replay binary was built
+      from PR #125's merge commit `6994908`; the measurement ran at main
+      `5809c8c`. The diff of `crates/mie-cli/tests/candidate_measure.rs`
+      and of this ADR between the two commits is empty, so the rule that
+      ran is the rule that was pre-registered.
+    - *Data.* The coverage probe found 730 of 730 files (`aggTrades` and
+      `metrics`), 0 missing, and 730 were imported with 0 failed (one
+      transport stall on a download, resumed from the ledger, no importer
+      change). `archive-verify` passed: 0 id breaks, 3 holes over 60 s, and
+      the metrics stream has 0 holes. The replay's dataset version is
+      `6b88fbd1…`, with 0 missing days and 0 domain rejections. The fold
+      reports 365 days unchecked, as pre-registered, because no `trades`
+      were imported.
+    - *Verdicts.*
+
+      | Rule | Verdict |
+      |---|---|
+      | R0 | 0 mismatches |
+      | R1b | PASS, `B` = 1440 (60 and 240 fail in both halves) |
+      | R1 | PASS, `q_hi` = 0.800 |
+
+      Per item 9, #22 M3 uses `B` = 1440 and `q_hi` = 0.800. The caveat of
+      item 9 applies: the PASS of `B` = 1440 is weaker evidence than its
+      nominal p. The ordering (60 and 240 fail, 1440 passes) is the same
+      on both years.
+    - *Sources.* The full result is on
+      [#22](https://github.com/Replikanti/mie/issues/22#issuecomment-6135775324);
+      the attestation that no run read the hold-out year before the rule
+      merged is on
+      [#124](https://github.com/Replikanti/mie/issues/124#issuecomment-6133856444).
+
 ## Consequences
 
 - `MarketState` grows by one field (`candidates`); every state hash and
