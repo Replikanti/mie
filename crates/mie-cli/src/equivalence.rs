@@ -44,16 +44,19 @@
 //!    state only when the run's feature set is this binary's). A mismatch is
 //!    `DIVERGED (warm prefix)`; the report prints the journaled and the
 //!    current prefix dataset version beside it, never comparing them: a
-//!    run whose first records lie within `RUN_MARGIN_MS` of its
-//!    predecessor's end (a fast restart) moves the version without a data
-//!    change once it has sealed them (ADR-052 D5, D9).
+//!    fast restart whose first records lie before its predecessor's end plus
+//!    `RUN_MARGIN_MS` moves the version without a data change once it has
+//!    sealed them (ADR-052 D5, D9).
 //! 4. The run's own part, the chain's recompute of the run joined to the
 //!    prefix through the ADR-039 D3 `HoldBack` (what the run's core
 //!    consumed), is driven into the same engine through
 //!    [`drive_chain_checkpointed`] with a fresh recorder, and compared as
 //!    the cold unit compares a run. The part is driven even after a prefix
 //!    mismatch, so the pass stays on the chain. A failure of the chain makes
-//!    the run and every later warm run NOT COMPARABLE.
+//!    the warm run it reaches and every later one NOT COMPARABLE. A chain
+//!    run that fails to load is charged to the first warm run at or after
+//!    it, never to an earlier one, whose events were all delivered: a warm
+//!    run's verdict does not depend on which later runs are selected.
 //!
 //! The report: a header (window, source, encodings, current feature set,
 //! and the history chain's pass when one ran), one line per run in journal
@@ -559,12 +562,24 @@ fn warm_pass(
         chain.cutover().as_millis()
     );
     // A run the chain does not know cannot occur (the stream recomputes
-    // chain runs only); it would end every view.
-    let mut parts = RunParts::new(through.stream, move |stream: &HistoryChainStream<'_>| {
-        stream
-            .run_of_last_event()
-            .map(|run_id| index.get(run_id).copied().unwrap_or(usize::MAX))
-    });
+    // chain runs only): as an event's part it would end every view, as a
+    // failure's it reaches the view that meets it. A failure is charged to
+    // the run that failed, so a warm run before it keeps its full verdict,
+    // the one a pass ending with it gives.
+    let failures = index.clone();
+    let mut parts = RunParts::new(
+        through.stream,
+        move |stream: &HistoryChainStream<'_>| {
+            stream
+                .run_of_last_event()
+                .map(|run_id| index.get(run_id).copied().unwrap_or(usize::MAX))
+        },
+        move |stream: &HistoryChainStream<'_>| {
+            stream
+                .failed_run()
+                .and_then(|run_id| failures.get(run_id).copied())
+        },
+    );
     let mut engine = MarketStateEngine::new();
     let mut failed: Option<String> = None;
     for (k, warm) in ordered {

@@ -654,6 +654,14 @@ impl<'a> HistoryChainStream<'a> {
         self.live.as_ref()?.stream.run_of_last_event()
     }
 
+    /// The chain run whose read, check or recompute failed the stream
+    /// ([`LiveReplayStream::failed_run`]): every event before that run's
+    /// was delivered. `None` before a failure, for a failure of the archive
+    /// segment and for the live segment's check after its last run.
+    pub fn failed_run(&self) -> Option<&str> {
+        self.live.as_ref()?.stream.failed_run()
+    }
+
     /// Where the chain ends, once the stream has ended (`None` before): with
     /// a live segment, where its last chained run leaves the chained output;
     /// without one, the archive segment's last event and newest
@@ -1548,6 +1556,44 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_run_is_named_after_every_event_before_it() {
+        // R2 ended cleanly, but one of its records is missing.
+        let fixture = Fixture::new();
+        let mut source = MemorySource::default();
+        seal_archive(&mut source);
+        for (i, b) in fixture.builders.iter().enumerate() {
+            b.seal(&mut source, if i == 2 { &[3] } else { &[] });
+        }
+        let chain = chain(&source, fixture.runs.clone());
+        let mut stream = chain.to_end_of("20261005T021001Z").unwrap().stream;
+        let mut delivered = Vec::new();
+        let failed = loop {
+            match stream.next_event() {
+                Ok(Some(event)) => {
+                    assert_eq!(stream.failed_run(), None);
+                    delivered.push(event);
+                }
+                Ok(None) => panic!("the stream ended"),
+                Err(failed) => break failed,
+            }
+        };
+        assert!(
+            matches!(&failed, ProviderError::Source(d) if d.contains("20261005T020000Z")),
+            "{failed}"
+        );
+        assert_eq!(stream.failed_run(), Some("20261005T020000Z"));
+        // R1 delivered all of its events before R2 failed: as many as the
+        // prefix of R2 holds.
+        assert_eq!(stream.run_of_last_event(), Some("20261005T000010Z"));
+        let mut prefix = chain.before_run("20261005T020000Z").unwrap().stream;
+        assert_eq!(delivered, drain(&mut prefix));
+        // An archive-only prefix names no run.
+        let mut archive = chain.before_run("20261005T000010Z").unwrap().stream;
+        drain(&mut archive);
+        assert_eq!(archive.failed_run(), None);
+    }
+
+    #[test]
     fn the_chain_through_an_open_or_unknown_run_is_refused() {
         let fixture = Fixture::new();
         let mut source = fixture.source();
@@ -1868,7 +1914,8 @@ mod tests {
     }
 
     /// The prefix before a second chain run that starts `gap_ms` after the
-    /// first ended, twice: as the warm start (W3) journals it, while the
+    /// first ended, with its first record 1 s after its start, twice: as
+    /// the warm start (W3) journals it, while the
     /// second run is still capturing and has sealed nothing, and as an
     /// equivalence check sees it later, once the second run has sealed its
     /// files and ended. Each is the dataset version and the events.
@@ -1926,10 +1973,12 @@ mod tests {
     }
 
     #[test]
-    fn a_fast_restart_moves_the_prefix_dataset_version_but_not_its_events() {
-        // A restart 60 s after the predecessor's end, inside its margin: the
-        // run's own first files fall into its prefix's selection once
-        // sealed (ADR-052 decisions 5 and 9).
+    fn a_run_sealing_records_inside_its_prefix_selection_moves_its_version_not_its_events() {
+        // A restart 60 s after the predecessor's end, its first record 1 s
+        // later, so before the predecessor's end plus the margin: once
+        // sealed, that file falls into the prefix's selection (ADR-052
+        // decisions 5 and 9). The start alone does not decide it; the
+        // record's time does.
         let (at_start, later) = prefix_at_start_and_later(60_000);
         assert!(!at_start.1.is_empty());
         assert_eq!(at_start.1, later.1, "the prefix's events are the same");
@@ -1937,8 +1986,9 @@ mod tests {
     }
 
     #[test]
-    fn a_slow_restart_keeps_the_prefix_dataset_version() {
-        // 10 min after the predecessor's end, past its margin.
+    fn a_run_whose_records_lie_past_its_prefix_selection_keeps_its_version() {
+        // A restart 10 min after the predecessor's end, its first record 1 s
+        // later: past the predecessor's end plus the margin.
         let (at_start, later) = prefix_at_start_and_later(10 * MIN);
         assert_eq!(at_start.1, later.1);
         assert_eq!(at_start.0, later.0);

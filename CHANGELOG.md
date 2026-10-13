@@ -18,7 +18,7 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   before it must reproduce the journaled prefix event-stream hash and
   handoff state hash, else `DIVERGED (warm prefix)` with the journaled and
   the current prefix dataset version printed (never compared: a fast
-  restart moves the version without a data change); its own events, the
+  restart can move the version without a data change); its own events, the
   chain's recompute of the run, then drive the same engine with a fresh
   recorder and are compared as ADR-041 decision 4 compares a run. A warm
   run under another origin or cutover, or without `[history]`, is `NOT
@@ -26,8 +26,8 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   The report gains `history origin <ms> cutover <ms>: one pass through run
   <id>` and a warm run line with its prefix events. Cold runs are compared
   and printed as before. New: `HistoryChain::to_end_of`,
-  `HistoryChainStream::run_of_last_event`,
-  `LiveReplayStream::run_of_last_event`, and
+  `HistoryChainStream::run_of_last_event` and `failed_run`,
+  `LiveReplayStream::run_of_last_event` and `failed_run`, and
   `mie_app::equivalence::RunParts` and `compare_prefix`. ADR-041's status
   line records the superseded comparison unit.
 - **`mie ingest` warm-starts from the history chain while the capture runs

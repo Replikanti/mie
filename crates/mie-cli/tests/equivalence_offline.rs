@@ -44,6 +44,10 @@
 //! - (J) A cold chain run (failed warm-up) before a warm one: the first is
 //!   compared in the cold unit, the second's prefix crosses the first's
 //!   chain recompute; both `EQUIVALENT`.
+//! - (L) A chain run between two warm runs that crashed, delivered no
+//!   event, or fails to load: the warm runs before it keep their full
+//!   verdict, whatever else is selected; a failure is charged to the warm
+//!   runs from the failed run on.
 //! - (K) The runs of (I) without `[history]` or under another cutover are
 //!   `NOT COMPARABLE`, naming both chains; under another feature set they
 //!   compare the events only.
@@ -1415,6 +1419,125 @@ fn a_warm_run_after_a_cold_chain_run_crosses_its_chain_recompute() {
         )),
         "{text}"
     );
+}
+
+/// The line of run `run_id` in a report.
+fn run_line<'a>(text: &'a str, run_id: &str) -> &'a str {
+    let prefix = format!("run {run_id}: ");
+    text.lines()
+        .find(|l| l.starts_with(&prefix))
+        .unwrap_or_else(|| panic!("no line of {run_id}: {text}"))
+}
+
+#[test]
+fn a_crashed_empty_or_failing_run_between_warm_runs_is_charged_to_no_earlier_one() {
+    let dir = TempDir::new("equivalence-warm-between");
+    import_archive(dir.path());
+    let config = warm_config(dir.path(), Some(1_000));
+    let t1 = CUTOVER + HOUR;
+    let (t2, t3) = (t1 + HOUR, t1 + 2 * HOUR);
+    let w1 = warm_run(&config, t1, 10_000, t1 - 4_000);
+    let r2 = warm_run(&config, t2, 20_000, t2 - 3_000);
+    let w3 = warm_run(&config, t3, 30_000, t3 - 3_000);
+    let lines = journal(&config);
+    let (outcome, text) = check(&config, t1, t3 + 1);
+    assert!(outcome.pass, "{text}");
+    let alone = |config: &IngestConfig| {
+        let (outcome, text) = check(config, t1, t1 + 1);
+        assert_eq!(outcome.runs.len(), 1, "{text}");
+        (
+            outcome.runs[0].verdict.clone(),
+            run_line(&text, &w1).to_owned(),
+        )
+    };
+    let w1_alone = alone(&config);
+    assert_eq!(w1_alone.0, Verdict::Equivalent);
+    let end_of = |run_id: &str| {
+        lines
+            .iter()
+            .position(|l| l["type"] == "run_end" && l["run_id"] == run_id)
+            .unwrap()
+    };
+
+    // R2 fails to load: its run_end counts one record more than the store
+    // holds. W1's events were all delivered before R2 was read, so W1 keeps
+    // the verdict and line it has when selected alone; R2 and W3 are not
+    // comparable.
+    let mut failing = lines.clone();
+    let records = failing[end_of(&r2)]["records"].as_u64().unwrap();
+    failing[end_of(&r2)]["records"] = json!(records + 1);
+    let copy = TempDir::new("equivalence-warm-failing");
+    let failing = with_journal(&config, copy.path(), &failing);
+    let (outcome, text) = check(&failing, t1, t3 + 1);
+    assert_eq!(outcome.runs.len(), 3, "{text}");
+    assert_eq!(outcome.runs[0].verdict, Verdict::Equivalent, "{text}");
+    assert_eq!(run_line(&text, &w1), w1_alone.1, "{text}");
+    assert_eq!(alone(&failing), w1_alone);
+    for (run, verdict) in [&r2, &w3].iter().zip(&outcome.runs[1..]) {
+        let Verdict::NotComparable(reason) = &verdict.verdict else {
+            panic!("{text}")
+        };
+        assert!(
+            reason.starts_with("chain replay failed: ")
+                && reason.contains(&format!("run {r2} ended cleanly but ")),
+            "{run}: {reason}"
+        );
+    }
+    assert_eq!(outcome.exit_code(), 1);
+
+    // A failure of the earlier warm run's own data still reaches it: one of
+    // W1's records counted missing too.
+    let mut own = lines.clone();
+    let records = own[end_of(&w1)]["records"].as_u64().unwrap();
+    own[end_of(&w1)]["records"] = json!(records + 1);
+    let copy = TempDir::new("equivalence-warm-own-failure");
+    let (outcome, text) = check(&with_journal(&config, copy.path(), &own), t1, t3 + 1);
+    for verdict in &outcome.runs {
+        assert!(
+            matches!(&verdict.verdict, Verdict::NotComparable(r) if r.starts_with("chain replay failed: ")),
+            "{text}"
+        );
+    }
+
+    // R2 crashed: no run_end, so it ends at W3's start (ADR-039 D2). The
+    // crashed run is not comparable itself; the warm runs around it are.
+    let mut crashed = lines.clone();
+    crashed.remove(end_of(&r2));
+    let copy = TempDir::new("equivalence-warm-crashed");
+    let (outcome, text) = check(&with_journal(&config, copy.path(), &crashed), t1, t3 + 1);
+    assert_eq!(outcome.runs[0].verdict, Verdict::Equivalent, "{text}");
+    assert_eq!(
+        outcome.runs[1].verdict,
+        Verdict::NotComparable("the run did not end cleanly".to_owned()),
+        "{text}"
+    );
+    assert_eq!(outcome.runs[2].verdict, Verdict::Equivalent, "{text}");
+
+    // An empty chain run between W1 and R2: a clean run that captured
+    // nothing. Its part is empty, and the warm runs after it cross it.
+    let mut empty = lines.clone();
+    let mut start = one(&lines, &w1, "run_start").clone();
+    let (empty_id, at) = ("20261006T013000Z", t1 + 30 * 60_000);
+    start["run_id"] = json!(empty_id);
+    start["at_ms"] = json!(at);
+    let end = json!({
+        "type": "run_end", "run_id": empty_id, "at_ms": at + 60_000, "exit_code": 0,
+        "error": null, "events": 0, "domain_rejections": 0, "records": 0,
+    });
+    let after_w1 = end_of(&w1) + 1;
+    empty.splice(after_w1..after_w1, [start, end]);
+    let copy = TempDir::new("equivalence-warm-empty");
+    let (outcome, text) = check(&with_journal(&config, copy.path(), &empty), t1, t3 + 1);
+    assert_eq!(outcome.runs.len(), 4, "{text}");
+    assert_eq!(outcome.runs[1].run_id, empty_id);
+    assert_eq!(
+        outcome.runs[1].verdict,
+        Verdict::NotComparable(NOTHING_COMPARED.to_owned()),
+        "{text}"
+    );
+    for i in [0, 2, 3] {
+        assert_eq!(outcome.runs[i].verdict, Verdict::Equivalent, "{text}");
+    }
 }
 
 #[test]

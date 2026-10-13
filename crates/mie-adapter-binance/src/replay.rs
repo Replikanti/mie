@@ -495,6 +495,7 @@ impl<'a> HistoricalDataProvider for LiveReplay<'a> {
             trailing: Vec::new(),
             stats: Vec::new(),
             delivered_from: None,
+            failed_run: None,
             failed: None,
         };
         Ok(Replay {
@@ -538,6 +539,8 @@ pub struct LiveReplayStream<'a> {
     /// The index in `stats` of the run whose recompute delivered the event
     /// [`next_event`](MarketDataProvider::next_event) returned last.
     delivered_from: Option<usize>,
+    /// The run whose load failed, when one did.
+    failed_run: Option<String>,
     failed: Option<ProviderError>,
 }
 
@@ -577,6 +580,17 @@ impl LiveReplayStream<'_> {
     pub fn run_of_last_event(&self) -> Option<&str> {
         self.delivered_from
             .map(|index| self.stats[index].run_id.as_str())
+    }
+
+    /// The run whose read, check or recompute failed the stream, once
+    /// [`next_event`](MarketDataProvider::next_event) failed: every event of
+    /// the runs before it was delivered, and none of it or of a later run.
+    /// `None` before a failure, and for the check after the last run
+    /// (records in the window no run claims), which is no one run's. The
+    /// history chain charges a failure to the run it belongs to by it
+    /// (ADR-052 D9).
+    pub fn failed_run(&self) -> Option<&str> {
+        self.failed_run.as_deref()
     }
 
     /// Where the chained output stands after the runs loaded so far: its
@@ -917,6 +931,7 @@ impl MarketDataProvider for LiveReplayStream<'_> {
                 return Ok(None);
             };
             if let Err(failed) = self.load(&run, extent) {
+                self.failed_run = Some(run.run_id);
                 self.failed = Some(failed.clone());
                 return Err(failed);
             }

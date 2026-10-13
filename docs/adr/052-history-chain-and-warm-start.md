@@ -496,8 +496,12 @@ deferred option D are under *Alternatives considered*.
    - **Precedence:** the checks above; `DIVERGED (warm prefix)`; the first
      divergent checkpoint; a `run_end` total; nothing compared (no
      checkpoint); else `EQUIVALENT` or `EVENTS EQUIVALENT, STATE NOT
-     COMPARABLE`. A failure of the chain makes the run and every later
-     warm run of the pass `NOT COMPARABLE`.
+     COMPARABLE`. A failure of the chain makes the warm run it reaches and
+     every later one `NOT COMPARABLE`. A chain run that fails to load
+     (`HistoryChainStream::failed_run`) is charged to the first warm run at
+     or after it, never to an earlier one: every event before the failed
+     run was delivered, so an earlier warm run's verdict is the one a pass
+     ending with it gives, whichever later runs are selected.
    - **The report.** After the encodings, when a pass ran, one line
      `history origin <ms> cutover <ms>: one pass through run <id>`. A warm
      run's line carries its replayed prefix events, the chain's records,
@@ -512,19 +516,25 @@ deferred option D are under *Alternatives considered*.
      verdict: `warm_start` journals the prefix's version when the warm-up
      starts, while the run itself is still capturing. The prefix's
      selection ends at the predecessor's end plus `RUN_MARGIN_MS`
-     (300 000 ms, ADR-039 decision 2). The run's own first records lie at
-     its start, and by ADR-039 decision 2 at most 300 000 ms before it. So
-     for a run that starts within 300 000 ms of its predecessor's end, and
-     possibly for one within 2 × 300 000 ms, the run's first sealed files
-     later fall inside the prefix's selection, and the current version
-     differs without any data change (decision 5: a window's version is
-     stable only once later runs have sealed past its end plus the
-     margin). A restart 600 000 ms or more after the predecessor's end
-     keeps the version. The adapter's tests pin both sides: a restart 60 s
-     after the predecessor's end moves the version while the prefix's
-     events stay identical, one 10 min after it keeps both.
-     Comparing the versions would mark every fast restart `DIVERGED`,
-     #106's SIGTERM restart included. A version that excluded the run's
+     (300 000 ms, ADR-039 decision 2). The current version differs from
+     the journaled one, without any data change, once the run has sealed a
+     file whose first record lies before that end plus 300 000 ms: the
+     file then falls inside the prefix's selection (decision 5: a window's
+     version is stable only once later runs have sealed past its end plus
+     the margin). What decides is when the run's first records lie, not
+     when the run starts: a restart 299 s after the predecessor's end
+     whose first record arrives 2 s after its start keeps the version.
+     ADR-039 decision 2 puts a run's records at most 300 000 ms before its
+     start, so the version can move only for a run that starts less than
+     600 000 ms after its predecessor's end, and never for one at or above
+     it, as long as that premise holds; the replay does not check it for
+     records inside the files it reads. The adapter's tests pin one case on
+     each side: a run that starts 60 s after the predecessor's end with its
+     first record 1 s later moves the version while the prefix's events
+     stay identical; one that starts 10 min after it keeps both.
+     Comparing the versions would mark a fast restart `DIVERGED` whenever
+     its first records come within the margin, #106's SIGTERM restart
+     included. A version that excluded the run's
      own files would change decision 5 and W3's journal.
    - ADR-041 decisions 1–3 and 5 are unchanged, and runs without a warm
      start keep the cold unit.
@@ -921,9 +931,9 @@ deferred option D are under *Alternatives considered*.
   (`prefix_events`, `run_end.events`)** — decision 9: a recompute with
   extra trailing events would be cut at the journaled count and pass. The
   split follows the adapter's attribution of each event instead.
-- **Equivalence: comparing the prefix dataset versions** — decision 9:
-  every restart within 300 000 ms of its predecessor's end would be
-  `DIVERGED` without a data change.
+- **Equivalence: comparing the prefix dataset versions** — decision 9: a
+  restart whose first records lie within 300 000 ms of its predecessor's
+  end would be `DIVERGED` without a data change.
 - **Equivalence: another chain as `DIVERGED (warm prefix)`** — decision
   9: another origin or cutover is another dataset, which the run was never
   meant to match; `NOT COMPARABLE` says so, as an encoding mismatch does.

@@ -375,13 +375,25 @@ pub fn compare_prefix(
 /// run at `index`, `None` before every run (the history chain's archive
 /// segment). Parts must not decrease along the stream.
 ///
+/// `failure_part` maps the inner provider, right after it failed, to the
+/// run the failure belongs to, when it belongs to one: every event of the
+/// parts before that run was delivered, and none of it. Such a failure ends
+/// the views of the earlier parts cleanly and reaches the first view of
+/// that run or later, so a run's verdict never depends on whether a later
+/// run is part of the pass. A failure that belongs to no run reaches the
+/// view that meets it.
+///
 /// The views are taken in order: [`before`](Self::before) a run's index,
 /// then [`run`](Self::run) of it, for increasing indices. A view ends at
 /// the first event of a later part and holds that event for the next view.
 #[derive(Debug)]
-pub struct RunParts<P, F> {
+pub struct RunParts<P, F, G> {
     inner: P,
     part_of: F,
+    failure_part: G,
+    /// A failure of the inner provider that belongs to the run at the
+    /// index, not delivered yet.
+    held_failure: Option<(ProviderError, usize)>,
     /// The event read last and not delivered yet, with its part.
     held: Option<(MarketEvent, Option<usize>)>,
     /// The part of the event read last.
@@ -403,21 +415,24 @@ enum View {
 /// One view of a [`RunParts`]: a [`MarketDataProvider`] over the events of
 /// some parts.
 #[derive(Debug)]
-pub struct PartView<'a, P, F> {
-    parts: &'a mut RunParts<P, F>,
+pub struct PartView<'a, P, F, G> {
+    parts: &'a mut RunParts<P, F, G>,
     view: View,
 }
 
-impl<P, F> RunParts<P, F>
+impl<P, F, G> RunParts<P, F, G>
 where
     P: MarketDataProvider,
     F: FnMut(&P) -> Option<usize>,
+    G: FnMut(&P) -> Option<usize>,
 {
-    /// Splits `inner` by `part_of`.
-    pub fn new(inner: P, part_of: F) -> Self {
+    /// Splits `inner` by `part_of`, its failures by `failure_part`.
+    pub fn new(inner: P, part_of: F, failure_part: G) -> Self {
         Self {
             inner,
             part_of,
+            failure_part,
+            held_failure: None,
             held: None,
             reached: None,
             ended: false,
@@ -428,7 +443,7 @@ where
 
     /// The events whose part is before the run at `index`: the parts
     /// before every run and those of earlier runs.
-    pub fn before(&mut self, index: usize) -> PartView<'_, P, F> {
+    pub fn before(&mut self, index: usize) -> PartView<'_, P, F, G> {
         PartView {
             parts: self,
             view: View::Before(index),
@@ -436,7 +451,7 @@ where
     }
 
     /// The events of the run at `index`.
-    pub fn run(&mut self, index: usize) -> PartView<'_, P, F> {
+    pub fn run(&mut self, index: usize) -> PartView<'_, P, F, G> {
         PartView {
             parts: self,
             view: View::Run(index),
@@ -462,12 +477,34 @@ where
         let (event, part) = match self.held.take() {
             Some(held) => held,
             None => {
+                if let Some((_, run)) = &self.held_failure {
+                    let reached = match view {
+                        View::Before(index) => *run < index,
+                        View::Run(index) => *run <= index,
+                    };
+                    if !reached {
+                        return Ok(None);
+                    }
+                    let (failed, _) = self.held_failure.take().expect("checked above");
+                    self.failed = Some(failed.clone());
+                    return Err(failed);
+                }
                 if self.ended {
                     return Ok(None);
                 }
-                let Some(event) = self.inner.next_event()? else {
-                    self.ended = true;
-                    return Ok(None);
+                let event = match self.inner.next_event() {
+                    Ok(Some(event)) => event,
+                    Ok(None) => {
+                        self.ended = true;
+                        return Ok(None);
+                    }
+                    Err(failed) => {
+                        match (self.failure_part)(&self.inner) {
+                            Some(run) => self.held_failure = Some((failed, run)),
+                            None => self.failed = Some(failed),
+                        }
+                        return self.next_in(view);
+                    }
                 };
                 let part = (self.part_of)(&self.inner);
                 if let Some(reached) = self.reached.filter(|&reached| part < reached) {
@@ -512,14 +549,17 @@ fn part_name(part: Option<usize>) -> String {
     part.map_or_else(|| "no run".to_owned(), |index| format!("run {index}"))
 }
 
-impl<P, F> MarketDataProvider for PartView<'_, P, F>
+impl<P, F, G> MarketDataProvider for PartView<'_, P, F, G>
 where
     P: MarketDataProvider,
     F: FnMut(&P) -> Option<usize>,
+    G: FnMut(&P) -> Option<usize>,
 {
     /// # Errors
     ///
-    /// The inner provider's failures; [`ProviderError::Contract`] when the
+    /// The inner provider's failures, in the first view of the run they
+    /// belong to or later ([`RunParts`]), and from then on;
+    /// [`ProviderError::Contract`] when the
     /// parts go back or a run's view meets an event of an earlier part (the
     /// views were not taken in order), and from then on.
     fn next_event(&mut self) -> Result<Option<MarketEvent>, ProviderError> {
@@ -822,6 +862,8 @@ mod tests {
         events: VecDeque<(MarketEvent, Option<usize>)>,
         last: Option<usize>,
         fail: bool,
+        /// The run its failure belongs to.
+        failed_run: Option<usize>,
     }
 
     impl Parted {
@@ -830,6 +872,7 @@ mod tests {
                 events: events.iter().cloned().collect(),
                 last: None,
                 fail: false,
+                failed_run: None,
             }
         }
     }
@@ -847,10 +890,14 @@ mod tests {
         }
     }
 
-    fn split(
-        events: &[(MarketEvent, Option<usize>)],
-    ) -> RunParts<Parted, fn(&Parted) -> Option<usize>> {
-        RunParts::new(Parted::new(events), |p: &Parted| p.last)
+    type Part = fn(&Parted) -> Option<usize>;
+
+    fn parts_of(parted: Parted) -> RunParts<Parted, Part, Part> {
+        RunParts::new(parted, |p| p.last, |p| p.failed_run)
+    }
+
+    fn split(events: &[(MarketEvent, Option<usize>)]) -> RunParts<Parted, Part, Part> {
+        parts_of(Parted::new(events))
     }
 
     fn drain(provider: &mut impl MarketDataProvider) -> Result<Vec<MarketEvent>, ProviderError> {
@@ -913,15 +960,51 @@ mod tests {
             "{err}"
         );
 
-        // A provider failure.
+        // A provider failure that belongs to no run reaches the view that
+        // meets it.
+        let failure = Err(ProviderError::Source("the store failed".to_owned()));
         let mut failing = Parted::new(&parted());
         failing.fail = true;
-        let mut parts = RunParts::new(failing, |p: &Parted| p.last);
+        let mut parts = parts_of(failing);
         drain(&mut parts.before(2)).unwrap();
-        assert_eq!(
-            drain(&mut parts.run(2)),
-            Err(ProviderError::Source("the store failed".to_owned()))
-        );
+        assert_eq!(drain(&mut parts.run(2)), failure);
+        assert_eq!(drain(&mut parts.run(3)), failure, "and from then on");
+    }
+
+    #[test]
+    fn a_failure_of_a_later_run_ends_the_earlier_views_cleanly() {
+        // Run 2 fails to load after run 0's events: run 0's view ends
+        // cleanly, as if the pass ended with run 0, and the failure reaches
+        // run 2's view.
+        let events = tape();
+        let failure = Err(ProviderError::Source("the store failed".to_owned()));
+        let failing = |failed_run| {
+            let mut parted = Parted::new(&parted()[..5]);
+            parted.fail = true;
+            parted.failed_run = Some(failed_run);
+            parts_of(parted)
+        };
+        let mut parts = failing(2);
+        assert_eq!(drain(&mut parts.before(0)).unwrap(), events[..3]);
+        assert_eq!(drain(&mut parts.run(0)).unwrap(), events[3..5]);
+        assert!(drain(&mut parts.before(1)).unwrap().is_empty());
+        assert!(drain(&mut parts.run(1)).unwrap().is_empty());
+        assert!(drain(&mut parts.before(2)).unwrap().is_empty());
+        assert_eq!(parts.hash(), hash_of(&events[..5]), "run 2's prefix");
+        assert_eq!(drain(&mut parts.run(2)), failure);
+        assert_eq!(drain(&mut parts.run(3)), failure, "and from then on");
+
+        // A pass that skips the failed run's views meets it in a later
+        // run's prefix.
+        let mut parts = failing(2);
+        drain(&mut parts.before(0)).unwrap();
+        drain(&mut parts.run(0)).unwrap();
+        assert_eq!(drain(&mut parts.before(3)), failure);
+
+        // A failure of the run being read reaches its own view.
+        let mut parts = failing(0);
+        drain(&mut parts.before(0)).unwrap();
+        assert_eq!(drain(&mut parts.run(0)), failure);
     }
 
     #[test]
