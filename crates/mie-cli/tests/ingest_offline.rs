@@ -1302,13 +1302,27 @@ fn a_restart_is_journaled_when_it_happens_even_if_the_run_then_fails() {
     assert_eq!(one(&lines, run, "run_end")["exit_code"], 1);
 }
 
-#[test]
-fn a_queue_past_its_limit_abandons_the_warm_up_and_starts_cold() {
-    let dir = TempDir::new("warm-queue-overflow");
+/// Where the warm-up of [`overflow_run`] is held.
+#[derive(Clone, Copy)]
+enum HoldAt {
+    /// Before its memory guard: the queue may hold all of
+    /// `max_run_records`.
+    BeforeGuard,
+    /// After it has its result, so after the guard lowered the queue's
+    /// limit to what `max_run_records` leaves beside the largest run.
+    AfterGuard,
+}
+
+/// A chain run after a 3-record predecessor with `max_run_records` `max`
+/// whose warm-up is held at `at` until the run has journaled its
+/// `warm_start`: no record arrives before the hold is reached, and the hold
+/// lasts until the queue has overflowed, so the limit in force is exactly
+/// the one of `at`. Returns the cold run's error and the run's journal.
+fn overflow_run(tag: &str, max: u64, at: HoldAt) -> (String, Vec<Value>) {
+    let dir = TempDir::new(tag);
     import_archive(dir.path());
     let mut config = history_config(dir.path(), "2026-10-03", "2026-10-06");
-    // The predecessor holds 3 records; the guard admits it.
-    config.history.as_mut().unwrap().max_run_records = Some(5);
+    config.history.as_mut().unwrap().max_run_records = Some(max);
     let times = [
         CUTOVER + HOUR,
         CUTOVER + HOUR + 1_000,
@@ -1323,24 +1337,44 @@ fn a_queue_past_its_limit_abandons_the_warm_up_and_starts_cold() {
     );
     write_records(&config, &records, &lines);
     let t = CUTOVER + 2 * HOUR;
-    // The warm-up is held before its guard, so the queue may hold all 5
-    // records `max_run_records` allows; the 6th overflows it. The warm-up is
-    // released only after that.
+
+    let reached = Arc::new(AtomicBool::new(false));
     let release = Arc::new(AtomicBool::new(false));
-    let released = Arc::clone(&release);
-    let before: Box<dyn FnOnce() + Send> = Box::new(move || {
+    let hold: Box<dyn FnOnce() + Send> = {
+        let (reached, release) = (Arc::clone(&reached), Arc::clone(&release));
+        Box::new(move || {
+            reached.store(true, Ordering::SeqCst);
+            let deadline = Instant::now() + WAIT_DEADLINE;
+            while !release.load(Ordering::SeqCst) {
+                assert!(Instant::now() < deadline, "the warm-up was never released");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        })
+    };
+    let journal_path = config.paths.journal.clone();
+    let mut steps = vec![Step::Run(Box::new(move || {
+        // No record before the warm-up has reached its hold.
         let deadline = Instant::now() + WAIT_DEADLINE;
-        while !released.load(Ordering::SeqCst) {
-            assert!(Instant::now() < deadline, "the warm-up was never released");
+        while !reached.load(Ordering::SeqCst) {
+            assert!(
+                Instant::now() < deadline,
+                "the warm-up never reached its hold"
+            );
             std::thread::sleep(Duration::from_millis(1));
         }
-    });
-    let mut steps: Vec<Step> = (0..8)
-        .map(|i| Step::Frame(AGG, agg(1 + i, t + 10 + 1_000 * i as i64)))
-        .collect();
+    }))];
+    steps.extend((0..8).map(|i| Step::Frame(AGG, agg(1 + i, t + 10 + 1_000 * i as i64))));
     steps.push(Step::Run(Box::new(move || {
-        // Let the capture hand the 8 records to the core first.
-        std::thread::sleep(Duration::from_millis(50));
+        // The overflow journals (and syncs) the cold `warm_start`; only
+        // then is the abandoned warm-up let go.
+        let deadline = Instant::now() + WAIT_DEADLINE;
+        while !std::fs::read_to_string(&journal_path)
+            .unwrap_or_default()
+            .contains("\"warm_start\"")
+        {
+            assert!(Instant::now() < deadline, "the queue never overflowed");
+            std::thread::sleep(Duration::from_millis(1));
+        }
         release.store(true, Ordering::SeqCst);
     })));
     steps.extend((8..10).map(|i| Step::Frame(AGG, agg(1 + i, t + 10 + 1_000 * i as i64))));
@@ -1358,35 +1392,45 @@ fn a_queue_past_its_limit_abandons_the_warm_up_and_starts_cold() {
         http: Arc::new(Oi(Arc::clone(&script))),
         clock: Arc::new(ClockOf(Arc::clone(&script))),
     };
-    let hold = WarmUpHold {
-        before: Some(before),
-        after: None,
+    let hold = match at {
+        HoldAt::BeforeGuard => WarmUpHold {
+            before: Some(hold),
+            after: None,
+        },
+        HoldAt::AfterGuard => WarmUpHold {
+            before: None,
+            after: Some(hold),
+        },
     };
     let outcome =
         mie_cli::ingest::run_with_hold(&config, transports, shutdown, hold).expect("ingest starts");
     let cold = assert_cold(&config, &outcome, "warm-up-failed");
-    let error = cold["error"].as_str().unwrap();
-    assert!(
-        error.contains("warm-up queue") && error.contains("max_run_records 5"),
-        "{error}"
-    );
-    // Overflowed at the first record past the limit: all 5 while the
-    // warm-up was held, or, when the core took the records only after the
-    // release, the 2 that the guard's largest run (3) leaves.
-    let number = |after: &str| -> u64 {
-        error
-            .split(after)
-            .next()
-            .and_then(|head| head.rsplit(' ').next())
-            .and_then(|n| n.parse().ok())
-            .unwrap_or_else(|| panic!("{error}"))
-    };
-    let (queued, limit) = (number(" records queued"), number(" that [history]"));
-    assert!(queued == limit + 1 && (limit == 5 || limit == 2), "{error}");
-    // Every trade reached the cold engine: the queued ones, then the rest.
     let lines = journal(&config);
+    // Every trade reached the cold engine: the queued ones, then the rest.
     let end = one(&lines, &outcome.run_id, "run_end");
     assert_eq!(end["records"], 10);
     assert_eq!(outcome.domain_rejections, 0);
     assert!(outcome.events >= 10, "{}", outcome.events);
+    (cold["error"].as_str().unwrap().to_owned(), lines)
+}
+
+#[test]
+fn a_queue_past_its_limit_abandons_the_warm_up_and_starts_cold() {
+    let expected = |queued: u64, limit: u64, max: u64| {
+        format!(
+            "warm-up queue (ADR-052 D13): {queued} records queued, more than the {limit} that \
+             [history] max_run_records {max} leaves beside the run the warm-up replays"
+        )
+    };
+    // Before the guard: nothing is replayed yet, so the queue may hold all
+    // of max_run_records.
+    let (error, _) = overflow_run("queue-before-guard", 5, HoldAt::BeforeGuard);
+    assert_eq!(error, expected(6, 5, 5));
+    // After the guard: the 3-record predecessor leaves 2.
+    let (error, _) = overflow_run("queue-after-guard", 5, HoldAt::AfterGuard);
+    assert_eq!(error, expected(3, 2, 5));
+    // The boundary: the guard admits a run of exactly max_run_records,
+    // which leaves the queue no room; the first queued record overflows it.
+    let (error, _) = overflow_run("queue-no-room", 3, HoldAt::AfterGuard);
+    assert_eq!(error, expected(1, 0, 3));
 }
