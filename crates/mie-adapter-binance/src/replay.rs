@@ -37,7 +37,10 @@
 //!   [`HoldBack`](crate::holdback::HoldBack): in-order events pass
 //!   unchanged, and an event of a fast restart that is not above the last
 //!   delivered one becomes a `LateEvent` gap or re-timed open interest,
-//!   never an engine `OutOfOrder`.
+//!   never an engine `OutOfOrder`. A run's pipeline and that join are one
+//!   [`RunContinuation`], which the warm start (ADR-052 D7) also pushes the
+//!   live run's records through, so the live engine's input is this
+//!   recompute by construction.
 //! - **Window** (D4). An event is delivered when its ordering time lies in
 //!   the window; a gap counts at its `end`. A gap whose `end` is at or after
 //!   the window's end is not delivered — live announced it only when the
@@ -283,7 +286,7 @@ impl<'a> LiveReplay<'a> {
                 }
             }
         }
-        let (events, stats) = recompute(run, sorted(run, records)?)?;
+        let (events, stats) = recompute(run, sorted(run, records)?, None)?;
         Ok(RunReplay {
             events: events.into(),
             stats,
@@ -303,6 +306,77 @@ impl<'a> LiveReplay<'a> {
                 )
             })
             .collect()
+    }
+}
+
+/// One run's recompute, record by record: the run's [`Pipeline`], whose
+/// released events pass, when the run continues an earlier output, through
+/// the zero hold-back [`HoldBack::after`] that joins it (module docs, D3).
+///
+/// The one recompute of a run: [`LiveReplay::replay`] and
+/// [`LiveReplay::run_replay`] push a run's stored records through it, and
+/// the warm start pushes the live run's records through it as they arrive
+/// (ADR-052 D7). The output is a pure function of the parameters and of
+/// the records in the order given, so pushing a run's records one at a
+/// time gives exactly the events a recompute of all of them gives.
+#[derive(Debug, Clone)]
+pub struct RunContinuation {
+    pipeline: Pipeline,
+    join: Option<HoldBack>,
+}
+
+impl RunContinuation {
+    /// The recompute of a run of `symbol` with its `hold_back_ms`,
+    /// `oi_retime_ms` and `seeds` (the inputs of [`Pipeline::new`]). With
+    /// `after` = `(last, newest_oi)` it continues an earlier output whose
+    /// last event is `last` and whose newest open-interest time is
+    /// `newest_oi` ([`HoldBack::after`] with `oi_retime_ms`); without, its
+    /// output is the pipeline's.
+    pub fn new(
+        symbol: &str,
+        hold_back_ms: i64,
+        oi_retime_ms: i64,
+        seeds: &BTreeMap<BinanceStream, EventTime>,
+        after: Option<(MarketEvent, Option<EventTime>)>,
+    ) -> Self {
+        Self {
+            pipeline: Pipeline::new(symbol, hold_back_ms, oi_retime_ms, seeds),
+            join: after.map(|(last, newest_oi)| HoldBack::after(last, newest_oi, oi_retime_ms)),
+        }
+    }
+
+    /// Takes the run's next record of `stream` and returns the events now
+    /// due, in canonical order.
+    pub fn push(&mut self, stream: BinanceStream, record: &RawRecord) -> Vec<MarketEvent> {
+        let events = self.pipeline.push(stream, record).events;
+        self.joined(events)
+    }
+
+    /// Releases everything still held: the pipeline's hold-back, then the
+    /// join's.
+    pub fn finish(&mut self) -> Vec<MarketEvent> {
+        let events = self.pipeline.finish();
+        let mut out = self.joined(events);
+        if let Some(join) = self.join.as_mut() {
+            out.extend(join.finish());
+        }
+        out
+    }
+
+    /// The pipeline's counters so far.
+    pub fn stats(&self) -> PipelineStats {
+        self.pipeline.stats()
+    }
+
+    fn joined(&mut self, events: Vec<MarketEvent>) -> Vec<MarketEvent> {
+        let Some(join) = self.join.as_mut() else {
+            return events;
+        };
+        let mut out = Vec::with_capacity(events.len());
+        for event in events {
+            out.extend(join.push(event).1);
+        }
+        out
     }
 }
 
@@ -491,6 +565,22 @@ impl LiveReplayStream<'_> {
         &self.trailing
     }
 
+    /// Where the chained output stands after the runs loaded so far: its
+    /// last event, delivered or not, its newest open-interest time, and per
+    /// domain series its newest event time (the earlier segment's included,
+    /// [`continue_after`](Self::continue_after)). After the last run it is
+    /// what a run chained next continues after, and its chain seeds
+    /// (ADR-052 D3).
+    pub(crate) fn tail(
+        &self,
+    ) -> (
+        Option<&MarketEvent>,
+        Option<EventTime>,
+        &BTreeMap<Stream, EventTime>,
+    ) {
+        (self.last.as_ref(), self.newest_oi, &self.newest)
+    }
+
     /// Chains the first run after `last`, the last event of an earlier
     /// segment, with `newest_oi` as the newest open-interest time it
     /// delivered (ADR-052 D2, the seam): the first run then passes the same
@@ -517,23 +607,11 @@ impl LiveReplayStream<'_> {
     /// events.
     fn load(&mut self, run: &LiveRun, extent: (i64, i64)) -> Result<(), ProviderError> {
         let records = self.read_run(run, extent)?;
+        let after = self.last.clone().map(|last| (last, self.newest_oi));
         let (events, stats) = if self.chain.is_some() {
-            recompute(&with_chain_seeds(run, &self.newest), records)?
+            recompute(&with_chain_seeds(run, &self.newest), records, after)?
         } else {
-            recompute(run, records)?
-        };
-
-        let events = match &self.last {
-            Some(last) => {
-                let mut hold = HoldBack::after(last.clone(), self.newest_oi, run.oi_retime_ms);
-                let mut chained = Vec::with_capacity(events.len());
-                for event in events {
-                    chained.extend(hold.push(event).1);
-                }
-                chained.extend(hold.finish());
-                chained
-            }
-            None => events,
+            recompute(run, records, after)?
         };
         if let Some(last) = events.last() {
             self.last = Some(last.clone());
@@ -686,7 +764,7 @@ impl LiveReplayStream<'_> {
 /// `run` with the chain seeds of `newest` (module docs): per non-book
 /// stream, the chain's newest event time of its domain series replaces a
 /// journaled seed that is missing or newer.
-fn with_chain_seeds(run: &LiveRun, newest: &BTreeMap<Stream, EventTime>) -> LiveRun {
+pub(crate) fn with_chain_seeds(run: &LiveRun, newest: &BTreeMap<Stream, EventTime>) -> LiveRun {
     let mut run = run.clone();
     for stream in BinanceStream::ALL {
         if matches!(stream, BinanceStream::Depth | BinanceStream::DepthSnapshot) {
@@ -716,14 +794,16 @@ fn sorted(run: &LiveRun, mut records: RunRecords) -> Result<RunRecords, Provider
     Ok(records)
 }
 
-/// Checks a run's sorted records and recomputes them with the run's
-/// pipeline: the one recompute of [`LiveReplay::replay`] and
+/// Checks a run's sorted records and recomputes them through a
+/// [`RunContinuation`] with the run's parameters, continuing `after` when
+/// given (D3): the one recompute of [`LiveReplay::replay`] and
 /// [`LiveReplay::run_replay`] (module docs, D2). A run that ended cleanly
 /// must be complete; a crashed run is recomputed over its contiguous
 /// `receive_seq` prefix.
 fn recompute(
     run: &LiveRun,
     records: RunRecords,
+    after: Option<(MarketEvent, Option<EventTime>)>,
 ) -> Result<(Vec<MarketEvent>, RunStats), ProviderError> {
     let found = records.len();
     let prefix = records
@@ -752,19 +832,25 @@ fn recompute(
         }
     }
 
-    let mut pipeline = Pipeline::new(&run.symbol, run.hold_back_ms, run.oi_retime_ms, &run.seeds);
+    let mut continuation = RunContinuation::new(
+        &run.symbol,
+        run.hold_back_ms,
+        run.oi_retime_ms,
+        &run.seeds,
+        after,
+    );
     let mut events = Vec::new();
     for (_, stream, record) in &records[..prefix] {
-        events.extend(pipeline.push(*stream, record).events);
+        events.extend(continuation.push(*stream, record));
     }
-    events.extend(pipeline.finish());
+    events.extend(continuation.finish());
     let stats = RunStats {
         run_id: run.run_id.clone(),
         records: found as u64,
         replayed: prefix as u64,
         ignored: (found - prefix) as u64,
         clean: run.clean_records.is_some(),
-        pipeline: pipeline.stats(),
+        pipeline: continuation.stats(),
     };
     Ok((events, stats))
 }
@@ -996,6 +1082,93 @@ mod tests {
                 .count(),
             120
         );
+    }
+
+    #[test]
+    fn a_run_continuation_is_the_recompute_and_its_chaining_record_by_record() {
+        // Without a join: the run's pipeline, as live delivered it.
+        let b = busy_run();
+        let run = b.run(T0, Some(T0 + 21_000), Some(b.records.len() as u64));
+        let mut alone = RunContinuation::new(
+            &run.symbol,
+            run.hold_back_ms,
+            run.oi_retime_ms,
+            &run.seeds,
+            None,
+        );
+        let mut out = Vec::new();
+        for (stream, record) in &b.records {
+            out.extend(alone.push(*stream, record));
+        }
+        out.extend(alone.finish());
+        assert_eq!(out, b.live(&run));
+        assert_eq!(alone.stats().streams[&BinanceStream::AggTrade].records, 200);
+
+        // With a join: the run's pipeline output through the zero hold-back
+        // `HoldBack::after`, as the chained replay computed it before
+        // `RunContinuation` existed, and as the replay delivers it now.
+        let mut first = RunBuilder::new("20261006T010000Z");
+        for i in 0..50_u64 {
+            first.push(BinanceStream::AggTrade, 1, agg(1 + i, T0 + 200 * i as i64));
+        }
+        first.push(BinanceStream::OpenInterest, 1, oi(T0 + 9_000));
+        let mut second = RunBuilder::new("20261006T010011Z");
+        second.push(BinanceStream::MarkPrice, 1, mark(T0 + 9_500));
+        second.push(BinanceStream::OpenInterest, 1, oi(T0 + 9_700));
+        second.push(BinanceStream::AggTrade, 1, agg(40, T0 + 9_600));
+        for i in 0..20_u64 {
+            second.push(
+                BinanceStream::AggTrade,
+                1,
+                agg(51 + i, T0 + 11_000 + 100 * i as i64),
+            );
+        }
+        let mut source = MemorySource::default();
+        first.seal(&mut source, &[]);
+        second.seal(&mut source, &[]);
+        let run1 = first.run(T0, Some(T0 + 10_000), Some(first.records.len() as u64));
+        let run2 = second.run(
+            T0 + 10_500,
+            Some(T0 + 20_000),
+            Some(second.records.len() as u64),
+        );
+        let live1 = first.live(&run1);
+        let last1 = live1.last().unwrap().clone();
+        let newest_oi1 = live1
+            .iter()
+            .filter_map(|e| match e {
+                MarketEvent::OpenInterest(oi) => Some(oi.time),
+                _ => None,
+            })
+            .max();
+        let mut hold = HoldBack::after(last1.clone(), newest_oi1, run2.oi_retime_ms);
+        let mut expected = Vec::new();
+        for event in second.live(&run2) {
+            expected.extend(hold.push(event).1);
+        }
+        expected.extend(hold.finish());
+
+        let mut joined = RunContinuation::new(
+            &run2.symbol,
+            run2.hold_back_ms,
+            run2.oi_retime_ms,
+            &run2.seeds,
+            Some((last1, newest_oi1)),
+        );
+        let mut out = Vec::new();
+        for (stream, record) in &second.records {
+            out.extend(joined.push(*stream, record));
+        }
+        out.extend(joined.finish());
+        assert_eq!(out, expected);
+        assert!(
+            out.iter().any(|e| matches!(e, MarketEvent::FeedGap(g)
+                if g.reason == GapReason::LateEvent)),
+            "the overlap is late: {out:?}"
+        );
+        let replayed = replay(&source, vec![run1, run2], window(T0 - 60_000, T0 + 60_000));
+        assert_eq!(replayed[..live1.len()], live1[..]);
+        assert_eq!(replayed[live1.len()..], out[..]);
     }
 
     #[test]

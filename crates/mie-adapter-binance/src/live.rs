@@ -23,6 +23,16 @@
 //! checkpoint ([`CaptureEvent::BookCheckpoint`]). None of that changes what
 //! the core receives.
 //!
+//! **The core feed** ([`CoreFeed`]). By default the core receives the
+//! pipeline's events (step 5, [`MarketDataProvider::next_event`]). With
+//! [`CoreFeed::Records`] it receives every appended record instead, in
+//! `receive_seq` order ([`BinanceLiveProvider::next_record`]), and runs its
+//! own pipeline over them: the warm start (ADR-052 D3, D7) recomputes the
+//! run with the history chain's seeds, which are known only once the
+//! capture has started. The capture's pipeline still runs for the journal
+//! (gaps, book transitions, checkpoint audits) and the snapshot requests;
+//! its events then go nowhere else.
+//!
 //! So an event reaches the core only after its record was appended, and a
 //! frame that fails to normalize is still persisted. The sink is sealed every
 //! `seal_interval` and at shutdown, which bounds the crash loss of
@@ -58,6 +68,17 @@ use std::time::Duration;
 /// How often the capture thread wakes up without input, to keep the seal
 /// and stats cadence.
 const CAPTURE_TICK: Duration = Duration::from_millis(50);
+
+/// What the capture thread sends to the core (module docs).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CoreFeed {
+    /// The pipeline's canonical events ([`MarketDataProvider::next_event`]).
+    #[default]
+    Events,
+    /// Every appended record with its stream, in `receive_seq` order
+    /// ([`BinanceLiveProvider::next_record`]).
+    Records,
+}
 
 /// Everything a live capture run is configured with.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,6 +134,8 @@ pub struct LiveConfig {
     pub depth_checkpoint_interval: Duration,
     /// Least time between two depth snapshot requests.
     pub depth_snapshot_min_spacing: Duration,
+    /// What the core receives (module docs).
+    pub core_feed: CoreFeed,
 }
 
 impl LiveConfig {
@@ -143,6 +166,7 @@ impl LiveConfig {
             depth_snapshot_limit: 1_000,
             depth_checkpoint_interval: Duration::from_secs(60),
             depth_snapshot_min_spacing: Duration::from_secs(2),
+            core_feed: CoreFeed::Events,
         }
     }
 
@@ -434,6 +458,7 @@ pub(crate) enum Inbound {
 /// A message from the capture thread to the provider.
 enum CoreMsg {
     Event(MarketEvent),
+    Record(BinanceStream, RawRecord),
     End,
     Failed(String),
 }
@@ -536,10 +561,12 @@ fn channel<T>(
 }
 
 /// The live [`MarketDataProvider`]: blocks until the capture thread
-/// delivers the next canonical event.
+/// delivers the next canonical event, or with [`CoreFeed::Records`] the next
+/// appended record ([`next_record`](Self::next_record)).
 pub struct BinanceLiveProvider {
     rx: Receiver<CoreMsg>,
     gauge: Arc<Gauge>,
+    feed: CoreFeed,
     ended: bool,
     failure: Option<String>,
 }
@@ -547,14 +574,36 @@ pub struct BinanceLiveProvider {
 impl fmt::Debug for BinanceLiveProvider {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BinanceLiveProvider")
+            .field("feed", &self.feed)
             .field("ended", &self.ended)
             .field("failure", &self.failure)
             .finish_non_exhaustive()
     }
 }
 
-impl MarketDataProvider for BinanceLiveProvider {
-    fn next_event(&mut self) -> Result<Option<MarketEvent>, ProviderError> {
+impl BinanceLiveProvider {
+    /// The next record the capture appended, with its stream, in
+    /// `receive_seq` order; `Ok(None)` after the capture's end marker.
+    ///
+    /// # Errors
+    ///
+    /// [`ProviderError::Contract`] when the capture feeds events
+    /// ([`CoreFeed::Events`]); [`ProviderError::Source`] when the capture
+    /// failed, as for [`next_event`](MarketDataProvider::next_event).
+    pub fn next_record(&mut self) -> Result<Option<(BinanceStream, RawRecord)>, ProviderError> {
+        if self.feed != CoreFeed::Records {
+            return Err(ProviderError::Contract(
+                "next_record on a capture that feeds events".to_owned(),
+            ));
+        }
+        Ok(self.receive()?.map(|msg| match msg {
+            Received::Record(stream, record) => (stream, record),
+            Received::Event(_) => unreachable!("a records feed sends no event"),
+        }))
+    }
+
+    /// The next message for the core; `Ok(None)` after the end marker.
+    fn receive(&mut self) -> Result<Option<Received>, ProviderError> {
         if let Some(failure) = &self.failure {
             return Err(ProviderError::Source(failure.clone()));
         }
@@ -564,7 +613,11 @@ impl MarketDataProvider for BinanceLiveProvider {
         let failure = match self.rx.recv() {
             Ok(CoreMsg::Event(event)) => {
                 self.gauge.received();
-                return Ok(Some(event));
+                return Ok(Some(Received::Event(event)));
+            }
+            Ok(CoreMsg::Record(stream, record)) => {
+                self.gauge.received();
+                return Ok(Some(Received::Record(stream, record)));
             }
             Ok(CoreMsg::End) => {
                 self.ended = true;
@@ -575,6 +628,31 @@ impl MarketDataProvider for BinanceLiveProvider {
         };
         self.failure = Some(failure.clone());
         Err(ProviderError::Source(failure))
+    }
+}
+
+/// A message [`BinanceLiveProvider::receive`] hands on.
+enum Received {
+    Event(MarketEvent),
+    Record(BinanceStream, RawRecord),
+}
+
+impl MarketDataProvider for BinanceLiveProvider {
+    /// # Errors
+    ///
+    /// [`ProviderError::Contract`] when the capture feeds records
+    /// ([`CoreFeed::Records`]); [`ProviderError::Source`] when the capture
+    /// failed.
+    fn next_event(&mut self) -> Result<Option<MarketEvent>, ProviderError> {
+        if self.feed != CoreFeed::Events {
+            return Err(ProviderError::Contract(
+                "next_event on a capture that feeds records".to_owned(),
+            ));
+        }
+        Ok(self.receive()?.map(|msg| match msg {
+            Received::Event(event) => event,
+            Received::Record(..) => unreachable!("an events feed sends no record"),
+        }))
     }
 }
 
@@ -674,6 +752,7 @@ where
         inbound_gauge,
         core_tx,
         core_gauge: Arc::clone(&core_gauge),
+        core_feed: config.core_feed,
         core_gone: false,
         shutdown: Arc::clone(&shutdown),
         seal_interval: config.seal_interval,
@@ -773,6 +852,7 @@ where
     let provider = BinanceLiveProvider {
         rx: core_rx,
         gauge: core_gauge,
+        feed: config.core_feed,
         ended: false,
         failure: None,
     };
@@ -802,6 +882,7 @@ struct CaptureLoop<S> {
     inbound_gauge: Arc<Gauge>,
     core_tx: CountedSender<CoreMsg>,
     core_gauge: Arc<Gauge>,
+    core_feed: CoreFeed,
     core_gone: bool,
     shutdown: Arc<AtomicBool>,
     seal_interval: Duration,
@@ -926,6 +1007,9 @@ impl<S: RawRecordSink> CaptureLoop<S> {
         }
         self.request_snapshot();
         self.deliver(pushed.events);
+        if self.core_feed == CoreFeed::Records {
+            self.send_to_core(CoreMsg::Record(stream, record));
+        }
         Ok(())
     }
 
@@ -955,12 +1039,18 @@ impl<S: RawRecordSink> CaptureLoop<S> {
             if let Some(result) = self.audit.apply(&event) {
                 self.observe(&CaptureEvent::BookCheckpoint(result));
             }
-            if !self.core_gone && self.core_tx.send(CoreMsg::Event(event)).is_err() {
-                // The core stopped consuming: keep persisting until the
-                // producers stop.
-                self.core_gone = true;
-                self.shutdown.store(true, Ordering::Relaxed);
+            if self.core_feed == CoreFeed::Events {
+                self.send_to_core(CoreMsg::Event(event));
             }
+        }
+    }
+
+    fn send_to_core(&mut self, msg: CoreMsg) {
+        if !self.core_gone && self.core_tx.send(msg).is_err() {
+            // The core stopped consuming: keep persisting until the
+            // producers stop.
+            self.core_gone = true;
+            self.shutdown.store(true, Ordering::Relaxed);
         }
     }
 

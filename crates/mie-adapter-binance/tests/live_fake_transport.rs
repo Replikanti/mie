@@ -11,8 +11,8 @@ use mie_adapter_binance::transport::{
     Clock, HttpGet, HttpReply, ReadOutcome, WsConnection, WsConnector,
 };
 use mie_adapter_binance::{
-    BinanceStream, CaptureEvent, CaptureObserver, CaptureSummary, CheckpointResult, LiveConfig,
-    SideCoverage, SnapshotTrigger, start,
+    BinanceStream, CaptureEvent, CaptureObserver, CaptureSummary, CheckpointResult, CoreFeed,
+    LiveConfig, SideCoverage, SnapshotTrigger, start,
 };
 use mie_domain::event::{GapReason, MarketEvent, Stream};
 use mie_domain::time::EventTime;
@@ -1891,4 +1891,244 @@ fn depth_checkpoints_keep_their_cadence_spacing_and_backoff() {
     );
     // Without diffs nothing reaches the core.
     assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
+/// What a capture that feeds the core records ([`CoreFeed::Records`])
+/// delivered.
+struct RecordsOutcome {
+    records: Vec<(BinanceStream, RawRecord)>,
+    provider_error: Option<ProviderError>,
+    joined: Result<(MemorySink, CaptureSummary), CaptureError>,
+    observed: Vec<CaptureEvent>,
+    sink: Arc<Mutex<SinkLog>>,
+}
+
+/// [`run`] with the records feed: drains `next_record` until the end marker
+/// or a failure, then checks that both stay put and that `next_event` is
+/// refused.
+fn run_records(
+    mut config: LiveConfig,
+    connector: Arc<FakeConnector>,
+    http: Arc<dyn HttpGet>,
+    clock: Arc<FakeClock>,
+    shutdown: Arc<AtomicBool>,
+    fail_at: Option<usize>,
+) -> RecordsOutcome {
+    config.core_feed = CoreFeed::Records;
+    let sink_log = Arc::new(Mutex::new(SinkLog::default()));
+    *connector.sink.lock().unwrap() = Some(Arc::clone(&sink_log));
+    let sink = MemorySink {
+        log: Arc::clone(&sink_log),
+        fail_at,
+    };
+    let recorder = Recorder::default();
+    *connector.observed.lock().unwrap() = Some(recorder.clone());
+    let (mut provider, handle) = start(
+        config,
+        sink,
+        connector,
+        http,
+        clock,
+        Box::new(recorder.clone()),
+        shutdown,
+    )
+    .expect("start");
+    let mut records = Vec::new();
+    let provider_error = loop {
+        match provider.next_record() {
+            Ok(Some((stream, record))) => {
+                // Raw first: the record was appended before the core got it.
+                assert!(
+                    sink_log
+                        .lock()
+                        .unwrap()
+                        .records
+                        .iter()
+                        .any(|(_, r)| *r == record),
+                    "a record reached the core before it was appended"
+                );
+                records.push((stream, record));
+            }
+            Ok(None) => {
+                assert_eq!(provider.next_record(), Ok(None), "the end stays put");
+                break None;
+            }
+            Err(error) => {
+                assert_eq!(provider.next_record(), Err(error.clone()));
+                break Some(error);
+            }
+        }
+    };
+    assert!(
+        matches!(provider.next_event(), Err(ProviderError::Contract(_))),
+        "a records feed refuses next_event"
+    );
+    drop(provider);
+    let joined = handle.join();
+    let observed = recorder.0.lock().unwrap().clone();
+    RecordsOutcome {
+        records,
+        provider_error,
+        joined,
+        observed,
+        sink: sink_log,
+    }
+}
+
+#[test]
+fn the_records_feed_delivers_every_appended_record_in_receive_seq_order() {
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let clock = FakeClock::new(D0, "mie-depth");
+    let bid = |p: &str, q: &str| format!(r#"["{p}","{q}"]"#);
+    let script = vec![
+        Step::Frame(depth(11, 20, 10, D0, &bid("100.00", "1.000"), "")),
+        // The snapshot syncs the book.
+        Step::AwaitRecords(2),
+        // An unparsable diff: persisted, and the book desyncs.
+        Step::Frame("not json".to_owned()),
+        Step::Frame(depth(21, 30, 20, D0 + 100, &bid("99.00", "2.000"), "")),
+        Step::AwaitRecords(4),
+        Step::Shutdown,
+    ];
+    let connector = FakeConnector::new(
+        vec![("btcusdt@depth@100ms", vec![Connect::Open(script)])],
+        &clock,
+        &shutdown,
+    );
+    let http = DepthHttp::new(
+        vec![Http::Status(
+            200,
+            depth_snapshot(15, D0 - 50, &bid("100.00", "1.000"), ""),
+        )],
+        &clock,
+        &shutdown,
+    );
+    let out = run_records(
+        config(&[BinanceStream::Depth, BinanceStream::DepthSnapshot]),
+        connector,
+        http,
+        clock,
+        shutdown,
+        None,
+    );
+    assert!(out.provider_error.is_none(), "{:?}", out.provider_error);
+    let appended: Vec<RawRecord> = {
+        let log = out.sink.lock().unwrap();
+        log.records.iter().map(|(_, r)| r.clone()).collect()
+    };
+    let delivered: Vec<RawRecord> = out.records.iter().map(|(_, r)| r.clone()).collect();
+    assert_eq!(delivered, appended);
+    let seqs: Vec<u64> = delivered
+        .iter()
+        .map(|r| r.capture.as_ref().unwrap().receive_seq)
+        .collect();
+    assert_eq!(seqs, [0, 1, 2, 3]);
+    let streams: Vec<BinanceStream> = out.records.iter().map(|(s, _)| *s).collect();
+    assert_eq!(
+        streams,
+        [
+            BinanceStream::Depth,
+            BinanceStream::DepthSnapshot,
+            BinanceStream::Depth,
+            BinanceStream::Depth
+        ]
+    );
+    assert_eq!(delivered[2].payload, b"not json");
+    // The capture's own pipeline still runs for the journal: the book
+    // synced, the unparsable diff was reported and desynced it.
+    assert!(
+        book_transitions(&out.observed)
+            .iter()
+            .any(|t| matches!(t, BookTransition::Synced { .. }))
+    );
+    assert!(out.observed.iter().any(|e| matches!(
+        e,
+        CaptureEvent::NormalizeError {
+            receive_seq: 2,
+            stream: BinanceStream::Depth,
+            ..
+        }
+    )));
+    let (_, summary) = out.joined.expect("clean capture");
+    // The four records went through the core channel, and nothing else
+    // before the summary was taken.
+    assert_eq!(summary.stats.core.sent, 4);
+    assert_eq!(summary.stats.records, 4);
+}
+
+#[test]
+fn a_failed_append_fails_the_records_feed_and_events_feeds_refuse_records() {
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let clock = FakeClock::new(D0, "mie-aggTrade");
+    let connector = FakeConnector::new(
+        vec![(
+            "btcusdt@aggTrade",
+            vec![Connect::Open(vec![
+                Step::Frame(agg(1, D0 + 1)),
+                Step::Frame(agg(2, D0 + 2)),
+                Step::Frame(agg(3, D0 + 3)),
+            ])],
+        )],
+        &clock,
+        &shutdown,
+    );
+    let out = run_records(
+        config(&[BinanceStream::AggTrade]),
+        connector,
+        no_http(&clock, &shutdown),
+        clock,
+        Arc::clone(&shutdown),
+        Some(1),
+    );
+    assert!(
+        matches!(&out.provider_error, Some(ProviderError::Source(m)) if m.contains("disk full")),
+        "{:?}",
+        out.provider_error
+    );
+    // Only the record appended before the failure reached the core.
+    assert_eq!(out.records.len(), 1);
+    assert_eq!(out.records[0].0, BinanceStream::AggTrade);
+    assert!(out.joined.is_err());
+    assert!(shutdown.load(Ordering::Relaxed));
+
+    // The events feed, the default, refuses `next_record`.
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let clock = FakeClock::new(D0, "mie-aggTrade");
+    let connector = FakeConnector::new(
+        vec![(
+            "btcusdt@aggTrade",
+            vec![Connect::Open(vec![
+                Step::Frame(agg(1, D0 + 1)),
+                Step::Shutdown,
+            ])],
+        )],
+        &clock,
+        &shutdown,
+    );
+    let config = config(&[BinanceStream::AggTrade]);
+    assert_eq!(config.core_feed, CoreFeed::Events);
+    let (mut provider, handle) = start(
+        config,
+        MemorySink {
+            log: Arc::default(),
+            fail_at: None,
+        },
+        connector,
+        no_http(&clock, &shutdown),
+        clock,
+        Box::new(Recorder::default()),
+        shutdown,
+    )
+    .expect("start");
+    assert!(matches!(
+        provider.next_record(),
+        Err(ProviderError::Contract(_))
+    ));
+    let mut events = 0;
+    while provider.next_event().unwrap().is_some() {
+        events += 1;
+    }
+    assert_eq!(events, 1);
+    drop(provider);
+    assert!(handle.join().is_ok());
 }
