@@ -2,7 +2,11 @@
 
 - Status: accepted; the 418/429 clause of D9 ("A 418 or 429 defers the
   next poll by an exponential backoff") and the "418/429 backoff" row of the
-  2026-10-10 justification addendum (section f) are superseded by ADR-046
+  2026-10-10 justification addendum (section f) are superseded by ADR-046;
+  D5's 7-day seed lookback is superseded by ADR-052 (decision 3) for the
+  engine of warm-started runs, which is seeded from the history chain and
+  journals those seeds in `warm_start`; the capture's own pipeline keeps
+  the lookback, journaled in `run_start`
 - Date: 2026-10-06
 - Amended: 2026-10-10 (#74)
 - Amended: 2026-10-10 (#77)

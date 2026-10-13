@@ -205,12 +205,45 @@ deferred option D are under *Alternatives considered*.
    stream's seed is the newest event of the same domain stream in the
    chain, archive included, instead of the newest sealed event of the last
    7 days (ADR-032 decision 5). So every hole between runs carries a
-   `Disconnected` gap, and the seam carries one per seeded stream. Seeds
-   are journaled in `run_start` (ADR-032 decision 4), so replay
-   reproduces them.
+   `Disconnected` gap, and the seam carries one per seeded stream.
    - Why: under the 7-day lookback, a pause of more than 7 days gets no
      gap, and the engine would treat the bars across it as complete. A
      chain seed has no window, so every hole is marked.
+   - **Where the chain seeds are journaled (W3).** The warm engine's chain
+     seeds are journaled in the run's `warm_start` record (decision 6),
+     and `run_start` keeps the seeds of the capture's own pipeline, the
+     7-day lookback of ADR-032 decision 5, which also seed a cold fallback
+     (decision 8). The core receives the run's raw records, not the
+     capture pipeline's events, queues them during the warm-up and, at the
+     handoff, recomputes them with the chain seeds through the same
+     `RunContinuation` (the run's pipeline joined to the prefix by
+     `HoldBack::after`) the chained replay recomputes the run with. The
+     history chain keeps journaled seeds that reach back at least as far as
+     its own (W2, below), so it recomputes a warm run exactly as its engine
+     consumed it.
+     - Why: a chain seed is the chain's newest event per series, known
+       only once the prefix has been replayed, which takes about 19.2 min
+       per year of history (decision 11). `run_start` must be durable
+       before the first record is sealed (ADR-039 decision 2), and the
+       capture starts at once (decision 7), so the chain seeds cannot be in
+       `run_start` without making the capture wait. `warm_start` is synced
+       before the seeds are used, so a crash after the handoff still leaves
+       the seeds of what reached the engine.
+     - A warm run's `gap` lines describe the capture's pipeline, which
+       keeps journaling gaps, book transitions and checkpoint audits and
+       requesting snapshots. What reached the engine is the recompute with
+       `warm_start`'s seeds.
+     - Rejected, an event queue whose provisional seed-gap starts are
+       rewritten at the handoff: the queue would be smaller, but exactness
+       would rest on edge cases. A seed gap that the run's own hold-back
+       re-times keeps a start clamped against its original end; the order
+       of gaps that share an end depends on their start, so rewriting it
+       can reorder them; and a stream the chain holds no event of cannot
+       be un-seeded after the fact.
+     - Rejected, a seeds-only pass over the chain before the capture
+       starts: exact, but every start would lose the archive replay's time
+       (R = 441.4 s per year, decision 11) of raw data, which decision 7
+       rules out.
    - **At the seam, only streams the archive carries are seeded:**
      `Trades` (aggTrades), `Klines` and `OpenInterest` (metrics)
      (`docs/data-availability.md`). `MarkPrice`, `Liquidations` and
@@ -239,8 +272,10 @@ deferred option D are under *Alternatives considered*.
      is kept as journaled. The order book keeps its journaled seed: its
      sequencer takes one seed from two streams, `depth` and
      `depthSnapshot` (ADR-038), which this per-stream rule does not
-     cover, and the archive carries no book, so the seam never needs it;
-     its chain seed comes with W3's journal. Rejected, refusing a chain whose seam is unmarked: the
+     cover, and the archive carries no book, so the seam never needs it.
+     Its chain seed comes with W3's journal: the warm start seeds both
+     book streams with the chain's newest order-book event, `warm_start`
+     journals it, and the chain keeps it. Rejected, refusing a chain whose seam is unmarked: the
      production cutover follows #99's cold sessions, so every chain would
      be refused until W3.
    - Runs without a history keep the lookback (decision 8).
@@ -320,28 +355,70 @@ deferred option D are under *Alternatives considered*.
        fixtures need other dates, and decision 1 binds production. W3
        journals it with every run. Rejected, refusing any other origin at
        validation: no fixture could build a chain.
-   - `run_start` gains `history_origin_ms` and `history_cutover_ms`. They
-     are comparability keys, like those ADR-041 decision 3 added, not
-     pipeline parameters: ADR-032 decision 4 is unchanged.
-   - A new `warm_start` journal record holds:
-     - the origin, the effective origin and the cutover;
-     - the prefix's dataset version, last event time, event-stream hash
-       (ADR-039 decision 7) and domain-rejection count;
-     - the state hash at the handoff (ADR-041 decision 1);
-     - `ready_after_ms`: the wall time from `run_start` until the queue is
-       drained, the moment the live engine is current;
-     - the queue's high-water (decision 7);
-     - which of ADR-041's long-warm-up features are still `WarmingUp` at
-       the handoff;
-     - or, instead of the above, an `error` (decision 8).
+   - `[history]` also holds `max_run_records`, the memory guard's limit
+     (decision 13): an optional integer above 0 with no default. Only
+     `mie ingest` reads it; `mie replay` and `mie experiment` ignore it.
+   - `run_start` gains `history_origin_ms` and `history_cutover_ms` (null
+     without `[history]`). They are comparability keys, like those ADR-041
+     decision 3 added, not pipeline parameters: ADR-032 decision 4 is
+     unchanged, and its seeds stay those of the capture's pipeline
+     (decision 3).
+   - A new `warm_start` journal record, one per run, written by `mie
+     ingest`. A warm run's holds `warm: true` and:
+     - `origin_ms`, `effective_origin_ms` (ms, or null without a restart
+       in the prefix) and `cutover_ms`;
+     - the prefix's `prefix_dataset` (64 hex), `prefix_last_event_ms` (the
+       warm engine's `as_of`, or null), `prefix_events` and
+       `prefix_event_hash` (16 hex), its event-stream hash (ADR-039
+       decision 7), and `prefix_rejections`;
+     - `handoff_state_hash` (16 hex), the state hash at the handoff
+       (ADR-041 decision 1);
+     - `seeds` (raw stream → ms), the chain seeds the run's records are
+       recomputed with (decision 3);
+     - the queue's high-water (decision 7), `queue_high_water` in records
+       and `queue_high_water_bytes` in payload bytes;
+     - `warming_up`: the ids of ADR-041's long-warm-up features still
+       `WarmingUp` at the handoff: `volatility.atr.1h@1`,
+       `volatility.regime.1h@1`, both volume composites,
+       `structure.swing` and `structure.levels` at 15m, 1h, 4h and 1d,
+       `derivatives.funding.settled@1` and
+       `location.auction.prior_day@1`.
+
+     A cold run's holds `warm: false`, `cold` (`no-history`,
+     `before-cutover` or `warm-up-failed`, decision 8), `error` (text, or
+     null) and, with `[history]`, `origin_ms` and `cutover_ms`.
+   - A new `warm_ready` record holds `ready_after_ms`: the wall time from
+     `run_start` until the warm engine has applied the queue, the moment it
+     is current (decision 12's trigger). It is its own record because
+     `warm_start` must be durable before its seeds are used, at the
+     handoff, while the queue drains later. Rejected, one `warm_start`
+     after the drain: the seeds would stay unjournaled while the queue
+     drains.
+   - A new `chain_restart` record holds `time`, one per uncrossable hole in
+     the run's live part (decision 4).
+   - A second or malformed `warm_start` of a run is a journal error, as a
+     second `run_end` is.
 
 7. **The warm-up runs concurrently with the capture** (#106 plan D3). The
    capture starts at once. The warm-up replays the chain through the
    current run's predecessor on its own thread, while the core drains the
-   live provider into an in-memory queue. At the handoff the queue drains
-   into the warm engine through the chain's `HoldBack`, in arrival order;
-   a fast-restart overlap becomes a `LateEvent` gap, as in the chained
-   replay (ADR-039 decision 3), never an engine `OutOfOrder`.
+   live provider into an in-memory queue. The queue holds the run's raw
+   records, in `receive_seq` order, not events: their seeds are known only
+   at the handoff (decision 3). At the handoff the queue, then the live
+   records, are recomputed by the run's `RunContinuation`, the same one the
+   chained replay uses: the run's pipeline with the chain seeds, joined to
+   the prefix through the chain's zero hold-back `HoldBack`. A
+   fast-restart overlap therefore becomes a `LateEvent` gap or re-timed
+   open interest, as in the chained replay (ADR-039 decision 3), never an
+   engine `OutOfOrder`. The live part drives the warm engine through
+   `mie_app::equivalence::drive_chain_checkpointed`, a chain consumer's
+   drive (decision 4) with a fresh checkpoint recorder, so checkpoint
+   ordinals count the run's own events (ADR-041 decision 3).
+   - The core checks after every record whether the warm-up has finished,
+     so the handoff waits for at most the next record. The capture's own
+     pipeline keeps running for the journal, the snapshot requests and the
+     book audit; the core-channel gauge and ADR-041's 0 ms blocked-time
+     gate are unchanged.
    - Rejected, warming up before the capture: each restart would lose the
      warm-up's duration of raw data (about 19.2 min per year of history,
      decision 11), and after the cutover no archive fills that hole.
@@ -350,7 +427,8 @@ deferred option D are under *Alternatives considered*.
      that the capture thread blocks, which ADR-041's 0 ms blocked-time gate
      forbids.
    - The queue's memory grows with the warm-up time times the arrival
-     rate; #106 records its high-water (*Consequences*).
+     rate; `warm_start` records its high-water in records and in payload
+     bytes, and #106 records both (*Consequences*).
 
 8. **Absence and failure give a cold run** (#106 plan D4). `[history]` is
    optional. A configuration without it, a run started before the
@@ -358,6 +436,17 @@ deferred option D are under *Alternatives considered*.
    The `warm_start` record says which, and equivalence compares such a run
    under ADR-041 decision 4. The capture never waits for the warm-up and
    never stops because of it.
+   - The reasons: `no-history`; `before-cutover` (the run's `run_start`
+     time is before the cutover, the history chain's own rule); and
+     `warm-up-failed`, with the error: the chain refuses its bounds or
+     runs (decision 2), the replay fails, the warm-up thread panics, the
+     memory guard refuses (decision 13), or the run ends before the
+     warm-up finishes (the core cancels it at the next prefix event, so a
+     shutdown waits for at most one run's load).
+   - A `warm-up-failed` run's core drives a fresh engine over the queue,
+     then the live records, through a `RunContinuation` without a join,
+     seeded with `run_start`'s seeds: exactly what the capture's own
+     pipeline delivers, so ADR-041 decision 4's cold unit still holds.
    - Why: #99's measurement configuration and every existing fixture keep
      working unchanged, and a broken prefix never costs raw data.
    - Rejected, a mandatory `[history]` that refuses to start: raw data is
@@ -591,13 +680,23 @@ deferred option D are under *Alternatives considered*.
       restart replays the same run and aborts again: a crash loop that
       loses raw data. That would break decision 8, so it must never
       happen.
-    - **The guard (W3, #117).** Before it replays the live segment, the
-      warm-up predicts the largest run's memory from that run's journaled
-      record count times the bytes per record below. When the prediction
-      exceeds the memory the host leaves to the warm-up, it journals an
-      `error` in `warm_start` and the run starts cold (decision 8),
+    - **The guard (W3, #117).** Before it replays anything, the warm-up
+      finds the largest chain run before the starting one by record count
+      and compares it with `[history] max_run_records`, `N_max` below, read
+      as a record count because the bytes per record are not measured yet.
+      A count above it journals the `error`, naming the run and both
+      numbers, in `warm_start`, and the run starts cold (decision 8),
       without allocating the prefix. The capture never dies from the
       run's size.
+      - The count is `run_end.records` for a cleanly ended run. A run
+        without a clean end counts the rows of the sealed files of its
+        streams that overlap its ADR-039 decision 2 extent: an upper
+        bound, since adjacent runs share files, so the guard can refuse
+        early but never too late.
+      - The key has no default. Without it every chain run starts cold
+        with the error "not configured". Why: any default would be a number
+        without the measurement below, and a default too high is the crash
+        loop above. #106 sets the value with its source.
     - **The trigger, in records.** `N_max` = the memory the host leaves to
       the warm-up ÷ the bytes per record. The bytes per record are
       measured as the peak memory of an offline `LiveReplay` of the
@@ -667,8 +766,11 @@ deferred option D are under *Alternatives considered*.
   UTC-day VWAP. #95's *Limits* left this point to W. No consumer of live
   state exists yet (#24, #38), and `ready_after_ms` measures the delay.
 - The queue's memory grows with the warm-up time times the arrival rate,
-  about 2.79 M events for a one-year warm-up at the year's peak rate (table
-  above). #106 records its high-water.
+  about 2.79 M items for a one-year warm-up at the year's peak rate (table
+  above). Each item is a raw record (its payload bytes plus the capture
+  envelope), not a decoded event, so it is larger than a core-channel
+  slot; no size is assumed here. `warm_start` records the high-water in
+  records and payload bytes, and #106 measures the bytes.
 
 ## Alternatives considered
 

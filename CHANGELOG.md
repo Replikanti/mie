@@ -12,6 +12,29 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
 
 ### Added
 
+- **`mie ingest` warm-starts from the history chain while the capture runs
+  (ADR-052 D3, D6–D8, D13, #117).** With `[history]`, a run that starts at
+  or after the cutover starts its capture at once, with the core fed the
+  raw records (`CoreFeed::Records`, `BinanceLiveProvider::next_record`),
+  and replays the chain through its predecessor on a `mie-warm-up` thread
+  while the core queues the records. At the handoff the queue, then the
+  live records, are recomputed with the chain seeds through the new
+  `RunContinuation`, the one recompute the chained replay now uses too,
+  joined to the prefix, and drive the warm engine through the new
+  `mie_app::equivalence::drive_chain_checkpointed` with a fresh checkpoint
+  recorder. New journal records: `warm_start` (the prefix's dataset
+  version, event-stream hash, rejections and effective origin, the handoff
+  state hash, the chain seeds, the queue's high-water in records and bytes,
+  the long-warm-up features still warming up; or the cold reason
+  `no-history`, `before-cutover` or `warm-up-failed` with its error),
+  `warm_ready` (`ready_after_ms`) and `chain_restart`; `run_start` gains
+  `history_origin_ms` and `history_cutover_ms`. A warm run's replay takes
+  its seeds from `warm_start`. The memory guard reads the new optional
+  `[history] max_run_records`, which has no default: without it every
+  chain run starts cold, with the reason journaled. A failed, refused or
+  unfinished warm-up starts the run cold; the capture never waits for it.
+  Runs without `[history]` capture and feed the core as before. `mie
+  equivalence` reports warm runs diverged until #118.
 - **Research on the history chain: `research.replay_summary@2` and
   `mie experiment run --source history` (ADR-052 D10, #119).** With an
   ingest configuration that has `[history]`, the run opens the sample on
