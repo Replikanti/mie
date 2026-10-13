@@ -15,8 +15,9 @@
 //! concentration (ADR-043, [`liquidity`]), and location: the UTC-day VWAP
 //! the level registry with its zone events, and the auction state against
 //! the prior day's value (ADR-044, [`location`]), and the order-flow
-//! candidates: CVD and open-interest divergences on confirmed swings
-//! (ADR-051, [`candidate`]); every other kind passes through.
+//! candidates: CVD and open-interest divergences on confirmed swings,
+//! effort vs result, exhaustion and absorption (ADR-051, [`candidate`]);
+//! every other kind passes through.
 //! Further feature families are added by the Market State issues, each as a
 //! registered, versioned definition (ADR-029, [`feature`]).
 //! The engine computes one [`FeatureSet`] and stamps its
@@ -141,8 +142,13 @@ pub struct MarketState {
     /// ([`catalog::CANDIDATE_DIVERGENCE_CVD`],
     /// [`catalog::CANDIDATE_DIVERGENCE_OI`]) for 15m, 1h, 4h and 1d — the
     /// last comparison of consecutive swing highs and of swing lows at
-    /// their anchors. Candidates, never signals (ADR-012). The last field,
-    /// appended after `trade_count` (ADR-051 D1).
+    /// their anchors; `candidate.effort_result.<5m|15m|1h>@1`
+    /// ([`catalog::CANDIDATE_EFFORT_RESULT`]), the last judged
+    /// effort-vs-result evaluation of each aggression window;
+    /// `candidate.exhaustion@1`; and `candidate.absorption.<5m|15m|1h>@1`
+    /// ([`catalog::CANDIDATE_ABSORPTION`], live only). Candidates, never
+    /// signals (ADR-012). The last field, appended after `trade_count`
+    /// (ADR-051 D1).
     pub candidates: Candidates,
 }
 
@@ -635,6 +641,7 @@ impl MarketStateEngine {
         let MarketState {
             flow,
             derivatives,
+            book,
             location,
             candidates,
             ..
@@ -647,6 +654,7 @@ impl MarketStateEngine {
                 flow,
                 derivatives,
                 location,
+                book,
             },
             candidates,
             &mut self.candidate_pending,
@@ -1153,10 +1161,14 @@ mod tests {
              bars.time.1h@1,bars.time.1m@1,bars.time.4h@1,bars.time.5m@1,\
              book.clusters@1,book.depth@1,book.l2@1,book.liquidity.window.15m@1,\
              book.liquidity.window.1h@1,book.liquidity.window.5m@1,\
+             candidate.absorption.15m@1,candidate.absorption.1h@1,\
+             candidate.absorption.5m@1,\
              candidate.divergence.cvd.15m@1,candidate.divergence.cvd.1d@1,\
              candidate.divergence.cvd.1h@1,candidate.divergence.cvd.4h@1,\
              candidate.divergence.oi.15m@1,candidate.divergence.oi.1d@1,\
              candidate.divergence.oi.1h@1,candidate.divergence.oi.4h@1,\
+             candidate.effort_result.15m@1,candidate.effort_result.1h@1,\
+             candidate.effort_result.5m@1,candidate.exhaustion@1,\
              derivatives.funding.settled@1,derivatives.liq.window.15m@1,\
              derivatives.liq.window.1h@1,derivatives.liq.window.5m@1,\
              derivatives.mark@1,derivatives.oi.5m@1,derivatives.oi.sample@1,\

@@ -1156,7 +1156,16 @@ pub(crate) mod tests {
             ..Scenario::divergent(Side::High)
         };
         let mut engine = MarketStateEngine::new();
-        let mut before = engine.state().candidates.clone();
+        // The divergence values; effort vs result warms up every minute.
+        let divergences = |engine: &MarketStateEngine| -> Vec<TimeframeDivergences> {
+            engine
+                .state()
+                .candidates
+                .iter_divergences()
+                .map(|(_, divergences)| *divergences)
+                .collect()
+        };
+        let mut before = divergences(&engine);
         let mut changes = Vec::new();
         for event in scenario.tape() {
             engine.apply(&event).unwrap();
@@ -1170,7 +1179,7 @@ pub(crate) mod tests {
                     _ => None,
                 })
                 .collect();
-            let after = engine.state().candidates.clone();
+            let after = divergences(&engine);
             if after != before || !engine.candidate_events().is_empty() {
                 // Only the event that confirms a 15m swing changes anything,
                 // and every fact is visible at that swing's known_at.

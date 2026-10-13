@@ -56,6 +56,8 @@ R1b and R1 (below); M3 fixes `B` and `q_hi` from the hold-out run of D9 and
 ships effort vs result, exhaustion and absorption. The M2 run on the #12
 year stopped on R1b; D9 records that result, the revision of R1b's
 statistic it led to (#124) and the hold-out year the revised rules run on.
+The hold-out run passed both rules: M3 runs at `B` = 1 440 and `q_hi` =
+0.800 (D9 item 11).
 
 ## Decision
 
@@ -120,7 +122,9 @@ statistic it led to (#124) and the hold-out year the revised rules run on.
 - The tracker is mutated in place, never cloned per event; the stage reads
   only the committed state, so it cannot move any other field.
 - Facts are emitted per closed bar in close order, per swing that bar
-  confirmed, the CVD comparison before the OI one.
+  confirmed, the CVD comparison before the OI one. At an event that closes
+  a 1m bar, effort vs result follows per window (5m, 15m, 1h), then
+  exhaustion, then absorption per window (D5–D7).
 
 ### D3. Location context (events only, never a feature input)
 
@@ -255,13 +259,19 @@ tf = 15m, 1h, 4h, 1d.
 - **When it evaluates.** Once per event that closes at least one 1m bar,
   on the windows after that event. A gap that closes k minutes in one
   event yields one evaluation; that window already carries `feed_gap`.
+  A minute without an evaluation (`delta == 0`, no displacement, a window
+  not ready) leaves the value, and so `active`, as it was: it neither
+  emits nor re-arms. An effort or a progress that does not fit an `i64`
+  (D2) makes the value `Unavailable{OutOfRange}` and is no sample.
 - **Baseline.** The previous `B` evaluations of the same window (the
   current one excluded), held in a ring. Quantiles are nearest-rank and
   exact on integers: the q-quantile is the ⌈q·B⌉-th smallest value, so
   q = 0.5 is the lower median ADR-043 uses.
 - **The value carries** `effort`, `progress`, `effort_high` (the `q_hi`
   quantile of effort), `effort_median`, `move_high` and `move_median` (the
-  same quantiles of `|displacement|`) and `active`.
+  same quantiles of `|displacement|`) and `active`, with the window's
+  length and end, the aggressor that carried its net aggression (ADR-023)
+  and its coverage. It is the last judged evaluation.
 - **Candidate condition.** `effort ≥ effort_high` and `progress ≤
   move_median`: aggression in the tail, with less progress than a typical
   window's absolute move. *Why the median for "little progress":* it is the
@@ -288,8 +298,9 @@ tf = 15m, 1h, 4h, 1d.
   2026-04-01 12:00 UTC). The first half sets the value; the second half
   only checks it. One continuous replay; an episode belongs to the half of
   its emission time.
-- **`B`: fixed by R1b (M3).** `B` exists so that a rank does not depend on
-  which hours of the day filled the baseline. R1b measures exactly that.
+- **`B` = 1 440, fixed by R1b on the hold-out year (D9 item 11).** `B`
+  exists so that a rank does not depend on which hours of the day filled
+  the baseline. R1b measures exactly that.
   - **Candidates.** `B` ∈ {60, 240, 1440}: the spans of the 1h, 4h and 1d
     bars (ADR-031) in evaluations, one per minute. 60 and 240 are sub-day
     baselines, which R1b picks if the intraday activity cycle turns out
@@ -412,10 +423,13 @@ tf = 15m, 1h, 4h, 1d.
     half: stop. Every stop is reported on #22. `B_ref` is never picked by
     default: it cannot be tested against itself, and its 7× state and
     7-day warm-up are costs a human accepts, not a rule.
-- **`q_hi`: fixed by R1 (M3), at the `B` R1b fixed.** `q_hi` is the
-  highest value of {0.80, 0.85, 0.90, 0.95, 0.975, 0.99} at which, on the
-  first half of the measurement year (D9), every window length yields at least
-  `n_min` = 97 episodes in every floor cell (MC below).
+- **`q_hi` = 0.800, fixed by R1 at `B` = 1 440 on the hold-out year (D9
+  item 11).** `q_hi` is the highest value of {0.80, 0.85, 0.90, 0.95,
+  0.975, 0.99} at which, on the first half of the measurement year (D9),
+  every window length yields at least `n_min` = 97 episodes in every floor
+  cell (MC below). The floor binds at the bottom of the grid (see *If only
+  0.80 passes*); the binding cell is 15m `MEDIUM`/`value_edge`, 100
+  episodes at 0.800 and 71 at 0.850.
   - **Cells.** #28 splits its comparisons by regime and by location (its
     scope: "regime/location splits", with location named as "VAH/VAL,
     structural extremes"). Its estimates therefore live in cells of a
@@ -503,10 +517,13 @@ tf = 15m, 1h, 4h, 1d.
     silently. The remedy (coarser bins, a wider half-width for #28, more
     data) is a human decision, recorded as a revision of this ADR before
     M3 fixes any constant.
-- **Warm-up.** `Samples(B)`, where a sample is an evaluation.
-- **Parameters.** `baseline_evaluations` = `B`, `effort_quantile` =
-  `q_hi` (a `Rate`), `result_rule` = `progress_at_most_move_median`,
-  `window_ms`.
+- **Warm-up.** `Samples(B)`, where a sample is an earlier evaluation in
+  the baseline: the k-th evaluation shows `WarmingUp{k − 1, B}`, and the
+  (B + 1)-th, judged against the B before it, is the first value. At
+  `B` = 1 440 that is a day of minutes with an evaluation.
+- **Parameters.** `baseline_evaluations` = `B` = 1 440, `effort_quantile`
+  = `q_hi` = 0.800 (a `Rate`), `result_rule` =
+  `progress_at_most_move_median`, `window_ms`.
 
 ### D6. Exhaustion
 
@@ -544,8 +561,14 @@ Why each number:
 Emission is on the rising edge. Warm-up is `Samples(6)` 1h evaluations:
 the expansion is read at `t − 5 min` and evaluations come one per minute,
 so the first `t` with an expansion to read is the sixth 1h evaluation (the
-one at `t − 5 min` and the five after it). Parameters: `decay_window_ms` = 300 000, `expansion_window_ms` =
-3 600 000, `extreme_tolerance` = 0.0006.
+one at `t − 5 min` and the five after it). A sample is a judged 1h
+evaluation; the value stays warming up until the first exhaustion
+evaluation, at 6 of 6 when the minute that completes the count has none.
+The value is the last evaluation: the 1h and 5m evaluations it read, the
+decay's aggression in the expansion's direction, the extreme and the
+close, and each part of the condition. A minute without an evaluation
+leaves it as it was. Parameters: `decay_window_ms` = 300 000,
+`expansion_window_ms` = 3 600 000, `extreme_tolerance` = 0.0006.
 
 ### D7. Absorption
 
@@ -568,11 +591,17 @@ run on the same clock (ADR-043 D6).
   that band to ≥ 90 % availability. The 1 bps band holds only 42–68 levels
   per side (ADR-043 M3), so it misses refills just behind the touch.
 - **No evaluation** when the band's `beyond_window` is set (part of the
-  flow was not observed), or when the book window is warming up or
-  unavailable. Archive replays therefore keep it warming up.
+  flow was not observed), when the book window is warming up or
+  unavailable, or when it ends at another minute than the judged
+  effort-vs-result evaluation, and none in a minute without one. Such a
+  minute leaves the value as it was. Archive replays therefore keep it
+  warming up.
 - Emission is on the rising edge. Warm-up is `Samples(1)`: a minute with
-  both inputs ready. Parameters: `band` = 0.0005, `replenish_rule` =
-  `added_at_least_filled`.
+  both inputs ready, the first evaluation. The value is the last
+  evaluation: the effort-vs-result value it read, the passive side, the
+  band, `added` and `filled` there, the book window's coverage, whether the
+  side was replenished, and `active`. Parameters: `band` = 0.0005,
+  `replenish_rule` = `added_at_least_filled`.
 
 ### D8. Where each number comes from
 
@@ -583,7 +612,7 @@ run on the same clock (ADR-043 D6).
 | OI point age at an anchor ≤ 360 000 ms | One grid interval plus the 60 s lag `derivatives.oi.5m@1` accepts (ADR-042 D2); less loses healthy live anchors, more reads an outage's stale point | derivation |
 | Ring of 4 closed-bar records | `SWING_BARS + 1`: the swing bar is exactly `SWING_BARS` bars before the confirming one (ADR-031, ADR-037 D3) | derivation |
 | R1b before R1 | `q_hi` names a tail only under a fixed `B` | derivation |
-| `B` ∈ {60, 240, 1440} | The 1h, 4h and 1d bar spans in one-minute evaluations; 1440 is the shortest baseline holding every UTC hour | derivation; **value fixed by R1b (M3)** |
+| `B` ∈ {60, 240, 1440} | The 1h, 4h and 1d bar spans in one-minute evaluations; 1440 is the shortest baseline holding every UTC hour | derivation; **`B` = 1 440, fixed by R1b on the hold-out year (D9 item 11)** |
 | `B_ref` 10 080 | One week: every hour 7×, every weekday once; the longest baseline in the grid | derivation |
 | R1b's 24 UTC hours | The daily activity cycle's resolution; M2 counts by them | judgment |
 | R1b's statistic: Pearson X² of the 2 × 24 table (`B`, reference) × hour | The count-weighted test of "the same hour profile, up to scale"; the hour's level cancels in the split, and each hour weighs by its count (M2's coefficient of variation did not, D9) | derivation |
@@ -592,7 +621,7 @@ run on the same clock (ADR-043 D6).
 | Evaluability: no expected count below 1, at most 9 of 48 below 5 | Cochran's rule (1954): where X²'s χ² tail can be trusted; 9 is the largest count ≤ 20 % of 48. Looser lets the tail error flip a verdict at α/k; stricter (all ≥ 5) carves out M2's failing combination and stops R1b for want of data | published rule + what breaks |
 | Pearson's X² rather than G | X² follows χ² more closely at small expected counts (Larntz 1978; Koehler and Larntz 1980); G gives p 0.00087 where X² gives 0.0097 on a #12-year table, either side of α/k | published comparison |
 | 5 % family level, k ≤ 18 | Bonferroni over at most 3 windows × 6 `q` evaluable combinations, so a `B` that ranks like the reference fails anywhere in a half at most 5 % of the time; the same level as `n_min`'s 1.96, so both rules share one error rate. 1 % lets a distorting `B` pass more often; 10 % stops R1b for nothing one time in ten | derivation + shared level |
-| `q_hi` grid {0.80 … 0.99} | Tail roughly halved per step; finer would fit the sample | judgment + derivation; **value fixed by R1 (M3)** |
+| `q_hi` grid {0.80 … 0.99} | Tail roughly halved per step; finer would fit the sample | judgment + derivation; **`q_hi` = 0.800, fixed by R1 at `B` = 1 440 on the hold-out year (D9 item 11)** |
 | `n_min` 97 | 1.96² · 0.25 / 0.10² = 96.04 in the regime × location cells #28 estimates | derivation from the 10 pp judgment |
 | 10 pp half-width | The coarsest contrast worth testing against the baseline | judgment |
 | Three location bins | The two location factors #28 names plus the remainder | derivation from #28's scope |
@@ -790,6 +819,53 @@ run on the same clock (ADR-043 D6).
       item 9 applies: the PASS of `B` = 1440 is weaker evidence than its
       nominal p. The ordering (60 and 240 fail, 1440 passes) is the same
       on both years.
+    - *R1b tables.* X² over the evaluable combinations of each candidate
+      and half, against the critical value at that half's k:
+
+      | B | half | evaluable (k) | X² | critical | verdict |
+      |---|---|---|---|---|---|
+      | 60 | first | 13 | 90.9 – 416.8, all fail | 45.116 | FAIL |
+      | 60 | second | 14 | 87.7 – 326.4, all fail | 45.378 | FAIL |
+      | 240 | first | 13 | 68.8 – 325.5, all fail | 45.116 | FAIL |
+      | 240 | second | 14 | 45.5 – 212.5, all fail | 45.378 | FAIL |
+      | 1440 | first | 11 | 7.5 – 30.3, all pass | 44.523 | PASS |
+      | 1440 | second | 13 | 6.3 – 34.6, all pass | 45.116 | PASS |
+
+      Not evaluable at 1 440: on the first half 5m and 15m at q ≥ 0.975
+      and 1h at q ≥ 0.950; on the second half 5m at q = 0.990, 15m and 1h
+      at q ≥ 0.975. Every window length has an evaluable combination on
+      both halves.
+    - *R1 at `B` = 1 440, q = 0.800.* Episodes per regime label and bin
+      (`value_edge`/`structural_extreme`/`neither`); the first half carries
+      268, 160 and 79 unlabelled episodes (5m, 15m, 1h) while the regime
+      warms up from the window's start, the second none; no episode is
+      unlocated:
+
+      | window | half | LOW | MEDIUM | HIGH | EXTREME | pooled |
+      |---|---|---|---|---|---|---|
+      | 5m | first | 250/54/1569 | 153/22/1781 | 80/5/1162 | 49/2/1249 | 532/83/5761 |
+      | 5m | second | 267/94/1543 | 213/63/1849 | 131/31/1372 | 90/10/1466 | 701/198/6230 |
+      | 15m | first | 148/28/935 | 100/10/1082 | 42/0/702 | 26/1/773 | 316/39/3492 |
+      | 15m | second | 164/31/926 | 114/21/1112 | 80/9/834 | 56/6/898 | 414/67/3770 |
+      | 1h | first | 80/4/472 | 59/2/578 | 19/1/406 | 21/1/420 | 179/8/1876 |
+      | 1h | second | 73/8/525 | 82/11/621 | 32/4/419 | 24/2/416 | 211/25/1981 |
+    - *Minimum-cell classification (first half, every grid value).* On
+      every window the four `neither` cells are floor cells and
+      `value_edge` is pooled: its pooled cell is a floor cell, and so are
+      its servable cells (5m and 15m `LOW` and `MEDIUM`; on 1h none).
+      `structural_extreme` is unpowered on every window: no cell, pooled
+      or not, reaches 97 at any grid value (its pooled cell holds 83, 39
+      and 8 at 0.800). #28 reports it with its actual interval and no
+      ±10 pp claim.
+    - *Why 0.800.* At 0.850 the 15m `MEDIUM`/`value_edge` floor cell holds
+      71 episodes on the first half, below 97; at 0.800 it holds 100. The
+      second half checks the frozen floor at 0.800: its smallest floor
+      cell is 15m `MEDIUM`/`value_edge` with 114. The floor binds at the
+      bottom of the grid, so #28 has no head-room to split these cells
+      further (by side or by auction state) at ±10 pp.
+    - *Recorded.* Exhaustion episodes at `B` = 1 440, q = 0.800: 948 on
+      the first half and 1 382 on the second. The measurement's wall time
+      was 1 062.6 s for the year, against ADR-037's 1 166.6 s.
     - *Sources.* The full result is on
       [#22](https://github.com/Replikanti/mie/issues/22#issuecomment-6135775324);
       the attestation that no run read the hold-out year before the rule
@@ -816,9 +892,14 @@ run on the same clock (ADR-043 D6).
   is live only), so contexts from archive and live differ by those levels.
 - A divergence across a trades gap carries `feed_gap`: the CVD change
   misses whatever traded inside the gap.
-- Effort vs result, exhaustion and absorption wait for the hold-out run
-  (D9); until M3 the engine computes only the divergences. If that run
-  stops, M3 stays blocked until a new human decision.
+- Effort vs result, exhaustion and absorption run at `B` = 1 440 and
+  `q_hi` = 0.800, the values the hold-out run fixed (D9). Effort vs result
+  is warming up for the first 1 440 evaluations of a window, a day of
+  minutes; exhaustion for six judged 1h evaluations after that; absorption
+  needs a live run longer than that day before its first evaluation.
+- The R1 floor binds at the bottom of the grid: #28 has no head-room to
+  split the regime × location cells further at ±10 pp, and
+  `structural_extreme` is unpowered on every window (D9 item 11).
 - R1b's test is lenient near the reference: both baselines read the same
   tape, so their hour tables are positively correlated and X² is
   conservative toward PASS (D5, D9). A mild hour distortion of `B` = 1440

@@ -1791,6 +1791,281 @@ pub const CANDIDATE_DIVERGENCE_OI: [(Timeframe, &FeatureDefinition); 4] = [
     (Timeframe::D1, &CANDIDATE_DIVERGENCE_OI_1D_V1),
 ];
 
+/// `B` of effort vs result (ADR-051 D5): the baseline holds the previous
+/// 1 440 evaluations of a window. Fixed by R1b on the hold-out year (D9):
+/// 60 and 240 rank by the hour of day, 1 440 does not.
+pub const EFFORT_BASELINE_EVALUATIONS: i64 = 1_440;
+
+/// `q_hi` of effort vs result (ADR-051 D5): the effort quantile a window
+/// must reach, 0.800. Fixed by R1 at `B` = 1 440 on the hold-out year (D9),
+/// where the episode floor binds at the bottom of the grid.
+pub const EFFORT_QUANTILE: Rate = Rate::from_units(80_000_000);
+
+/// The parameters of effort vs result on the window of `window_ms`
+/// (ADR-051 D5), sorted by name.
+const fn effort_result_params(window_ms: i64) -> [Param; 4] {
+    [
+        Param {
+            name: "baseline_evaluations",
+            value: ParamValue::Int(EFFORT_BASELINE_EVALUATIONS),
+        },
+        Param {
+            name: "effort_quantile",
+            value: ParamValue::Rate(EFFORT_QUANTILE),
+        },
+        Param {
+            name: "result_rule",
+            value: ParamValue::Text("progress_at_most_move_median"),
+        },
+        Param {
+            name: "window_ms",
+            value: ParamValue::Int(window_ms),
+        },
+    ]
+}
+
+/// The effort-vs-result parameters of the 5m window.
+const EFFORT_RESULT_PARAMS_5M: [Param; 4] = effort_result_params(300_000);
+
+/// The effort-vs-result parameters of the 15m window.
+const EFFORT_RESULT_PARAMS_15M: [Param; 4] = effort_result_params(900_000);
+
+/// The effort-vs-result parameters of the 1h window.
+const EFFORT_RESULT_PARAMS_1H: [Param; 4] = effort_result_params(3_600_000);
+
+/// A `candidate.effort_result.<label>@1` definition (ADR-051 D5): one
+/// aggression window judged against its own previous evaluations.
+const fn candidate_effort_result_v1(
+    id: &'static str,
+    params: &'static [Param],
+    inputs: &'static [Input],
+) -> FeatureDefinition {
+    FeatureDefinition {
+        key: FeatureKey::new(id, 1),
+        params,
+        inputs,
+        // `EFFORT_BASELINE_EVALUATIONS`, which fits a `u32`.
+        warm_up: WarmUp::Samples(1_440),
+    }
+}
+
+/// `candidate.effort_result.5m@1`: effort vs result of the 5-minute
+/// aggression window (ADR-051 D5). Once per event that closes at least one
+/// 1m bar, the window after that event is evaluated: `effort = |delta|` and
+/// `progress = displacement × sign(delta)`, price movement in the direction
+/// of the net aggression. A window with `delta == 0` or no displacement is
+/// not evaluated. Each evaluation is judged against the previous 1 440 of
+/// the same window: `effort_high` and `effort_median` are the 0.800 and 0.5
+/// nearest-rank quantiles of their effort (the ⌈q·B⌉-th smallest value),
+/// `move_high` and `move_median` the same quantiles of their
+/// `|displacement|`. The condition is `effort ≥ effort_high` and
+/// `progress ≤ move_median`: aggression in the tail with less progress than
+/// a typical window's move. The value is the last judged evaluation; a
+/// candidate event is emitted when the condition turns true (rising edge).
+/// A candidate, never a signal (ADR-012); aggression is not direction
+/// (ADR-023).
+///
+/// - Parameters: `baseline_evaluations` = 1 440 (fixed by R1b, ADR-051 D9),
+///   `effort_quantile` = 0.800 (fixed by R1), `result_rule` =
+///   `progress_at_most_move_median`, `window_ms` = 300 000.
+/// - Inputs: `flow.window.5m@1`.
+/// - Warm-up: 1 440 samples, where a sample is an earlier evaluation in the
+///   baseline; the first value is the 1 441st evaluation.
+/// - Gap policy: nothing resets on a gap. A minute without an evaluation
+///   leaves the value, and so the condition, as it was: it neither emits
+///   nor re-arms. The value carries the window's coverage; a gap that
+///   closes several minutes in one event is one evaluation.
+pub const CANDIDATE_EFFORT_RESULT_5M_V1: FeatureDefinition = candidate_effort_result_v1(
+    "candidate.effort_result.5m",
+    &EFFORT_RESULT_PARAMS_5M,
+    &[Input::Feature(FLOW_WINDOW_5M_V1.key)],
+);
+
+/// `candidate.effort_result.15m@1`: effort vs result of the 15-minute
+/// aggression window (ADR-051 D5).
+///
+/// Parameters as [`CANDIDATE_EFFORT_RESULT_5M_V1`] with `window_ms` =
+/// 900 000. Inputs: `flow.window.15m@1`. Warm-up (1 440 earlier
+/// evaluations) and gap policy as [`CANDIDATE_EFFORT_RESULT_5M_V1`].
+pub const CANDIDATE_EFFORT_RESULT_15M_V1: FeatureDefinition = candidate_effort_result_v1(
+    "candidate.effort_result.15m",
+    &EFFORT_RESULT_PARAMS_15M,
+    &[Input::Feature(FLOW_WINDOW_15M_V1.key)],
+);
+
+/// `candidate.effort_result.1h@1`: effort vs result of the 1-hour
+/// aggression window (ADR-051 D5).
+///
+/// Parameters as [`CANDIDATE_EFFORT_RESULT_5M_V1`] with `window_ms` =
+/// 3 600 000. Inputs: `flow.window.1h@1`. Warm-up (1 440 earlier
+/// evaluations) and gap policy as [`CANDIDATE_EFFORT_RESULT_5M_V1`].
+pub const CANDIDATE_EFFORT_RESULT_1H_V1: FeatureDefinition = candidate_effort_result_v1(
+    "candidate.effort_result.1h",
+    &EFFORT_RESULT_PARAMS_1H,
+    &[Input::Feature(FLOW_WINDOW_1H_V1.key)],
+);
+
+/// Effort vs result of each aggression window, shortest first, in
+/// [`FLOW_WINDOWS`] order. The timeframe is the window length.
+pub const CANDIDATE_EFFORT_RESULT: [(Timeframe, &FeatureDefinition); 3] = [
+    (Timeframe::M5, &CANDIDATE_EFFORT_RESULT_5M_V1),
+    (Timeframe::M15, &CANDIDATE_EFFORT_RESULT_15M_V1),
+    (Timeframe::H1, &CANDIDATE_EFFORT_RESULT_1H_V1),
+];
+
+/// Exhaustion's extreme tolerance (ADR-051 D6): the last close lies within
+/// 6 bps of the extreme, one ordinary minute's move.
+pub const EXHAUSTION_EXTREME_TOLERANCE: Rate = Rate::from_units(60_000);
+
+/// `candidate.exhaustion@1`: aggression decaying at an extreme after an
+/// expansion (ADR-051 D6). At the 5m effort-vs-result evaluation ending at
+/// `t`, all three must hold:
+///
+/// - expansion: the judged 1h evaluation ending at `t − 5 min` has
+///   `effort ≥ effort_high` and `progress ≥ move_high`; without one there
+///   is no evaluation;
+/// - decay: the 5m evaluation's net aggression in the expansion's
+///   direction, `delta_5m × sign(delta_1h)`, is at most the 5m
+///   `effort_median`;
+/// - at the extreme: the last close of a 1m bar with trades lies within
+///   6 bps of the extreme of the closed 1m bars of `(t − 65 min, t]` in the
+///   expansion's direction (their highest high after net buying, their
+///   lowest low after net selling): `|extreme − close| · 10 000 ≤
+///   |extreme| · 6`, exact.
+///
+/// The value is the last evaluation; a candidate event is emitted when the
+/// conjunction turns true (rising edge). A candidate, never a signal
+/// (ADR-012).
+///
+/// - Parameters: `decay_window_ms` = 300 000, `expansion_window_ms` =
+///   3 600 000, `extreme_tolerance` = 0.0006.
+/// - Inputs: `candidate.effort_result.1h@1`, `candidate.effort_result.5m@1`
+///   and `bars.time.1m@1`, so recalibrating effort vs result re-versions
+///   exhaustion through its inputs.
+/// - Warm-up: 6 samples, where a sample is a judged 1h evaluation: the first
+///   with an expansion to read is the sixth. The value stays warming up
+///   until the first evaluation, at 6 of 6 when the minute that completes
+///   the count has none.
+/// - Gap policy: nothing resets on a gap; a minute without an evaluation
+///   leaves the value as it was. The expansion is looked up by its end, so
+///   a gap that skips `t − 5 min` gives no evaluation at `t`.
+pub const CANDIDATE_EXHAUSTION_V1: FeatureDefinition = FeatureDefinition {
+    key: FeatureKey::new("candidate.exhaustion", 1),
+    params: &[
+        Param {
+            name: "decay_window_ms",
+            value: ParamValue::Int(300_000),
+        },
+        Param {
+            name: "expansion_window_ms",
+            value: ParamValue::Int(3_600_000),
+        },
+        Param {
+            name: "extreme_tolerance",
+            value: ParamValue::Rate(EXHAUSTION_EXTREME_TOLERANCE),
+        },
+    ],
+    inputs: &[
+        Input::Feature(CANDIDATE_EFFORT_RESULT_1H_V1.key),
+        Input::Feature(CANDIDATE_EFFORT_RESULT_5M_V1.key),
+        Input::Feature(BARS_TIME_1M_V1.key),
+    ],
+    warm_up: WarmUp::Samples(6),
+};
+
+/// Absorption's band (ADR-051 D7): the 5 bps band of
+/// `book.liquidity.window.<tf>@1`, where ADR-043 D8 places the passive
+/// walls.
+pub const ABSORPTION_BAND: Rate = BOOK_BANDS[2];
+
+/// The parameters of absorption (ADR-051 D7), sorted by name.
+const ABSORPTION_PARAMS: [Param; 2] = [
+    Param {
+        name: "band",
+        value: ParamValue::Rate(ABSORPTION_BAND),
+    },
+    Param {
+        name: "replenish_rule",
+        value: ParamValue::Text("added_at_least_filled"),
+    },
+];
+
+/// A `candidate.absorption.<label>@1` definition (ADR-051 D7).
+const fn candidate_absorption_v1(id: &'static str, inputs: &'static [Input]) -> FeatureDefinition {
+    FeatureDefinition {
+        key: FeatureKey::new(id, 1),
+        params: &ABSORPTION_PARAMS,
+        inputs,
+        warm_up: WarmUp::Samples(1),
+    }
+}
+
+/// `candidate.absorption.5m@1`: aggression absorbed by replenished passive
+/// liquidity over the 5-minute window (ADR-051 D7), live only. At each
+/// judged evaluation of `candidate.effort_result.5m@1`, the book window
+/// ending at the same minute is read on the passive side opposite the
+/// aggressor (net buying means the ask, net selling the bid) inside the
+/// 5 bps band: the condition is the effort-vs-result condition and
+/// `added ≥ filled`, at least as much resting size came back as aggression
+/// took. Inferred fills count in both `added` and `filled` (ADR-043 D5), so
+/// `added − filled` does not depend on them. The "level" is where the fills
+/// rest and refill; registry-level gating is a trigger rule's. The value is
+/// the last evaluation; a candidate event is emitted when the condition
+/// turns true (rising edge). A candidate, never a signal (ADR-012).
+///
+/// - Parameters: `band` = 0.0005, `replenish_rule` =
+///   `added_at_least_filled`.
+/// - Inputs: `candidate.effort_result.5m@1` and
+///   `book.liquidity.window.5m@1`, on the same clock (ADR-043 D6).
+/// - Warm-up: one sample, where a sample is an evaluated minute: both inputs
+///   ready at the same minute and the band fully observed.
+/// - Gap policy: no evaluation while the book window is warming up or
+///   unavailable, or when the band's `beyond_window` is set; such a minute
+///   leaves the value as it was. Archive replays have no book, so the value
+///   stays warming up there.
+pub const CANDIDATE_ABSORPTION_5M_V1: FeatureDefinition = candidate_absorption_v1(
+    "candidate.absorption.5m",
+    &[
+        Input::Feature(CANDIDATE_EFFORT_RESULT_5M_V1.key),
+        Input::Feature(BOOK_LIQUIDITY_WINDOW_5M_V1.key),
+    ],
+);
+
+/// `candidate.absorption.15m@1`: absorption over the 15-minute window
+/// (ADR-051 D7), live only.
+///
+/// Parameters, warm-up and gap policy as [`CANDIDATE_ABSORPTION_5M_V1`].
+/// Inputs: `candidate.effort_result.15m@1` and
+/// `book.liquidity.window.15m@1`.
+pub const CANDIDATE_ABSORPTION_15M_V1: FeatureDefinition = candidate_absorption_v1(
+    "candidate.absorption.15m",
+    &[
+        Input::Feature(CANDIDATE_EFFORT_RESULT_15M_V1.key),
+        Input::Feature(BOOK_LIQUIDITY_WINDOW_15M_V1.key),
+    ],
+);
+
+/// `candidate.absorption.1h@1`: absorption over the 1-hour window (ADR-051
+/// D7), live only.
+///
+/// Parameters, warm-up and gap policy as [`CANDIDATE_ABSORPTION_5M_V1`].
+/// Inputs: `candidate.effort_result.1h@1` and `book.liquidity.window.1h@1`.
+pub const CANDIDATE_ABSORPTION_1H_V1: FeatureDefinition = candidate_absorption_v1(
+    "candidate.absorption.1h",
+    &[
+        Input::Feature(CANDIDATE_EFFORT_RESULT_1H_V1.key),
+        Input::Feature(BOOK_LIQUIDITY_WINDOW_1H_V1.key),
+    ],
+);
+
+/// Absorption of each window, shortest first, in [`FLOW_WINDOWS`] order.
+/// The timeframe is the window length.
+pub const CANDIDATE_ABSORPTION: [(Timeframe, &FeatureDefinition); 3] = [
+    (Timeframe::M5, &CANDIDATE_ABSORPTION_5M_V1),
+    (Timeframe::M15, &CANDIDATE_ABSORPTION_15M_V1),
+    (Timeframe::H1, &CANDIDATE_ABSORPTION_1H_V1),
+];
+
 /// Every version of every feature. Never shrinks.
 pub const DEFINITIONS: &[&FeatureDefinition] = &[
     &TRADE_LAST_PRICE_V1,
@@ -1850,6 +2125,13 @@ pub const DEFINITIONS: &[&FeatureDefinition] = &[
     &CANDIDATE_DIVERGENCE_OI_1H_V1,
     &CANDIDATE_DIVERGENCE_OI_4H_V1,
     &CANDIDATE_DIVERGENCE_OI_1D_V1,
+    &CANDIDATE_EFFORT_RESULT_5M_V1,
+    &CANDIDATE_EFFORT_RESULT_15M_V1,
+    &CANDIDATE_EFFORT_RESULT_1H_V1,
+    &CANDIDATE_EXHAUSTION_V1,
+    &CANDIDATE_ABSORPTION_5M_V1,
+    &CANDIDATE_ABSORPTION_15M_V1,
+    &CANDIDATE_ABSORPTION_1H_V1,
 ];
 
 /// The fingerprint each published `id@version` must keep. Append-only: one
@@ -1912,6 +2194,13 @@ pub const LOCK: &[LockEntry] = &[
     LockEntry::new("candidate.divergence.oi.1h", 1, 0xed72_db8d_55a5_b120),
     LockEntry::new("candidate.divergence.oi.4h", 1, 0x8661_6833_ab6f_e39e),
     LockEntry::new("candidate.divergence.oi.1d", 1, 0xb8a9_ad9b_7bc9_7d5b),
+    LockEntry::new("candidate.effort_result.5m", 1, 0xdae9_0d28_c0a2_11ca),
+    LockEntry::new("candidate.effort_result.15m", 1, 0x793d_4c46_6a46_04dd),
+    LockEntry::new("candidate.effort_result.1h", 1, 0x3eaa_567a_9b36_b2df),
+    LockEntry::new("candidate.exhaustion", 1, 0xf1b8_b407_0df0_6011),
+    LockEntry::new("candidate.absorption.5m", 1, 0x4b55_ca57_95ce_65f2),
+    LockEntry::new("candidate.absorption.15m", 1, 0x6fe7_230f_9701_9c98),
+    LockEntry::new("candidate.absorption.1h", 1, 0x34dd_4f79_4cb6_798f),
 ];
 
 /// The default feature set: the latest version of each computed feature.
@@ -1972,6 +2261,13 @@ pub const CURRENT: &[FeatureKey] = &[
     CANDIDATE_DIVERGENCE_OI_1H_V1.key,
     CANDIDATE_DIVERGENCE_OI_4H_V1.key,
     CANDIDATE_DIVERGENCE_OI_1D_V1.key,
+    CANDIDATE_EFFORT_RESULT_5M_V1.key,
+    CANDIDATE_EFFORT_RESULT_15M_V1.key,
+    CANDIDATE_EFFORT_RESULT_1H_V1.key,
+    CANDIDATE_EXHAUSTION_V1.key,
+    CANDIDATE_ABSORPTION_5M_V1.key,
+    CANDIDATE_ABSORPTION_15M_V1.key,
+    CANDIDATE_ABSORPTION_1H_V1.key,
 ];
 
 /// Older versions the engine still computes on request, each in place of
@@ -2067,10 +2363,10 @@ mod tests {
             hasher.write_u32(entry.key.version.get());
             hasher.write_u64(entry.fingerprint.value());
         }
-        assert_eq!(LOCK.len(), 57, "lock lines");
+        assert_eq!(LOCK.len(), 64, "lock lines");
         assert_eq!(
             hasher.finish().to_string(),
-            "04992581d5bdce97",
+            "b42604b215f62872",
             "lock digest"
         );
     }
@@ -2669,6 +2965,68 @@ mod tests {
     }
 
     #[test]
+    fn candidate_flow_definitions_match_their_windows() {
+        // ADR-051 D5–D7: effort vs result on each aggression window,
+        // absorption on that window's effort and the book window of the same
+        // length, exhaustion on the 1h and 5m effort; no location input
+        // (decision 3).
+        assert_eq!(
+            CANDIDATE_EFFORT_RESULT.map(|(timeframe, _)| timeframe),
+            FLOW_WINDOWS.map(|(timeframe, _)| timeframe)
+        );
+        assert_eq!(
+            CANDIDATE_ABSORPTION.map(|(timeframe, _)| timeframe),
+            BOOK_LIQUIDITY_WINDOWS.map(|(timeframe, _)| timeframe)
+        );
+        for (((timeframe, effort), (_, flow)), ((_, absorption), (_, book))) in
+            CANDIDATE_EFFORT_RESULT
+                .into_iter()
+                .zip(FLOW_WINDOWS)
+                .zip(CANDIDATE_ABSORPTION.into_iter().zip(BOOK_LIQUIDITY_WINDOWS))
+        {
+            assert_eq!(
+                effort.key.id.as_str(),
+                format!("candidate.effort_result.{}", timeframe.label())
+            );
+            assert_eq!(effort.params, &effort_result_params(timeframe.millis())[..]);
+            assert_eq!(effort.inputs, &[Input::Feature(flow.key)]);
+            assert_eq!(
+                effort.warm_up,
+                WarmUp::Samples(u32::try_from(EFFORT_BASELINE_EVALUATIONS).unwrap())
+            );
+            assert_eq!(
+                absorption.key.id.as_str(),
+                format!("candidate.absorption.{}", timeframe.label())
+            );
+            assert_eq!(absorption.params, &ABSORPTION_PARAMS[..]);
+            assert_eq!(
+                absorption.inputs,
+                &[Input::Feature(effort.key), Input::Feature(book.key)]
+            );
+            assert_eq!(absorption.warm_up, WarmUp::Samples(1));
+            for definition in [effort, absorption] {
+                assert!(CURRENT.contains(&definition.key), "{}", definition.key);
+            }
+        }
+        assert_eq!(
+            CANDIDATE_EXHAUSTION_V1.inputs,
+            &[
+                Input::Feature(CANDIDATE_EFFORT_RESULT_1H_V1.key),
+                Input::Feature(CANDIDATE_EFFORT_RESULT_5M_V1.key),
+                Input::Feature(BARS_TIME_1M_V1.key),
+            ]
+        );
+        assert_eq!(CANDIDATE_EXHAUSTION_V1.warm_up, WarmUp::Samples(6));
+        assert!(CURRENT.contains(&CANDIDATE_EXHAUSTION_V1.key));
+        // The fixed values of ADR-051 D9: B = 1 440, q_hi = 0.800; the 5 bps
+        // band and the 6 bps tolerance.
+        assert_eq!(EFFORT_BASELINE_EVALUATIONS, 1_440);
+        assert_eq!(EFFORT_QUANTILE, Rate::from_units(80_000_000));
+        assert_eq!(ABSORPTION_BAND, Rate::from_units(50_000));
+        assert_eq!(EXHAUSTION_EXTREME_TOLERANCE, Rate::from_units(60_000));
+    }
+
+    #[test]
     fn selectable_versions_are_older_than_current() {
         // ADR-029 D3, ADR-044 D10: each selectable version is registered,
         // older than the CURRENT version of its id, and substitutes into
@@ -2713,10 +3071,14 @@ mod tests {
              bars.time.1h@1,bars.time.1m@1,bars.time.4h@1,bars.time.5m@1,\
              book.clusters@1,book.depth@1,book.l2@1,book.liquidity.window.15m@1,\
              book.liquidity.window.1h@1,book.liquidity.window.5m@1,\
+             candidate.absorption.15m@1,candidate.absorption.1h@1,\
+             candidate.absorption.5m@1,\
              candidate.divergence.cvd.15m@1,candidate.divergence.cvd.1d@1,\
              candidate.divergence.cvd.1h@1,candidate.divergence.cvd.4h@1,\
              candidate.divergence.oi.15m@1,candidate.divergence.oi.1d@1,\
              candidate.divergence.oi.1h@1,candidate.divergence.oi.4h@1,\
+             candidate.effort_result.15m@1,candidate.effort_result.1h@1,\
+             candidate.effort_result.5m@1,candidate.exhaustion@1,\
              derivatives.funding.settled@1,derivatives.liq.window.15m@1,\
              derivatives.liq.window.1h@1,derivatives.liq.window.5m@1,\
              derivatives.mark@1,derivatives.oi.5m@1,derivatives.oi.sample@1,\
@@ -2730,6 +3092,6 @@ mod tests {
              structure.swing.1h@1,structure.swing.4h@1,trade.last_price@1,\
              volatility.atr.1h@1,volatility.regime.1h@1"
         );
-        assert_eq!(set.version().to_string(), "17fec2c17e164179");
+        assert_eq!(set.version().to_string(), "8e6f1b978d12a884");
     }
 }
