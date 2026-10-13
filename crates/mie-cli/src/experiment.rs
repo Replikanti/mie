@@ -5,33 +5,32 @@
 //!   [`mie_domain::research`]) and prints its experiment id and canonical
 //!   text, or every error, one per line.
 //! - [`run`] runs a spec through [`ExperimentService`] over a replay of the
-//!   raw store (live or archive, as `mie replay`) and records the result in
-//!   the append-only [`FsResultStore`]. It prints `recorded <key>` for a new
-//!   result and `reproduced <key>` when the stored result was reproduced
-//!   exactly; anything else is `FAIL: <reason>`. The composition root is the
-//!   only place that hands the writable store to the pipeline (ADR-020).
-//!   A data-version mismatch of an archive run that folds `aggTrades`
-//!   (ADR-050) adds a hint: `--trade-correction none` opens the data
-//!   versions recorded before ADR-050. `--source history` is refused: the
-//!   history chain reaches experiments with `research.replay_summary@2`
-//!   (ADR-052 D10).
+//!   raw store and records the result in the append-only [`FsResultStore`].
+//!   `live` and `archive` (as `mie replay`) run `research.replay_summary@1`;
+//!   `history` runs `research.replay_summary@2` on the history chain of an
+//!   ingest configuration with `[history]` (ADR-052 D10), whose origin and
+//!   cutover come from the built chain. It prints `recorded <key>` for a
+//!   new result and `reproduced <key>` when the stored result was
+//!   reproduced exactly; anything else is `FAIL: <reason>`. The composition
+//!   root is the only place that hands the writable store to the pipeline
+//!   (ADR-020). A data-version mismatch of an archive run that folds
+//!   `aggTrades` (ADR-050) adds a hint: `--trade-correction none` opens the
+//!   data versions recorded before ADR-050. The chain always folds, so it
+//!   gets no hint.
 
 use crate::journal::read_runs;
-use crate::replay::{ReplaySource, archive_replay};
+use crate::replay::{ReplaySource, archive_replay, history_chain};
 use mie_adapter_binance::LiveReplay;
 use mie_adapter_binance::archive::fold::TradeCorrection;
 use mie_adapter_fs::FsResultStore;
 use mie_adapter_parquet::ParquetRawStore;
-use mie_app::ExperimentService;
+use mie_app::{ChainBounds, ExperimentService};
 use mie_domain::feature::catalog;
 use mie_domain::research::{ExperimentSpec, SpecError};
 use mie_ports::inbound::{ExperimentRun, ResearchError, RunResearchExperiment};
 use mie_ports::outbound::HistoricalDataProvider;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-
-/// Why `mie experiment run` refuses `--source history` (module docs).
-const HISTORY_REFUSED: &str = "--source history applies to `mie replay` only";
 
 /// One `mie experiment run` invocation.
 #[derive(Debug, Clone)]
@@ -74,14 +73,9 @@ pub fn validate(path: &Path, out: &mut dyn Write) -> Result<bool, String> {
 ///
 /// # Errors
 ///
-/// A description when the source is `history`, which `mie experiment run`
-/// does not take yet (ADR-052 D10 adds it with `research.replay_summary@2`),
-/// or when the spec file cannot be read or the output written. Every run
-/// failure is reported in the output.
+/// A description when the spec file cannot be read or the output written.
+/// Every run failure is reported in the output.
 pub fn run(request: &ExperimentRequest, out: &mut dyn Write) -> Result<bool, String> {
-    if let ReplaySource::History(_) = request.source {
-        return Err(HISTORY_REFUSED.to_owned());
-    }
     let mut report = Vec::new();
     let spec = match load(&request.spec)? {
         Ok(spec) => spec,
@@ -106,7 +100,7 @@ pub fn run(request: &ExperimentRequest, out: &mut dyn Write) -> Result<bool, Str
                             &config.instrument.symbol,
                             runs,
                         );
-                        execute(live, results, &spec, false)
+                        execute(ExperimentService::new(live, results), &spec, false)
                     }
                     Err(error) => Err(error),
                 }
@@ -118,10 +112,26 @@ pub fn run(request: &ExperimentRequest, out: &mut dyn Write) -> Result<bool, Str
             } => {
                 let store = ParquetRawStore::new(&config.paths.raw_root);
                 let folding = *correction == TradeCorrection::Fold;
-                archive_replay(&store, config, streams.as_deref(), *correction)
-                    .and_then(|replay| execute(replay, results, &spec, folding))
+                archive_replay(&store, config, streams.as_deref(), *correction).and_then(|replay| {
+                    execute(ExperimentService::new(replay, results), &spec, folding)
+                })
             }
-            ReplaySource::History(_) => Err(HISTORY_REFUSED.to_owned()),
+            ReplaySource::History(config) => {
+                let store = ParquetRawStore::new(&config.paths.raw_root);
+                history_chain(config, &store).and_then(|chain| {
+                    // The bounds come from the built chain, so they cannot
+                    // disagree with the provider.
+                    let bounds = ChainBounds {
+                        origin: chain.origin(),
+                        cutover: chain.cutover(),
+                    };
+                    execute(
+                        ExperimentService::on_chain(chain, results, bounds),
+                        &spec,
+                        false,
+                    )
+                })
+            }
         },
         Err(error) => Err(error.to_string()),
     };
@@ -134,16 +144,14 @@ pub fn run(request: &ExperimentRequest, out: &mut dyn Write) -> Result<bool, Str
     Ok(pass)
 }
 
-/// Runs `spec` over `history` into `results`: the line to print, or why it
-/// failed. `folding`: the history folds `aggTrades` (ADR-050), so a data
+/// Runs `spec` through `service`: the line to print, or why it failed.
+/// `folding`: an archive replay that folds `aggTrades` (ADR-050), so a data
 /// version from before the fold may be the cause of a mismatch.
 fn execute<H: HistoricalDataProvider>(
-    history: H,
-    results: FsResultStore,
+    mut service: ExperimentService<H, FsResultStore>,
     spec: &ExperimentSpec,
     folding: bool,
 ) -> Result<String, String> {
-    let mut service = ExperimentService::new(history, results);
     let run = service.run(spec).map_err(|e| match e {
         ResearchError::DataVersionMismatch { .. } if folding => format!(
             "{e}\nhint: --trade-correction none reproduces data versions recorded before \

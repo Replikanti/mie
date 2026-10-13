@@ -1,10 +1,12 @@
 //! `mie experiment` offline (#29, ADR-040): specs validated, run over
 //! archive rows in a real Parquet raw store, results recorded once in the
-//! append-only result store and reproduced exactly.
+//! append-only result store and reproduced exactly. `--source history`
+//! runs `research.replay_summary@2` on the history chain of the seam
+//! fixture (ADR-052 D10).
 
 mod common;
 
-use common::{HOUR, TempDir};
+use common::{CUTOVER, HOUR, ORIGIN, TempDir, import_rows, seam_fixture};
 use mie_adapter_binance::archive::catalog::{DAY_MS, parse_day};
 use mie_adapter_binance::archive::fold::TradeCorrection;
 use mie_adapter_binance::archive::normalize::record_time;
@@ -12,9 +14,12 @@ use mie_adapter_binance::archive::replay::ArchiveReplay;
 use mie_adapter_binance::archive::{ARCHIVE_SOURCE, ArchiveStream};
 use mie_adapter_parquet::ParquetRawStore;
 use mie_cli::config::ArchiveConfig;
+use mie_cli::config::IngestConfig;
 use mie_cli::experiment::{self, ExperimentRequest};
-use mie_cli::replay::ReplaySource;
+use mie_cli::replay::{self, ReplayOutcome, ReplayRequest, ReplaySource};
 use mie_domain::feature::{FeatureSet, catalog};
+use mie_domain::research::ExperimentSpec;
+use mie_domain::state_hash::STATE_HASH_ENCODING;
 use mie_domain::time::EventTime;
 use mie_ports::outbound::{HistoricalDataProvider, ReplayWindow};
 use mie_ports::raw::{RawRecord, RawRecordSink, RawStreamKey};
@@ -382,4 +387,168 @@ fn an_empty_sample_fails_the_run() {
         run(&request),
         (false, "FAIL: the sample period holds no event\n".to_owned())
     );
+}
+
+// ---------------------------------------------------------------------------
+// `--source history`: `research.replay_summary@2` (ADR-052 D10).
+
+fn window(start: i64, end: i64) -> ReplayWindow {
+    ReplayWindow {
+        start: EventTime::from_millis(start),
+        end: EventTime::from_millis(end),
+    }
+}
+
+/// `mie replay --source history` of `config` over `w`.
+fn history_replay(config: &IngestConfig, w: ReplayWindow) -> ReplayOutcome {
+    let mut out = Vec::new();
+    let outcome = replay::run(
+        &ReplayRequest {
+            source: ReplaySource::History(config.clone()),
+            window: w,
+        },
+        &mut out,
+    )
+    .unwrap();
+    assert!(outcome.pass, "{}", String::from_utf8_lossy(&out));
+    outcome
+}
+
+/// The value of the line `<key> <value>` of a stored result.
+fn stored_line<'a>(text: &'a str, key: &str) -> &'a str {
+    text.lines()
+        .find_map(|line| line.strip_prefix(key)?.strip_prefix(' '))
+        .unwrap_or_else(|| panic!("no {key} line in\n{text}"))
+}
+
+fn history_request(dir: &Path, config: &IngestConfig, spec: &str) -> ExperimentRequest {
+    ExperimentRequest {
+        spec: write_spec(dir, "history.spec", spec),
+        source: ReplaySource::History(config.clone()),
+        results: dir.join("results"),
+    }
+}
+
+#[test]
+fn a_history_run_records_then_reproduces_the_prefix_and_the_sample() {
+    let dir = TempDir::new("experiment-history");
+    let config = seam_fixture(dir.path());
+    let sample = window(CUTOVER, CUTOVER + DAY_MS);
+    let replayed = history_replay(&config, sample);
+    let text = spec_text(sample, replayed.dataset.as_ref().unwrap().as_str());
+    let request = history_request(dir.path(), &config, &text);
+    let experiment = ExperimentSpec::parse(&text, &catalog::registry())
+        .unwrap()
+        .id();
+    // The spec lists no `catalog::SELECTABLE` member: the engine computes
+    // the current set.
+    let key = format!(
+        "{experiment}/research.replay_summary@2-{}-{STATE_HASH_ENCODING}",
+        catalog::current_set().version()
+    );
+
+    let (pass, first) = run(&request);
+    assert!(pass, "{first}");
+    assert_eq!(first, format!("recorded {key}\n"));
+    let stored = files(&request.results);
+    assert_eq!(stored.len(), 1, "{stored:?}");
+    assert!(stored[0].0.ends_with(format!("{key}.result")), "{stored:?}");
+    let stored_text = String::from_utf8(stored[0].1.clone()).unwrap();
+
+    // The prefix is the chain's replay of [origin, sample start), the
+    // sample its replay of the sample.
+    let prefix = history_replay(&config, window(ORIGIN, CUTOVER));
+    assert_eq!(
+        stored_line(&stored_text, "prefix-data"),
+        prefix.dataset.unwrap().as_str()
+    );
+    assert_eq!(
+        stored_line(&stored_text, "prefix-stream"),
+        prefix.stream_hash.unwrap().to_string()
+    );
+    assert_eq!(stored_line(&stored_text, "prefix-rejections"), "0");
+    assert_eq!(
+        stored_line(&stored_text, "stream"),
+        replayed.stream_hash.unwrap().to_string()
+    );
+    assert_eq!(stored_line(&stored_text, "rejections"), "0");
+    assert_eq!(stored_line(&stored_text, "origin"), ORIGIN.to_string());
+    assert_eq!(stored_line(&stored_text, "cutover"), CUTOVER.to_string());
+    assert_eq!(stored_line(&stored_text, "effective-origin"), "-");
+
+    let (pass, second) = run(&request);
+    assert!(pass, "{second}");
+    assert_eq!(second, format!("reproduced {key}\n"));
+    assert_eq!(files(&request.results), stored);
+}
+
+#[test]
+fn an_archive_row_imported_on_a_prefix_day_fails_the_rerun() {
+    let dir = TempDir::new("experiment-history-prefix");
+    let config = seam_fixture(dir.path());
+    let sample = window(CUTOVER, CUTOVER + DAY_MS);
+    let recorded = history_replay(&config, sample).dataset.unwrap();
+    let request = history_request(dir.path(), &config, &spec_text(sample, recorded.as_str()));
+    let (pass, text) = run(&request);
+    assert!(pass, "{text}");
+    let stored = files(&request.results);
+
+    // A late archive row on the origin's second day: the sample's chain
+    // version covers the archive segment, so it moves.
+    let (_, archive) = config.history_archive().unwrap().unwrap();
+    let time = ORIGIN + DAY_MS + 30 * 60_000 + 11;
+    import_rows(
+        &archive,
+        &[(
+            ArchiveStream::AggTrades,
+            format!("9000,85000.10,0.010,9000,9000,{time},false"),
+        )],
+    );
+    let moved = history_replay(&config, sample).dataset.unwrap();
+    assert_ne!(moved, recorded);
+    assert_eq!(
+        run(&request),
+        (
+            false,
+            format!(
+                "FAIL: data version mismatch: the spec names {recorded}, the sample opened \
+                 {moved}\n"
+            )
+        )
+    );
+    assert_eq!(files(&request.results), stored);
+}
+
+#[test]
+fn a_history_run_without_a_history_section_or_before_the_origin_fails() {
+    let dir = TempDir::new("experiment-history-refused");
+    let config = seam_fixture(dir.path());
+    let sample = window(CUTOVER, CUTOVER + DAY_MS);
+    let data = history_replay(&config, sample).dataset.unwrap();
+
+    let mut cold = config.clone();
+    cold.history = None;
+    let request = history_request(dir.path(), &cold, &spec_text(sample, data.as_str()));
+    let (pass, text) = run(&request);
+    assert!(!pass);
+    assert!(
+        text.starts_with("FAIL: ") && text.contains("no [history] section"),
+        "{text}"
+    );
+    assert!(files(&request.results).is_empty());
+
+    let early = window(ORIGIN - DAY_MS, ORIGIN + DAY_MS);
+    let request = history_request(dir.path(), &config, &spec_text(early, data.as_str()));
+    assert_eq!(
+        run(&request),
+        (
+            false,
+            format!(
+                "FAIL: the sample starts at {} ms, before the history origin {ORIGIN} ms \
+                 (ADR-052 D10)\n",
+                ORIGIN - DAY_MS
+            )
+        )
+    );
+    assert!(files(&request.results).is_empty());
 }

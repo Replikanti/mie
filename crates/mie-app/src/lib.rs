@@ -21,13 +21,15 @@
 //! ADR-041).
 //!
 //! [`ExperimentService`] ([`research`]) runs an experiment spec and is the
-//! only writer of research results (ADR-020, ADR-040).
+//! only writer of research results (ADR-020, ADR-040): `@1` over a replay
+//! of the sample, `@2` on the history chain, with the prefix driven first
+//! (ADR-052 D10).
 
 pub mod equivalence;
 pub mod kline_check;
 pub mod research;
 
-pub use research::{ExperimentService, REPLAY_SUMMARY_V1};
+pub use research::{ChainBounds, ExperimentService, REPLAY_SUMMARY_V1, REPLAY_SUMMARY_V2};
 
 use mie_domain::event::MarketEvent;
 use mie_domain::event_hash::{EventStreamHash, EventStreamHasher};

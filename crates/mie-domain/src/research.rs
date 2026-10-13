@@ -10,9 +10,11 @@
 //! - [`ExperimentId`] — FNV-1a 64 ([`crate::fingerprint`]) over the
 //!   canonical spec text, so the same experiment has the same id everywhere.
 //! - [`ExperimentResult`] ([`result`]) — what a deterministic pipeline
-//!   produced for a spec, keyed by `(experiment id, pipeline id@N)` and
-//!   stored as **result text v1**. Only the pipeline writes results
-//!   (ADR-020); agents may propose specs.
+//!   produced for a spec, keyed by `(experiment id, pipeline id@N)` and,
+//!   for a pipeline that reads Market State, the engine key ([`EngineKey`]:
+//!   feature-set version and state-hash encoding), and stored as **result
+//!   text v1**. Only the pipeline writes results (ADR-020); agents may
+//!   propose specs.
 //!
 //! Slots whose semantics later issues own (location, trigger, entry,
 //! invalidation, target, slippage, funding, Market State filters) are
@@ -110,12 +112,44 @@
 //! The `outcome` line tags the kind and the kind's own lines follow it; a
 //! new kind adds a tag, and the lines of an existing kind never change. A
 //! result whose `experiment` line differs from the id of its embedded spec
-//! does not parse, and neither does any text that is not canonical.
+//! does not parse, and neither does any text that is not canonical. A
+//! pipeline version with a kind of its own fixes the `outcome` line:
+//! `research.replay_summary@1` records `replay-summary`, `@2`
+//! `history-replay-summary`, and any other pairing does not parse.
+//!
+//! `history-replay-summary` (`research.replay_summary@2`, ADR-052 D10)
+//! replaces the two `replay-summary` lines with these, in this order:
+//!
+//! ```text
+//! outcome history-replay-summary
+//! origin <ms>
+//! effective-origin <ms|->
+//! cutover <ms>
+//! prefix-data <64 hex|->
+//! prefix-stream <events>:<16 hex>
+//! prefix-rejections <n>
+//! engine-features <16 hex>
+//! state-encoding <n>
+//! state-start <16 hex>
+//! stream <events>:<16 hex>
+//! rejections <n>
+//! state-end <16 hex>
+//! ```
+//!
+//! `-` means no restart (`effective-origin`) or an empty prefix
+//! (`prefix-data`); `state-encoding` is a decimal from 1. Its key carries
+//! the engine of `engine-features` and `state-encoding`, so the key is
+//! still a function of the text: its name is
+//! `<pipeline id>@<N>-<feature-set 16 hex>-<state encoding>`
+//! ([`ResultKey::name`]).
 
 pub mod result;
 pub mod spec;
 
-pub use result::{ExperimentResult, Outcome, PipelineKey, ResultKey, ResultParseError};
+pub use result::{
+    EngineKey, ExperimentResult, HistoryReplaySummary, Outcome, PipelineKey, ResultKey,
+    ResultParseError,
+};
 pub use spec::{ExperimentSpec, FeeSchedule, RegimeFilter, SamplePeriod, SpecError, SpecField};
 
 use crate::feature::{FeatureKey, is_valid_id};

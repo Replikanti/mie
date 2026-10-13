@@ -4,8 +4,13 @@
 //! [`ResearchResultReader`] as one file per result:
 //!
 //! ```text
-//! <root>/<experiment hex>/<pipeline id>@<N>.result
+//! <root>/<experiment hex>/<pipeline id>@<N>[-<feature-set hex>-<state encoding>].result
 //! ```
+//!
+//! The file name is the key's name ([`ResultKey::name`]): a result whose
+//! outcome reads Market State carries its engine key (ADR-040 D9, ADR-052
+//! D10), so every build's result of an experiment sits in its one
+//! directory.
 //!
 //! A file holds the result text v1 ([`mie_domain::research`]) followed by
 //! the trailer line `sha256 <64 hex>`: the SHA-256 of every byte before it.
@@ -37,7 +42,7 @@
 //!   unknown names are ignored, never removed.
 
 use mie_domain::feature::{FeatureRegistry, catalog};
-use mie_domain::research::{ExperimentId, ExperimentResult, HypothesisId, PipelineKey, ResultKey};
+use mie_domain::research::{ExperimentId, ExperimentResult, HypothesisId, ResultKey};
 use mie_ports::outbound::{ResearchResultReader, ResearchResultStore, ResultStoreError};
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
@@ -95,22 +100,18 @@ impl FsResultStore {
     pub fn path_of(&self, key: &ResultKey) -> PathBuf {
         self.root
             .join(key.experiment.to_string())
-            .join(format!("{}.{RESULT_EXTENSION}", key.pipeline))
+            .join(format!("{}.{RESULT_EXTENSION}", key.name()))
     }
 
     /// The keys of the result files of `experiment`, sorted. Dot-files and
-    /// other names are skipped.
+    /// other names, non-canonical key names included, are skipped.
     fn keys_of(&self, experiment: ExperimentId) -> Result<Vec<ResultKey>, ResultStoreError> {
         let dir = self.root.join(experiment.to_string());
         let mut keys: Vec<ResultKey> = sorted_names(&dir)?
             .iter()
             .filter(|name| !name.starts_with('.'))
             .filter_map(|name| name.strip_suffix(&format!(".{RESULT_EXTENSION}")))
-            .filter_map(PipelineKey::parse)
-            .map(|pipeline| ResultKey {
-                experiment,
-                pipeline,
-            })
+            .filter_map(|name| ResultKey::from_name(experiment, name))
             .collect();
         keys.sort();
         Ok(keys)
@@ -226,7 +227,7 @@ impl ResearchResultStore for FsResultStore {
 
         let text = result.canonical_text();
         let path = self.path_of(&key);
-        let name = format!("{}.{RESULT_EXTENSION}", key.pipeline);
+        let name = format!("{}.{RESULT_EXTENSION}", key.name());
         let tmp = self.write_tmp(&dir, &name, &with_trailer(&text))?;
         let linked = fs::hard_link(&tmp, &path);
         // A temporary name that cannot be removed is a dot-file the store

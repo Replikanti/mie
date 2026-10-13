@@ -12,6 +12,21 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
 
 ### Added
 
+- **Research on the history chain: `research.replay_summary@2` and
+  `mie experiment run --source history` (ADR-052 D10, #119).** With an
+  ingest configuration that has `[history]`, the run opens the sample on
+  the history chain and checks its data version, drives the chain's prefix
+  `[origin, sample start)` into the engine without evaluating it, then
+  replays the sample into the same engine as `@1` does, both through
+  `mie_app::drive_chain`. The new outcome kind `history-replay-summary`
+  records the origin, the effective origin, the cutover, the prefix's
+  dataset version, event-stream hash and rejections, the engine key, and the
+  state hashes at the sample's start and end. A `@2` result is keyed by
+  experiment, pipeline and engine (feature-set version and state-hash
+  encoding), stored as `<pipeline id>@<N>-<feature-set hex>-<state
+  encoding>.result`, so a build with another engine records next to the
+  old result. A sample before the origin fails. `--source live|archive`,
+  `@1`, its keys and result text are unchanged.
 - **The history chain and `mie replay --source history` (ADR-052, #116).**
   An optional `[history]` section of the ingest configuration (`origin`,
   `cutover`, `archive_config`; the archive configuration must share the raw
@@ -30,7 +45,7 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   `MAX_BARS_PER_EVENT` one-minute bars) restarts a fresh engine through the
   new `mie_app::drive_chain`; each restart and the effective origin are
   printed. `--source live|archive` reports are unchanged; `mie experiment
-  run` refuses `--source history`.
+  run` refused `--source history` until #119 (above).
 - **Order-flow candidates: CVD and open-interest divergences (ADR-051,
   #22).** `candidate.divergence.cvd.<15m|1h|4h|1d>@1` and
   `candidate.divergence.oi.<15m|1h|4h|1d>@1` compare consecutive confirmed

@@ -128,15 +128,25 @@ USAGE:
         crates/mie-cli/experiment.example.spec.
 
     mie experiment run <spec> --config <path> --results <dir>
-                       [--source live|archive] [--streams <a,b,...>]
+                       [--source live|archive|history] [--streams <a,b,...>]
                        [--trade-correction fold|none]
         Run the spec's sample period through the core (source options as
         mie replay) and record the result in the append-only result store
-        under <dir>. Prints `recorded <key>` for a new result or
-        `reproduced <key>` when the stored result was reproduced exactly;
-        exits 0. A data-version mismatch, an empty sample, a provider
-        failure or a result that differs from the stored one prints
-        `FAIL: <reason>` and exits 1. Stored results are never overwritten.
+        under <dir>. live and archive record research.replay_summary@1.
+        history takes an ingest config with a [history] section and
+        records research.replay_summary@2 (ADR-052 D10): the history chain
+        from the origin up to the sample's start drives the engine first,
+        the sample is then replayed as @1 replays it, and the result adds
+        the prefix's provenance and the state hashes at the sample's start
+        and end. Its key ends in the engine's feature-set version and
+        state-hash encoding, so another build records next to the old
+        result. --streams and --trade-correction apply to archive only.
+        Prints `recorded <key>` for a new result or `reproduced <key>` when
+        the stored result was reproduced exactly; exits 0. A data-version
+        mismatch, an empty sample, a sample before the history origin, a
+        provider failure or a result that differs from the stored one
+        prints `FAIL: <reason>` and exits 1. Stored results are never
+        overwritten.
 
     mie --help
 ";
