@@ -98,6 +98,17 @@ cargo run --release -p mie-cli -- capture-report \
     --config crates/mie-cli/ingest.example.toml --from <epoch ms> --to <epoch ms>
 ```
 
+With a `[history]` section (ADR-052), a run that starts at or after the
+cutover warm-starts its engine from the history chain through its
+predecessor while the capture already runs: the records that arrive during
+the warm-up are queued and recomputed with the chain's seeds at the
+handoff. The journal's `warm_start` record holds the prefix's provenance
+and the seeds, or why the run started cold (no `[history]`, a start before
+the cutover, a failed warm-up, or `[history] max_run_records` missing or
+exceeded by the largest run or by the records queued during the warm-up,
+the memory guard). `mie equivalence` compares warm runs from #118
+on; until then it reports them diverged.
+
 Historical backfill from the Binance public data archive (source
 `binance-archive`, see [data availability](docs/data-availability.md)):
 probe, import (re-runs skip imported files, an interrupted file resumes),

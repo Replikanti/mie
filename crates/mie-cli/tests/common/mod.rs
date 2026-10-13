@@ -568,6 +568,7 @@ pub fn history_config(dir: &Path, origin: &str, cutover: &str) -> IngestConfig {
         origin: origin.to_owned(),
         cutover: cutover.to_owned(),
         archive_config: dir.join("archive.toml"),
+        max_run_records: None,
     });
     config
 }

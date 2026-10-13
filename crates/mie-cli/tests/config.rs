@@ -228,6 +228,25 @@ mod history {
         }
     }
 
+    #[test]
+    fn the_memory_guard_key_is_optional_positive_and_without_default() {
+        let config = IngestConfig::parse(&format!("{REQUIRED}{HISTORY}")).expect("valid");
+        assert_eq!(config.history.unwrap().max_run_records, None);
+        let text = format!("{REQUIRED}{HISTORY}max_run_records = 25000000\n");
+        let config = IngestConfig::parse(&text).expect("valid");
+        assert_eq!(config.history.unwrap().max_run_records, Some(25_000_000));
+        for (line, expected) in [
+            ("max_run_records = 0", "must be positive"),
+            ("max_run_records = -5", "max_run_records"),
+            ("max_run_records = \"many\"", "max_run_records"),
+            ("max_run_bytes = 5", "unknown field"),
+        ] {
+            let text = format!("{REQUIRED}{HISTORY}{line}\n");
+            let error = IngestConfig::parse(&text).expect_err(line).0;
+            assert!(error.contains(expected), "{line}: {error}");
+        }
+    }
+
     /// An ingest configuration under `dir` with a `[history]` naming the
     /// archive configuration `archive.toml` there, whose raw root is
     /// `archive_root` and symbol `symbol`.

@@ -65,8 +65,10 @@ depth_snapshot_min_spacing_ms = 2000
 # hash and Market State hash, about 1440 lines per day.
 state_checkpoint_interval_secs = 60
 
-# The history chain (ADR-052), read by `mie replay --source history` and
-# `mie experiment run --source history`.
+# The history chain (ADR-052), read by `mie replay --source history`,
+# `mie experiment run --source history`, and by `mie ingest`, which
+# warm-starts every run that starts at or after the cutover from the chain
+# through the run's predecessor while the capture runs (ADR-052 D3, D7).
 # Optional: without it every run starts cold (ADR-052 D8).
 # [history]
 # # The chain's origin and the cutover between the archive and the live
@@ -79,3 +81,11 @@ state_checkpoint_interval_secs = 60
 # # The `mie archive-*` configuration of the archive segment: the same
 # # raw_root and symbol as this file.
 # archive_config = "archive.toml"
+# # The warm start's memory guard (ADR-052 D13): the most records a chain
+# # run before the starting one may hold, since the warm-up holds one run
+# # in memory at a time; the records queued while it runs share the limit
+# # with the largest run. No default: without it every warm start falls back
+# # to a cold run, with the reason journaled. The value is the host memory
+# # left to the warm-up divided by the bytes per record, both measured by
+# # #106; none is given here.
+# max_run_records =

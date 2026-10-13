@@ -55,7 +55,12 @@
 //! - **Prefix.** [`HistoryChain::before_run`] is the chain through a run's
 //!   predecessor, unwindowed at the end, for the warm start and its
 //!   equivalence check: the named run and every later one are skipped, never
-//!   recomputed.
+//!   recomputed. Once it has ended, its [`tail`](HistoryChainStream::tail)
+//!   ([`ChainTail`]) is what the named run continues after: the seeds the
+//!   chain recomputes it with ([`ChainTail::run_seeds`]) and the join to the
+//!   prefix ([`ChainTail::continuation`]). The warm start (W3) pushes the
+//!   live run's records through that continuation, so the live engine's
+//!   input is the chain's recompute of the run by construction.
 //! - **Dataset version** (ADR-052 D5, [`chain_dataset`]): SHA-256 over a
 //!   versioned text holding the origin, the cutover and both segments'
 //!   versions, so an archive correction and a newly sealed run both change
@@ -71,7 +76,8 @@ use crate::archive::catalog::{ArchiveStream, DAY_MS};
 use crate::archive::fetch::hex;
 use crate::archive::fold::TradeCorrection;
 use crate::archive::replay::{ArchiveReplay, ArchiveReplayStream};
-use crate::replay::{LiveReplay, LiveReplayStream, LiveRun, RUN_MARGIN_MS};
+use crate::replay::{LiveReplay, LiveReplayStream, LiveRun, RUN_MARGIN_MS, RunContinuation};
+use crate::stream::BinanceStream;
 use mie_domain::event::{FeedGap, MarketEvent, Stream};
 use mie_domain::time::EventTime;
 use mie_ports::outbound::{
@@ -128,7 +134,7 @@ pub fn chain_dataset(
 /// invented at the origin.
 ///
 /// The one computation of the seam seeds: the warm start (W3) journals the
-/// same seeds for the first chain run.
+/// same seeds for the first chain run ([`HistoryChainStream::tail`]).
 pub(crate) fn seam_seeds(
     mut newest: BTreeMap<Stream, EventTime>,
     trailing: &[FeedGap],
@@ -139,6 +145,64 @@ pub(crate) fn seam_seeds(
         }
     }
     newest
+}
+
+/// Where a chain prefix ends ([`HistoryChainStream::tail`]): what the next
+/// chain run continues after (ADR-052 D2, D3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainTail {
+    /// The prefix's last event, delivered or not; `None` for an empty
+    /// prefix.
+    pub last: Option<MarketEvent>,
+    /// The prefix's newest open-interest time.
+    pub newest_oi: Option<EventTime>,
+    /// Per domain series, where the prefix's data of it ends: its newest
+    /// event time, or at the seam where the archive's trailing gap of the
+    /// series starts ([`seam_seeds`]).
+    pub newest: BTreeMap<Stream, EventTime>,
+}
+
+impl ChainTail {
+    /// The seeds the history chain recomputes the next run with, per
+    /// captured stream: each non-book stream gets its domain series' chain
+    /// seed, `depth` and `depthSnapshot` the order book's. A series the
+    /// prefix holds no event of gets none: at the seam that is mark price,
+    /// liquidations and the order book (ADR-052 D3).
+    ///
+    /// Journaled as the run's seeds, they are exactly the seeds the chain
+    /// keeps: no journaled seed of a non-book stream is newer than the
+    /// chain's, and none is missing where the chain has one, so the chain's
+    /// per-stream rule changes none of them; the book keeps its journaled
+    /// seed anyway.
+    pub fn run_seeds(&self) -> BTreeMap<BinanceStream, EventTime> {
+        BinanceStream::ALL
+            .into_iter()
+            .filter_map(|stream| {
+                let seed = self.newest.get(&stream.domain_stream())?;
+                Some((stream, *seed))
+            })
+            .collect()
+    }
+
+    /// The recompute of the next run with `seeds`, joined to the prefix
+    /// through the zero hold-back join of ADR-039 D3, as the chain joins it
+    /// (an empty prefix needs no join). `symbol`, `hold_back_ms` and
+    /// `oi_retime_ms` are the run's.
+    pub fn continuation(
+        &self,
+        symbol: &str,
+        hold_back_ms: i64,
+        oi_retime_ms: i64,
+        seeds: &BTreeMap<BinanceStream, EventTime>,
+    ) -> RunContinuation {
+        RunContinuation::new(
+            symbol,
+            hold_back_ms,
+            oi_retime_ms,
+            seeds,
+            self.last.clone().map(|last| (last, self.newest_oi)),
+        )
+    }
 }
 
 /// [`HistoricalDataProvider`] over the history chain of one instrument
@@ -521,6 +585,34 @@ impl<'a> HistoryChainStream<'a> {
         &self.trailing
     }
 
+    /// Where the chain ends, once the stream has ended (`None` before): with
+    /// a live segment, where its last chained run leaves the chained output;
+    /// without one, the archive segment's last event and newest
+    /// open-interest time, and [`seam_seeds`] of its newest events and
+    /// trailing gaps, the seeds the first chain run gets at the seam. For
+    /// [`HistoryChain::before_run`] it is what the named run continues
+    /// after (module docs).
+    pub fn tail(&self) -> Option<ChainTail> {
+        if !self.live_done {
+            return None;
+        }
+        Some(match &self.live {
+            Some(live) => {
+                let (last, newest_oi, newest) = live.stream.tail();
+                ChainTail {
+                    last: last.cloned(),
+                    newest_oi,
+                    newest: newest.clone(),
+                }
+            }
+            None => ChainTail {
+                last: self.last.clone(),
+                newest_oi: self.newest_oi,
+                newest: seam_seeds(self.newest.clone(), self.archive.stream.trailing_gaps()),
+            },
+        })
+    }
+
     /// Whether `event` is delivered in the window (ADR-039 D4); a gap still
     /// open at the window's end is withheld and listed when it starts before
     /// it.
@@ -609,7 +701,7 @@ mod tests {
     use crate::archive::ARCHIVE_SOURCE;
     use crate::archive::catalog::parse_day;
     use crate::archive::normalize::record_time as archive_time;
-    use crate::stream::BinanceStream;
+    use crate::replay::with_chain_seeds;
     use crate::testing::{MemorySource, RunBuilder, SOURCE, agg, mark, oi};
     use mie_domain::event::{GapReason, Stream};
     use mie_domain::state::MarketStateEngine;
@@ -1312,6 +1404,170 @@ mod tests {
                 "{id}"
             );
         }
+    }
+
+    /// `builder`'s records pushed through `continuation`, then finished.
+    fn continue_with(continuation: &mut RunContinuation, builder: &RunBuilder) -> Vec<MarketEvent> {
+        let mut out = Vec::new();
+        for (stream, record) in &builder.records {
+            out.extend(continuation.push(*stream, record));
+        }
+        out.extend(continuation.finish());
+        out
+    }
+
+    /// The run's seeds replaced by `tail`'s chain seeds, the continuation
+    /// of the run after `tail`, and what it delivers over the run's records:
+    /// what the warm start computes live.
+    fn warm(tail: &ChainTail, run: &LiveRun, builder: &RunBuilder) -> (LiveRun, Vec<MarketEvent>) {
+        let mut seeded = run.clone();
+        seeded.seeds = tail.run_seeds();
+        let mut continuation = tail.continuation(
+            &run.symbol,
+            run.hold_back_ms,
+            run.oi_retime_ms,
+            &seeded.seeds,
+        );
+        let out = continue_with(&mut continuation, builder);
+        (seeded, out)
+    }
+
+    #[test]
+    fn a_prefix_tail_continues_the_next_run_exactly_as_the_chain_does() {
+        let fixture = Fixture::new();
+        let source = fixture.source();
+        let chain = chain(&source, fixture.runs.clone());
+        let (union, _) = replay(&chain, window(origin(), far()));
+        assert!(
+            chain
+                .replay(window(origin(), far()))
+                .unwrap()
+                .stream
+                .tail()
+                .is_none()
+        );
+
+        // The first chain run after the archive-only prefix.
+        let mut prefix = chain.before_run("20261005T000010Z").unwrap().stream;
+        assert!(prefix.tail().is_none(), "not before the stream has ended");
+        let events = drain(&mut prefix);
+        let tail = prefix.tail().unwrap();
+        assert_eq!(tail.last.as_ref(), events.last());
+        assert_eq!(tail.last.as_ref().unwrap().time(), time(archive_last()));
+        // At the seam only the archive's series are seeded (ADR-052 D3).
+        let seeds = tail.run_seeds();
+        assert_eq!(
+            seeds.keys().copied().collect::<Vec<_>>(),
+            [BinanceStream::AggTrade, BinanceStream::OpenInterest]
+        );
+        assert_eq!(seeds[&BinanceStream::AggTrade], time(archive_last()));
+        let (r1, out) = warm(&tail, &fixture.runs[1], &fixture.builders[1]);
+        // R1's chained output in the full chain: up to R2's first event.
+        let r2_first = union
+            .iter()
+            .position(|e| e.time() >= time(fixture.runs[2].started_at_ms))
+            .unwrap();
+        assert_eq!(out, union[events.len()..r2_first]);
+        // Journaled, the chain seeds are what the chain recomputes R1 with.
+        assert_eq!(with_chain_seeds(&r1, &tail.newest), r1);
+
+        // R2 after the prefix through R1.
+        let mut prefix = chain.before_run("20261005T020000Z").unwrap().stream;
+        let events = drain(&mut prefix);
+        let tail = prefix.tail().unwrap();
+        let (r2, out) = warm(&tail, &fixture.runs[2], &fixture.builders[2]);
+        assert_eq!(union[..events.len()], events[..]);
+        assert_eq!(out, union[events.len()..events.len() + out.len()]);
+        // R3, the fast restart, follows with its mark-price seed gap.
+        assert!(
+            gap_of(&union[events.len() + out.len()]).is_some_and(
+                |g| g.stream == Stream::MarkPrice && g.reason == GapReason::Disconnected
+            ),
+            "{:?}",
+            &union[events.len() + out.len()..]
+        );
+        assert_eq!(with_chain_seeds(&r2, &tail.newest), r2);
+        // R1 captured no mark price, so R2's is unseeded; its trades are
+        // seeded from R1's last trade.
+        assert!(!r2.seeds.contains_key(&BinanceStream::MarkPrice));
+        assert_eq!(
+            r2.seeds[&BinanceStream::AggTrade],
+            time(cutover() + 10_000 + 29 * 30_000)
+        );
+    }
+
+    #[test]
+    fn a_trailing_archive_gap_moves_the_tail_seed_to_its_start() {
+        // As `the_seam_marks_an_archive_that_ends_early`: the archive holds
+        // only its first day.
+        let mut source = MemorySource::default();
+        let mut id = 1;
+        archive_day(&mut source, origin(), &mut id, None);
+        let archive_last_trade = origin() + 23 * HOUR + 7;
+        let c = cutover();
+        let mut r1 = RunBuilder::new("20261005T000010Z");
+        for i in 0..10 {
+            r1.push(
+                BinanceStream::AggTrade,
+                1,
+                agg(10_000 + i as u64, c + 10_000 + i * 30_000),
+            );
+        }
+        r1.seal(&mut source, &[]);
+        let run = r1.run(c + 10_000, Some(c + 20 * MIN), Some(10));
+        let chain = chain(&source, vec![run.clone()]);
+        let (union, _) = replay(&chain, window(origin(), far()));
+
+        let mut prefix = chain.before_run(&run.run_id).unwrap().stream;
+        let events = drain(&mut prefix);
+        let trailing = prefix.archive().stream().trailing_gaps().to_vec();
+        let trades_gap = trailing
+            .iter()
+            .find(|g| g.stream == Stream::Trades)
+            .unwrap();
+        let tail = prefix.tail().unwrap();
+        assert_eq!(
+            tail.run_seeds()[&BinanceStream::AggTrade],
+            trades_gap.start.min(time(archive_last_trade))
+        );
+        assert_eq!(tail.newest[&Stream::Trades], time(archive_last_trade));
+        let (seeded, out) = warm(&tail, &run, &r1);
+        assert_eq!(out, union[events.len()..]);
+        assert_eq!(with_chain_seeds(&seeded, &tail.newest), seeded);
+        assert!(
+            out.iter()
+                .any(|e| gap_of(e).is_some_and(|g| g.stream == Stream::Trades
+                    && g.reason == GapReason::Disconnected
+                    && g.start == time(archive_last_trade)))
+        );
+    }
+
+    #[test]
+    fn the_book_takes_the_order_book_series_seed() {
+        let tail = ChainTail {
+            last: None,
+            newest_oi: None,
+            newest: BTreeMap::from([
+                (Stream::OrderBook, time(5_000)),
+                (Stream::MarkPrice, time(6_000)),
+            ]),
+        };
+        assert_eq!(
+            tail.run_seeds(),
+            BTreeMap::from([
+                (BinanceStream::MarkPrice, time(6_000)),
+                (BinanceStream::Depth, time(5_000)),
+                (BinanceStream::DepthSnapshot, time(5_000)),
+            ])
+        );
+        // An empty prefix needs no join: the continuation is the pipeline.
+        let mut b = RunBuilder::new("20261005T000010Z");
+        b.push(BinanceStream::AggTrade, 1, agg(1, cutover() + 1_000));
+        b.push(BinanceStream::AggTrade, 1, agg(2, cutover() + 2_000));
+        let run = b.run(cutover(), None, None);
+        let mut continuation =
+            tail.continuation(&run.symbol, run.hold_back_ms, run.oi_retime_ms, &run.seeds);
+        assert_eq!(continue_with(&mut continuation, &b), b.live(&run));
     }
 
     #[test]

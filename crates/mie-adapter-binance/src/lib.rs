@@ -56,12 +56,14 @@ mod ws;
 pub use book_audit::{BookAudit, CheckpointResult, MIN_SIDE_LEVELS, SideCoverage};
 pub use book_sync::{BookSequencer, BookStats, BookTransition};
 pub use history::{
-    CHAIN_DATASET_ENCODING, HistoryChain, HistoryChainStream, Segment, chain_dataset,
+    CHAIN_DATASET_ENCODING, ChainTail, HistoryChain, HistoryChainStream, Segment, chain_dataset,
 };
 pub use live::{
-    BinanceLiveProvider, CaptureEvent, CaptureHandle, CaptureObserver, CaptureSummary, LiveConfig,
-    SnapshotTrigger, run_id, start,
+    BinanceLiveProvider, CaptureEvent, CaptureHandle, CaptureObserver, CaptureSummary, CoreFeed,
+    LiveConfig, SnapshotTrigger, run_id, start,
 };
 pub use pipeline::{Pipeline, PipelineStats, Pushed, StreamStats};
-pub use replay::{LiveReplay, LiveReplayStream, LiveRun, RUN_MARGIN_MS, RunReplay, RunStats};
+pub use replay::{
+    LiveReplay, LiveReplayStream, LiveRun, RUN_MARGIN_MS, RunContinuation, RunReplay, RunStats,
+};
 pub use stream::{BinanceStream, DEPTH_SNAPSHOT_LIMITS, OI_POLL_INTERVAL_MS, WsRoute};
