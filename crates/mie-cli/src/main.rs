@@ -113,13 +113,20 @@ USAGE:
         run_start; a date is a UTC day, as for mie replay), recompute the
         run alone from the raw store into a fresh engine and compare its
         state checkpoints (ordinal, event-stream hash, Market State hash)
-        with the ones the run journaled. Prints one line per run —
-        EQUIVALENT, DIVERGED with the first divergent checkpoint, EVENTS
-        EQUIVALENT / STATE NOT COMPARABLE (another feature set: only the
-        delivered events are compared), or NOT COMPARABLE (crashed, no
-        checkpoints, no event delivered, replay error) — then PASS or
-        FAIL; the same request prints the same bytes. Exits 0 only when at
-        least one run was compared and every run is EQUIVALENT.
+        with the ones the run journaled. A warm-started run (ADR-052 D9)
+        is compared on one pass over the history chain of the config's
+        [history]: the chain through its predecessor must reproduce the
+        prefix event-stream hash and the handoff state hash its warm_start
+        journaled (else DIVERGED (warm prefix), with the journaled and the
+        current prefix dataset version printed), then the run's own events
+        continue in the same engine and their checkpoints are compared.
+        Prints one line per run — EQUIVALENT, DIVERGED with the first
+        divergent checkpoint, DIVERGED (warm prefix), EVENTS EQUIVALENT /
+        STATE NOT COMPARABLE (another feature set: only the delivered
+        events are compared), or NOT COMPARABLE (crashed, no checkpoints,
+        no event delivered, replay error, another history chain) — then
+        PASS or FAIL; the same request prints the same bytes. Exits 0 only
+        when at least one run was compared and every run is EQUIVALENT.
 
     mie experiment validate <spec>
         Validate an experiment spec (spec text v1, ADR-040). Prints the

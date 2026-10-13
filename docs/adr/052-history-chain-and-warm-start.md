@@ -463,19 +463,71 @@ deferred option D are under *Alternatives considered*.
 
 9. **The equivalence unit for warm-started runs** (supersedes ADR-041
    decision 4 for them).
-   - `mie equivalence` replays the chain through the run's predecessor
-     and checks the prefix's event-stream hash and the handoff state hash
-     against `warm_start`.
-   - It then drives the run's own events through the decision 3
-     `HoldBack` of ADR-039 into the same engine, with a fresh checkpoint
-     recorder, and compares the checkpoints as ADR-041 decision 4 does.
-     Ordinals and event hashes stay per run (ADR-041 decision 3).
-   - A prefix mismatch is `DIVERGED (warm prefix)`. The report prints both
-     the journaled and the current dataset version, so a data change
-     (decision 5) can be told from a determinism failure.
-   - One chain pass serves every run of an invocation. ADR-041 decisions
-     1–3 and 5 are unchanged, and runs without a warm start keep the cold
-     unit.
+   - **The unit.** A run whose `warm_start` is warm is compared against
+     the chain through its predecessor: the prefix's event-stream hash
+     and the handoff state hash are checked against `warm_start`, then
+     the run's own events drive the same engine, with a fresh checkpoint
+     recorder, and the checkpoints and the `run_end` totals are compared
+     as ADR-041 decision 4 does. Ordinals and event hashes stay per run
+     (ADR-041 decision 3).
+   - **The run's own events are the chain's recompute of the run**:
+     decision 3's chain seeds, joined to the prefix through ADR-039
+     decision 3's zero hold-back `HoldBack`. Decision 7 made that
+     recompute the live core's input, so `EQUIVALENT` means live = chain
+     = what `mie replay --source history` delivers.
+   - **One pass.** One invocation replays the chain once, from the origin
+     to the end of the last comparable warm run (`HistoryChain::to_end_of`,
+     the chain through a run, which is `before_run` of its successor). The
+     stream is split at run boundaries by the run whose recompute
+     delivered each event (`HistoryChainStream::run_of_last_event`). Each
+     warm run's prefix is every part before it, so the pass also crosses
+     the chain runs between two warm runs (cold, crashed or not selected)
+     exactly as each warm-up did. The run's own part is driven even after
+     a prefix mismatch, so the pass stays on the chain.
+   - **Comparability.** Before any replay, a warm run needs ADR-041's keys
+     (a clean `run_end`, checkpoints, this binary's encodings) and the
+     configured `[history]` with the origin and cutover its `warm_start`
+     journaled. A run without `[history]` in the configuration, or under
+     another origin or cutover, is `NOT COMPARABLE`, naming both chains,
+     as an encoding mismatch is: another chain is another dataset, not a
+     divergence. Under another feature set the prefix's events are
+     compared, not its state, and the run's part as ADR-041 compares such
+     a run: `EVENTS EQUIVALENT, STATE NOT COMPARABLE`.
+   - **Precedence:** the checks above; `DIVERGED (warm prefix)`; the first
+     divergent checkpoint; a `run_end` total; nothing compared (no
+     checkpoint); else `EQUIVALENT` or `EVENTS EQUIVALENT, STATE NOT
+     COMPARABLE`. A failure of the chain makes the run and every later
+     warm run of the pass `NOT COMPARABLE`.
+   - **The report.** After the encodings, when a pass ran, one line
+     `history origin <ms> cutover <ms>: one pass through run <id>`. A warm
+     run's line carries its replayed prefix events, the chain's records,
+     events and rejections of the run, its checkpoints and the current
+     prefix dataset version. `DIVERGED (warm prefix)` says whether the
+     delivered events or only the handoff state differ, and prints the
+     events, the event hash, the state hash and the dataset version,
+     journaled (live) against current (replay). Cold runs print as ADR-041
+     prints them.
+   - **The dataset version is printed, never compared.** It lets a data
+     change (decision 5) be told from a determinism failure, but it is no
+     verdict: `warm_start` journals the prefix's version when the warm-up
+     starts, while the run itself is still capturing. The prefix's
+     selection ends at the predecessor's end plus `RUN_MARGIN_MS`
+     (300 000 ms, ADR-039 decision 2). The run's own first records lie at
+     its start, and by ADR-039 decision 2 at most 300 000 ms before it. So
+     for a run that starts within 300 000 ms of its predecessor's end, and
+     possibly for one within 2 × 300 000 ms, the run's first sealed files
+     later fall inside the prefix's selection, and the current version
+     differs without any data change (decision 5: a window's version is
+     stable only once later runs have sealed past its end plus the
+     margin). A restart 600 000 ms or more after the predecessor's end
+     keeps the version. The adapter's tests pin both sides: a restart 60 s
+     after the predecessor's end moves the version while the prefix's
+     events stay identical, one 10 min after it keeps both.
+     Comparing the versions would mark every fast restart `DIVERGED`,
+     #106's SIGTERM restart included. A version that excluded the run's
+     own files would change decision 5 and W3's journal.
+   - ADR-041 decisions 1–3 and 5 are unchanged, and runs without a warm
+     start keep the cold unit.
    - Why: a warm run's state includes its prefix, so a cold recompute of
      the run alone diverges from it at the first checkpoint by design.
 
@@ -780,7 +832,9 @@ deferred option D are under *Alternatives considered*.
   #106's acceptance measures (decision 10), plus the live segment's
   measured rate.
 - Every equivalence check of warm-started runs replays the chain once per
-  invocation.
+  invocation, through the last comparable warm run selected: about 19.2
+  min per year of history at r = 1 (decision 11). An invocation that
+  selects no comparable warm run builds no chain.
 - A correction of archive days before the cutover (#102, ADR-050) changes
   the canonical state. Older warm runs then report `DIVERGED (warm
   prefix)`, with the changed dataset version printed next to the journaled
@@ -855,6 +909,24 @@ deferred option D are under *Alternatives considered*.
   known.
 - **A cold start after an uncrossable hole** — decision 4: one month-long
   outage would disable the warm-start for good.
+- **Equivalence: the chain through each warm run's predecessor, replayed
+  per run** — decision 9: N replays from the origin, about 19.2 min per
+  year of history each (decision 11), where one pass serves them all.
+- **Equivalence: recomputing a warm run with `LiveReplay::run_replay`
+  joined to the prefix's tail** — decision 9: the harness would re-derive
+  the chain's per-run seeds and join for every chain run between two warm
+  runs (cold, crashed or not selected), a second implementation of
+  decision 3.
+- **Equivalence: splitting the pass by the journaled counts
+  (`prefix_events`, `run_end.events`)** — decision 9: a recompute with
+  extra trailing events would be cut at the journaled count and pass. The
+  split follows the adapter's attribution of each event instead.
+- **Equivalence: comparing the prefix dataset versions** — decision 9:
+  every restart within 300 000 ms of its predecessor's end would be
+  `DIVERGED` without a data change.
+- **Equivalence: another chain as `DIVERGED (warm prefix)`** — decision
+  9: another origin or cutover is another dataset, which the run was never
+  meant to match; `NOT COMPARABLE` says so, as an encoding mismatch does.
 
 ## Accept when
 

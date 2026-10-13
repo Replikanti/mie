@@ -12,6 +12,24 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
 
 ### Added
 
+- **`mie equivalence` compares warm-started runs on the history chain
+  (ADR-052 D9, #118).** A run whose `warm_start` is warm is checked against
+  one pass over the chain of the configuration's `[history]`: the parts
+  before it must reproduce the journaled prefix event-stream hash and
+  handoff state hash, else `DIVERGED (warm prefix)` with the journaled and
+  the current prefix dataset version printed (never compared: a fast
+  restart moves the version without a data change); its own events, the
+  chain's recompute of the run, then drive the same engine with a fresh
+  recorder and are compared as ADR-041 decision 4 compares a run. A warm
+  run under another origin or cutover, or without `[history]`, is `NOT
+  COMPARABLE`; under another feature set it compares the events only.
+  The report gains `history origin <ms> cutover <ms>: one pass through run
+  <id>` and a warm run line with its prefix events. Cold runs are compared
+  and printed as before. New: `HistoryChain::to_end_of`,
+  `HistoryChainStream::run_of_last_event`,
+  `LiveReplayStream::run_of_last_event`, and
+  `mie_app::equivalence::RunParts` and `compare_prefix`. ADR-041's status
+  line records the superseded comparison unit.
 - **`mie ingest` warm-starts from the history chain while the capture runs
   (ADR-052 D3, D6–D8, D13, #117).** With `[history]`, a run that starts at
   or after the cutover starts its capture at once, with the core fed the
@@ -38,7 +56,7 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   `on_restart` callback). A failed, refused, overflowing or unfinished
   warm-up starts the run cold; the capture never waits for it.
   Runs without `[history]` capture and feed the core as before. `mie
-  equivalence` reports warm runs diverged until #118.
+  equivalence` compares warm runs from #118 on (below).
 - **Research on the history chain: `research.replay_summary@2` and
   `mie experiment run --source history` (ADR-052 D10, #119).** With an
   ingest configuration that has `[history]`, the run opens the sample on
