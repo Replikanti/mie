@@ -94,6 +94,41 @@ deferred option D are under *Alternatives considered*.
      (the soaks, #99's sessions) have multi-day holes between them that
      must stay out of the canonical state. 00:00 UTC for the same reasons
      as the origin.
+   - **The cutover runbook: run 1 is sacrificial** (rehearsal 2026-10-14).
+     The rule's two conditions conflict in practice. Binance publishes the
+     archive day D-1 during day D, hours after 00:00 UTC (the exact hour
+     is measured at #106's acceptance), so "the archive imported through
+     the day before" cannot hold at 00:00 UTC of D. But the first chain
+     run must start within the first clock hour of D: a whole empty hour
+     bar is `Continuity::Break` and resets the volatility features
+     (*Consequences*), so a seam with a whole empty hour bar fails
+     *Accept when* item 3 for every later handoff. The procedure:
+     1. Run 1 starts at 00:00 UTC of D (at or just after it: a run that
+        starts before the cutover is cold, decision 8). It is
+        *sacrificial*: its warm start runs against an archive with a
+        trailing gap (D-1 missing). The trailing gap of the archive
+        segment is carried over the seam by the first run's seed gaps
+        (`crates/mie-adapter-binance/src/history.rs`, module docs, *Chain
+        seeds* and *The archive segment's own trailing gaps*), so its
+        records are valid chain data and its seam has no empty hour bar.
+        After the D-1 import, a replay's prefix is the complete archive,
+        which differs from the one run 1 warmed up on, so `mie
+        equivalence` reports run 1 `DIVERGED (warm prefix)`. This is
+        expected and no failure: the prefix, not the run's own events, is
+        what differs.
+     2. After the D-1 import, SIGTERM run 1 and start run 2 at once. Run
+        2's prefix is the complete archive plus run 1. The restart leaves
+        under one hour of hole, so no whole hour bar is empty
+        (*Consequences*).
+     - Why this and not a new decision: it adds no rule about the origin
+       or the cutover, it resolves how the existing rule is met.
+     - Rejected, delaying run 1 until the archive is published: the hours
+       between 00:00 UTC and the publication would be a seam with whole
+       empty hour bars, which resets `volatility.atr.1h@1` and
+       `volatility.regime.1h@1` (the rehearsal's nine empty bars did
+       exactly this).
+     - Rejected, filling the seam from the archive: live never held that
+       state (*Holes stay holes* below, #106 plan D1).
    - **Holes stay holes** (#106 plan D1): the chain is exactly what live
      delivered. The archive never fills a live hole.
    - Rejected, re-basing the chain on the newest archived day at every
@@ -534,6 +569,15 @@ deferred option D are under *Alternatives considered*.
      each side: a run that starts 60 s after the predecessor's end with its
      first record 1 s later moves the version while the prefix's events
      stay identical; one that starts 10 min after it keeps both.
+     The rehearsal (2026-10-14, #106 comment 6170357925) observed it on
+     its fast restart: run 2 started 4 s after run 1 ended and journaled
+     `prefix_dataset 6e6f88cf…`, while `mie equivalence` later printed
+     `22d320d8…` for the same prefix. Run 1's extent includes
+     `RUN_MARGIN_MS`, and the files run 2 sealed after its warm start fall
+     into the prefix's selection. The event and state hashes match, so the
+     result stays `EQUIVALENT`. A fast restart's journaled
+     `prefix_dataset` is therefore not the version a later replay reports,
+     and the acceptance run's report notes it.
      Comparing the versions would mark a fast restart `DIVERGED` whenever
      its first records come within the margin, #106's SIGTERM restart
      included. A version that excluded the run's
@@ -664,6 +708,19 @@ deferred option D are under *Alternatives considered*.
       11's formula gives for one read and one engine; (3) the live segment
       is unmeasured. #106's acceptance run replaces the forecast with a
       measured `@2` wall time (*Accept when*, item 6).
+    - **Measured, rehearsal 2026-10-14** (a provisional cutover of
+      2026-10-14 in a separate store over the production archive, main
+      `9c4ac1a`; #106 comment 6170357925): the `@2` experiment over a
+      sample of 1 h 40 min (10:00 to 11:40 UTC) took 67.7 min when
+      reproduced (the `recorded` run took 75.3 min, contended, and is not
+      used), with 550 MB RSS. The forecast for that prefix is 1 593.6 s
+      = 26.6 min per year, so the measurement is 67.7 / 26.6 ≈ 2.5 times
+      it. It is also 67.7 / 44.7 ≈ 1.5 times the same prefix's live
+      warm-up (decision 11), where the forecast says 1.4. The `@2` prefix
+      therefore costs more than the live warm-up, in the direction this
+      decision predicted. The forecast undershoots for the reason given
+      in decision 11. A sample of 1 h 40 min is a sample of one, and
+      #106's acceptance run replaces it.
 
 11. **The startup cost per segment.**
     - **Archive.** Two full-year runs of one tool
@@ -680,6 +737,37 @@ deferred option D are under *Alternatives considered*.
       measures (the engine with `structure.levels.<tf>@2` against today's;
       r = 1 is today's engine). At r = 1 that is 1 152.2 s, 19.2 min per
       year.
+    - **Measured, rehearsal 2026-10-14** (#106 comment 6170357925). The
+      rehearsal used a provisional cutover of 2026-10-14 in a separate
+      store with the production archive, imported through 2026-10-13, and
+      main `9c4ac1a`. The first run's live warm-up, uncontended, over the
+      archive segment 2025-10-01 to 2026-10-13 (616 888 955 prefix
+      events), journaled `ready_after_ms` = 2 679 833 ms = 44.7 min
+      (2 679 833 / 60 000).
+      - Against the forecast: 2 679 833 ms / 1 152.2 s ≈ 2.3 times the
+        forecast for one year. The segment is 378 days, 1.04 years (365
+        days to 2026-09-30, plus 13), so against the forecast scaled to it
+        (1 152.2 × 378 / 365 = 1 193.2 s) the factor is 2.25: about 2.3
+        times either way. As a rate it is 44.7 / 1.04 ≈ 43 min per year of
+        archive, rounded up to 45 min for the estimate below. The
+        formula stays as the derivation of the first forecast, and this
+        measurement, not the formula, dates the cost.
+      - Why the forecast undershoots: R and E came from
+        `crates/mie-cli/tests/location_measure.rs`, which drives a subset
+        of the engine over aggTrades only, while the warm-up drives the
+        full feature set plus the ADR-050 fold over the imported `trades`
+        days (252 days). This confirms the "low on known counts" caveat of
+        decision 10; the rehearsal did not split the factor among them,
+        and no number here assigns a share to either cause.
+      - A second warm-up in the rehearsal, with the first run in its
+        prefix, took 3 135 737 ms = 52.3 min, but a concurrent `mie
+        equivalence` ran on another core, so it is a contended value and
+        is not used.
+      - **Replaced by #106's acceptance run.** These are rehearsal values
+        from a provisional cutover. The real acceptance run (cutover on
+        the first day of continuous production capture, *Accept when*)
+        replaces them, in the Numbers table and in decision 12's fire
+        estimate.
     - **Live.** Its rate is *measured by #106*, per day of live history,
       and is never taken from the archive's. A live replay recomputes every
       run's pipeline (ADR-039 decision 1) and replays depth diffs into the
@@ -728,17 +816,25 @@ deferred option D are under *Alternatives considered*.
       event is its seed gap, which opens the partial bar the same way
       (`partial_start_marks_the_first_bar_of_every_timeframe`,
       `crates/mie-domain/src/bars.rs`).
-    - **Fire estimate**, at archive rates and r = 1: 90 / 19.2 ≈ 4.7 years
-      of history (105 min would be about 5.5 years). The live segment is
-      not measured yet (decision 11), so the estimate can be far off; #106
-      updates it.
+    - **Fire estimate**, forecast: at archive rates and r = 1, 90 / 19.2 ≈
+      4.7 years of history (105 min would be about 5.5 years). The live
+      segment is not measured yet (decision 11), so the estimate can be far
+      off; #106 updates it.
+    - **Fire estimate, rehearsal 2026-10-14:** the measured live warm-up is
+      about 45 min per year of history (decision 11), so the trigger fires
+      at 90 / 45 = 2.0 years of history, about two years (105 min would be
+      2.3). Rejected as the basis: the forecast, which the measurement
+      refutes by 2.3 times. The estimate is for the archive segment only
+      and from one run on a provisional cutover; #106's acceptance run
+      replaces it.
     - **The trigger does not see research.** Every state-reading research
       request (`mie replay --source history`, W5's experiments) replays the
       same prefix from the origin (decision 2): a replay at a live start's
       cost per year of history, an experiment at about 1.4 times it (a
-      forecast, decision 10), while the trigger watches only live starts
-      (`ready_after_ms`). Research iteration can therefore become the
-      binding cost before the 90 min trigger fires. The trigger and its
+      forecast, decision 10; 1.5 times in the rehearsal), while the
+      trigger watches only live starts (`ready_after_ms`). Research
+      iteration can therefore become the binding cost before the 90 min
+      trigger fires. The trigger and its
       number stay unchanged: no research-cost threshold has been measured,
       so this paragraph records the debt, not a second number.
 
@@ -829,11 +925,14 @@ deferred option D are under *Alternatives considered*.
 | 65 536 slots, about 27 s | ADR-026 (`core_channel_capacity`, *Why 65 536*) | Peak rate 60 015 / 25 s + 19/s = 2 419.6/s; 65 536 / 2 419.6 ≈ 27.1 s | Any fixed capacity blocks once the warm-up outlasts capacity / arrival rate. Holding one year's warm-up (1 152.2 s at r = 1) at the peak rate takes 1 152.2 × 2 419.6 ≈ 2.79 M slots, about 245 MB pre-allocated at 88 B per core slot (ADR-026), and that need grows with the history. The quiet side: at the archive's mean aggTrades rate (603 218 226 / 365 days ≈ 19.1/s) plus the other six streams at their p99 rate (19/s, ADR-026), 65 536 slots last about 29 min. So the rejection rests on a burst during the warm-up, since one blocked millisecond fails ADR-041's 0 ms gate, and on the growth with the history, not on the 27 s alone |
 | 1 863.0 s and 1 152.2 s, giving 710.8 s and 441.4 s | #96 (two engines) and ADR-044 (one engine): the same tool (`location_measure.rs`), the same 365-day window, the same host | E = 1 863.0 − 1 152.2 = 710.8 s per engine; R = 1 152.2 − 710.8 = 441.4 s for the rest | Caveats: (1) both runs read aggTrades only (ADR-044), while the chain reads the default streams plus the ADR-050 fold, which also reads `trades` files over its 252-day defect window. (2) ADR-044 also records the #11 replay of the same window over the default streams: 20.5 min. (3) "Per year" means per the 603.2 M aggTrades of that year, so a busier year costs more. The formula only dates the forecast; the trigger fires on the measured `ready_after_ms`, so a wrong estimate never makes it fire wrongly |
 | 19.2 min per year at r = 1 | The row above | 1 152.2 s / 60 ≈ 19.2 min | r is #95 S3's measured engine-time ratio; at r > 1 a year costs more and the trigger fires sooner |
-| 1 593.6 s, about 26.6 min per year (a `@2` experiment; forecast) | Decision 11's R and E. Pending: the measured `@2` wall time of #106's acceptance (*Accept when*, item 6) | 2 · 441.4 + 710.8 = 1 593.6 s at r = 1; 1 593.6 / 1 152.2 ≈ 1.4 times a live start's archive warm-up | It is a forecast, low on the three counts of decision 10; nothing fires on it. One read would save 441.4 s per year, at the price decision 10 states |
+| 44.7 min live warm-up (`ready_after_ms` 2 679 833 ms), about 2.3 times the forecast; about 45 min per year (rehearsal 2026-10-14) | #106 comment 6170357925: the first run's warm-up, uncontended, over the archive segment 2025-10-01 to 2026-10-13 (616 888 955 prefix events), provisional cutover 2026-10-14, main `9c4ac1a` | 2 679 833 / 60 000 = 44.7 min; 2 679 833 ms / 1 152.2 s ≈ 2.3 (2.25 against the forecast scaled to 378 days = 1.04 years: 1 152.2 × 378 / 365 = 1 193.2 s); 44.7 / 1.04 ≈ 43 min per year, rounded to 45 | The forecast's R and E come from `location_measure.rs`, a subset of the engine over aggTrades only, while the warm-up drives the full feature set plus the ADR-050 fold. A rehearsal value from one run: #106's acceptance run replaces it. The 52.3 min second warm-up ran beside a `mie equivalence` and is not used |
+| 67.7 min `@2` experiment (rehearsal 2026-10-14), about 2.5 times the forecast and 1.5 times the live warm-up | #106 comment 6170357925: the reproduced run over a 1 h 40 min sample (10:00 to 11:40 UTC), the same prefix as the warm-up row. The recorded run, 75.3 min, was contended and is not used | 67.7 / 26.6 ≈ 2.5; 67.7 / 44.7 ≈ 1.5 | A sample of one. Replaced by the measured `@2` wall time of #106's acceptance (*Accept when*, item 6) |
+| 1 593.6 s, about 26.6 min per year (a `@2` experiment; forecast, measured 2.5 times higher in the rehearsal, row above) | Decision 11's R and E. Pending: the measured `@2` wall time of #106's acceptance (*Accept when*, item 6) | 2 · 441.4 + 710.8 = 1 593.6 s at r = 1; 1 593.6 / 1 152.2 ≈ 1.4 times a live start's archive warm-up | It is a forecast, low on the three counts of decision 10; nothing fires on it. One read would save 441.4 s per year, at the price decision 10 states |
 | The live segment's rate | Not measured | #106 measures the per-day rate | Borrowing the archive's rate would misdate the trigger: the live replay recomputes every run's pipeline and replays depth diffs, which the archive replay does not |
 | The 90 min trigger (105 min rejected) | `Samples(7)` (ADR-037 decision 10; `SWING_WINDOW` = 2·3 + 1). The first bar is `partial_start` (ADR-031 decision 6), and `TimeframeTracker::confirm` counts it. Pinned by `a_cold_start_mid_bar_is_ready_at_the_seventh_15m_close` | The 7th close falls 105 min after the first bar's open, so a cold engine is `Ready` 105 min − offset after the start, with offset ∈ [0, 15 min): (90, 105] min | Above 90: for a start late in a 15m bar, the warm engine becomes current later than a cold engine would have had 15m structure `Ready`, the regression #95 defined; 105 holds only for a start on a 15m boundary. Below 90: the snapshot gets built while the replay still beats every cold structure warm-up (#95, "Why not lower") |
 | `ready_after_ms` is wall time; the cold warm-up is event time | ADR-031 decision 4 (a bar closes at the next trades-stream event); ADR-032 decision 6 (2 000 ms hold-back) | Both delay a cold engine's 7th close in wall time | So the 90 min comparison errs on the safe side. A live run's first trades-stream event is its seed gap, which opens the partial bar the same way (`partial_start_marks_the_first_bar_of_every_timeframe`, `bars.rs`) |
-| Fire estimates: about 4.7 years at 90 min, about 5.5 years at 105 min | The two rows above | 90 / 19.2 ≈ 4.7; 105 / 19.2 ≈ 5.5, at archive rates and r = 1 | The live segment is unmeasured: it replays depth diffs and every run's pipeline. The estimate can be far off, and #106 updates it |
+| Fire estimates (forecast): about 4.7 years at 90 min, about 5.5 years at 105 min | The two rows above | 90 / 19.2 ≈ 4.7; 105 / 19.2 ≈ 5.5, at archive rates and r = 1 | The live segment is unmeasured: it replays depth diffs and every run's pipeline. The estimate can be far off, and #106 updates it |
+| Fire estimate, rehearsal 2026-10-14: about 2 years at 90 min (about 2.3 at 105 min) | The 44.7 min row above | 90 / 45 = 2.0; 105 / 45 = 2.3, at the measured archive warm-up rate | One run on a provisional cutover, archive segment only. #106's acceptance run replaces it; the trigger itself fires on the measured `ready_after_ms`, never on this estimate |
 | 2.40 M records per 24 h (debt 2's day forecast) | Capture journals, `run_end.records` over the run's duration (measured in the PR #121 review): #9 run `20261008T035138Z` 1 811 583 records in 18.14 h (five streams, no depth); #10 run `20261008T231852Z` 1 055 736 in 12.93 h (all seven streams); the aggTrades yearly mean 603 218 226 / 365 days | 1 811 583 / 18.14 × 24 ≈ 2.40 M; 1 055 736 / 12.93 × 24 ≈ 1.96 M; 603 218 226 / 365 ≈ 1.65 M a day. The maximum is taken (decision 13). ADR-039's "about 1.5 M for a 24 h run" is below both measured runs and is not used | Lower: the forecast overstates the safe run length (1.5 M would by 2.40 / 1.5 = 1.6 ×). Higher: the forecast comes too early. Neither moves the limit: the trigger and the guard count records (`N_max`), so the rate only dates the forecast |
 | 6.7 days (the rejected 2026-10-01 cutover) | ADR-031's justification addendum, decision 11: archive end 2026-09-30, live start 2026-10-07 15:50 UTC | — | It would pull the seam and the October soak holes into the canonical state |
 
@@ -855,7 +954,36 @@ deferred option D are under *Alternatives considered*.
   cover* lists, except `derivatives.funding.settled@1`, which stays
   archive-only (no live settlement event, ADR-042 decision 4): the
   long-warm-up features are `Ready` at the handoff, and #106's acceptance
-  shows it.
+  shows it. For volatility this holds only under the limitation in the next
+  bullet.
+- **Volatility memory survives only while the chain has no empty hour
+  bar** (rehearsal 2026-10-14, #106 comment 6170357925). An hour bar with
+  no trades and incomplete coverage is `Continuity::Break`
+  (`crates/mie-domain/src/volatility.rs`, `Continuity::of`), and
+  `VolatilitySeries::push` answers it with a fresh series: it resets
+  `volatility.atr.1h@1` (14 hourly bars, `ATR_LENGTH`) and
+  `volatility.regime.1h@1` (214 hourly samples, `REGIME_WARM_UP`, about
+  8.9 days). So the warm start carries volatility memory into live only
+  while the chain has no empty hour bar within that horizon (14 h for the
+  ATR, about 8.9 days for the regime); an outage that leaves a whole clock
+  hour without data (any outage of 2 h or more, and one between 1 h and
+  2 h depending on its alignment to the hour) equals a cold start for
+  volatility. The rehearsal saw it: its seam held nine empty hour bars
+  (00:00 to 09:50 UTC), run 1's handoff precedes the seam and showed
+  `Ready`, and run 2's handoff, with the seam in its prefix, showed both
+  features `WarmingUp`.
+  - **Accepted as a limitation.** Reason: bridging an empty bar would
+    invent a true range, and raw data is the source of truth (invariant
+    4); and filling the hour from the archive is rejected by decision 2
+    (*Holes stay holes*, #106 plan D1). A restart under one hour never
+    leaves a whole clock hour empty, so it keeps the memory.
+  - **Operational mitigation:** restarts under one hour, and the cutover
+    runbook of decision 2 (the first chain run within the first clock
+    hour of the cutover day).
+  - **Revisit trigger:** when #24 consumes the regime and production shows
+    a material share of time in `WarmingUp` after outages. A change
+    (bridging an empty bar, instead of breaking) would be an ADR-033
+    decision, not part of #106 or this ADR.
 - During the warm-up the live engine is current for no feature, including
   those a cold engine has `Ready` within minutes: bars, flow and the
   UTC-day VWAP. #95's *Limits* left this point to W. No consumer of live
@@ -946,24 +1074,36 @@ deferred option D are under *Alternatives considered*.
 coverage list, as in ADR-041, not a duration):
 
 1. The archive is imported through the day before the cutover, and the
-   production configuration carries `[history]`.
-2. Two warm-started runs: the first, whose prefix ends at the seam, then a
-   second after SIGTERM, whose prefix contains the first. `mie
-   equivalence` reports both `EQUIVALENT` with state compared, and a
-   second invocation prints identical bytes.
-3. At each handoff, `warm_start` shows ADR-041's long-warm-up features
-   `Ready`: `volatility.atr.1h@1`, `volatility.regime.1h@1`, both volume
-   composites, 4h and 1d structure, and `location.auction.prior_day@1`. A
-   cold run cannot show this, so it is the evidence that the warm-start
-   carries memory into live. Reachable: the archive segment alone spans
-   about a year, far beyond the longest warm-up (8.9 days).
-4. 0 ms blocked in every `stats` record of both runs, the warm-up
-   included. ADR-041's hard gate applies because the warm-up adds a replay
-   thread beside the capture.
+   production configuration carries `[history]`. No archive date is
+   missing for `aggTrades` and `klines` through the day before the cutover
+   (checked by listing the store's dates, not assumed: the rehearsal found
+   2026-10-01 to 2026-10-07 missing in the store, which reset volatility
+   and discarded a first attempt).
+2. The cutover runbook of decision 2: run 1 is the sacrificial run at
+   00:00 UTC of the cutover day. After it, two warm-started runs, runs 2
+   and 3: run 2 starts at once after run 1's SIGTERM following the D-1
+   import, and run 3 after a SIGTERM of run 2, so its prefix contains run
+   2. `mie equivalence` reports runs 2 and 3 `EQUIVALENT` with state
+   compared, and a second invocation prints identical bytes. Run 1
+   reports `DIVERGED (warm prefix)` by design (decision 2). A journaled
+   `prefix_dataset` that differs from the replay's is expected for a fast
+   restart (decision 9).
+3. At the handoffs of runs 2 and 3, `warm_start` shows ADR-041's
+   long-warm-up features `Ready`: `volatility.atr.1h@1`,
+   `volatility.regime.1h@1`, both volume composites, 4h and 1d structure,
+   and `location.auction.prior_day@1`. A cold run cannot show this, so it
+   is the evidence that the warm-start carries memory into live. Reachable:
+   the archive segment alone spans about a year, far beyond the longest
+   warm-up (8.9 days), provided the seam and the restarts leave no whole
+   empty hour bar (*Consequences*).
+4. 0 ms blocked in every `stats` record of every run of the procedure, the
+   warm-up included. ADR-041's hard gate applies because the warm-up adds a
+   replay thread beside the capture.
 5. `ready_after_ms`, peak memory, queue high-water and the per-segment
    rates go into the Acceptance section, with decision 12's fire estimate
-   updated. If `ready_after_ms` already exceeds 90 min, the snapshot issue
-   is filed then.
+   updated, replacing the rehearsal values of decisions 10 to 12 and the
+   Numbers table. If `ready_after_ms` already exceeds 90 min, the snapshot
+   issue is filed then.
 6. A `--source history` experiment on a sample after the cutover prints
    `recorded`, then `reproduced`, and the result file's SHA-256 is
    unchanged. The wall time of both runs, with the prefix's archive and
