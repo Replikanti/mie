@@ -18,7 +18,8 @@
 //! [`equivalence`] records the state checkpoints that live ingestion
 //! journals and the equivalence harness recomputes, through
 //! [`drive_tolerant_observed`], and compares two checkpoint lists (#13,
-//! ADR-041).
+//! ADR-041); for warm-started runs it splits the history chain at run
+//! boundaries and checks each run's prefix (ADR-052 D9).
 //!
 //! [`ExperimentService`] ([`research`]) runs an experiment spec and is the
 //! only writer of research results (ADR-020, ADR-040): `@1` over a replay

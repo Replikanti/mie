@@ -106,8 +106,8 @@ handoff. The journal's `warm_start` record holds the prefix's provenance
 and the seeds, or why the run started cold (no `[history]`, a start before
 the cutover, a failed warm-up, or `[history] max_run_records` missing or
 exceeded by the largest run or by the records queued during the warm-up,
-the memory guard). `mie equivalence` compares warm runs from #118
-on; until then it reports them diverged.
+the memory guard). `mie equivalence` compares a warm run against the
+history chain through its predecessor (below).
 
 Historical backfill from the Binance public data archive (source
 `binance-archive`, see [data availability](docs/data-availability.md)):
@@ -150,7 +150,13 @@ cargo run --release -p mie-cli -- replay --source history \
 Check live/replay equivalence (ADR-041): every capture run started in the
 window is recomputed alone into a fresh engine, and its state checkpoints
 (event-stream hash and Market State hash) are compared with the ones
-`mie ingest` journaled; the first divergence is reported:
+`mie ingest` journaled; the first divergence is reported. A warm-started
+run (ADR-052 D9) is compared on one pass over the history chain of the
+configuration's `[history]`: the chain through its predecessor must
+reproduce the prefix and handoff its `warm_start` journaled (else
+`DIVERGED (warm prefix)`, with the journaled and the current prefix dataset
+version printed), and the run's own events then continue in the same
+engine. A run journaled under another history chain is `NOT COMPARABLE`:
 
 ```sh
 cargo run --release -p mie-cli -- equivalence \

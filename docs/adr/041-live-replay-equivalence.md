@@ -1,6 +1,6 @@
 # ADR-041: Live/replay equivalence — Market State hash and checkpoints
 
-- Status: accepted
+- Status: accepted; decision 4's comparison unit (one run recomputed alone into a fresh engine) is superseded by ADR-052 (decision 9) for warm-started runs; runs without a warm start keep it
 - Date: 2026-10-09
 
 ## Context

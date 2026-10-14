@@ -29,6 +29,17 @@
 //! [`compare_events`] instead: each recorded checkpoint's ordinal and
 //! event-stream hash against the replay's hash after as many events
 //! ([`EventPrefixes`]), which no engine change can move (ADR-041).
+//!
+//! **The warm unit** (ADR-052 D9). A warm-started run's engine went through
+//! the history chain up to the run's predecessor before it took the run's
+//! first event, so its checkpoints are compared on one pass over the chain:
+//! [`RunParts`] splits the chain's stream at run boundaries, by the run
+//! that delivered each event. Each warm run's prefix (every part before
+//! the run) is driven into the pass's one engine, its event-stream hash and
+//! the engine's state hash are checked against the journaled handoff with
+//! [`compare_prefix`], and the run's own part is driven into the same
+//! engine with a fresh recorder through [`drive_chain_checkpointed`], then
+//! compared as above.
 
 use crate::{ChainDrive, drive_chain_with, drive_tolerant_observed};
 use mie_domain::event::MarketEvent;
@@ -336,6 +347,226 @@ impl<P: MarketDataProvider + ?Sized> MarketDataProvider for EventPrefixes<'_, P>
     }
 }
 
+/// How a warm-started run's prefix differs from its journaled handoff
+/// (ADR-052 D9): `live` and `replay` are each the prefix's event-stream
+/// hash and the state hash after it. [`DivergenceKind::EventStream`] when
+/// the stream hashes (count and fingerprint) differ; otherwise
+/// [`DivergenceKind::State`] when `compare_state` is set and the state
+/// hashes differ; `None` when they match. A run recorded with another
+/// feature set compares the events only (`compare_state` unset), as
+/// [`compare_events`] does.
+pub fn compare_prefix(
+    live: (EventStreamHash, StateHash),
+    replay: (EventStreamHash, StateHash),
+    compare_state: bool,
+) -> Option<DivergenceKind> {
+    if live.0 != replay.0 {
+        Some(DivergenceKind::EventStream)
+    } else if compare_state && live.1 != replay.1 {
+        Some(DivergenceKind::State)
+    } else {
+        None
+    }
+}
+
+/// A stream split into parts at run boundaries, for one pass of the warm
+/// unit (module docs). `part_of` maps the inner provider, right after it
+/// delivered an event, to the part of that event: `Some(index)` for the
+/// run at `index`, `None` before every run (the history chain's archive
+/// segment). Parts must not decrease along the stream.
+///
+/// `failure_part` maps the inner provider, right after it failed, to the
+/// run the failure belongs to, when it belongs to one: every event of the
+/// parts before that run was delivered, and none of it. Such a failure ends
+/// the views of the earlier parts cleanly and reaches the first view of
+/// that run or later, so a run's verdict never depends on whether a later
+/// run is part of the pass. A failure that belongs to no run reaches the
+/// view that meets it.
+///
+/// The views are taken in order: [`before`](Self::before) a run's index,
+/// then [`run`](Self::run) of it, for increasing indices. A view ends at
+/// the first event of a later part and holds that event for the next view.
+#[derive(Debug)]
+pub struct RunParts<P, F, G> {
+    inner: P,
+    part_of: F,
+    failure_part: G,
+    /// A failure of the inner provider that belongs to the run at the
+    /// index, not delivered yet.
+    held_failure: Option<(ProviderError, usize)>,
+    /// The event read last and not delivered yet, with its part.
+    held: Option<(MarketEvent, Option<usize>)>,
+    /// The part of the event read last.
+    reached: Option<Option<usize>>,
+    ended: bool,
+    hasher: EventStreamHasher,
+    failed: Option<ProviderError>,
+}
+
+/// Which events a [`PartView`] yields.
+#[derive(Debug, Clone, Copy)]
+enum View {
+    /// Those of every part before the run at the index.
+    Before(usize),
+    /// Those of the run at the index.
+    Run(usize),
+}
+
+/// One view of a [`RunParts`]: a [`MarketDataProvider`] over the events of
+/// some parts.
+#[derive(Debug)]
+pub struct PartView<'a, P, F, G> {
+    parts: &'a mut RunParts<P, F, G>,
+    view: View,
+}
+
+impl<P, F, G> RunParts<P, F, G>
+where
+    P: MarketDataProvider,
+    F: FnMut(&P) -> Option<usize>,
+    G: FnMut(&P) -> Option<usize>,
+{
+    /// Splits `inner` by `part_of`, its failures by `failure_part`.
+    pub fn new(inner: P, part_of: F, failure_part: G) -> Self {
+        Self {
+            inner,
+            part_of,
+            failure_part,
+            held_failure: None,
+            held: None,
+            reached: None,
+            ended: false,
+            hasher: EventStreamHasher::new(),
+            failed: None,
+        }
+    }
+
+    /// The events whose part is before the run at `index`: the parts
+    /// before every run and those of earlier runs.
+    pub fn before(&mut self, index: usize) -> PartView<'_, P, F, G> {
+        PartView {
+            parts: self,
+            view: View::Before(index),
+        }
+    }
+
+    /// The events of the run at `index`.
+    pub fn run(&mut self, index: usize) -> PartView<'_, P, F, G> {
+        PartView {
+            parts: self,
+            view: View::Run(index),
+        }
+    }
+
+    /// The event-stream hash v1 of every event the views delivered, the
+    /// held event excluded: at a run boundary, the hash of the run's
+    /// prefix.
+    pub fn hash(&self) -> EventStreamHash {
+        self.hasher.finish()
+    }
+
+    /// The inner provider.
+    pub fn inner(&self) -> &P {
+        &self.inner
+    }
+
+    fn next_in(&mut self, view: View) -> Result<Option<MarketEvent>, ProviderError> {
+        if let Some(failed) = &self.failed {
+            return Err(failed.clone());
+        }
+        let (event, part) = match self.held.take() {
+            Some(held) => held,
+            None => {
+                if let Some((_, run)) = &self.held_failure {
+                    let reached = match view {
+                        View::Before(index) => *run < index,
+                        View::Run(index) => *run <= index,
+                    };
+                    if !reached {
+                        return Ok(None);
+                    }
+                    let (failed, _) = self.held_failure.take().expect("checked above");
+                    self.failed = Some(failed.clone());
+                    return Err(failed);
+                }
+                if self.ended {
+                    return Ok(None);
+                }
+                let event = match self.inner.next_event() {
+                    Ok(Some(event)) => event,
+                    Ok(None) => {
+                        self.ended = true;
+                        return Ok(None);
+                    }
+                    Err(failed) => {
+                        match (self.failure_part)(&self.inner) {
+                            Some(run) => self.held_failure = Some((failed, run)),
+                            None => self.failed = Some(failed),
+                        }
+                        return self.next_in(view);
+                    }
+                };
+                let part = (self.part_of)(&self.inner);
+                if let Some(reached) = self.reached.filter(|&reached| part < reached) {
+                    return self.fail(format!(
+                        "an event of {} after one of {}: the parts went back",
+                        part_name(part),
+                        part_name(reached)
+                    ));
+                }
+                self.reached = Some(part);
+                (event, part)
+            }
+        };
+        let deliver = match view {
+            View::Before(index) => part < Some(index),
+            View::Run(index) if part < Some(index) => {
+                return self.fail(format!(
+                    "an event of {} reached the view of run {index}: the views were not taken \
+                     in order",
+                    part_name(part)
+                ));
+            }
+            View::Run(index) => part == Some(index),
+        };
+        if !deliver {
+            self.held = Some((event, part));
+            return Ok(None);
+        }
+        self.hasher.push(&event);
+        Ok(Some(event))
+    }
+
+    fn fail(&mut self, detail: String) -> Result<Option<MarketEvent>, ProviderError> {
+        let failed = ProviderError::Contract(detail);
+        self.failed = Some(failed.clone());
+        Err(failed)
+    }
+}
+
+/// A part as an error names it.
+fn part_name(part: Option<usize>) -> String {
+    part.map_or_else(|| "no run".to_owned(), |index| format!("run {index}"))
+}
+
+impl<P, F, G> MarketDataProvider for PartView<'_, P, F, G>
+where
+    P: MarketDataProvider,
+    F: FnMut(&P) -> Option<usize>,
+    G: FnMut(&P) -> Option<usize>,
+{
+    /// # Errors
+    ///
+    /// The inner provider's failures, in the first view of the run they
+    /// belong to or later ([`RunParts`]), and from then on;
+    /// [`ProviderError::Contract`] when the
+    /// parts go back or a run's view meets an event of an earlier part (the
+    /// views were not taken in order), and from then on.
+    fn next_event(&mut self) -> Result<Option<MarketEvent>, ProviderError> {
+        self.parts.next_in(self.view)
+    }
+}
+
 /// The first recorded checkpoint whose events the replay did not deliver.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EventDivergence {
@@ -622,6 +853,226 @@ mod tests {
                 "checkpoint 3".to_owned(),
                 "checkpoint 4".to_owned()
             ]
+        );
+    }
+
+    /// Delivers `events` with their parts; `last` is the part of the event
+    /// delivered last. Fails at its end when `fail` is set.
+    struct Parted {
+        events: VecDeque<(MarketEvent, Option<usize>)>,
+        last: Option<usize>,
+        fail: bool,
+        /// The run its failure belongs to.
+        failed_run: Option<usize>,
+    }
+
+    impl Parted {
+        fn new(events: &[(MarketEvent, Option<usize>)]) -> Self {
+            Self {
+                events: events.iter().cloned().collect(),
+                last: None,
+                fail: false,
+                failed_run: None,
+            }
+        }
+    }
+
+    impl MarketDataProvider for Parted {
+        fn next_event(&mut self) -> Result<Option<MarketEvent>, ProviderError> {
+            match self.events.pop_front() {
+                Some((event, part)) => {
+                    self.last = part;
+                    Ok(Some(event))
+                }
+                None if self.fail => Err(ProviderError::Source("the store failed".to_owned())),
+                None => Ok(None),
+            }
+        }
+    }
+
+    type Part = fn(&Parted) -> Option<usize>;
+
+    fn parts_of(parted: Parted) -> RunParts<Parted, Part, Part> {
+        RunParts::new(parted, |p| p.last, |p| p.failed_run)
+    }
+
+    fn split(events: &[(MarketEvent, Option<usize>)]) -> RunParts<Parted, Part, Part> {
+        parts_of(Parted::new(events))
+    }
+
+    fn drain(provider: &mut impl MarketDataProvider) -> Result<Vec<MarketEvent>, ProviderError> {
+        let mut out = Vec::new();
+        while let Some(event) = provider.next_event()? {
+            out.push(event);
+        }
+        Ok(out)
+    }
+
+    /// The tape's six trades as [archive ×3, run 0 ×2, run 2 ×1].
+    fn parted() -> Vec<(MarketEvent, Option<usize>)> {
+        let parts = [None, None, None, Some(0), Some(0), Some(2)];
+        tape().into_iter().zip(parts).collect()
+    }
+
+    #[test]
+    fn run_parts_split_a_stream_at_run_boundaries() {
+        let events = tape();
+        let mut parts = split(&parted());
+        assert_eq!(parts.hash(), hash_of(&[]));
+        assert_eq!(drain(&mut parts.before(0)).unwrap(), events[..3]);
+        assert_eq!(parts.hash(), hash_of(&events[..3]), "run 0's prefix");
+        assert_eq!(drain(&mut parts.run(0)).unwrap(), events[3..5]);
+        // Run 1 delivered nothing: its prefix is run 0's and before.
+        assert!(drain(&mut parts.before(1)).unwrap().is_empty());
+        assert!(drain(&mut parts.run(1)).unwrap().is_empty());
+        assert_eq!(parts.hash(), hash_of(&events[..5]));
+        assert!(drain(&mut parts.before(2)).unwrap().is_empty());
+        assert_eq!(parts.hash(), hash_of(&events[..5]), "run 2's prefix");
+        assert_eq!(drain(&mut parts.run(2)).unwrap(), events[5..]);
+        assert_eq!(parts.hash(), hash_of(&events));
+        assert!(drain(&mut parts.run(3)).unwrap().is_empty());
+
+        // A later run's prefix crosses the parts before it.
+        let mut parts = split(&parted());
+        assert_eq!(drain(&mut parts.before(2)).unwrap(), events[..5]);
+        assert_eq!(drain(&mut parts.run(2)).unwrap(), events[5..]);
+    }
+
+    #[test]
+    fn run_parts_refuse_parts_out_of_order_and_pass_provider_failures_on() {
+        // A part that goes back.
+        let mut back = parted();
+        back[5].1 = None;
+        let mut parts = split(&back);
+        assert_eq!(drain(&mut parts.before(0)).unwrap().len(), 3);
+        let err = drain(&mut parts.run(0)).unwrap_err();
+        assert!(
+            matches!(&err, ProviderError::Contract(d) if d.contains("went back")),
+            "{err}"
+        );
+        assert_eq!(parts.before(9).next_event(), Err(err), "and from then on");
+
+        // A run's view taken before its prefix.
+        let mut parts = split(&parted());
+        let err = parts.run(0).next_event().unwrap_err();
+        assert!(
+            matches!(&err, ProviderError::Contract(d) if d.contains("not taken in order")),
+            "{err}"
+        );
+
+        // A provider failure that belongs to no run reaches the view that
+        // meets it.
+        let failure = Err(ProviderError::Source("the store failed".to_owned()));
+        let mut failing = Parted::new(&parted());
+        failing.fail = true;
+        let mut parts = parts_of(failing);
+        drain(&mut parts.before(2)).unwrap();
+        assert_eq!(drain(&mut parts.run(2)), failure);
+        assert_eq!(drain(&mut parts.run(3)), failure, "and from then on");
+    }
+
+    #[test]
+    fn a_failure_of_a_later_run_ends_the_earlier_views_cleanly() {
+        // Run 2 fails to load after run 0's events: run 0's view ends
+        // cleanly, as if the pass ended with run 0, and the failure reaches
+        // run 2's view.
+        let events = tape();
+        let failure = Err(ProviderError::Source("the store failed".to_owned()));
+        let failing = |failed_run| {
+            let mut parted = Parted::new(&parted()[..5]);
+            parted.fail = true;
+            parted.failed_run = Some(failed_run);
+            parts_of(parted)
+        };
+        let mut parts = failing(2);
+        assert_eq!(drain(&mut parts.before(0)).unwrap(), events[..3]);
+        assert_eq!(drain(&mut parts.run(0)).unwrap(), events[3..5]);
+        assert!(drain(&mut parts.before(1)).unwrap().is_empty());
+        assert!(drain(&mut parts.run(1)).unwrap().is_empty());
+        assert!(drain(&mut parts.before(2)).unwrap().is_empty());
+        assert_eq!(parts.hash(), hash_of(&events[..5]), "run 2's prefix");
+        assert_eq!(drain(&mut parts.run(2)), failure);
+        assert_eq!(drain(&mut parts.run(3)), failure, "and from then on");
+
+        // A pass that skips the failed run's views meets it in a later
+        // run's prefix.
+        let mut parts = failing(2);
+        drain(&mut parts.before(0)).unwrap();
+        drain(&mut parts.run(0)).unwrap();
+        assert_eq!(drain(&mut parts.before(3)), failure);
+
+        // A failure of the run being read reaches its own view.
+        let mut parts = failing(0);
+        drain(&mut parts.before(0)).unwrap();
+        assert_eq!(drain(&mut parts.run(0)), failure);
+    }
+
+    #[test]
+    fn a_pass_over_the_parts_reaches_the_state_of_one_chain_drive() {
+        // The tape, then a run whose first event lies past the domain's
+        // bound: a restart at a run boundary.
+        let bound_ms = i64::try_from(mie_domain::bars::MAX_BARS_PER_EVENT).unwrap() * 60_000;
+        let at = 60_000 + bound_ms;
+        let mut events = parted();
+        events.extend([
+            (trade(at, 7, 1_000_000), Some(3)),
+            (trade(at + 15_000, 8, 1_000_000), Some(3)),
+        ]);
+        let all: Vec<MarketEvent> = events.iter().map(|(e, _)| e.clone()).collect();
+        let mut whole = MarketStateEngine::new();
+        let drive =
+            crate::drive_chain(&mut Feed(all.iter().cloned().collect()), &mut whole, |_| {})
+                .unwrap();
+        assert_eq!(drive.restarts, [EventTime::from_millis(at)]);
+
+        let mut parts = split(&events);
+        let mut engine = MarketStateEngine::new();
+        let mut restarts = Vec::new();
+        for run in [0, 2, 3] {
+            let prefix = crate::drive_chain(&mut parts.before(run), &mut engine, |_| {}).unwrap();
+            restarts.extend(prefix.restarts);
+            let mut checkpoints = Vec::new();
+            let part = drive_chain_checkpointed(
+                &mut parts.run(run),
+                &mut engine,
+                10_000,
+                |_| {},
+                |_| {},
+                |c| checkpoints.push(*c),
+            )
+            .unwrap();
+            restarts.extend(part.restarts);
+            // A fresh recorder per run: ordinals count the run's events.
+            assert_eq!(checkpoints.last().unwrap().ordinal, part.events, "{run}");
+        }
+        assert_eq!(restarts, drive.restarts);
+        assert_eq!(engine.state().state_hash(), whole.state().state_hash());
+        assert_eq!(parts.hash(), hash_of(&all));
+    }
+
+    #[test]
+    fn compare_prefix_reports_the_events_before_the_state() {
+        let events = tape();
+        let (stream, other) = (hash_of(&events), hash_of(&events[..5]));
+        let state = StateHash::from_fingerprint(Fingerprint::from_raw(1));
+        let moved = StateHash::from_fingerprint(Fingerprint::from_raw(2));
+        assert_eq!(compare_prefix((stream, state), (stream, state), true), None);
+        assert_eq!(
+            compare_prefix((stream, state), (other, moved), true),
+            Some(DivergenceKind::EventStream)
+        );
+        assert_eq!(
+            compare_prefix((stream, state), (other, state), false),
+            Some(DivergenceKind::EventStream)
+        );
+        assert_eq!(
+            compare_prefix((stream, state), (stream, moved), true),
+            Some(DivergenceKind::State)
+        );
+        // Another feature set: the state is not compared.
+        assert_eq!(
+            compare_prefix((stream, state), (stream, moved), false),
+            None
         );
     }
 

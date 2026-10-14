@@ -494,6 +494,8 @@ impl<'a> HistoricalDataProvider for LiveReplay<'a> {
             newest: BTreeMap::new(),
             trailing: Vec::new(),
             stats: Vec::new(),
+            delivered_from: None,
+            failed_run: None,
             failed: None,
         };
         Ok(Replay {
@@ -534,6 +536,11 @@ pub struct LiveReplayStream<'a> {
     newest: BTreeMap<Stream, EventTime>,
     trailing: Vec<FeedGap>,
     stats: Vec<RunStats>,
+    /// The index in `stats` of the run whose recompute delivered the event
+    /// [`next_event`](MarketDataProvider::next_event) returned last.
+    delivered_from: Option<usize>,
+    /// The run whose load failed, when one did.
+    failed_run: Option<String>,
     failed: Option<ProviderError>,
 }
 
@@ -563,6 +570,27 @@ impl LiveReplayStream<'_> {
     /// Gaps still open at the window's end: not delivered (module docs).
     pub fn trailing_gaps(&self) -> &[FeedGap] {
         &self.trailing
+    }
+
+    /// The run whose recompute delivered the event that
+    /// [`next_event`](MarketDataProvider::next_event) returned last; `None`
+    /// before the first event. Exact, because the queue only ever holds one
+    /// run's events ([`load`](Self::load)). The history chain splits its
+    /// stream at run boundaries by it (ADR-052 D9).
+    pub fn run_of_last_event(&self) -> Option<&str> {
+        self.delivered_from
+            .map(|index| self.stats[index].run_id.as_str())
+    }
+
+    /// The run whose read, check or recompute failed the stream, once
+    /// [`next_event`](MarketDataProvider::next_event) failed: every event of
+    /// the runs before it was delivered, and none of it or of a later run.
+    /// `None` before a failure, and for the check after the last run
+    /// (records in the window no run claims), which is no one run's. The
+    /// history chain charges a failure to the run it belongs to by it
+    /// (ADR-052 D9).
+    pub fn failed_run(&self) -> Option<&str> {
+        self.failed_run.as_deref()
     }
 
     /// Where the chained output stands after the runs loaded so far: its
@@ -604,7 +632,9 @@ impl LiveReplayStream<'_> {
     }
 
     /// Loads, checks and recomputes one run, then queues its in-window
-    /// events.
+    /// events. Called only when the queue is empty, so the queue only ever
+    /// holds the events of the run loaded last, the last entry of `stats`:
+    /// [`run_of_last_event`](Self::run_of_last_event) relies on it.
     fn load(&mut self, run: &LiveRun, extent: (i64, i64)) -> Result<(), ProviderError> {
         let records = self.read_run(run, extent)?;
         let after = self.last.clone().map(|last| (last, self.newest_oi));
@@ -885,6 +915,7 @@ impl MarketDataProvider for LiveReplayStream<'_> {
     fn next_event(&mut self) -> Result<Option<MarketEvent>, ProviderError> {
         loop {
             if let Some(event) = self.out.pop_front() {
+                self.delivered_from = self.stats.len().checked_sub(1);
                 return Ok(Some(event));
             }
             if let Some(failed) = &self.failed {
@@ -900,6 +931,7 @@ impl MarketDataProvider for LiveReplayStream<'_> {
                 return Ok(None);
             };
             if let Err(failed) = self.load(&run, extent) {
+                self.failed_run = Some(run.run_id);
                 self.failed = Some(failed.clone());
                 return Err(failed);
             }

@@ -53,14 +53,20 @@
 //!   the seam (chain seeds above). A series without a live stream
 //!   (funding) has no seam to carry it over.
 //! - **Prefix.** [`HistoryChain::before_run`] is the chain through a run's
-//!   predecessor, unwindowed at the end, for the warm start and its
-//!   equivalence check: the named run and every later one are skipped, never
-//!   recomputed. Once it has ended, its [`tail`](HistoryChainStream::tail)
+//!   predecessor, unwindowed at the end, for the warm start: the named run
+//!   and every later one are skipped, never recomputed. Once it has ended, its [`tail`](HistoryChainStream::tail)
 //!   ([`ChainTail`]) is what the named run continues after: the seeds the
 //!   chain recomputes it with ([`ChainTail::run_seeds`]) and the join to the
 //!   prefix ([`ChainTail::continuation`]). The warm start (W3) pushes the
 //!   live run's records through that continuation, so the live engine's
 //!   input is the chain's recompute of the run by construction.
+//! - **Through a run.** [`HistoryChain::to_end_of`] is the chain through a
+//!   run, the prefix of its successor. The equivalence check of
+//!   warm-started runs (ADR-052 D9) replays it once for all of them and
+//!   splits it at run boundaries with
+//!   [`run_of_last_event`](HistoryChainStream::run_of_last_event): the
+//!   events before a run's first attributed event are the run's prefix, the
+//!   run's own events are the chain's recompute of it.
 //! - **Dataset version** (ADR-052 D5, [`chain_dataset`]): SHA-256 over a
 //!   versioned text holding the origin, the cutover and both segments'
 //!   versions, so an archive correction and a newly sealed run both change
@@ -361,6 +367,44 @@ impl<'a> HistoryChain<'a> {
         &self,
         run_id: &str,
     ) -> Result<Replay<HistoryChainStream<'a>>, ProviderError> {
+        let index = self.chain_index(run_id)?;
+        if index == self.first_chained {
+            return self.open(self.archive_window(), None);
+        }
+        let predecessor = index - 1;
+        let end = self.ends[predecessor].unwrap_or(self.runs[index].started_at_ms);
+        self.through(predecessor, end)
+    }
+
+    /// The chain through run `run_id`, unwindowed at the end: the archive
+    /// segment, then every chain run up to and including `run_id`, over the
+    /// window `[origin, end + RUN_MARGIN_MS)` with `end` the run's ADR-039
+    /// D2 end (its `run_end`, else its journaled successor's start). When a
+    /// successor exists, it is [`before_run`](Self::before_run) of that
+    /// successor. Every later run is skipped, never recomputed. For one pass
+    /// of the equivalence check over several warm-started runs (ADR-052
+    /// D9), split at run boundaries by
+    /// [`run_of_last_event`](HistoryChainStream::run_of_last_event).
+    ///
+    /// # Errors
+    ///
+    /// [`ProviderError::Contract`] when `run_id` is not a journaled run,
+    /// started before the cutover, or has no end: neither a `run_end` nor a
+    /// journaled successor, so it may still be capturing. As
+    /// [`replay`](Self::replay) otherwise.
+    pub fn to_end_of(&self, run_id: &str) -> Result<Replay<HistoryChainStream<'a>>, ProviderError> {
+        let index = self.chain_index(run_id)?;
+        let Some(end) = self.ends[index] else {
+            return Err(ProviderError::Contract(format!(
+                "run {run_id} has neither a run_end nor a journaled successor, so it may still \
+                 be capturing: the chain through it has no end (ADR-039 D2)"
+            )));
+        };
+        self.through(index, end)
+    }
+
+    /// The index in `runs` of the chain run `run_id`.
+    fn chain_index(&self, run_id: &str) -> Result<usize, ProviderError> {
         let index = self
             .runs
             .iter()
@@ -378,15 +422,23 @@ impl<'a> HistoryChain<'a> {
                 self.cutover
             )));
         }
-        let Some(live_start) = self.live_start().filter(|_| index > self.first_chained) else {
-            return self.open(self.archive_window(), None);
-        };
-        let predecessor = index - 1;
-        let end = self.ends[predecessor]
-            .unwrap_or(self.runs[index].started_at_ms)
-            .saturating_add(RUN_MARGIN_MS);
-        let end = EventTime::from_millis(end);
-        let ids = self.runs[self.first_chained..index]
+        Ok(index)
+    }
+
+    /// The archive segment, then the chain runs up to and including the one
+    /// at `last` (a chain run), over `[origin, end + RUN_MARGIN_MS)` with
+    /// `end` that run's ADR-039 D2 end: the one construction of
+    /// [`before_run`](Self::before_run) and [`to_end_of`](Self::to_end_of).
+    fn through(
+        &self,
+        last: usize,
+        end: i64,
+    ) -> Result<Replay<HistoryChainStream<'a>>, ProviderError> {
+        let live_start = self
+            .live_start()
+            .expect("a chain run exists, so the live segment has a start");
+        let end = EventTime::from_millis(end.saturating_add(RUN_MARGIN_MS));
+        let ids = self.runs[self.first_chained..=last]
             .iter()
             .map(|run| run.run_id.clone())
             .collect();
@@ -457,6 +509,7 @@ impl<'a> HistoryChain<'a> {
                 live,
                 archive_done: false,
                 live_done: false,
+                from_live: false,
                 last: None,
                 newest_oi: None,
                 newest: BTreeMap::new(),
@@ -539,6 +592,8 @@ pub struct HistoryChainStream<'a> {
     live: Option<Segment<LiveReplayStream<'a>>>,
     archive_done: bool,
     live_done: bool,
+    /// Whether the event delivered last came from the live segment.
+    from_live: bool,
     /// The archive segment's last event, delivered or not.
     last: Option<MarketEvent>,
     /// The archive segment's newest open-interest time.
@@ -583,6 +638,28 @@ impl<'a> HistoryChainStream<'a> {
     /// stream's ([`ArchiveReplayStream::trailing_gaps`]), not the chain's.
     pub fn trailing_gaps(&self) -> &[FeedGap] {
         &self.trailing
+    }
+
+    /// The chain run whose recompute delivered the event that
+    /// [`next_event`](MarketDataProvider::next_event) returned last: `None`
+    /// for an archive event and before the first event
+    /// ([`LiveReplayStream::run_of_last_event`]). Over
+    /// [`HistoryChain::to_end_of`] it splits the stream at run boundaries:
+    /// the events before a run's first attributed event are its prefix
+    /// (ADR-052 D9).
+    pub fn run_of_last_event(&self) -> Option<&str> {
+        if !self.from_live {
+            return None;
+        }
+        self.live.as_ref()?.stream.run_of_last_event()
+    }
+
+    /// The chain run whose read, check or recompute failed the stream
+    /// ([`LiveReplayStream::failed_run`]): every event before that run's
+    /// was delivered. `None` before a failure, for a failure of the archive
+    /// segment and for the live segment's check after its last run.
+    pub fn failed_run(&self) -> Option<&str> {
+        self.live.as_ref()?.stream.failed_run()
     }
 
     /// Where the chain ends, once the stream has ended (`None` before): with
@@ -659,6 +736,7 @@ impl<'a> HistoryChainStream<'a> {
             self.last = Some(event.clone());
             if self.admit(&event) {
                 self.archive.delivered += 1;
+                self.from_live = false;
                 return Ok(Some(event));
             }
         }
@@ -679,6 +757,7 @@ impl<'a> HistoryChainStream<'a> {
                 if let Some(live) = self.live.as_mut() {
                     live.delivered += 1;
                 }
+                self.from_live = true;
                 return Ok(Some(event));
             }
         }
@@ -1406,6 +1485,136 @@ mod tests {
         }
     }
 
+    /// The events of `stream`, each with the chain run that delivered it.
+    fn attributed(stream: &mut HistoryChainStream<'_>) -> Vec<(MarketEvent, Option<String>)> {
+        let mut out = Vec::new();
+        assert_eq!(stream.run_of_last_event(), None, "before the first event");
+        while let Some(event) = stream.next_event().unwrap() {
+            out.push((event, stream.run_of_last_event().map(str::to_owned)));
+        }
+        out
+    }
+
+    #[test]
+    fn the_chain_through_a_run_is_the_prefix_of_its_successor() {
+        let fixture = Fixture::new();
+        let source = fixture.source();
+        let chain = chain(&source, fixture.runs.clone());
+        let (r1, r2, r3) = (
+            fixture.runs[1].run_id.as_str(),
+            fixture.runs[2].run_id.as_str(),
+            fixture.runs[3].run_id.as_str(),
+        );
+
+        // Through R2: R3's prefix, event for event and in dataset version.
+        let mut through = chain.to_end_of(r2).unwrap();
+        let mut prefix = chain.before_run(r3).unwrap();
+        assert_eq!(through.dataset, prefix.dataset);
+        assert_eq!(drain(&mut through.stream), drain(&mut prefix.stream));
+        assert_eq!(through.stream.window(), prefix.stream.window());
+
+        // Through R3, the newest run: the chain up to its end plus the
+        // margin.
+        let end = fixture.runs[3].ended_at_ms.unwrap() + RUN_MARGIN_MS;
+        let mut last = chain.to_end_of(r3).unwrap();
+        let windowed = chain.replay(window(origin(), end)).unwrap();
+        assert_eq!(last.dataset, windowed.dataset);
+        let events = attributed(&mut last.stream);
+        let (expected, _) = replay(&chain, window(origin(), end));
+        assert_eq!(
+            events.iter().map(|(e, _)| e.clone()).collect::<Vec<_>>(),
+            expected
+        );
+
+        // The attribution: the archive's events, then R1's, R2's and R3's.
+        let n = last.stream.archive().delivered() as usize;
+        assert!(n > 0);
+        assert!(events[..n].iter().all(|(_, run)| run.is_none()));
+        let mut runs: Vec<&str> = events[n..]
+            .iter()
+            .map(|(_, run)| run.as_deref().expect("a live event is attributed"))
+            .collect();
+        runs.dedup();
+        assert_eq!(runs, [r1, r2, r3]);
+        // The events before each run's first one are its prefix.
+        for run in [r1, r2, r3] {
+            let first = events
+                .iter()
+                .position(|(_, by)| by.as_deref() == Some(run))
+                .unwrap();
+            let mut prefix = chain.before_run(run).unwrap().stream;
+            let prefix = drain(&mut prefix);
+            assert_eq!(
+                events[..first]
+                    .iter()
+                    .map(|(e, _)| e.clone())
+                    .collect::<Vec<_>>(),
+                prefix,
+                "{run}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_run_is_named_after_every_event_before_it() {
+        // R2 ended cleanly, but one of its records is missing.
+        let fixture = Fixture::new();
+        let mut source = MemorySource::default();
+        seal_archive(&mut source);
+        for (i, b) in fixture.builders.iter().enumerate() {
+            b.seal(&mut source, if i == 2 { &[3] } else { &[] });
+        }
+        let chain = chain(&source, fixture.runs.clone());
+        let mut stream = chain.to_end_of("20261005T021001Z").unwrap().stream;
+        let mut delivered = Vec::new();
+        let failed = loop {
+            match stream.next_event() {
+                Ok(Some(event)) => {
+                    assert_eq!(stream.failed_run(), None);
+                    delivered.push(event);
+                }
+                Ok(None) => panic!("the stream ended"),
+                Err(failed) => break failed,
+            }
+        };
+        assert!(
+            matches!(&failed, ProviderError::Source(d) if d.contains("20261005T020000Z")),
+            "{failed}"
+        );
+        assert_eq!(stream.failed_run(), Some("20261005T020000Z"));
+        // R1 delivered all of its events before R2 failed: as many as the
+        // prefix of R2 holds.
+        assert_eq!(stream.run_of_last_event(), Some("20261005T000010Z"));
+        let mut prefix = chain.before_run("20261005T020000Z").unwrap().stream;
+        assert_eq!(delivered, drain(&mut prefix));
+        // An archive-only prefix names no run.
+        let mut archive = chain.before_run("20261005T000010Z").unwrap().stream;
+        drain(&mut archive);
+        assert_eq!(archive.failed_run(), None);
+    }
+
+    #[test]
+    fn the_chain_through_an_open_or_unknown_run_is_refused() {
+        let fixture = Fixture::new();
+        let mut source = fixture.source();
+        // R4 is still capturing: no run_end, no successor.
+        let s4 = fixture.runs[3].ended_at_ms.unwrap() + 2_000;
+        let mut r4 = RunBuilder::new("20261005T022003Z");
+        r4.push(BinanceStream::AggTrade, 1, agg(40_000, s4 + 1_000));
+        r4.seal(&mut source, &[]);
+        let mut runs = fixture.runs.clone();
+        runs.push(r4.run(s4, None, None));
+        let chain = chain(&source, runs);
+        for id in ["20261005T022003Z", "20261004T233000Z", "20261006T000000Z"] {
+            assert!(
+                matches!(chain.to_end_of(id), Err(ProviderError::Contract(_))),
+                "{id}"
+            );
+        }
+        // R3 ends at its run_end although a successor is capturing.
+        assert!(chain.to_end_of("20261005T021001Z").is_ok());
+    }
+
     /// `builder`'s records pushed through `continuation`, then finished.
     fn continue_with(continuation: &mut RunContinuation, builder: &RunBuilder) -> Vec<MarketEvent> {
         let mut out = Vec::new();
@@ -1702,5 +1911,86 @@ mod tests {
             "97fadd11b3b4a9806b9e5e58a8bc185527ad68c8d1788898d9d88fa05682ccbc"
         );
         assert_eq!(CHAIN_DATASET_ENCODING, 1);
+    }
+
+    /// The prefix before a second chain run that starts `gap_ms` after the
+    /// first ended, with its first record 1 s after its start, twice: as
+    /// the warm start (W3) journals it, while the
+    /// second run is still capturing and has sealed nothing, and as an
+    /// equivalence check sees it later, once the second run has sealed its
+    /// files and ended. Each is the dataset version and the events.
+    fn prefix_at_start_and_later(
+        gap_ms: i64,
+    ) -> (
+        (DatasetVersion, Vec<MarketEvent>),
+        (DatasetVersion, Vec<MarketEvent>),
+    ) {
+        let mut source = MemorySource::default();
+        let mut id = 1;
+        archive_day(&mut source, origin(), &mut id, None);
+        let c = cutover();
+        let mut r1 = RunBuilder::new("20261005T000010Z");
+        for i in 0..10 {
+            r1.push(
+                BinanceStream::AggTrade,
+                1,
+                agg(10_000 + i as u64, c + 10_000 + i * 30_000),
+            );
+        }
+        r1.seal(&mut source, &[]);
+        let r1_end = c + 20 * MIN;
+        let s2 = r1_end + gap_ms;
+        let r1_run = r1.run(c + 10_000, Some(r1_end), Some(10));
+        let id2 = if gap_ms < 5 * MIN {
+            "20261005T002100Z"
+        } else {
+            "20261005T003000Z"
+        };
+        let mut r2 = RunBuilder::new(id2);
+        for i in 0..10 {
+            r2.push(
+                BinanceStream::AggTrade,
+                1,
+                agg(20_000 + i as u64, s2 + 1_000 + i * 30_000),
+            );
+        }
+        // At the warm start: the second run is journaled without an end and
+        // has sealed nothing yet.
+        let at_start = chain(&source, vec![r1_run.clone(), r2.run(s2, None, None)])
+            .before_run(id2)
+            .unwrap();
+        let at_start = (at_start.dataset, drain(&mut { at_start.stream }));
+        // Later: the second run sealed its files and ended cleanly.
+        r2.seal(&mut source, &[]);
+        let later = chain(
+            &source,
+            vec![r1_run, r2.run(s2, Some(s2 + 20 * MIN), Some(10))],
+        )
+        .before_run(id2)
+        .unwrap();
+        let later = (later.dataset, drain(&mut { later.stream }));
+        (at_start, later)
+    }
+
+    #[test]
+    fn a_run_sealing_records_inside_its_prefix_selection_moves_its_version_not_its_events() {
+        // A restart 60 s after the predecessor's end, its first record 1 s
+        // later, so before the predecessor's end plus the margin: once
+        // sealed, that file falls into the prefix's selection (ADR-052
+        // decisions 5 and 9). The start alone does not decide it; the
+        // record's time does.
+        let (at_start, later) = prefix_at_start_and_later(60_000);
+        assert!(!at_start.1.is_empty());
+        assert_eq!(at_start.1, later.1, "the prefix's events are the same");
+        assert_ne!(at_start.0, later.0, "no data changed, the version did");
+    }
+
+    #[test]
+    fn a_run_whose_records_lie_past_its_prefix_selection_keeps_its_version() {
+        // A restart 10 min after the predecessor's end, its first record 1 s
+        // later: past the predecessor's end plus the margin.
+        let (at_start, later) = prefix_at_start_and_later(10 * MIN);
+        assert_eq!(at_start.1, later.1);
+        assert_eq!(at_start.0, later.0);
     }
 }

@@ -26,20 +26,55 @@
 //!   EQUIVALENT with the state compared; a mutated level quantity in one
 //!   recorded diff diverges at the first checkpoint after it, and a flipped
 //!   state hash as state.
+//!
+//! Warm-started runs (ADR-052 D9), through the offline `mie ingest`
+//! composition with `[history]` over an imported archive (the scripted
+//! capture of `common::warm`):
+//!
+//! - (H) Three warm runs, the second a fast restart 2 s after the first,
+//!   whose overlapping trade becomes a `LateEvent` gap inside its compared
+//!   part, the third an hour later: all `EQUIVALENT` with state compared on
+//!   one pass; each prefix contains the predecessor; a second invocation
+//!   prints the same bytes; the third run alone is `EQUIVALENT` too.
+//! - (I) Two warm runs an hour apart: a changed archive trade makes both
+//!   `DIVERGED (warm prefix)`; a changed trade of the first run diverges it
+//!   at a checkpoint and the second at its prefix; a flipped journaled
+//!   handoff state hash diverges the second as state, with the dataset
+//!   version unchanged.
+//! - (J) A cold chain run (failed warm-up) before a warm one: the first is
+//!   compared in the cold unit, the second's prefix crosses the first's
+//!   chain recompute; both `EQUIVALENT`.
+//! - (L) A chain run between two warm runs that crashed, delivered no
+//!   event, or fails to load: the warm runs before it keep their full
+//!   verdict, whatever else is selected; a failure is charged to the warm
+//!   runs from the failed run on.
+//! - (K) The runs of (I) without `[history]` or under another cutover are
+//!   `NOT COMPARABLE`, naming both chains; under another feature set they
+//!   compare the events only.
 
 mod common;
 
-use common::{Connections, DepthConnection, DrivenClock, TempDir, ingest_depth};
+use common::warm::{
+    Step, import_archive, import_archive_with, oi, one, run_steps, warm_config, warm_ingest,
+};
+use common::{
+    CUTOVER, Connections, DepthConnection, DrivenClock, HOUR, ORIGIN, TempDir, ingest_depth,
+    journal,
+};
+use mie_adapter_binance::archive::ArchiveStream;
+use mie_adapter_binance::archive::catalog::DAY_MS;
 use mie_adapter_binance::transport::{Clock, HttpGet};
-use mie_adapter_binance::{BinanceStream, LiveReplay};
+use mie_adapter_binance::{BinanceStream, LiveReplay, RUN_MARGIN_MS};
 use mie_adapter_parquet::{ParquetRawStore, RotationPolicy};
 use mie_app::equivalence::{DivergenceKind, StateCheckpoint, drive_checkpointed};
 use mie_cli::config::IngestConfig;
 use mie_cli::equivalence::{
     self, EquivalenceOutcome, EquivalenceRequest, Mismatch, NOTHING_COMPARED, Verdict,
+    WarmPrefixDivergence,
 };
 use mie_cli::ingest::Transports;
 use mie_cli::journal::{JournaledRun, read_runs};
+use mie_cli::replay::{self, ReplayRequest, ReplaySource};
 use mie_domain::event::MarketEvent;
 use mie_domain::feature::{FeatureValue, catalog};
 use mie_domain::state::MarketStateEngine;
@@ -1006,6 +1041,563 @@ fn the_order_book_state_replays_equivalently_and_a_mutated_level_diverges() {
         panic!("{text}")
     };
     assert_eq!((d.index, d.kind), (target, DivergenceKind::State), "{text}");
+}
+
+// ---------------------------------------------------------------------------
+// (H)–(K) Warm-started runs (ADR-052 D9): one pass over the history chain.
+
+/// The streams of the scripted warm captures.
+const WARM_STREAMS: [&str; 3] = ["aggTrade", "markPrice", "openInterest"];
+
+/// A warm-started chain run of `run_steps` at `t`, trade ids from
+/// `first_id`, its open-interest sample at `oi_ms`: its run id.
+fn warm_run(config: &IngestConfig, t: i64, first_id: u64, oi_ms: i64) -> String {
+    let outcome = warm_ingest(config, t, run_steps(t, first_id), vec![oi(oi_ms)], None);
+    assert_eq!(outcome.exit_code(), 0, "{:?}", outcome.error);
+    let lines = journal(config);
+    assert_eq!(one(&lines, &outcome.run_id, "warm_start")["warm"], true);
+    outcome.run_id
+}
+
+/// Two warm runs an hour apart under `dir`: more than `RUN_MARGIN_MS`
+/// after the first ended, so the second's files lie outside its prefix's
+/// selection and the journaled prefix dataset version stays current. The
+/// configuration, the run ids and the start times.
+fn two_warm_runs(dir: &Path) -> (IngestConfig, [String; 2], [i64; 2]) {
+    import_archive(dir);
+    let config = warm_config(dir, Some(1_000));
+    let (t1, t2) = (CUTOVER + HOUR, CUTOVER + 2 * HOUR);
+    let r1 = warm_run(&config, t1, 10_000, t1 - 4_000);
+    let r2 = warm_run(&config, t2, 20_000, t2 - 3_000);
+    (config, [r1, r2], [t1, t2])
+}
+
+/// The warm prefix divergence of `verdict`.
+fn warm_prefix<'a>(verdict: &'a Verdict, text: &str) -> &'a WarmPrefixDivergence {
+    let Verdict::Diverged(Mismatch::WarmPrefix(d)) = verdict else {
+        panic!("{text}")
+    };
+    d
+}
+
+/// Every live record of `config`'s store, by run and `receive_seq`.
+fn live_records(config: &IngestConfig) -> Vec<Record> {
+    let store = ParquetRawStore::new(&config.paths.raw_root);
+    let keys: BTreeSet<RawStreamKey> = WARM_STREAMS
+        .iter()
+        .map(|s| RawStreamKey::new("binance-um", "BTCUSDT", s).unwrap())
+        .collect();
+    let window = ReplayWindow {
+        start: EventTime::from_millis(CUTOVER - DAY_MS),
+        end: EventTime::from_millis(CUTOVER + 2 * DAY_MS),
+    };
+    let mut records = Vec::new();
+    for file in store
+        .select(&RawSelection::new(keys, window).unwrap())
+        .unwrap()
+        .files
+    {
+        for record in store.read(&file).unwrap() {
+            let capture = record.capture.clone().unwrap();
+            records.push(Record {
+                stream: BinanceStream::from_raw_name(file.stream.stream()).unwrap(),
+                receive_seq: capture.receive_seq,
+                receive_time_ns: capture.receive_time_ns,
+                session_id: capture.session_id,
+                event_time_ms: record.event_time.as_millis(),
+                payload: String::from_utf8(record.payload).unwrap(),
+            });
+        }
+    }
+    let run_of = |r: &Record| {
+        r.session_id
+            .split('/')
+            .next()
+            .unwrap_or_default()
+            .to_owned()
+    };
+    records.sort_by_key(|r| (run_of(r), r.receive_seq));
+    records
+}
+
+/// `config`'s store rebuilt under `dir`: the archive of
+/// [`import_archive_with`] `archive`, the live records read back and
+/// rewritten after `live`, and a copy of the journal of the unchanged runs.
+fn rebuilt(
+    config: &IngestConfig,
+    dir: &Path,
+    archive: impl FnOnce(&mut Vec<(ArchiveStream, String)>),
+    live: impl FnOnce(&mut [Record]),
+) -> IngestConfig {
+    import_archive_with(dir, archive);
+    let rebuilt = warm_config(dir, Some(1_000));
+    let mut records = live_records(config);
+    live(&mut records);
+    write_store(&rebuilt.paths.raw_root, &records);
+    std::fs::copy(&config.paths.journal, &rebuilt.paths.journal).unwrap();
+    rebuilt
+}
+
+/// `config` over the same store, reading the journal `lines` written under
+/// `dir`.
+fn with_journal(config: &IngestConfig, dir: &Path, lines: &[Value]) -> IngestConfig {
+    let mut copy = config.clone();
+    copy.paths.journal = dir.join("journal.jsonl");
+    write_journal(&copy.paths.journal, lines);
+    copy
+}
+
+/// The journaled `field` of run `run_id`'s `kind` line, as a count.
+fn count(lines: &[Value], run_id: &str, kind: &str, field: &str) -> u64 {
+    one(lines, run_id, kind)[field].as_u64().unwrap()
+}
+
+#[test]
+fn warm_started_runs_with_a_restart_between_them_are_equivalent() {
+    let dir = TempDir::new("equivalence-warm");
+    import_archive(dir.path());
+    let config = warm_config(dir.path(), Some(1_000));
+    let t1 = CUTOVER + HOUR;
+    let r1 = warm_run(&config, t1, 10_000, t1 - 4_000);
+    // A fast restart 2 s after the first run ended (the schedule of
+    // `a_fast_restart_overlap_is_late_or_retimed_never_rejected`): its first
+    // trade and its open interest are older than the first run's last
+    // event, so the join turns them into a `LateEvent` gap and re-timed
+    // open interest inside the compared part.
+    let t2 = t1 + 3_500;
+    let steps = vec![
+        Step::Advance(6_500),
+        Step::Polled(1),
+        Step::Frame(common::warm::AGG, common::agg(10_100, t1 + 64_000)),
+        Step::Frame(common::warm::AGG, common::agg(10_101, t1 + 70_000)),
+        Step::Gate,
+        Step::Frame(common::warm::AGG, common::agg(10_102, t1 + 71_000)),
+        Step::Frame(common::warm::AGG, common::agg(10_103, t1 + 72_000)),
+    ];
+    let second = warm_ingest(&config, t2, steps, vec![oi(t1 + 60_000)], None);
+    assert_eq!(second.exit_code(), 0, "{:?}", second.error);
+    let r2 = second.run_id;
+    // About an hour later, on a 10 s poll slot as `run_steps` needs.
+    let t3 = t1 + 2 * HOUR;
+    let r3 = warm_run(&config, t3, 30_000, t3 - 3_000);
+    let runs = [r1, r2, r3];
+    let lines = journal(&config);
+    assert_eq!(one(&lines, &runs[1], "warm_start")["warm"], true);
+
+    // Each prefix contains the predecessor's prefix and its events.
+    for pair in runs.windows(2) {
+        assert_eq!(
+            count(&lines, &pair[1], "warm_start", "prefix_events"),
+            count(&lines, &pair[0], "warm_start", "prefix_events")
+                + count(&lines, &pair[0], "run_end", "events"),
+            "{pair:?}"
+        );
+    }
+    // The fast restart's join made a late gap, which its core consumed.
+    let end2 = one(&lines, &runs[1], "run_end")["at_ms"].as_i64().unwrap();
+    let request = ReplayRequest {
+        source: ReplaySource::History(config.clone()),
+        window: ReplayWindow {
+            start: EventTime::from_millis(ORIGIN),
+            end: EventTime::from_millis(end2 + RUN_MARGIN_MS),
+        },
+    };
+    let mut out = Vec::new();
+    replay::run(&request, &mut out).expect("the report is written");
+    let replayed = String::from_utf8(out).unwrap();
+    assert!(
+        replayed
+            .lines()
+            .any(|l| l.starts_with("delivered Trades:") && l.contains("LateEvent")),
+        "{replayed}"
+    );
+
+    let (outcome, text) = check(&config, t1, t3 + 1);
+    assert_eq!(outcome.runs.len(), 3, "{text}");
+    for run in &outcome.runs {
+        assert_eq!(run.verdict, Verdict::Equivalent, "{text}");
+    }
+    assert!(outcome.pass, "{text}");
+    assert_eq!(outcome.exit_code(), 0);
+    assert!(
+        text.ends_with(
+            "PASS
+"
+        ),
+        "{text}"
+    );
+    assert_eq!(text.matches(": one pass through run ").count(), 1, "{text}");
+    assert!(
+        text.contains(&format!(
+            "history origin {ORIGIN} cutover {CUTOVER}: one pass through run {}
+",
+            runs[2]
+        )),
+        "{text}"
+    );
+    for run in &runs {
+        let prefix = count(&lines, run, "warm_start", "prefix_events");
+        assert!(
+            text.contains(&format!("run {run}: warm prefix events {prefix}, records ")),
+            "{text}"
+        );
+    }
+
+    // A second invocation prints the same bytes.
+    let (again, repeated) = check(&config, t1, t3 + 1);
+    assert_eq!(repeated, text);
+    assert_eq!(again, outcome);
+
+    // The last run alone: the pass crosses the runs not selected.
+    let (alone, text) = check(&config, t3, t3 + 1);
+    assert_eq!(alone.runs.len(), 1, "{text}");
+    assert_eq!(alone.runs[0].verdict, Verdict::Equivalent, "{text}");
+    assert!(alone.pass, "{text}");
+}
+
+#[test]
+fn a_changed_warm_prefix_or_handoff_diverges_as_the_warm_prefix() {
+    let dir = TempDir::new("equivalence-warm-prefix");
+    let (config, [r1, r2], [t1, t2]) = two_warm_runs(dir.path());
+    let lines = journal(&config);
+    let (outcome, text) = check(&config, t1, t2 + 1);
+    assert!(outcome.pass, "{text}");
+
+    // (c) The second run's journaled handoff state hash flipped, in a
+    // journal copy over the same store.
+    let mut flipped = lines.clone();
+    let warm = flipped
+        .iter_mut()
+        .find(|l| l["type"] == "warm_start" && l["run_id"] == r2.as_str())
+        .unwrap();
+    let hash = warm["handoff_state_hash"].as_str().unwrap().to_owned();
+    warm["handoff_state_hash"] = json!(if hash == "0123456789abcdef" {
+        "fedcba9876543210"
+    } else {
+        "0123456789abcdef"
+    });
+    let copy = TempDir::new("equivalence-warm-handoff");
+    let (outcome, text) = check(&with_journal(&config, copy.path(), &flipped), t1, t2 + 1);
+    assert_eq!(outcome.runs[0].verdict, Verdict::Equivalent, "{text}");
+    let d = warm_prefix(&outcome.runs[1].verdict, &text);
+    assert_eq!(d.kind, DivergenceKind::State, "{text}");
+    assert_eq!(d.live_stream, d.replay_stream);
+    assert_ne!(d.live_state, d.replay_state);
+    assert_eq!(d.live_dataset, d.replay_dataset, "{text}");
+    assert_eq!(outcome.exit_code(), 1);
+    assert!(
+        text.contains(&format!("run {r2}: warm prefix events ")),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            ": DIVERGED (warm prefix)
+"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "  first divergence: the warm prefix, the events match, the handoff state differs
+"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "  dataset    live {} replay {}
+",
+            d.live_dataset, d.replay_dataset
+        )),
+        "{text}"
+    );
+    assert!(
+        text.ends_with(
+            "FAIL: 1 of 2 run(s) not equivalent
+"
+        ),
+        "{text}"
+    );
+
+    // (a) One archive trade's quantity changed.
+    let store = TempDir::new("equivalence-warm-archive");
+    let changed = rebuilt(
+        &config,
+        store.path(),
+        |rows| {
+            let row = &mut rows[30].1;
+            assert!(row.contains(",0.010,"), "{row}");
+            *row = row.replacen(",0.010,", ",0.020,", 1);
+        },
+        |_| {},
+    );
+    let (outcome, text) = check(&changed, t1, t2 + 1);
+    assert_eq!(outcome.runs.len(), 2, "{text}");
+    for run in &outcome.runs {
+        let d = warm_prefix(&run.verdict, &text);
+        assert_eq!(d.kind, DivergenceKind::EventStream, "{text}");
+        assert_ne!(d.live_stream, d.replay_stream);
+        assert_ne!(d.live_dataset, d.replay_dataset, "{text}");
+    }
+    assert!(
+        text.contains(
+            "  first divergence: the warm prefix, the delivered events differ
+"
+        ),
+        "{text}"
+    );
+    assert_eq!(outcome.exit_code(), 1);
+
+    // (b) One trade of the first run changed.
+    let store = TempDir::new("equivalence-warm-run");
+    let prefix = format!("{r1}/");
+    let changed = rebuilt(
+        &config,
+        store.path(),
+        |_| {},
+        |records| {
+            let record = records
+                .iter_mut()
+                .find(|r| {
+                    r.session_id.starts_with(&prefix)
+                        && r.stream == BinanceStream::AggTrade
+                        && serde_json::from_str::<Value>(&r.payload).unwrap()["a"] == 10_003
+                })
+                .expect("the first run's fourth trade");
+            let mut payload: Value = serde_json::from_str(&record.payload).unwrap();
+            payload["q"] = json!("9.999");
+            record.payload = payload.to_string();
+        },
+    );
+    let (outcome, text) = check(&changed, t1, t2 + 1);
+    let Verdict::Diverged(Mismatch::Checkpoint(d)) = &outcome.runs[0].verdict else {
+        panic!("{text}")
+    };
+    assert_eq!(d.kind, DivergenceKind::EventStream, "{text}");
+    let d = warm_prefix(&outcome.runs[1].verdict, &text);
+    assert_eq!(d.kind, DivergenceKind::EventStream, "{text}");
+    assert_eq!(outcome.exit_code(), 1);
+}
+
+#[test]
+fn a_warm_run_after_a_cold_chain_run_crosses_its_chain_recompute() {
+    let dir = TempDir::new("equivalence-warm-after-cold");
+    import_archive(dir.path());
+    // Without max_run_records no warm-up starts (`warm-up-failed`), so the
+    // script has no gate to wait for.
+    let cold = warm_config(dir.path(), None);
+    let t1 = CUTOVER + HOUR;
+    let steps = run_steps(t1, 10_000)
+        .into_iter()
+        .filter(|step| !matches!(step, Step::Gate))
+        .collect();
+    let first = warm_ingest(&cold, t1, steps, vec![oi(t1 - 4_000)], None);
+    assert_eq!(first.exit_code(), 0, "{:?}", first.error);
+    let r1 = first.run_id;
+    let config = warm_config(dir.path(), Some(1_000));
+    let t2 = t1 + HOUR;
+    let r2 = warm_run(&config, t2, 20_000, t2 - 3_000);
+    let lines = journal(&config);
+    assert_eq!(one(&lines, &r1, "warm_start")["cold"], "warm-up-failed");
+
+    let (outcome, text) = check(&config, t1, t2 + 1);
+    assert_eq!(outcome.runs.len(), 2, "{text}");
+    for run in &outcome.runs {
+        assert_eq!(run.verdict, Verdict::Equivalent, "{text}");
+    }
+    assert!(outcome.pass, "{text}");
+    // The first run in the cold unit, the second in the warm one.
+    assert!(text.contains(&format!("run {r1}: records ")), "{text}");
+    assert!(
+        text.contains(&format!("run {r2}: warm prefix events ")),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            ": one pass through run {r2}
+"
+        )),
+        "{text}"
+    );
+}
+
+/// The line of run `run_id` in a report.
+fn run_line<'a>(text: &'a str, run_id: &str) -> &'a str {
+    let prefix = format!("run {run_id}: ");
+    text.lines()
+        .find(|l| l.starts_with(&prefix))
+        .unwrap_or_else(|| panic!("no line of {run_id}: {text}"))
+}
+
+#[test]
+fn a_crashed_empty_or_failing_run_between_warm_runs_is_charged_to_no_earlier_one() {
+    let dir = TempDir::new("equivalence-warm-between");
+    import_archive(dir.path());
+    let config = warm_config(dir.path(), Some(1_000));
+    let t1 = CUTOVER + HOUR;
+    let (t2, t3) = (t1 + HOUR, t1 + 2 * HOUR);
+    let w1 = warm_run(&config, t1, 10_000, t1 - 4_000);
+    let r2 = warm_run(&config, t2, 20_000, t2 - 3_000);
+    let w3 = warm_run(&config, t3, 30_000, t3 - 3_000);
+    let lines = journal(&config);
+    let (outcome, text) = check(&config, t1, t3 + 1);
+    assert!(outcome.pass, "{text}");
+    let alone = |config: &IngestConfig| {
+        let (outcome, text) = check(config, t1, t1 + 1);
+        assert_eq!(outcome.runs.len(), 1, "{text}");
+        (
+            outcome.runs[0].verdict.clone(),
+            run_line(&text, &w1).to_owned(),
+        )
+    };
+    let w1_alone = alone(&config);
+    assert_eq!(w1_alone.0, Verdict::Equivalent);
+    let end_of = |run_id: &str| {
+        lines
+            .iter()
+            .position(|l| l["type"] == "run_end" && l["run_id"] == run_id)
+            .unwrap()
+    };
+
+    // R2 fails to load: its run_end counts one record more than the store
+    // holds. W1's events were all delivered before R2 was read, so W1 keeps
+    // the verdict and line it has when selected alone; R2 and W3 are not
+    // comparable.
+    let mut failing = lines.clone();
+    let records = failing[end_of(&r2)]["records"].as_u64().unwrap();
+    failing[end_of(&r2)]["records"] = json!(records + 1);
+    let copy = TempDir::new("equivalence-warm-failing");
+    let failing = with_journal(&config, copy.path(), &failing);
+    let (outcome, text) = check(&failing, t1, t3 + 1);
+    assert_eq!(outcome.runs.len(), 3, "{text}");
+    assert_eq!(outcome.runs[0].verdict, Verdict::Equivalent, "{text}");
+    assert_eq!(run_line(&text, &w1), w1_alone.1, "{text}");
+    assert_eq!(alone(&failing), w1_alone);
+    for (run, verdict) in [&r2, &w3].iter().zip(&outcome.runs[1..]) {
+        let Verdict::NotComparable(reason) = &verdict.verdict else {
+            panic!("{text}")
+        };
+        assert!(
+            reason.starts_with("chain replay failed: ")
+                && reason.contains(&format!("run {r2} ended cleanly but ")),
+            "{run}: {reason}"
+        );
+    }
+    assert_eq!(outcome.exit_code(), 1);
+
+    // A failure of the earlier warm run's own data still reaches it: one of
+    // W1's records counted missing too.
+    let mut own = lines.clone();
+    let records = own[end_of(&w1)]["records"].as_u64().unwrap();
+    own[end_of(&w1)]["records"] = json!(records + 1);
+    let copy = TempDir::new("equivalence-warm-own-failure");
+    let (outcome, text) = check(&with_journal(&config, copy.path(), &own), t1, t3 + 1);
+    for verdict in &outcome.runs {
+        assert!(
+            matches!(&verdict.verdict, Verdict::NotComparable(r) if r.starts_with("chain replay failed: ")),
+            "{text}"
+        );
+    }
+
+    // R2 crashed: no run_end, so it ends at W3's start (ADR-039 D2). The
+    // crashed run is not comparable itself; the warm runs around it are.
+    let mut crashed = lines.clone();
+    crashed.remove(end_of(&r2));
+    let copy = TempDir::new("equivalence-warm-crashed");
+    let (outcome, text) = check(&with_journal(&config, copy.path(), &crashed), t1, t3 + 1);
+    assert_eq!(outcome.runs[0].verdict, Verdict::Equivalent, "{text}");
+    assert_eq!(
+        outcome.runs[1].verdict,
+        Verdict::NotComparable("the run did not end cleanly".to_owned()),
+        "{text}"
+    );
+    assert_eq!(outcome.runs[2].verdict, Verdict::Equivalent, "{text}");
+
+    // An empty chain run between W1 and R2: a clean run that captured
+    // nothing. Its part is empty, and the warm runs after it cross it.
+    let mut empty = lines.clone();
+    let mut start = one(&lines, &w1, "run_start").clone();
+    let (empty_id, at) = ("20261006T013000Z", t1 + 30 * 60_000);
+    start["run_id"] = json!(empty_id);
+    start["at_ms"] = json!(at);
+    let end = json!({
+        "type": "run_end", "run_id": empty_id, "at_ms": at + 60_000, "exit_code": 0,
+        "error": null, "events": 0, "domain_rejections": 0, "records": 0,
+    });
+    let after_w1 = end_of(&w1) + 1;
+    empty.splice(after_w1..after_w1, [start, end]);
+    let copy = TempDir::new("equivalence-warm-empty");
+    let (outcome, text) = check(&with_journal(&config, copy.path(), &empty), t1, t3 + 1);
+    assert_eq!(outcome.runs.len(), 4, "{text}");
+    assert_eq!(outcome.runs[1].run_id, empty_id);
+    assert_eq!(
+        outcome.runs[1].verdict,
+        Verdict::NotComparable(NOTHING_COMPARED.to_owned()),
+        "{text}"
+    );
+    for i in [0, 2, 3] {
+        assert_eq!(outcome.runs[i].verdict, Verdict::Equivalent, "{text}");
+    }
+}
+
+#[test]
+fn a_warm_run_under_another_history_or_feature_set_is_not_compared_in_full() {
+    let dir = TempDir::new("equivalence-warm-other");
+    let (config, runs, [t1, t2]) = two_warm_runs(dir.path());
+    let journaled = format!(
+        "the run warm-started from the history chain with origin {ORIGIN} ms and cutover \
+         {CUTOVER} ms"
+    );
+
+    // Without [history].
+    let mut none = config.clone();
+    none.history = None;
+    let (outcome, text) = check(&none, t1, t2 + 1);
+    for run in &outcome.runs {
+        assert_eq!(
+            run.verdict,
+            Verdict::NotComparable(format!("{journaled}, the configuration has no [history]")),
+            "{text}"
+        );
+    }
+    assert!(!text.contains("one pass"), "{text}");
+    assert_eq!(outcome.exit_code(), 1);
+
+    // Under another cutover.
+    let mut other = config.clone();
+    other.history.as_mut().unwrap().cutover = "2026-10-05".to_owned();
+    let (outcome, text) = check(&other, t1, t2 + 1);
+    for run in &outcome.runs {
+        assert_eq!(
+            run.verdict,
+            Verdict::NotComparable(format!(
+                "{journaled}, the configured [history] has origin {ORIGIN} ms and cutover {} ms",
+                CUTOVER - DAY_MS
+            )),
+            "{text}"
+        );
+    }
+    assert_eq!(outcome.exit_code(), 1);
+
+    // Recorded with another feature set: the events only, the prefix's
+    // too.
+    let mut lines = journal(&config);
+    for line in &mut lines {
+        if line["type"] == "run_start" {
+            line["feature_set"] = json!("00000000000000ff");
+        }
+    }
+    let copy = TempDir::new("equivalence-warm-feature-set");
+    let (outcome, text) = check(&with_journal(&config, copy.path(), &lines), t1, t2 + 1);
+    assert_eq!(outcome.runs.len(), runs.len(), "{text}");
+    for run in &outcome.runs {
+        assert!(matches!(run.verdict, Verdict::EventsOnly { .. }), "{text}");
+    }
+    assert!(
+        text.contains("EVENTS EQUIVALENT, STATE NOT COMPARABLE (feature set 00000000000000ff ≠ "),
+        "{text}"
+    );
+    assert_eq!(outcome.exit_code(), 1);
 }
 
 // ---------------------------------------------------------------------------
