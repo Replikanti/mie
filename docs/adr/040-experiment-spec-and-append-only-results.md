@@ -1,6 +1,6 @@
 # ADR-040: Experiment specification, identity and append-only results
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-10-09
 
 ## Context
@@ -231,3 +231,18 @@ events) would still print `reproduced`. The price is two replays of about
 dataset version is not compared with ADR-039's `fa73cb88…`: the archive
 gained metrics days after 2026-09-30 since that run (#69), which can change
 the version of a day-widened selection without changing a delivered event.
+
+## Acceptance
+
+Accepted 2026-10-14 after the acceptance run of #76 (binary from main
+`be6b986`). `mie replay --source archive --trade-correction none` over
+2025-10-01 … 2026-09-30 printed dataset `fa73cb88…`, the spec's `data`,
+and `event-stream 604001515:20929b98dfd17a44`. The first `mie experiment
+run` printed `recorded f661bde8283658df/research.replay_summary@1` (26.1
+min, peak RSS 361 MB); the stored result carries `stream
+604001515:20929b98dfd17a44` and `rejections 0`, the ADR-039 values. The
+second printed `reproduced` with the same key (24.9 min), and the result
+file's SHA-256 was the same before and after it. The dataset version
+equals ADR-039's, so the metrics days added by #69 did not change this
+selection. Full results:
+https://github.com/Replikanti/mie/issues/76#issuecomment-6178351324
