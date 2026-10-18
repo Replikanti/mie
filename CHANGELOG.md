@@ -12,6 +12,25 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
 
 ### Added
 
+- **Bias context and the auction and SFP trigger rules (ADR-053, part
+  of #24).** `bias.context@1` records the 1h volatility regime and, per
+  structure timeframe and side, the step of the last swing pair
+  (`higher`, `equal`, `lower`): explicitly non-authorizing, with no
+  aggregate or direction, and read by no trigger rule
+  (`Bias::read(&MarketState)` is public). `trigger.failed_auction@1`,
+  `trigger.failed_reclaim@1` and `trigger.breakout_acceptance@1` fire on
+  the auction facts of `location.auction.prior_day@1`, read from each
+  fact's own status and anchored at the crossed or accepted value edge;
+  `trigger.sfp.<15m|1h|4h|1d>@1` fires on each SFP, anchored at the swept
+  level, its location context without the swept swing's own levels. A new
+  last stage of the engine emits them through
+  `MarketStateEngine::trigger_events`, each with the rule's feature key,
+  its family, the evidence fact, a location context and a bias snapshot;
+  the bias and the last trigger of each id are appended last to
+  `MarketState` as `triggers`. Every state hash and the feature-set
+  version change; the pre-#24 hashes are pinned. ADR-053 is `proposed`
+  and also fixes the candidate (M2) and OI-expansion (M3) rules that
+  follow.
 - **`mie equivalence` compares warm-started runs on the history chain
   (ADR-052 D9, #118).** A run whose `warm_start` is warm is checked against
   one pass over the chain of the configuration's `[history]`: the parts

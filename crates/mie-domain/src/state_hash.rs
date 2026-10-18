@@ -7,7 +7,7 @@
 //! [`Fingerprint`] over an explicit byte encoding of every public field of
 //! [`MarketState`], written with the [`Fingerprinter`] writers (ADR-029). The
 //! engine's internal trackers (ATR window, flow, profile, structure,
-//! derivatives, liquidity, location and candidate trackers) are not hashed: the public state is
+//! derivatives, liquidity, location, candidate and trigger trackers) are not hashed: the public state is
 //! the contract, and a hidden divergence shows up in it at a later
 //! checkpoint. The order book is public state (`book.l2@1`, ADR-043), so
 //! every level of it is hashed.
@@ -17,8 +17,8 @@
 //! [`MarketState`] in declaration order: `feature_set`, `as_of`,
 //! `last_trade_price`, `bars`, `motion`, `atr`, `regime`, `flow`, `profile`,
 //! `structure`, `derivatives`, `book`, `location`, `trade_count`,
-//! `candidates` (appended last by ADR-051 D1). Every value is written by
-//! these rules:
+//! `candidates` (appended by ADR-051 D1), `triggers` (appended last by
+//! ADR-053 D1). Every value is written by these rules:
 //!
 //! | Type | Encoding |
 //! |---|---|
@@ -31,7 +31,7 @@
 //! | arrays, `Vec`, slices | `write_len`, then the elements in stored order |
 //! | `FeatureKey` | the ADR-029 encoding: `write_str` of the id, `write_u32` of the version |
 //! | `FeatureSetVersion` | `write_u64` of the fingerprint value |
-//! | enums | an explicit match, never a cast, with codes in declaration order: `Timeframe` M1 0, M5 1, M15 2, H1 3, H4 4, D1 5; `RegimeLabel` Low 0, Medium 1, High 2, Extreme 3; `Side` High 0, Low 1; `SweepOutcome` Pending 0, Sfp 1, Break 2; `book::Side` Bid 0, Ask 1; `Aggressor` Buy 0, Sell 1; `LevelKind` Poc 0, Vah 1, Val 2, Hvn 3, Lvn 4, StructuralHigh 5, StructuralLow 6, LiquidityCluster 7, PriorSweep 8, SfpRejectionZone 9, Vwap 10, ValidatedReference 11; `AuctionState` InsideValue 0, AtValueEdge 1, OutsideValue 2, Breakout 3, FailedBreakout 4, FailedReclaim 5, Acceptance 6; `LevelSide` High 0, Low 1, Bid 2, Ask 3; `Region` Below 0, In 1, Above 2; `Position` Below 0, LowEdge 1, In 2, HighEdge 3, Above 4; `Origin` Start 0, Acceptance 1 |
+//! | enums | an explicit match, never a cast, with codes in declaration order: `Timeframe` M1 0, M5 1, M15 2, H1 3, H4 4, D1 5; `RegimeLabel` Low 0, Medium 1, High 2, Extreme 3; `Side` High 0, Low 1; `SweepOutcome` Pending 0, Sfp 1, Break 2; `book::Side` Bid 0, Ask 1; `Aggressor` Buy 0, Sell 1; `LevelKind` Poc 0, Vah 1, Val 2, Hvn 3, Lvn 4, StructuralHigh 5, StructuralLow 6, LiquidityCluster 7, PriorSweep 8, SfpRejectionZone 9, Vwap 10, ValidatedReference 11; `AuctionState` InsideValue 0, AtValueEdge 1, OutsideValue 2, Breakout 3, FailedBreakout 4, FailedReclaim 5, Acceptance 6; `LevelSide` High 0, Low 1, Bid 2, Ask 3; `Region` Below 0, In 1, Above 2; `Position` Below 0, LowEdge 1, In 2, HighEdge 3, Above 4; `Origin` Start 0, Acceptance 1; `SwingStep` Higher 0, Equal 1, Lower 2; `TriggerFamily` FailedAuction 0, Sfp 1, Absorption 2, Exhaustion 3, EffortVsResult 4, CvdDivergence 5, OiExpansionRejection 6, FailedReclaim 7, BreakoutAcceptance 8 |
 //! | `OrderBook` | the chain (`write_u8`: `Straddle` 0, `Chained` 1, `Invalid` 2, then the id as `u64` unless invalid), the trusted window (two `Option<Price>`), then the bids and the asks, each best first as `write_len` followed by price and quantity per level |
 //! | `Level` (in the book features) | price, then quantity |
 //! | structs | every field, through exhaustive destructuring, in declaration order as of encoding v1 |
@@ -108,6 +108,7 @@ impl MarketState {
             location,
             trade_count,
             candidates,
+            triggers,
         } = self;
         feature_set.encode(&mut f);
         as_of.encode(&mut f);
@@ -124,6 +125,7 @@ impl MarketState {
         location.encode(&mut f);
         trade_count.encode(&mut f);
         candidates.encode(&mut f);
+        triggers.encode(&mut f);
         StateHash(f.finish())
     }
 }
@@ -246,11 +248,11 @@ mod tests {
         // change), and otherwise only with an encoding bump (module docs).
         assert_eq!(
             MarketStateEngine::new().state().state_hash().to_string(),
-            "cb45d06de49e3e6d"
+            "eb34096e448e1a60"
         );
         assert_eq!(
             engine_after(&tape()).state().state_hash().to_string(),
-            "4df7c63b5cecaeb7"
+            "a7173b1696ab434a"
         );
     }
 
@@ -276,6 +278,7 @@ mod tests {
             location,
             trade_count,
             candidates: _,
+            triggers: _,
         } = state;
         let VolumeProfiles {
             utc_day,
@@ -305,14 +308,15 @@ mod tests {
     #[test]
     fn appending_composite_7d_leaves_the_pre_96_hashes_intact() {
         // The default set before #96: `location.levels@1` and no
-        // `profile.volume.composite_7d@1` (nor the candidates of #22). It
+        // `profile.volume.composite_7d@1` (nor the candidates of #22 or the
+        // bias and triggers of #24). It
         // still builds, to the version the pre-#96 pins recorded.
         let keys: Vec<FeatureKey> = catalog::current_set_with(&[catalog::LOCATION_LEVELS_V1.key])
             .unwrap()
             .definitions()
             .map(|definition| definition.key)
             .filter(|key| *key != catalog::PROFILE_VOLUME_COMPOSITE_7D_V1.key)
-            .filter(|key| !is_candidate(*key))
+            .filter(|key| !is_candidate(*key) && !is_bias_or_trigger(*key))
             .collect();
         let pre_96 = FeatureSet::new(&catalog::registry(), &keys).unwrap();
         assert_eq!(pre_96.version().to_string(), "be668af626d0ce5a");
@@ -341,6 +345,12 @@ mod tests {
         key.id.as_str().starts_with("candidate.")
     }
 
+    /// Whether `key` is the bias or a trigger (#24, ADR-053).
+    fn is_bias_or_trigger(key: FeatureKey) -> bool {
+        let id = key.id.as_str();
+        id.starts_with("bias.") || id.starts_with("trigger.")
+    }
+
     /// The hash `state` has without `candidates`: every other field written
     /// exactly as [`MarketState::state_hash`] writes it. This is encoding v1
     /// as it stood before #22 appended the field.
@@ -362,6 +372,7 @@ mod tests {
             location,
             trade_count,
             candidates: _,
+            triggers: _,
         } = state;
         feature_set.encode(&mut f);
         as_of.encode(&mut f);
@@ -383,13 +394,14 @@ mod tests {
     #[test]
     fn appending_candidates_leaves_the_pre_22_hashes_intact() {
         // ADR-041 D2, ADR-051 D1: the set before #22 is CURRENT without the
-        // candidate keys. It still builds, to the version pinned before #22.
+        // candidate keys (nor the bias and triggers of #24, built on them).
+        // It still builds, to the version pinned before #22.
         let keys: Vec<FeatureKey> = catalog::CURRENT
             .iter()
             .copied()
-            .filter(|key| !is_candidate(*key))
+            .filter(|key| !is_candidate(*key) && !is_bias_or_trigger(*key))
             .collect();
-        assert_eq!(keys.len() + 15, catalog::CURRENT.len());
+        assert_eq!(keys.len() + 15 + 8, catalog::CURRENT.len());
         let pre_22 = FeatureSet::new(&catalog::registry(), &keys).unwrap();
         assert_eq!(pre_22.version().to_string(), "685b83d7bf13b54c");
         // The engine reaches the pre-#22 state on every other field: under
@@ -404,6 +416,75 @@ mod tests {
             assert_eq!(hash_without_candidates(&state).to_string(), golden);
             // The appended field is written: the full hash differs.
             assert_ne!(state.state_hash(), hash_without_candidates(&state));
+        }
+    }
+
+    /// The hash `state` has without `triggers`: every other field written
+    /// exactly as [`MarketState::state_hash`] writes it. This is encoding v1
+    /// as it stood before #24 appended the field.
+    fn hash_without_triggers(state: &MarketState) -> StateHash {
+        let mut f = header();
+        let MarketState {
+            feature_set,
+            as_of,
+            last_trade_price,
+            bars,
+            motion,
+            atr,
+            regime,
+            flow,
+            profile,
+            structure,
+            derivatives,
+            book,
+            location,
+            trade_count,
+            candidates,
+            triggers: _,
+        } = state;
+        feature_set.encode(&mut f);
+        as_of.encode(&mut f);
+        last_trade_price.encode(&mut f);
+        bars.encode(&mut f);
+        motion.encode(&mut f);
+        atr.encode(&mut f);
+        regime.encode(&mut f);
+        flow.encode(&mut f);
+        profile.encode(&mut f);
+        structure.encode(&mut f);
+        derivatives.encode(&mut f);
+        book.encode(&mut f);
+        location.encode(&mut f);
+        trade_count.encode(&mut f);
+        candidates.encode(&mut f);
+        StateHash(f.finish())
+    }
+
+    #[test]
+    fn appending_triggers_leaves_the_pre_24_hashes_intact() {
+        // ADR-041 D2, ADR-053 D1: the set before #24 is CURRENT without the
+        // bias and trigger keys. It still builds, to the version pinned
+        // before #24.
+        let keys: Vec<FeatureKey> = catalog::CURRENT
+            .iter()
+            .copied()
+            .filter(|key| !is_bias_or_trigger(*key))
+            .collect();
+        assert_eq!(keys.len() + 8, catalog::CURRENT.len());
+        let pre_24 = FeatureSet::new(&catalog::registry(), &keys).unwrap();
+        assert_eq!(pre_24.version().to_string(), "8e6f1b978d12a884");
+        // The engine reaches the pre-#24 state on every other field: under
+        // the pre-#24 stamp and without the appended field, it gives the
+        // two encoding-v1 goldens pinned before #24.
+        for (events, golden) in [
+            (Vec::new(), "cb45d06de49e3e6d"),
+            (tape(), "4df7c63b5cecaeb7"),
+        ] {
+            let mut state = engine_after(&events).state().clone();
+            state.feature_set = pre_24.version();
+            assert_eq!(hash_without_triggers(&state).to_string(), golden);
+            // The appended field is written: the full hash differs.
+            assert_ne!(state.state_hash(), hash_without_triggers(&state));
         }
     }
 
@@ -667,6 +748,10 @@ mod tests {
             ));
         }
         edits.extend(flow_candidate_edits());
+        // The tape closes no 1h bar, confirms no swing and closes no day:
+        // the bias and every trigger value are as they start.
+        assert_eq!(base.triggers, crate::trigger::Triggers::new());
+        edits.extend(trigger_edits());
         let mut seen = vec![("base", reference)];
         for (name, edit) in &edits {
             let mut state = base.clone();
@@ -1189,6 +1274,226 @@ mod tests {
             }),
         ));
         edits
+    }
+
+    /// One bias or trigger value per edit (ADR-053 D1, D3), each differing
+    /// from the others in one respect only: the component, the timeframe or
+    /// family, readiness, or one field of the value.
+    fn trigger_edits() -> Vec<(&'static str, Edit<'static>)> {
+        use crate::bars::{Coverage, Timeframe};
+        use crate::location::{AuctionState, AuctionStatus, Origin, Position, Region};
+        use crate::structure::{Level, Side, Sweep, SweepOutcome};
+        use crate::trigger::{StepAt, SwingSequence, SwingStep, Trigger, TriggerValue};
+        let time = EventTime::from_millis;
+        let step = |step: SwingStep, at: i64| StepAt {
+            step,
+            swing_time: time(at),
+        };
+        let sequence = |high: Option<StepAt>, low: Option<StepAt>| {
+            FeatureValue::Ready(SwingSequence { high, low })
+        };
+        let swings = |timeframe: Timeframe, value: FeatureValue<SwingSequence>| -> Edit<'static> {
+            Box::new(move |s: &mut MarketState| {
+                *s.triggers.bias_mut().swings_mut(timeframe).unwrap() = value;
+            })
+        };
+        let status = AuctionStatus {
+            feature: catalog::LOCATION_AUCTION_PRIOR_DAY_V1.key,
+            reference_start: time(0),
+            val: Price::from_units(100),
+            vah: Price::from_units(200),
+            state: AuctionState::FailedBreakout,
+            side: Some(Region::Above),
+            accepted: Region::In,
+            origin: Origin::Start,
+            position: Position::In,
+            probe: None,
+            failure: None,
+            last_close: Price::from_units(150),
+            bar_end: time(60_000),
+            known_at: time(60_001),
+            coverage: Coverage::default(),
+        };
+        let auction = |position: usize, last: Option<Trigger<AuctionStatus>>| -> Edit<'static> {
+            let feature = [
+                catalog::TRIGGER_FAILED_AUCTION_V1.key,
+                catalog::TRIGGER_FAILED_RECLAIM_V1.key,
+                catalog::TRIGGER_BREAKOUT_ACCEPTANCE_V1.key,
+            ][position];
+            Box::new(move |s: &mut MarketState| {
+                s.triggers.auction_mut()[position] =
+                    FeatureValue::Ready(TriggerValue { feature, last });
+            })
+        };
+        let fired = |known_at: i64, anchor: i64, status: AuctionStatus| {
+            Some(Trigger {
+                known_at: time(known_at),
+                anchor: Price::from_units(anchor),
+                evidence: status,
+            })
+        };
+        let sweep = Sweep {
+            feature: catalog::STRUCTURE_LEVELS_15M_V1.key,
+            timeframe: Timeframe::M15,
+            level: Level {
+                side: Side::High,
+                price: Price::from_units(200),
+                swing_time: time(0),
+                confirmed_bar_end: time(3_600_000),
+                known_at: time(3_600_001),
+                touches: 0,
+                coverage: Coverage::default(),
+            },
+            time: time(3_700_000),
+            price: Price::from_units(201),
+            extreme: Price::from_units(201),
+            window_bars: 1,
+            outcome: SweepOutcome::Sfp,
+            resolved_bar_end: Some(time(4_500_000)),
+            known_at: time(4_500_001),
+            coverage: Coverage::default(),
+        };
+        let sfp = |position: usize, last: Option<Trigger<Sweep>>| -> Edit<'static> {
+            let feature = catalog::TRIGGER_SFP[position].1.key;
+            Box::new(move |s: &mut MarketState| {
+                s.triggers.sfp_mut()[position] =
+                    FeatureValue::Ready(TriggerValue { feature, last });
+            })
+        };
+        let resolved = Some(Trigger {
+            known_at: time(4_500_001),
+            anchor: Price::from_units(200),
+            evidence: sweep,
+        });
+        let percentile = AtrPercentile::new(50.0).unwrap();
+        let regime = Regime {
+            atr_percentile: percentile,
+            label: percentile.label(),
+            feature: catalog::VOLATILITY_REGIME_1H_V1.key,
+        };
+        vec![
+            (
+                "triggers bias regime",
+                Box::new(move |s: &mut MarketState| {
+                    s.triggers.bias_mut().regime = FeatureValue::Ready(regime);
+                }),
+            ),
+            (
+                "triggers bias regime count",
+                Box::new(|s: &mut MarketState| {
+                    s.triggers.bias_mut().regime = FeatureValue::WarmingUp {
+                        observed: 1,
+                        required: 214,
+                    };
+                }),
+            ),
+            (
+                "triggers bias feature",
+                Box::new(|s: &mut MarketState| {
+                    s.triggers.bias_mut().feature = FeatureKey::new("bias.context", 2);
+                }),
+            ),
+            (
+                "triggers bias swings 15m",
+                swings(Timeframe::M15, sequence(None, None)),
+            ),
+            (
+                "triggers bias swings 1d",
+                swings(Timeframe::D1, sequence(None, None)),
+            ),
+            (
+                "triggers bias swings unavailable",
+                swings(
+                    Timeframe::M15,
+                    FeatureValue::Unavailable {
+                        reason: Unavailability::OutOfRange,
+                    },
+                ),
+            ),
+            (
+                "triggers bias high step",
+                swings(
+                    Timeframe::M15,
+                    sequence(Some(step(SwingStep::Higher, 0)), None),
+                ),
+            ),
+            (
+                "triggers bias low step",
+                swings(
+                    Timeframe::M15,
+                    sequence(None, Some(step(SwingStep::Higher, 0))),
+                ),
+            ),
+            (
+                "triggers bias step kind",
+                swings(
+                    Timeframe::M15,
+                    sequence(Some(step(SwingStep::Equal, 0)), None),
+                ),
+            ),
+            (
+                "triggers bias step time",
+                swings(
+                    Timeframe::M15,
+                    sequence(Some(step(SwingStep::Higher, 1)), None),
+                ),
+            ),
+            ("triggers failed auction ready", auction(0, None)),
+            ("triggers failed reclaim ready", auction(1, None)),
+            ("triggers breakout acceptance ready", auction(2, None)),
+            (
+                "triggers auction last",
+                auction(0, fired(60_001, 200, status)),
+            ),
+            (
+                "triggers auction known at",
+                auction(0, fired(60_002, 200, status)),
+            ),
+            (
+                "triggers auction anchor",
+                auction(0, fired(60_001, 100, status)),
+            ),
+            (
+                "triggers auction evidence",
+                auction(
+                    0,
+                    fired(
+                        60_001,
+                        200,
+                        AuctionStatus {
+                            failure: None,
+                            last_close: Price::from_units(151),
+                            ..status
+                        },
+                    ),
+                ),
+            ),
+            (
+                "triggers auction warming",
+                Box::new(|s: &mut MarketState| {
+                    s.triggers.auction_mut()[0] = FeatureValue::Unavailable {
+                        reason: Unavailability::InputInvalid,
+                    };
+                }),
+            ),
+            ("triggers sfp 15m ready", sfp(0, None)),
+            ("triggers sfp 1d ready", sfp(3, None)),
+            ("triggers sfp last", sfp(0, resolved)),
+            (
+                "triggers sfp evidence",
+                sfp(
+                    0,
+                    Some(Trigger {
+                        known_at: time(4_500_001),
+                        anchor: Price::from_units(200),
+                        evidence: Sweep {
+                            extreme: Price::from_units(202),
+                            ..sweep
+                        },
+                    }),
+                ),
+            ),
+        ]
     }
 
     /// Five valid books, each differing from the first in one respect only:

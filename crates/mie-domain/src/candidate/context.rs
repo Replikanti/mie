@@ -3,9 +3,10 @@
 //! state, read from the committed state of the event that emits it.
 //!
 //! The context is recorded, never a filter and never a feature input:
-//! location gating is a trigger-rule condition owned by the bias/trigger
-//! issue (ADR-012), and keeping location out of every candidate definition
-//! keeps `location.levels@1` selectable (ADR-044 D10).
+//! location gating is a trigger-rule condition (ADR-012, ADR-053 D4), and
+//! keeping location out of every candidate definition keeps
+//! `location.levels@1` selectable (ADR-044 D10). The trigger events of
+//! ADR-053 carry the same context, read by the same code.
 
 use crate::feature::{FeatureKey, FeatureValue};
 use crate::location::{

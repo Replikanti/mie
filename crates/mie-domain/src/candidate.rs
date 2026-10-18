@@ -5,11 +5,11 @@
 //! exist: a hypothesis for Conditional Behavior and research, never a
 //! signal (ADR-012, ADR-013). Candidates carry no bias, direction, location
 //! gate or execution meaning; the trigger rule of each
-//! [`TriggerFamily`](crate::trigger::TriggerFamily) that builds on one is
-//! owned by the bias/trigger issue. The only sided fields are facts: which
-//! extreme ([`Side`](crate::structure::Side)), which taker side carried the
-//! net aggression ([`Aggressor`](crate::event::Aggressor), ADR-023) and
-//! which passive side.
+//! [`TriggerFamily`](crate::trigger::TriggerFamily) that builds on one, with
+//! its location gate, is ADR-053's (D4, D6). The only sided fields are
+//! facts: which extreme ([`Side`](crate::structure::Side)), which taker side
+//! carried the net aggression ([`Aggressor`](crate::event::Aggressor),
+//! ADR-023) and which passive side.
 //!
 //! - `candidate.divergence.cvd.<tf>@1` and `candidate.divergence.oi.<tf>@1`
 //!   ([`divergence`], decision 4): CVD and open-interest divergences on
@@ -34,6 +34,7 @@ pub mod effort;
 
 mod context;
 
+pub(crate) use context::Exclude;
 pub use context::{ContextLevel, ContextLevels, LocationContext};
 
 use crate::bars::{Bar, Timeframe};
@@ -497,7 +498,7 @@ impl CandidateTracker {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::bars::tests::Lcg;
     use crate::event::samples::t;
@@ -515,8 +516,9 @@ mod tests {
     /// 45. A random walk in cents with drifting trends and trades 20 s to
     /// 160 s apart, as the structure golden tape; open interest on every
     /// 5-minute boundary, a random walk of its own; a trades gap on day 9
-    /// and no open interest for two hours of day 20.
-    fn golden_tape() -> Vec<MarketEvent> {
+    /// and no open interest for two hours of day 20. Also the trigger
+    /// golden tape (ADR-053).
+    pub(crate) fn golden_tape() -> Vec<MarketEvent> {
         let mut lcg = Lcg(0x6d69_6500_0000_0022);
         let mut events = Vec::new();
         let mut time = 13 * 3_600_000;
