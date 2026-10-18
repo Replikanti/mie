@@ -12,6 +12,25 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
 
 ### Added
 
+- **Candidate trigger rules (ADR-053 D4/D6, part of #24).**
+  `trigger.cvd_divergence.<15m|1h|4h|1d>@1`,
+  `trigger.effort_result.<5m|15m|1h>@1`, `trigger.exhaustion@1` and
+  `trigger.absorption.<5m|15m|1h>@1` (live only) fire on the order-flow
+  candidates of ADR-051 at a defined location: the context the rule reads
+  must be ready and list a level of an admitted kind (every kind but
+  liquidity clusters, prior sweeps and validated references, named in the
+  `gate_kinds` parameter). A CVD divergence's gate reads the registry at
+  its current swing without every level of either swing of its pair, on
+  any structure timeframe, and its trigger carries that context; the other
+  families gate on the candidate's own context. Each trigger carries the
+  full candidate event as evidence; each value holds the last trigger with
+  the candidate's hashed value and follows its candidate's validity.
+  `TriggerEvidence` gains `Candidate` and is no longer `Copy`. ADR-053 is
+  amended (D4, D6, D8) and stays `proposed`. Every state hash and the
+  feature-set version change again; the pre-#22, pre-#24 and pre-#96 pins
+  hold. The ignored `location_measure` rule-I check now compares only the
+  bias and the auction and SFP trigger values, since the candidate trigger
+  values depend on the selected registry by design.
 - **Bias context and the auction and SFP trigger rules (ADR-053, part
   of #24).** `bias.context@1` records the 1h volatility regime and, per
   structure timeframe and side, the step of the last swing pair

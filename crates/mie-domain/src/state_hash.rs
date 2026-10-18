@@ -248,11 +248,11 @@ mod tests {
         // change), and otherwise only with an encoding bump (module docs).
         assert_eq!(
             MarketStateEngine::new().state().state_hash().to_string(),
-            "eb34096e448e1a60"
+            "f2fcd23ae8ce4663"
         );
         assert_eq!(
             engine_after(&tape()).state().state_hash().to_string(),
-            "a7173b1696ab434a"
+            "402d9ecf5191f8bb"
         );
     }
 
@@ -401,7 +401,7 @@ mod tests {
             .copied()
             .filter(|key| !is_candidate(*key) && !is_bias_or_trigger(*key))
             .collect();
-        assert_eq!(keys.len() + 15 + 8, catalog::CURRENT.len());
+        assert_eq!(keys.len() + 15 + 19, catalog::CURRENT.len());
         let pre_22 = FeatureSet::new(&catalog::registry(), &keys).unwrap();
         assert_eq!(pre_22.version().to_string(), "685b83d7bf13b54c");
         // The engine reaches the pre-#22 state on every other field: under
@@ -470,7 +470,7 @@ mod tests {
             .copied()
             .filter(|key| !is_bias_or_trigger(*key))
             .collect();
-        assert_eq!(keys.len() + 8, catalog::CURRENT.len());
+        assert_eq!(keys.len() + 19, catalog::CURRENT.len());
         let pre_24 = FeatureSet::new(&catalog::registry(), &keys).unwrap();
         assert_eq!(pre_24.version().to_string(), "8e6f1b978d12a884");
         // The engine reaches the pre-#24 state on every other field: under
@@ -752,6 +752,7 @@ mod tests {
         // the bias and every trigger value are as they start.
         assert_eq!(base.triggers, crate::trigger::Triggers::new());
         edits.extend(trigger_edits());
+        edits.extend(candidate_trigger_edits());
         let mut seen = vec![("base", reference)];
         for (name, edit) in &edits {
             let mut state = base.clone();
@@ -1490,6 +1491,174 @@ mod tests {
                             extreme: Price::from_units(202),
                             ..sweep
                         },
+                    }),
+                ),
+            ),
+        ]
+    }
+
+    /// One candidate trigger value per edit (ADR-053 D6), each differing
+    /// from the others in one respect only: the family, the timeframe or
+    /// window, readiness, or one field of the last trigger's evidence.
+    fn candidate_trigger_edits() -> Vec<(&'static str, Edit<'static>)> {
+        use crate::bars::{Coverage, Timeframe};
+        use crate::candidate::absorption::Absorption;
+        use crate::candidate::effort::{EffortResult, Exhaustion};
+        use crate::event::Aggressor;
+        use crate::num::Rate;
+        use crate::structure::Side as SwingSide;
+        use crate::trigger::{Trigger, TriggerValue};
+        let time = EventTime::from_millis;
+        fn fired<E>(evidence: E) -> Option<Trigger<E>> {
+            Some(Trigger {
+                known_at: EventTime::from_millis(1_000),
+                anchor: Price::from_units(100),
+                evidence,
+            })
+        }
+        let anchor = |price: i64| SwingAnchor {
+            swing_time: time(0),
+            known_at: time(1),
+            price: Price::from_units(price),
+            time: time(2),
+            cvd: Qty::from_units(3),
+            gaps: 0,
+            coverage: Coverage::default(),
+        };
+        let comparison = CvdComparison {
+            pair: SwingPair {
+                side: SwingSide::High,
+                previous: anchor(1),
+                current: anchor(2),
+                price_change: Price::from_units(1),
+                cvd_change: Qty::from_units(-1),
+                gaps_between: 0,
+                span_ms: 2,
+                coverage: Coverage::default(),
+            },
+            divergent: true,
+        };
+        let cvd = |position: usize, last: Option<Trigger<CvdComparison>>| -> Edit<'static> {
+            let feature = catalog::TRIGGER_CVD_DIVERGENCE[position].1.key;
+            Box::new(move |s: &mut MarketState| {
+                s.triggers.cvd_divergence_mut()[position] =
+                    FeatureValue::Ready(TriggerValue { feature, last });
+            })
+        };
+        let result = EffortResult {
+            feature: catalog::CANDIDATE_EFFORT_RESULT_5M_V1.key,
+            timeframe: Timeframe::M5,
+            end: time(300_000),
+            aggressor: Aggressor::Buy,
+            effort: Qty::from_units(10),
+            progress: Price::from_units(1),
+            effort_high: Qty::from_units(8),
+            effort_median: Qty::from_units(4),
+            move_high: Price::from_units(6),
+            move_median: Price::from_units(2),
+            coverage: Coverage::default(),
+            active: true,
+        };
+        let effort = |position: usize, last: Option<Trigger<EffortResult>>| -> Edit<'static> {
+            let feature = catalog::TRIGGER_EFFORT_RESULT[position].1.key;
+            Box::new(move |s: &mut MarketState| {
+                s.triggers.effort_result_mut()[position] =
+                    FeatureValue::Ready(TriggerValue { feature, last });
+            })
+        };
+        let exhaustion = Exhaustion {
+            feature: catalog::CANDIDATE_EXHAUSTION_V1.key,
+            end: time(300_000),
+            expansion: result,
+            decay: result,
+            decay_aggression: Qty::from_units(3),
+            extreme: Price::from_units(100),
+            close: Price::from_units(99),
+            expanded: true,
+            decayed: true,
+            at_extreme: true,
+            active: true,
+        };
+        let exhausted = |last: Option<Trigger<Exhaustion>>| -> Edit<'static> {
+            Box::new(move |s: &mut MarketState| {
+                *s.triggers.exhaustion_mut() = FeatureValue::Ready(TriggerValue {
+                    feature: catalog::TRIGGER_EXHAUSTION_V1.key,
+                    last,
+                });
+            })
+        };
+        let absorption = Absorption {
+            feature: catalog::CANDIDATE_ABSORPTION_5M_V1.key,
+            effort: result,
+            passive: Side::Ask,
+            band: Rate::from_units(50_000),
+            added: Qty::from_units(5),
+            filled: Qty::from_units(4),
+            book_coverage: Coverage::default(),
+            replenished: true,
+            active: true,
+        };
+        let absorbed = |position: usize, last: Option<Trigger<Absorption>>| -> Edit<'static> {
+            let feature = catalog::TRIGGER_ABSORPTION[position].1.key;
+            Box::new(move |s: &mut MarketState| {
+                s.triggers.absorption_mut()[position] =
+                    FeatureValue::Ready(TriggerValue { feature, last });
+            })
+        };
+        vec![
+            ("triggers cvd divergence 15m ready", cvd(0, None)),
+            ("triggers cvd divergence 1d ready", cvd(3, None)),
+            ("triggers cvd divergence last", cvd(0, fired(comparison))),
+            (
+                "triggers cvd divergence evidence",
+                cvd(
+                    0,
+                    fired(CvdComparison {
+                        divergent: false,
+                        ..comparison
+                    }),
+                ),
+            ),
+            (
+                "triggers cvd divergence warming",
+                Box::new(|s: &mut MarketState| {
+                    s.triggers.cvd_divergence_mut()[0] = FeatureValue::Unavailable {
+                        reason: Unavailability::OutOfRange,
+                    };
+                }),
+            ),
+            ("triggers effort result 5m ready", effort(0, None)),
+            ("triggers effort result 1h ready", effort(2, None)),
+            ("triggers effort result last", effort(0, fired(result))),
+            (
+                "triggers effort result evidence",
+                effort(
+                    0,
+                    fired(EffortResult {
+                        effort: Qty::from_units(11),
+                        ..result
+                    }),
+                ),
+            ),
+            ("triggers exhaustion ready", exhausted(None)),
+            ("triggers exhaustion last", exhausted(fired(exhaustion))),
+            (
+                "triggers exhaustion evidence",
+                exhausted(fired(Exhaustion {
+                    close: Price::from_units(98),
+                    ..exhaustion
+                })),
+            ),
+            ("triggers absorption 5m ready", absorbed(0, None)),
+            ("triggers absorption 1h ready", absorbed(2, None)),
+            ("triggers absorption last", absorbed(0, fired(absorption))),
+            (
+                "triggers absorption evidence",
+                absorbed(
+                    0,
+                    fired(Absorption {
+                        added: Qty::from_units(6),
+                        ..absorption
                     }),
                 ),
             ),

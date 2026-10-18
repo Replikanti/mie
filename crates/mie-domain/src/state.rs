@@ -156,9 +156,13 @@ pub struct MarketState {
     /// ([`catalog::BIAS_CONTEXT_V1`]), the regime and the swing steps
     /// every trigger records and no rule reads; and the last trigger of
     /// `trigger.failed_auction@1`, `trigger.failed_reclaim@1`,
-    /// `trigger.breakout_acceptance@1` and `trigger.sfp.<tf>@1`
-    /// ([`catalog::TRIGGER_SFP`]). Each trigger value follows its fact
-    /// input's validity. Never an execution instruction (ADR-010,
+    /// `trigger.breakout_acceptance@1`, `trigger.sfp.<tf>@1`
+    /// ([`catalog::TRIGGER_SFP`]), and the location-gated candidate
+    /// triggers `trigger.cvd_divergence.<tf>@1`
+    /// ([`catalog::TRIGGER_CVD_DIVERGENCE`]),
+    /// `trigger.effort_result.<w>@1`, `trigger.exhaustion@1` and
+    /// `trigger.absorption.<w>@1` (live only). Each trigger value follows
+    /// its fact input's validity. Never an execution instruction (ADR-010,
     /// ADR-012). The last field, appended after `candidates` (ADR-053 D1).
     pub triggers: Triggers,
 }
@@ -696,6 +700,7 @@ impl MarketStateEngine {
         self.triggers.detect(
             &self.structure_events,
             &self.location_events,
+            &self.candidate_events,
             trigger::Inputs {
                 regime,
                 structure,
@@ -1234,7 +1239,12 @@ mod tests {
              structure.levels.15m@1,structure.levels.1d@1,structure.levels.1h@1,\
              structure.levels.4h@1,structure.swing.15m@1,structure.swing.1d@1,\
              structure.swing.1h@1,structure.swing.4h@1,trade.last_price@1,\
-             trigger.breakout_acceptance@1,trigger.failed_auction@1,\
+             trigger.absorption.15m@1,trigger.absorption.1h@1,\
+             trigger.absorption.5m@1,trigger.breakout_acceptance@1,\
+             trigger.cvd_divergence.15m@1,trigger.cvd_divergence.1d@1,\
+             trigger.cvd_divergence.1h@1,trigger.cvd_divergence.4h@1,\
+             trigger.effort_result.15m@1,trigger.effort_result.1h@1,\
+             trigger.effort_result.5m@1,trigger.exhaustion@1,trigger.failed_auction@1,\
              trigger.failed_reclaim@1,trigger.sfp.15m@1,trigger.sfp.1d@1,\
              trigger.sfp.1h@1,trigger.sfp.4h@1,\
              volatility.atr.1h@1,volatility.regime.1h@1"
@@ -2214,12 +2224,14 @@ mod tests {
     #[test]
     fn v1_and_v2_differ_only_in_the_registry() {
         // ADR-044 D10 and the #96 rule I: `@2` changes only the composite
-        // that feeds the registry, so with the stamp and the registry set
-        // equal the two states are equal after every event, and the
-        // auction facts are the same.
+        // that feeds the registry, so with the stamp, the registry and the
+        // candidate trigger values it gates (ADR-053 D4) set equal the two
+        // states are equal after every event, and the auction facts are
+        // the same.
         let mut v1 = levels_v1_engine();
         let mut v2 = MarketStateEngine::new();
         let mut differed = 0;
+        let mut gated = 0;
         let auction = |engine: &MarketStateEngine| -> Vec<LocationEvent> {
             engine
                 .location_events()
@@ -2238,12 +2250,27 @@ mod tests {
                 differed += 1;
             }
             aligned.location.levels = v2.state().location.levels.clone();
+            // The candidate trigger values depend on the registry by design
+            // (ADR-053 D4): the gate reads the selected registry. Every other
+            // trigger value, and the bias, must agree.
+            let triggers = &v2.state().triggers;
+            if aligned.triggers != *triggers {
+                gated += 1;
+            }
+            assert!(
+                aligned.triggers.equal_but_registry(triggers),
+                "{}",
+                event.time()
+            );
+            aligned.triggers = triggers.clone();
             assert_eq!(&aligned, v2.state(), "{}", event.time());
             assert_eq!(auction(&v1), auction(&v2), "{}", event.time());
         }
         // The registries do differ once a composite is ready.
         assert!(v2.state().profile.composite_7d.is_ready());
         assert!(differed > 1_000, "{differed}");
+        // …and so do the candidate trigger values the gate reads them for.
+        assert!(gated > 0, "{gated}");
     }
 
     #[test]

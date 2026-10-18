@@ -2296,6 +2296,331 @@ pub const TRIGGER_SFP: [(Timeframe, &FeatureDefinition); 4] = [
     (Timeframe::D1, &TRIGGER_SFP_1D_V1),
 ];
 
+/// The `gate_kinds` parameter of a candidate trigger (ADR-053 D4): the
+/// level kinds whose presence in the context lets a candidate through, by
+/// their `Display` names, in `LevelKind` declaration order. Every kind but
+/// `cluster` (live only, within 5 bps of mid), `prior_sweep` (traded
+/// through, the most numerous) and `validated_reference` (no source yet).
+const CANDIDATE_GATE_KINDS: Param = Param {
+    name: "gate_kinds",
+    value: ParamValue::Text("poc,vah,val,hvn,lvn,structural_high,structural_low,sfp_zone,vwap"),
+};
+
+/// The parameters of a CVD divergence trigger on the timeframe of
+/// `timeframe_ms` (ADR-053 D4, D6), sorted by name: the gate skips both
+/// swings of the pair.
+const fn cvd_divergence_trigger_params(timeframe_ms: i64) -> [Param; 3] {
+    [
+        CANDIDATE_GATE_KINDS,
+        Param {
+            name: "gate_skip",
+            value: ParamValue::Text("swing_pair"),
+        },
+        Param {
+            name: "timeframe_ms",
+            value: ParamValue::Int(timeframe_ms),
+        },
+    ]
+}
+
+/// The parameters of an effort-vs-result or absorption trigger on the
+/// window of `window_ms` (ADR-053 D4, D6), sorted by name: the gate reads
+/// the candidate's own context.
+const fn window_trigger_params(window_ms: i64) -> [Param; 3] {
+    [
+        CANDIDATE_GATE_KINDS,
+        Param {
+            name: "gate_skip",
+            value: ParamValue::Text("none"),
+        },
+        Param {
+            name: "window_ms",
+            value: ParamValue::Int(window_ms),
+        },
+    ]
+}
+
+/// The CVD divergence trigger parameters of the 15m timeframe.
+const CVD_DIVERGENCE_TRIGGER_PARAMS_15M: [Param; 3] = cvd_divergence_trigger_params(900_000);
+
+/// The CVD divergence trigger parameters of the 1h timeframe.
+const CVD_DIVERGENCE_TRIGGER_PARAMS_1H: [Param; 3] = cvd_divergence_trigger_params(3_600_000);
+
+/// The CVD divergence trigger parameters of the 4h timeframe.
+const CVD_DIVERGENCE_TRIGGER_PARAMS_4H: [Param; 3] = cvd_divergence_trigger_params(14_400_000);
+
+/// The CVD divergence trigger parameters of the 1d timeframe.
+const CVD_DIVERGENCE_TRIGGER_PARAMS_1D: [Param; 3] = cvd_divergence_trigger_params(86_400_000);
+
+/// The window trigger parameters of the 5-minute window.
+const WINDOW_TRIGGER_PARAMS_5M: [Param; 3] = window_trigger_params(300_000);
+
+/// The window trigger parameters of the 15-minute window.
+const WINDOW_TRIGGER_PARAMS_15M: [Param; 3] = window_trigger_params(900_000);
+
+/// The window trigger parameters of the 1-hour window.
+const WINDOW_TRIGGER_PARAMS_1H: [Param; 3] = window_trigger_params(3_600_000);
+
+/// `trigger.cvd_divergence.15m@1`: a CVD divergence on 15m swings at a
+/// defined location (ADR-053 D4, D6). A `candidate.divergence.cvd.15m@1`
+/// fact is a trigger if the registry at the current swing's price, read
+/// without every level of either swing of the pair (any
+/// `structure.levels.<tf>` source, that swing's side and price, a swing bar
+/// that nests with that swing's bar), lists a level of a `gate_kinds` kind
+/// and is ready. The anchor is the current swing's price; the event carries
+/// that context, the full candidate event as evidence (with its own
+/// ADR-051 D3 context) and the bias; the value is the last trigger, with
+/// the comparison as evidence. No number of its own: the candidate carries
+/// every threshold.
+///
+/// - Parameters: `gate_kinds` = `poc,vah,val,hvn,lvn,structural_high,
+///   structural_low,sfp_zone,vwap`, `gate_skip` = `swing_pair`,
+///   `timeframe_ms` = 900 000.
+/// - Inputs: `candidate.divergence.cvd.15m@1`, `location.auction.prior_day@1`
+///   (the context's copy) and `bias.context@1`.
+/// - Warm-up: none of its own; the value is warming up or unavailable
+///   exactly while `candidate.divergence.cvd.15m@1` is, and otherwise holds
+///   the last trigger (`None` before the first). A candidate the gate stops
+///   leaves the value as it was.
+/// - Gap policy: that of `candidate.divergence.cvd.15m@1`.
+pub const TRIGGER_CVD_DIVERGENCE_15M_V1: FeatureDefinition = trigger_v1(
+    "trigger.cvd_divergence.15m",
+    &CVD_DIVERGENCE_TRIGGER_PARAMS_15M,
+    &[
+        Input::Feature(CANDIDATE_DIVERGENCE_CVD_15M_V1.key),
+        Input::Feature(LOCATION_AUCTION_PRIOR_DAY_V1.key),
+        Input::Feature(BIAS_CONTEXT_V1.key),
+    ],
+);
+
+/// `trigger.cvd_divergence.1h@1`: a CVD divergence on 1h swings at a
+/// defined location (ADR-053 D4, D6).
+///
+/// Parameters as [`TRIGGER_CVD_DIVERGENCE_15M_V1`] with `timeframe_ms` =
+/// 3 600 000. Inputs: `candidate.divergence.cvd.1h@1`,
+/// `location.auction.prior_day@1` and `bias.context@1`. Warm-up and gap
+/// policy as [`TRIGGER_CVD_DIVERGENCE_15M_V1`], on
+/// `candidate.divergence.cvd.1h@1`.
+pub const TRIGGER_CVD_DIVERGENCE_1H_V1: FeatureDefinition = trigger_v1(
+    "trigger.cvd_divergence.1h",
+    &CVD_DIVERGENCE_TRIGGER_PARAMS_1H,
+    &[
+        Input::Feature(CANDIDATE_DIVERGENCE_CVD_1H_V1.key),
+        Input::Feature(LOCATION_AUCTION_PRIOR_DAY_V1.key),
+        Input::Feature(BIAS_CONTEXT_V1.key),
+    ],
+);
+
+/// `trigger.cvd_divergence.4h@1`: a CVD divergence on 4h swings at a
+/// defined location (ADR-053 D4, D6).
+///
+/// Parameters as [`TRIGGER_CVD_DIVERGENCE_15M_V1`] with `timeframe_ms` =
+/// 14 400 000. Inputs: `candidate.divergence.cvd.4h@1`,
+/// `location.auction.prior_day@1` and `bias.context@1`. Warm-up and gap
+/// policy as [`TRIGGER_CVD_DIVERGENCE_15M_V1`], on
+/// `candidate.divergence.cvd.4h@1`.
+pub const TRIGGER_CVD_DIVERGENCE_4H_V1: FeatureDefinition = trigger_v1(
+    "trigger.cvd_divergence.4h",
+    &CVD_DIVERGENCE_TRIGGER_PARAMS_4H,
+    &[
+        Input::Feature(CANDIDATE_DIVERGENCE_CVD_4H_V1.key),
+        Input::Feature(LOCATION_AUCTION_PRIOR_DAY_V1.key),
+        Input::Feature(BIAS_CONTEXT_V1.key),
+    ],
+);
+
+/// `trigger.cvd_divergence.1d@1`: a CVD divergence on 1d swings at a
+/// defined location (ADR-053 D4, D6).
+///
+/// Parameters as [`TRIGGER_CVD_DIVERGENCE_15M_V1`] with `timeframe_ms` =
+/// 86 400 000. Inputs: `candidate.divergence.cvd.1d@1`,
+/// `location.auction.prior_day@1` and `bias.context@1`. Warm-up and gap
+/// policy as [`TRIGGER_CVD_DIVERGENCE_15M_V1`], on
+/// `candidate.divergence.cvd.1d@1`.
+pub const TRIGGER_CVD_DIVERGENCE_1D_V1: FeatureDefinition = trigger_v1(
+    "trigger.cvd_divergence.1d",
+    &CVD_DIVERGENCE_TRIGGER_PARAMS_1D,
+    &[
+        Input::Feature(CANDIDATE_DIVERGENCE_CVD_1D_V1.key),
+        Input::Feature(LOCATION_AUCTION_PRIOR_DAY_V1.key),
+        Input::Feature(BIAS_CONTEXT_V1.key),
+    ],
+);
+
+/// The CVD divergence trigger of each structure timeframe, shortest first,
+/// in [`CANDIDATE_DIVERGENCE_CVD`] order.
+pub const TRIGGER_CVD_DIVERGENCE: [(Timeframe, &FeatureDefinition); 4] = [
+    (Timeframe::M15, &TRIGGER_CVD_DIVERGENCE_15M_V1),
+    (Timeframe::H1, &TRIGGER_CVD_DIVERGENCE_1H_V1),
+    (Timeframe::H4, &TRIGGER_CVD_DIVERGENCE_4H_V1),
+    (Timeframe::D1, &TRIGGER_CVD_DIVERGENCE_1D_V1),
+];
+
+/// `trigger.effort_result.5m@1`: effort vs result of the 5-minute window at
+/// a defined location (ADR-053 D4, D6). A `candidate.effort_result.5m@1`
+/// rising edge is a trigger if the candidate's own context lists a level
+/// of a `gate_kinds` kind and is ready. Its anchor is the last 1m close,
+/// not a swing, so no registry level is derived from the fact and the gate
+/// skips none. The event carries that context, the full candidate event as
+/// evidence and the bias; the value is the last trigger, with the
+/// evaluation as evidence.
+///
+/// - Parameters: `gate_kinds` as [`TRIGGER_CVD_DIVERGENCE_15M_V1`],
+///   `gate_skip` = `none`, `window_ms` = 300 000.
+/// - Inputs: `candidate.effort_result.5m@1`, `location.auction.prior_day@1`
+///   (the context's copy) and `bias.context@1`.
+/// - Warm-up: none of its own; the value is warming up or unavailable
+///   exactly while `candidate.effort_result.5m@1` is (1 440 earlier
+///   evaluations), and otherwise holds the last trigger (`None` before the
+///   first). A candidate the gate stops leaves the value as it was.
+/// - Gap policy: that of `candidate.effort_result.5m@1`.
+pub const TRIGGER_EFFORT_RESULT_5M_V1: FeatureDefinition = trigger_v1(
+    "trigger.effort_result.5m",
+    &WINDOW_TRIGGER_PARAMS_5M,
+    &[
+        Input::Feature(CANDIDATE_EFFORT_RESULT_5M_V1.key),
+        Input::Feature(LOCATION_AUCTION_PRIOR_DAY_V1.key),
+        Input::Feature(BIAS_CONTEXT_V1.key),
+    ],
+);
+
+/// `trigger.effort_result.15m@1`: effort vs result of the 15-minute window
+/// at a defined location (ADR-053 D4, D6).
+///
+/// Parameters as [`TRIGGER_EFFORT_RESULT_5M_V1`] with `window_ms` =
+/// 900 000. Inputs: `candidate.effort_result.15m@1`,
+/// `location.auction.prior_day@1` and `bias.context@1`. Warm-up and gap
+/// policy as [`TRIGGER_EFFORT_RESULT_5M_V1`], on
+/// `candidate.effort_result.15m@1`.
+pub const TRIGGER_EFFORT_RESULT_15M_V1: FeatureDefinition = trigger_v1(
+    "trigger.effort_result.15m",
+    &WINDOW_TRIGGER_PARAMS_15M,
+    &[
+        Input::Feature(CANDIDATE_EFFORT_RESULT_15M_V1.key),
+        Input::Feature(LOCATION_AUCTION_PRIOR_DAY_V1.key),
+        Input::Feature(BIAS_CONTEXT_V1.key),
+    ],
+);
+
+/// `trigger.effort_result.1h@1`: effort vs result of the 1-hour window at
+/// a defined location (ADR-053 D4, D6).
+///
+/// Parameters as [`TRIGGER_EFFORT_RESULT_5M_V1`] with `window_ms` =
+/// 3 600 000. Inputs: `candidate.effort_result.1h@1`,
+/// `location.auction.prior_day@1` and `bias.context@1`. Warm-up and gap
+/// policy as [`TRIGGER_EFFORT_RESULT_5M_V1`], on
+/// `candidate.effort_result.1h@1`.
+pub const TRIGGER_EFFORT_RESULT_1H_V1: FeatureDefinition = trigger_v1(
+    "trigger.effort_result.1h",
+    &WINDOW_TRIGGER_PARAMS_1H,
+    &[
+        Input::Feature(CANDIDATE_EFFORT_RESULT_1H_V1.key),
+        Input::Feature(LOCATION_AUCTION_PRIOR_DAY_V1.key),
+        Input::Feature(BIAS_CONTEXT_V1.key),
+    ],
+);
+
+/// The effort-vs-result trigger of each aggression window, shortest first,
+/// in [`CANDIDATE_EFFORT_RESULT`] order. The timeframe is the window
+/// length.
+pub const TRIGGER_EFFORT_RESULT: [(Timeframe, &FeatureDefinition); 3] = [
+    (Timeframe::M5, &TRIGGER_EFFORT_RESULT_5M_V1),
+    (Timeframe::M15, &TRIGGER_EFFORT_RESULT_15M_V1),
+    (Timeframe::H1, &TRIGGER_EFFORT_RESULT_1H_V1),
+];
+
+/// `trigger.exhaustion@1`: exhaustion at a defined location (ADR-053 D4,
+/// D6). A `candidate.exhaustion@1` rising edge is a trigger if the
+/// candidate's own context lists a level of a `gate_kinds` kind and is
+/// ready; the gate skips none, as [`TRIGGER_EFFORT_RESULT_5M_V1`]. The
+/// value is the last trigger, with the evaluation as evidence.
+///
+/// - Parameters: `gate_kinds` as [`TRIGGER_CVD_DIVERGENCE_15M_V1`],
+///   `gate_skip` = `none`.
+/// - Inputs: `candidate.exhaustion@1`, `location.auction.prior_day@1` and
+///   `bias.context@1`.
+/// - Warm-up and gap policy: those of `candidate.exhaustion@1`, as
+///   [`TRIGGER_EFFORT_RESULT_5M_V1`].
+pub const TRIGGER_EXHAUSTION_V1: FeatureDefinition = trigger_v1(
+    "trigger.exhaustion",
+    &[
+        CANDIDATE_GATE_KINDS,
+        Param {
+            name: "gate_skip",
+            value: ParamValue::Text("none"),
+        },
+    ],
+    &[
+        Input::Feature(CANDIDATE_EXHAUSTION_V1.key),
+        Input::Feature(LOCATION_AUCTION_PRIOR_DAY_V1.key),
+        Input::Feature(BIAS_CONTEXT_V1.key),
+    ],
+);
+
+/// `trigger.absorption.5m@1`: absorption over the 5-minute window at a
+/// defined location (ADR-053 D4, D6), live only as its input. A
+/// `candidate.absorption.5m@1` rising edge is a trigger if the candidate's
+/// own context lists a level of a `gate_kinds` kind and is ready; the gate
+/// skips none and never reads a cluster level, so it means the same live
+/// and in archive replays, where the value stays warming up.
+///
+/// - Parameters as [`TRIGGER_EFFORT_RESULT_5M_V1`].
+/// - Inputs: `candidate.absorption.5m@1`, `location.auction.prior_day@1`
+///   and `bias.context@1`.
+/// - Warm-up and gap policy: those of `candidate.absorption.5m@1`, as
+///   [`TRIGGER_EFFORT_RESULT_5M_V1`].
+pub const TRIGGER_ABSORPTION_5M_V1: FeatureDefinition = trigger_v1(
+    "trigger.absorption.5m",
+    &WINDOW_TRIGGER_PARAMS_5M,
+    &[
+        Input::Feature(CANDIDATE_ABSORPTION_5M_V1.key),
+        Input::Feature(LOCATION_AUCTION_PRIOR_DAY_V1.key),
+        Input::Feature(BIAS_CONTEXT_V1.key),
+    ],
+);
+
+/// `trigger.absorption.15m@1`: absorption over the 15-minute window at a
+/// defined location (ADR-053 D4, D6), live only.
+///
+/// Parameters as [`TRIGGER_EFFORT_RESULT_15M_V1`]. Inputs:
+/// `candidate.absorption.15m@1`, `location.auction.prior_day@1` and
+/// `bias.context@1`. Warm-up and gap policy as
+/// [`TRIGGER_ABSORPTION_5M_V1`], on `candidate.absorption.15m@1`.
+pub const TRIGGER_ABSORPTION_15M_V1: FeatureDefinition = trigger_v1(
+    "trigger.absorption.15m",
+    &WINDOW_TRIGGER_PARAMS_15M,
+    &[
+        Input::Feature(CANDIDATE_ABSORPTION_15M_V1.key),
+        Input::Feature(LOCATION_AUCTION_PRIOR_DAY_V1.key),
+        Input::Feature(BIAS_CONTEXT_V1.key),
+    ],
+);
+
+/// `trigger.absorption.1h@1`: absorption over the 1-hour window at a
+/// defined location (ADR-053 D4, D6), live only.
+///
+/// Parameters as [`TRIGGER_EFFORT_RESULT_1H_V1`]. Inputs:
+/// `candidate.absorption.1h@1`, `location.auction.prior_day@1` and
+/// `bias.context@1`. Warm-up and gap policy as
+/// [`TRIGGER_ABSORPTION_5M_V1`], on `candidate.absorption.1h@1`.
+pub const TRIGGER_ABSORPTION_1H_V1: FeatureDefinition = trigger_v1(
+    "trigger.absorption.1h",
+    &WINDOW_TRIGGER_PARAMS_1H,
+    &[
+        Input::Feature(CANDIDATE_ABSORPTION_1H_V1.key),
+        Input::Feature(LOCATION_AUCTION_PRIOR_DAY_V1.key),
+        Input::Feature(BIAS_CONTEXT_V1.key),
+    ],
+);
+
+/// The absorption trigger of each window, shortest first, in
+/// [`CANDIDATE_ABSORPTION`] order. The timeframe is the window length.
+pub const TRIGGER_ABSORPTION: [(Timeframe, &FeatureDefinition); 3] = [
+    (Timeframe::M5, &TRIGGER_ABSORPTION_5M_V1),
+    (Timeframe::M15, &TRIGGER_ABSORPTION_15M_V1),
+    (Timeframe::H1, &TRIGGER_ABSORPTION_1H_V1),
+];
+
 /// Every version of every feature. Never shrinks.
 pub const DEFINITIONS: &[&FeatureDefinition] = &[
     &TRADE_LAST_PRICE_V1,
@@ -2370,6 +2695,17 @@ pub const DEFINITIONS: &[&FeatureDefinition] = &[
     &TRIGGER_SFP_1H_V1,
     &TRIGGER_SFP_4H_V1,
     &TRIGGER_SFP_1D_V1,
+    &TRIGGER_CVD_DIVERGENCE_15M_V1,
+    &TRIGGER_CVD_DIVERGENCE_1H_V1,
+    &TRIGGER_CVD_DIVERGENCE_4H_V1,
+    &TRIGGER_CVD_DIVERGENCE_1D_V1,
+    &TRIGGER_EFFORT_RESULT_5M_V1,
+    &TRIGGER_EFFORT_RESULT_15M_V1,
+    &TRIGGER_EFFORT_RESULT_1H_V1,
+    &TRIGGER_EXHAUSTION_V1,
+    &TRIGGER_ABSORPTION_5M_V1,
+    &TRIGGER_ABSORPTION_15M_V1,
+    &TRIGGER_ABSORPTION_1H_V1,
 ];
 
 /// The fingerprint each published `id@version` must keep. Append-only: one
@@ -2447,6 +2783,17 @@ pub const LOCK: &[LockEntry] = &[
     LockEntry::new("trigger.sfp.1h", 1, 0xec4b_9ffa_f8c6_3de5),
     LockEntry::new("trigger.sfp.4h", 1, 0x445b_aff9_215b_645e),
     LockEntry::new("trigger.sfp.1d", 1, 0x21c8_8a6d_cdd7_9af2),
+    LockEntry::new("trigger.cvd_divergence.15m", 1, 0xbc9d_8dee_6d5d_d715),
+    LockEntry::new("trigger.cvd_divergence.1h", 1, 0x5c2c_3db0_c2ae_afa1),
+    LockEntry::new("trigger.cvd_divergence.4h", 1, 0x5147_f434_dff6_36c6),
+    LockEntry::new("trigger.cvd_divergence.1d", 1, 0x6553_454e_8418_df92),
+    LockEntry::new("trigger.effort_result.5m", 1, 0xdf61_65ea_af38_65cd),
+    LockEntry::new("trigger.effort_result.15m", 1, 0x43e5_034d_b650_d780),
+    LockEntry::new("trigger.effort_result.1h", 1, 0x80c5_2a79_c3d0_26a8),
+    LockEntry::new("trigger.exhaustion", 1, 0x7700_595a_208c_cf12),
+    LockEntry::new("trigger.absorption.5m", 1, 0xa3aa_1a5c_4dd4_7e4b),
+    LockEntry::new("trigger.absorption.15m", 1, 0xb442_1293_cdf7_cc00),
+    LockEntry::new("trigger.absorption.1h", 1, 0x53d5_9a84_1d8d_4292),
 ];
 
 /// The default feature set: the latest version of each computed feature.
@@ -2522,6 +2869,17 @@ pub const CURRENT: &[FeatureKey] = &[
     TRIGGER_SFP_1H_V1.key,
     TRIGGER_SFP_4H_V1.key,
     TRIGGER_SFP_1D_V1.key,
+    TRIGGER_CVD_DIVERGENCE_15M_V1.key,
+    TRIGGER_CVD_DIVERGENCE_1H_V1.key,
+    TRIGGER_CVD_DIVERGENCE_4H_V1.key,
+    TRIGGER_CVD_DIVERGENCE_1D_V1.key,
+    TRIGGER_EFFORT_RESULT_5M_V1.key,
+    TRIGGER_EFFORT_RESULT_15M_V1.key,
+    TRIGGER_EFFORT_RESULT_1H_V1.key,
+    TRIGGER_EXHAUSTION_V1.key,
+    TRIGGER_ABSORPTION_5M_V1.key,
+    TRIGGER_ABSORPTION_15M_V1.key,
+    TRIGGER_ABSORPTION_1H_V1.key,
 ];
 
 /// Older versions the engine still computes on request, each in place of
@@ -2617,10 +2975,10 @@ mod tests {
             hasher.write_u32(entry.key.version.get());
             hasher.write_u64(entry.fingerprint.value());
         }
-        assert_eq!(LOCK.len(), 72, "lock lines");
+        assert_eq!(LOCK.len(), 83, "lock lines");
         assert_eq!(
             hasher.finish().to_string(),
-            "959583d499b997de",
+            "7a763f887730020f",
             "lock digest"
         );
     }
@@ -3354,6 +3712,92 @@ mod tests {
             assert_eq!(definition.warm_up, WarmUp::None, "{}", definition.key);
             assert!(CURRENT.contains(&definition.key), "{}", definition.key);
         }
+        // ADR-053 D4, D6: the candidate triggers, on the candidates' own
+        // timeframes and windows, each reading its candidate, the auction
+        // state and the bias, with the gate in the parameters.
+        let candidate_trigger = |definition: &FeatureDefinition,
+                                 id: String,
+                                 input: FeatureKey,
+                                 skip: &'static str,
+                                 span: Option<Param>| {
+            assert_eq!(definition.key.id.as_str(), id);
+            let mut params = vec![
+                CANDIDATE_GATE_KINDS,
+                Param {
+                    name: "gate_skip",
+                    value: ParamValue::Text(skip),
+                },
+            ];
+            params.extend(span);
+            assert_eq!(definition.params, params.as_slice(), "{}", definition.key);
+            assert_eq!(
+                definition.inputs,
+                &[
+                    Input::Feature(input),
+                    Input::Feature(LOCATION_AUCTION_PRIOR_DAY_V1.key),
+                    Input::Feature(BIAS_CONTEXT_V1.key),
+                ],
+                "{}",
+                definition.key
+            );
+            assert_eq!(definition.warm_up, WarmUp::None, "{}", definition.key);
+            assert!(CURRENT.contains(&definition.key), "{}", definition.key);
+        };
+        assert_eq!(
+            TRIGGER_CVD_DIVERGENCE.map(|(timeframe, _)| timeframe),
+            CANDIDATE_DIVERGENCE_CVD.map(|(timeframe, _)| timeframe)
+        );
+        for ((timeframe, definition), (_, candidate)) in TRIGGER_CVD_DIVERGENCE
+            .into_iter()
+            .zip(CANDIDATE_DIVERGENCE_CVD)
+        {
+            candidate_trigger(
+                definition,
+                format!("trigger.cvd_divergence.{}", timeframe.label()),
+                candidate.key,
+                "swing_pair",
+                Some(Param {
+                    name: "timeframe_ms",
+                    value: ParamValue::Int(timeframe.millis()),
+                }),
+            );
+        }
+        for (triggers, candidates, family) in [
+            (
+                TRIGGER_EFFORT_RESULT,
+                CANDIDATE_EFFORT_RESULT,
+                "effort_result",
+            ),
+            (TRIGGER_ABSORPTION, CANDIDATE_ABSORPTION, "absorption"),
+        ] {
+            assert_eq!(
+                triggers.map(|(timeframe, _)| timeframe),
+                candidates.map(|(timeframe, _)| timeframe)
+            );
+            for ((timeframe, definition), (_, candidate)) in triggers.into_iter().zip(candidates) {
+                candidate_trigger(
+                    definition,
+                    format!("trigger.{family}.{}", timeframe.label()),
+                    candidate.key,
+                    "none",
+                    Some(Param {
+                        name: "window_ms",
+                        value: ParamValue::Int(timeframe.millis()),
+                    }),
+                );
+            }
+        }
+        candidate_trigger(
+            &TRIGGER_EXHAUSTION_V1,
+            "trigger.exhaustion".to_string(),
+            CANDIDATE_EXHAUSTION_V1.key,
+            "none",
+            None,
+        );
+        assert_eq!(
+            CANDIDATE_GATE_KINDS.value,
+            ParamValue::Text("poc,vah,val,hvn,lvn,structural_high,structural_low,sfp_zone,vwap")
+        );
     }
 
     #[test]
@@ -3420,11 +3864,16 @@ mod tests {
              structure.levels.15m@1,structure.levels.1d@1,structure.levels.1h@1,\
              structure.levels.4h@1,structure.swing.15m@1,structure.swing.1d@1,\
              structure.swing.1h@1,structure.swing.4h@1,trade.last_price@1,\
-             trigger.breakout_acceptance@1,trigger.failed_auction@1,\
+             trigger.absorption.15m@1,trigger.absorption.1h@1,\
+             trigger.absorption.5m@1,trigger.breakout_acceptance@1,\
+             trigger.cvd_divergence.15m@1,trigger.cvd_divergence.1d@1,\
+             trigger.cvd_divergence.1h@1,trigger.cvd_divergence.4h@1,\
+             trigger.effort_result.15m@1,trigger.effort_result.1h@1,\
+             trigger.effort_result.5m@1,trigger.exhaustion@1,trigger.failed_auction@1,\
              trigger.failed_reclaim@1,trigger.sfp.15m@1,trigger.sfp.1d@1,\
              trigger.sfp.1h@1,trigger.sfp.4h@1,\
              volatility.atr.1h@1,volatility.regime.1h@1"
         );
-        assert_eq!(set.version().to_string(), "87f86f8b926b707c");
+        assert_eq!(set.version().to_string(), "adc14850f98d3011");
     }
 }

@@ -107,7 +107,8 @@ impl LocationContext {
 
 /// The registry levels left out of a context: every level derived from a
 /// swing — its structural level, and the prior sweep and SFP zone it
-/// becomes when a trade goes beyond it, the confirming trade included. The
+/// becomes when a trade goes beyond it, the confirming trade included —
+/// or, for a CVD divergence's trigger, from both swings of its pair. The
 /// swing is the event itself, not a place it happened at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Exclude {
@@ -137,10 +138,27 @@ pub(crate) enum Exclude {
         /// Open time of the swing bar.
         anchor: EventTime,
     },
+    /// Both swings of a CVD divergence pair (ADR-053 D4): every level the
+    /// [`EveryRegistry`](Self::EveryRegistry) key names for the current
+    /// swing or for the previous one. The comparison of the two is the
+    /// candidate, so neither swing is a place it happened at.
+    Pair {
+        /// The side of both swings.
+        side: LevelSide,
+        /// The timeframe of both swings.
+        timeframe: Timeframe,
+        /// The previous swing: its price and the open time of its swing
+        /// bar.
+        previous: (Price, EventTime),
+        /// The current swing: its price and the open time of its swing
+        /// bar.
+        current: (Price, EventTime),
+    },
 }
 
 impl Exclude {
-    /// Whether `level` is derived from the swing.
+    /// Whether `level` is derived from the swing (or, for a pair, from
+    /// either swing).
     fn matches(&self, level: &LocationLevel) -> bool {
         match *self {
             Self::OwnRegistry {
@@ -157,17 +175,37 @@ impl Exclude {
                 price,
                 timeframe,
                 anchor,
+            } => of_extreme(level, side, timeframe, (price, anchor)),
+            Self::Pair {
+                side,
+                timeframe,
+                previous,
+                current,
             } => {
-                level.side == Some(side)
-                    && level.price == price
-                    && level.anchor.is_some_and(|level_anchor| {
-                        structure_timeframe(level.source).is_some_and(|level_timeframe| {
-                            nests((level_anchor, level_timeframe), (anchor, timeframe))
-                        })
-                    })
+                of_extreme(level, side, timeframe, current)
+                    || of_extreme(level, side, timeframe, previous)
             }
         }
     }
+}
+
+/// Whether `level` marks the extreme of one swing as some structure
+/// timeframe registered it (ADR-053 D4): a `structure.levels.<tf>` level
+/// of the swing's side and price whose swing bar nests with the swing's
+/// bar, given as its price and open time.
+fn of_extreme(
+    level: &LocationLevel,
+    side: LevelSide,
+    timeframe: Timeframe,
+    (price, anchor): (Price, EventTime),
+) -> bool {
+    level.side == Some(side)
+        && level.price == price
+        && level.anchor.is_some_and(|level_anchor| {
+            structure_timeframe(level.source).is_some_and(|level_timeframe| {
+                nests((level_anchor, level_timeframe), (anchor, timeframe))
+            })
+        })
 }
 
 /// The timeframe of a `structure.levels.<tf>` source, by id: any version
@@ -236,6 +274,185 @@ impl fmt::Display for LocationContext {
             FeatureValue::Ready(status) => write!(f, " auction={}", status.state),
             FeatureValue::WarmingUp { .. } => f.write_str(" auction=warming"),
             FeatureValue::Unavailable { .. } => f.write_str(" auction=unavailable"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HOUR: i64 = 3_600_000;
+    const M15: i64 = 900_000;
+
+    /// A level of `kind` from `source` with `side`, `anchor` and `price`.
+    fn level(
+        kind: LevelKind,
+        source: FeatureKey,
+        side: LevelSide,
+        anchor: i64,
+        price: i64,
+    ) -> LocationLevel {
+        LocationLevel {
+            kind,
+            source,
+            side: Some(side),
+            anchor: Some(EventTime::from_millis(anchor)),
+            price: Price::from_units(price),
+            low: Price::from_units(price),
+            high: Price::from_units(price + 10),
+            known_at: EventTime::from_millis(anchor + HOUR),
+            touches: 0,
+            in_zone: false,
+            distance: Price::from_units(0),
+            confluence: 0,
+            strength: None,
+        }
+    }
+
+    /// A 1h swing-high pair: the previous swing at 100 in the hour from
+    /// 2h, the current one at 110 in the hour from 7h.
+    fn pair() -> Exclude {
+        Exclude::Pair {
+            side: LevelSide::High,
+            timeframe: Timeframe::H1,
+            previous: (Price::from_units(100), EventTime::from_millis(2 * HOUR)),
+            current: (Price::from_units(110), EventTime::from_millis(7 * HOUR)),
+        }
+    }
+
+    #[test]
+    fn a_pair_names_either_swing_on_every_structure_registry() {
+        // ADR-053 D4: the levels of either swing, as any structure
+        // timeframe registered its extreme, whatever their kind.
+        let m15 = catalog::STRUCTURE_LEVELS_15M_V1.key;
+        let h1 = catalog::STRUCTURE_LEVELS_1H_V1.key;
+        let h4 = catalog::STRUCTURE_LEVELS_4H_V1.key;
+        for matched in [
+            // The previous swing's prior sweep and SFP zone on its own
+            // registry, and on 15m inside its hour.
+            level(LevelKind::PriorSweep, h1, LevelSide::High, 2 * HOUR, 100),
+            level(
+                LevelKind::SfpRejectionZone,
+                h1,
+                LevelSide::High,
+                2 * HOUR,
+                100,
+            ),
+            level(
+                LevelKind::SfpRejectionZone,
+                m15,
+                LevelSide::High,
+                2 * HOUR + 2 * M15,
+                100,
+            ),
+            level(
+                LevelKind::PriorSweep,
+                m15,
+                LevelSide::High,
+                2 * HOUR + 3 * M15,
+                100,
+            ),
+            // The current swing on 15m and in the 4h bar that holds it.
+            level(
+                LevelKind::StructuralHigh,
+                m15,
+                LevelSide::High,
+                7 * HOUR + M15,
+                110,
+            ),
+            level(
+                LevelKind::SfpRejectionZone,
+                h4,
+                LevelSide::High,
+                4 * HOUR,
+                110,
+            ),
+        ] {
+            assert!(pair().matches(&matched), "{matched:?}");
+        }
+    }
+
+    #[test]
+    fn a_pair_keeps_every_other_place() {
+        let m15 = catalog::STRUCTURE_LEVELS_15M_V1.key;
+        for kept in [
+            // An equal-price swing outside both swings' bars: a place price
+            // came back to.
+            level(
+                LevelKind::SfpRejectionZone,
+                m15,
+                LevelSide::High,
+                4 * HOUR,
+                100,
+            ),
+            level(
+                LevelKind::StructuralHigh,
+                m15,
+                LevelSide::High,
+                9 * HOUR,
+                110,
+            ),
+            // The other side at the same price and bar.
+            level(
+                LevelKind::SfpRejectionZone,
+                m15,
+                LevelSide::Low,
+                2 * HOUR,
+                100,
+            ),
+            // Another price in the same bar.
+            level(
+                LevelKind::SfpRejectionZone,
+                m15,
+                LevelSide::High,
+                2 * HOUR,
+                101,
+            ),
+            // A non-structure source at the same price, side and bar.
+            level(
+                LevelKind::Vwap,
+                catalog::LOCATION_VWAP_UTC_DAY_V1.key,
+                LevelSide::High,
+                2 * HOUR,
+                100,
+            ),
+        ] {
+            assert!(!pair().matches(&kept), "{kept:?}");
+        }
+    }
+
+    #[test]
+    fn a_pair_is_the_union_of_the_two_swing_keys() {
+        // The previous swing's key is the key an SFP of that swing uses
+        // (`EveryRegistry`), and so is the current swing's.
+        let Exclude::Pair {
+            side,
+            timeframe,
+            previous,
+            current,
+        } = pair()
+        else {
+            unreachable!()
+        };
+        let key = |(price, anchor): (Price, EventTime)| Exclude::EveryRegistry {
+            side,
+            price,
+            timeframe,
+            anchor,
+        };
+        let m15 = catalog::STRUCTURE_LEVELS_15M_V1.key;
+        for anchor in (0..40).map(|bar| bar * M15) {
+            for price in [100, 110] {
+                for side in [LevelSide::High, LevelSide::Low] {
+                    let candidate = level(LevelKind::PriorSweep, m15, side, anchor, price);
+                    assert_eq!(
+                        pair().matches(&candidate),
+                        key(previous).matches(&candidate) || key(current).matches(&candidate),
+                        "{candidate:?}"
+                    );
+                }
+            }
         }
     }
 }
