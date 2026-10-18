@@ -419,6 +419,25 @@ impl Triggers {
             .map(|(((timeframe, _), effort), absorption)| (timeframe, effort, absorption))
     }
 
+    /// Whether `self` and `other` agree in every value that does not read
+    /// the level registry: the bias and the auction and SFP trigger values
+    /// (#96 rule I). The candidate trigger values depend on the selected
+    /// registry by design, since their location gate reads it (ADR-053 D4),
+    /// so they are not compared. Exhaustive, so a new value does not compile
+    /// until it is placed on one side.
+    pub fn equal_but_registry(&self, other: &Self) -> bool {
+        let Self {
+            bias,
+            auction,
+            sfp,
+            cvd_divergence: _,
+            effort_result: _,
+            exhaustion: _,
+            absorption: _,
+        } = self;
+        *bias == other.bias && *auction == other.auction && *sfp == other.sfp
+    }
+
     /// `bias.context@1`, for tests that build a state by hand.
     #[cfg(test)]
     pub(crate) fn bias_mut(&mut self) -> &mut Bias {

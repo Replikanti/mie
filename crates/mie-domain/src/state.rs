@@ -2253,14 +2253,16 @@ mod tests {
             // The candidate trigger values depend on the registry by design
             // (ADR-053 D4): the gate reads the selected registry. Every other
             // trigger value, and the bias, must agree.
-            let mut triggers = v2.state().triggers.clone();
-            if aligned.triggers != triggers {
+            let triggers = &v2.state().triggers;
+            if aligned.triggers != *triggers {
                 gated += 1;
             }
-            *aligned.triggers.cvd_divergence_mut() = *triggers.cvd_divergence_mut();
-            *aligned.triggers.effort_result_mut() = *triggers.effort_result_mut();
-            *aligned.triggers.exhaustion_mut() = *triggers.exhaustion_mut();
-            *aligned.triggers.absorption_mut() = *triggers.absorption_mut();
+            assert!(
+                aligned.triggers.equal_but_registry(triggers),
+                "{}",
+                event.time()
+            );
+            aligned.triggers = triggers.clone();
             assert_eq!(&aligned, v2.state(), "{}", event.time());
             assert_eq!(auction(&v1), auction(&v2), "{}", event.time());
         }
