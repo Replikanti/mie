@@ -197,16 +197,47 @@ not pin a trigger version.
   - Failed reclaim anchors at the edge between the accepted region and
     value: VAH when Above is accepted, VAL when Below is.
   - An SFP anchors at the swept level's price. Its context leaves out every
-    registry level derived from the swept swing itself — same
-    `structure.levels.<tf>` source, side and swing bar: its structural
-    level, and the prior sweep and SFP zone it became. *Why:* the ADR-051
-    D3 reason. The swept swing is the fact, not a place it happened at, and
+    registry level derived from the swept swing, on every structure
+    timeframe: each level of any `structure.levels.<tf>` source with the
+    swing's side and price whose swing bar nests with the swept swing's bar
+    (one bar lies within the other). That is its structural level, and the
+    prior sweep and SFP zone it became, in the registry that swept it and in
+    every other registry that holds the same extreme. *Why:* the ADR-051 D3
+    reason. The swept swing is the fact, not a place it happened at, and
     the event that resolves the SFP also enters the swing's SFP zone into
-    the registry, so every context would list it.
+    the registry, so every context would list it. One extreme can be a
+    swing on several timeframes: a 1h swing low at P whose 15m bar inside
+    that hour also has its low at P is one price seen on two grids.
+    Excluding only the sweeping registry's levels left the swing in the
+    context through the other timeframes: on the trigger golden tape, 202
+    of 515 SFPs, 104 of them with a level of a kind the candidate gate
+    below admits.
+    - *Why this key:* it names the extreme without a timeframe. A registry
+      level carries no time of the extreme trade, only the open of its own
+      timeframe's swing bar, so side, price and nested bar is the finest
+      identity it holds. It is exact: the structure timeframes share the
+      UTC grid, so two of their bars either nest or do not overlap, and two
+      nested bars with the same extreme on the same side have that price
+      inside the shorter bar, which the longer one contains. Two shorter
+      swings at the same price inside one longer swept bar are both left
+      out: inside the swept bar they are the same price on the same side,
+      not another place.
+    - *Rejected:* the same source, side and swing bar only (the
+      ADR-051 D3 key as written; it keeps the swing through the other
+      timeframes, as above); side and price alone (it would also drop an
+      older swing at the same price outside the swept bar, which is a place
+      price came back to).
 - **Candidate families (M2): gate.** A candidate is a trigger only if its
   own context lists at least one level of kind `Poc`, `Vah`, `Val`, `Hvn`,
   `Lvn`, `StructuralHigh`, `StructuralLow`, `SfpRejectionZone` or `Vwap`.
   If the context levels are not `Ready`, there is no trigger.
+  - *A divergence's own swing does not pass the gate.* The candidate's
+    recorded context keeps ADR-051 D3's exclusion (its own registry only;
+    a merged definition), so the gate also skips every level that the SFP
+    key above names for the candidate's swing: any `structure.levels.<tf>`
+    source, the swing's side and price, a nested swing bar. *Why:* else a
+    1h CVD divergence would pass the gate on the 15m structural high or SFP
+    zone of its own swing, the self-reference the SFP rule removes.
   - *Why a gate at all:* ADR-012 requires a trigger at a defined location;
     a candidate is defined anywhere (ADR-051), so its trigger rule is where
     the location condition goes.
@@ -404,6 +435,9 @@ rejection is the D5 failed auction).
   `location.levels@1` selection (D4). Rejected; the context records it.
 - **Any registry level as the gate; only value edges and structural
   extremes as the gate.** D4. Rejected.
+- **An SFP context without the swept swing's levels in its own registry
+  only.** Keeps the swing through the other structure timeframes (D4).
+  Rejected.
 - **A confirmation delay or later-reclaim horizon on the auction and SFP
   rules.** An unmeasured number (D5). Rejected.
 - **A tail-quantile OI expansion; the OI at the swing anchor.** D7.

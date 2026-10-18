@@ -22,7 +22,8 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   the auction facts of `location.auction.prior_day@1`, read from each
   fact's own status and anchored at the crossed or accepted value edge;
   `trigger.sfp.<15m|1h|4h|1d>@1` fires on each SFP, anchored at the swept
-  level, its location context without the swept swing's own levels. A new
+  level, its location context without the swept swing's levels on any
+  structure timeframe (same side and price, nested swing bar). A new
   last stage of the engine emits them through
   `MarketStateEngine::trigger_events`, each with the rule's feature key,
   its family, the evidence fact, a location context and a bias snapshot;

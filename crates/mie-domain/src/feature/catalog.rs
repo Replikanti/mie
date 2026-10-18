@@ -2213,8 +2213,9 @@ const SFP_TRIGGER_PARAMS_1D: [Param; 2] = sfp_trigger_params(86_400_000);
 /// D5). A `structure.levels.15m@1` sweep that resolves as an SFP; a clean
 /// break is none. The anchor is the swept level's price, and the location
 /// context leaves out every registry level derived from the swept swing
-/// itself (same `structure.levels.15m` source, side and swing bar). No
-/// confirmation delay beyond the SFP window of ADR-037. The event carries
+/// itself, on every structure timeframe (any `structure.levels.<tf>`
+/// source, same side and price, a swing bar that nests with the swept
+/// one). No confirmation delay beyond the SFP window of ADR-037. The event carries
 /// the resolved sweep as evidence, the context and the bias; the value is
 /// the last trigger.
 ///

@@ -464,7 +464,7 @@ impl TriggerTracker {
             };
             let anchor = sweep.level.price;
             let context =
-                LocationContext::read(anchor, Some(structure::own_swing(sweep)), inputs.location);
+                LocationContext::read(anchor, Some(structure::swept_swing(sweep)), inputs.location);
             self.sfp[position] = Some(Trigger {
                 known_at: sweep.known_at,
                 anchor,
@@ -1022,6 +1022,103 @@ mod tests {
         }
     }
 
+    /// Whether a level is the swing `sweep` swept, as any structure
+    /// timeframe registered it (ADR-053 D4): a `structure.levels.<tf>`
+    /// level of the swing's side and price whose swing bar nests with the
+    /// swept swing's bar. Written from the ADR text, not from the code.
+    fn of_swept_swing(
+        sweep: &Sweep,
+        (side, source, anchor, price): (
+            Option<crate::location::LevelSide>,
+            FeatureKey,
+            Option<EventTime>,
+            Price,
+        ),
+    ) -> bool {
+        let Some((timeframe, _)) = catalog::STRUCTURE_LEVELS
+            .iter()
+            .find(|(_, definition)| definition.key.id == source.id)
+        else {
+            return false;
+        };
+        let Some(open) = anchor.map(EventTime::as_millis) else {
+            return false;
+        };
+        let end = open + timeframe.millis();
+        let swing_open = sweep.level.swing_time.as_millis();
+        let swing_end = swing_open + sweep.timeframe.millis();
+        let swing_side = match sweep.level.side {
+            Side::High => crate::location::LevelSide::High,
+            Side::Low => crate::location::LevelSide::Low,
+        };
+        side == Some(swing_side)
+            && price == sweep.level.price
+            && ((open <= swing_open && swing_end <= end)
+                || (swing_open <= open && end <= swing_end))
+    }
+
+    #[test]
+    fn an_sfp_context_leaves_out_its_swing_on_every_structure_timeframe() {
+        // ADR-053 D4: a swing bar of another structure timeframe at the
+        // swept price and side, nested in the swept swing's bar or holding
+        // it, marks the same extreme, so the context leaves it out too. On
+        // the candidate golden tape the registry holds such a level at the
+        // anchor for many SFPs, so the test is not vacuous: 202 of 515, 104
+        // of them with a kind the candidate gate admits.
+        let mut engine = MarketStateEngine::new();
+        let (mut sfps, mut other_timeframe, mut gate_kind) = (0, 0, 0);
+        for event in crate::candidate::tests::golden_tape() {
+            engine.apply(&event).unwrap();
+            for fact in engine.trigger_events() {
+                let TriggerEvidence::Sfp(sweep) = fact.evidence else {
+                    continue;
+                };
+                sfps += 1;
+                let registry = engine.state().location.levels.ready().unwrap();
+                let other: Vec<LevelKind> = registry
+                    .levels()
+                    .iter()
+                    .filter(|level| {
+                        level.source != sweep.feature
+                            && zone_contains(level, fact.anchor())
+                            && of_swept_swing(
+                                &sweep,
+                                (level.side, level.source, level.anchor, level.price),
+                            )
+                    })
+                    .map(|level| level.kind)
+                    .collect();
+                if !other.is_empty() {
+                    other_timeframe += 1;
+                }
+                if other.iter().any(|kind| {
+                    matches!(
+                        kind,
+                        LevelKind::StructuralHigh
+                            | LevelKind::StructuralLow
+                            | LevelKind::SfpRejectionZone
+                    )
+                }) {
+                    gate_kind += 1;
+                }
+                let levels = fact.context.levels.ready().unwrap();
+                let left: Vec<&crate::candidate::ContextLevel> = levels
+                    .levels
+                    .iter()
+                    .filter(|level| {
+                        of_swept_swing(
+                            &sweep,
+                            (level.side, level.source, level.anchor, level.price),
+                        )
+                    })
+                    .collect();
+                assert!(left.is_empty(), "{fact}: {left:?}");
+            }
+        }
+        // ADR-053 D4 quotes these counts.
+        assert_eq!((sfps, other_timeframe, gate_kind), (515, 202, 104));
+    }
+
     /// The brief §11 tape: day 0 as [`Tape::prior_day`]; on day 1 one trade
     /// a minute in the middle of value, but a 15m swing high exactly at the
     /// prior day's VAH on bar 16 (minute 247). Bar 20 probes above value
@@ -1530,7 +1627,7 @@ mod tests {
             &catalog::TRIGGER_SFP_15M_V1,
             756,
             GOLDEN_SFP_15M,
-            "c02513f57608f381",
+            "25f83224a86821cb",
         );
     }
 
@@ -1540,7 +1637,7 @@ mod tests {
             &catalog::TRIGGER_SFP_1H_V1,
             191,
             GOLDEN_SFP_1H,
-            "fd2ac41853e7a69d",
+            "ed614487d89208f9",
         );
     }
 
@@ -1550,7 +1647,7 @@ mod tests {
             &catalog::TRIGGER_SFP_4H_V1,
             47,
             GOLDEN_SFP_4H,
-            "275ce1d8511eea3e",
+            "e2a97b7e4f2cff19",
         );
     }
 
@@ -1574,9 +1671,9 @@ mod tests {
 
     const GOLDEN_SFP_15M: &str = "62161380ms sfp evidence=[15m low level=61969.20000000 bar=55800000ms confirmed=59400000ms touches=2 at=61514129ms price=61966.54000000 extreme=61966.54000000 bars=1 sfp resolved=62100000ms complete structure.levels.15m@1] trigger.sfp.15m@1 ctx=61969.20000000 levels=vwap@61984.17149090 location.levels@2 auction=warming bias regime=warming 15m=[high=- low=-] 1h=warming 4h=warming 1d=warming bias.context@1";
 
-    const GOLDEN_SFP_1H: &str = "97260667ms sfp evidence=[1h low level=61900.09000000 bar=75600000ms confirmed=90000000ms touches=0 at=93129730ms price=61897.65000000 extreme=61882.07000000 bars=2 sfp resolved=97200000ms complete structure.levels.1h@1] trigger.sfp.1h@1 ctx=61900.09000000 levels=prior_sweep:low@61900.09000000,vwap@61914.46220263,hvn@61925.00000000[61920.00000000,61930.00000000],prior_sweep:low@61920.27000000,val@61930.00000000[61930.00000000,61940.00000000] location.levels@2 auction=breakout bias regime=warming 15m=[high=higher@87300000ms low=higher@84600000ms] 1h=[high=- low=-] 4h=warming 1d=warming bias.context@1";
+    const GOLDEN_SFP_1H: &str = "97260667ms sfp evidence=[1h low level=61900.09000000 bar=75600000ms confirmed=90000000ms touches=0 at=93129730ms price=61897.65000000 extreme=61882.07000000 bars=2 sfp resolved=97200000ms complete structure.levels.1h@1] trigger.sfp.1h@1 ctx=61900.09000000 levels=vwap@61914.46220263,hvn@61925.00000000[61920.00000000,61930.00000000],prior_sweep:low@61920.27000000,val@61930.00000000[61930.00000000,61940.00000000] location.levels@2 auction=breakout bias regime=warming 15m=[high=higher@87300000ms low=higher@84600000ms] 1h=[high=- low=-] 4h=warming 1d=warming bias.context@1";
 
-    const GOLDEN_SFP_4H: &str = "288021457ms sfp evidence=[4h high level=62057.32000000 bar=172800000ms confirmed=230400000ms touches=2 at=259693621ms price=62057.71000000 extreme=62088.48000000 bars=2 sfp resolved=288000000ms complete structure.levels.4h@1] trigger.sfp.4h@1 ctx=62057.32000000 levels=poc@62025.00000000[62020.00000000,62030.00000000],hvn@62025.00000000[62020.00000000,62030.00000000],prior_sweep:high@62024.72000000,prior_sweep:high@62024.72000000,sfp_zone:high@62024.72000000[62024.72000000,62027.66000000],sfp_zone:high@62024.72000000[62024.72000000,62027.66000000],structural_low:low@62025.15000000,prior_sweep:high@62027.66000000,vah@62040.00000000[62030.00000000,62040.00000000],prior_sweep:low@62036.28000000,prior_sweep:high@62042.67000000,prior_sweep:high@62042.70000000,sfp_zone:high@62042.70000000[62042.70000000,62044.63000000],prior_sweep:high@62049.17000000,sfp_zone:high@62049.17000000[62049.17000000,62051.12000000],prior_sweep:high@62049.24000000,sfp_zone:high@62049.24000000[62049.24000000,62057.32000000],prior_sweep:high@62051.12000000,prior_sweep:high@62057.32000000,prior_sweep:high@62057.32000000,structural_high:high@62062.20000000,vwap@62063.50291131,prior_sweep:low@62065.69000000,prior_sweep:low@62066.40000000,prior_sweep:high@62081.53000000,sfp_zone:high@62081.53000000[62081.53000000,62084.18000000],prior_sweep:high@62081.62000000,sfp_zone:high@62081.62000000[62081.62000000,62084.18000000],prior_sweep:high@62084.18000000,sfp_zone:high@62084.18000000[62084.18000000,62088.48000000],structural_high:high@62088.48000000,structural_high:high@62088.48000000 location.levels@2 auction=unavailable bias regime=warming 15m=[high=lower@282600000ms low=lower@283500000ms] 1h=[high=higher@270000000ms low=lower@230400000ms] 4h=[high=- low=higher@230400000ms] 1d=warming bias.context@1";
+    const GOLDEN_SFP_4H: &str = "288021457ms sfp evidence=[4h high level=62057.32000000 bar=172800000ms confirmed=230400000ms touches=2 at=259693621ms price=62057.71000000 extreme=62088.48000000 bars=2 sfp resolved=288000000ms complete structure.levels.4h@1] trigger.sfp.4h@1 ctx=62057.32000000 levels=poc@62025.00000000[62020.00000000,62030.00000000],hvn@62025.00000000[62020.00000000,62030.00000000],prior_sweep:high@62024.72000000,prior_sweep:high@62024.72000000,sfp_zone:high@62024.72000000[62024.72000000,62027.66000000],sfp_zone:high@62024.72000000[62024.72000000,62027.66000000],structural_low:low@62025.15000000,prior_sweep:high@62027.66000000,vah@62040.00000000[62030.00000000,62040.00000000],prior_sweep:low@62036.28000000,prior_sweep:high@62042.67000000,prior_sweep:high@62042.70000000,sfp_zone:high@62042.70000000[62042.70000000,62044.63000000],prior_sweep:high@62049.17000000,sfp_zone:high@62049.17000000[62049.17000000,62051.12000000],prior_sweep:high@62049.24000000,sfp_zone:high@62049.24000000[62049.24000000,62057.32000000],prior_sweep:high@62051.12000000,structural_high:high@62062.20000000,vwap@62063.50291131,prior_sweep:low@62065.69000000,prior_sweep:low@62066.40000000,prior_sweep:high@62081.53000000,sfp_zone:high@62081.53000000[62081.53000000,62084.18000000],prior_sweep:high@62081.62000000,sfp_zone:high@62081.62000000[62081.62000000,62084.18000000],prior_sweep:high@62084.18000000,sfp_zone:high@62084.18000000[62084.18000000,62088.48000000],structural_high:high@62088.48000000,structural_high:high@62088.48000000 location.levels@2 auction=unavailable bias regime=warming 15m=[high=lower@282600000ms low=lower@283500000ms] 1h=[high=higher@270000000ms low=lower@230400000ms] 4h=[high=- low=higher@230400000ms] 1d=warming bias.context@1";
 
     const GOLDEN_SFP_1D: &str = "86450066ms value warming 1/7";
 }

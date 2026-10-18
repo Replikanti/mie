@@ -4,9 +4,10 @@
 //! A `StructureEvent::Sfp` of `structure.levels.<tf>@1` is a
 //! `trigger.sfp.<tf>@1`; a clean break is none. The anchor is the swept
 //! level's price, and the location context leaves out every registry level
-//! derived from the swept swing itself (ADR-053 D4, the ADR-051 D3 reason):
-//! the swing is the fact, not a place it happened at. No confirmation delay
-//! beyond ADR-037's SFP window.
+//! derived from the swept swing itself, on every structure timeframe that
+//! registered it (ADR-053 D4, the ADR-051 D3 reason): the swing is the
+//! fact, not a place it happened at. No confirmation delay beyond ADR-037's
+//! SFP window.
 
 use crate::candidate::Exclude;
 use crate::feature::{FeatureDefinition, catalog};
@@ -29,16 +30,19 @@ pub(super) fn triggered(
     Some((position, definition, sweep))
 }
 
-/// The registry levels of the swept swing: same `structure.levels.<tf>`
-/// source, side and swing bar — its structural level, and the prior sweep
-/// and SFP zone it became.
-pub(super) fn own_swing(sweep: &Sweep) -> Exclude {
-    Exclude {
+/// The registry levels of the swept swing on every structure timeframe
+/// (ADR-053 D4): each `structure.levels.<tf>` level of the swing's side and
+/// price whose swing bar nests with the swept swing bar — its structural
+/// level, and the prior sweep and SFP zone it became, in the registry that
+/// swept it and in every other that registered the same extreme.
+pub(super) fn swept_swing(sweep: &Sweep) -> Exclude {
+    Exclude::EveryRegistry {
         side: match sweep.level.side {
             Side::High => LevelSide::High,
             Side::Low => LevelSide::Low,
         },
-        source_id: sweep.feature.id.as_str(),
+        price: sweep.level.price,
+        timeframe: sweep.timeframe,
         anchor: sweep.level.swing_time,
     }
 }
