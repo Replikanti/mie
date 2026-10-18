@@ -1,6 +1,6 @@
 # ADR-051: Order-flow candidates — divergences on confirmed swings, effort vs result, exhaustion and absorption
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-10-12
 
 ## Context
@@ -1036,3 +1036,36 @@ Every criterion is reachable once the hold-out import completes, and
 otherwise settled by the D9 stop rules, except the absorption part of R0:
 no live store holds a run of 25 h yet (the #10 soak's longest run is
 shorter), so it waits for one.
+
+## Acceptance
+
+Accepted 2026-10-18. Every R0 run used the `candidate_measure` ignored
+tests at main `47d2e58` (M3, `B` = 1 440, `q_hi` = 0.800).
+
+- **R0, effort vs result and exhaustion.** `measure_candidates` over the
+  #12 year replayed 603 323 345 events, the expected count, with 0
+  mismatches and 0 rejections: effort-vs-result facts 5m/15m/1h
+  14 572 / 8 420 / 4 120 and 1 610 exhaustion facts, wall 3 005.3 s
+  (ADR-037's measurement run: 1 166.6 s). Over the hold-out year:
+  521 397 971 events, 0 mismatches, 0 rejections, facts
+  13 722 / 8 240 / 4 358 and 2 330, wall 1 315.7 s.
+- **R0, absorption.** `measure_candidates_live` over the #10 soak and the
+  #13 runs: 0 mismatches, 0 rejections and, as this text predicts, no
+  evaluated absorption minute, so the test's assert fails there. Two
+  captures were made for the 25 h run, binary main `47d2e58` with the
+  example ingest configuration:
+  - run `20261015T203016Z` lost the network after 24 h 41 min and never
+    reconnected: 0 mismatches, 58 evaluated minutes (5m 34, 15m 24, 1h 0),
+    short of the 1h window;
+  - run `20261016T225606Z`, 34 h 33 min without a restart and stopped with
+    a clean `run_end`, rode out an 8-minute network outage and seven depth
+    resyncs: 2 042 225 events, 0 mismatches, 0 rejections, 1 585 evaluated
+    absorption minutes (5m 603, 15m 563, 1h 419) and absorption facts
+    16 / 15 / 6, all matched, with effort-vs-result facts 17 / 16 / 10 and
+    4 exhaustion facts.
+- **R1b and R1** passed on both halves of the hold-out year at `B` =
+  1 440 and `q_hi` = 0.800, with the recorded tables:
+  https://github.com/Replikanti/mie/issues/124#issuecomment-6135775852
+
+Full R0 results:
+https://github.com/Replikanti/mie/issues/22#issuecomment-6226620582
