@@ -614,7 +614,7 @@ impl DivergenceTracker {
         }
         let context = LocationContext::read(
             swing.price,
-            Some(Exclude {
+            Some(Exclude::OwnRegistry {
                 side: match swing.side {
                     Side::High => LevelSide::High,
                     Side::Low => LevelSide::Low,

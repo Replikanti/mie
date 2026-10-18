@@ -16,8 +16,9 @@
 //! the level registry with its zone events, and the auction state against
 //! the prior day's value (ADR-044, [`location`]), and the order-flow
 //! candidates: CVD and open-interest divergences on confirmed swings,
-//! effort vs result, exhaustion and absorption (ADR-051, [`candidate`]);
-//! every other kind passes through.
+//! effort vs result, exhaustion and absorption (ADR-051, [`candidate`]),
+//! and the bias context and trigger rules (ADR-053, [`trigger`]); every
+//! other kind passes through.
 //! Further feature families are added by the Market State issues, each as a
 //! registered, versioned definition (ADR-029, [`feature`]).
 //! The engine computes one [`FeatureSet`] and stamps its
@@ -35,6 +36,7 @@
 //! [`location`]: crate::location
 //! [`profile`]: crate::profile
 //! [`structure`]: crate::structure
+//! [`trigger`]: crate::trigger
 //! [`volatility`]: crate::volatility
 
 use crate::bars::{Bar, BarError, BarSet, MAX_BARS_PER_EVENT, Timeframe};
@@ -55,6 +57,7 @@ use crate::structure::{
     LevelsRule, StructureError, StructureEvent, StructureSet, StructureTracker,
 };
 use crate::time::EventTime;
+use crate::trigger::{self, TriggerEvent, TriggerTracker, Triggers};
 use crate::volatility::{AtrRegimeSeries, MotionAnchors, MotionSet, VolatilityError};
 use std::cmp::Ordering;
 use std::fmt;
@@ -147,9 +150,17 @@ pub struct MarketState {
     /// effort-vs-result evaluation of each aggression window;
     /// `candidate.exhaustion@1`; and `candidate.absorption.<5m|15m|1h>@1`
     /// ([`catalog::CANDIDATE_ABSORPTION`], live only). Candidates, never
-    /// signals (ADR-012). The last field, appended after `trade_count`
-    /// (ADR-051 D1).
+    /// signals (ADR-012). Appended after `trade_count` (ADR-051 D1).
     pub candidates: Candidates,
+    /// Bias and triggers (ADR-053): `bias.context@1`
+    /// ([`catalog::BIAS_CONTEXT_V1`]), the regime and the swing steps
+    /// every trigger records and no rule reads; and the last trigger of
+    /// `trigger.failed_auction@1`, `trigger.failed_reclaim@1`,
+    /// `trigger.breakout_acceptance@1` and `trigger.sfp.<tf>@1`
+    /// ([`catalog::TRIGGER_SFP`]). Each trigger value follows its fact
+    /// input's validity. Never an execution instruction (ADR-010,
+    /// ADR-012). The last field, appended after `candidates` (ADR-053 D1).
+    pub triggers: Triggers,
 }
 
 /// Builds [`MarketState`] incrementally from an event stream in canonical
@@ -205,6 +216,13 @@ pub struct MarketStateEngine {
     /// Scratch buffer for an event's candidate facts, swapped with
     /// `candidate_events` once the event is accepted.
     candidate_pending: Vec<CandidateEvent>,
+    /// The last trigger of every trigger id.
+    triggers: TriggerTracker,
+    /// The trigger facts of the last accepted event.
+    trigger_events: Vec<TriggerEvent>,
+    /// Scratch buffer for an event's trigger facts, swapped with
+    /// `trigger_events` once the event is accepted.
+    trigger_pending: Vec<TriggerEvent>,
 }
 
 /// Volatility state after the bars an event closed, committed with them.
@@ -403,6 +421,7 @@ impl MarketStateEngine {
             location: LocationState::new(),
             trade_count: 0,
             candidates: Candidates::new(),
+            triggers: Triggers::new(),
         };
         Self {
             features,
@@ -426,6 +445,9 @@ impl MarketStateEngine {
             candidates: CandidateTracker::new(),
             candidate_events: Vec::new(),
             candidate_pending: Vec::new(),
+            triggers: TriggerTracker::new(),
+            trigger_events: Vec::new(),
+            trigger_pending: Vec::new(),
         }
     }
 
@@ -660,6 +682,30 @@ impl MarketStateEngine {
             &mut self.candidate_pending,
         );
         std::mem::swap(&mut self.candidate_events, &mut self.candidate_pending);
+        // The infallible trigger stage, last, on the committed state
+        // (ADR-053 decision 2).
+        self.trigger_pending.clear();
+        let MarketState {
+            regime,
+            structure,
+            location,
+            candidates,
+            triggers,
+            ..
+        } = &mut self.state;
+        self.triggers.detect(
+            &self.structure_events,
+            &self.location_events,
+            trigger::Inputs {
+                regime,
+                structure,
+                location,
+                candidates,
+            },
+            triggers,
+            &mut self.trigger_pending,
+        );
+        std::mem::swap(&mut self.trigger_events, &mut self.trigger_pending);
         self.state.as_of = Some(event.time());
         self.last = Some(event.clone());
         self.ids = ids;
@@ -725,6 +771,13 @@ impl MarketStateEngine {
     /// leaves them unchanged.
     pub fn candidate_events(&self) -> &[CandidateEvent] {
         &self.candidate_events
+    }
+
+    /// The trigger facts of the last accepted event, in emission order
+    /// (ADR-053, decision 2); empty when it produced none. A rejected event
+    /// leaves them unchanged.
+    pub fn trigger_events(&self) -> &[TriggerEvent] {
+        &self.trigger_events
     }
 }
 
@@ -961,6 +1014,7 @@ mod tests {
                 location: LocationState::new(),
                 trade_count: 3,
                 candidates: Candidates::new(),
+                triggers: Triggers::new(),
             }
         );
         assert!(engine.state().bars.iter().all(|series| {
@@ -1159,7 +1213,7 @@ mod tests {
             "bars.motion.15m@1,bars.motion.1d@1,bars.motion.1h@1,bars.motion.1m@1,\
              bars.motion.4h@1,bars.motion.5m@1,bars.time.15m@1,bars.time.1d@1,\
              bars.time.1h@1,bars.time.1m@1,bars.time.4h@1,bars.time.5m@1,\
-             book.clusters@1,book.depth@1,book.l2@1,book.liquidity.window.15m@1,\
+             bias.context@1,book.clusters@1,book.depth@1,book.l2@1,book.liquidity.window.15m@1,\
              book.liquidity.window.1h@1,book.liquidity.window.5m@1,\
              candidate.absorption.15m@1,candidate.absorption.1h@1,\
              candidate.absorption.5m@1,\
@@ -1180,6 +1234,9 @@ mod tests {
              structure.levels.15m@1,structure.levels.1d@1,structure.levels.1h@1,\
              structure.levels.4h@1,structure.swing.15m@1,structure.swing.1d@1,\
              structure.swing.1h@1,structure.swing.4h@1,trade.last_price@1,\
+             trigger.breakout_acceptance@1,trigger.failed_auction@1,\
+             trigger.failed_reclaim@1,trigger.sfp.15m@1,trigger.sfp.1d@1,\
+             trigger.sfp.1h@1,trigger.sfp.4h@1,\
              volatility.atr.1h@1,volatility.regime.1h@1"
         );
         // Consuming events never changes it.

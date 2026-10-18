@@ -2068,6 +2068,234 @@ pub const CANDIDATE_ABSORPTION: [(Timeframe, &FeatureDefinition); 3] = [
     (Timeframe::H1, &CANDIDATE_ABSORPTION_1H_V1),
 ];
 
+/// `bias.context@1`: the bias context (ADR-053 D3), recomputed after every
+/// event. Two components, each with its input's validity: a copy of
+/// `volatility.regime.1h@1` (label and raw percentile), and per structure
+/// timeframe and side the step of the last swing pair of
+/// `candidate.divergence.cvd.<tf>@1` — `higher`, `equal` or `lower` by the
+/// sign of its price change — with the later swing's bar time. Price facts
+/// only; no aggregate, no direction, no action. Explicitly
+/// non-authorizing: every trigger event carries a snapshot, and no trigger
+/// rule reads it (ADR-012).
+///
+/// - Parameters: `step_rule` = `sign_of_price_change`.
+/// - Inputs: `volatility.regime.1h@1` and
+///   `candidate.divergence.cvd.<15m|1h|4h|1d>@1`.
+/// - Warm-up: none of its own; each component is warming up or unavailable
+///   exactly while its input is.
+/// - Gap policy: that of each input; nothing resets here.
+pub const BIAS_CONTEXT_V1: FeatureDefinition = FeatureDefinition {
+    key: FeatureKey::new("bias.context", 1),
+    params: &[Param {
+        name: "step_rule",
+        value: ParamValue::Text("sign_of_price_change"),
+    }],
+    inputs: &[
+        Input::Feature(VOLATILITY_REGIME_1H_V1.key),
+        Input::Feature(CANDIDATE_DIVERGENCE_CVD_15M_V1.key),
+        Input::Feature(CANDIDATE_DIVERGENCE_CVD_1H_V1.key),
+        Input::Feature(CANDIDATE_DIVERGENCE_CVD_4H_V1.key),
+        Input::Feature(CANDIDATE_DIVERGENCE_CVD_1D_V1.key),
+    ],
+    warm_up: WarmUp::None,
+};
+
+/// A `trigger.<family>[.<qualifier>]@1` definition (ADR-053 D1): no
+/// warm-up of its own, so the value follows its fact input's validity.
+const fn trigger_v1(
+    id: &'static str,
+    params: &'static [Param],
+    inputs: &'static [Input],
+) -> FeatureDefinition {
+    FeatureDefinition {
+        key: FeatureKey::new(id, 1),
+        params,
+        inputs,
+        warm_up: WarmUp::None,
+    }
+}
+
+/// The inputs of an auction trigger (ADR-053 D5): the auction state, whose
+/// facts it reads and whose copy its context carries, and the bias its
+/// events carry.
+const AUCTION_TRIGGER_INPUTS: [Input; 2] = [
+    Input::Feature(LOCATION_AUCTION_PRIOR_DAY_V1.key),
+    Input::Feature(BIAS_CONTEXT_V1.key),
+];
+
+/// `trigger.failed_auction@1`: a failed auction (ADR-053 D5). A
+/// `location.auction.prior_day@1` fact whose label turns to
+/// `failed_breakout` at the failing close (`failure.at` is the fact's
+/// `known_at`), read from the fact's own status, never from the state,
+/// which at a UTC-day rollover already holds the new reference. The anchor
+/// is the crossed edge: VAH for a probe toward above, VAL for one toward
+/// below. The event carries the status as evidence, the location context
+/// at the anchor and the bias; the value is the last trigger. A trigger
+/// feeds Conditional Behavior and research, never execution (ADR-010,
+/// ADR-012).
+///
+/// - Parameters: `anchor_rule` = `crossed_edge`.
+/// - Inputs: `location.auction.prior_day@1` and `bias.context@1`.
+/// - Warm-up: none of its own; the value is warming up or unavailable
+///   exactly while `location.auction.prior_day@1` is, and otherwise holds
+///   the last trigger (`None` before the first).
+/// - Gap policy: that of `location.auction.prior_day@1`.
+pub const TRIGGER_FAILED_AUCTION_V1: FeatureDefinition = trigger_v1(
+    "trigger.failed_auction",
+    &[Param {
+        name: "anchor_rule",
+        value: ParamValue::Text("crossed_edge"),
+    }],
+    &AUCTION_TRIGGER_INPUTS,
+);
+
+/// `trigger.failed_reclaim@1`: a failed reclaim (ADR-053 D5). A
+/// `location.auction.prior_day@1` fact whose label turns to
+/// `failed_reclaim` at the failing close, read from the fact's own status.
+/// The anchor is the edge between the accepted region and value: VAH when
+/// above is accepted, VAL when below is.
+///
+/// - Parameters: `anchor_rule` = `accepted_edge`.
+/// - Inputs, warm-up and gap policy as [`TRIGGER_FAILED_AUCTION_V1`].
+pub const TRIGGER_FAILED_RECLAIM_V1: FeatureDefinition = trigger_v1(
+    "trigger.failed_reclaim",
+    &[Param {
+        name: "anchor_rule",
+        value: ParamValue::Text("accepted_edge"),
+    }],
+    &AUCTION_TRIGGER_INPUTS,
+);
+
+/// `trigger.breakout_acceptance@1`: a breakout followed by acceptance
+/// (ADR-053 D5). A `location.auction.prior_day@1` fact from `breakout` to
+/// `acceptance`: the probe's 60th counted close. The anchor is the crossed
+/// edge, as [`TRIGGER_FAILED_AUCTION_V1`].
+///
+/// - Parameters: `anchor_rule` = `crossed_edge`.
+/// - Inputs, warm-up and gap policy as [`TRIGGER_FAILED_AUCTION_V1`].
+pub const TRIGGER_BREAKOUT_ACCEPTANCE_V1: FeatureDefinition = trigger_v1(
+    "trigger.breakout_acceptance",
+    &[Param {
+        name: "anchor_rule",
+        value: ParamValue::Text("crossed_edge"),
+    }],
+    &AUCTION_TRIGGER_INPUTS,
+);
+
+/// The parameters of an SFP trigger on the timeframe of `timeframe_ms`
+/// (ADR-053 D5), sorted by name.
+const fn sfp_trigger_params(timeframe_ms: i64) -> [Param; 2] {
+    [
+        Param {
+            name: "anchor_rule",
+            value: ParamValue::Text("swept_level"),
+        },
+        Param {
+            name: "timeframe_ms",
+            value: ParamValue::Int(timeframe_ms),
+        },
+    ]
+}
+
+/// The SFP trigger parameters of the 15m timeframe.
+const SFP_TRIGGER_PARAMS_15M: [Param; 2] = sfp_trigger_params(900_000);
+
+/// The SFP trigger parameters of the 1h timeframe.
+const SFP_TRIGGER_PARAMS_1H: [Param; 2] = sfp_trigger_params(3_600_000);
+
+/// The SFP trigger parameters of the 4h timeframe.
+const SFP_TRIGGER_PARAMS_4H: [Param; 2] = sfp_trigger_params(14_400_000);
+
+/// The SFP trigger parameters of the 1d timeframe.
+const SFP_TRIGGER_PARAMS_1D: [Param; 2] = sfp_trigger_params(86_400_000);
+
+/// `trigger.sfp.15m@1`: a swing-failure pattern on 15m structure (ADR-053
+/// D5). A `structure.levels.15m@1` sweep that resolves as an SFP; a clean
+/// break is none. The anchor is the swept level's price, and the location
+/// context leaves out every registry level derived from the swept swing
+/// itself, on every structure timeframe (any `structure.levels.<tf>`
+/// source, same side and price, a swing bar that nests with the swept
+/// one). No confirmation delay beyond the SFP window of ADR-037. The event carries
+/// the resolved sweep as evidence, the context and the bias; the value is
+/// the last trigger.
+///
+/// - Parameters: `anchor_rule` = `swept_level`, `timeframe_ms` = 900 000.
+/// - Inputs: `structure.levels.15m@1`, `location.auction.prior_day@1` (the
+///   context's copy) and `bias.context@1`.
+/// - Warm-up: none of its own; the value is warming up or unavailable
+///   exactly while `structure.levels.15m@1` is, and otherwise holds the
+///   last trigger (`None` before the first).
+/// - Gap policy: that of `structure.levels.15m@1`.
+pub const TRIGGER_SFP_15M_V1: FeatureDefinition = trigger_v1(
+    "trigger.sfp.15m",
+    &SFP_TRIGGER_PARAMS_15M,
+    &[
+        Input::Feature(STRUCTURE_LEVELS_15M_V1.key),
+        Input::Feature(LOCATION_AUCTION_PRIOR_DAY_V1.key),
+        Input::Feature(BIAS_CONTEXT_V1.key),
+    ],
+);
+
+/// `trigger.sfp.1h@1`: a swing-failure pattern on 1h structure (ADR-053
+/// D5).
+///
+/// Parameters as [`TRIGGER_SFP_15M_V1`] with `timeframe_ms` = 3 600 000.
+/// Inputs: `structure.levels.1h@1`, `location.auction.prior_day@1` and
+/// `bias.context@1`. Warm-up and gap policy as [`TRIGGER_SFP_15M_V1`], on
+/// `structure.levels.1h@1`.
+pub const TRIGGER_SFP_1H_V1: FeatureDefinition = trigger_v1(
+    "trigger.sfp.1h",
+    &SFP_TRIGGER_PARAMS_1H,
+    &[
+        Input::Feature(STRUCTURE_LEVELS_1H_V1.key),
+        Input::Feature(LOCATION_AUCTION_PRIOR_DAY_V1.key),
+        Input::Feature(BIAS_CONTEXT_V1.key),
+    ],
+);
+
+/// `trigger.sfp.4h@1`: a swing-failure pattern on 4h structure (ADR-053
+/// D5).
+///
+/// Parameters as [`TRIGGER_SFP_15M_V1`] with `timeframe_ms` = 14 400 000.
+/// Inputs: `structure.levels.4h@1`, `location.auction.prior_day@1` and
+/// `bias.context@1`. Warm-up and gap policy as [`TRIGGER_SFP_15M_V1`], on
+/// `structure.levels.4h@1`.
+pub const TRIGGER_SFP_4H_V1: FeatureDefinition = trigger_v1(
+    "trigger.sfp.4h",
+    &SFP_TRIGGER_PARAMS_4H,
+    &[
+        Input::Feature(STRUCTURE_LEVELS_4H_V1.key),
+        Input::Feature(LOCATION_AUCTION_PRIOR_DAY_V1.key),
+        Input::Feature(BIAS_CONTEXT_V1.key),
+    ],
+);
+
+/// `trigger.sfp.1d@1`: a swing-failure pattern on 1d structure (ADR-053
+/// D5).
+///
+/// Parameters as [`TRIGGER_SFP_15M_V1`] with `timeframe_ms` = 86 400 000.
+/// Inputs: `structure.levels.1d@1`, `location.auction.prior_day@1` and
+/// `bias.context@1`. Warm-up and gap policy as [`TRIGGER_SFP_15M_V1`], on
+/// `structure.levels.1d@1`.
+pub const TRIGGER_SFP_1D_V1: FeatureDefinition = trigger_v1(
+    "trigger.sfp.1d",
+    &SFP_TRIGGER_PARAMS_1D,
+    &[
+        Input::Feature(STRUCTURE_LEVELS_1D_V1.key),
+        Input::Feature(LOCATION_AUCTION_PRIOR_DAY_V1.key),
+        Input::Feature(BIAS_CONTEXT_V1.key),
+    ],
+);
+
+/// The SFP trigger of each structure timeframe, shortest first, in
+/// [`STRUCTURE_LEVELS`] order.
+pub const TRIGGER_SFP: [(Timeframe, &FeatureDefinition); 4] = [
+    (Timeframe::M15, &TRIGGER_SFP_15M_V1),
+    (Timeframe::H1, &TRIGGER_SFP_1H_V1),
+    (Timeframe::H4, &TRIGGER_SFP_4H_V1),
+    (Timeframe::D1, &TRIGGER_SFP_1D_V1),
+];
+
 /// Every version of every feature. Never shrinks.
 pub const DEFINITIONS: &[&FeatureDefinition] = &[
     &TRADE_LAST_PRICE_V1,
@@ -2134,6 +2362,14 @@ pub const DEFINITIONS: &[&FeatureDefinition] = &[
     &CANDIDATE_ABSORPTION_5M_V1,
     &CANDIDATE_ABSORPTION_15M_V1,
     &CANDIDATE_ABSORPTION_1H_V1,
+    &BIAS_CONTEXT_V1,
+    &TRIGGER_FAILED_AUCTION_V1,
+    &TRIGGER_FAILED_RECLAIM_V1,
+    &TRIGGER_BREAKOUT_ACCEPTANCE_V1,
+    &TRIGGER_SFP_15M_V1,
+    &TRIGGER_SFP_1H_V1,
+    &TRIGGER_SFP_4H_V1,
+    &TRIGGER_SFP_1D_V1,
 ];
 
 /// The fingerprint each published `id@version` must keep. Append-only: one
@@ -2203,6 +2439,14 @@ pub const LOCK: &[LockEntry] = &[
     LockEntry::new("candidate.absorption.5m", 1, 0x4b55_ca57_95ce_65f2),
     LockEntry::new("candidate.absorption.15m", 1, 0x6fe7_230f_9701_9c98),
     LockEntry::new("candidate.absorption.1h", 1, 0x34dd_4f79_4cb6_798f),
+    LockEntry::new("bias.context", 1, 0xd196_bbe7_2e2a_08fc),
+    LockEntry::new("trigger.failed_auction", 1, 0xbbc2_6e69_e622_49cf),
+    LockEntry::new("trigger.failed_reclaim", 1, 0x2789_f65f_6998_92fa),
+    LockEntry::new("trigger.breakout_acceptance", 1, 0x624b_d5b6_65d4_3100),
+    LockEntry::new("trigger.sfp.15m", 1, 0x25dd_dccc_fb18_f0b1),
+    LockEntry::new("trigger.sfp.1h", 1, 0xec4b_9ffa_f8c6_3de5),
+    LockEntry::new("trigger.sfp.4h", 1, 0x445b_aff9_215b_645e),
+    LockEntry::new("trigger.sfp.1d", 1, 0x21c8_8a6d_cdd7_9af2),
 ];
 
 /// The default feature set: the latest version of each computed feature.
@@ -2270,6 +2514,14 @@ pub const CURRENT: &[FeatureKey] = &[
     CANDIDATE_ABSORPTION_5M_V1.key,
     CANDIDATE_ABSORPTION_15M_V1.key,
     CANDIDATE_ABSORPTION_1H_V1.key,
+    BIAS_CONTEXT_V1.key,
+    TRIGGER_FAILED_AUCTION_V1.key,
+    TRIGGER_FAILED_RECLAIM_V1.key,
+    TRIGGER_BREAKOUT_ACCEPTANCE_V1.key,
+    TRIGGER_SFP_15M_V1.key,
+    TRIGGER_SFP_1H_V1.key,
+    TRIGGER_SFP_4H_V1.key,
+    TRIGGER_SFP_1D_V1.key,
 ];
 
 /// Older versions the engine still computes on request, each in place of
@@ -2365,10 +2617,10 @@ mod tests {
             hasher.write_u32(entry.key.version.get());
             hasher.write_u64(entry.fingerprint.value());
         }
-        assert_eq!(LOCK.len(), 64, "lock lines");
+        assert_eq!(LOCK.len(), 72, "lock lines");
         assert_eq!(
             hasher.finish().to_string(),
-            "b42604b215f62872",
+            "959583d499b997de",
             "lock digest"
         );
     }
@@ -3029,6 +3281,82 @@ mod tests {
     }
 
     #[test]
+    fn bias_and_trigger_definitions_match_their_facts() {
+        // ADR-053 D3–D5: the bias reads the regime and the CVD divergences;
+        // each trigger reads its fact feature, the auction state its context
+        // copies and the bias, with no `location.levels` input (D4) and no
+        // warm-up of its own (D1).
+        use crate::structure::STRUCTURE_TIMEFRAMES;
+        assert_eq!(
+            BIAS_CONTEXT_V1.inputs,
+            &[
+                Input::Feature(VOLATILITY_REGIME_1H_V1.key),
+                Input::Feature(CANDIDATE_DIVERGENCE_CVD_15M_V1.key),
+                Input::Feature(CANDIDATE_DIVERGENCE_CVD_1H_V1.key),
+                Input::Feature(CANDIDATE_DIVERGENCE_CVD_4H_V1.key),
+                Input::Feature(CANDIDATE_DIVERGENCE_CVD_1D_V1.key),
+            ]
+        );
+        assert_eq!(BIAS_CONTEXT_V1.warm_up, WarmUp::None);
+        assert!(CURRENT.contains(&BIAS_CONTEXT_V1.key));
+        for (definition, anchor_rule) in [
+            (&TRIGGER_FAILED_AUCTION_V1, "crossed_edge"),
+            (&TRIGGER_FAILED_RECLAIM_V1, "accepted_edge"),
+            (&TRIGGER_BREAKOUT_ACCEPTANCE_V1, "crossed_edge"),
+        ] {
+            assert_eq!(
+                definition.params,
+                &[Param {
+                    name: "anchor_rule",
+                    value: ParamValue::Text(anchor_rule),
+                }],
+                "{}",
+                definition.key
+            );
+            assert_eq!(
+                definition.inputs,
+                &[
+                    Input::Feature(LOCATION_AUCTION_PRIOR_DAY_V1.key),
+                    Input::Feature(BIAS_CONTEXT_V1.key),
+                ],
+                "{}",
+                definition.key
+            );
+            assert_eq!(definition.warm_up, WarmUp::None, "{}", definition.key);
+            assert!(CURRENT.contains(&definition.key), "{}", definition.key);
+        }
+        assert_eq!(
+            TRIGGER_SFP.map(|(timeframe, _)| timeframe),
+            STRUCTURE_TIMEFRAMES
+        );
+        for ((timeframe, definition), (_, levels)) in TRIGGER_SFP.into_iter().zip(STRUCTURE_LEVELS)
+        {
+            assert_eq!(
+                definition.key.id.as_str(),
+                format!("trigger.sfp.{}", timeframe.label())
+            );
+            assert_eq!(
+                definition.params,
+                &sfp_trigger_params(timeframe.millis())[..],
+                "{}",
+                definition.key
+            );
+            assert_eq!(
+                definition.inputs,
+                &[
+                    Input::Feature(levels.key),
+                    Input::Feature(LOCATION_AUCTION_PRIOR_DAY_V1.key),
+                    Input::Feature(BIAS_CONTEXT_V1.key),
+                ],
+                "{}",
+                definition.key
+            );
+            assert_eq!(definition.warm_up, WarmUp::None, "{}", definition.key);
+            assert!(CURRENT.contains(&definition.key), "{}", definition.key);
+        }
+    }
+
+    #[test]
     fn selectable_versions_are_older_than_current() {
         // ADR-029 D3, ADR-044 D10: each selectable version is registered,
         // older than the CURRENT version of its id, and substitutes into
@@ -3071,7 +3399,7 @@ mod tests {
             "bars.motion.15m@1,bars.motion.1d@1,bars.motion.1h@1,bars.motion.1m@1,\
              bars.motion.4h@1,bars.motion.5m@1,bars.time.15m@1,bars.time.1d@1,\
              bars.time.1h@1,bars.time.1m@1,bars.time.4h@1,bars.time.5m@1,\
-             book.clusters@1,book.depth@1,book.l2@1,book.liquidity.window.15m@1,\
+             bias.context@1,book.clusters@1,book.depth@1,book.l2@1,book.liquidity.window.15m@1,\
              book.liquidity.window.1h@1,book.liquidity.window.5m@1,\
              candidate.absorption.15m@1,candidate.absorption.1h@1,\
              candidate.absorption.5m@1,\
@@ -3092,8 +3420,11 @@ mod tests {
              structure.levels.15m@1,structure.levels.1d@1,structure.levels.1h@1,\
              structure.levels.4h@1,structure.swing.15m@1,structure.swing.1d@1,\
              structure.swing.1h@1,structure.swing.4h@1,trade.last_price@1,\
+             trigger.breakout_acceptance@1,trigger.failed_auction@1,\
+             trigger.failed_reclaim@1,trigger.sfp.15m@1,trigger.sfp.1d@1,\
+             trigger.sfp.1h@1,trigger.sfp.4h@1,\
              volatility.atr.1h@1,volatility.regime.1h@1"
         );
-        assert_eq!(set.version().to_string(), "8e6f1b978d12a884");
+        assert_eq!(set.version().to_string(), "87f86f8b926b707c");
     }
 }

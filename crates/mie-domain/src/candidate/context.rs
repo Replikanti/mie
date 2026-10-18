@@ -3,13 +3,15 @@
 //! state, read from the committed state of the event that emits it.
 //!
 //! The context is recorded, never a filter and never a feature input:
-//! location gating is a trigger-rule condition owned by the bias/trigger
-//! issue (ADR-012), and keeping location out of every candidate definition
-//! keeps `location.levels@1` selectable (ADR-044 D10).
+//! location gating is a trigger-rule condition (ADR-012, ADR-053 D4), and
+//! keeping location out of every candidate definition keeps
+//! `location.levels@1` selectable (ADR-044 D10). The trigger events of
+//! ADR-053 carry the same context, read by the same code.
 
-use crate::feature::{FeatureKey, FeatureValue};
+use crate::bars::Timeframe;
+use crate::feature::{FeatureKey, FeatureValue, catalog};
 use crate::location::{
-    AuctionStatus, LevelKind, LevelSet, LevelSide, LocationState, zone_contains,
+    AuctionStatus, LevelKind, LevelSet, LevelSide, LocationLevel, LocationState, zone_contains,
 };
 use crate::num::Price;
 use crate::time::EventTime;
@@ -103,34 +105,90 @@ impl LocationContext {
     }
 }
 
-/// The registry levels left out of a context: every level derived from the
-/// candidate's own swing (ADR-051 D3) — its structural level, and the prior
-/// sweep and SFP zone it becomes when a trade goes beyond it, the
-/// confirming trade included. The swing is the candidate itself, not a
-/// place it happened at.
+/// The registry levels left out of a context: every level derived from a
+/// swing — its structural level, and the prior sweep and SFP zone it
+/// becomes when a trade goes beyond it, the confirming trade included. The
+/// swing is the event itself, not a place it happened at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Exclude {
-    /// The swing's side.
-    pub(crate) side: LevelSide,
-    /// The id of the `structure.levels.<tf>` registry the swing entered.
-    pub(crate) source_id: &'static str,
-    /// Open time of the swing bar.
-    pub(crate) anchor: EventTime,
+pub(crate) enum Exclude {
+    /// A candidate's swing (ADR-051 D3): the levels of the
+    /// `structure.levels.<tf>` registry the swing entered, with its side
+    /// and swing bar.
+    OwnRegistry {
+        /// The swing's side.
+        side: LevelSide,
+        /// The id of the `structure.levels.<tf>` registry the swing
+        /// entered.
+        source_id: &'static str,
+        /// Open time of the swing bar.
+        anchor: EventTime,
+    },
+    /// A swept swing (ADR-053 D4): the levels of every
+    /// `structure.levels.<tf>` registry with its side and price whose swing
+    /// bar nests with its swing bar — the same extreme, as each structure
+    /// timeframe that saw it registered it.
+    EveryRegistry {
+        /// The swing's side.
+        side: LevelSide,
+        /// The swing's price.
+        price: Price,
+        /// The swing's timeframe.
+        timeframe: Timeframe,
+        /// Open time of the swing bar.
+        anchor: EventTime,
+    },
 }
 
 impl Exclude {
-    /// Whether a level of any kind is derived from the swing: same
-    /// registry, same side, anchored at the swing bar.
-    fn matches(
-        &self,
-        side: Option<LevelSide>,
-        source: FeatureKey,
-        anchor: Option<EventTime>,
-    ) -> bool {
-        side == Some(self.side)
-            && anchor == Some(self.anchor)
-            && source.id.as_str() == self.source_id
+    /// Whether `level` is derived from the swing.
+    fn matches(&self, level: &LocationLevel) -> bool {
+        match *self {
+            Self::OwnRegistry {
+                side,
+                source_id,
+                anchor,
+            } => {
+                level.side == Some(side)
+                    && level.anchor == Some(anchor)
+                    && level.source.id.as_str() == source_id
+            }
+            Self::EveryRegistry {
+                side,
+                price,
+                timeframe,
+                anchor,
+            } => {
+                level.side == Some(side)
+                    && level.price == price
+                    && level.anchor.is_some_and(|level_anchor| {
+                        structure_timeframe(level.source).is_some_and(|level_timeframe| {
+                            nests((level_anchor, level_timeframe), (anchor, timeframe))
+                        })
+                    })
+            }
+        }
     }
+}
+
+/// The timeframe of a `structure.levels.<tf>` source, by id: any version
+/// of that registry. `None` for every other source.
+fn structure_timeframe(source: FeatureKey) -> Option<Timeframe> {
+    catalog::STRUCTURE_LEVELS
+        .iter()
+        .find(|(_, definition)| definition.key.id == source.id)
+        .map(|(timeframe, _)| *timeframe)
+}
+
+/// Whether one of two bars, each its open time and timeframe, lies within
+/// the other. The structure timeframes share the UTC grid, so two of their
+/// bars either nest or do not overlap.
+fn nests(
+    (a, a_timeframe): (EventTime, Timeframe),
+    (b, b_timeframe): (EventTime, Timeframe),
+) -> bool {
+    let (a_open, b_open) = (a.as_millis(), b.as_millis());
+    let (a_end, b_end) = (a_open + a_timeframe.millis(), b_open + b_timeframe.millis());
+    (a_open <= b_open && b_end <= a_end) || (b_open <= a_open && a_end <= b_end)
 }
 
 /// The levels of `set` at `anchor`, in registry order, without `exclude`.
@@ -141,10 +199,7 @@ fn levels_at(set: &LevelSet, anchor: Price, exclude: Option<Exclude>) -> Context
             .levels()
             .iter()
             .filter(|level| zone_contains(level, anchor))
-            .filter(|level| {
-                !exclude
-                    .is_some_and(|exclude| exclude.matches(level.side, level.source, level.anchor))
-            })
+            .filter(|level| !exclude.is_some_and(|exclude| exclude.matches(level)))
             .map(|level| ContextLevel {
                 kind: level.kind,
                 source: level.source,

@@ -46,9 +46,9 @@
 //!
 //! 1. Pick an id `<family>.<name>[.<qualifier>]`. Families: `trade`, `bars`,
 //!    `volatility`, `flow`, `book`, `derivatives`, `profile`, `structure`,
-//!    `location`, `candidate`. Parameterizations that must coexist (ATR on 5m and on 1h)
-//!    get distinct ids, and the timeframe also stays a parameter so the
-//!    fingerprint covers it. Ids are never renamed or reused.
+//!    `location`, `candidate`, `bias`, `trigger`. Parameterizations that
+//!    must coexist (ATR on 5m and on 1h) get distinct ids, and the
+//!    timeframe also stays a parameter so the fingerprint covers it. Ids are never renamed or reused.
 //! 2. Declare `<NAME>_V1` in [`catalog`]: parameters sorted by name with exact
 //!    values (a time span is an `Int` whose name ends in `_ms`), inputs
 //!    (streams, or upstream features at exact versions) and warm-up. Its doc
