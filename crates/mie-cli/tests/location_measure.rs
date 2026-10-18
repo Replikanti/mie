@@ -29,7 +29,8 @@
 //!   state), and the state transitions per day.
 //! - The #96 checks of `@2` against `@1`, each a count asserted zero:
 //!   **isolation** (rule I), events after which the two states differ
-//!   anywhere but in the feature-set stamp and the registry, or the two
+//!   anywhere but in the feature-set stamp, the registry and the candidate
+//!   trigger values its location gate reads it for (ADR-053 D4), or the two
 //!   engines' auction facts differ, or that only one engine rejected;
 //!   **sourcing** (rule S), rebuilds where a registry holds a level of the
 //!   other version's composite, or fewer than 3 levels of its own composite
@@ -279,7 +280,10 @@ fn half_label(half: Option<usize>) -> &'static str {
 
 /// Whether `a` and `b` are equal in every field but the feature-set stamp
 /// and the level registry (#96 rule I). Exhaustive, so a new field does not
-/// compile until it is compared.
+/// compile until it is compared. Of the triggers it compares the bias and
+/// the auction and SFP values only: the candidate trigger values depend on
+/// the selected registry by design, since their location gate reads it
+/// (ADR-053 D4).
 fn equal_but_registry(a: &MarketState, b: &MarketState) -> bool {
     let MarketState {
         feature_set: _,
@@ -319,7 +323,9 @@ fn equal_but_registry(a: &MarketState, b: &MarketState) -> bool {
         && *auction == b.location.auction
         && *trade_count == b.trade_count
         && *candidates == b.candidates
-        && *triggers == b.triggers
+        && triggers.bias() == b.triggers.bias()
+        && triggers.iter_auction().eq(b.triggers.iter_auction())
+        && triggers.iter_sfp().eq(b.triggers.iter_sfp())
 }
 
 /// The auction facts of the last event.

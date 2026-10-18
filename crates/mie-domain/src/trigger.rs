@@ -18,7 +18,9 @@
 //!   - SFP on the structure facts of `structure.levels.<tf>@1` (ADR-053 D5,
 //!     `structure`);
 //!   - CVD divergence, effort vs result, exhaustion and absorption on the
-//!     order-flow candidates, gated on location (ADR-053 D4, D6): #24 M2;
+//!     order-flow candidates `candidate.*@1`, each the candidate fact at a
+//!     defined location: the context the rule reads lists a level of an
+//!     admitted kind (ADR-053 D4, D6, `candidate`);
 //!   - OI expansion followed by rejection (ADR-053 D7): #24 M3.
 //!
 //! Triggers are the last stage of an event (ADR-053 D2): they run after the
@@ -34,12 +36,16 @@
 pub mod bias;
 
 mod auction;
+mod candidate;
 mod structure;
 
 pub use bias::{Bias, StepAt, SwingSequence, SwingStep};
 
 use crate::bars::Timeframe;
-use crate::candidate::{Candidates, LocationContext};
+use crate::candidate::absorption::Absorption;
+use crate::candidate::divergence::CvdComparison;
+use crate::candidate::effort::{EffortResult, Exhaustion};
+use crate::candidate::{CandidateEvent, Candidates, LocationContext};
 use crate::feature::{FeatureKey, FeatureValue, Input, catalog};
 use crate::fingerprint::Fingerprinter;
 use crate::location::{AuctionStatus, LocationEvent, LocationState};
@@ -50,6 +56,7 @@ use crate::structure::{STRUCTURE_TIMEFRAMES, StructureEvent, StructureSet, Sweep
 use crate::time::EventTime;
 use crate::volatility::AtrRegimeSeries;
 use auction::AUCTION_TRIGGERS;
+use candidate::Slot;
 use std::fmt;
 
 /// Families of observable trigger events that hypotheses can test.
@@ -249,14 +256,37 @@ pub struct Triggers {
     auction: [FeatureValue<TriggerValue<AuctionStatus>>; 3],
     /// `trigger.sfp.<tf>@1`, in [`STRUCTURE_TIMEFRAMES`] order.
     sfp: [FeatureValue<TriggerValue<Sweep>>; 4],
+    /// `trigger.cvd_divergence.<tf>@1`, in [`STRUCTURE_TIMEFRAMES`] order
+    /// (ADR-053 D6).
+    cvd_divergence: [FeatureValue<TriggerValue<CvdComparison>>; 4],
+    /// `trigger.effort_result.<w>@1`, in
+    /// [`catalog::TRIGGER_EFFORT_RESULT`] order.
+    effort_result: [FeatureValue<TriggerValue<EffortResult>>; 3],
+    /// `trigger.exhaustion@1`.
+    exhaustion: FeatureValue<TriggerValue<Exhaustion>>,
+    /// `trigger.absorption.<w>@1`, in [`catalog::TRIGGER_ABSORPTION`]
+    /// order.
+    absorption: [FeatureValue<TriggerValue<Absorption>>; 3],
 }
 
 impl StateEncode for Triggers {
     fn encode(&self, f: &mut Fingerprinter) {
-        let Self { bias, auction, sfp } = self;
+        let Self {
+            bias,
+            auction,
+            sfp,
+            cvd_divergence,
+            effort_result,
+            exhaustion,
+            absorption,
+        } = self;
         bias.encode(f);
         auction.encode(f);
         sfp.encode(f);
+        cvd_divergence.encode(f);
+        effort_result.encode(f);
+        exhaustion.encode(f);
+        absorption.encode(f);
     }
 }
 
@@ -328,6 +358,67 @@ impl Triggers {
         STRUCTURE_TIMEFRAMES.into_iter().zip(&self.sfp)
     }
 
+    /// `trigger.cvd_divergence.<tf>@1` of `timeframe`, if it is a
+    /// structure timeframe.
+    pub fn cvd_divergence(
+        &self,
+        timeframe: Timeframe,
+    ) -> Option<&FeatureValue<TriggerValue<CvdComparison>>> {
+        STRUCTURE_TIMEFRAMES
+            .iter()
+            .position(|candidate| *candidate == timeframe)
+            .map(|index| &self.cvd_divergence[index])
+    }
+
+    /// `trigger.cvd_divergence.<tf>@1` of every structure timeframe,
+    /// shortest first.
+    pub fn iter_cvd_divergence(
+        &self,
+    ) -> impl Iterator<Item = (Timeframe, &FeatureValue<TriggerValue<CvdComparison>>)> {
+        STRUCTURE_TIMEFRAMES.into_iter().zip(&self.cvd_divergence)
+    }
+
+    /// `trigger.effort_result.<w>@1` of the window of length `timeframe`,
+    /// if it is an effort window.
+    pub fn effort_result(
+        &self,
+        timeframe: Timeframe,
+    ) -> Option<&FeatureValue<TriggerValue<EffortResult>>> {
+        window_position(timeframe).map(|index| &self.effort_result[index])
+    }
+
+    /// `trigger.exhaustion@1`.
+    pub fn exhaustion(&self) -> &FeatureValue<TriggerValue<Exhaustion>> {
+        &self.exhaustion
+    }
+
+    /// `trigger.absorption.<w>@1` of the window of length `timeframe`, if
+    /// it is an effort window.
+    pub fn absorption(
+        &self,
+        timeframe: Timeframe,
+    ) -> Option<&FeatureValue<TriggerValue<Absorption>>> {
+        window_position(timeframe).map(|index| &self.absorption[index])
+    }
+
+    /// The trigger values of the effort windows, shortest first: effort vs
+    /// result and absorption, with the window length.
+    pub fn iter_windows(
+        &self,
+    ) -> impl Iterator<
+        Item = (
+            Timeframe,
+            &FeatureValue<TriggerValue<EffortResult>>,
+            &FeatureValue<TriggerValue<Absorption>>,
+        ),
+    > {
+        catalog::TRIGGER_EFFORT_RESULT
+            .into_iter()
+            .zip(&self.effort_result)
+            .zip(&self.absorption)
+            .map(|(((timeframe, _), effort), absorption)| (timeframe, effort, absorption))
+    }
+
     /// `bias.context@1`, for tests that build a state by hand.
     #[cfg(test)]
     pub(crate) fn bias_mut(&mut self) -> &mut Bias {
@@ -345,19 +436,61 @@ impl Triggers {
     pub(crate) fn sfp_mut(&mut self) -> &mut [FeatureValue<TriggerValue<Sweep>>; 4] {
         &mut self.sfp
     }
+
+    /// The CVD divergence trigger values, for tests that build a state by
+    /// hand.
+    #[cfg(test)]
+    pub(crate) fn cvd_divergence_mut(
+        &mut self,
+    ) -> &mut [FeatureValue<TriggerValue<CvdComparison>>; 4] {
+        &mut self.cvd_divergence
+    }
+
+    /// The effort-vs-result trigger values, for tests that build a state by
+    /// hand.
+    #[cfg(test)]
+    pub(crate) fn effort_result_mut(
+        &mut self,
+    ) -> &mut [FeatureValue<TriggerValue<EffortResult>>; 3] {
+        &mut self.effort_result
+    }
+
+    /// The exhaustion trigger value, for tests that build a state by hand.
+    #[cfg(test)]
+    pub(crate) fn exhaustion_mut(&mut self) -> &mut FeatureValue<TriggerValue<Exhaustion>> {
+        &mut self.exhaustion
+    }
+
+    /// The absorption trigger values, for tests that build a state by hand.
+    #[cfg(test)]
+    pub(crate) fn absorption_mut(&mut self) -> &mut [FeatureValue<TriggerValue<Absorption>>; 3] {
+        &mut self.absorption
+    }
+}
+
+/// The position of the effort window of length `timeframe` in
+/// [`catalog::TRIGGER_EFFORT_RESULT`] (and [`catalog::TRIGGER_ABSORPTION`]).
+fn window_position(timeframe: Timeframe) -> Option<usize> {
+    catalog::TRIGGER_EFFORT_RESULT
+        .iter()
+        .position(|(candidate, _)| *candidate == timeframe)
 }
 
 /// The fact a trigger was built on (ADR-053 D1): its input feature's own
 /// hashed form.
 ///
 /// `Display` prints the fact.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TriggerEvidence {
     /// A `location.auction.prior_day@1` status: the status of the close
     /// whose label changed, against the reference it was classified under.
     Auction(AuctionStatus),
     /// A `structure.levels.<tf>@1` sweep resolved as an SFP.
     Sfp(Sweep),
+    /// A `candidate.*@1` fact (ADR-053 D6): the full candidate event, with
+    /// its own ADR-051 D3 context. Boxed: it is several times the size of
+    /// the other facts.
+    Candidate(Box<CandidateEvent>),
 }
 
 impl fmt::Display for TriggerEvidence {
@@ -365,13 +498,15 @@ impl fmt::Display for TriggerEvidence {
         match self {
             Self::Auction(status) => write!(f, "{status}"),
             Self::Sfp(sweep) => write!(f, "{} {sweep}", sweep.timeframe),
+            Self::Candidate(fact) => write!(f, "{fact}"),
         }
     }
 }
 
 /// A trigger fact, in emission order (ADR-053 D2): per structure fact of
 /// the event, in its order, the SFP triggers; then per location fact, in
-/// its order, the auction triggers.
+/// its order, the auction triggers; then per candidate fact, in its order,
+/// the candidate triggers.
 ///
 /// Not hashed. `Display` prints the canonical line the golden tests pin:
 /// the family, the evidence, the rule's feature key, the location context
@@ -436,6 +571,15 @@ pub(crate) struct TriggerTracker {
     auction: [Option<Trigger<AuctionStatus>>; 3],
     /// The SFP triggers, in [`STRUCTURE_TIMEFRAMES`] order.
     sfp: [Option<Trigger<Sweep>>; 4],
+    /// The CVD divergence triggers, in [`STRUCTURE_TIMEFRAMES`] order.
+    cvd_divergence: [Option<Trigger<CvdComparison>>; 4],
+    /// The effort-vs-result triggers, in
+    /// [`catalog::TRIGGER_EFFORT_RESULT`] order.
+    effort_result: [Option<Trigger<EffortResult>>; 3],
+    /// The exhaustion trigger.
+    exhaustion: Option<Trigger<Exhaustion>>,
+    /// The absorption triggers, in [`catalog::TRIGGER_ABSORPTION`] order.
+    absorption: [Option<Trigger<Absorption>>; 3],
 }
 
 impl TriggerTracker {
@@ -446,13 +590,15 @@ impl TriggerTracker {
 
     /// The infallible stage (ADR-053 D2): after the candidate stage has
     /// committed the event, reads the bias, turns the event's structure
-    /// facts and then its location facts, each in their order, into
-    /// trigger events, and refreshes `triggers`. Reads only those facts and
-    /// the committed state; appends the events to `events`.
+    /// facts, then its location facts, then its candidate facts, each in
+    /// their order, into trigger events, and refreshes `triggers`. Reads
+    /// only those facts and the committed state; appends the events to
+    /// `events`.
     pub(crate) fn detect(
         &mut self,
         structure_events: &[StructureEvent],
         location_events: &[LocationEvent],
+        candidate_events: &[CandidateEvent],
         inputs: Inputs<'_>,
         triggers: &mut Triggers,
         events: &mut Vec<TriggerEvent>,
@@ -510,14 +656,67 @@ impl TriggerTracker {
                 bias,
             });
         }
+        for fact in candidate_events {
+            let Some(triggered) = candidate::triggered(fact, inputs.location) else {
+                continue;
+            };
+            let (known_at, anchor) = (fact.time(), triggered.anchor());
+            match triggered.slot {
+                Slot::CvdDivergence(position, evidence) => {
+                    self.cvd_divergence[position] = Some(Trigger {
+                        known_at,
+                        anchor,
+                        evidence,
+                    });
+                }
+                Slot::EffortResult(position, evidence) => {
+                    self.effort_result[position] = Some(Trigger {
+                        known_at,
+                        anchor,
+                        evidence,
+                    });
+                }
+                Slot::Exhaustion(evidence) => {
+                    self.exhaustion = Some(Trigger {
+                        known_at,
+                        anchor,
+                        evidence,
+                    });
+                }
+                Slot::Absorption(position, evidence) => {
+                    self.absorption[position] = Some(Trigger {
+                        known_at,
+                        anchor,
+                        evidence,
+                    });
+                }
+            }
+            events.push(TriggerEvent {
+                feature: triggered.definition.key,
+                family: triggered.family,
+                known_at,
+                inputs: triggered.definition.inputs,
+                evidence: TriggerEvidence::Candidate(Box::new(fact.clone())),
+                context: triggered.context,
+                bias,
+            });
+        }
         let Triggers {
             bias: held,
             auction,
             sfp,
+            cvd_divergence,
+            effort_result,
+            exhaustion,
+            absorption,
         } = triggers;
         *held = bias;
         *auction = self.auction_values(inputs.location);
         *sfp = self.sfp_values(inputs.structure);
+        *cvd_divergence = self.cvd_divergence_values(inputs.candidates);
+        *effort_result = self.effort_result_values(inputs.candidates);
+        *exhaustion = self.exhaustion_value(inputs.candidates);
+        *absorption = self.absorption_values(inputs.candidates);
     }
 
     /// Every value as `inputs` stand, with the last triggers held.
@@ -526,7 +725,83 @@ impl TriggerTracker {
             bias: Bias::from_parts(inputs.regime, inputs.candidates),
             auction: self.auction_values(inputs.location),
             sfp: self.sfp_values(inputs.structure),
+            cvd_divergence: self.cvd_divergence_values(inputs.candidates),
+            effort_result: self.effort_result_values(inputs.candidates),
+            exhaustion: self.exhaustion_value(inputs.candidates),
+            absorption: self.absorption_values(inputs.candidates),
         }
+    }
+
+    /// The CVD divergence trigger values: each follows its timeframe's
+    /// `candidate.divergence.cvd.<tf>@1` (ADR-053 D1, D6).
+    fn cvd_divergence_values(
+        &self,
+        candidates: &Candidates,
+    ) -> [FeatureValue<TriggerValue<CvdComparison>>; 4] {
+        [0, 1, 2, 3].map(|position| {
+            let (timeframe, definition) = catalog::TRIGGER_CVD_DIVERGENCE[position];
+            let value = TriggerValue {
+                feature: definition.key,
+                last: self.cvd_divergence[position],
+            };
+            match candidates.divergences(timeframe) {
+                Some(divergences) => following(&divergences.cvd, value),
+                // Every structure timeframe has divergences.
+                None => FeatureValue::Ready(value),
+            }
+        })
+    }
+
+    /// The effort-vs-result trigger values: each follows its window's
+    /// `candidate.effort_result.<w>@1` (ADR-053 D1, D6).
+    fn effort_result_values(
+        &self,
+        candidates: &Candidates,
+    ) -> [FeatureValue<TriggerValue<EffortResult>>; 3] {
+        [0, 1, 2].map(|position| {
+            let (timeframe, definition) = catalog::TRIGGER_EFFORT_RESULT[position];
+            let value = TriggerValue {
+                feature: definition.key,
+                last: self.effort_result[position],
+            };
+            match candidates.effort_result(timeframe) {
+                Some(input) => following(input, value),
+                // Every effort window has an evaluation.
+                None => FeatureValue::Ready(value),
+            }
+        })
+    }
+
+    /// The exhaustion trigger value: it follows `candidate.exhaustion@1`
+    /// (ADR-053 D1, D6).
+    fn exhaustion_value(&self, candidates: &Candidates) -> FeatureValue<TriggerValue<Exhaustion>> {
+        following(
+            candidates.exhaustion(),
+            TriggerValue {
+                feature: catalog::TRIGGER_EXHAUSTION_V1.key,
+                last: self.exhaustion,
+            },
+        )
+    }
+
+    /// The absorption trigger values: each follows its window's
+    /// `candidate.absorption.<w>@1` (ADR-053 D1, D6).
+    fn absorption_values(
+        &self,
+        candidates: &Candidates,
+    ) -> [FeatureValue<TriggerValue<Absorption>>; 3] {
+        [0, 1, 2].map(|position| {
+            let (timeframe, definition) = catalog::TRIGGER_ABSORPTION[position];
+            let value = TriggerValue {
+                feature: definition.key,
+                last: self.absorption[position],
+            };
+            match candidates.absorption(timeframe) {
+                Some(input) => following(input, value),
+                // Every effort window has an absorption value.
+                None => FeatureValue::Ready(value),
+            }
+        })
     }
 
     /// The auction trigger values: each follows
@@ -579,7 +854,7 @@ fn following<T, U>(input: &FeatureValue<T>, value: U) -> FeatureValue<U> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::candidate::divergence::{CvdComparison, Divergence, SwingAnchor, SwingPair};
+    use crate::candidate::divergence::{Divergence, SwingAnchor, SwingPair};
     use crate::event::samples::t;
     use crate::event::{Aggressor, MarketEvent, Trade};
     use crate::feature::FeatureDefinition;
@@ -726,6 +1001,24 @@ mod tests {
             let levels = &state.structure.get(timeframe).unwrap().levels;
             assert_eq!(validity(value), validity(levels));
         }
+        for (timeframe, value) in triggers.iter_cvd_divergence() {
+            let cvd = &state.candidates.divergences(timeframe).unwrap().cvd;
+            assert_eq!(validity(value), validity(cvd));
+        }
+        for ((timeframe, effort, absorption), (_, effort_input, absorption_input)) in
+            triggers.iter_windows().zip(state.candidates.iter_windows())
+        {
+            assert_eq!(validity(effort), validity(effort_input), "{timeframe}");
+            assert_eq!(
+                validity(absorption),
+                validity(absorption_input),
+                "{timeframe}"
+            );
+        }
+        assert_eq!(
+            validity(triggers.exhaustion()),
+            validity(state.candidates.exhaustion())
+        );
         let facts = engine.trigger_events();
         for (index, fact) in facts.iter().enumerate() {
             assert_eq!(fact.known_at, state.as_of.unwrap());
@@ -739,7 +1032,7 @@ mod tests {
             {
                 continue;
             }
-            match fact.evidence {
+            match &fact.evidence {
                 TriggerEvidence::Auction(status) => {
                     let (_, value) = triggers
                         .iter_auction()
@@ -752,7 +1045,7 @@ mod tests {
                             Some(Trigger {
                                 known_at: fact.known_at,
                                 anchor: fact.anchor(),
-                                evidence: status,
+                                evidence: *status,
                             })
                         );
                     }
@@ -767,11 +1060,82 @@ mod tests {
                         Some(Trigger {
                             known_at: fact.known_at,
                             anchor: fact.anchor(),
-                            evidence: sweep,
+                            evidence: *sweep,
                         })
                     );
                 }
+                TriggerEvidence::Candidate(candidate) => check_candidate(triggers, fact, candidate),
             }
+        }
+    }
+
+    /// The candidate a trigger was built on, if any.
+    fn candidate_of(fact: &TriggerEvent) -> Option<&CandidateEvent> {
+        match &fact.evidence {
+            TriggerEvidence::Candidate(candidate) => Some(candidate),
+            TriggerEvidence::Auction(_) | TriggerEvidence::Sfp(_) => None,
+        }
+    }
+
+    /// ADR-053 D4, D6 on one candidate trigger: the candidate passed the
+    /// gate on the context the event carries, and its id's value, ready
+    /// with the candidate's input, holds the trigger with the candidate's
+    /// hashed value as evidence.
+    fn check_candidate(triggers: &Triggers, fact: &TriggerEvent, candidate: &CandidateEvent) {
+        assert_eq!(fact.known_at, candidate.time());
+        assert!(candidate::at_location(&fact.context), "{fact}");
+        fn expect<E: PartialEq + fmt::Debug>(
+            fact: &TriggerEvent,
+            value: Option<&FeatureValue<TriggerValue<E>>>,
+            evidence: E,
+        ) {
+            let FeatureValue::Ready(value) = value.unwrap() else {
+                panic!("a candidate fires on a ready input: {fact}");
+            };
+            assert_eq!(value.feature, fact.feature);
+            assert_eq!(
+                value.last,
+                Some(Trigger {
+                    known_at: fact.known_at,
+                    anchor: fact.anchor(),
+                    evidence,
+                })
+            );
+        }
+        match candidate {
+            CandidateEvent::CvdDivergence(event) => {
+                assert_eq!(fact.family, TriggerFamily::CvdDivergence);
+                assert_eq!(fact.anchor(), event.comparison.pair.current.price);
+                expect(
+                    fact,
+                    triggers.cvd_divergence(event.timeframe),
+                    event.comparison,
+                );
+            }
+            CandidateEvent::EffortVsResult(event) => {
+                assert_eq!(fact.family, TriggerFamily::EffortVsResult);
+                assert_eq!(fact.context, event.context);
+                expect(
+                    fact,
+                    triggers.effort_result(event.value.timeframe),
+                    event.value,
+                );
+            }
+            CandidateEvent::Exhaustion(event) => {
+                assert_eq!(fact.family, TriggerFamily::Exhaustion);
+                assert_eq!(fact.context, event.context);
+                expect(fact, Some(triggers.exhaustion()), event.value);
+            }
+            CandidateEvent::Absorption(event) => {
+                assert_eq!(fact.family, TriggerFamily::Absorption);
+                assert_eq!(fact.context, event.context);
+                expect(
+                    fact,
+                    triggers.absorption(event.value.effort.timeframe),
+                    event.value,
+                );
+            }
+            CandidateEvent::OiDivergence(_) => panic!("an OI divergence feeds no family: {fact}"),
         }
     }
 
@@ -786,11 +1150,16 @@ mod tests {
     }
 
     /// The auction triggers of `fired`, in order: the auction tapes also
-    /// sweep day 0's swing highs, so they emit SFP triggers too.
+    /// sweep day 0's swing highs and judge effort vs result, so they emit
+    /// SFP and candidate triggers too.
     fn auction_only(fired: Vec<(usize, TriggerEvent)>) -> Vec<(usize, TriggerEvent)> {
         fired
             .into_iter()
-            .filter(|(_, fact)| fact.family != TriggerFamily::Sfp)
+            .filter(|(_, fact)| {
+                AUCTION_TRIGGERS
+                    .iter()
+                    .any(|(family, _)| *family == fact.family)
+            })
             .collect()
     }
 
@@ -798,7 +1167,7 @@ mod tests {
     fn status_of(fact: &TriggerEvent) -> &AuctionStatus {
         match &fact.evidence {
             TriggerEvidence::Auction(status) => status,
-            TriggerEvidence::Sfp(sweep) => panic!("{sweep}"),
+            other => panic!("{other}"),
         }
     }
 
@@ -977,7 +1346,7 @@ mod tests {
             assert_eq!(fact.inputs, definition.inputs);
             assert_eq!(fact.known_at, t(12 * span + 1_000), "{timeframe}");
             assert_eq!(fact.anchor(), usdt(60_015));
-            let TriggerEvidence::Sfp(sweep) = fact.evidence else {
+            let TriggerEvidence::Sfp(sweep) = &fact.evidence else {
                 panic!("{fact}")
             };
             assert_eq!(
@@ -1028,6 +1397,31 @@ mod tests {
     /// swept swing's bar. Written from the ADR text, not from the code.
     fn of_swept_swing(
         sweep: &Sweep,
+        level: (
+            Option<crate::location::LevelSide>,
+            FeatureKey,
+            Option<EventTime>,
+            Price,
+        ),
+    ) -> bool {
+        of_swing(
+            (
+                sweep.timeframe,
+                sweep.level.side,
+                sweep.level.price,
+                sweep.level.swing_time,
+            ),
+            level,
+        )
+    }
+
+    /// Whether a level marks the extreme of a swing — its timeframe, side,
+    /// price and swing-bar open — as any structure timeframe registered it
+    /// (ADR-053 D4): a `structure.levels.<tf>` level of that side and price
+    /// whose swing bar nests with the swing's bar. Written from the ADR
+    /// text, not from the code.
+    fn of_swing(
+        (swing_timeframe, swing_side, swing_price, swing_time): (Timeframe, Side, Price, EventTime),
         (side, source, anchor, price): (
             Option<crate::location::LevelSide>,
             FeatureKey,
@@ -1045,16 +1439,221 @@ mod tests {
             return false;
         };
         let end = open + timeframe.millis();
-        let swing_open = sweep.level.swing_time.as_millis();
-        let swing_end = swing_open + sweep.timeframe.millis();
-        let swing_side = match sweep.level.side {
+        let swing_open = swing_time.as_millis();
+        let swing_end = swing_open + swing_timeframe.millis();
+        let swing_side = match swing_side {
             Side::High => crate::location::LevelSide::High,
             Side::Low => crate::location::LevelSide::Low,
         };
         side == Some(swing_side)
-            && price == sweep.level.price
+            && price == swing_price
             && ((open <= swing_open && swing_end <= end)
                 || (swing_open <= open && end <= swing_end))
+    }
+
+    /// Whether `kind` is one the candidate gate admits, written from the
+    /// ADR-053 D4 text.
+    fn admitted(kind: LevelKind) -> bool {
+        matches!(
+            kind,
+            LevelKind::Poc
+                | LevelKind::Vah
+                | LevelKind::Val
+                | LevelKind::Hvn
+                | LevelKind::Lvn
+                | LevelKind::StructuralHigh
+                | LevelKind::StructuralLow
+                | LevelKind::SfpRejectionZone
+                | LevelKind::Vwap
+        )
+    }
+
+    #[test]
+    fn the_candidate_gate_on_the_golden_tape() {
+        // ADR-053 D4, D6, D8: on the candidate golden tape the gate, written
+        // here from the ADR text over the registry the stage read, passes
+        // exactly the candidates that fire; no CVD trigger context lists a
+        // level of either swing, and every other candidate trigger carries
+        // its candidate's own context. The counts the ADR quotes are pinned
+        // here; a change to one moves the ADR text in the same PR.
+        let mut engine = MarketStateEngine::new();
+        let mut effort_warmed_up = false;
+        let mut divergences = [0; 4];
+        let mut previous_listed = 0;
+        let mut current_skipped = 0;
+        let mut both_skipped = [0; 4];
+        let (mut unpadded, mut padded) = (0, 0);
+        let mut outside_pair_only = 0;
+        let (mut edges, mut edge_triggers) = (0, 0);
+        for event in crate::candidate::tests::golden_tape() {
+            engine.apply(&event).unwrap();
+            check_values(&engine);
+            // The effort ids follow their input through its 1 440
+            // evaluations of warm-up.
+            if let Some(FeatureValue::WarmingUp { required, .. }) =
+                engine.state().triggers.effort_result(Timeframe::M5)
+            {
+                assert_eq!(*required, 1_440);
+                effort_warmed_up = true;
+            }
+            let fired: Vec<&TriggerEvent> = engine
+                .trigger_events()
+                .iter()
+                .filter(|fact| matches!(fact.evidence, TriggerEvidence::Candidate(_)))
+                .collect();
+            for fact in &fired {
+                if matches!(
+                    fact.family,
+                    TriggerFamily::EffortVsResult | TriggerFamily::Exhaustion
+                ) {
+                    edge_triggers += 1;
+                }
+            }
+            let fired_on = |candidate: &CandidateEvent| {
+                fired
+                    .iter()
+                    .filter(|fact| candidate_of(fact) == Some(candidate))
+                    .collect::<Vec<_>>()
+            };
+            for candidate in engine.candidate_events() {
+                let event = match candidate {
+                    CandidateEvent::CvdDivergence(event) => event,
+                    CandidateEvent::EffortVsResult(_) | CandidateEvent::Exhaustion(_) => {
+                        edges += 1;
+                        let gate = candidate.context().levels.ready().is_some_and(|levels| {
+                            levels.levels.iter().any(|level| admitted(level.kind))
+                        });
+                        assert_eq!(fired_on(candidate).len(), usize::from(gate), "{candidate}");
+                        continue;
+                    }
+                    _ => continue,
+                };
+                let position = STRUCTURE_TIMEFRAMES
+                    .iter()
+                    .position(|timeframe| *timeframe == event.timeframe)
+                    .unwrap();
+                divergences[position] += 1;
+                let pair = event.comparison.pair;
+                let price = pair.current.price;
+                let swing = |anchor: &SwingAnchor| {
+                    (event.timeframe, pair.side, anchor.price, anchor.swing_time)
+                };
+                let identity = |level: &crate::location::LocationLevel| {
+                    (level.side, level.source, level.anchor, level.price)
+                };
+                let of_current = |level| of_swing(swing(&pair.current), identity(level));
+                let of_previous = |level| of_swing(swing(&pair.previous), identity(level));
+                let at: Vec<&crate::location::LocationLevel> = engine
+                    .state()
+                    .location
+                    .levels
+                    .ready()
+                    .map(|registry| {
+                        registry
+                            .levels()
+                            .iter()
+                            .filter(|level| zone_contains(level, price))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let previous: Vec<_> = at
+                    .iter()
+                    .filter(|level| admitted(level.kind) && of_previous(level))
+                    .collect();
+                if !previous.is_empty() {
+                    previous_listed += 1;
+                }
+                assert!(
+                    previous
+                        .iter()
+                        .all(|level| level.kind == LevelKind::SfpRejectionZone),
+                    "{candidate}"
+                );
+                let without_current: Vec<_> = at
+                    .iter()
+                    .filter(|level| admitted(level.kind) && !of_current(level))
+                    .collect();
+                let without_pair: Vec<_> = without_current
+                    .iter()
+                    .filter(|level| !of_previous(level))
+                    .collect();
+                let gate_current = !without_current.is_empty();
+                let gate_pair = !without_pair.is_empty();
+                if gate_current {
+                    current_skipped += 1;
+                }
+                if gate_pair {
+                    both_skipped[position] += 1;
+                    // Passes only on SFP zones that resolved at or after the
+                    // current swing's anchor trade: swings outside the pair
+                    // that the candidate's own move made a zone of.
+                    if without_pair.iter().all(|level| {
+                        level.kind == LevelKind::SfpRejectionZone
+                            && level.known_at >= pair.current.time
+                    }) {
+                        outside_pair_only += 1;
+                    }
+                } else if gate_current {
+                    // The previous swing alone decides: does its zone reach
+                    // the current price, or only its padding?
+                    if without_current
+                        .iter()
+                        .any(|level| level.low <= price && price <= level.high)
+                    {
+                        unpadded += 1;
+                    } else {
+                        padded += 1;
+                    }
+                }
+                let own = fired_on(candidate);
+                assert_eq!(own.len(), usize::from(gate_pair), "{candidate}");
+                for fact in own {
+                    assert_eq!(
+                        fact.feature,
+                        catalog::TRIGGER_CVD_DIVERGENCE[position].1.key
+                    );
+                    assert_eq!(fact.anchor(), price);
+                    let levels = &fact.context.levels.ready().unwrap().levels;
+                    assert!(
+                        levels.iter().all(|level| {
+                            let identity = (level.side, level.source, level.anchor, level.price);
+                            !of_swing(swing(&pair.current), identity)
+                                && !of_swing(swing(&pair.previous), identity)
+                        }),
+                        "{fact}"
+                    );
+                }
+            }
+        }
+        assert!(effort_warmed_up);
+        // Trades only: the absorption ids stay warming up (ADR-053 D6).
+        for (timeframe, _, absorption) in engine.state().triggers.iter_windows() {
+            assert!(
+                matches!(absorption, FeatureValue::WarmingUp { .. }),
+                "{timeframe}"
+            );
+        }
+        // ADR-053 D4 and D8 quote these counts.
+        assert_eq!(
+            (
+                divergences,
+                previous_listed,
+                current_skipped,
+                both_skipped,
+                (unpadded, padded),
+                outside_pair_only,
+                (edges, edge_triggers),
+            ),
+            (
+                [194, 52, 11, 0],
+                120,
+                248,
+                [182, 50, 11, 0],
+                (1, 4),
+                3,
+                (6_962, 6_892),
+            )
+        );
     }
 
     #[test]
@@ -1070,7 +1669,7 @@ mod tests {
         for event in crate::candidate::tests::golden_tape() {
             engine.apply(&event).unwrap();
             for fact in engine.trigger_events() {
-                let TriggerEvidence::Sfp(sweep) = fact.evidence else {
+                let TriggerEvidence::Sfp(sweep) = &fact.evidence else {
                     continue;
                 };
                 sfps += 1;
@@ -1082,7 +1681,7 @@ mod tests {
                         level.source != sweep.feature
                             && zone_contains(level, fact.anchor())
                             && of_swept_swing(
-                                &sweep,
+                                sweep,
                                 (level.side, level.source, level.anchor, level.price),
                             )
                     })
@@ -1106,10 +1705,7 @@ mod tests {
                     .levels
                     .iter()
                     .filter(|level| {
-                        of_swept_swing(
-                            &sweep,
-                            (level.side, level.source, level.anchor, level.price),
-                        )
+                        of_swept_swing(sweep, (level.side, level.source, level.anchor, level.price))
                     })
                     .collect();
                 assert!(left.is_empty(), "{fact}: {left:?}");
@@ -1119,13 +1715,260 @@ mod tests {
         assert_eq!((sfps, other_timeframe, gate_kind), (515, 202, 104));
     }
 
+    /// `events` with every trade's time multiplied by `time` and its
+    /// distance from 60 000 USDT by `price`: the same structure on longer
+    /// bars or a wider range.
+    fn scaled(events: Vec<MarketEvent>, time: i64, price: i64) -> Vec<MarketEvent> {
+        let base = 60_000 * SCALE;
+        events
+            .into_iter()
+            .map(|event| match event {
+                MarketEvent::Trade(trade) => MarketEvent::Trade(Trade {
+                    time: t(trade.time.as_millis() * time),
+                    price: Price::from_units(base + (trade.price.units() - base) * price),
+                    ..trade
+                }),
+                other => other,
+            })
+            .collect()
+    }
+
+    /// Replays `events` through a new engine, checking the values after
+    /// each one, and returns the CVD divergence candidates and the CVD
+    /// divergence triggers with the engine.
+    fn divergences_of(
+        events: &[MarketEvent],
+    ) -> (
+        Vec<
+            crate::candidate::divergence::DivergenceEvent<
+                crate::candidate::divergence::CvdComparison,
+            >,
+        >,
+        Vec<TriggerEvent>,
+        MarketStateEngine,
+    ) {
+        let mut engine = MarketStateEngine::new();
+        let (mut candidates, mut triggers) = (Vec::new(), Vec::new());
+        for event in events {
+            engine.apply(event).unwrap();
+            check_values(&engine);
+            candidates.extend(
+                engine
+                    .candidate_events()
+                    .iter()
+                    .filter_map(|fact| match fact {
+                        CandidateEvent::CvdDivergence(event) => Some(event.clone()),
+                        _ => None,
+                    }),
+            );
+            triggers.extend(
+                engine
+                    .trigger_events()
+                    .iter()
+                    .filter(|fact| fact.family == TriggerFamily::CvdDivergence)
+                    .cloned(),
+            );
+        }
+        (candidates, triggers, engine)
+    }
+
+    /// Whether a context level marks either swing of `pair` on `timeframe`
+    /// (ADR-053 D4).
+    fn of_pair(
+        timeframe: Timeframe,
+        pair: &SwingPair,
+        level: &crate::candidate::ContextLevel,
+    ) -> bool {
+        let identity = (level.side, level.source, level.anchor, level.price);
+        [pair.previous, pair.current].iter().any(|swing| {
+            of_swing(
+                (timeframe, pair.side, swing.price, swing.swing_time),
+                identity,
+            )
+        })
+    }
+
+    #[test]
+    fn a_divergence_does_not_pass_the_gate_on_its_own_pair() {
+        // ADR-053 D4: B's move sweeps swing A and closes back inside within
+        // the SFP window, so A's SFP zone reaches B's price. On the
+        // divergence scenario spread ten times wider, nothing else lies
+        // within the tolerance of B: the candidate fires and lists A's
+        // zone, the trigger does not.
+        for side in [Side::High, Side::Low] {
+            let scenario = crate::candidate::divergence::tests::Scenario::divergent(side);
+            let (candidates, triggers, engine) = divergences_of(&scaled(scenario.tape(), 1, 10));
+            let [candidate] = candidates.as_slice() else {
+                panic!("{side}: {candidates:?}")
+            };
+            let pair = candidate.comparison.pair;
+            let levels = &candidate.context.levels.ready().unwrap().levels;
+            let admitted_levels: Vec<_> =
+                levels.iter().filter(|level| admitted(level.kind)).collect();
+            assert!(
+                admitted_levels.iter().any(|level| {
+                    level.kind == LevelKind::SfpRejectionZone && level.price == pair.previous.price
+                }),
+                "{candidate}"
+            );
+            assert!(
+                admitted_levels
+                    .iter()
+                    .all(|level| of_pair(Timeframe::M15, &pair, level)),
+                "{candidate}"
+            );
+            assert_eq!(triggers, [], "{side}");
+            assert_eq!(
+                engine.state().triggers.cvd_divergence(Timeframe::M15),
+                Some(&FeatureValue::Ready(TriggerValue {
+                    feature: catalog::TRIGGER_CVD_DIVERGENCE_15M_V1.key,
+                    last: None,
+                }))
+            );
+        }
+    }
+
+    #[test]
+    fn a_divergence_at_a_place_outside_its_pair_fires_once() {
+        // ADR-053 D4, D6: on the divergence scenario as it stands, the swing
+        // of the other side and the VWAP lie within the tolerance of B. One
+        // trigger fires; its context lists neither swing's levels, which
+        // the candidate's own context still lists, and its evidence is the
+        // candidate event.
+        for side in [Side::High, Side::Low] {
+            let scenario = crate::candidate::divergence::tests::Scenario::divergent(side);
+            let (candidates, triggers, engine) = divergences_of(&scenario.tape());
+            let ([candidate], [fact]) = (candidates.as_slice(), triggers.as_slice()) else {
+                panic!("{side}: {candidates:?} {triggers:?}")
+            };
+            let pair = candidate.comparison.pair;
+            assert_eq!(fact.feature, catalog::TRIGGER_CVD_DIVERGENCE_15M_V1.key);
+            assert_eq!(fact.inputs, catalog::TRIGGER_CVD_DIVERGENCE_15M_V1.inputs);
+            assert_eq!(fact.known_at, candidate.known_at);
+            assert_eq!(fact.anchor(), pair.current.price);
+            assert_eq!(
+                fact.evidence,
+                TriggerEvidence::Candidate(Box::new(CandidateEvent::CvdDivergence(
+                    candidate.clone()
+                )))
+            );
+            let own = &candidate.context.levels.ready().unwrap().levels;
+            assert!(
+                own.iter().any(|level| level.price == pair.previous.price
+                    && of_pair(Timeframe::M15, &pair, level)),
+                "{candidate}"
+            );
+            let levels = &fact.context.levels.ready().unwrap().levels;
+            assert!(levels.iter().any(|level| admitted(level.kind)), "{fact}");
+            assert!(
+                levels
+                    .iter()
+                    .all(|level| !of_pair(Timeframe::M15, &pair, level)),
+                "{fact}"
+            );
+            // The levels it lists are the candidate's, without the pair's.
+            let kept: Vec<_> = own
+                .iter()
+                .filter(|level| !of_pair(Timeframe::M15, &pair, level))
+                .collect();
+            assert_eq!(levels.iter().collect::<Vec<_>>(), kept);
+            let FeatureValue::Ready(value) = engine
+                .state()
+                .triggers
+                .cvd_divergence(Timeframe::M15)
+                .unwrap()
+            else {
+                panic!("{side}")
+            };
+            assert_eq!(
+                value.last,
+                Some(Trigger {
+                    known_at: fact.known_at,
+                    anchor: pair.current.price,
+                    evidence: candidate.comparison,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn a_daily_divergence_fires_through_the_engine() {
+        // The 45-day golden tape holds no daily divergence; the divergence
+        // scenario on daily bars does. Its swings are also swings of every
+        // shorter structure timeframe inside their days, which the context
+        // leaves out (ADR-053 D4).
+        for side in [Side::High, Side::Low] {
+            let scenario = crate::candidate::divergence::tests::Scenario::divergent(side);
+            let (candidates, triggers, engine) =
+                divergences_of(&scaled(scenario.tape(), DAY / 900_000, 1));
+            let daily: Vec<_> = triggers
+                .iter()
+                .filter(|fact| fact.feature == catalog::TRIGGER_CVD_DIVERGENCE_1D_V1.key)
+                .collect();
+            let [fact] = daily.as_slice() else {
+                panic!("{side}: {triggers:?}")
+            };
+            let Some(CandidateEvent::CvdDivergence(candidate)) = candidate_of(fact) else {
+                panic!("{fact}")
+            };
+            assert!(candidates.contains(candidate));
+            assert_eq!(candidate.timeframe, Timeframe::D1);
+            let pair = candidate.comparison.pair;
+            let levels = &fact.context.levels.ready().unwrap().levels;
+            assert!(
+                levels
+                    .iter()
+                    .all(|level| !of_pair(Timeframe::D1, &pair, level)),
+                "{fact}"
+            );
+            let FeatureValue::Ready(value) = engine
+                .state()
+                .triggers
+                .cvd_divergence(Timeframe::D1)
+                .unwrap()
+            else {
+                panic!("{side}")
+            };
+            assert_eq!(
+                value.last.map(|last| last.evidence),
+                Some(candidate.comparison)
+            );
+        }
+    }
+
+    #[test]
+    fn absorption_fires_on_a_book_with_its_candidates_location() {
+        // ADR-053 D6: live only. On the book tape every absorption id fires
+        // on its candidate's rising edge, at the candidate's own context.
+        let mut engine = MarketStateEngine::new();
+        let mut fired = [0; 3];
+        for event in crate::candidate::tests::book_tape() {
+            engine.apply(&event).unwrap();
+            check_values(&engine);
+            for fact in engine.trigger_events() {
+                let Some(CandidateEvent::Absorption(candidate)) = candidate_of(fact) else {
+                    continue;
+                };
+                assert_eq!(fact.context, candidate.context);
+                let position = catalog::TRIGGER_ABSORPTION
+                    .iter()
+                    .position(|(_, definition)| definition.key == fact.feature)
+                    .unwrap();
+                fired[position] += 1;
+            }
+        }
+        assert!(fired.iter().all(|count| *count > 0), "{fired:?}");
+    }
+
     /// The brief §11 tape: day 0 as [`Tape::prior_day`]; on day 1 one trade
     /// a minute in the middle of value, but a 15m swing high exactly at the
     /// prior day's VAH on bar 16 (minute 247). Bar 20 probes above value
     /// from minute 301 to 313, which also sweeps the swing, and its last
-    /// minute closes back inside. The trade 1 s into minute 315 closes that
-    /// minute and bar 20: one event fails the probe and resolves the sweep
-    /// as an SFP. Returns the tape and VAH.
+    /// minute closes back inside, 40 USDT below VAH: inside value beyond the
+    /// edge band, and within the padded zone of the VAH level. The trade
+    /// 1 s into minute 315 closes that minute and bar 20: one event fails
+    /// the probe, resolves the sweep as an SFP and judges the minute's
+    /// effort vs result at that close. Returns the tape and VAH.
     fn at_value_edge() -> (Vec<MarketEvent>, Price) {
         let (val, vah) = value_area();
         let middle = Price::from_units((val.units() + vah.units()) / 2);
@@ -1135,27 +1978,52 @@ mod tests {
         for price in &mut path[301..314] {
             *price = beyond;
         }
+        path[314] = Price::from_units(vah.units() - 40 * SCALE);
         (auction_tape(&path), vah)
     }
 
+    /// The trigger events of the last event of `fired`.
+    fn last_event(fired: &[(usize, TriggerEvent)]) -> Vec<&TriggerEvent> {
+        let last = fired.last().map(|(index, _)| *index);
+        fired
+            .iter()
+            .filter(|(index, _)| Some(*index) == last)
+            .map(|(_, fact)| fact)
+            .collect()
+    }
+
     #[test]
-    fn one_bias_and_location_meet_two_families() {
+    fn one_bias_and_location_meet_three_families() {
         // Brief §11, ADR-053 D2–D4: the same bias and location, tested
-        // against two families in one event, in emission order.
+        // against three families in one event, in emission order: the
+        // structure fact, the location fact, the candidate fact.
         let (events, vah) = at_value_edge();
-        let fired = triggers_of(&events);
+        let mut engine = MarketStateEngine::new();
+        let fired = run(&mut engine, &events);
+        assert_eq!(fired.last().unwrap().0, events.len() - 1);
+        let last = last_event(&fired);
         assert_eq!(
-            families(&fired),
-            [TriggerFamily::Sfp, TriggerFamily::FailedAuction]
+            last.iter().map(|fact| fact.family).collect::<Vec<_>>(),
+            [
+                TriggerFamily::Sfp,
+                TriggerFamily::FailedAuction,
+                TriggerFamily::EffortVsResult
+            ]
         );
-        let [(sfp_at, sfp), (auction_at, auction)] = fired.as_slice() else {
+        let [sfp, auction, effort] = last.as_slice() else {
             unreachable!()
         };
-        assert_eq!(sfp_at, auction_at);
-        assert_eq!(*sfp_at, events.len() - 1);
         assert_eq!(sfp.feature, catalog::TRIGGER_SFP_15M_V1.key);
         assert_eq!(sfp.bias, auction.bias);
+        assert_eq!(effort.bias, sfp.bias);
+        assert_eq!(effort.bias, Bias::read(engine.state()));
         assert_eq!((sfp.anchor(), auction.anchor()), (vah, vah));
+        // The candidate's anchor is the last close, inside value.
+        assert_eq!(effort.anchor(), Price::from_units(vah.units() - 40 * SCALE));
+        let Some(CandidateEvent::EffortVsResult(candidate)) = candidate_of(effort) else {
+            panic!("{effort}")
+        };
+        assert_eq!(effort.context, candidate.context);
         let prior_vah = |fact: &TriggerEvent| {
             fact.context
                 .levels
@@ -1171,6 +2039,7 @@ mod tests {
         };
         let level = prior_vah(sfp).expect("the SFP context lists the prior day's VAH");
         assert_eq!(prior_vah(auction), Some(level));
+        assert_eq!(prior_vah(effort), Some(level));
         assert_eq!(level.price, vah);
     }
 
@@ -1190,6 +2059,7 @@ mod tests {
             TriggerTracker::new().detect(
                 engine.structure_events(),
                 engine.location_events(),
+                engine.candidate_events(),
                 Inputs {
                     regime,
                     structure: &state.structure,
@@ -1202,7 +2072,20 @@ mod tests {
             (triggers, fired)
         };
         let (triggers, fired) = detect(&state.regime, &state.candidates);
-        assert_eq!(fired.len(), 2);
+        assert_eq!(
+            families(
+                &fired
+                    .iter()
+                    .cloned()
+                    .map(|fact| (0, fact))
+                    .collect::<Vec<_>>()
+            ),
+            [
+                TriggerFamily::Sfp,
+                TriggerFamily::FailedAuction,
+                TriggerFamily::EffortVsResult
+            ]
+        );
         let percentile = AtrPercentile::new(90.0).unwrap();
         let regime = FeatureValue::Ready(Regime {
             atr_percentile: percentile,
@@ -1236,10 +2119,25 @@ mod tests {
             }),
             low: None,
         });
-        let (other_triggers, other_fired) = detect(&regime, &candidates);
+        let (mut other_triggers, other_fired) = detect(&regime, &candidates);
         assert_ne!(other_triggers.bias(), triggers.bias());
-        assert_eq!(other_triggers.auction, triggers.auction);
-        assert_eq!(other_triggers.sfp, triggers.sfp);
+        // The 4h CVD divergence trigger follows the validity of the input
+        // the edit made ready (ADR-053 D1), and holds no trigger either
+        // way; every other value, the candidate ones included, is the same.
+        assert_eq!(
+            validity(&triggers.cvd_divergence[2]),
+            validity(&state.candidates.divergences(Timeframe::H4).unwrap().cvd)
+        );
+        assert_eq!(
+            other_triggers.cvd_divergence[2],
+            FeatureValue::Ready(TriggerValue {
+                feature: catalog::TRIGGER_CVD_DIVERGENCE_4H_V1.key,
+                last: None,
+            })
+        );
+        other_triggers.bias = triggers.bias;
+        other_triggers.cvd_divergence[2] = triggers.cvd_divergence[2];
+        assert_eq!(other_triggers, triggers);
         assert_eq!(other_fired.len(), fired.len());
         for (fact, other) in fired.iter().zip(&other_fired) {
             assert_ne!(fact.bias, other.bias);
@@ -1257,7 +2155,7 @@ mod tests {
             engine.apply(event).unwrap();
         }
         let facts = engine.trigger_events().to_vec();
-        assert_eq!(facts.len(), 2);
+        assert_eq!(facts.len(), 3);
         let triggers = engine.state().triggers.clone();
         // A trade whose volume overflows the developing bars.
         let last = events.last().unwrap().time().as_millis();
@@ -1294,6 +2192,13 @@ mod tests {
         let tape = crate::location::tests::walk_tape(0x6d69_6500_0000_0024, 4);
         let (facts, hashes) = replay(&tape);
         assert!(!facts.is_empty());
+        // The candidate ids are among them.
+        assert!(
+            facts
+                .iter()
+                .any(|fact| fact.starts_with("effort_vs_result ")),
+            "{facts:?}"
+        );
         assert_eq!(replay(&tape), (facts, hashes));
     }
 
@@ -1322,7 +2227,17 @@ mod tests {
         assert_eq!(engine.state().feature_set, features.version());
         let (events, _) = at_value_edge();
         let fired = run(&mut engine, &events);
-        assert_eq!(fired.len(), 2);
+        assert_eq!(
+            last_event(&fired)
+                .iter()
+                .map(|fact| fact.family)
+                .collect::<Vec<_>>(),
+            [
+                TriggerFamily::Sfp,
+                TriggerFamily::FailedAuction,
+                TriggerFamily::EffortVsResult
+            ]
+        );
         for (_, fact) in &fired {
             assert_eq!(
                 fact.context.levels.ready().unwrap().feature,
@@ -1362,11 +2277,23 @@ mod tests {
         let mut definitions: Vec<&'static FeatureDefinition> = vec![&catalog::BIAS_CONTEXT_V1];
         definitions.extend(AUCTION_TRIGGERS.map(|(_, definition)| definition));
         definitions.extend(catalog::TRIGGER_SFP.map(|(_, definition)| definition));
+        definitions.extend(candidate_definitions());
         definitions
     }
 
-    /// Whether a value changed: the bias, each auction id, each SFP id, in
-    /// [`trigger_definitions`] order.
+    /// Every candidate trigger definition (ADR-053 D6), in
+    /// [`Triggers`] order.
+    fn candidate_definitions() -> Vec<&'static FeatureDefinition> {
+        let mut definitions: Vec<&'static FeatureDefinition> = Vec::new();
+        definitions.extend(catalog::TRIGGER_CVD_DIVERGENCE.map(|(_, definition)| definition));
+        definitions.extend(catalog::TRIGGER_EFFORT_RESULT.map(|(_, definition)| definition));
+        definitions.push(&catalog::TRIGGER_EXHAUSTION_V1);
+        definitions.extend(catalog::TRIGGER_ABSORPTION.map(|(_, definition)| definition));
+        definitions
+    }
+
+    /// Whether a value changed: the bias, each auction id, each SFP id,
+    /// then each candidate id, in [`trigger_definitions`] order.
     fn changes(before: &Triggers, after: &Triggers) -> Vec<(FeatureKey, Option<String>)> {
         let mut changes = vec![(
             catalog::BIAS_CONTEXT_V1.key,
@@ -1384,6 +2311,31 @@ mod tests {
             before.sfp.iter().zip(&after.sfp).zip(catalog::TRIGGER_SFP)
         {
             changes.push((definition.key, (old != new).then(|| shown(new))));
+        }
+        let candidate_changes = before
+            .cvd_divergence
+            .iter()
+            .zip(&after.cvd_divergence)
+            .map(|(old, new)| (old != new).then(|| shown(new)))
+            .chain(
+                before
+                    .effort_result
+                    .iter()
+                    .zip(&after.effort_result)
+                    .map(|(old, new)| (old != new).then(|| shown(new))),
+            )
+            .chain(std::iter::once(
+                (before.exhaustion != after.exhaustion).then(|| shown(&after.exhaustion)),
+            ))
+            .chain(
+                before
+                    .absorption
+                    .iter()
+                    .zip(&after.absorption)
+                    .map(|(old, new)| (old != new).then(|| shown(new))),
+            );
+        for (change, definition) in candidate_changes.zip(candidate_definitions()) {
+            changes.push((definition.key, change));
         }
         changes
     }
@@ -1444,14 +2396,28 @@ mod tests {
         }
     }
 
+    /// The golden lines of the book tape (the candidate absorption golden
+    /// tape), as [`golden_lines`]: absorption is live only, so its trigger
+    /// ids fire only on a tape with a book.
+    fn book_golden_lines() -> &'static [(FeatureKey, String)] {
+        static LINES: std::sync::OnceLock<Vec<(FeatureKey, String)>> = std::sync::OnceLock::new();
+        LINES.get_or_init(|| replay_golden(crate::candidate::tests::book_tape()))
+    }
+
     /// The golden lines `feature` is pinned on: the auction golden tape for
-    /// the auction ids, the candidate golden tape for the rest.
+    /// the auction ids, the book tape for the absorption ids, the candidate
+    /// golden tape for the rest.
     fn golden_of(feature: &FeatureDefinition) -> &'static [(FeatureKey, String)] {
         if AUCTION_TRIGGERS
             .iter()
             .any(|(_, definition)| definition.key == feature.key)
         {
             auction_golden_lines()
+        } else if catalog::TRIGGER_ABSORPTION
+            .iter()
+            .any(|(_, definition)| definition.key == feature.key)
+        {
+            book_golden_lines()
         } else {
             golden_lines()
         }
@@ -1501,14 +2467,19 @@ mod tests {
     }
 
     #[test]
-    fn every_trigger_id_but_sfp_1d_fires_on_its_golden_tape() {
+    fn every_trigger_id_with_a_fact_on_its_golden_tape_fires_there() {
         // The goldens are not vacuous. The 45-day tape holds no SFP of a
-        // daily swing; the synthetic SFP test fires that id.
+        // daily swing and no daily divergence; the synthetic SFP and 1d
+        // divergence tests fire those ids.
+        let without = [
+            catalog::TRIGGER_SFP_1D_V1.key,
+            catalog::TRIGGER_CVD_DIVERGENCE_1D_V1.key,
+        ];
         for definition in trigger_definitions().into_iter().skip(1) {
             let (own, _) = own_lines(golden_of(definition), definition.key);
             let facts = own.iter().filter(|line| !line.contains(" value ")).count();
-            if definition.key == catalog::TRIGGER_SFP_1D_V1.key {
-                assert_eq!(facts, 0);
+            if without.contains(&definition.key) {
+                assert_eq!(facts, 0, "{}", definition.key);
             } else {
                 assert!(facts > 0, "{}", definition.key);
             }
@@ -1561,15 +2532,14 @@ mod tests {
         let mut lines: Vec<&str> = golden_lines()
             .iter()
             .chain(auction_golden_lines())
+            .chain(book_golden_lines())
             .map(|(_, line)| line.as_str())
             .collect();
         lines.extend(samples.iter().map(String::as_str));
-        for family in [
-            TriggerFamily::FailedAuction,
-            TriggerFamily::FailedReclaim,
-            TriggerFamily::BreakoutAcceptance,
-            TriggerFamily::Sfp,
-        ] {
+        for family in TriggerFamily::ALL
+            .into_iter()
+            .filter(|family| *family != TriggerFamily::OiExpansionRejection)
+        {
             let prefix = format!("{family} evidence=");
             assert!(lines.iter().any(|line| line.contains(&prefix)), "{family}");
         }
@@ -1661,6 +2631,116 @@ mod tests {
         );
     }
 
+    #[test]
+    fn golden_trigger_cvd_divergence_15m_v1() {
+        assert_golden(
+            &catalog::TRIGGER_CVD_DIVERGENCE_15M_V1,
+            365,
+            GOLDEN_CVD_DIVERGENCE_15M,
+            "a6259dbebcb71ba3",
+        );
+    }
+
+    #[test]
+    fn golden_trigger_cvd_divergence_1h_v1() {
+        assert_golden(
+            &catalog::TRIGGER_CVD_DIVERGENCE_1H_V1,
+            101,
+            GOLDEN_CVD_DIVERGENCE_1H,
+            "dda22abd91e5fc1b",
+        );
+    }
+
+    #[test]
+    fn golden_trigger_cvd_divergence_4h_v1() {
+        assert_golden(
+            &catalog::TRIGGER_CVD_DIVERGENCE_4H_V1,
+            23,
+            GOLDEN_CVD_DIVERGENCE_4H,
+            "6e0e2a1d22cc85fe",
+        );
+    }
+
+    #[test]
+    fn golden_trigger_cvd_divergence_1d_v1() {
+        assert_golden(
+            &catalog::TRIGGER_CVD_DIVERGENCE_1D_V1,
+            1,
+            GOLDEN_CVD_DIVERGENCE_1D,
+            "e9b34ffdcfdadaa4",
+        );
+    }
+
+    #[test]
+    fn golden_trigger_effort_result_5m_v1() {
+        assert_golden(
+            &catalog::TRIGGER_EFFORT_RESULT_5M_V1,
+            8369,
+            GOLDEN_EFFORT_RESULT_5M,
+            "c3c79821d8dff78b",
+        );
+    }
+
+    #[test]
+    fn golden_trigger_effort_result_15m_v1() {
+        assert_golden(
+            &catalog::TRIGGER_EFFORT_RESULT_15M_V1,
+            5704,
+            GOLDEN_EFFORT_RESULT_15M,
+            "e64a843912fc5708",
+        );
+    }
+
+    #[test]
+    fn golden_trigger_effort_result_1h_v1() {
+        assert_golden(
+            &catalog::TRIGGER_EFFORT_RESULT_1H_V1,
+            3728,
+            GOLDEN_EFFORT_RESULT_1H,
+            "5a9b9c8a4fa51f76",
+        );
+    }
+
+    #[test]
+    fn golden_trigger_exhaustion_v1() {
+        assert_golden(
+            &catalog::TRIGGER_EXHAUSTION_V1,
+            308,
+            GOLDEN_EXHAUSTION,
+            "e1ff7823ea5f220f",
+        );
+    }
+
+    #[test]
+    fn golden_trigger_absorption_5m_v1() {
+        assert_golden(
+            &catalog::TRIGGER_ABSORPTION_5M_V1,
+            11,
+            GOLDEN_ABSORPTION_5M,
+            "b77fb84f936394c8",
+        );
+    }
+
+    #[test]
+    fn golden_trigger_absorption_15m_v1() {
+        assert_golden(
+            &catalog::TRIGGER_ABSORPTION_15M_V1,
+            15,
+            GOLDEN_ABSORPTION_15M,
+            "a497d617fe26b9f6",
+        );
+    }
+
+    #[test]
+    fn golden_trigger_absorption_1h_v1() {
+        assert_golden(
+            &catalog::TRIGGER_ABSORPTION_1H_V1,
+            9,
+            GOLDEN_ABSORPTION_1H,
+            "c7ef0141900854ee",
+        );
+    }
+
     const GOLDEN_BIAS: &str = "54007615ms value bias regime=warming 15m=warming 1h=warming 4h=warming 1d=warming bias.context@1";
 
     const GOLDEN_FAILED_AUCTION: &str = "178028180ms failed_auction evidence=[failed_breakout ref=86400000ms val=61450.00000000 vah=62040.00000000 close=61997.13000000 at=in side=above a=in/start failed=above:44/1 complete location.auction.prior_day@1] trigger.failed_auction@1 ctx=62040.00000000 levels=hvn@62005.00000000[62000.00000000,62010.00000000],prior_sweep:high@62029.35000000,prior_sweep:high@62029.35000000,vah@62040.00000000[62030.00000000,62040.00000000],vwap@62053.90800666,lvn@62065.00000000[62060.00000000,62070.00000000] location.levels@2 auction=failed_breakout bias regime=warming 15m=[high=higher@157500000ms low=higher@169200000ms] 1h=[high=higher@154800000ms low=higher@133200000ms] 4h=[high=- low=-] 1d=warming bias.context@1";
@@ -1676,4 +2756,26 @@ mod tests {
     const GOLDEN_SFP_4H: &str = "288021457ms sfp evidence=[4h high level=62057.32000000 bar=172800000ms confirmed=230400000ms touches=2 at=259693621ms price=62057.71000000 extreme=62088.48000000 bars=2 sfp resolved=288000000ms complete structure.levels.4h@1] trigger.sfp.4h@1 ctx=62057.32000000 levels=poc@62025.00000000[62020.00000000,62030.00000000],hvn@62025.00000000[62020.00000000,62030.00000000],prior_sweep:high@62024.72000000,prior_sweep:high@62024.72000000,sfp_zone:high@62024.72000000[62024.72000000,62027.66000000],sfp_zone:high@62024.72000000[62024.72000000,62027.66000000],structural_low:low@62025.15000000,prior_sweep:high@62027.66000000,vah@62040.00000000[62030.00000000,62040.00000000],prior_sweep:low@62036.28000000,prior_sweep:high@62042.67000000,prior_sweep:high@62042.70000000,sfp_zone:high@62042.70000000[62042.70000000,62044.63000000],prior_sweep:high@62049.17000000,sfp_zone:high@62049.17000000[62049.17000000,62051.12000000],prior_sweep:high@62049.24000000,sfp_zone:high@62049.24000000[62049.24000000,62057.32000000],prior_sweep:high@62051.12000000,structural_high:high@62062.20000000,vwap@62063.50291131,prior_sweep:low@62065.69000000,prior_sweep:low@62066.40000000,prior_sweep:high@62081.53000000,sfp_zone:high@62081.53000000[62081.53000000,62084.18000000],prior_sweep:high@62081.62000000,sfp_zone:high@62081.62000000[62081.62000000,62084.18000000],prior_sweep:high@62084.18000000,sfp_zone:high@62084.18000000[62084.18000000,62088.48000000],structural_high:high@62088.48000000,structural_high:high@62088.48000000 location.levels@2 auction=unavailable bias regime=warming 15m=[high=lower@282600000ms low=lower@283500000ms] 1h=[high=higher@270000000ms low=lower@230400000ms] 4h=[high=- low=higher@230400000ms] 1d=warming bias.context@1";
 
     const GOLDEN_SFP_1D: &str = "86450066ms value warming 1/7";
+
+    const GOLDEN_CVD_DIVERGENCE_15M: &str = "64809276ms cvd_divergence evidence=[cvd_divergence 15m low prev=61969.20000000@56332199ms cur=61966.54000000@61514129ms dprice=-2.66000000 cvd=-11.99608482->-9.75701857 dcvd=2.23906625 gaps=0 span=5181930ms complete divergent=true candidate.divergence.cvd.15m@1 ctx=61966.54000000 levels=sfp_zone:low@61969.20000000[61966.54000000,61969.20000000],prior_sweep:low@61969.20000000,vwap@61983.67574530 location.levels@2 auction=warming] trigger.cvd_divergence.15m@1 ctx=61966.54000000 levels=vwap@61983.67574530 location.levels@2 auction=warming bias regime=warming 15m=[high=- low=lower@61200000ms] 1h=warming 4h=warming 1d=warming bias.context@1";
+
+    const GOLDEN_CVD_DIVERGENCE_1H: &str = "198042133ms cvd_divergence evidence=[cvd_divergence 1h high prev=61947.27000000@107168767ms cur=62057.32000000@185552262ms dprice=110.05000000 cvd=63.52029271->60.27519949 dcvd=-3.24509322 gaps=0 span=78383495ms complete divergent=true candidate.divergence.cvd.1h@1 ctx=62057.32000000 levels=prior_sweep:high@62029.62000000,sfp_zone:high@62029.62000000[62029.62000000,62031.68000000],vwap@62030.03772028,prior_sweep:high@62033.71000000,structural_high:high@62049.17000000,prior_sweep:high@62049.24000000,sfp_zone:high@62049.24000000[62049.24000000,62057.32000000],structural_high:high@62057.32000000 location.levels@2 auction=outside_value] trigger.cvd_divergence.1h@1 ctx=62057.32000000 levels=prior_sweep:high@62029.62000000,sfp_zone:high@62029.62000000[62029.62000000,62031.68000000],vwap@62030.03772028,prior_sweep:high@62033.71000000,structural_high:high@62049.17000000,prior_sweep:high@62049.24000000,sfp_zone:high@62049.24000000[62049.24000000,62057.32000000] location.levels@2 auction=outside_value bias regime=warming 15m=[high=lower@192600000ms low=higher@189900000ms] 1h=[high=higher@183600000ms low=higher@158400000ms] 4h=[high=- low=-] 1d=warming bias.context@1";
+
+    const GOLDEN_CVD_DIVERGENCE_4H: &str = "374447759ms cvd_divergence evidence=[cvd_divergence 4h high prev=62057.32000000@185552262ms cur=62140.03000000@321483259ms dprice=82.71000000 cvd=60.27519949->38.05121265 dcvd=-22.22398684 gaps=0 span=135930997ms complete divergent=true candidate.divergence.cvd.4h@1 ctx=62140.03000000 levels=sfp_zone:low@62108.54000000[62095.20000000,62108.54000000],vah@62110.00000000[62100.00000000,62110.00000000],sfp_zone:low@62110.52000000[62100.74000000,62110.52000000],prior_sweep:high@62103.29000000,prior_sweep:low@62108.54000000,prior_sweep:low@62110.52000000,vwap@62112.68118136,prior_sweep:high@62113.10000000,sfp_zone:high@62113.10000000[62113.10000000,62117.71000000],prior_sweep:high@62117.71000000,sfp_zone:high@62117.71000000[62117.71000000,62117.72000000],structural_high:high@62130.28000000,prior_sweep:high@62134.29000000,sfp_zone:high@62134.29000000[62134.29000000,62136.28000000],structural_high:high@62136.28000000,structural_high:high@62136.28000000,structural_high:high@62140.03000000,structural_high:high@62140.03000000 location.levels@2 auction=unavailable] trigger.cvd_divergence.4h@1 ctx=62140.03000000 levels=sfp_zone:low@62108.54000000[62095.20000000,62108.54000000],vah@62110.00000000[62100.00000000,62110.00000000],sfp_zone:low@62110.52000000[62100.74000000,62110.52000000],prior_sweep:high@62103.29000000,prior_sweep:low@62108.54000000,prior_sweep:low@62110.52000000,vwap@62112.68118136,prior_sweep:high@62113.10000000,sfp_zone:high@62113.10000000[62113.10000000,62117.71000000],prior_sweep:high@62117.71000000,sfp_zone:high@62117.71000000[62117.71000000,62117.72000000],structural_high:high@62130.28000000,prior_sweep:high@62134.29000000,sfp_zone:high@62134.29000000[62134.29000000,62136.28000000],structural_high:high@62136.28000000,structural_high:high@62136.28000000 location.levels@2 auction=unavailable bias regime=warming 15m=[high=lower@367200000ms low=lower@370800000ms] 1h=[high=lower@356400000ms low=higher@338400000ms] 4h=[high=higher@316800000ms low=higher@230400000ms] 1d=warming bias.context@1";
+
+    const GOLDEN_CVD_DIVERGENCE_1D: &str = "1209708595ms value last=- trigger.cvd_divergence.1d@1";
+
+    const GOLDEN_EFFORT_RESULT_5M: &str = "188300455ms effort_vs_result evidence=[effort_result 5m end=188280000ms aggressor=sell effort=3.13009011 progress=-1.39000000 effort_high=2.60044813 effort_median=1.39537000 move_high=6.51000000 move_median=3.50000000 complete active=true candidate.effort_result.5m@1 ctx=62037.54000000 levels=prior_sweep:high@62000.97000000,prior_sweep:high@62000.97000000,sfp_zone:high@62000.97000000[62000.97000000,62006.01000000],hvn@62015.00000000[62010.00000000,62020.00000000],structural_low:low@62012.36000000,prior_sweep:high@62013.41000000,sfp_zone:high@62013.41000000[62013.41000000,62019.20000000],prior_sweep:high@62019.20000000,prior_sweep:high@62029.62000000,sfp_zone:high@62029.62000000[62029.62000000,62031.68000000],vwap@62029.67532057,prior_sweep:high@62033.71000000,prior_sweep:high@62049.24000000,sfp_zone:high@62049.24000000[62049.24000000,62057.32000000] location.levels@2 auction=outside_value] trigger.effort_result.5m@1 ctx=62037.54000000 levels=prior_sweep:high@62000.97000000,prior_sweep:high@62000.97000000,sfp_zone:high@62000.97000000[62000.97000000,62006.01000000],hvn@62015.00000000[62010.00000000,62020.00000000],structural_low:low@62012.36000000,prior_sweep:high@62013.41000000,sfp_zone:high@62013.41000000[62013.41000000,62019.20000000],prior_sweep:high@62019.20000000,prior_sweep:high@62029.62000000,sfp_zone:high@62029.62000000[62029.62000000,62031.68000000],vwap@62029.67532057,prior_sweep:high@62033.71000000,prior_sweep:high@62049.24000000,sfp_zone:high@62049.24000000[62049.24000000,62057.32000000] location.levels@2 auction=outside_value bias regime=warming 15m=[high=higher@181800000ms low=higher@179100000ms] 1h=[high=lower@104400000ms low=higher@158400000ms] 4h=[high=- low=-] 1d=warming bias.context@1";
+
+    const GOLDEN_EFFORT_RESULT_15M: &str = "189553603ms effort_vs_result evidence=[effort_result 15m end=189540000ms aggressor=sell effort=9.48881729 progress=4.33000000 effort_high=4.70789481 effort_median=2.62103277 move_high=10.92000000 move_median=6.00000000 complete active=true candidate.effort_result.15m@1 ctx=62034.73000000 levels=prior_sweep:high@62000.97000000,prior_sweep:high@62000.97000000,sfp_zone:high@62000.97000000[62000.97000000,62006.01000000],hvn@62015.00000000[62010.00000000,62020.00000000],structural_low:low@62012.36000000,prior_sweep:high@62013.41000000,sfp_zone:high@62013.41000000[62013.41000000,62019.20000000],prior_sweep:high@62019.20000000,prior_sweep:high@62029.62000000,sfp_zone:high@62029.62000000[62029.62000000,62031.68000000],vwap@62030.25160864,prior_sweep:high@62033.71000000,prior_sweep:high@62049.24000000,sfp_zone:high@62049.24000000[62049.24000000,62057.32000000],structural_high:high@62057.32000000 location.levels@2 auction=outside_value] trigger.effort_result.15m@1 ctx=62034.73000000 levels=prior_sweep:high@62000.97000000,prior_sweep:high@62000.97000000,sfp_zone:high@62000.97000000[62000.97000000,62006.01000000],hvn@62015.00000000[62010.00000000,62020.00000000],structural_low:low@62012.36000000,prior_sweep:high@62013.41000000,sfp_zone:high@62013.41000000[62013.41000000,62019.20000000],prior_sweep:high@62019.20000000,prior_sweep:high@62029.62000000,sfp_zone:high@62029.62000000[62029.62000000,62031.68000000],vwap@62030.25160864,prior_sweep:high@62033.71000000,prior_sweep:high@62049.24000000,sfp_zone:high@62049.24000000[62049.24000000,62057.32000000],structural_high:high@62057.32000000 location.levels@2 auction=outside_value bias regime=warming 15m=[high=higher@185400000ms low=higher@179100000ms] 1h=[high=lower@104400000ms low=higher@158400000ms] 4h=[high=- low=-] 1d=warming bias.context@1";
+
+    const GOLDEN_EFFORT_RESULT_1H: &str = "194941793ms effort_vs_result evidence=[effort_result 1h end=194940000ms aggressor=sell effort=9.95302085 progress=-16.50000000 effort_high=9.69932969 effort_median=5.35401407 move_high=24.72000000 move_median=10.39000000 complete active=true candidate.effort_result.1h@1 ctx=62041.38000000 levels=sfp_zone:high@62000.97000000[62000.97000000,62006.01000000],hvn@62015.00000000[62010.00000000,62020.00000000],structural_low:low@62012.36000000,prior_sweep:high@62013.41000000,sfp_zone:high@62013.41000000[62013.41000000,62019.20000000],structural_low:low@62014.71000000,prior_sweep:high@62019.20000000,prior_sweep:high@62029.62000000,sfp_zone:high@62029.62000000[62029.62000000,62031.68000000],vwap@62031.11563947,prior_sweep:high@62033.71000000,prior_sweep:high@62049.24000000,sfp_zone:high@62049.24000000[62049.24000000,62057.32000000],structural_high:high@62057.32000000 location.levels@2 auction=outside_value] trigger.effort_result.1h@1 ctx=62041.38000000 levels=sfp_zone:high@62000.97000000[62000.97000000,62006.01000000],hvn@62015.00000000[62010.00000000,62020.00000000],structural_low:low@62012.36000000,prior_sweep:high@62013.41000000,sfp_zone:high@62013.41000000[62013.41000000,62019.20000000],structural_low:low@62014.71000000,prior_sweep:high@62019.20000000,prior_sweep:high@62029.62000000,sfp_zone:high@62029.62000000[62029.62000000,62031.68000000],vwap@62031.11563947,prior_sweep:high@62033.71000000,prior_sweep:high@62049.24000000,sfp_zone:high@62049.24000000[62049.24000000,62057.32000000],structural_high:high@62057.32000000 location.levels@2 auction=outside_value bias regime=warming 15m=[high=higher@185400000ms low=higher@189900000ms] 1h=[high=lower@104400000ms low=higher@158400000ms] 4h=[high=- low=-] 1d=warming bias.context@1";
+
+    const GOLDEN_EXHAUSTION: &str = "196838221ms exhaustion evidence=[exhaustion end=196800000ms expansion=[1h end=196500000ms aggressor=sell effort=14.00580309 progress=30.02000000 effort_high=9.98765481 effort_median=5.44429252 move_high=24.72000000 move_median=10.46000000 complete active=false candidate.effort_result.1h@1] decay=[5m end=196800000ms aggressor=sell effort=0.51751975 progress=3.93000000 effort_high=2.60784460 effort_median=1.40469943 move_high=6.54000000 move_median=3.53000000 complete active=false candidate.effort_result.5m@1] decay_aggression=0.51751975 extreme=62009.55000000 close=62011.08000000 expanded=true decayed=true at_extreme=true active=true candidate.exhaustion@1 ctx=62011.08000000 levels=lvn@61975.00000000[61970.00000000,61980.00000000],prior_sweep:low@61975.11000000,prior_sweep:high@62000.97000000,prior_sweep:high@62000.97000000,sfp_zone:high@62000.97000000[62000.97000000,62006.01000000],hvn@62015.00000000[62010.00000000,62020.00000000],prior_sweep:low@62012.36000000,prior_sweep:high@62013.41000000,sfp_zone:high@62013.41000000[62013.41000000,62019.20000000],prior_sweep:low@62014.71000000,prior_sweep:high@62019.20000000,prior_sweep:high@62029.62000000,sfp_zone:high@62029.62000000[62029.62000000,62031.68000000],vwap@62030.78929859,prior_sweep:high@62033.71000000 location.levels@2 auction=outside_value] trigger.exhaustion@1 ctx=62011.08000000 levels=lvn@61975.00000000[61970.00000000,61980.00000000],prior_sweep:low@61975.11000000,prior_sweep:high@62000.97000000,prior_sweep:high@62000.97000000,sfp_zone:high@62000.97000000[62000.97000000,62006.01000000],hvn@62015.00000000[62010.00000000,62020.00000000],prior_sweep:low@62012.36000000,prior_sweep:high@62013.41000000,sfp_zone:high@62013.41000000[62013.41000000,62019.20000000],prior_sweep:low@62014.71000000,prior_sweep:high@62019.20000000,prior_sweep:high@62029.62000000,sfp_zone:high@62029.62000000[62029.62000000,62031.68000000],vwap@62030.78929859,prior_sweep:high@62033.71000000 location.levels@2 auction=outside_value bias regime=warming 15m=[high=lower@192600000ms low=higher@189900000ms] 1h=[high=lower@104400000ms low=higher@158400000ms] 4h=[high=- low=-] 1d=warming bias.context@1";
+
+    const GOLDEN_ABSORPTION_5M: &str = "173705421ms absorption evidence=[absorption effort=[5m end=173700000ms aggressor=sell effort=22.20000000 progress=0.00000000 effort_high=16.04000000 effort_median=5.80000000 move_high=0.10000000 move_median=0.00000000 complete active=true candidate.effort_result.5m@1] passive=bid band=0.00050000 added=31.83000000 filled=24.02000000 book=complete replenished=true active=true candidate.absorption.5m@1 ctx=60000.10000000 levels=cluster:bid@59984.00000000,cluster:bid@59988.00000000,cluster:bid@59992.00000000,cluster:bid@59996.00000000,cluster:bid@60000.00000000,poc@60005.00000000[60000.00000000,60010.00000000],vah@60010.00000000[60000.00000000,60010.00000000],val@60000.00000000[60000.00000000,60010.00000000],hvn@60005.00000000[60000.00000000,60010.00000000],vwap@60000.03655487,cluster:ask@60004.10000000,cluster:ask@60008.10000000,cluster:ask@60012.10000000,cluster:ask@60016.10000000,cluster:ask@60020.10000000 location.levels@2 auction=unavailable] trigger.absorption.5m@1 ctx=60000.10000000 levels=cluster:bid@59984.00000000,cluster:bid@59988.00000000,cluster:bid@59992.00000000,cluster:bid@59996.00000000,cluster:bid@60000.00000000,poc@60005.00000000[60000.00000000,60010.00000000],vah@60010.00000000[60000.00000000,60010.00000000],val@60000.00000000[60000.00000000,60010.00000000],hvn@60005.00000000[60000.00000000,60010.00000000],vwap@60000.03655487,cluster:ask@60004.10000000,cluster:ask@60008.10000000,cluster:ask@60012.10000000,cluster:ask@60016.10000000,cluster:ask@60020.10000000 location.levels@2 auction=unavailable bias regime=warming 15m=warming 1h=warming 4h=warming 1d=warming bias.context@1";
+
+    const GOLDEN_ABSORPTION_15M: &str = "179341368ms absorption evidence=[absorption effort=[15m end=179340000ms aggressor=buy effort=25.58000000 progress=0.00000000 effort_high=24.64000000 effort_median=12.76000000 move_high=0.10000000 move_median=0.00000000 complete active=true candidate.effort_result.15m@1] passive=ask band=0.00050000 added=53.00000000 filled=49.70000000 book=complete replenished=true active=true candidate.absorption.15m@1 ctx=60000.00000000 levels=cluster:bid@59984.00000000,cluster:bid@59988.00000000,cluster:bid@59992.00000000,cluster:bid@59996.00000000,cluster:bid@60000.00000000,poc@60005.00000000[60000.00000000,60010.00000000],vah@60010.00000000[60000.00000000,60010.00000000],val@60000.00000000[60000.00000000,60010.00000000],hvn@60005.00000000[60000.00000000,60010.00000000],vwap@60000.05888156,cluster:ask@60004.10000000,cluster:ask@60008.10000000,cluster:ask@60012.10000000,cluster:ask@60016.10000000,cluster:ask@60020.10000000 location.levels@2 auction=unavailable] trigger.absorption.15m@1 ctx=60000.00000000 levels=cluster:bid@59984.00000000,cluster:bid@59988.00000000,cluster:bid@59992.00000000,cluster:bid@59996.00000000,cluster:bid@60000.00000000,poc@60005.00000000[60000.00000000,60010.00000000],vah@60010.00000000[60000.00000000,60010.00000000],val@60000.00000000[60000.00000000,60010.00000000],hvn@60005.00000000[60000.00000000,60010.00000000],vwap@60000.05888156,cluster:ask@60004.10000000,cluster:ask@60008.10000000,cluster:ask@60012.10000000,cluster:ask@60016.10000000,cluster:ask@60020.10000000 location.levels@2 auction=unavailable bias regime=warming 15m=warming 1h=warming 4h=warming 1d=warming bias.context@1";
+
+    const GOLDEN_ABSORPTION_1H: &str = "178862262ms absorption evidence=[absorption effort=[1h end=178860000ms aggressor=buy effort=64.62000000 progress=0.00000000 effort_high=51.32000000 effort_median=31.04000000 move_high=0.10000000 move_median=0.10000000 complete active=true candidate.effort_result.1h@1] passive=ask band=0.00050000 added=146.27000000 filled=144.28000000 book=complete replenished=true active=true candidate.absorption.1h@1 ctx=60000.00000000 levels=cluster:bid@59984.00000000,cluster:bid@59988.00000000,cluster:bid@59992.00000000,cluster:bid@59996.00000000,cluster:bid@60000.00000000,poc@60005.00000000[60000.00000000,60010.00000000],vah@60010.00000000[60000.00000000,60010.00000000],val@60000.00000000[60000.00000000,60010.00000000],hvn@60005.00000000[60000.00000000,60010.00000000],vwap@60000.05717431,cluster:ask@60004.10000000,cluster:ask@60008.10000000,cluster:ask@60012.10000000,cluster:ask@60016.10000000,cluster:ask@60020.10000000 location.levels@2 auction=unavailable] trigger.absorption.1h@1 ctx=60000.00000000 levels=cluster:bid@59984.00000000,cluster:bid@59988.00000000,cluster:bid@59992.00000000,cluster:bid@59996.00000000,cluster:bid@60000.00000000,poc@60005.00000000[60000.00000000,60010.00000000],vah@60010.00000000[60000.00000000,60010.00000000],val@60000.00000000[60000.00000000,60010.00000000],hvn@60005.00000000[60000.00000000,60010.00000000],vwap@60000.05717431,cluster:ask@60004.10000000,cluster:ask@60008.10000000,cluster:ask@60012.10000000,cluster:ask@60016.10000000,cluster:ask@60020.10000000 location.levels@2 auction=unavailable bias regime=warming 15m=warming 1h=warming 4h=warming 1d=warming bias.context@1";
 }

@@ -231,13 +231,62 @@ not pin a trigger version.
   own context lists at least one level of kind `Poc`, `Vah`, `Val`, `Hvn`,
   `Lvn`, `StructuralHigh`, `StructuralLow`, `SfpRejectionZone` or `Vwap`.
   If the context levels are not `Ready`, there is no trigger.
-  - *A divergence's own swing does not pass the gate.* The candidate's
-    recorded context keeps ADR-051 D3's exclusion (its own registry only;
-    a merged definition), so the gate also skips every level that the SFP
-    key above names for the candidate's swing: any `structure.levels.<tf>`
-    source, the swing's side and price, a nested swing bar. *Why:* else a
-    1h CVD divergence would pass the gate on the 15m structural high or SFP
-    zone of its own swing, the self-reference the SFP rule removes.
+  - *A divergence's own swings do not pass the gate.* A CVD divergence is
+    a pair, the swing just confirmed and the previous swing of its side,
+    and the comparison of the two is the candidate. Its recorded context
+    keeps ADR-051 D3's exclusion (its own registry, its current swing; a
+    merged definition). The gate reads the registry at the current swing's
+    price again and skips every level that the SFP key above names for
+    either swing of the pair: any `structure.levels.<tf>` source, that
+    swing's side and price, a swing bar that nests with that swing's bar.
+    The trigger event carries the context the gate read.
+    - *Why the current swing:* else a 1h CVD divergence would pass the gate
+      on the 15m structural high or SFP zone of its own swing, the
+      self-reference the SFP rule removes.
+    - *Why the previous swing:* it is the other half of the comparison, so
+      it is the candidate too, not a place (the ADR-051 D3 reason). The
+      current swing is a strictly further extreme, so the first trade
+      beyond the previous swing swept that swing's level in every registry
+      before the divergence is confirmed (ADR-037 D6). What remains of it
+      is its prior sweep, which the gate does not admit, and, if the sweep
+      closed back inside, its SFP zone: from the previous swing's price to
+      the sweep's extreme (ADR-037 D7), padded by the registry tolerance of
+      6 bps of that price (ADR-044 D3). That zone contains the current
+      swing's price in two ways, and neither is a place. When the move
+      that made the current swing is the sweep, the zone reaches the
+      current price because that price is the sweep's extreme: the
+      containment holds by construction. Otherwise it holds when the
+      current swing lies within 6 bps beyond the zone: a bound on the
+      candidate's own price change, set by a padding nobody measured for
+      that purpose (ADR-013).
+    - *Measured* on the candidate golden tape, a synthetic 45-day random
+      walk (a test pins the counts): 257 CVD divergences; 120 list an
+      admitted level of their previous swing at the anchor, each an SFP
+      zone and none a structural level; 248 pass the gate with the current
+      swing skipped, 243 with both. Of the 5 that the previous swing alone
+      decides, the zone reaches the current price in 1 and only its
+      padding does in 4. The counts show the rule is not vacuous on that
+      tape, not how often it binds on BTC; *Accept when* reports that.
+    - *A swing outside the pair stays a place,* even when the candidate's
+      own move made its SFP zone: it existed before that move and is not
+      part of the comparison, and its zone records that the move went
+      beyond it and was rejected. On the same tape 3 of the 257 pass the
+      gate only on such a zone (one that resolved at or after the current
+      swing's anchor trade).
+    - *Rejected:* admitting the previous swing (the gate would pass on the
+      candidate's own comparison base, by construction or through a 6 bps
+      bound on its own price change); skipping every SFP zone that
+      resolved at or after the current swing's anchor trade (it also drops
+      swings outside the pair, which are places; it still admits the
+      previous swing's older zones that reach the current price only
+      through the padding; and a context level carries no sweep or
+      resolution time, so ADR-051's `ContextLevel` would need a new field);
+      skipping the previous swing's zone only when it reaches the current
+      price unpadded (it keeps the padding cases, the 6 bps bound).
+  - For effort vs result, exhaustion and absorption the gate reads the
+    candidate's own context unchanged, and the trigger event carries it:
+    their anchor is the last 1m close, not a swing, so no registry level is
+    derived from the fact (ADR-051 D3).
   - *Why a gate at all:* ADR-012 requires a trigger at a defined location;
     a candidate is defined anywhere (ADR-051), so its trigger rule is where
     the location condition goes.
@@ -263,7 +312,12 @@ not pin a trigger version.
   without its upstream (the ADR-051 D3 reason, ADR-044 D10). The context
   names the registry it read, and the feature-set version names the
   selection. `location.auction.prior_day@1` is declared: the context copies
-  it, and it is not selectable.
+  it, and it is not selectable. The candidate trigger values therefore
+  depend on the registry an engine selected: a `location.levels@1` engine
+  can gate a candidate differently from the default one. The feature-set
+  version tells the two apart (ADR-041 D2); the #96 isolation check (rule
+  I of `location_measure`) compares every trigger value except the
+  candidate families'.
 
 ### D5. Rules on location and structure facts (no new numbers)
 
@@ -300,15 +354,32 @@ not pin a trigger version.
 `trigger.absorption.<5m|15m|1h>@1`.
 
 - Each is the candidate event — the divergent comparison, or the rising
-  edge of an evaluated candidate (ADR-051) — plus the D4 gate on the
-  candidate's own context. No new number: the candidate's own definition
-  carries every threshold.
+  edge of an evaluated candidate (ADR-051) — plus the D4 gate (for a
+  divergence on the context without both swings of its pair, for the
+  others on the candidate's own context). No new number: the candidate's
+  own definition carries every threshold.
 - The event carries the full `CandidateEvent` as evidence.
 - The absorption ids are live only, as their input: they stay warming up in
   archive replays.
 - *Why the timeframes and windows:* they are the candidates' own (the
   structure timeframes of ADR-037 D1 and the aggression windows of ADR-035);
   a trigger on another horizon would need a candidate on it first.
+- **Value:** the last trigger, with the candidate's hashed value as
+  evidence (`CvdComparison`, `EffortResult`, `Exhaustion`, `Absorption`)
+  and its anchor: the current swing's price for a divergence, the last
+  close otherwise. A candidate the gate stops leaves the value as it was.
+- **Parameters:** `gate_kinds` =
+  `poc,vah,val,hvn,lvn,structural_high,structural_low,sfp_zone,vwap` (the
+  admitted kinds of D4, in `LevelKind` declaration order); `gate_skip` =
+  `swing_pair` for the CVD ids and `none` for the others (D4); the CVD ids
+  also `timeframe_ms`, the effort-vs-result and absorption ids
+  `window_ms`. *Why the gate is a parameter:* any change to it (admitting
+  `ValidatedReference` once #33 gives it a source, say) must be a new
+  version, and only a parameter puts it in the fingerprint (ADR-029).
+  **Inputs:** the candidate feature (`candidate.divergence.cvd.<tf>@1`,
+  `candidate.effort_result.<w>@1`, `candidate.exhaustion@1` or
+  `candidate.absorption.<w>@1`), `location.auction.prior_day@1` for the
+  context, and `bias.context@1` for the snapshot.
 
 ### D7. OI expansion followed by rejection (M3)
 
@@ -378,6 +449,8 @@ rejection is the D5 failed auction).
 | No confirmation delay or reclaim horizon | Confirmation depth is a research variable (ADR-015, #31) | no new number |
 | Excluded gate kinds `LiquidityCluster`, `PriorSweep`, `ValidatedReference` | Live-only within 5 bps of mid (ADR-043 D8); traded-through and the most numerous kind, p50 80 of 256 per closed minute (ADR-044 M3, `@2`); no source until #33 | derivation + measurement |
 | Admitted kinds' density (p50 per closed minute: SFP zones 51, structural highs 48 / lows 29, HVN 22, LVN 20, POC/VAH/VAL 2 each, VWAP 1) | ADR-044 M3 (`@2`); recorded to show the gate may be wide, measured by M4 | measurement, recorded |
+| Previous-swing skip of the CVD gate | No number of its own: the D4 key. The 6 bps it cites is ADR-044 D3's registry padding, quoted to show what admitting the swing would filter | no new number |
+| Golden-tape counts 257 / 120 / 248 / 243 / 5 (1 + 4) / 3; 6 892 of 6 962 effort-vs-result and exhaustion edges pass the gate | Measured on the synthetic candidate golden tape by an M2 test that pins them; they show the pair skip is not vacuous and the gate is wide for the other families there, not how BTC behaves | measurement, recorded |
 | OI point age ≤ 360 000 ms | One grid interval plus the 60 s lag `derivatives.oi.5m@1` accepts (ADR-042 D2); less loses healthy live points, more reads an outage's stale point | derivation |
 | OI comparison strict, unsigned | Equal open interest is no expansion; open interest counts both sides | derivation |
 | Development year 2025-10-01 … 2026-09-30 for *Accept when* | The #12 year every earlier measurement used; nothing is fitted, so no hold-out is needed | derivation |
@@ -408,7 +481,9 @@ rejection is the D5 failed auction).
 - The candidate gate may be wide: the registry holds p50 256 levels per
   closed minute, and the admitted kinds include the dense SFP zones (p50
   51) and structural highs (p50 48). M4 reports the pass rate per family
-  and kind before anyone relies on it.
+  and kind before anyone relies on it. On the synthetic candidate golden
+  tape it passes 243 of 257 CVD divergences and 6 892 of 6 962
+  effort-vs-result and exhaustion edges (D8).
 - SFPs whose excursion resolves inside one 5-minute grid interval can never
   qualify for the OI family, so `trigger.oi_expansion_rejection.15m@1` may
   be rare. M4 measures that share, and its reachability rule stops the run
@@ -435,6 +510,9 @@ rejection is the D5 failed auction).
   `location.levels@1` selection (D4). Rejected; the context records it.
 - **Any registry level as the gate; only value edges and structural
   extremes as the gate.** D4. Rejected.
+- **Admitting a divergence's previous swing as its location; skipping
+  every SFP zone the candidate's move made; skipping the previous swing's
+  zone only when it reaches the current price.** D4. Rejected.
 - **An SFP context without the swept swing's levels in its own registry
   only.** Keeps the swing through the other structure timeframes (D4).
   Rejected.
@@ -457,8 +535,10 @@ M4 runs the ignored measurement tool (M3) on the #12 development year,
   never fires cannot be researched, so its absence is a definition bug or a
   fact that only a human decision records.
 - **Reported, no threshold:** counts per id, per half and per regime label;
-  the gate pass rate per candidate family; the in-zone share per level
-  kind; the share of SFPs whose excursion stays inside one grid interval.
+  the gate pass rate per candidate family; the CVD divergences per
+  timeframe that the previous-swing skip alone stops (D4); the in-zone
+  share per level kind; the share of SFPs whose excursion stays inside one
+  grid interval.
 - **Absorption:** reachability is checked on the live store that ADR-051's
   live R0 run used, since the absorption ids are live only.
 - **No hold-out needed:** no constant is fitted to data, so the
