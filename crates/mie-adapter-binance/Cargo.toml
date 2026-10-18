@@ -33,7 +33,7 @@ ureq = { version = "3", default-features = false, features = ["rustls-no-provide
 # Reads the archive's zip files (one deflated CSV entry each, CRC-checked).
 # No default features: no encryption, no bzip2/lzma/zstd/xz codecs, no time
 # crate; deflate through flate2 only (ADR-034).
-zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 # Selects flate2's pure-Rust miniz_oxide backend for zip's deflate, so no C
 # zlib and no Zlib-licensed zlib-rs enter the tree. Not used directly.
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }

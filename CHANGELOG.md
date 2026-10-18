@@ -233,6 +233,16 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   backoff was swallowed by the 10 s poll slot and polling went on into the
   rate limit. Successful polls stay on the 10 s grid.
 
+### Security
+
+- **`zip` 8.6 → 9.0 (RUSTSEC-2026-0367, -0368, -0369).** The three
+  advisories concern `extract()` (SUID/SGID bits, symlink targets and
+  permissions through symlinks outside the destination), which mie never
+  calls: the archive reader opens the one CSV entry with `by_index(0)` and
+  streams it. `cargo deny check` fails on them all the same. In 9.0 an
+  entry's `name()` returns a `Result`; a name that does not decode is now a
+  `FetchError::Zip` like any other unreadable archive.
+
 ## [0.1.0] - 2026-10-09
 
 ### Added

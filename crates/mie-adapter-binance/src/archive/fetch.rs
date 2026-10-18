@@ -387,11 +387,11 @@ where
         .into());
     }
     let entry = archive.by_index(0).map_err(|e| zip_error(&e))?;
-    if entry.name() != entry_name {
+    let name = entry.name().map_err(|e| zip_error(&e))?;
+    if name != entry_name {
         return Err(FetchError::Zip(format!(
-            "{} holds {:?}, expected {entry_name:?}",
-            zip_path.display(),
-            entry.name()
+            "{} holds {name:?}, expected {entry_name:?}",
+            zip_path.display()
         ))
         .into());
     }
