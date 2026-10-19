@@ -1,8 +1,8 @@
 # Direction: what the first measured answer decides
 
-- Status: draft. The three directions and their criteria are set; the
-  thresholds are **not set yet** and are filled in by the owner before the
-  first Research Lab result is read.
+- Status: draft. The directions, the criteria and the methods that set the
+  statistical thresholds are registered here. The personal inputs are
+  filled in by the owner before the first Research Lab result is read.
 - Date: 2026-10-20
 
 ## Why this exists
@@ -30,51 +30,94 @@ and LLMs stay research operators (ADR-011).
 If none of the three finds interest, MIE stays a personal research tool.
 That is an acceptable outcome, not a failure of the rule.
 
+## How thresholds are set
+
+There are two kinds, and neither is guessed.
+
+- **Statistical thresholds** follow from data. This document registers the
+  method, not the number; the Research Lab computes the number on the
+  calibration slice.
+- **Personal inputs** cannot be measured from the market. They come from
+  the owner's risk tolerance, time and product judgment, and are written
+  into the table below before the first result is read.
+
+### Calibration slice
+
+The earliest contiguous part of the history is reserved for calibration:
+variance estimates and null distributions are computed there and nowhere
+else. It is excluded from every evaluation below, so the thresholds never
+see the data they judge. Its dataset version and date range are recorded
+in the inputs table.
+
+### Net outcome
+
+Every outcome is measured in R, net of:
+
+- **fees** at the owner's fee tier;
+- **slippage** measured from the reconstructed order book where live depth
+  exists (ADR-038). For the archive period, where only coarse depth bands
+  exist ([data availability](data-availability.md)), from a slippage model
+  calibrated on the live book and recorded with the experiment;
+- **funding** from the derivatives context (ADR-042).
+
+### Methods
+
+| ID | Quantity | Method |
+|---|---|---|
+| M1 | Minimum sample | n ≥ (z·σ/μ)², where σ is the standard deviation of net outcomes on the calibration slice, μ the smallest net expectancy worth trading (input) and z follows from the confidence level (input). |
+| M2 | Net expectancy | The lower bound of a block-bootstrap confidence interval of net expectancy, at the confidence level, is above zero. Blocks keep time order, so serially dependent trades are not treated as independent. |
+| M3 | Effect against baseline | The baseline is the unconditional probability of each threshold being reached first (Conditional Behavior outputs). The null distribution comes from permuting context labels within time blocks. A context counts when its effect exceeds the null at the false discovery rate (input), corrected with Benjamini–Hochberg across every context tested. |
+| M4 | Stability | The effect keeps its sign in every walk-forward window and still passes M3 out-of-sample. |
+| M5 | Forward test | Forward-test net expectancy does not fall below the lower tail of the walk-forward window distribution, at the confidence level. |
+| M6 | Counter-hypothesis | The opposite interpretation was tested and lost (Conditional Behavior, "Counter-hypothesis"). |
+
+### Personal inputs
+
+| Input | Value |
+|---|---|
+| Confidence level (sets z, M2, M5) | to be set |
+| False discovery rate (M3) | to be set |
+| Smallest net expectancy worth trading, in R per trade (M1) | to be set |
+| Fee tier | to be set |
+| Maximum acceptable out-of-sample drawdown, in R | to be set |
+| Minimum frequency for A, setups per week | to be set |
+| Minimum frequency for B, alerts per week | to be set |
+| Waiting period for outside interest in C | to be set |
+| Calibration slice, dataset version and date range | to be set |
+
+The drawdown is recorded in R only. The capital and the risk per trade it
+is derived from stay out of this public repository.
+
 ## The evidence that decides
 
 The evidence comes from Conditional Behavior outputs and from candidates
 moving through the Registry lifecycle
-(`RESEARCH → BACKTESTED → WALK_FORWARD → PAPER → VALIDATED`). All metrics are
-net of fees, slippage and funding, on versioned data and features, per the
-Research Lab's anti-overfitting rules.
+(`RESEARCH → BACKTESTED → WALK_FORWARD → PAPER → VALIDATED`), on versioned
+data and features, excluding the calibration slice.
 
 **A holds when** at least one candidate reaches `VALIDATED` after
-walk-forward and the unseen forward test, and:
+walk-forward and the unseen forward test, and it passes M1, M2 and M5
+out-of-sample, stays within the maximum drawdown, and its suitable setups
+reach the minimum frequency for A.
 
-| Criterion | Threshold |
-|---|---|
-| Out-of-sample trades (walk-forward + forward test) | to be set |
-| Net expectancy and its confidence bound | to be set |
-| Net profit factor, walk-forward | to be set |
-| Forward test vs walk-forward distribution | to be set |
-| Maximum drawdown, out-of-sample | to be set |
-| Frequency of suitable setups | to be set |
-
-**B holds when** A does not, or A holds for too few setups to trade, but
-conditional behavior shows stable differences that would improve a
-discretionary decision:
-
-| Criterion | Threshold |
-|---|---|
-| Effect size per context against the unconditional baseline | to be set |
-| Sample per context, in-sample and out-of-sample | to be set |
-| Stability across walk-forward windows and out-of-sample | to be set |
-| Counter-hypothesis | The opposite interpretation was tested and lost |
-| Number of such contexts and how often they recur | to be set |
+**B holds when** A does not, or A's setups are too rare to trade, but
+contexts that pass M1, M3, M4 and M6 together recur at least at the
+minimum frequency for B. That is information that improves a discretionary
+decision even when it is not a stand-alone strategy.
 
 **C holds when** neither A nor B does, but the machine itself holds up:
 live/replay equivalence passes on the full history chain (ADR-041,
 ADR-052), an experiment runs end to end reproducibly from a clean checkout,
-and someone outside the project asks to use it within a period after the
-results are published (period to be set).
+and someone outside the project asks to use it within the waiting period
+after the results are published.
 
 ## Rules
 
-1. The thresholds are fixed before the first Research Lab result is read.
-   Until then this document may be edited freely.
-2. After that, a threshold changes only through a dated addendum at the end
-   of this file that states the reason. The original line stays, as in the
-   ADR lifecycle.
+1. The methods and the personal inputs are fixed before the first Research
+   Lab result is read. Until then this document may be edited freely.
+2. After that, a method or an input changes only through a dated addendum
+   at the end of this file that states the reason. The original line
+   stays, as in the ADR lifecycle.
 3. If A and B both hold, A comes first. B is added on top only if
    publishing does not degrade A's execution, for example by crowding the
    same levels.
@@ -83,3 +126,5 @@ results are published (period to be set).
 5. Before charging anyone for B's output, check whether it counts as advice
    on crypto-assets under MiCA, which is a licensed service, or as general
    market information.
+6. The Research Lab implements M1 to M6. Until it does, this document is
+   their specification.
