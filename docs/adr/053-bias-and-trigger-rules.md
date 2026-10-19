@@ -1,6 +1,6 @@
 # ADR-053: Bias and trigger rules — a non-authorizing bias context and one versioned rule per trigger family
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-10-18
 
 ## Context
@@ -302,8 +302,9 @@ not pin a trigger version.
   - *`ValidatedReference` excluded:* it has no source until #33; admitting
     it then is a new version, decided with its source.
   - Every level stays in the event's context, so research can still split
-    by kind. The gate's pass rate is unknown until M4 measures it (see
-    Consequences).
+    by kind. The gate's pass rate was unknown until M4 measured it: 88.9–94.8 %
+    of the candidates of the #12 year pass (see Consequences and
+    *Acceptance*).
   - *Rejected:* any registry level (clusters split live from archive, and
     prior sweeps make the gate nearly vacuous); only value edges and
     structural extremes (ADR-051 R1's `neither` bin "holds most episodes",
@@ -465,7 +466,11 @@ rejection is the D5 failed auction).
     = 76 % of 15m SFPs, 50.15 / 63.69 = 79 % on 1h and 52.75 / 64.25 =
     82 % on 4h; with the sweep time spread evenly over the bar (S3 puts its
     p50 at 0.51–0.61 of the bar), that is 76 % × 275 / 900 ≈ 23 % of 15m
-    SFPs, ≈ 6 % on 1h and ≈ 2 % on 4h. The newest-point rule instead loses
+    SFPs, ≈ 6 % on 1h and ≈ 2 % on 4h. *Measured* (M4, #12 year, shares of
+    all SFPs of the timeframe, whose outcomes sum to the SFP count): 765 of
+    4 267 15m SFPs = 17.9 %, 34 / 1 063 = 3.2 % on 1h, 3 / 257 = 1.2 % on
+    4h and 0 / 44 on 1d, below the estimates (23 / 6 / 2 %) at every
+    timeframe. The newest-point rule instead loses
     none in the archive and, live, every first-bar SFP swept in the bar's
     last 300 s, where the live end still reads the boundary before the bar
     end: 76 % × 300 / 900 ≈ 25 % of 15m SFPs.
@@ -554,7 +559,7 @@ rejection is the D5 failed auction).
 | Golden-tape counts 257 / 120 / 248 / 243 / 5 (1 + 4) / 3; 6 892 of 6 962 effort-vs-result and exhaustion edges pass the gate | Measured on the synthetic candidate golden tape by an M2 test that pins them; they show the pair skip is not vacuous and the gate is wide for the other families there, not how BTC behaves | measurement, recorded |
 | `oi_lag_ms` 25 000 | The longest live spacing ADR-042 D1 calls continuous (10 000 ms resolution + 15 000 ms `step_tolerance_ms`; measured maximum 15 049 ms): a continuous live feed has closed the boundary the lag before every event, as the archive has. Less: a slow continuous feed may not have closed it; more: the points drift from their events for no gain | derivation |
 | Two held OI points | The boundary read lies in `[t − 325 000, t − 25 000]` ms, at most one grid interval before the newest boundary closed by `t` | derivation |
-| Archive cost ≈ 23 % / 6 % / 2 % of 15m / 1h / 4h SFPs | ADR-037 S3's first-window-bar share of SFPs (76 / 79 / 82 %) times the 275 s of a bar where a sweep and its first-bar SFP read one boundary, over the bar length; a rate estimate, measured by M4 | derivation, estimate |
+| Archive cost ≈ 23 % / 6 % / 2 % of 15m / 1h / 4h SFPs | ADR-037 S3's first-window-bar share of SFPs (76 / 79 / 82 %) times the 275 s of a bar where a sweep and its first-bar SFP read one boundary, over the bar length; a rate estimate. Measured by M4: 765 / 4 267 = 17.9 %, 34 / 1 063 = 3.2 %, 3 / 257 = 1.2 % | derivation, estimate; measurement, recorded |
 | Golden-tape counts 398 / 197 / 195 / 12 / 122 (15m), 96 / 48 / 46 / 1 (1h), 21 / 9 / 9 (4h) | Measured on the synthetic candidate golden tape by an M3 test that pins them; they show the rule is not vacuous there and where it parts from the newest-point rule, not how BTC behaves | measurement, recorded |
 | OI comparison strict, unsigned | Equal open interest is no expansion; open interest counts both sides | derivation |
 | Development year 2025-10-01 … 2026-09-30 for *Accept when* | The #12 year every earlier measurement used; nothing is fitted, so no hold-out is needed | derivation |
@@ -587,13 +592,21 @@ rejection is the D5 failed auction).
   51) and structural highs (p50 48). M4 reports the pass rate per family
   and kind before anyone relies on it. On the synthetic candidate golden
   tape it passes 243 of 257 CVD divergences and 6 892 of 6 962
-  effort-vs-result and exhaustion edges (D8).
+  effort-vs-result and exhaustion edges (D8). M4 measured it on the #12
+  year: CVD divergence 91.3–94.8 % of the candidates on 15m / 1h / 4h
+  (711 / 752, 182 / 192, 42 / 46; 1d 3 / 4), effort vs result 88.9–90.7 %
+  (5m 12 952 / 14 572, 15m 7 496 / 8 420, 1h 3 738 / 4 120), exhaustion
+  90.8 % (1 462 / 1 610). The gate is wide, as this risk expected: it drops
+  5.2–11.1 % of the candidates (1d CVD aside). Narrowing it is a new
+  version, decided on this data.
 - An excursion whose start and end read the same OI boundary has no
   comparison: one inside a grid interval, and one swept in the last 275 s
   of the bar that resolves it (D7), about 23 % of 15m SFPs in the archive
   by the ADR-037 S3 rates. So `trigger.oi_expansion_rejection.15m@1` may
   be rare. M4 reports the shared boundaries per OI id, and its
-  reachability rule stops the run if an id never fires.
+  reachability rule stops the run if an id never fires. Measured on the
+  #12 year: 765 of 4 267 15m SFPs share a boundary (17.9 %, against the
+  estimate's 23 %), and the id fires 1 469 times.
 - The archive and a continuous live feed select the same OI boundaries at
   every start and end (D7); their points still differ in `resolution_ms`
   and sample time, so the OI values of one stretch differ between the two
@@ -664,3 +677,120 @@ development year, 2025-10-01 … 2026-09-30:
 
 Every criterion is reachable on the stores that exist today: the #12 year
 is imported, and the live store of ADR-051's R0 run holds absorption facts.
+
+## Acceptance
+
+Accepted 2026-10-19. Both runs used the `trigger_measure` ignored tests
+(`measure_triggers`, `measure_triggers_live`) of main `040dfae` (M3), release
+build. The year run covered 2025-10-01 … 2026-09-30 with
+`MIE_MEASURE_EVENTS=603323345` under a 4 GB memory cap; its halves split at
+the window's midpoint, 2026-04-01 12:00 UTC. The live run replayed ADR-051's
+R0 live store, run `20261016T225606Z` and the other cleanly ended runs of
+that capture.
+
+- **T0 (asserted):** the year replayed 603 323 345 events, the expected
+  count, with 0 rejections and 0 mismatches; values were compared at
+  30 275 events. The live run: 2 042 225 events in run `20261016T225606Z`,
+  0 rejections, 0 mismatches, values compared at 65 events.
+- **Reachability:** every archive-reachable id fires in the year (ids
+  without a trigger: none). The three absorption ids are live only and fire
+  on the live store, 5m / 15m / 1h 16 / 15 / 6.
+- **Cost:** the year run took a wall time of 4 078.1 s at a peak RSS of
+  423 MB (the live run 75.4 s, 125 s for the test); ADR-051 R0's
+  `candidate_measure` of the same replay took 3 005.3 s. The live run peaks
+  at 6.1 GB of anonymous memory (a re-run under an 8 GB cap; under the
+  4 GB cap it reached the limit, 28 616 `memory.max` events, and still
+  passed without an OOM kill).
+  `measure_candidates_live` shows the same 6.1 GB on the same store. The
+  memory is `LiveReplay::run_replay` collecting and sorting a whole run's
+  records before recomputing, so it grows with the run length (34 h here);
+  ADR-052's 550 MB came from a 1 h 40 min sample. Follow-up: #140.
+
+**Reported (no threshold).** *Counts per id;* the cells are the regime
+labels low / medium / high / extreme / unlabelled, and the live column is
+the total (every live trigger is unlabelled):
+
+| Trigger id | Year total | Half 1 | Half 2 | Live |
+|---|---|---|---|---|
+| `trigger.failed_auction@1` | 697 | 91 / 94 / 57 / 126 / 8 | 76 / 88 / 96 / 61 / 0 | 2 |
+| `trigger.failed_reclaim@1` | 430 | 47 / 63 / 59 / 64 / 4 | 59 / 51 / 54 / 29 / 0 | 0 |
+| `trigger.breakout_acceptance@1` | 367 | 46 / 50 / 38 / 42 / 6 | 49 / 61 / 40 / 35 / 0 | 2 |
+| `trigger.sfp.15m@1` | 4 267 | 628 / 591 / 392 / 447 / 85 | 691 / 674 / 470 / 289 / 0 | 15 |
+| `trigger.sfp.1h@1` | 1 063 | 129 / 137 / 91 / 149 / 17 | 142 / 167 / 125 / 106 / 0 | 3 |
+| `trigger.sfp.4h@1` | 257 | 15 / 37 / 17 / 48 / 4 | 22 / 31 / 27 / 56 / 0 | 0 |
+| `trigger.sfp.1d@1` | 44 | 0 / 6 / 3 / 11 / 0 | 1 / 5 / 4 / 14 / 0 | 0 |
+| `trigger.cvd_divergence.15m@1` | 711 | 104 / 95 / 81 / 67 / 9 | 108 / 103 / 78 / 66 / 0 | 3 |
+| `trigger.cvd_divergence.1h@1` | 182 | 25 / 34 / 14 / 24 / 2 | 15 / 30 / 18 / 20 / 0 | 0 |
+| `trigger.cvd_divergence.4h@1` | 42 | 5 / 5 / 8 / 1 / 1 | 5 / 8 / 8 / 1 / 0 | 0 |
+| `trigger.cvd_divergence.1d@1` | 3 | 0 / 0 / 0 / 1 / 0 | 0 / 2 / 0 / 0 / 0 | 0 |
+| `trigger.effort_result.5m@1` | 12 952 | 1 743 / 1 779 / 1 160 / 1 262 / 212 | 1 969 / 2 245 / 1 440 / 1 142 / 0 | 17 |
+| `trigger.effort_result.15m@1` | 7 496 | 1 040 / 983 / 673 / 795 / 126 | 1 134 / 1 266 / 843 / 636 / 0 | 16 |
+| `trigger.effort_result.1h@1` | 3 738 | 509 / 506 / 336 / 451 / 57 | 548 / 528 / 445 / 358 / 0 | 10 |
+| `trigger.exhaustion@1` | 1 462 | 184 / 147 / 82 / 85 / 30 | 359 / 311 / 148 / 116 / 0 | 4 |
+| `trigger.absorption.5m@1` | 0 | 0 / 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 / 0 | 16 |
+| `trigger.absorption.15m@1` | 0 | 0 / 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 / 0 | 15 |
+| `trigger.absorption.1h@1` | 0 | 0 / 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 / 0 | 6 |
+| `trigger.oi_expansion_rejection.15m@1` | 1 469 | 202 / 221 / 118 / 158 / 22 | 227 / 244 / 164 / 113 / 0 | 6 |
+| `trigger.oi_expansion_rejection.1h@1` | 453 | 62 / 61 / 40 / 74 / 9 | 47 / 70 / 46 / 44 / 0 | 2 |
+| `trigger.oi_expansion_rejection.4h@1` | 125 | 9 / 13 / 10 / 27 / 2 | 13 / 15 / 12 / 24 / 0 | 0 |
+| `trigger.oi_expansion_rejection.1d@1` | 19 | 0 / 6 / 0 / 5 / 0 | 0 / 4 / 1 / 3 / 0 | 0 |
+| `trigger.oi_expansion_rejection.prior_day@1` | 319 | 42 / 44 / 23 / 50 / 4 | 34 / 45 / 48 / 29 / 0 | 1 |
+
+*Gate pass rate per candidate id (D4):*
+
+| Candidate id | Year passed / candidates | Rate | Live passed / candidates |
+|---|---|---|---|
+| `trigger.cvd_divergence.15m@1` | 711 / 752 | 94.5 % | 3 / 3 |
+| `trigger.cvd_divergence.1h@1` | 182 / 192 | 94.8 % | 0 / 0 |
+| `trigger.cvd_divergence.4h@1` | 42 / 46 | 91.3 % | 0 / 0 |
+| `trigger.cvd_divergence.1d@1` | 3 / 4 | 75.0 % | 0 / 0 |
+| `trigger.effort_result.5m@1` | 12 952 / 14 572 | 88.9 % | 17 / 17 |
+| `trigger.effort_result.15m@1` | 7 496 / 8 420 | 89.0 % | 16 / 16 |
+| `trigger.effort_result.1h@1` | 3 738 / 4 120 | 90.7 % | 10 / 10 |
+| `trigger.exhaustion@1` | 1 462 / 1 610 | 90.8 % | 4 / 4 |
+| `trigger.absorption.5m@1` | 0 / 0 | - | 16 / 16 |
+| `trigger.absorption.15m@1` | 0 / 0 | - | 15 / 15 |
+| `trigger.absorption.1h@1` | 0 / 0 | - | 6 / 6 |
+
+The CVD divergences that only the previous-swing skip stops (D4), on
+15m / 1h / 4h / 1d: 18 / 5 / 1 / 1.
+
+*Context share, the percentage of trigger contexts that list a level kind,
+per family* (year; `cluster` and `validated_reference` are 0 in every
+family, since clusters are live only and `validated_reference` has no
+source, so they are left out):
+
+| Family (triggers) | poc | vah | val | hvn | lvn | structural_high | structural_low | prior_sweep | sfp_zone | vwap |
+|---|---|---|---|---|---|---|---|---|---|---|
+| failed_auction (697) | 2.4 | 47.1 | 53.2 | 37.0 | 38.5 | 0.0 | 0.0 | 82.1 | 92.8 | 11.1 |
+| sfp (5 631) | 5.0 | 5.5 | 5.1 | 34.2 | 34.2 | 2.0 | 1.9 | 63.8 | 90.0 | 4.7 |
+| absorption (0) | - | - | - | - | - | - | - | - | - | - |
+| exhaustion (1 462) | 4.7 | 8.0 | 6.3 | 42.1 | 36.2 | 3.4 | 3.7 | 68.6 | 91.9 | 8.1 |
+| effort_vs_result (24 186) | 5.4 | 5.5 | 5.0 | 38.8 | 36.0 | 0.8 | 0.9 | 70.8 | 92.4 | 8.9 |
+| cvd_divergence (938) | 6.6 | 3.4 | 5.9 | 39.5 | 35.3 | 10.8 | 8.2 | 63.6 | 91.5 | 3.8 |
+| oi_expansion_rejection (2 385) | 3.9 | 10.9 | 10.5 | 33.1 | 33.2 | 2.2 | 1.8 | 64.7 | 89.9 | 5.2 |
+| failed_reclaim (430) | 3.0 | 54.2 | 46.3 | 34.4 | 37.0 | 0.0 | 0.0 | 84.2 | 84.9 | 12.8 |
+| breakout_acceptance (367) | 5.2 | 53.1 | 47.7 | 41.1 | 34.6 | 0.0 | 0.3 | 85.6 | 91.8 | 21.5 |
+
+On the live store the `cluster` share is 100 % for failed auction (2
+triggers), absorption (37), exhaustion (4) and effort vs result (43), 78 %
+for SFP (18), 67 % for CVD divergence (3), 89 % for OI (9) and 0 % for
+breakout acceptance (2); the other kinds rest on too few triggers to read.
+
+*OI outcomes per id (D7),* the year:
+
+| OI id | no start | no end | resolution mismatch | shared boundary | not higher | out of range | fired |
+|---|---|---|---|---|---|---|---|
+| `trigger.oi_expansion_rejection.15m@1` | 0 | 0 | 0 | 765 | 2 033 | 0 | 1 469 |
+| `trigger.oi_expansion_rejection.1h@1` | 0 | 0 | 0 | 34 | 576 | 0 | 453 |
+| `trigger.oi_expansion_rejection.4h@1` | 0 | 0 | 0 | 3 | 129 | 0 | 125 |
+| `trigger.oi_expansion_rejection.1d@1` | 0 | 0 | 0 | 0 | 25 | 0 | 19 |
+| `trigger.oi_expansion_rejection.prior_day@1` | 0 | 0 | 0 | 65 | 313 | 0 | 319 |
+
+The outcomes of each id sum to its SFP count (4 267 / 1 063 / 257 / 44) or,
+for `prior_day`, to the 697 failed auctions. No rejection lacked a start
+or end point or had a resolution mismatch. The live store: 15m 0 / 0 / 0 /
+1 / 8 / 0 / 6, 1h 0 / 0 / 0 / 0 / 1 / 0 / 2, `prior_day` 0 / 0 / 0 / 0 / 1 /
+0 / 1, 4h and 1d none, in the same column order.
+
+Full results: https://github.com/Replikanti/mie/issues/24#issuecomment-6269005686

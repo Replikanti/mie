@@ -12,6 +12,11 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
 
 ### Added
 
+- **ADR-053 is `accepted` (#24 M4).** The *Accept when* measurement on the
+  #12 year and the ADR-051 R0 live store passed: 603 323 345 events, 0
+  mismatches, every archive-reachable trigger id fired. The measured gate
+  pass rates (88.9–94.8 %) and shared-boundary shares (17.9 / 3.2 / 1.2 % of
+  15m / 1h / 4h SFPs) are recorded in the ADR. No code changes.
 - **OI expansion followed by rejection and the trigger measurement tool
   (ADR-053 D7, part of #24).** `trigger.oi_expansion_rejection.<15m|1h|4h|1d>@1`
   fire on the SFP of their timeframe and
