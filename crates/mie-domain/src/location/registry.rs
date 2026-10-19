@@ -752,6 +752,46 @@ mod tests {
     }
 
     #[test]
+    fn zone_contains_includes_its_exact_padded_edges() {
+        // A zone 59 990 … 60 010 USDT around 60 000 USDT, padded by
+        // TOLERANCE_BPS = 6 bps of 60 000 = 36 USDT exactly; on both bounds
+        // just inside, exactly on and just outside the padded edge. The
+        // ADR-054 measurement's model checks the same vectors
+        // (`the_model_zone_includes_its_exact_padded_edges`), so the two
+        // implementations agree at the boundary.
+        use crate::num::SCALE;
+        let (reference, low, high) = (60_000 * SCALE, 59_990 * SCALE, 60_010 * SCALE);
+        let reach = 36 * SCALE;
+        assert_eq!(reference * TOLERANCE_BPS, reach * 10_000);
+        let level = LocationLevel::sourced(
+            LevelKind::Poc,
+            source("profile.test"),
+            None,
+            None,
+            (
+                Price::from_units(reference),
+                Price::from_units(low),
+                Price::from_units(high),
+            ),
+        );
+        let vectors = [
+            (low - reach + 1, true),
+            (low - reach, true),
+            (low - reach - 1, false),
+            (high + reach - 1, true),
+            (high + reach, true),
+            (high + reach + 1, false),
+        ];
+        for (units, inside) in vectors {
+            assert_eq!(
+                zone_contains(&level, Price::from_units(units)),
+                inside,
+                "{units}"
+            );
+        }
+    }
+
+    #[test]
     fn the_zone_is_the_bar_range_against_the_padded_zone() {
         // 6 bps of 60 000 is 36 USDT: a bar whose high is 36 below the level
         // reaches it, 36.00000001 below does not.

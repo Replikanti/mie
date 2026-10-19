@@ -83,7 +83,7 @@
 //! invariant and every report section in CI on the seeded tapes of
 //! `trigger_measure.rs` (`common::tapes`), and asserts that every compared
 //! kind occurred, so T0 cannot pass vacuously: a multi-member episode of
-//! each windowed family (effort vs result, absorption), a chained
+//! each windowed family (effort vs result, absorption, exhaustion), a chained
 //! divergence pair, an SFP chain, an emitted truncated episode, records
 //! held back before `emit_from`, an event that closes several minutes, and
 //! a rejected event after which the engine still shows the previous event's
@@ -161,10 +161,20 @@ const ZONE_BPS: i128 = 6;
 /// ADR-044 D3's padded zone: whether `price` lies in `[low − w, high + w]`
 /// with `w` = 6 bps of the level's price, exact.
 fn in_zone(level: &LocationLevel, price: mie_domain::num::Price) -> bool {
+    in_padded_zone(level.price, level.low, level.high, price)
+}
+
+/// [`in_zone`] on the level's price and zone edges.
+fn in_padded_zone(
+    reference: mie_domain::num::Price,
+    low: mie_domain::num::Price,
+    high: mie_domain::num::Price,
+    price: mie_domain::num::Price,
+) -> bool {
     let price = i128::from(price.units());
-    let reach = i128::from(level.price.units()).abs() * ZONE_BPS;
-    (i128::from(level.low.units()) - price) * 10_000 <= reach
-        && (price - i128::from(level.high.units())) * 10_000 <= reach
+    let reach = i128::from(reference.units()).abs() * ZONE_BPS;
+    (i128::from(low.units()) - price) * 10_000 <= reach
+        && (price - i128::from(high.units())) * 10_000 <= reach
 }
 
 /// The context of a baseline anchor (D1): every registry level whose padded
@@ -1317,6 +1327,10 @@ fn model_reproduces_the_sampler_on_a_synthetic_tape() {
             multi(&book, TriggerFamily::Absorption),
         ),
         (
+            "multi-member exhaustion episodes",
+            multi(&full, TriggerFamily::Exhaustion),
+        ),
+        (
             "chained CVD divergences",
             multi(&full, TriggerFamily::CvdDivergence),
         ),
@@ -1331,6 +1345,39 @@ fn model_reproduces_the_sampler_on_a_synthetic_tape() {
     ];
     for (kind, count) in kinds {
         assert!(count > 0, "the tapes compared no {kind}");
+    }
+}
+
+#[test]
+fn the_model_zone_includes_its_exact_padded_edges() {
+    // The vectors of mie-domain's `zone_contains_includes_its_exact_padded_edges`,
+    // so the model and the domain agree at the boundary: a zone
+    // 59 990 … 60 010 USDT around 60 000 USDT, padded by 6 bps of 60 000 =
+    // 36 USDT exactly, on both bounds just inside, exactly on and just
+    // outside the padded edge.
+    use mie_domain::num::{Price, SCALE};
+    let (reference, low, high) = (60_000 * SCALE, 59_990 * SCALE, 60_010 * SCALE);
+    let reach = 36 * SCALE;
+    assert_eq!(i128::from(reference) * ZONE_BPS, i128::from(reach) * 10_000);
+    let vectors = [
+        (low - reach + 1, true),
+        (low - reach, true),
+        (low - reach - 1, false),
+        (high + reach - 1, true),
+        (high + reach, true),
+        (high + reach + 1, false),
+    ];
+    for (units, inside) in vectors {
+        assert_eq!(
+            in_padded_zone(
+                Price::from_units(reference),
+                Price::from_units(low),
+                Price::from_units(high),
+                Price::from_units(units),
+            ),
+            inside,
+            "{units}"
+        );
     }
 }
 
