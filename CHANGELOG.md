@@ -12,6 +12,11 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
 
 ### Added
 
+- **Direction criteria ([`docs/direction.md`](docs/direction.md)).** The
+  three directions the project can take after milestone 1 (trade it, sell
+  the intelligence, sell the research machine), the evidence that selects
+  each, and proposed thresholds that are fixed before the first Research
+  Lab result is read. No code changes.
 - **Context records and their sampling policy (ADR-054, proposed; part of
   #25).** The new domain module `mie_domain::conditional` turns the
   engine's output after each accepted event into `ContextRecord`s: a
