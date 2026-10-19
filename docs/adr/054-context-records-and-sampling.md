@@ -82,7 +82,8 @@ which only exists once #26 fixes horizons.
 - `sample`, one of:
   - `Trigger { trigger, episode }`: the ADR-053 event **as emitted**, with
     its key (family and parameter version), evidence, `LocationContext` and
-    `Bias`, and its `Episode` (D4).
+    `Bias`, and its `Episode` (D4): the id, and whether the sample opened
+    the episode, the episode is truncated, or the sample is a bridge.
   - `Baseline { minute_end }`: the end of the 1m bar whose close set the
     anchor. It is the grid point, so a consumer can subsample.
 - `context: LocationContext` and `bias: Bias`:
@@ -201,11 +202,30 @@ One episode stream per **trigger id** (feature key).
   |---|---|---|
   | `trigger.effort_result.<w>@1`, `trigger.absorption.<w>@1` (via `Absorption.effort`) | `end − w` (`w` = the window's `timeframe`) | `end − 1 ms` |
   | `trigger.exhaustion@1` | `expansion.end − expansion.timeframe` (= `t − 65 min`) | `end − 1 ms` |
-  | `trigger.cvd_divergence.<tf>@1` | `pair.previous.time` | `pair.current.time` |
-  | `trigger.sfp.<tf>@1` | `sweep.time` | `resolved_bar_end − 1 ms` |
+  | `trigger.cvd_divergence.<tf>@1` | `pair.previous.time` | `pair.current.known_at − 1 ms` |
+  | `trigger.sfp.<tf>@1` | `sweep.time` | `resolved_bar_end − 1 ms` (`known_at` if unresolved) |
   | `trigger.oi_expansion_rejection.<tf>@1` and `.prior_day@1` | the earlier of the rejection's `first` and `start.boundary` | the later of the rejection's `last` and `end.boundary` |
   | auction ids (failed auction, failed reclaim, breakout + acceptance) | the deciding 1m bar: `bar_end − 60 000 ms` | `bar_end − 1 ms` |
 
+  - *Why a divergence runs through the confirming bars:* the later swing
+    exists only once `SWING_BARS` = 3 closed bars after it stay inside its
+    extreme (ADR-037), so those bars are data the decision read, and two
+    divergences whose confirmations share bars share input. `current.known_at`
+    is the event that closed the confirming bar; no trade lies between that
+    bar's end and this event (it is the first trades-stream event after
+    it, ADR-031), so `known_at − 1 ms` covers the same trades as the bar
+    end, read from the evidence without the constant. *Rejected:* ending at
+    the anchor trade `current.time`. Two episodes would then count the same
+    confirming bars as independent evidence: on the candidate golden tape
+    23 of the 163 CVD-divergence episodes (all timeframes) did, and on 1d
+    the confirmation is 3 days.
+  - *Two arms with no trigger of their own:* an OI divergence
+    (`CandidateEvent::OiDivergence`) feeds no trigger family (ADR-053 D7),
+    so no trigger carries one; `evidence_span` gives it the divergence rule
+    above only so the function is total. An SFP's sweep is always resolved
+    when its trigger fires (ADR-053 D5), so `resolved_bar_end` is set; the
+    `known_at` fallback, the event that emitted the fact, keeps the
+    function total without inventing a bar end.
   - *Why the auction ids get only their deciding bar:* a failure or an
     acceptance ends its probe (ADR-044 D8), and the next trigger of the id
     needs a new probe, which starts at a later close. Two triggers of one
@@ -217,25 +237,44 @@ One episode stream per **trigger id** (feature key).
     trade before it, ADR-035), the swing that made a swept level. Counting
     them would chain every effort edge within a day into one episode: a
     24-hour cooldown by another name.
-- **Join rule:** a trigger joins its id's open episode when
-  `first ≤ open.last`; the episode's `last` becomes the later of the two.
-  Otherwise it opens a new episode, and the open one closes. So
-  consecutive divergences that share a swing chain, rising edges of one
-  window whose minutes overlap chain, and SFPs whose excursions overlap
+- **Join rule:** a trigger joins its id's open episode when its span
+  overlaps the episode's data: `first ≤ open.last` and
+  `open.first ≤ last`. The episode's data becomes the hull of both.
+  Otherwise the trigger opens a new episode, and the open one closes.
+  Since every member overlaps the data it joins, an episode's data is
+  always one interval, the union of its members' spans, so "overlaps the
+  hull" and "overlaps a member's data" are the same test. So consecutive
+  divergences that share a swing or confirming bars chain, rising edges of
+  one window whose minutes overlap chain, and SFPs whose excursions overlap
   chain.
+  - *Why both bounds:* with `first ≤ open.last` alone, a span lying wholly
+    before the open episode joins it although they share no datum, and
+    the episode count depends on the emission order of one event's
+    triggers. With both bounds it does not: a test assigns two disjoint
+    spans at one event in both orders and gets two episodes each time.
 - **Invariant**, which the tests pin: two episodes of one id share no
   input data, except across a reported bridge.
-- **Bridges:** a trigger that joins the open episode while its `first` is
-  at or before the previous closed episode's `last` reaches back into that
-  episode's data. Streaming cannot merge two closed episodes, so bridges
-  are counted (`SamplingStats.bridges`) and M3 reports them. They occur
-  only where `first` is not monotone per id: the high and low sides of a
-  divergence id, and SFPs of different levels.
+- **Bridges:** a trigger whose span overlaps the hull of the data of its
+  id's closed episodes may share data with one of them. Streaming does not
+  merge it back into a closed episode, so it is reported instead: on the
+  sample (`Episode.bridge`) and per id (`SamplingStats.per_trigger`). The
+  check is conservative: a span that falls into a gap between two closed
+  episodes is reported although it shares no datum, and none is missed.
+  Bridges need spans out of time order within an id, which only the high
+  and low sides of a divergence id and SFPs of different levels produce:
+  in an id whose spans arrive in order no closed episode reaches past the
+  open one, so none is reported.
 - **Identity:** `EpisodeId { trigger, opened_at, ordinal }`: the trigger
   id, the `CanonicalKey` of the event that opened it, and how many episodes
-  the id had opened at that event before it. *Why the ordinal:* one close
-  can confirm a high and a low swing with disjoint spans. Each record
-  carries `Episode { id, opener, truncated }`; consumers count
+  the id had opened at that event before it. Under this span table two
+  triggers of one id at one event share their `last` instant (the same
+  resolving bar, minute, confirming close or rejection), so they always
+  join one episode and the ordinal is 0; tests pin that on the candidate
+  golden tape and the location golden tape.
+  *Why the ordinal anyway:* it makes the id unique by construction, not by
+  that property of the span table, so a later span rule (a new policy
+  version) cannot make two episodes share an id. Each record carries
+  `Episode { id, opener, truncated, bridge }`; consumers count
   `DISTINCT id`.
 - **Truncated:** the opener's `first` is earlier than the first event the
   sampler observed, so its earlier members may be missing.
@@ -314,7 +353,7 @@ One episode stream per **trigger id** (feature key).
 | 1m baseline grid | D3: every trigger family is decided at an event that closes a 1m bar (ADR-051 D2, ADR-044, ADR-037, ADR-053 D2) | Coarser: the closes of longer bars weigh 5× (5m grid) or 60× (1h grid) their share. Finer: instants at which no trigger can occur |
 | Effort and absorption span `[end − w, end − 1 ms]` | The window's own `timeframe` and `end` (ADR-035 windows of closed minutes, half-open) | Shorter than the span: two episodes share input data, so one stretch of evidence is counted twice. Longer: episodes that share no input are merged, and how much longer is #26's horizon |
 | Exhaustion `first` = `t − 65 min` | The judged 1h expansion ending at `t − 5 min` and the extreme over `(t − 65 min, t]` (ADR-051 D6), read from the evidence | As above |
-| CVD divergence `[previous.time, current.time]` | The anchor trades of the swing pair (ADR-051 D4) | As above |
+| CVD divergence `[previous.time, current.known_at − 1 ms]` | The earlier anchor trade of the swing pair (ADR-051 D4) to the event that closed the bar confirming the later swing, the 3rd bar after it (`SWING_BARS`, ADR-037) | As above; ending at the anchor trade instead counts shared confirming bars twice (D4) |
 | SFP `[sweep.time, resolved_bar_end − 1 ms]` | The sweeping trade and the resolving bar (ADR-037) | As above |
 | OI union with `start.boundary`, `end.boundary` | The two `derivatives.oi.5m@1` points the expansion compares (ADR-053 D7) | As above |
 | Auction deciding bar, 60 000 ms | The 1m bar whose close changed the label (ADR-044 classifies at 1m closes); a probe ends with its failure or acceptance (ADR-044 D8) | Longer: triggers of one id on separate probes could chain. Shorter: part of the deciding bar is left out |
@@ -363,8 +402,9 @@ There is no other number.
   low. That is not bounded by a number, which would be the rejected
   cooldown: M3 reports samples and duration per episode, and a human reads
   that table before #26 fixes horizons.
-- Bridges leave two closed episodes that share data. They are counted, not
-  repaired.
+- Bridges leave two episodes that may share data. They are flagged on the
+  sample and counted per id, not repaired, and the count is an upper bound
+  (D4).
 - Episode ids depend on where a replay starts: an episode open at the
   first observed event is marked `truncated`, and `emit_from` lets a warm
   prefix rebuild it. Replays from the same start reproduce byte for byte.
@@ -419,7 +459,8 @@ year, 2025-10-01 … 2026-09-30, and on the ADR-051 R0 live store:
   live store.
 - **Reported, no threshold:**
   - per id: samples, episodes, samples per episode (p50/p90/p99/max),
-    episode duration (p50/p99/max), bridges and truncated episodes;
+    episode duration (p50/p99/max), bridges and truncated episodes
+    (`SamplingStats.per_trigger`, `Episode.bridge`);
   - cross-id co-emissions per family at one event;
   - baseline samples: in total, per regime label and per ADR-051 location
     bin (`value_edge` / `structural_extreme` / `neither`), and the instants

@@ -23,8 +23,10 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   `StateSnapshot` of 13 features (`SNAPSHOT_FEATURES`). Overlap control has
   no time constant: within one trigger id, a trigger joins the open
   episode when its evidence span (`evidence_span`, read from the
-  evidence's own fields) overlaps the episode's data; every sample is kept
-  with an `Episode { id, opener, truncated }`, and bridges are counted.
+  evidence's own fields; a divergence's runs through the bars that confirm
+  its later swing) overlaps the episode's data; every sample is kept with
+  an `Episode { id, opener, truncated, bridge }`, and `SamplingStats`
+  counts samples, episodes, bridges and truncated episodes per trigger id.
   Location zone events are not sampled. `ContextSampler` is pure, streams
   its records, and can emit from a window start after a warm prefix;
   `ContextProvenance` carries the data version, the engine key and the

@@ -45,13 +45,14 @@ pub mod snapshot;
 
 pub use episode::{
     Assignment, Episode, EpisodeId, EpisodeTracker, EvidenceSpan, SpanRule, TRIGGER_IDS,
-    evidence_span,
+    evidence_span, trigger_position,
 };
 pub use snapshot::{SNAPSHOT_FEATURES, StateSnapshot};
 
 use crate::bars::Timeframe;
 use crate::candidate::LocationContext;
 use crate::event::MarketEvent;
+use crate::feature::FeatureKey;
 use crate::fingerprint::{Fingerprint, Fingerprinter};
 use crate::num::Price;
 use crate::order::CanonicalKey;
@@ -74,7 +75,7 @@ pub const SAMPLING_V1: PipelineKey = PipelineKey::new("conditional.sampling", 1)
 /// mie-sampling-policy 1
 /// policy conditional.sampling@1
 /// baseline every_event_closing_a_1m_bar anchor=last_1m_close_with_trades
-/// episode scope=trigger_id join=first_at_most_open_last
+/// episode scope=trigger_id join=span_overlaps_episode_data bridge=span_overlaps_closed_data
 /// span <trigger id> <span rule>        (one line per TRIGGER_IDS entry)
 /// snapshot <feature>,<feature>,…       (SNAPSHOT_FEATURES)
 /// ```
@@ -84,7 +85,9 @@ pub fn policy_text() -> String {
     let mut text = String::from("mie-sampling-policy 1\n");
     text.push_str(&format!("policy {SAMPLING_V1}\n"));
     text.push_str("baseline every_event_closing_a_1m_bar anchor=last_1m_close_with_trades\n");
-    text.push_str("episode scope=trigger_id join=first_at_most_open_last\n");
+    text.push_str(
+        "episode scope=trigger_id join=span_overlaps_episode_data bridge=span_overlaps_closed_data\n",
+    );
     for (key, rule) in TRIGGER_IDS {
         text.push_str(&format!("span {key} {rule}\n"));
     }
@@ -198,7 +201,20 @@ impl fmt::Display for ContextRecord {
     }
 }
 
-/// Counts over the emitted records.
+/// Counts over the emitted trigger samples of one trigger id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TriggerStats {
+    /// Trigger samples emitted.
+    pub samples: u64,
+    /// Distinct episodes with at least one emitted sample.
+    pub episodes: u64,
+    /// Emitted samples that are bridges (ADR-054 D4).
+    pub bridges: u64,
+    /// Distinct emitted episodes that are truncated.
+    pub truncated: u64,
+}
+
+/// Counts over the emitted records: totals, and per trigger id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SamplingStats {
     /// Records emitted, trigger and baseline.
@@ -209,6 +225,15 @@ pub struct SamplingStats {
     pub bridges: u64,
     /// Distinct emitted episodes that are truncated.
     pub truncated: u64,
+    /// The counts of each trigger id, in [`TRIGGER_IDS`] order.
+    pub per_trigger: [TriggerStats; TRIGGER_IDS.len()],
+}
+
+impl SamplingStats {
+    /// The counts of the trigger id `trigger`, if it is one.
+    pub fn trigger(&self, trigger: FeatureKey) -> Option<&TriggerStats> {
+        trigger_position(trigger).map(|position| &self.per_trigger[position])
+    }
 }
 
 /// The last closed 1m bar with trades.
@@ -312,12 +337,22 @@ impl ContextSampler {
             if !emitting {
                 continue;
             }
-            self.stats.records += 1;
-            if self.episodes.first_emission(trigger.feature) {
-                self.stats.episodes += 1;
-                self.stats.truncated += u64::from(assignment.episode.truncated);
+            let episode = assignment.episode;
+            let first = self.episodes.first_emission(trigger.feature);
+            let stats = &mut self.stats;
+            stats.records += 1;
+            let per = trigger_position(trigger.feature)
+                .map(|position| &mut stats.per_trigger[position])
+                .expect("every trigger id has a stats slot");
+            per.samples += 1;
+            if first {
+                stats.episodes += 1;
+                per.episodes += 1;
+                stats.truncated += u64::from(episode.truncated);
+                per.truncated += u64::from(episode.truncated);
             }
-            self.stats.bridges += u64::from(assignment.bridge);
+            stats.bridges += u64::from(episode.bridge);
+            per.bridges += u64::from(episode.bridge);
             emit(ContextRecord {
                 event: key,
                 sample: Sample::Trigger {
@@ -337,7 +372,7 @@ mod tests {
     use super::*;
     use crate::candidate::CandidateEvent;
     use crate::event::samples::t;
-    use crate::event::{Aggressor, OpenInterest, Trade};
+    use crate::event::{Aggressor, FeedGap, GapReason, OpenInterest, Stream, Trade};
     use crate::feature::{FeatureKey, catalog};
     use crate::num::{Qty, SCALE};
     use crate::structure::STRUCTURE_TIMEFRAMES;
@@ -567,7 +602,8 @@ mod tests {
     }
 
     /// A 15m CVD divergence trigger on the swing anchors at `previous` and
-    /// `current` ms.
+    /// `current` ms, the later swing confirmed by an event 1 ms after its
+    /// anchor, so its span is `[previous, current]`.
     fn divergence(previous: i64, current: i64) -> TriggerEvent {
         let mut trigger =
             template(|fact| fact.feature == catalog::TRIGGER_CVD_DIVERGENCE_15M_V1.key);
@@ -579,6 +615,7 @@ mod tests {
         };
         event.comparison.pair.previous.time = t(previous);
         event.comparison.pair.current.time = t(current);
+        event.comparison.pair.current.known_at = t(current + 1);
         trigger
     }
 
@@ -670,6 +707,112 @@ mod tests {
         for (index, record) in &records {
             assert_eq!(record.event, events[*index].canonical_key());
         }
+    }
+
+    #[test]
+    fn an_event_that_closes_only_empty_minutes_keeps_the_anchor() {
+        // ADR-054 D3: a trades gap closes the minute with trades; the trade
+        // after it closes only empty minutes and still samples, at the
+        // anchor and `minute_end` of the last minute with trades.
+        let events = [
+            trade(1_000, 1, usdt(60_000)),
+            trade(20_000, 2, usdt(60_010)),
+            MarketEvent::FeedGap(FeedGap {
+                stream: Stream::Trades,
+                start: t(30_000),
+                end: t(5 * MINUTE + 10_000),
+                reason: GapReason::Disconnected,
+            }),
+            trade(10 * MINUTE + 1_000, 3, usdt(60_500)),
+        ];
+        let mut engine = MarketStateEngine::new();
+        let mut sampler = ContextSampler::new(None);
+        let mut baselines = Vec::new();
+        for (index, event) in events.iter().enumerate() {
+            engine.apply(event).unwrap();
+            let minutes: Vec<bool> = engine
+                .closed_bars()
+                .iter()
+                .filter(|bar| bar.timeframe == Timeframe::M1)
+                .map(|bar| bar.ohlc.is_some())
+                .collect();
+            sampler.observe(event, &engine, |record| {
+                if let Sample::Baseline { minute_end } = record.sample {
+                    baselines.push((index, minute_end, record.context.anchor, minutes.clone()));
+                }
+            });
+        }
+        assert_eq!(baselines.len(), 2, "{baselines:?}");
+        let (gap, gap_end, gap_anchor, gap_minutes) = &baselines[0];
+        assert_eq!((*gap, *gap_end, *gap_anchor), (2, t(MINUTE), usdt(60_010)));
+        assert!(gap_minutes[0], "{gap_minutes:?}");
+        let (after, after_end, after_anchor, after_minutes) = &baselines[1];
+        assert_eq!(*after, 3);
+        assert!(!after_minutes.is_empty() && after_minutes.iter().all(|with| !with));
+        // The anchor and `minute_end` repeat.
+        assert_eq!((*after_end, *after_anchor), (t(MINUTE), usdt(60_010)));
+    }
+
+    #[test]
+    fn divergence_spans_run_through_the_confirming_bars() {
+        // ADR-054 D4: the span of a divergence ends where the later swing's
+        // confirming bar ends, not at its anchor trade.
+        let mut checked = 0;
+        for (_, _, fact) in &golden_run().fired {
+            let Some(CandidateEvent::CvdDivergence(event)) = candidate_of(fact) else {
+                continue;
+            };
+            let pair = &event.comparison.pair;
+            let span = evidence_span(fact);
+            assert_eq!(span.first, pair.previous.time);
+            assert_eq!(span.last, t(pair.current.known_at.as_millis() - 1));
+            assert_eq!(pair.current.known_at, fact.known_at);
+            assert!(span.last > pair.current.time, "{fact}");
+            checked += 1;
+        }
+        assert!(checked > 100, "{checked}");
+    }
+
+    #[test]
+    fn stats_count_per_trigger_id() {
+        let run = golden_run();
+        let stats = run.stats;
+        let per = stats.per_trigger;
+        assert_eq!(
+            per.iter().map(|id| id.samples).sum::<u64>(),
+            run.triggers.len() as u64
+        );
+        assert_eq!(
+            per.iter().map(|id| id.episodes).sum::<u64>(),
+            stats.episodes
+        );
+        assert_eq!(per.iter().map(|id| id.bridges).sum::<u64>(), stats.bridges);
+        assert_eq!(
+            per.iter().map(|id| id.truncated).sum::<u64>(),
+            stats.truncated
+        );
+        for (key, _) in TRIGGER_IDS {
+            let records: Vec<&Episode> = run
+                .triggers
+                .iter()
+                .filter_map(|(_, record, _)| trigger_of(record))
+                .filter(|(trigger, _)| trigger.feature == key)
+                .map(|(_, episode)| episode)
+                .collect();
+            let counted = stats.trigger(key).unwrap();
+            assert_eq!(counted.samples, records.len() as u64, "{key}");
+            assert_eq!(
+                counted.episodes,
+                records.iter().filter(|episode| episode.opener).count() as u64,
+                "{key}"
+            );
+            assert_eq!(
+                counted.bridges,
+                records.iter().filter(|episode| episode.bridge).count() as u64,
+                "{key}"
+            );
+        }
+        assert_eq!(stats.trigger(catalog::BIAS_CONTEXT_V1.key), None);
     }
 
     #[test]
@@ -767,7 +910,7 @@ mod tests {
             (end + 5 * MINUTE, effort_at(Timeframe::M5, end + 5 * MINUTE)),
         ]);
         assert_eq!(episodes(&apart), 2);
-        assert!(apart.iter().all(|a| a.episode.opener && !a.bridge));
+        assert!(apart.iter().all(|a| a.episode.opener && !a.episode.bridge));
     }
 
     #[test]
@@ -843,6 +986,7 @@ mod tests {
         for (_, record) in &records {
             let (trigger, episode) = trigger_of(record).unwrap();
             assert!(episode.opener, "{record}");
+            assert_eq!(episode.id.ordinal, 0, "{record}");
             let TriggerEvidence::Auction(status) = &trigger.evidence else {
                 unreachable!()
             };
@@ -928,17 +1072,43 @@ mod tests {
 
     #[test]
     fn one_event_can_open_two_episodes_of_one_id() {
+        // Two disjoint spans of one id at one event, in both emission
+        // orders: the same two episodes, told apart by the ordinal. (Real
+        // triggers of one id at one event share their `last` instant and
+        // join one episode; the ordinal keeps the id unique regardless.)
         let hour = 3_600_000;
-        let mut tracker = EpisodeTracker::new();
         let at = key(10 * hour, 1);
-        // A high pair and a low pair confirmed by one close, disjoint.
-        let high = tracker.assign(&divergence(hour, 2 * hour), at, t(0));
-        let low = tracker.assign(&divergence(3 * hour, 4 * hour), at, t(0));
-        assert_eq!((high.episode.id.ordinal, low.episode.id.ordinal), (0, 1));
-        assert!(high.episode.opener && low.episode.opener);
-        // The next event starts counting again.
-        let later = tracker.assign(&divergence(5 * hour, 6 * hour), key(11 * hour, 2), t(0));
-        assert_eq!(later.episode.id.ordinal, 0);
+        let pairs = [divergence(hour, 2 * hour), divergence(3 * hour, 4 * hour)];
+        for order in [[0, 1], [1, 0]] {
+            let mut tracker = EpisodeTracker::new();
+            let [first, second] = order.map(|index| tracker.assign(&pairs[index], at, t(0)));
+            assert_ne!(first.episode.id, second.episode.id, "{order:?}");
+            assert_eq!(
+                (first.episode.id.ordinal, second.episode.id.ordinal),
+                (0, 1)
+            );
+            assert!(first.episode.opener && second.episode.opener, "{order:?}");
+            assert!(!first.episode.bridge && !second.episode.bridge, "{order:?}");
+            // The next event starts counting again.
+            let later = tracker.assign(&divergence(5 * hour, 6 * hour), key(11 * hour, 2), t(0));
+            assert_eq!(later.episode.id.ordinal, 0);
+        }
+    }
+
+    #[test]
+    fn a_span_wholly_before_the_open_episode_opens_its_own() {
+        // The join rule is a real overlap: a span that ends before the open
+        // episode's data starts shares nothing with it.
+        let hour = 3_600_000;
+        let assignments = assign_all(&[
+            (3 * hour, divergence(hour, 2 * hour)),
+            (6 * hour, divergence(4 * hour, 5 * hour)),
+            (7 * hour, divergence(30 * MINUTE, 50 * MINUTE)),
+        ]);
+        assert_eq!(episodes(&assignments), 3);
+        assert!(assignments[2].episode.opener);
+        // It overlaps no closed episode either.
+        assert!(!assignments[2].episode.bridge);
     }
 
     #[test]
@@ -952,8 +1122,8 @@ mod tests {
         ]);
         assert_eq!(episodes(&assignments), 2);
         assert!(!assignments[2].episode.opener);
-        assert!(assignments[2].bridge);
-        assert!(!assignments[1].bridge);
+        assert!(assignments[2].episode.bridge);
+        assert!(!assignments[1].episode.bridge);
     }
 
     #[test]
@@ -967,9 +1137,30 @@ mod tests {
             .map(|(_, key, fact)| (fact.feature, tracker.assign(fact, *key, observed_from)))
             .collect();
         let mut multi = 0;
-        let mut crossing = 0;
+        let mut crossing: Vec<usize> = Vec::new();
+        // The data of every episode: a member overlaps the data it joins.
+        let mut data: Vec<(EpisodeId, EvidenceSpan)> = Vec::new();
         for (later, (feature, assignment)) in assigned.iter().enumerate() {
             multi += usize::from(!assignment.episode.opener);
+            // Under the @1 span table one event opens at most one episode
+            // of an id.
+            assert_eq!(assignment.episode.id.ordinal, 0);
+            match data.iter_mut().find(|(id, _)| *id == assignment.episode.id) {
+                Some((_, span)) => {
+                    assert!(!assignment.episode.opener);
+                    assert!(
+                        span.overlaps(assignment.span),
+                        "{feature} {}",
+                        assignment.span
+                    );
+                    span.first = span.first.min(assignment.span.first);
+                    span.last = span.last.max(assignment.span.last);
+                }
+                None => {
+                    assert!(assignment.episode.opener);
+                    data.push((assignment.episode.id, assignment.span));
+                }
+            }
             for (earlier_feature, earlier) in &assigned[..later] {
                 if earlier_feature != feature
                     || earlier.episode.id == assignment.episode.id
@@ -977,16 +1168,19 @@ mod tests {
                 {
                     continue;
                 }
-                crossing += 1;
-                assert!(assignment.bridge, "{feature} {}", assignment.span);
+                if crossing.last() != Some(&later) {
+                    crossing.push(later);
+                }
+                assert!(assignment.episode.bridge, "{feature} {}", assignment.span);
             }
         }
         assert!(multi > 100, "{multi}");
-        // Every bridge counted by the full sampler is one of these.
-        assert!(run.stats.bridges <= u64::try_from(crossing).unwrap());
+        // Every sample that crosses into another episode is a bridge; the
+        // check is conservative, so there may be more bridges.
+        assert!(crossing.len() as u64 <= run.stats.bridges);
         assert_eq!(
             run.stats.bridges,
-            assigned.iter().filter(|(_, a)| a.bridge).count() as u64
+            assigned.iter().filter(|(_, a)| a.episode.bridge).count() as u64
         );
     }
 
@@ -1171,7 +1365,7 @@ mod tests {
     fn sampling_policy_fingerprint_golden() {
         let text = policy_text();
         assert!(text.starts_with(
-            "mie-sampling-policy 1\npolicy conditional.sampling@1\nbaseline every_event_closing_a_1m_bar anchor=last_1m_close_with_trades\nepisode scope=trigger_id join=first_at_most_open_last\nspan trigger.failed_auction@1 deciding_minute\n"
+            "mie-sampling-policy 1\npolicy conditional.sampling@1\nbaseline every_event_closing_a_1m_bar anchor=last_1m_close_with_trades\nepisode scope=trigger_id join=span_overlaps_episode_data bridge=span_overlaps_closed_data\nspan trigger.failed_auction@1 deciding_minute\n"
         ));
         assert!(text.contains(
             "span trigger.oi_expansion_rejection.prior_day@1 oi_union\nsnapshot trade.last_price@1,volatility.atr.1h@1,flow.window.5m@1,"
@@ -1246,7 +1440,7 @@ mod tests {
         println!("stats {:?}", run.stats);
     }
 
-    const GOLDEN_POLICY_FINGERPRINT: &str = "6b303f8914d404b2";
-    const GOLDEN_RECORDS: (usize, &str) = (46_403, "5172ce40371aeeb8");
+    const GOLDEN_POLICY_FINGERPRINT: &str = "2c71fff23e8b0415";
+    const GOLDEN_RECORDS: (usize, &str) = (46_403, "2cc22dddefd1246f");
     const GOLDEN_FIRST_TRIGGER_RECORD: &str = "62161380ms Trade seq 163 trigger episode=trigger.sfp.15m@1/62161380ms/163/0 opener sfp evidence=[15m low level=61969.20000000 bar=55800000ms confirmed=59400000ms touches=2 at=61514129ms price=61966.54000000 extreme=61966.54000000 bars=1 sfp resolved=62100000ms complete structure.levels.15m@1] trigger.sfp.15m@1 ctx=61969.20000000 levels=vwap@61984.17149090 location.levels@2 auction=warming bias regime=warming 15m=[high=- low=-] 1h=warming 4h=warming 1d=warming bias.context@1 state trade.last_price@1=[61977.49000000] volatility.atr.1h@1=warming flow.window.5m@1=[5m end=62160000ms buy=0.46222275 sell=1.05082227 delta=-0.58859952 vol=1.51304502 trades=2 large=0 large_buy=0.00000000 large_sell=0.00000000 ref=61972.31000000 disp=3.88000000 imbalance=-0.38901652774350365 trades_per_min=0.4 vol_per_min=0.302609004 large_share=0 response=-6.591918389603851 complete flow.window.5m@1] flow.window.15m@1=[15m end=62160000ms buy=4.11021922 sell=2.08457016 delta=2.02564906 vol=6.19478938 trades=10 large=0 large_buy=0.00000000 large_sell=0.00000000 ref=61978.59000000 disp=-2.40000000 imbalance=0.32699240212102254 trades_per_min=0.6666666666666666 vol_per_min=0.41298595866666665 large_share=0 response=-1.184805427254018 complete flow.window.15m@1] flow.window.1h@1=[1h end=62160000ms buy=24.14170459 sell=15.20346730 delta=8.93823729 vol=39.34517189 trades=40 large=6 large_buy=1.86027866 large_sell=8.99881232 ref=61978.70000000 disp=-2.51000000 imbalance=0.2271749457592724 trades_per_min=0.6666666666666666 vol_per_min=0.6557528648333334 large_share=0.2759955150370039 response=-0.28081599520837963 complete flow.window.1h@1] flow.cvd.utc_day@1=[day=0ms cvd=-7.67851777 partial_start flow.cvd.utc_day@1] candidate.effort_result.5m@1=warming candidate.effort_result.15m@1=warming candidate.effort_result.1h@1=warming book.liquidity.window.5m@1=warming book.liquidity.window.15m@1=warming book.liquidity.window.1h@1=warming derivatives.oi.5m@1=[boundary=62100000ms oi=80066.10000000 sample=62100000ms res=300000ms delta=-42.20000000 vel_per_min=-8.44 derivatives.oi.5m@1]";
 }

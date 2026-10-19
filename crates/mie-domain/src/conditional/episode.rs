@@ -3,17 +3,22 @@
 //! Each trigger is reduced to its **evidence span** `[first, last]`, the
 //! data time of the first and the last input its evidence was built from,
 //! read from the evidence's own fields ([`evidence_span`]). Within one
-//! trigger id, a trigger joins the id's open episode when `first ≤
-//! open.last`, and the episode's `last` becomes the later of the two;
-//! otherwise it opens a new episode. Every sample is kept; counts are taken
-//! over episodes.
+//! trigger id, a trigger joins the id's open episode when its span overlaps
+//! the episode's data, `first ≤ open.last` and `open.first ≤ last`, and the
+//! episode's data grows to the hull of both; otherwise it opens a new
+//! episode and the open one closes. Each member overlaps the hull it joins,
+//! so an episode's data is always one interval, the union of its members'
+//! spans. Every sample is kept; counts are taken over episodes.
 //!
-//! Streaming cannot merge two closed episodes, so a trigger that joins the
-//! open episode while its `first` reaches back to the previous closed
-//! episode's data is a **bridge**: [`EpisodeTracker::assign`] reports it,
-//! and outside bridges two episodes of one id share no input data.
+//! Streaming cannot merge a closed episode back, so a trigger whose span
+//! overlaps the hull of its id's closed episodes is a **bridge**: it may
+//! share data with one of them. [`EpisodeTracker::assign`] reports it on
+//! the [`Episode`], and outside bridges two episodes of one id share no
+//! input data. The check is conservative: a span that falls into a gap
+//! between two closed episodes is reported although it shares no datum.
 
 use crate::candidate::CandidateEvent;
+use crate::candidate::divergence::SwingPair;
 use crate::feature::{FeatureKey, catalog};
 use crate::location::AuctionStatus;
 use crate::order::CanonicalKey;
@@ -34,7 +39,8 @@ pub enum SpanRule {
     DecidingMinute,
     /// The sweep's excursion: `[sweep.time, resolved_bar_end − 1 ms]`.
     SweepToResolution,
-    /// The swing pair's anchor trades: `[previous.time, current.time]`.
+    /// The swing pair from the earlier anchor trade through the bars that
+    /// confirm the later swing: `[previous.time, current.known_at − 1 ms]`.
     SwingPair,
     /// The effort window's minutes: `[end − w, end − 1 ms]`.
     EffortWindow,
@@ -69,7 +75,7 @@ impl SpanRule {
         match self {
             Self::DecidingMinute => "deciding_minute",
             Self::SweepToResolution => "sweep_to_resolution",
-            Self::SwingPair => "swing_pair",
+            Self::SwingPair => "swing_pair_to_confirmation",
             Self::EffortWindow => "effort_window",
             Self::Exhaustion => "exhaustion",
             Self::OiUnion => "oi_union",
@@ -165,6 +171,11 @@ pub const TRIGGER_IDS: [(FeatureKey, SpanRule); 23] = [
     ),
 ];
 
+/// The position of `trigger` in [`TRIGGER_IDS`].
+pub fn trigger_position(trigger: FeatureKey) -> Option<usize> {
+    TRIGGER_IDS.iter().position(|(key, _)| *key == trigger)
+}
+
 /// The data time of the first and the last input a trigger's evidence was
 /// built from, both inclusive (ADR-054 D4).
 ///
@@ -203,6 +214,17 @@ fn auction_span(status: &AuctionStatus) -> EvidenceSpan {
     }
 }
 
+/// The span of a swing pair: the earlier anchor trade to the event that
+/// closed the bar confirming the later swing, exclusive. No trade lies
+/// between that bar's end and the closing event, so this reads the same
+/// data as the bar end without a constant.
+fn pair_span(pair: &SwingPair) -> EvidenceSpan {
+    EvidenceSpan {
+        first: pair.previous.time,
+        last: minus(pair.current.known_at, 1),
+    }
+}
+
 /// The span of an SFP: the sweeping trade to the end of the resolving bar.
 fn sweep_span(sweep: &Sweep) -> EvidenceSpan {
     EvidenceSpan {
@@ -223,14 +245,10 @@ pub fn evidence_span(trigger: &TriggerEvent) -> EvidenceSpan {
         TriggerEvidence::Auction(status) => auction_span(status),
         TriggerEvidence::Sfp(sweep) => sweep_span(sweep),
         TriggerEvidence::Candidate(fact) => match fact.as_ref() {
-            CandidateEvent::CvdDivergence(event) => EvidenceSpan {
-                first: event.comparison.pair.previous.time,
-                last: event.comparison.pair.current.time,
-            },
-            CandidateEvent::OiDivergence(event) => EvidenceSpan {
-                first: event.comparison.pair.previous.time,
-                last: event.comparison.pair.current.time,
-            },
+            CandidateEvent::CvdDivergence(event) => pair_span(&event.comparison.pair),
+            // No trigger family is built on an OI divergence (ADR-053 D7);
+            // the arm keeps the function total, with the CVD rule.
+            CandidateEvent::OiDivergence(event) => pair_span(&event.comparison.pair),
             CandidateEvent::EffortVsResult(event) => EvidenceSpan {
                 first: minus(event.value.end, event.value.timeframe.millis()),
                 last: minus(event.value.end, 1),
@@ -265,8 +283,10 @@ pub fn evidence_span(trigger: &TriggerEvent) -> EvidenceSpan {
 
 /// The identity of an episode (ADR-054 D4): its trigger id, the event that
 /// opened it and how many episodes the id had opened at that event before
-/// it. One close can confirm a high and a low swing with disjoint spans, so
-/// one event can open two episodes of one id.
+/// it. Under `conditional.sampling@1` two triggers of one id at one event
+/// share their `last` instant, so they join one episode and the ordinal is
+/// 0; it keeps the id unique by construction rather than by that property
+/// of the span table.
 ///
 /// `Display` prints `<trigger>/<opened_at time>/<seq>/<ordinal>`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -302,6 +322,9 @@ pub struct Episode {
     /// The opener's `first` is earlier than the first event the sampler
     /// observed: earlier members may be missing.
     pub truncated: bool,
+    /// The sample's span overlaps the data of the id's closed episodes, so
+    /// it may share input data with one of them (module docs).
+    pub bridge: bool,
 }
 
 impl fmt::Display for Episode {
@@ -312,6 +335,9 @@ impl fmt::Display for Episode {
         }
         if self.truncated {
             f.write_str(" truncated")?;
+        }
+        if self.bridge {
+            f.write_str(" bridge")?;
         }
         Ok(())
     }
@@ -324,9 +350,6 @@ pub struct Assignment {
     pub episode: Episode,
     /// The trigger's evidence span.
     pub span: EvidenceSpan,
-    /// The trigger joined the open episode with a `first` at or before the
-    /// previous closed episode's `last`.
-    pub bridge: bool,
 }
 
 /// The open episode of one trigger id.
@@ -334,8 +357,8 @@ pub struct Assignment {
 struct Open {
     /// Its identity.
     id: EpisodeId,
-    /// The latest `last` of its members.
-    last: EventTime,
+    /// Its data: the hull, and so the union, of its members' spans.
+    data: EvidenceSpan,
     /// Its opener's `first` precedes the first observed event.
     truncated: bool,
     /// A sample of it has been emitted, for [`EpisodeTracker::first_emission`].
@@ -347,14 +370,14 @@ struct Open {
 struct Slot {
     /// The open episode.
     open: Option<Open>,
-    /// The `last` of the previous closed episode, for bridges.
-    closed_last: Option<EventTime>,
+    /// The hull of the data of its closed episodes, for bridges.
+    closed: Option<EvidenceSpan>,
     /// The last event at which the id opened an episode, and how many it
     /// opened there.
     opened: Option<(CanonicalKey, u32)>,
 }
 
-/// One open episode plus the previous closed episode's `last` per trigger
+/// One open episode plus the hull of the closed episodes' data per trigger
 /// id, in fixed [`TRIGGER_IDS`] slots (ADR-054 D4, D6).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EpisodeTracker {
@@ -382,10 +405,7 @@ impl EpisodeTracker {
     /// If `trigger` is not in [`TRIGGER_IDS`]; a test pins that every
     /// trigger id of the catalog is.
     fn slot(&mut self, trigger: FeatureKey) -> &mut Slot {
-        let position = TRIGGER_IDS
-            .iter()
-            .position(|(key, _)| *key == trigger)
-            .expect("every trigger id has an episode slot");
+        let position = trigger_position(trigger).expect("every trigger id has an episode slot");
         &mut self.slots[position]
     }
 
@@ -401,18 +421,22 @@ impl EpisodeTracker {
     ) -> Assignment {
         let span = evidence_span(trigger);
         let slot = self.slot(trigger.feature);
+        let bridge = slot.closed.is_some_and(|closed| closed.overlaps(span));
         if let Some(open) = &mut slot.open
-            && span.first <= open.last
+            && open.data.overlaps(span)
         {
-            open.last = open.last.max(span.last);
+            open.data = EvidenceSpan {
+                first: open.data.first.min(span.first),
+                last: open.data.last.max(span.last),
+            };
             return Assignment {
                 episode: Episode {
                     id: open.id,
                     opener: false,
                     truncated: open.truncated,
+                    bridge,
                 },
                 span,
-                bridge: slot.closed_last.is_some_and(|last| span.first <= last),
             };
         }
         let ordinal = match slot.opened {
@@ -420,7 +444,15 @@ impl EpisodeTracker {
             _ => 0,
         };
         slot.opened = Some((event, ordinal + 1));
-        slot.closed_last = slot.open.map(|open| open.last);
+        if let Some(open) = slot.open {
+            slot.closed = Some(match slot.closed {
+                Some(closed) => EvidenceSpan {
+                    first: closed.first.min(open.data.first),
+                    last: closed.last.max(open.data.last),
+                },
+                None => open.data,
+            });
+        }
         let id = EpisodeId {
             trigger: trigger.feature,
             opened_at: event,
@@ -429,7 +461,7 @@ impl EpisodeTracker {
         let truncated = span.first < observed_from;
         slot.open = Some(Open {
             id,
-            last: span.last,
+            data: span,
             truncated,
             emitted: false,
         });
@@ -438,9 +470,9 @@ impl EpisodeTracker {
                 id,
                 opener: true,
                 truncated,
+                bridge,
             },
             span,
-            bridge: false,
         }
     }
 
