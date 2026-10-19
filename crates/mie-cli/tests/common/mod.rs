@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+pub mod tapes;
 pub mod warm;
 
 /// 2026-10-06T00:00:00Z in ms.

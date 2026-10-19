@@ -12,6 +12,25 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
 
 ### Added
 
+- **The context-sampling driver and the measurement tool (ADR-054 D5, D6,
+  proposed; part of #25).** `mie_app::conditional::sample_contexts` runs a
+  `ContextSampler` through `drive_tolerant_observed` and feeds it accepted
+  events only: after a rejected event the engine still shows the previous
+  event's bars and triggers, so an unguarded sampler would repeat its
+  records. The engine and the sampler are the caller's, so a drive can
+  continue warm ones. `sample_window` opens a replay window, builds the
+  run's `ContextProvenance` from `Replay::dataset` and a fresh engine, and
+  streams the records, with an optional `emit_from` for a warm prefix.
+  New ignored tests `measure_contexts` (the archive) and
+  `measure_contexts_live` (each cleanly ended live run) in
+  `crates/mie-cli/tests/context_measure.rs` check every record against an
+  independent model of ADR-054 D1–D4, assert the grid invariant and the
+  reachability of every trigger id, and report the per-id episode tables,
+  the cross-id co-emissions, the baseline split per regime label and
+  location bin, the wall time and the peak RSS for M3; their
+  synthetic-tape twin runs in CI. The seeded tapes of `trigger_measure.rs`
+  moved to `crates/mie-cli/tests/common/tapes.rs` unchanged. No engine,
+  catalog or state-hash change.
 - **Direction criteria ([`docs/direction.md`](docs/direction.md)).** The
   three directions the project can take after milestone 1 (trade it, sell
   the intelligence, sell the research machine), the criteria that select
