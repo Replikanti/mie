@@ -64,20 +64,20 @@ Every outcome is measured in R, net of:
 
 | ID | Quantity | Method |
 |---|---|---|
-| M1 | Minimum sample | n ≥ (z·σ/μ)², where σ is the standard deviation of net outcomes on the calibration slice, μ the smallest net expectancy worth trading (input) and z follows from the confidence level (input). |
-| M2 | Net expectancy | The lower bound of a block-bootstrap confidence interval of net expectancy, at the confidence level, is above zero. Blocks keep time order, so serially dependent trades are not treated as independent. |
-| M3 | Effect against baseline | The baseline is the unconditional probability of each threshold being reached first (Conditional Behavior outputs). The null distribution comes from permuting context labels within time blocks. A context counts when its effect exceeds the null at the false discovery rate (input), corrected with Benjamini–Hochberg across every context tested. |
-| M4 | Stability | The effect keeps its sign in every walk-forward window and still passes M3 out-of-sample. |
-| M5 | Forward test | Forward-test net expectancy does not fall below the lower tail of the walk-forward window distribution, at the confidence level. |
-| M6 | Counter-hypothesis | The opposite interpretation was tested and lost (Conditional Behavior, "Counter-hypothesis"). |
+| T1 | Minimum sample | n ≥ (z·σ/μ)², where σ is the standard deviation of net outcomes on the calibration slice, μ the smallest net expectancy worth trading (input) and z follows from the confidence level (input). n counts episodes, not samples (ADR-054 D4): samples within one episode are correlated. |
+| T2 | Net expectancy | The lower bound of a block-bootstrap confidence interval of net expectancy, at the confidence level, is above zero. It resamples whole episodes (ADR-054 D4) in time-ordered blocks, so serially dependent trades are not treated as independent. |
+| T3 | Effect against baseline | The baseline is the unconditional baseline sample (ADR-054) in the same location context, measured as the probability of each threshold being reached first. The null distribution comes from permuting context labels within time blocks. A context counts when its effect exceeds the null at the false discovery rate (input), corrected with Benjamini–Hochberg across every context tested. |
+| T4 | Stability | The effect keeps its sign in every walk-forward window and still passes T3 out-of-sample. |
+| T5 | Forward test | Forward-test net expectancy does not fall below the lower tail of the walk-forward window distribution, at the confidence level. |
+| T6 | Counter-hypothesis | The opposite interpretation was tested and lost (Conditional Behavior, "Counter-hypothesis"). |
 
 ### Personal inputs
 
 | Input | Value |
 |---|---|
-| Confidence level (sets z, M2, M5) | to be set |
-| False discovery rate (M3) | to be set |
-| Smallest net expectancy worth trading, in R per trade (M1) | to be set |
+| Confidence level (sets z, T2, T5) | to be set |
+| False discovery rate (T3) | to be set |
+| Smallest net expectancy worth trading, in R per trade (T1) | to be set |
 | Fee tier | to be set |
 | Maximum acceptable out-of-sample drawdown, in R | to be set |
 | Minimum frequency for A, setups per week | to be set |
@@ -96,12 +96,12 @@ moving through the Registry lifecycle
 data and features, excluding the calibration slice.
 
 **A holds when** at least one candidate reaches `VALIDATED` after
-walk-forward and the unseen forward test, and it passes M1, M2 and M5
+walk-forward and the unseen forward test, and it passes T1, T2 and T5
 out-of-sample, stays within the maximum drawdown, and its suitable setups
 reach the minimum frequency for A.
 
 **B holds when** A does not, or A's setups are too rare to trade, but
-contexts that pass M1, M3, M4 and M6 together recur at least at the
+contexts that pass T1, T3, T4 and T6 together recur at least at the
 minimum frequency for B. That is information that improves a discretionary
 decision even when it is not a stand-alone strategy.
 
@@ -126,5 +126,5 @@ after the results are published.
 5. Before charging anyone for B's output, check whether it counts as advice
    on crypto-assets under MiCA, which is a licensed service, or as general
    market information.
-6. The Research Lab implements M1 to M6. Until it does, this document is
+6. The Research Lab implements T1 to T6. Until it does, this document is
    their specification.
