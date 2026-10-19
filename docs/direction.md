@@ -1,8 +1,8 @@
 # Direction: what the first measured answer decides
 
-- Status: draft. The three directions are set; every threshold below is
-  **proposed** and is confirmed or replaced by the owner before the first
-  Research Lab result is read.
+- Status: draft. The three directions and their criteria are set; the
+  thresholds are **not set yet** and are filled in by the owner before the
+  first Research Lab result is read.
 - Date: 2026-10-20
 
 ## Why this exists
@@ -41,32 +41,32 @@ Research Lab's anti-overfitting rules.
 **A holds when** at least one candidate reaches `VALIDATED` after
 walk-forward and the unseen forward test, and:
 
-| Criterion | Proposed threshold |
+| Criterion | Threshold |
 |---|---|
-| Out-of-sample trades (walk-forward + forward test) | ≥ 100 |
-| Net expectancy | > 0, with the lower bound of a 95 % bootstrap interval > 0 |
-| Net profit factor, walk-forward | ≥ 1.3 |
-| Forward test vs walk-forward | Forward expectancy within the walk-forward distribution, not below its 10th percentile |
-| Maximum drawdown, out-of-sample | ≤ 10 R |
-| Frequency: suitable setups | ≥ 2 per week on average |
+| Out-of-sample trades (walk-forward + forward test) | to be set |
+| Net expectancy and its confidence bound | to be set |
+| Net profit factor, walk-forward | to be set |
+| Forward test vs walk-forward distribution | to be set |
+| Maximum drawdown, out-of-sample | to be set |
+| Frequency of suitable setups | to be set |
 
 **B holds when** A does not, or A holds for too few setups to trade, but
 conditional behavior shows stable differences that would improve a
 discretionary decision:
 
-| Criterion | Proposed threshold |
+| Criterion | Threshold |
 |---|---|
-| Effect size per context | First-threshold-reached probability differs from the unconditional baseline by ≥ 10 percentage points |
-| Sample per context | ≥ 100 events in-sample and ≥ 50 out-of-sample |
-| Stability | The effect keeps its sign in every walk-forward window and stays ≥ 5 points out-of-sample |
+| Effect size per context against the unconditional baseline | to be set |
+| Sample per context, in-sample and out-of-sample | to be set |
+| Stability across walk-forward windows and out-of-sample | to be set |
 | Counter-hypothesis | The opposite interpretation was tested and lost |
-| Usefulness | ≥ 3 such contexts, together recurring ≥ 3 times per week |
+| Number of such contexts and how often they recur | to be set |
 
 **C holds when** neither A nor B does, but the machine itself holds up:
 live/replay equivalence passes on the full history chain (ADR-041,
 ADR-052), an experiment runs end to end reproducibly from a clean checkout,
-and someone outside the project asks to use it within 8 weeks of the
-results being published.
+and someone outside the project asks to use it within a period after the
+results are published (period to be set).
 
 ## Rules
 
