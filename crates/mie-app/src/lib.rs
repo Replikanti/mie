@@ -25,7 +25,12 @@
 //! only writer of research results (ADR-020, ADR-040): `@1` over a replay
 //! of the sample, `@2` on the history chain, with the prefix driven first
 //! (ADR-052 D10).
+//!
+//! [`conditional`] drives the context sampler of ADR-054 through
+//! [`drive_tolerant_observed`] for accepted events only, and opens a replay
+//! window with its provenance (#25).
 
+pub mod conditional;
 pub mod equivalence;
 pub mod kline_check;
 pub mod research;
