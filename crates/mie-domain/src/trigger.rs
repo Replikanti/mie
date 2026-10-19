@@ -21,7 +21,11 @@
 //!     order-flow candidates `candidate.*@1`, each the candidate fact at a
 //!     defined location: the context the rule reads lists a level of an
 //!     admitted kind (ADR-053 D4, D6, `candidate`);
-//!   - OI expansion followed by rejection (ADR-053 D7): #24 M3.
+//!   - OI expansion followed by rejection on the SFP of each structure
+//!     timeframe and on the failed auction: a strictly higher
+//!     `derivatives.oi.5m@1` point at the rejection than at the start of
+//!     the excursion, each read at the boundary [`OI_LAG_MS`] before its
+//!     event (ADR-053 D7, `oi`).
 //!
 //! Triggers are the last stage of an event (ADR-053 D2): they run after the
 //! candidate stage, on the committed state, read only the facts the same
@@ -37,15 +41,18 @@ pub mod bias;
 
 mod auction;
 mod candidate;
+mod oi;
 mod structure;
 
 pub use bias::{Bias, StepAt, SwingSequence, SwingStep};
+pub use oi::{OI_LAG_MS, OiExpansion, OiRejection};
 
 use crate::bars::Timeframe;
 use crate::candidate::absorption::Absorption;
 use crate::candidate::divergence::CvdComparison;
 use crate::candidate::effort::{EffortResult, Exhaustion};
 use crate::candidate::{CandidateEvent, Candidates, LocationContext};
+use crate::derivatives::{Derivatives, OiGridPoint};
 use crate::feature::{FeatureKey, FeatureValue, Input, catalog};
 use crate::fingerprint::Fingerprinter;
 use crate::location::{AuctionStatus, LocationEvent, LocationState};
@@ -57,6 +64,7 @@ use crate::time::EventTime;
 use crate::volatility::AtrRegimeSeries;
 use auction::AUCTION_TRIGGERS;
 use candidate::Slot;
+use oi::{OiPoints, ProbeStart, SweepStart};
 use std::fmt;
 
 /// Families of observable trigger events that hypotheses can test.
@@ -267,6 +275,11 @@ pub struct Triggers {
     /// `trigger.absorption.<w>@1`, in [`catalog::TRIGGER_ABSORPTION`]
     /// order.
     absorption: [FeatureValue<TriggerValue<Absorption>>; 3],
+    /// `trigger.oi_expansion_rejection.<tf>@1`, in
+    /// [`STRUCTURE_TIMEFRAMES`] order (ADR-053 D7).
+    oi_expansion_rejection: [FeatureValue<TriggerValue<OiExpansion>>; 4],
+    /// `trigger.oi_expansion_rejection.prior_day@1` (ADR-053 D7).
+    oi_expansion_rejection_prior_day: FeatureValue<TriggerValue<OiExpansion>>,
 }
 
 impl StateEncode for Triggers {
@@ -279,6 +292,8 @@ impl StateEncode for Triggers {
             effort_result,
             exhaustion,
             absorption,
+            oi_expansion_rejection,
+            oi_expansion_rejection_prior_day,
         } = self;
         bias.encode(f);
         auction.encode(f);
@@ -287,6 +302,8 @@ impl StateEncode for Triggers {
         effort_result.encode(f);
         exhaustion.encode(f);
         absorption.encode(f);
+        oi_expansion_rejection.encode(f);
+        oi_expansion_rejection_prior_day.encode(f);
     }
 }
 
@@ -304,11 +321,13 @@ impl Triggers {
         let structure = StructureSet::new();
         let location = LocationState::new();
         let candidates = Candidates::new();
+        let derivatives = Derivatives::new();
         TriggerTracker::new().values(&Inputs {
             regime: &regime,
             structure: &structure,
             location: &location,
             candidates: &candidates,
+            oi_5m: &derivatives.oi_5m,
         })
     }
 
@@ -419,12 +438,42 @@ impl Triggers {
             .map(|(((timeframe, _), effort), absorption)| (timeframe, effort, absorption))
     }
 
+    /// `trigger.oi_expansion_rejection.<tf>@1` of `timeframe`, if it is a
+    /// structure timeframe.
+    pub fn oi_expansion_rejection(
+        &self,
+        timeframe: Timeframe,
+    ) -> Option<&FeatureValue<TriggerValue<OiExpansion>>> {
+        STRUCTURE_TIMEFRAMES
+            .iter()
+            .position(|candidate| *candidate == timeframe)
+            .map(|index| &self.oi_expansion_rejection[index])
+    }
+
+    /// `trigger.oi_expansion_rejection.<tf>@1` of every structure
+    /// timeframe, shortest first.
+    pub fn iter_oi_expansion_rejection(
+        &self,
+    ) -> impl Iterator<Item = (Timeframe, &FeatureValue<TriggerValue<OiExpansion>>)> {
+        STRUCTURE_TIMEFRAMES
+            .into_iter()
+            .zip(&self.oi_expansion_rejection)
+    }
+
+    /// `trigger.oi_expansion_rejection.prior_day@1`.
+    pub fn oi_expansion_rejection_prior_day(&self) -> &FeatureValue<TriggerValue<OiExpansion>> {
+        &self.oi_expansion_rejection_prior_day
+    }
+
     /// Whether `self` and `other` agree in every value that does not read
-    /// the level registry: the bias and the auction and SFP trigger values
-    /// (#96 rule I). The candidate trigger values depend on the selected
-    /// registry by design, since their location gate reads it (ADR-053 D4),
-    /// so they are not compared. Exhaustive, so a new value does not compile
-    /// until it is placed on one side.
+    /// the level registry: the bias and the auction, SFP and OI-expansion
+    /// trigger values (#96 rule I). The candidate trigger values depend on
+    /// the selected registry by design, since their location gate reads it
+    /// (ADR-053 D4), so they are not compared. The OI-expansion values read
+    /// no registry (their facts and points do not, only their events'
+    /// contexts, which are not values), and comparing them keeps a future
+    /// registry read in ADR-053 D7 from going unseen. Exhaustive, so a new
+    /// value does not compile until it is placed on one side.
     pub fn equal_but_registry(&self, other: &Self) -> bool {
         let Self {
             bias,
@@ -434,8 +483,14 @@ impl Triggers {
             effort_result: _,
             exhaustion: _,
             absorption: _,
+            oi_expansion_rejection,
+            oi_expansion_rejection_prior_day,
         } = self;
-        *bias == other.bias && *auction == other.auction && *sfp == other.sfp
+        *bias == other.bias
+            && *auction == other.auction
+            && *sfp == other.sfp
+            && *oi_expansion_rejection == other.oi_expansion_rejection
+            && *oi_expansion_rejection_prior_day == other.oi_expansion_rejection_prior_day
     }
 
     /// `bias.context@1`, for tests that build a state by hand.
@@ -485,6 +540,24 @@ impl Triggers {
     pub(crate) fn absorption_mut(&mut self) -> &mut [FeatureValue<TriggerValue<Absorption>>; 3] {
         &mut self.absorption
     }
+
+    /// The OI-expansion trigger values of the SFP timeframes, for tests that
+    /// build a state by hand.
+    #[cfg(test)]
+    pub(crate) fn oi_expansion_rejection_mut(
+        &mut self,
+    ) -> &mut [FeatureValue<TriggerValue<OiExpansion>>; 4] {
+        &mut self.oi_expansion_rejection
+    }
+
+    /// The OI-expansion trigger value of the failed auction, for tests that
+    /// build a state by hand.
+    #[cfg(test)]
+    pub(crate) fn oi_expansion_rejection_prior_day_mut(
+        &mut self,
+    ) -> &mut FeatureValue<TriggerValue<OiExpansion>> {
+        &mut self.oi_expansion_rejection_prior_day
+    }
 }
 
 /// The position of the effort window of length `timeframe` in
@@ -510,6 +583,10 @@ pub enum TriggerEvidence {
     /// its own ADR-051 D3 context. Boxed: it is several times the size of
     /// the other facts.
     Candidate(Box<CandidateEvent>),
+    /// An open-interest expansion judged at an SFP or a failed auction
+    /// (ADR-053 D7): the rejection, both `derivatives.oi.5m@1` points and
+    /// the change.
+    OiExpansion(OiExpansion),
 }
 
 impl fmt::Display for TriggerEvidence {
@@ -518,14 +595,16 @@ impl fmt::Display for TriggerEvidence {
             Self::Auction(status) => write!(f, "{status}"),
             Self::Sfp(sweep) => write!(f, "{} {sweep}", sweep.timeframe),
             Self::Candidate(fact) => write!(f, "{fact}"),
+            Self::OiExpansion(expansion) => write!(f, "{expansion}"),
         }
     }
 }
 
 /// A trigger fact, in emission order (ADR-053 D2): per structure fact of
-/// the event, in its order, the SFP triggers; then per location fact, in
-/// its order, the auction triggers; then per candidate fact, in its order,
-/// the candidate triggers.
+/// the event, in its order, the SFP trigger, followed by its OI-expansion
+/// trigger if any; then per location fact, in its order, the auction
+/// trigger, a failed auction followed by its OI-expansion trigger if any;
+/// then per candidate fact, in its order, the candidate trigger.
 ///
 /// Not hashed. `Display` prints the canonical line the golden tests pin:
 /// the family, the evidence, the rule's feature key, the location context
@@ -579,11 +658,14 @@ pub(crate) struct Inputs<'a> {
     pub(crate) location: &'a LocationState,
     /// The candidates: `candidate.divergence.cvd.<tf>@1`, for the bias.
     pub(crate) candidates: &'a Candidates,
+    /// `derivatives.oi.5m@1`, for the OI-expansion points.
+    pub(crate) oi_5m: &'a FeatureValue<OiGridPoint>,
 }
 
-/// The trigger engine state (ADR-053 D2): the last trigger of each id.
-/// Engine state, updated in place; the Market State exposes [`Triggers`],
-/// which follows each id's input validity around it.
+/// The trigger engine state (ADR-053 D2): the last trigger of each id, and
+/// the OI-expansion records (ADR-053 D7). Engine state, updated in place
+/// and rebuilt by replay; the Market State exposes [`Triggers`], which
+/// follows each id's input validity around it.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct TriggerTracker {
     /// The auction triggers, in `AUCTION_TRIGGERS` order.
@@ -599,6 +681,18 @@ pub(crate) struct TriggerTracker {
     exhaustion: Option<Trigger<Exhaustion>>,
     /// The absorption triggers, in [`catalog::TRIGGER_ABSORPTION`] order.
     absorption: [Option<Trigger<Absorption>>; 3],
+    /// The OI-expansion triggers of the SFPs, in [`STRUCTURE_TIMEFRAMES`]
+    /// order.
+    oi_sfp: [Option<Trigger<OiExpansion>>; 4],
+    /// The OI-expansion trigger of the failed auction.
+    oi_prior_day: Option<Trigger<OiExpansion>>,
+    /// The last two ready `derivatives.oi.5m@1` points.
+    oi_points: OiPoints,
+    /// The start point of each pending sweep that had one, ordered by key:
+    /// at most one per pending sweep of the structure registries.
+    sweep_starts: Vec<SweepStart>,
+    /// The record of the committed probe toward above or below.
+    probe_start: Option<ProbeStart>,
 }
 
 impl TriggerTracker {
@@ -608,11 +702,17 @@ impl TriggerTracker {
     }
 
     /// The infallible stage (ADR-053 D2): after the candidate stage has
-    /// committed the event, reads the bias, turns the event's structure
-    /// facts, then its location facts, then its candidate facts, each in
-    /// their order, into trigger events, and refreshes `triggers`. Reads
-    /// only those facts and the committed state; appends the events to
-    /// `events`.
+    /// committed the event, reads the bias and the open-interest point,
+    /// turns the event's structure facts, then its location facts, then its
+    /// candidate facts, each in their order, into trigger events, updates
+    /// the OI-expansion records, and refreshes `triggers`. Reads only those
+    /// facts and the committed state; appends the events to `events`.
+    ///
+    /// ADR-053 D7 on the structure facts: a sweep records the point at its
+    /// sweeping trade, a break drops it, and an SFP takes it and emits its
+    /// OI-expansion trigger right after its SFP trigger. On the location
+    /// facts: a failed auction consults the probe record before the record
+    /// follows the committed status after the location facts.
     pub(crate) fn detect(
         &mut self,
         structure_events: &[StructureEvent],
@@ -623,7 +723,20 @@ impl TriggerTracker {
         events: &mut Vec<TriggerEvent>,
     ) {
         let bias = Bias::from_parts(inputs.regime, inputs.candidates);
+        self.oi_points.observe(inputs.oi_5m);
         for fact in structure_events {
+            let start = match fact {
+                StructureEvent::Sweep(sweep) => {
+                    oi::record_sweep(&mut self.sweep_starts, sweep, &self.oi_points);
+                    continue;
+                }
+                StructureEvent::Break(sweep) => {
+                    oi::take_sweep(&mut self.sweep_starts, sweep);
+                    continue;
+                }
+                StructureEvent::Sfp(sweep) => oi::take_sweep(&mut self.sweep_starts, sweep),
+                StructureEvent::Swing(_) => continue,
+            };
             let Some((position, definition, sweep)) = structure::triggered(fact) else {
                 continue;
             };
@@ -635,15 +748,35 @@ impl TriggerTracker {
                 anchor,
                 evidence: *sweep,
             });
+            let expansion = start
+                .zip(self.oi_points.at(sweep.known_at))
+                .and_then(|(start, end)| oi::expansion(OiRejection::Sfp(*sweep), start, end));
             events.push(TriggerEvent {
                 feature: definition.key,
                 family: TriggerFamily::Sfp,
                 known_at: sweep.known_at,
                 inputs: definition.inputs,
                 evidence: TriggerEvidence::Sfp(*sweep),
-                context,
+                context: context.clone(),
                 bias,
             });
+            if let Some(expansion) = expansion {
+                let (_, definition) = catalog::TRIGGER_OI_EXPANSION_REJECTION[position];
+                self.oi_sfp[position] = Some(Trigger {
+                    known_at: sweep.known_at,
+                    anchor,
+                    evidence: expansion,
+                });
+                events.push(TriggerEvent {
+                    feature: definition.key,
+                    family: TriggerFamily::OiExpansionRejection,
+                    known_at: sweep.known_at,
+                    inputs: definition.inputs,
+                    evidence: TriggerEvidence::OiExpansion(expansion),
+                    context,
+                    bias,
+                });
+            }
         }
         for fact in location_events {
             let LocationEvent::Auction {
@@ -665,16 +798,45 @@ impl TriggerTracker {
                 anchor,
                 evidence: *status,
             });
+            let context = LocationContext::read(anchor, None, inputs.location);
+            // Only a failed auction is an OI-expansion rejection.
+            let expansion = (family == TriggerFamily::FailedAuction)
+                .then(|| ProbeStart::failed(self.probe_start, status))
+                .flatten()
+                .zip(self.oi_points.at(*known_at))
+                .and_then(|(start, end)| {
+                    oi::expansion(OiRejection::FailedAuction(*status), start, end)
+                });
             events.push(TriggerEvent {
                 feature: definition.key,
                 family,
                 known_at: *known_at,
                 inputs: definition.inputs,
                 evidence: TriggerEvidence::Auction(*status),
-                context: LocationContext::read(anchor, None, inputs.location),
+                context: context.clone(),
                 bias,
             });
+            if let Some(expansion) = expansion {
+                let definition = &catalog::TRIGGER_OI_EXPANSION_REJECTION_PRIOR_DAY_V1;
+                self.oi_prior_day = Some(Trigger {
+                    known_at: *known_at,
+                    anchor,
+                    evidence: expansion,
+                });
+                events.push(TriggerEvent {
+                    feature: definition.key,
+                    family: TriggerFamily::OiExpansionRejection,
+                    known_at: *known_at,
+                    inputs: definition.inputs,
+                    evidence: TriggerEvidence::OiExpansion(expansion),
+                    context,
+                    bias,
+                });
+            }
         }
+        // The probe record follows the committed status (ADR-053 D7).
+        self.probe_start =
+            ProbeStart::next(self.probe_start, &inputs.location.auction, &self.oi_points);
         for fact in candidate_events {
             let Some(triggered) = candidate::triggered(fact, inputs.location) else {
                 continue;
@@ -728,6 +890,8 @@ impl TriggerTracker {
             effort_result,
             exhaustion,
             absorption,
+            oi_expansion_rejection,
+            oi_expansion_rejection_prior_day,
         } = triggers;
         *held = bias;
         *auction = self.auction_values(inputs.location);
@@ -736,6 +900,8 @@ impl TriggerTracker {
         *effort_result = self.effort_result_values(inputs.candidates);
         *exhaustion = self.exhaustion_value(inputs.candidates);
         *absorption = self.absorption_values(inputs.candidates);
+        *oi_expansion_rejection = self.oi_sfp_values(inputs.structure);
+        *oi_expansion_rejection_prior_day = self.oi_prior_day_value(inputs.location);
     }
 
     /// Every value as `inputs` stand, with the last triggers held.
@@ -748,7 +914,51 @@ impl TriggerTracker {
             effort_result: self.effort_result_values(inputs.candidates),
             exhaustion: self.exhaustion_value(inputs.candidates),
             absorption: self.absorption_values(inputs.candidates),
+            oi_expansion_rejection: self.oi_sfp_values(inputs.structure),
+            oi_expansion_rejection_prior_day: self.oi_prior_day_value(inputs.location),
         }
+    }
+
+    /// The OI-expansion trigger values of the SFPs: each follows its
+    /// rejection's fact input, its timeframe's `structure.levels.<tf>@1`,
+    /// not the open-interest grid (ADR-053 D1, D7).
+    fn oi_sfp_values(
+        &self,
+        structure: &StructureSet,
+    ) -> [FeatureValue<TriggerValue<OiExpansion>>; 4] {
+        [0, 1, 2, 3].map(|position| {
+            let value = TriggerValue {
+                feature: catalog::TRIGGER_OI_EXPANSION_REJECTION[position].1.key,
+                last: self.oi_sfp[position],
+            };
+            match structure.get(STRUCTURE_TIMEFRAMES[position]) {
+                Some(timeframe) => following(&timeframe.levels, value),
+                // Every structure timeframe has structure.
+                None => FeatureValue::Ready(value),
+            }
+        })
+    }
+
+    /// The OI-expansion trigger value of the failed auction: it follows
+    /// `location.auction.prior_day@1` (ADR-053 D1, D7).
+    fn oi_prior_day_value(
+        &self,
+        location: &LocationState,
+    ) -> FeatureValue<TriggerValue<OiExpansion>> {
+        following(
+            &location.auction,
+            TriggerValue {
+                feature: catalog::TRIGGER_OI_EXPANSION_REJECTION_PRIOR_DAY_V1.key,
+                last: self.oi_prior_day,
+            },
+        )
+    }
+
+    /// The OI-expansion records, for the bounded-records test: the sweep
+    /// start records and whether a probe record is held.
+    #[cfg(test)]
+    pub(crate) fn oi_records(&self) -> (usize, bool) {
+        (self.sweep_starts.len(), self.probe_start.is_some())
     }
 
     /// The CVD divergence trigger values: each follows its timeframe's
@@ -875,7 +1085,7 @@ mod tests {
     use super::*;
     use crate::candidate::divergence::{Divergence, SwingAnchor, SwingPair};
     use crate::event::samples::t;
-    use crate::event::{Aggressor, MarketEvent, Trade};
+    use crate::event::{Aggressor, MarketEvent, OpenInterest, Trade};
     use crate::feature::FeatureDefinition;
     use crate::location::{AuctionState, LevelKind, Region, zone_contains};
     use crate::num::{Qty, SCALE};
@@ -990,6 +1200,7 @@ mod tests {
         for (index, event) in events.iter().enumerate() {
             engine.apply(event).unwrap();
             check_values(engine);
+            check_records(engine);
             fired.extend(
                 engine
                     .trigger_events()
@@ -1038,6 +1249,16 @@ mod tests {
             validity(triggers.exhaustion()),
             validity(state.candidates.exhaustion())
         );
+        // The OI-expansion values follow their rejection's fact input, not
+        // the open-interest grid (ADR-053 D7).
+        for (timeframe, value) in triggers.iter_oi_expansion_rejection() {
+            let levels = &state.structure.get(timeframe).unwrap().levels;
+            assert_eq!(validity(value), validity(levels), "{timeframe}");
+        }
+        assert_eq!(
+            validity(triggers.oi_expansion_rejection_prior_day()),
+            validity(&state.location.auction)
+        );
         let facts = engine.trigger_events();
         for (index, fact) in facts.iter().enumerate() {
             assert_eq!(fact.known_at, state.as_of.unwrap());
@@ -1084,15 +1305,110 @@ mod tests {
                     );
                 }
                 TriggerEvidence::Candidate(candidate) => check_candidate(triggers, fact, candidate),
+                TriggerEvidence::OiExpansion(expansion) => check_oi(triggers, fact, expansion),
             }
         }
+        // ADR-053 D2, D7: each OI-expansion trigger directly follows the
+        // trigger of its rejection, at the same anchor, context and bias.
+        for (index, fact) in facts.iter().enumerate() {
+            let TriggerEvidence::OiExpansion(expansion) = &fact.evidence else {
+                continue;
+            };
+            let rejection = &facts[index - 1];
+            match (&expansion.rejection, &rejection.evidence) {
+                (OiRejection::Sfp(sweep), TriggerEvidence::Sfp(rejected)) => {
+                    assert_eq!(sweep, rejected, "{fact}");
+                }
+                (OiRejection::FailedAuction(status), TriggerEvidence::Auction(rejected)) => {
+                    assert_eq!(status, rejected, "{fact}");
+                    assert_eq!(rejection.family, TriggerFamily::FailedAuction);
+                }
+                _ => panic!("{fact} follows {rejection}"),
+            }
+            assert_eq!(rejection.context, fact.context, "{fact}");
+            assert_eq!(rejection.bias, fact.bias, "{fact}");
+        }
+    }
+
+    /// ADR-053 D7 on one OI-expansion trigger, written from the ADR text:
+    /// both points on the boundary the lag before their events, the same
+    /// resolution, a later boundary, strictly more open interest and the
+    /// exact change; its id's value, ready with its rejection's fact input,
+    /// holds the trigger.
+    fn check_oi(triggers: &Triggers, fact: &TriggerEvent, expansion: &OiExpansion) {
+        assert_eq!(fact.family, TriggerFamily::OiExpansionRejection);
+        let lagged = |time: EventTime| {
+            let millis = time.as_millis() - 25_000;
+            millis - millis.rem_euclid(300_000)
+        };
+        let value = match &expansion.rejection {
+            OiRejection::Sfp(sweep) => {
+                assert_eq!(sweep.known_at, fact.known_at);
+                assert_eq!(expansion.start.boundary.as_millis(), lagged(sweep.time));
+                triggers.oi_expansion_rejection(sweep.timeframe)
+            }
+            // The start is the failed probe's first close, which the
+            // failing status no longer holds; the probe tests check it.
+            OiRejection::FailedAuction(status) => {
+                assert_eq!(status.failure.unwrap().at, fact.known_at);
+                Some(triggers.oi_expansion_rejection_prior_day())
+            }
+        };
+        assert_eq!(expansion.end.boundary.as_millis(), lagged(fact.known_at));
+        assert_eq!(expansion.start.resolution_ms, expansion.end.resolution_ms);
+        assert!(expansion.start.boundary < expansion.end.boundary);
+        assert_eq!(
+            i128::from(expansion.change.units()),
+            i128::from(expansion.end.open_interest.units())
+                - i128::from(expansion.start.open_interest.units())
+        );
+        assert!(expansion.change.units() > 0);
+        match (value.unwrap(), &expansion.rejection) {
+            (FeatureValue::Ready(value), _) => {
+                assert_eq!(value.feature, fact.feature);
+                assert_eq!(
+                    value.last,
+                    Some(Trigger {
+                        known_at: fact.known_at,
+                        anchor: fact.anchor(),
+                        evidence: *expansion,
+                    })
+                );
+            }
+            // At a UTC-day rollover the auction state has already switched
+            // (ADR-044 D2), and the value follows it.
+            (_, OiRejection::FailedAuction(_)) => {}
+            (_, OiRejection::Sfp(_)) => panic!("an SFP resolves on a ready registry: {fact}"),
+        }
+    }
+
+    /// ADR-053 D7: the OI-expansion records stay bounded — at most one
+    /// sweep start per pending sweep of the structure registries.
+    fn check_records(engine: &MarketStateEngine) {
+        let state = engine.state();
+        let pending: usize = STRUCTURE_TIMEFRAMES
+            .iter()
+            .map(|timeframe| {
+                state
+                    .structure
+                    .get(*timeframe)
+                    .unwrap()
+                    .levels
+                    .ready()
+                    .map_or(0, |registry| registry.pending().len())
+            })
+            .sum();
+        let (sweeps, _) = engine.trigger_tracker().oi_records();
+        assert!(sweeps <= pending, "{sweeps} records, {pending} pending");
     }
 
     /// The candidate a trigger was built on, if any.
     fn candidate_of(fact: &TriggerEvent) -> Option<&CandidateEvent> {
         match &fact.evidence {
             TriggerEvidence::Candidate(candidate) => Some(candidate),
-            TriggerEvidence::Auction(_) | TriggerEvidence::Sfp(_) => None,
+            TriggerEvidence::Auction(_)
+            | TriggerEvidence::Sfp(_)
+            | TriggerEvidence::OiExpansion(_) => None,
         }
     }
 
@@ -2066,7 +2382,7 @@ mod tests {
     fn the_bias_gates_nothing() {
         // ADR-053 D3: two states that differ only in the bias inputs give
         // the same triggers, apart from the snapshot.
-        let (events, _) = at_value_edge();
+        let (events, _) = at_value_edge_with_oi();
         let mut engine = MarketStateEngine::new();
         for event in &events {
             engine.apply(event).unwrap();
@@ -2084,6 +2400,7 @@ mod tests {
                     structure: &state.structure,
                     location: &state.location,
                     candidates,
+                    oi_5m: &state.derivatives.oi_5m,
                 },
                 &mut triggers,
                 &mut fired,
@@ -2091,6 +2408,8 @@ mod tests {
             (triggers, fired)
         };
         let (triggers, fired) = detect(&state.regime, &state.candidates);
+        // A fresh tracker holds no OI-expansion record, so the rejections
+        // of the last event fire without their expansions.
         assert_eq!(
             families(
                 &fired
@@ -2105,6 +2424,32 @@ mod tests {
                 TriggerFamily::EffortVsResult
             ]
         );
+        // The engine's tracker holds them; the bias does not change them.
+        let detect_held = |regime: &FeatureValue<Regime>, candidates: &Candidates| {
+            let mut engine = MarketStateEngine::new();
+            for event in &events[..events.len() - 1] {
+                engine.apply(event).unwrap();
+            }
+            let mut tracker = engine.trigger_tracker().clone();
+            engine.apply(events.last().unwrap()).unwrap();
+            let mut triggers = Triggers::new();
+            let mut fired = Vec::new();
+            tracker.detect(
+                engine.structure_events(),
+                engine.location_events(),
+                engine.candidate_events(),
+                Inputs {
+                    regime,
+                    structure: &state.structure,
+                    location: &state.location,
+                    candidates,
+                    oi_5m: &state.derivatives.oi_5m,
+                },
+                &mut triggers,
+                &mut fired,
+            );
+            fired
+        };
         let percentile = AtrPercentile::new(90.0).unwrap();
         let regime = FeatureValue::Ready(Regime {
             atr_percentile: percentile,
@@ -2138,6 +2483,19 @@ mod tests {
             }),
             low: None,
         });
+        let held = detect_held(&state.regime, &state.candidates);
+        assert_eq!(
+            held.iter().map(|fact| fact.family).collect::<Vec<_>>(),
+            EDGE_FAMILIES
+        );
+        assert_eq!(held, engine.trigger_events());
+        let other_held = detect_held(&regime, &candidates);
+        assert_eq!(other_held.len(), held.len());
+        for (fact, other) in held.iter().zip(&other_held) {
+            let mut other = other.clone();
+            other.bias = fact.bias;
+            assert_eq!(*fact, other);
+        }
         let (mut other_triggers, other_fired) = detect(&regime, &candidates);
         assert_ne!(other_triggers.bias(), triggers.bias());
         // The 4h CVD divergence trigger follows the validity of the input
@@ -2168,14 +2526,15 @@ mod tests {
 
     #[test]
     fn a_rejected_event_leaves_the_triggers_and_their_facts() {
-        let (events, _) = at_value_edge();
+        let (events, _) = at_value_edge_with_oi();
         let mut engine = MarketStateEngine::new();
         for event in &events {
             engine.apply(event).unwrap();
         }
         let facts = engine.trigger_events().to_vec();
-        assert_eq!(facts.len(), 3);
+        assert_eq!(facts.len(), EDGE_FAMILIES.len());
         let triggers = engine.state().triggers.clone();
+        let tracker = engine.trigger_tracker().clone();
         // A trade whose volume overflows the developing bars.
         let last = events.last().unwrap().time().as_millis();
         let overflow = MarketEvent::Trade(Trade {
@@ -2193,6 +2552,8 @@ mod tests {
         );
         assert_eq!(engine.trigger_events(), facts.as_slice());
         assert_eq!(engine.state().triggers, triggers);
+        // The OI-expansion records too.
+        assert_eq!(engine.trigger_tracker(), &tracker);
     }
 
     #[test]
@@ -2208,16 +2569,20 @@ mod tests {
             }
             (facts, hashes)
         };
-        let tape = crate::location::tests::walk_tape(0x6d69_6500_0000_0024, 4);
+        let tape = with_open_interest(
+            crate::location::tests::walk_tape(0x6d69_6500_0000_0024, 4),
+            Feed::Archive,
+            oi_walk(0x6d69_6500_0024_0001),
+        );
         let (facts, hashes) = replay(&tape);
         assert!(!facts.is_empty());
-        // The candidate ids are among them.
-        assert!(
-            facts
-                .iter()
-                .any(|fact| fact.starts_with("effort_vs_result ")),
-            "{facts:?}"
-        );
+        // The candidate and OI-expansion ids are among them.
+        for family in ["effort_vs_result ", "oi_expansion_rejection "] {
+            assert!(
+                facts.iter().any(|fact| fact.starts_with(family)),
+                "{family}: {facts:?}"
+            );
+        }
         assert_eq!(replay(&tape), (facts, hashes));
     }
 
@@ -2244,23 +2609,592 @@ mod tests {
         );
         let mut engine = MarketStateEngine::with_features(features.clone()).unwrap();
         assert_eq!(engine.state().feature_set, features.version());
-        let (events, _) = at_value_edge();
+        let (events, _) = at_value_edge_with_oi();
         let fired = run(&mut engine, &events);
         assert_eq!(
             last_event(&fired)
                 .iter()
                 .map(|fact| fact.family)
                 .collect::<Vec<_>>(),
-            [
-                TriggerFamily::Sfp,
-                TriggerFamily::FailedAuction,
-                TriggerFamily::EffortVsResult
-            ]
+            EDGE_FAMILIES
         );
         for (_, fact) in &fired {
             assert_eq!(
                 fact.context.levels.ready().unwrap().feature,
                 catalog::LOCATION_LEVELS_V1.key
+            );
+        }
+    }
+
+    /// The open-interest feed of a test tape.
+    #[derive(Debug, Clone, Copy)]
+    enum Feed {
+        /// One sample at each boundary at 300 000 ms resolution, as the
+        /// archive's `metrics` rows: the boundary closes at itself.
+        Archive,
+        /// Two 10 s polls around each boundary, 4 s before it with the
+        /// boundary's open interest and 6 s after it with 0.07 BTC more, as
+        /// a live poll lands: the boundary closes at the poll after it.
+        Live,
+    }
+
+    /// `events` with open-interest samples merged in canonical order: for
+    /// every grid boundary after the first event up to the last,
+    /// `oi(boundary)` units on `feed`.
+    fn with_open_interest(
+        mut events: Vec<MarketEvent>,
+        feed: Feed,
+        mut oi: impl FnMut(i64) -> i64,
+    ) -> Vec<MarketEvent> {
+        let time = |event: Option<&MarketEvent>| event.map_or(0, |event| event.time().as_millis());
+        let (first, last) = (time(events.first()), time(events.last()));
+        let sample = |millis: i64, units: i64, resolution_ms: u32| {
+            MarketEvent::OpenInterest(OpenInterest {
+                time: t(millis),
+                open_interest: Qty::from_units(units),
+                resolution_ms,
+            })
+        };
+        let mut boundary = first - first.rem_euclid(GRID_MS) + GRID_MS;
+        let mut samples = Vec::new();
+        while boundary <= last {
+            let units = oi(boundary);
+            match feed {
+                Feed::Archive => samples.push(sample(boundary, units, 300_000)),
+                Feed::Live => {
+                    samples.push(sample(boundary - 4_000, units, 10_000));
+                    samples.push(sample(boundary + 6_000, units + 7_000_000, 10_000));
+                }
+            }
+            boundary += GRID_MS;
+        }
+        events.extend(samples);
+        events.sort();
+        events
+    }
+
+    /// The open-interest grid in milliseconds (ADR-042 D2).
+    const GRID_MS: i64 = 300_000;
+
+    /// Open interest rising by 0.1 BTC per boundary from 80 000 BTC.
+    fn rising(boundary: i64) -> i64 {
+        80_000 * SCALE + boundary / GRID_MS * (SCALE / 10)
+    }
+
+    /// A seeded open-interest walk from 80 000 BTC, ±10 BTC per boundary
+    /// in steps of 0.1 BTC.
+    fn oi_walk(seed: u64) -> impl FnMut(i64) -> i64 {
+        let (mut state, mut oi) = (seed, 80_000 * SCALE);
+        move |_| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let step = i64::try_from((state >> 11) % 201).unwrap() - 100;
+            oi += step * (SCALE / 10);
+            oi
+        }
+    }
+
+    /// The boundary an event at `millis` reads its point at, written from
+    /// ADR-053 D7: `⌊(t − 25 000) / 300 000⌋ · 300 000`.
+    fn lagged(millis: i64) -> EventTime {
+        let lagged = millis - 25_000;
+        t(lagged - lagged.rem_euclid(GRID_MS))
+    }
+
+    /// The OI expansion a trigger carries.
+    fn expansion_of(fact: &TriggerEvent) -> &OiExpansion {
+        match &fact.evidence {
+            TriggerEvidence::OiExpansion(expansion) => expansion,
+            other => panic!("{other}"),
+        }
+    }
+
+    /// The at-value-edge tape with rising archive open interest: the last
+    /// event emits the SFP, its OI expansion, the failed auction, its OI
+    /// expansion and the effort-vs-result trigger.
+    fn at_value_edge_with_oi() -> (Vec<MarketEvent>, Price) {
+        let (events, vah) = at_value_edge();
+        (with_open_interest(events, Feed::Archive, rising), vah)
+    }
+
+    /// The families of the last event of [`at_value_edge_with_oi`], in
+    /// emission order (ADR-053 D2).
+    const EDGE_FAMILIES: [TriggerFamily; 5] = [
+        TriggerFamily::Sfp,
+        TriggerFamily::OiExpansionRejection,
+        TriggerFamily::FailedAuction,
+        TriggerFamily::OiExpansionRejection,
+        TriggerFamily::EffortVsResult,
+    ];
+
+    #[test]
+    fn an_oi_expansion_follows_its_sfp_on_every_structure_timeframe() {
+        // ADR-053 D7 with rising open interest: the sweep at 2 s into bar
+        // 11 and the SFP at 1 s into bar 12 read different boundaries, the
+        // later one higher. On the daily tape this is the 1d id, which the
+        // 45-day golden tape cannot reach.
+        for (position, (timeframe, definition)) in catalog::TRIGGER_OI_EXPANSION_REJECTION
+            .into_iter()
+            .enumerate()
+        {
+            let span = timeframe.millis();
+            let mut engine = MarketStateEngine::new();
+            let tape = with_open_interest(sfp_tape(timeframe, false), Feed::Archive, rising);
+            let fired = run(&mut engine, &tape);
+            let own: Vec<usize> = (0..fired.len())
+                .filter(|index| fired[*index].1.feature == definition.key)
+                .collect();
+            let [index] = own.as_slice() else {
+                panic!("{timeframe}: {own:?}")
+            };
+            let ((event, fact), (sfp_event, sfp)) = (&fired[*index], &fired[index - 1]);
+            assert_eq!(sfp.feature, catalog::TRIGGER_SFP[position].1.key);
+            assert_eq!(event, sfp_event);
+            assert_eq!(fact.family, TriggerFamily::OiExpansionRejection);
+            assert_eq!(fact.inputs, definition.inputs);
+            assert_eq!(fact.known_at, t(12 * span + 1_000), "{timeframe}");
+            assert_eq!((fact.anchor(), &fact.context), (usdt(60_015), &sfp.context));
+            assert_eq!(fact.bias, sfp.bias);
+            let TriggerEvidence::Sfp(sweep) = &sfp.evidence else {
+                panic!("{sfp}")
+            };
+            let expansion = expansion_of(fact);
+            assert_eq!(expansion.rejection, OiRejection::Sfp(*sweep));
+            assert_eq!(expansion.start.boundary, lagged(11 * span + 2_000));
+            assert_eq!(expansion.end.boundary, lagged(12 * span + 1_000));
+            assert_eq!(
+                expansion.start.open_interest,
+                Qty::from_units(rising(expansion.start.boundary.as_millis()))
+            );
+            assert_eq!(
+                expansion.change.units(),
+                expansion.end.open_interest.units() - expansion.start.open_interest.units()
+            );
+            assert_eq!(
+                engine.state().triggers.oi_expansion_rejection(timeframe),
+                Some(&FeatureValue::Ready(TriggerValue {
+                    feature: definition.key,
+                    last: Some(Trigger {
+                        known_at: fact.known_at,
+                        anchor: usdt(60_015),
+                        evidence: *expansion,
+                    }),
+                }))
+            );
+        }
+    }
+
+    #[test]
+    fn near_misses_of_an_oi_expansion_do_not_fire() {
+        let span = Timeframe::M15.millis();
+        let sfp = catalog::TRIGGER_SFP_15M_V1.key;
+        let oi = catalog::TRIGGER_OI_EXPANSION_REJECTION_15M_V1.key;
+        let fires = |events: &[MarketEvent]| {
+            let fired = triggers_of(events);
+            let any = |key: FeatureKey| fired.iter().any(|(_, fact)| fact.feature == key);
+            (any(sfp), any(oi))
+        };
+        let tape = |oi: fn(i64) -> i64| {
+            with_open_interest(sfp_tape(Timeframe::M15, false), Feed::Archive, oi)
+        };
+        assert_eq!(fires(&tape(rising)), (true, true));
+        // Equal open interest, and falling open interest.
+        assert_eq!(fires(&tape(|_| 80_000 * SCALE)), (true, false));
+        assert_eq!(
+            fires(&tape(|boundary| 80_000 * SCALE - boundary / GRID_MS * SCALE)),
+            (true, false)
+        );
+        // A sweep 100 s before the bar end: its point and the SFP's lie on
+        // one boundary, so there is no comparison.
+        let mut late = Tape::swing_high(Timeframe::M15);
+        late.trade(12 * span - 100_000, usdt(60_020))
+            .trade(12 * span - 99_000, usdt(60_014))
+            .trade(12 * span + 1_000, usdt(60_014));
+        assert_eq!(lagged(12 * span - 100_000), lagged(12 * span + 1_000));
+        assert_eq!(
+            fires(&with_open_interest(late.events, Feed::Archive, rising)),
+            (true, false)
+        );
+        // An open-interest hole over the SFP's boundary: no end point.
+        let holed: Vec<MarketEvent> = tape(rising)
+            .into_iter()
+            .filter(|event| {
+                !matches!(event, MarketEvent::OpenInterest(sample)
+                    if (10 * span..12 * span).contains(&sample.time.as_millis()))
+            })
+            .collect();
+        assert_eq!(fires(&holed), (true, false));
+        // A clean break is no SFP, so no expansion either, and its record
+        // goes with the sweep.
+        let mut engine = MarketStateEngine::new();
+        let broken = with_open_interest(sfp_tape(Timeframe::M15, true), Feed::Archive, rising);
+        let fired = run(&mut engine, &broken);
+        assert!(
+            fired
+                .iter()
+                .all(|(_, fact)| fact.feature != sfp && fact.feature != oi)
+        );
+        let pending = engine
+            .state()
+            .structure
+            .get(Timeframe::M15)
+            .unwrap()
+            .levels
+            .ready()
+            .unwrap()
+            .pending()
+            .len();
+        assert_eq!(pending, 0);
+    }
+
+    /// The failed-auction triggers and their OI expansions of `fired`.
+    fn failed_auctions(fired: &[(usize, TriggerEvent)]) -> Vec<&TriggerEvent> {
+        fired
+            .iter()
+            .map(|(_, fact)| fact)
+            .filter(|fact| {
+                fact.family == TriggerFamily::FailedAuction
+                    || fact.feature == catalog::TRIGGER_OI_EXPANSION_REJECTION_PRIOR_DAY_V1.key
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_failed_auction_with_rising_oi_fires_its_expansion() {
+        // ADR-053 D7: the probe's first close, 1 s into minute 11, and the
+        // failing close, 1 s into minute 16, read different boundaries.
+        let (val, vah) = value_area();
+        for (beyond, edge) in [(ABOVE, vah), (BELOW, val)] {
+            let mut path = minutes(INSIDE, 10);
+            path.extend(minutes(beyond, 5));
+            path.extend(minutes(INSIDE, 2));
+            let mut engine = MarketStateEngine::new();
+            let fired = run(
+                &mut engine,
+                &with_open_interest(auction_tape(&path), Feed::Archive, rising),
+            );
+            let [auction, fact] = failed_auctions(&fired)[..] else {
+                panic!("{fired:?}")
+            };
+            assert_eq!(auction.family, TriggerFamily::FailedAuction);
+            let definition = &catalog::TRIGGER_OI_EXPANSION_REJECTION_PRIOR_DAY_V1;
+            assert_eq!(
+                (fact.feature, fact.inputs),
+                (definition.key, definition.inputs)
+            );
+            assert_eq!(fact.known_at, t(DAY + 16 * MINUTE + 1_000));
+            assert_eq!(fact.known_at, auction.known_at);
+            assert_eq!((fact.anchor(), &fact.context), (edge, &auction.context));
+            let expansion = expansion_of(fact);
+            assert_eq!(
+                expansion.rejection,
+                OiRejection::FailedAuction(*status_of(auction))
+            );
+            assert_eq!(expansion.start.boundary, lagged(DAY + 11 * MINUTE + 1_000));
+            assert_eq!(expansion.end.boundary, lagged(DAY + 16 * MINUTE + 1_000));
+            let FeatureValue::Ready(value) =
+                engine.state().triggers.oi_expansion_rejection_prior_day()
+            else {
+                panic!("{beyond}")
+            };
+            assert_eq!(value.last.map(|last| last.evidence), Some(*expansion));
+            // With flat open interest only the failed auction fires.
+            let flat = triggers_of(&with_open_interest(
+                auction_tape(&path),
+                Feed::Archive,
+                |_| 80_000 * SCALE,
+            ));
+            assert_eq!(
+                failed_auctions(&flat)
+                    .iter()
+                    .map(|fact| fact.family)
+                    .collect::<Vec<_>>(),
+                [TriggerFamily::FailedAuction]
+            );
+        }
+    }
+
+    #[test]
+    fn a_retarget_restarts_the_excursion() {
+        // A probe above from 1 s into minute 11, retargeted below 1 s into
+        // minute 19 (no auction fact: the label stays a breakout), failed
+        // 1 s into minute 22. The excursion starts at the retarget.
+        let (val, _) = value_area();
+        let mut path = minutes(INSIDE, 10);
+        path.extend(minutes(ABOVE, 8));
+        path.extend(minutes(BELOW, 3));
+        path.extend(minutes(INSIDE, 2));
+        let (above, below, failed) = (
+            lagged(DAY + 11 * MINUTE + 1_000),
+            lagged(DAY + 19 * MINUTE + 1_000),
+            lagged(DAY + 22 * MINUTE + 1_000),
+        );
+        assert!(above < below && below < failed);
+        let fired = triggers_of(&with_open_interest(
+            auction_tape(&path),
+            Feed::Archive,
+            rising,
+        ));
+        let [auction, fact] = failed_auctions(&fired)[..] else {
+            panic!("{fired:?}")
+        };
+        assert_eq!(status_of(auction).failure.unwrap().toward, Region::Below);
+        assert_eq!(fact.anchor(), val);
+        let expansion = expansion_of(fact);
+        assert_eq!(
+            (expansion.start.boundary, expansion.end.boundary),
+            (below, failed)
+        );
+        // Open interest that peaks at the retarget's boundary rose over the
+        // first probe but not over the excursion: no expansion.
+        let peaked = |boundary: i64| rising(boundary.min(DAY + 900_000));
+        assert_eq!(below, t(DAY + 900_000));
+        let fired = triggers_of(&with_open_interest(
+            auction_tape(&path),
+            Feed::Archive,
+            peaked,
+        ));
+        assert_eq!(
+            failed_auctions(&fired)
+                .iter()
+                .map(|fact| fact.family)
+                .collect::<Vec<_>>(),
+            [TriggerFamily::FailedAuction]
+        );
+    }
+
+    #[test]
+    fn a_failure_at_the_rollover_finds_its_probe() {
+        // ADR-053 D7, ADR-044 D2: the trade that closes 23:59 and the day
+        // fails a probe under day 0's value; the record is consulted before
+        // the switch drops it.
+        let mut path = minutes(INSIDE, 1_430);
+        path.extend(minutes(ABOVE, 9));
+        path.extend(minutes(INSIDE, 2));
+        let mut engine = MarketStateEngine::new();
+        let fired = run(
+            &mut engine,
+            &with_open_interest(auction_tape(&path), Feed::Archive, rising),
+        );
+        let [auction, fact] = failed_auctions(&fired)[..] else {
+            panic!("{fired:?}")
+        };
+        assert_eq!(fact.known_at, t(2 * DAY + 1_000));
+        let expansion = expansion_of(fact);
+        assert_eq!(
+            expansion.rejection,
+            OiRejection::FailedAuction(*status_of(auction))
+        );
+        assert_eq!(status_of(auction).reference_start, t(0));
+        assert_eq!(
+            expansion.start.boundary,
+            lagged(DAY + 1_431 * MINUTE + 1_000)
+        );
+        assert_eq!(expansion.end.boundary, lagged(2 * DAY + 1_000));
+        // The probe record is gone with the old reference; the value
+        // follows the auction state, unavailable on day 2, and holds the
+        // trigger.
+        assert!(!engine.trigger_tracker().oi_records().1);
+        let unavailable = validity(&engine.state().location.auction);
+        assert_eq!(
+            validity(engine.state().triggers.oi_expansion_rejection_prior_day()),
+            unavailable
+        );
+        assert_eq!(
+            engine
+                .trigger_tracker()
+                .oi_prior_day
+                .map(|last| last.evidence),
+            Some(*expansion)
+        );
+    }
+
+    #[test]
+    fn archive_and_live_open_interest_select_the_same_boundaries() {
+        // ADR-053 D7, ADR-019: the same trades with the same open interest
+        // at each boundary, once as archive rows and once as live polls,
+        // fire the same ids on the same boundaries and values; only the
+        // resolution and sample times of the points differ.
+        let trades = crate::location::tests::walk_tape(0x6d69_6500_0024_0004, 4);
+        let picks = |feed: Feed| {
+            let events = with_open_interest(trades.clone(), feed, oi_walk(0x6d69_6500_0024_0005));
+            let fired = triggers_of(&events);
+            let sfps = fired
+                .iter()
+                .filter(|(_, fact)| fact.family == TriggerFamily::Sfp)
+                .count();
+            let mut resolutions = Vec::new();
+            let picked: Vec<_> = fired
+                .iter()
+                .filter_map(|(_, fact)| match &fact.evidence {
+                    TriggerEvidence::OiExpansion(expansion) => {
+                        resolutions.push(expansion.start.resolution_ms);
+                        Some((
+                            fact.feature,
+                            fact.known_at,
+                            expansion.start.boundary,
+                            expansion.end.boundary,
+                            expansion.start.open_interest,
+                            expansion.change,
+                        ))
+                    }
+                    _ => None,
+                })
+                .collect();
+            (sfps, picked, resolutions)
+        };
+        let (archive_sfps, archive, archive_resolutions) = picks(Feed::Archive);
+        let (live_sfps, live, live_resolutions) = picks(Feed::Live);
+        assert!(archive.len() > 10, "{archive:?}");
+        assert!(
+            archive
+                .iter()
+                .any(|pick| pick.0 == catalog::TRIGGER_OI_EXPANSION_REJECTION_1H_V1.key)
+        );
+        assert_eq!(archive_sfps, live_sfps);
+        assert_eq!(archive, live);
+        assert!(archive_resolutions.iter().all(|res| *res == 300_000));
+        assert!(live_resolutions.iter().all(|res| *res == 10_000));
+    }
+
+    #[test]
+    fn one_event_emits_each_rejection_before_its_expansion() {
+        // ADR-053 D2: the structure fact's SFP and its OI expansion, then the
+        // location fact's failed auction and its OI expansion, then the
+        // candidate fact; every trigger with the event's bias.
+        let (events, vah) = at_value_edge_with_oi();
+        let mut engine = MarketStateEngine::new();
+        let fired = run(&mut engine, &events);
+        let last = last_event(&fired);
+        assert_eq!(
+            last.iter().map(|fact| fact.family).collect::<Vec<_>>(),
+            EDGE_FAMILIES
+        );
+        assert_eq!(
+            last[1].feature,
+            catalog::TRIGGER_OI_EXPANSION_REJECTION_15M_V1.key
+        );
+        assert_eq!(
+            last[3].feature,
+            catalog::TRIGGER_OI_EXPANSION_REJECTION_PRIOR_DAY_V1.key
+        );
+        assert_eq!((last[1].anchor(), last[3].anchor()), (vah, vah));
+        for fact in &last {
+            assert_eq!(fact.bias, Bias::read(engine.state()));
+        }
+    }
+
+    #[test]
+    fn the_point_rule_on_the_golden_tape() {
+        // ADR-053 D7 and D8 quote these counts: on the candidate golden
+        // tape (archive open interest), per SFP timeframe, the SFPs; those
+        // the rejected rule — the newest ready point within 360 000 ms of
+        // the event — would fire, and how many of them start and end on one
+        // boundary; those the lagged rule fires, and how many start and end
+        // on one boundary with both points present; and the SFPs resolved
+        // within 25 s of their bar end, where the two rules read different
+        // end boundaries. Both rules are written here from the ADR text.
+        let mut engine = MarketStateEngine::new();
+        let (mut newest, mut held): (Option<OiGridPoint>, [Option<OiGridPoint>; 2]) =
+            (None, [None, None]);
+        let mut starts: Vec<(Sweep, Option<OiGridPoint>, Option<OiGridPoint>)> = Vec::new();
+        let mut counts = [[0_u32; 6]; 3];
+        let fires = |start: Option<OiGridPoint>, end: Option<OiGridPoint>| match (start, end) {
+            (Some(start), Some(end)) => {
+                start.resolution_ms == end.resolution_ms
+                    && start.boundary < end.boundary
+                    && start.open_interest < end.open_interest
+            }
+            _ => false,
+        };
+        let shared = |start: Option<OiGridPoint>, end: Option<OiGridPoint>| {
+            start
+                .zip(end)
+                .is_some_and(|(start, end)| start.boundary == end.boundary)
+        };
+        for event in crate::candidate::tests::golden_tape() {
+            engine.apply(&event).unwrap();
+            let time = event.time().as_millis();
+            if let FeatureValue::Ready(point) = &engine.state().derivatives.oi_5m {
+                newest = Some(*point);
+                if held[0].is_none_or(|last| point.boundary > last.boundary) {
+                    held = [Some(*point), held[0]];
+                }
+            }
+            let old = newest.filter(|point| point.boundary.as_millis() >= time - 360_000);
+            let new = held
+                .into_iter()
+                .flatten()
+                .find(|point| point.boundary == lagged(time));
+            for fact in engine.structure_events() {
+                match fact {
+                    StructureEvent::Sweep(sweep) => starts.push((*sweep, old, new)),
+                    StructureEvent::Sfp(sweep) | StructureEvent::Break(sweep) => {
+                        let key = |other: &Sweep| {
+                            (other.timeframe, other.level.side, other.level.swing_time)
+                        };
+                        let index = starts
+                            .iter()
+                            .position(|(start, _, _)| key(start) == key(sweep))
+                            .unwrap();
+                        let (_, old_start, new_start) = starts.remove(index);
+                        let Some(row) = [Timeframe::M15, Timeframe::H1, Timeframe::H4]
+                            .iter()
+                            .position(|timeframe| *timeframe == sweep.timeframe)
+                        else {
+                            continue;
+                        };
+                        if matches!(fact, StructureEvent::Break(_)) {
+                            continue;
+                        }
+                        let fired = engine.trigger_events().iter().any(|trigger| {
+                            matches!(&trigger.evidence, TriggerEvidence::OiExpansion(expansion)
+                                if expansion.rejection == OiRejection::Sfp(*sweep))
+                        });
+                        assert_eq!(fired, fires(new_start, new), "{sweep}");
+                        let late = time - sweep.resolved_bar_end.unwrap().as_millis() < 25_000;
+                        for (cell, count) in counts[row].iter_mut().zip([
+                            true,
+                            fires(old_start, old),
+                            shared(old_start, old),
+                            fired,
+                            shared(new_start, new),
+                            late,
+                        ]) {
+                            *cell += u32::from(count);
+                        }
+                    }
+                    StructureEvent::Swing(_) => {}
+                }
+            }
+        }
+        assert_eq!(
+            counts,
+            [
+                [398, 197, 0, 195, 12, 122],
+                [96, 48, 0, 46, 1, 32],
+                [21, 9, 0, 9, 0, 6],
+            ]
+        );
+    }
+
+    #[test]
+    fn the_oi_records_stay_bounded_on_the_golden_tapes() {
+        // ADR-053 D7: the replay of every golden tape checks after each
+        // event that the sweep records number at most the pending sweeps
+        // ([`check_records`]); the OI-expansion ids fire there, so the
+        // records were in use.
+        for (lines, family) in [
+            (golden_lines(), "oi_expansion_rejection evidence=[sfp "),
+            (
+                auction_golden_lines(),
+                "oi_expansion_rejection evidence=[failed_auction ",
+            ),
+        ] {
+            assert!(
+                lines.iter().any(|(_, line)| line.contains(family)),
+                "{family}"
             );
         }
     }
@@ -2297,6 +3231,18 @@ mod tests {
         definitions.extend(AUCTION_TRIGGERS.map(|(_, definition)| definition));
         definitions.extend(catalog::TRIGGER_SFP.map(|(_, definition)| definition));
         definitions.extend(candidate_definitions());
+        definitions.extend(oi_definitions());
+        definitions
+    }
+
+    /// Every OI-expansion trigger definition (ADR-053 D7), in [`Triggers`]
+    /// order.
+    fn oi_definitions() -> Vec<&'static FeatureDefinition> {
+        let mut definitions: Vec<&'static FeatureDefinition> =
+            catalog::TRIGGER_OI_EXPANSION_REJECTION
+                .map(|(_, definition)| definition)
+                .to_vec();
+        definitions.push(&catalog::TRIGGER_OI_EXPANSION_REJECTION_PRIOR_DAY_V1);
         definitions
     }
 
@@ -2312,7 +3258,8 @@ mod tests {
     }
 
     /// Whether a value changed: the bias, each auction id, each SFP id,
-    /// then each candidate id, in [`trigger_definitions`] order.
+    /// each candidate id, then each OI-expansion id, in
+    /// [`trigger_definitions`] order.
     fn changes(before: &Triggers, after: &Triggers) -> Vec<(FeatureKey, Option<String>)> {
         let mut changes = vec![(
             catalog::BIAS_CONTEXT_V1.key,
@@ -2356,6 +3303,18 @@ mod tests {
         for (change, definition) in candidate_changes.zip(candidate_definitions()) {
             changes.push((definition.key, change));
         }
+        let oi_changes = before
+            .oi_expansion_rejection
+            .iter()
+            .zip(&after.oi_expansion_rejection)
+            .map(|(old, new)| (old != new).then(|| shown(new)))
+            .chain(std::iter::once(
+                (before.oi_expansion_rejection_prior_day != after.oi_expansion_rejection_prior_day)
+                    .then(|| shown(&after.oi_expansion_rejection_prior_day)),
+            ));
+        for (change, definition) in oi_changes.zip(oi_definitions()) {
+            changes.push((definition.key, change));
+        }
         changes
     }
 
@@ -2382,11 +3341,18 @@ mod tests {
 
     /// The golden lines of the auction golden tape, as [`golden_lines`]:
     /// the location golden tape, on which every auction state occurs
-    /// (ADR-044), so every auction family fires.
+    /// (ADR-044), so every auction family fires, with a seeded archive
+    /// open-interest walk ([`with_open_interest`]), so the failed auction's
+    /// OI-expansion id fires too. Open interest feeds no auction rule, so
+    /// the walk leaves the auction ids' lines as they were.
     fn auction_golden_lines() -> &'static [(FeatureKey, String)] {
         static LINES: std::sync::OnceLock<Vec<(FeatureKey, String)>> = std::sync::OnceLock::new();
         LINES.get_or_init(|| {
-            replay_golden(crate::location::tests::walk_tape(0x6d69_6500_0000_0044, 7))
+            replay_golden(with_open_interest(
+                crate::location::tests::walk_tape(0x6d69_6500_0000_0044, 7),
+                Feed::Archive,
+                oi_walk(0x6d69_6500_0024_0003),
+            ))
         })
     }
 
@@ -2399,6 +3365,7 @@ mod tests {
             for event in tape {
                 engine.apply(&event).unwrap();
                 check_values(&engine);
+                check_records(&engine);
                 let time = event.time();
                 let after = &engine.state().triggers;
                 for (key, change) in changes(&before, after) {
@@ -2424,12 +3391,13 @@ mod tests {
     }
 
     /// The golden lines `feature` is pinned on: the auction golden tape for
-    /// the auction ids, the book tape for the absorption ids, the candidate
-    /// golden tape for the rest.
+    /// the auction ids and the failed auction's OI-expansion id, the book
+    /// tape for the absorption ids, the candidate golden tape for the rest.
     fn golden_of(feature: &FeatureDefinition) -> &'static [(FeatureKey, String)] {
         if AUCTION_TRIGGERS
             .iter()
             .any(|(_, definition)| definition.key == feature.key)
+            || feature.key == catalog::TRIGGER_OI_EXPANSION_REJECTION_PRIOR_DAY_V1.key
         {
             auction_golden_lines()
         } else if catalog::TRIGGER_ABSORPTION
@@ -2488,11 +3456,12 @@ mod tests {
     #[test]
     fn every_trigger_id_with_a_fact_on_its_golden_tape_fires_there() {
         // The goldens are not vacuous. The 45-day tape holds no SFP of a
-        // daily swing and no daily divergence; the synthetic SFP and 1d
+        // daily swing and no daily divergence; the synthetic SFP, OI and 1d
         // divergence tests fire those ids.
         let without = [
             catalog::TRIGGER_SFP_1D_V1.key,
             catalog::TRIGGER_CVD_DIVERGENCE_1D_V1.key,
+            catalog::TRIGGER_OI_EXPANSION_REJECTION_1D_V1.key,
         ];
         for definition in trigger_definitions().into_iter().skip(1) {
             let (own, _) = own_lines(golden_of(definition), definition.key);
@@ -2534,7 +3503,7 @@ mod tests {
             "continuation",
             "entry",
         ];
-        let (edge, _) = at_value_edge();
+        let (edge, _) = at_value_edge_with_oi();
         let mut samples: Vec<String> = triggers_of(&edge)
             .into_iter()
             .map(|(_, fact)| fact.to_string())
@@ -2555,10 +3524,7 @@ mod tests {
             .map(|(_, line)| line.as_str())
             .collect();
         lines.extend(samples.iter().map(String::as_str));
-        for family in TriggerFamily::ALL
-            .into_iter()
-            .filter(|family| *family != TriggerFamily::OiExpansionRejection)
-        {
+        for family in TriggerFamily::ALL {
             let prefix = format!("{family} evidence=");
             assert!(lines.iter().any(|line| line.contains(&prefix)), "{family}");
         }
@@ -2760,6 +3726,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn golden_trigger_oi_expansion_rejection_15m_v1() {
+        assert_golden(
+            &catalog::TRIGGER_OI_EXPANSION_REJECTION_15M_V1,
+            374,
+            GOLDEN_OI_15M,
+            "2a3bc1adf0206358",
+        );
+    }
+
+    #[test]
+    fn golden_trigger_oi_expansion_rejection_1h_v1() {
+        assert_golden(
+            &catalog::TRIGGER_OI_EXPANSION_REJECTION_1H_V1,
+            97,
+            GOLDEN_OI_1H,
+            "fe2424248daee909",
+        );
+    }
+
+    #[test]
+    fn golden_trigger_oi_expansion_rejection_4h_v1() {
+        assert_golden(
+            &catalog::TRIGGER_OI_EXPANSION_REJECTION_4H_V1,
+            25,
+            GOLDEN_OI_4H,
+            "1a4237713c25f86b",
+        );
+    }
+
+    #[test]
+    fn golden_trigger_oi_expansion_rejection_1d_v1() {
+        assert_golden(
+            &catalog::TRIGGER_OI_EXPANSION_REJECTION_1D_V1,
+            7,
+            GOLDEN_OI_1D,
+            "752615bfc4555f80",
+        );
+    }
+
+    #[test]
+    fn golden_trigger_oi_expansion_rejection_prior_day_v1() {
+        assert_golden(
+            &catalog::TRIGGER_OI_EXPANSION_REJECTION_PRIOR_DAY_V1,
+            16,
+            GOLDEN_OI_PRIOR_DAY,
+            "ebb7d51bf76fb780",
+        );
+    }
+
     const GOLDEN_BIAS: &str = "54007615ms value bias regime=warming 15m=warming 1h=warming 4h=warming 1d=warming bias.context@1";
 
     const GOLDEN_FAILED_AUCTION: &str = "178028180ms failed_auction evidence=[failed_breakout ref=86400000ms val=61450.00000000 vah=62040.00000000 close=61997.13000000 at=in side=above a=in/start failed=above:44/1 complete location.auction.prior_day@1] trigger.failed_auction@1 ctx=62040.00000000 levels=hvn@62005.00000000[62000.00000000,62010.00000000],prior_sweep:high@62029.35000000,prior_sweep:high@62029.35000000,vah@62040.00000000[62030.00000000,62040.00000000],vwap@62053.90800666,lvn@62065.00000000[62060.00000000,62070.00000000] location.levels@2 auction=failed_breakout bias regime=warming 15m=[high=higher@157500000ms low=higher@169200000ms] 1h=[high=higher@154800000ms low=higher@133200000ms] 4h=[high=- low=-] 1d=warming bias.context@1";
@@ -2797,4 +3813,14 @@ mod tests {
     const GOLDEN_ABSORPTION_15M: &str = "179341368ms absorption evidence=[absorption effort=[15m end=179340000ms aggressor=buy effort=25.58000000 progress=0.00000000 effort_high=24.64000000 effort_median=12.76000000 move_high=0.10000000 move_median=0.00000000 complete active=true candidate.effort_result.15m@1] passive=ask band=0.00050000 added=53.00000000 filled=49.70000000 book=complete replenished=true active=true candidate.absorption.15m@1 ctx=60000.00000000 levels=cluster:bid@59984.00000000,cluster:bid@59988.00000000,cluster:bid@59992.00000000,cluster:bid@59996.00000000,cluster:bid@60000.00000000,poc@60005.00000000[60000.00000000,60010.00000000],vah@60010.00000000[60000.00000000,60010.00000000],val@60000.00000000[60000.00000000,60010.00000000],hvn@60005.00000000[60000.00000000,60010.00000000],vwap@60000.05888156,cluster:ask@60004.10000000,cluster:ask@60008.10000000,cluster:ask@60012.10000000,cluster:ask@60016.10000000,cluster:ask@60020.10000000 location.levels@2 auction=unavailable] trigger.absorption.15m@1 ctx=60000.00000000 levels=cluster:bid@59984.00000000,cluster:bid@59988.00000000,cluster:bid@59992.00000000,cluster:bid@59996.00000000,cluster:bid@60000.00000000,poc@60005.00000000[60000.00000000,60010.00000000],vah@60010.00000000[60000.00000000,60010.00000000],val@60000.00000000[60000.00000000,60010.00000000],hvn@60005.00000000[60000.00000000,60010.00000000],vwap@60000.05888156,cluster:ask@60004.10000000,cluster:ask@60008.10000000,cluster:ask@60012.10000000,cluster:ask@60016.10000000,cluster:ask@60020.10000000 location.levels@2 auction=unavailable bias regime=warming 15m=warming 1h=warming 4h=warming 1d=warming bias.context@1";
 
     const GOLDEN_ABSORPTION_1H: &str = "178862262ms absorption evidence=[absorption effort=[1h end=178860000ms aggressor=buy effort=64.62000000 progress=0.00000000 effort_high=51.32000000 effort_median=31.04000000 move_high=0.10000000 move_median=0.10000000 complete active=true candidate.effort_result.1h@1] passive=ask band=0.00050000 added=146.27000000 filled=144.28000000 book=complete replenished=true active=true candidate.absorption.1h@1 ctx=60000.00000000 levels=cluster:bid@59984.00000000,cluster:bid@59988.00000000,cluster:bid@59992.00000000,cluster:bid@59996.00000000,cluster:bid@60000.00000000,poc@60005.00000000[60000.00000000,60010.00000000],vah@60010.00000000[60000.00000000,60010.00000000],val@60000.00000000[60000.00000000,60010.00000000],hvn@60005.00000000[60000.00000000,60010.00000000],vwap@60000.05717431,cluster:ask@60004.10000000,cluster:ask@60008.10000000,cluster:ask@60012.10000000,cluster:ask@60016.10000000,cluster:ask@60020.10000000 location.levels@2 auction=unavailable] trigger.absorption.1h@1 ctx=60000.00000000 levels=cluster:bid@59984.00000000,cluster:bid@59988.00000000,cluster:bid@59992.00000000,cluster:bid@59996.00000000,cluster:bid@60000.00000000,poc@60005.00000000[60000.00000000,60010.00000000],vah@60010.00000000[60000.00000000,60010.00000000],val@60000.00000000[60000.00000000,60010.00000000],hvn@60005.00000000[60000.00000000,60010.00000000],vwap@60000.05717431,cluster:ask@60004.10000000,cluster:ask@60008.10000000,cluster:ask@60012.10000000,cluster:ask@60016.10000000,cluster:ask@60020.10000000 location.levels@2 auction=unavailable bias regime=warming 15m=warming 1h=warming 4h=warming 1d=warming bias.context@1";
+
+    const GOLDEN_OI_15M: &str = "62161380ms oi_expansion_rejection evidence=[sfp 15m low level=61969.20000000 bar=55800000ms confirmed=59400000ms touches=2 at=61514129ms price=61966.54000000 extreme=61966.54000000 bars=1 sfp resolved=62100000ms complete structure.levels.15m@1 start=[boundary=61200000ms oi=80005.40000000 sample=61200000ms res=300000ms delta=-85.30000000 vel_per_min=-17.06 derivatives.oi.5m@1] end=[boundary=62100000ms oi=80066.10000000 sample=62100000ms res=300000ms delta=-42.20000000 vel_per_min=-8.44 derivatives.oi.5m@1] change=60.70000000] trigger.oi_expansion_rejection.15m@1 ctx=61969.20000000 levels=vwap@61984.17149090 location.levels@2 auction=warming bias regime=warming 15m=[high=- low=-] 1h=warming 4h=warming 1d=warming bias.context@1";
+
+    const GOLDEN_OI_1H: &str = "97260667ms oi_expansion_rejection evidence=[sfp 1h low level=61900.09000000 bar=75600000ms confirmed=90000000ms touches=0 at=93129730ms price=61897.65000000 extreme=61882.07000000 bars=2 sfp resolved=97200000ms complete structure.levels.1h@1 start=[boundary=93000000ms oi=80130.10000000 sample=93000000ms res=300000ms delta=42.50000000 vel_per_min=8.5 derivatives.oi.5m@1] end=[boundary=97200000ms oi=80238.40000000 sample=97200000ms res=300000ms delta=-93.10000000 vel_per_min=-18.62 derivatives.oi.5m@1] change=108.30000000] trigger.oi_expansion_rejection.1h@1 ctx=61900.09000000 levels=vwap@61914.46220263,hvn@61925.00000000[61920.00000000,61930.00000000],prior_sweep:low@61920.27000000,val@61930.00000000[61930.00000000,61940.00000000] location.levels@2 auction=breakout bias regime=warming 15m=[high=higher@87300000ms low=higher@84600000ms] 1h=[high=- low=-] 4h=warming 1d=warming bias.context@1";
+
+    const GOLDEN_OI_4H: &str = "403209273ms oi_expansion_rejection evidence=[sfp 4h high level=62140.03000000 bar=316800000ms confirmed=374400000ms touches=0 at=385610639ms price=62142.90000000 extreme=62171.37000000 bars=2 sfp resolved=403200000ms complete structure.levels.4h@1 start=[boundary=385500000ms oi=78670.00000000 sample=385500000ms res=300000ms delta=-24.30000000 vel_per_min=-4.86 derivatives.oi.5m@1] end=[boundary=402900000ms oi=78833.10000000 sample=402900000ms res=300000ms delta=51.10000000 vel_per_min=10.22 derivatives.oi.5m@1] change=163.10000000] trigger.oi_expansion_rejection.4h@1 ctx=62140.03000000 levels=sfp_zone:low@62108.54000000[62095.20000000,62108.54000000],vah@62110.00000000[62100.00000000,62110.00000000],sfp_zone:low@62110.52000000[62100.74000000,62110.52000000],prior_sweep:high@62103.29000000,structural_low:low@62107.31000000,prior_sweep:low@62108.54000000,prior_sweep:low@62110.52000000,prior_sweep:high@62113.10000000,sfp_zone:high@62113.10000000[62113.10000000,62117.71000000],prior_sweep:high@62117.71000000,sfp_zone:high@62117.71000000[62117.71000000,62117.72000000],vwap@62124.77724970,prior_sweep:high@62128.26000000,structural_low:low@62128.71000000,sfp_zone:low@62130.28000000[62128.71000000,62130.28000000],prior_sweep:high@62130.23000000,prior_sweep:high@62130.28000000,prior_sweep:low@62130.28000000,prior_sweep:high@62134.29000000,sfp_zone:high@62134.29000000[62134.29000000,62136.28000000],prior_sweep:high@62136.28000000,prior_sweep:high@62136.28000000,prior_sweep:high@62160.98000000,sfp_zone:high@62160.98000000[62160.98000000,62171.37000000],structural_high:high@62171.37000000 location.levels@2 auction=unavailable bias regime=warming 15m=[high=higher@396900000ms low=lower@399600000ms] 1h=[high=lower@356400000ms low=higher@370800000ms] 4h=[high=higher@316800000ms low=higher@230400000ms] 1d=warming bias.context@1";
+
+    const GOLDEN_OI_1D: &str = "86450066ms value warming 1/7";
+
+    const GOLDEN_OI_PRIOR_DAY: &str = "243847289ms oi_expansion_rejection evidence=[failed_auction failed_breakout ref=86400000ms val=61450.00000000 vah=62040.00000000 close=61994.59000000 at=in side=above a=in/accepted failed=above:56/1 feed_gap location.auction.prior_day@1 start=[boundary=240000000ms oi=79815.00000000 sample=240000000ms res=300000ms delta=1.30000000 vel_per_min=0.26 derivatives.oi.5m@1] end=[boundary=243600000ms oi=79840.50000000 sample=243600000ms res=300000ms delta=7.10000000 vel_per_min=1.42 derivatives.oi.5m@1] change=25.50000000] trigger.oi_expansion_rejection.prior_day@1 ctx=62040.00000000 levels=hvn@62005.00000000[62000.00000000,62010.00000000],vwap@62016.40530259,prior_sweep:high@62029.35000000,prior_sweep:high@62029.35000000,vah@62040.00000000[62030.00000000,62040.00000000],lvn@62065.00000000[62060.00000000,62070.00000000] location.levels@2 auction=failed_breakout bias regime=warming 15m=[high=higher@224100000ms low=higher@233100000ms] 1h=[high=higher@223200000ms low=lower@216000000ms] 4h=[high=- low=-] 1d=warming bias.context@1";
 }

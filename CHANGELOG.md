@@ -12,6 +12,28 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
 
 ### Added
 
+- **OI expansion followed by rejection and the trigger measurement tool
+  (ADR-053 D7, part of #24).** `trigger.oi_expansion_rejection.<15m|1h|4h|1d>@1`
+  fire on the SFP of their timeframe and
+  `trigger.oi_expansion_rejection.prior_day@1` on the failed auction, when
+  the `derivatives.oi.5m@1` point at the rejection lies on a later
+  boundary than the point at the excursion's start (the sweeping trade, or
+  the close where the failed probe started or retargeted), with the same
+  resolution and strictly higher open interest; no magnitude threshold.
+  The point at an event is the ready point of the boundary 25 s before it
+  (`oi_lag_ms`), so the archive and a continuous live feed select the same
+  boundaries; this replaces the 360 000 ms age bound ADR-053 first stated.
+  Each OI trigger directly follows its rejection's trigger with the same
+  anchor, context and bias, and carries the rejection, both points and the
+  change (`OiExpansion`, `OiRejection`, `TriggerEvidence::OiExpansion`).
+  The OI values are compared by `Triggers::equal_but_registry`. ADR-053 is
+  amended (D1, D7, D8, Consequences, *Accept when*) and stays `proposed`.
+  New ignored tests `measure_triggers` and `measure_triggers_live` in
+  `crates/mie-cli/tests/trigger_measure.rs` check the engine's triggers
+  against an independent model of ADR-053 D3–D7 and report the M4
+  measurements; their synthetic-tape twins run in CI. Every state hash and
+  the feature-set version change again; the pre-#22, pre-#24 and pre-#96
+  pins hold.
 - **Candidate trigger rules (ADR-053 D4/D6, part of #24).**
   `trigger.cvd_divergence.<15m|1h|4h|1d>@1`,
   `trigger.effort_result.<5m|15m|1h>@1`, `trigger.exhaustion@1` and

@@ -248,11 +248,11 @@ mod tests {
         // change), and otherwise only with an encoding bump (module docs).
         assert_eq!(
             MarketStateEngine::new().state().state_hash().to_string(),
-            "f2fcd23ae8ce4663"
+            "87cc6f436f7294cc"
         );
         assert_eq!(
             engine_after(&tape()).state().state_hash().to_string(),
-            "402d9ecf5191f8bb"
+            "56740f38ed0f635c"
         );
     }
 
@@ -401,7 +401,7 @@ mod tests {
             .copied()
             .filter(|key| !is_candidate(*key) && !is_bias_or_trigger(*key))
             .collect();
-        assert_eq!(keys.len() + 15 + 19, catalog::CURRENT.len());
+        assert_eq!(keys.len() + 15 + 24, catalog::CURRENT.len());
         let pre_22 = FeatureSet::new(&catalog::registry(), &keys).unwrap();
         assert_eq!(pre_22.version().to_string(), "685b83d7bf13b54c");
         // The engine reaches the pre-#22 state on every other field: under
@@ -470,7 +470,7 @@ mod tests {
             .copied()
             .filter(|key| !is_bias_or_trigger(*key))
             .collect();
-        assert_eq!(keys.len() + 19, catalog::CURRENT.len());
+        assert_eq!(keys.len() + 24, catalog::CURRENT.len());
         let pre_24 = FeatureSet::new(&catalog::registry(), &keys).unwrap();
         assert_eq!(pre_24.version().to_string(), "8e6f1b978d12a884");
         // The engine reaches the pre-#24 state on every other field: under
@@ -753,6 +753,7 @@ mod tests {
         assert_eq!(base.triggers, crate::trigger::Triggers::new());
         edits.extend(trigger_edits());
         edits.extend(candidate_trigger_edits());
+        edits.extend(oi_trigger_edits());
         let mut seen = vec![("base", reference)];
         for (name, edit) in &edits {
             let mut state = base.clone();
@@ -1661,6 +1662,168 @@ mod tests {
                         ..absorption
                     }),
                 ),
+            ),
+        ]
+    }
+
+    /// One OI-expansion trigger value per edit (ADR-053 D7), each differing
+    /// from the others in one respect only: the timeframe or the failed
+    /// auction, readiness, the rejection's kind or fact, a point, or the
+    /// change.
+    fn oi_trigger_edits() -> Vec<(&'static str, Edit<'static>)> {
+        use crate::bars::{Coverage, Timeframe};
+        use crate::derivatives::OiGridPoint;
+        use crate::location::{AuctionState, AuctionStatus, Origin, Position, Region};
+        use crate::structure::{Level, Side as SwingSide, Sweep, SweepOutcome};
+        use crate::trigger::{OiExpansion, OiRejection, Trigger, TriggerValue};
+        let time = EventTime::from_millis;
+        let point = |boundary: i64, oi: i64| OiGridPoint {
+            feature: catalog::DERIVATIVES_OI_5M_V1.key,
+            boundary: time(boundary),
+            open_interest: Qty::from_units(oi),
+            sample_time: time(boundary),
+            resolution_ms: 300_000,
+            delta: None,
+        };
+        let sweep = Sweep {
+            feature: catalog::STRUCTURE_LEVELS_15M_V1.key,
+            timeframe: Timeframe::M15,
+            level: Level {
+                side: SwingSide::High,
+                price: Price::from_units(200),
+                swing_time: time(0),
+                confirmed_bar_end: time(3_600_000),
+                known_at: time(3_600_001),
+                touches: 0,
+                coverage: Coverage::default(),
+            },
+            time: time(3_700_000),
+            price: Price::from_units(201),
+            extreme: Price::from_units(201),
+            window_bars: 1,
+            outcome: SweepOutcome::Sfp,
+            resolved_bar_end: Some(time(4_500_000)),
+            known_at: time(4_500_001),
+            coverage: Coverage::default(),
+        };
+        let status = AuctionStatus {
+            feature: catalog::LOCATION_AUCTION_PRIOR_DAY_V1.key,
+            reference_start: time(0),
+            val: Price::from_units(100),
+            vah: Price::from_units(200),
+            state: AuctionState::FailedBreakout,
+            side: Some(Region::Above),
+            accepted: Region::In,
+            origin: Origin::Start,
+            position: Position::In,
+            probe: None,
+            failure: None,
+            last_close: Price::from_units(150),
+            bar_end: time(4_500_000),
+            known_at: time(4_500_001),
+            coverage: Coverage::default(),
+        };
+        let expansion = OiExpansion {
+            rejection: OiRejection::Sfp(sweep),
+            start: point(3_600_000, 10),
+            end: point(4_200_000, 12),
+            change: Qty::from_units(2),
+        };
+        let fired = |evidence: OiExpansion| {
+            Some(Trigger {
+                known_at: time(4_500_001),
+                anchor: Price::from_units(200),
+                evidence,
+            })
+        };
+        let sfp = |position: usize, last: Option<Trigger<OiExpansion>>| -> Edit<'static> {
+            let feature = catalog::TRIGGER_OI_EXPANSION_REJECTION[position].1.key;
+            Box::new(move |s: &mut MarketState| {
+                s.triggers.oi_expansion_rejection_mut()[position] =
+                    FeatureValue::Ready(TriggerValue { feature, last });
+            })
+        };
+        let prior_day = |last: Option<Trigger<OiExpansion>>| -> Edit<'static> {
+            Box::new(move |s: &mut MarketState| {
+                *s.triggers.oi_expansion_rejection_prior_day_mut() =
+                    FeatureValue::Ready(TriggerValue {
+                        feature: catalog::TRIGGER_OI_EXPANSION_REJECTION_PRIOR_DAY_V1.key,
+                        last,
+                    });
+            })
+        };
+        vec![
+            ("triggers oi expansion 15m ready", sfp(0, None)),
+            ("triggers oi expansion 1d ready", sfp(3, None)),
+            ("triggers oi expansion last", sfp(0, fired(expansion))),
+            (
+                "triggers oi expansion rejection kind",
+                sfp(
+                    0,
+                    fired(OiExpansion {
+                        rejection: OiRejection::FailedAuction(status),
+                        ..expansion
+                    }),
+                ),
+            ),
+            (
+                "triggers oi expansion rejection fact",
+                sfp(
+                    0,
+                    fired(OiExpansion {
+                        rejection: OiRejection::Sfp(Sweep {
+                            extreme: Price::from_units(202),
+                            ..sweep
+                        }),
+                        ..expansion
+                    }),
+                ),
+            ),
+            (
+                "triggers oi expansion start",
+                sfp(
+                    0,
+                    fired(OiExpansion {
+                        start: point(3_900_000, 10),
+                        ..expansion
+                    }),
+                ),
+            ),
+            (
+                "triggers oi expansion end",
+                sfp(
+                    0,
+                    fired(OiExpansion {
+                        end: point(4_200_000, 13),
+                        ..expansion
+                    }),
+                ),
+            ),
+            (
+                "triggers oi expansion change",
+                sfp(
+                    0,
+                    fired(OiExpansion {
+                        change: Qty::from_units(3),
+                        ..expansion
+                    }),
+                ),
+            ),
+            (
+                "triggers oi expansion warming",
+                Box::new(|s: &mut MarketState| {
+                    s.triggers.oi_expansion_rejection_mut()[0] = FeatureValue::Unavailable {
+                        reason: Unavailability::InputInvalid,
+                    };
+                }),
+            ),
+            ("triggers oi expansion prior day ready", prior_day(None)),
+            (
+                "triggers oi expansion prior day last",
+                prior_day(fired(OiExpansion {
+                    rejection: OiRejection::FailedAuction(status),
+                    ..expansion
+                })),
             ),
         ]
     }

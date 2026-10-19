@@ -98,9 +98,11 @@ not pin a trigger version.
   state.
 - **Values.** The value of each trigger id is its last trigger: the
   `known_at`, the anchor price and the evidence, in the hashed form its
-  input feature already defines (`AuctionStatus`, `Sweep`, and in M2/M3
-  `CvdComparison`, `EffortResult`, `Exhaustion`, `Absorption`,
-  `OiGridPoint`). It is `None` until the first trigger. The
+  input feature already defines (`AuctionStatus`, `Sweep`, and in M2
+  `CvdComparison`, `EffortResult`, `Exhaustion`, `Absorption`). The OI
+  family's evidence is `OiExpansion` (M3): its rejection in that form
+  (`Sweep` or `AuctionStatus`), both `OiGridPoint`s and the change (D7).
+  It is `None` until the first trigger. The
   `LocationContext` and the `Bias` are carried by events only: they are
   reads of other hashed features (the ADR-051 D3 reason), and a value that
   repeated them would hash the same fact twice.
@@ -387,57 +389,156 @@ not pin a trigger version.
 timeframe's `Sfp`) and `trigger.oi_expansion_rejection.prior_day@1` (the
 rejection is the D5 failed auction).
 
-- **Start point:** the ready `derivatives.oi.5m@1` point at the event that
-  starts the excursion beyond the level.
+- **Start point:** the point at the event (below) that starts the
+  excursion beyond the level.
   - For an SFP: the `StructureEvent::Sweep` (the sweeping trade). Recorded
     under the key (timeframe, side, `swing_time`) and dropped at the `Sfp`
-    or `Break` resolution.
+    or `Break` resolution. A sweep without a point leaves no record, so its
+    SFP has no comparison.
   - For a failed auction: the 1m close at which a probe toward Above or
-    Below starts or retargets (`probe.since == known_at`). A retarget
-    between Above and Below keeps the `Breakout` label and so emits no
-    `Auction` event; the rule therefore reads the committed status at every
-    1m close. One probe record at a time, keyed by the reference; it is
-    consulted before it is updated in the same event, and dropped on
-    failure, acceptance or a new reference.
-- **End point:** the ready point at the rejecting event.
-- **Age bound.** A point counts only if its boundary is at or after the
-  event time − 360 000 ms. *Derivation:* one grid interval (300 000 ms:
-  until the next boundary is due) plus the grid's `max_age_ms` of
-  60 000 ms, the lag `derivatives.oi.5m@1` accepts between a boundary and
-  its sample (ADR-042 D2). A live boundary closes only on the first poll
-  after it, so for a few seconds of every interval the newest ready point
-  is just over one interval old although the feed is healthy. *Smaller:*
-  those healthy live points are lost while archive points are not, so the
-  id means different things live and in the archive. *Larger:* during an
-  open-interest outage the newest ready point stays ready, so an excursion
-  would read an outage's stale point as its start.
+    Below starts or retargets. **The hook:** after the location facts, the
+    stage reads the committed `location.auction.prior_day@1` status and
+    records its probe the first time it sees the probe's identity
+    (`reference_start`, `toward` ∈ {Above, Below}, `since`), with the point
+    at `since`.
+    - *Why that is the probe's close:* the status changes only at a
+      classified 1m close, and an event classifies at most one close with
+      trades (ADR-031), so a new identity is seen at its own close. A later
+      event at the same millisecond (an open-interest sample) sees the same
+      identity and records nothing. A time test (`status.known_at` equal to
+      the event time) would record such a follower again, after its sample
+      moved the grid. A retarget between Above and Below keeps the
+      `Breakout` label and so emits no `Auction` event; that is why the
+      hook reads the status, not the facts.
+    - *One record at a time.* A failed auction consults it — the same
+      reference and `failure.toward` — before the hook updates it in the
+      same event. The hook keeps it while the committed probe keeps its
+      identity, replaces it on a new identity (a new probe or a retarget),
+      and drops it when the committed status holds no probe toward Above or
+      Below (failure, acceptance, a probe toward value, warming up,
+      unavailable, a new reference).
+    - *Rollover.* The old day's last close is classified before the switch
+      (ADR-044 D2). A failure there is an auction fact, and it finds the
+      record before the hook drops it. A probe started there is never
+      recorded, since the committed status already shows the new
+      reference, and it cannot fail.
+    - *Live and archive alike:* the hook reads committed state only, on one
+      code path, rebuilt by replay (ADR-019, ADR-052). It adds no number
+      and no branch.
+    - *Rejected:* closed bars as an input of the stage (D2 reads the
+      event's facts and the committed state only); a location fact for
+      retargets (it would edit the accepted ADR-044).
+- **End point:** the point at the rejecting event.
+- **The point at an event** at time `t` is the held ready
+  `derivatives.oi.5m@1` point of the boundary
+  `⌊(t − 25 000 ms) / 300 000 ms⌋ · 300 000 ms`, else none. That boundary
+  lies in `[t − 325 000, t − 25 000]` ms. The stage holds the last two
+  ready points it saw: the boundary read is at most one grid interval
+  before the newest one closed by `t`, so two suffice. A boundary that
+  closed unavailable, or not at all, has no point.
+  - *Why:* every structure bar end is a 5-minute boundary and SFPs resolve
+    at bar closes; every fifth 1m close, where failures happen, is one too.
+    The archive orders a boundary's point at the boundary itself (`metrics`
+    rows stand at `create_time + 5 min` and measure that instant, ADR-042
+    *Acceptance* 1), so the trade that closes the bar sees it. A live feed
+    closes the boundary at its first 10 s poll after it (spacing p50
+    9 996 ms, so about 5 s later on average), while the closing trade comes
+    about 50 ms after the bar end (603 323 345 trades in the #12 year,
+    about 19 per second). Reading the newest point, the archive would
+    compare up to the bar-end boundary at nearly every SFP and live up to
+    the one before: one id, two meanings (ADR-019). Reading the boundary
+    25 s before the event, both sources select the same boundary at every
+    start and end while the live feed is continuous; `resolution_ms` still
+    tells their values apart.
+  - *Derivation of 25 000 ms:* the longest live spacing ADR-042 D1 still
+    calls continuous, the 10 000 ms resolution plus the 15 000 ms
+    `step_tolerance_ms`; the longest spacing measured on the live runs of
+    ADR-042 *Acceptance* is 15 049 ms. *Smaller:* a slow but continuous
+    live feed may not have closed the boundary yet, so live would lose
+    points the archive has. *Larger:* the points drift away from their
+    events and nothing is gained in agreement.
+  - *Cost:* live loses about nothing, since it already reads the boundary
+    before the bar end. The archive loses the comparison of an SFP that
+    resolves in its first window bar when the sweep fell in the bar's last
+    275 s (300 000 − 25 000 ms): the start then reads the same boundary as
+    the end. By ADR-037 S3, the first window bar resolves 49.43 / 64.62
+    = 76 % of 15m SFPs, 50.15 / 63.69 = 79 % on 1h and 52.75 / 64.25 =
+    82 % on 4h; with the sweep time spread evenly over the bar (S3 puts its
+    p50 at 0.51–0.61 of the bar), that is 76 % × 275 / 900 ≈ 23 % of 15m
+    SFPs, ≈ 6 % on 1h and ≈ 2 % on 4h. The newest-point rule instead loses
+    none in the archive and, live, every first-bar SFP swept in the bar's
+    last 300 s, where the live end still reads the boundary before the bar
+    end: 76 % × 300 / 900 ≈ 25 % of 15m SFPs.
+  - *Measured* on the candidate golden tape, a synthetic 45-day walk with
+    archive open interest (a test pins the counts): 398 15m SFPs, of
+    which the newest-point rule fires 197, none on a shared boundary, and
+    this rule 195, with 12 shared boundaries; on 1h 96 SFPs, 48 against 46
+    (1 shared); on 4h 21, 9 and 9. Only 122 of the 398 15m SFPs resolve
+    within 25 s of their bar end, where the two rules read different end
+    boundaries: the tape's trades are sparse, so it understates the shift
+    on BTC, where nearly every SFP does.
+  - *Weak spots:* the BTC figures above are rate estimates (the 34 h live
+    store holds too few SFPs to measure parity); an expansion only in the
+    last interval before the rejection is invisible in both sources; and
+    it is one new number.
+  - *Rejected:* the newest ready point within an age bound of 360 000 ms
+    (one grid interval plus `max_age_ms`), the rule this ADR first stated:
+    archive and live read different boundaries at nearly every SFP, as
+    above. Reading the end after the rejection: visible only after the
+    fact (D2). Rebuilding the previous point from `delta`: a delta carries
+    no `sample_time` and exists only between ready neighbours.
 - **Expansion condition:** both points are present, have the same
   `resolution_ms` (no comparison across an archive/live seam), `end.boundary
   > start.boundary`, and `end.open_interest > start.open_interest`
-  (strict).
-  - *Stated limit:* an excursion that starts and is rejected inside one grid
-    interval has no comparison. M4 measures how often that happens.
+  (strict, compared exactly in `i128`).
+  - *Stated limit:* an excursion whose start and end read the same
+    boundary, a shared boundary, has no comparison. M4 reports how often
+    that happens, per OI id.
+  - *Overflow:* a change that does not fit a `Qty` (possible only with
+    negative open interest) is no trigger and leaves the value as it was.
+    *Rejected:* `Unavailable(OutOfRange)`, which would give the value a
+    validity of its own, while D1 has it follow its fact input.
 - **Unsigned:** open interest counts both sides' positions, so the rule is
   the same for a probe above and below (the ADR-051 D4 reason).
 - **No magnitude threshold in `@1`** (ADR-013). The event carries both
-  points, the change and the span, so #28/#31 can threshold on measured
-  contribution.
+  points and the change, the span between them is their boundaries, so
+  #28/#31 can threshold on measured contribution.
   - *Rejected:* a tail quantile against a rolling baseline ("expansion"
     meaning unusual). Fixing the two effort numbers took a pre-registered
     tool, two rules and a hold-out year (ADR-051 D9); that hold-out year has
     now been read, so no clean data is left to fix a third.
   - *Rejected:* the OI at the swing anchor. On 4h/1d it can be days old, so
     it measures the move before the excursion, not the excursion.
+- **Value:** the last trigger: its `known_at`, the rejection's anchor (the
+  swept level's price, or the crossed edge) and the evidence `OiExpansion`
+  — the rejection (`Sweep` or `AuctionStatus`; one event can resolve
+  several SFPs, so the value names which), both `OiGridPoint`s and
+  `change: Qty`. The value follows the rejection's fact input
+  (`structure.levels.<tf>@1` or `location.auction.prior_day@1`), not the
+  grid (D1): a point that is missing means no trigger, not an invalid
+  value. The event directly follows its rejection's trigger, with the same
+  anchor, context and bias (D2).
+- **The #96 isolation check compares the OI values.** They read no
+  registry: their facts and points do not, and only their events' contexts
+  do, which are not values. `Triggers::equal_but_registry` therefore
+  places them on the compared side. *Rejected:* leaving them out, which
+  would hide a future registry read in this rule.
 - **Why these two rejections:** brief §11 lists this family next to failed
   auction and SFP as triggers at a value edge, and those two are the facts
   on main that mean "beyond a level, then back". A failed reclaim is a
   different auction context (returning into value); it gets its own id if
   #28 asks for one.
-- **Parameters:** `compare_rule` = `strict`, `oi_max_age_ms` = 360 000,
+- **Parameters:** `compare_rule` = `strict`, `oi_lag_ms` = 25 000,
   `rejection` = `sfp` or `failed_auction` (text); the SFP ids also
-  `timeframe_ms`.
+  `timeframe_ms`. **Inputs:** the fact feature (`structure.levels.<tf>@1`,
+  or `location.auction.prior_day@1` for the failed auction),
+  `derivatives.oi.5m@1` for the points, `location.auction.prior_day@1` for
+  the context, and `bias.context@1` for the snapshot.
 - **State:** engine state, rebuilt by replay; ADR-052's warm start replays
-  from the origin, so a warm-started engine holds the same records.
+  from the origin, so a warm-started engine holds the same records. One
+  start record per pending sweep that had a point (so at most as many as
+  the structure registries' pending sweeps), one probe record, and the
+  last two ready points.
 
 ### D8. Where each number comes from
 
@@ -451,7 +552,10 @@ rejection is the D5 failed auction).
 | Admitted kinds' density (p50 per closed minute: SFP zones 51, structural highs 48 / lows 29, HVN 22, LVN 20, POC/VAH/VAL 2 each, VWAP 1) | ADR-044 M3 (`@2`); recorded to show the gate may be wide, measured by M4 | measurement, recorded |
 | Previous-swing skip of the CVD gate | No number of its own: the D4 key. The 6 bps it cites is ADR-044 D3's registry padding, quoted to show what admitting the swing would filter | no new number |
 | Golden-tape counts 257 / 120 / 248 / 243 / 5 (1 + 4) / 3; 6 892 of 6 962 effort-vs-result and exhaustion edges pass the gate | Measured on the synthetic candidate golden tape by an M2 test that pins them; they show the pair skip is not vacuous and the gate is wide for the other families there, not how BTC behaves | measurement, recorded |
-| OI point age ≤ 360 000 ms | One grid interval plus the 60 s lag `derivatives.oi.5m@1` accepts (ADR-042 D2); less loses healthy live points, more reads an outage's stale point | derivation |
+| `oi_lag_ms` 25 000 | The longest live spacing ADR-042 D1 calls continuous (10 000 ms resolution + 15 000 ms `step_tolerance_ms`; measured maximum 15 049 ms): a continuous live feed has closed the boundary the lag before every event, as the archive has. Less: a slow continuous feed may not have closed it; more: the points drift from their events for no gain | derivation |
+| Two held OI points | The boundary read lies in `[t − 325 000, t − 25 000]` ms, at most one grid interval before the newest boundary closed by `t` | derivation |
+| Archive cost ≈ 23 % / 6 % / 2 % of 15m / 1h / 4h SFPs | ADR-037 S3's first-window-bar share of SFPs (76 / 79 / 82 %) times the 275 s of a bar where a sweep and its first-bar SFP read one boundary, over the bar length; a rate estimate, measured by M4 | derivation, estimate |
+| Golden-tape counts 398 / 197 / 195 / 12 / 122 (15m), 96 / 48 / 46 / 1 (1h), 21 / 9 / 9 (4h) | Measured on the synthetic candidate golden tape by an M3 test that pins them; they show the rule is not vacuous there and where it parts from the newest-point rule, not how BTC behaves | measurement, recorded |
 | OI comparison strict, unsigned | Equal open interest is no expansion; open interest counts both sides | derivation |
 | Development year 2025-10-01 … 2026-09-30 for *Accept when* | The #12 year every earlier measurement used; nothing is fitted, so no hold-out is needed | derivation |
 
@@ -484,10 +588,16 @@ rejection is the D5 failed auction).
   and kind before anyone relies on it. On the synthetic candidate golden
   tape it passes 243 of 257 CVD divergences and 6 892 of 6 962
   effort-vs-result and exhaustion edges (D8).
-- SFPs whose excursion resolves inside one 5-minute grid interval can never
-  qualify for the OI family, so `trigger.oi_expansion_rejection.15m@1` may
-  be rare. M4 measures that share, and its reachability rule stops the run
-  if the id never fires.
+- An excursion whose start and end read the same OI boundary has no
+  comparison: one inside a grid interval, and one swept in the last 275 s
+  of the bar that resolves it (D7), about 23 % of 15m SFPs in the archive
+  by the ADR-037 S3 rates. So `trigger.oi_expansion_rejection.15m@1` may
+  be rare. M4 reports the shared boundaries per OI id, and its
+  reachability rule stops the run if an id never fires.
+- The archive and a continuous live feed select the same OI boundaries at
+  every start and end (D7); their points still differ in `resolution_ms`
+  and sample time, so the OI values of one stretch differ between the two
+  sources, and none compares across a seam.
 - Without magnitude thresholds and without cooldowns, the trigger rate is
   the fact rate (times the gate's pass rate for candidates). Episodes,
   cooldowns and de-duplication belong to #25.
@@ -520,13 +630,20 @@ rejection is the D5 failed auction).
   rules.** An unmeasured number (D5). Rejected.
 - **A tail-quantile OI expansion; the OI at the swing anchor.** D7.
   Rejected.
+- **The newest ready OI point within a 360 000 ms age bound; reading the
+  end after the rejection; rebuilding a point from its `delta`.** D7.
+  Rejected.
+- **A time test or closed bars for the probe's start; a location fact for
+  retargets.** D7. Rejected.
+- **`Unavailable(OutOfRange)` for an OI change outside `Qty`; leaving the
+  OI values out of the #96 isolation check.** D7. Rejected.
 - **Reading `MarketState.location.auction` in the auction rules.** Wrong
   reference at the rollover (D5). Rejected.
 
 ## Accept when
 
-M4 runs the ignored measurement tool (M3) on the #12 development year,
-2025-10-01 … 2026-09-30:
+M4 runs the ignored measurement tool `trigger_measure` (M3) on the #12
+development year, 2025-10-01 … 2026-09-30:
 
 - **T0 (asserted):** 0 mismatches between the engine's trigger events and
   an independent model written from this text.
@@ -537,8 +654,9 @@ M4 runs the ignored measurement tool (M3) on the #12 development year,
 - **Reported, no threshold:** counts per id, per half and per regime label;
   the gate pass rate per candidate family; the CVD divergences per
   timeframe that the previous-swing skip alone stops (D4); the in-zone
-  share per level kind; the share of SFPs whose excursion stays inside one
-  grid interval.
+  share per level kind; per OI id, the rejections with no start point, no
+  end point, a resolution mismatch, a shared boundary (D7), open interest
+  not higher, a change out of range, and those that fired.
 - **Absorption:** reachability is checked on the live store that ADR-051's
   live R0 run used, since the absorption ids are live only.
 - **No hold-out needed:** no constant is fitted to data, so the
