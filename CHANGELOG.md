@@ -12,6 +12,25 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
 
 ### Added
 
+- **Context records and their sampling policy (ADR-054, proposed; part of
+  #25).** The new domain module `mie_domain::conditional` turns the
+  engine's output after each accepted event into `ContextRecord`s: a
+  trigger sample for every ADR-053 trigger event, carried unchanged with
+  its context and bias, and an unconditional baseline sample at every
+  event that closes a 1m bar, anchored at the last 1m close with trades
+  like the candidate contexts. Each record carries the event key (the
+  decision time), the location context, the bias and a declared
+  `StateSnapshot` of 13 features (`SNAPSHOT_FEATURES`). Overlap control has
+  no time constant: within one trigger id, a trigger joins the open
+  episode when its evidence span (`evidence_span`, read from the
+  evidence's own fields) overlaps the episode's data; every sample is kept
+  with an `Episode { id, opener, truncated }`, and bridges are counted.
+  Location zone events are not sampled. `ContextSampler` is pure, streams
+  its records, and can emit from a window start after a warm prefix;
+  `ContextProvenance` carries the data version, the engine key and the
+  policy `conditional.sampling@1` with its fingerprint. Records are not
+  Market State: no feature, catalog, lock or state hash changes. The app
+  driver and the measurement tool follow in M2.
 - **ADR-053 is `accepted` (#24 M4).** The *Accept when* measurement on the
   #12 year and the ADR-051 R0 live store passed: 603 323 345 events, 0
   mismatches, every archive-reachable trigger id fired. The measured gate
