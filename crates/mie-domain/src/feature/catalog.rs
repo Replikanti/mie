@@ -2621,6 +2621,188 @@ pub const TRIGGER_ABSORPTION: [(Timeframe, &FeatureDefinition); 3] = [
     (Timeframe::H1, &TRIGGER_ABSORPTION_1H_V1),
 ];
 
+/// The `compare_rule` parameter of an OI-expansion trigger (ADR-053 D7):
+/// the end point's open interest strictly above the start point's.
+const OI_TRIGGER_COMPARE_RULE: Param = Param {
+    name: "compare_rule",
+    value: ParamValue::Text("strict"),
+};
+
+/// The `oi_lag_ms` parameter of an OI-expansion trigger (ADR-053 D7): the
+/// point at an event at `t` is that of the boundary of `t − 25 000 ms`,
+/// [`crate::trigger::OI_LAG_MS`].
+const OI_TRIGGER_LAG: Param = Param {
+    name: "oi_lag_ms",
+    value: ParamValue::Int(25_000),
+};
+
+/// The parameters of an OI-expansion trigger rejected by an SFP on the
+/// timeframe of `timeframe_ms` (ADR-053 D7), sorted by name.
+const fn oi_sfp_trigger_params(timeframe_ms: i64) -> [Param; 4] {
+    [
+        OI_TRIGGER_COMPARE_RULE,
+        OI_TRIGGER_LAG,
+        Param {
+            name: "rejection",
+            value: ParamValue::Text("sfp"),
+        },
+        Param {
+            name: "timeframe_ms",
+            value: ParamValue::Int(timeframe_ms),
+        },
+    ]
+}
+
+/// The OI-expansion trigger parameters of the 15m timeframe.
+const OI_SFP_TRIGGER_PARAMS_15M: [Param; 4] = oi_sfp_trigger_params(900_000);
+
+/// The OI-expansion trigger parameters of the 1h timeframe.
+const OI_SFP_TRIGGER_PARAMS_1H: [Param; 4] = oi_sfp_trigger_params(3_600_000);
+
+/// The OI-expansion trigger parameters of the 4h timeframe.
+const OI_SFP_TRIGGER_PARAMS_4H: [Param; 4] = oi_sfp_trigger_params(14_400_000);
+
+/// The OI-expansion trigger parameters of the 1d timeframe.
+const OI_SFP_TRIGGER_PARAMS_1D: [Param; 4] = oi_sfp_trigger_params(86_400_000);
+
+/// `trigger.oi_expansion_rejection.15m@1`: open-interest expansion
+/// followed by rejection on 15m structure (ADR-053 D7). A
+/// `structure.levels.15m@1` SFP is a trigger if the `derivatives.oi.5m@1`
+/// point at the SFP lies on a later boundary than the point at the sweep's
+/// sweeping trade, with the same `resolution_ms` and strictly higher open
+/// interest. The point at an event at `t` is the ready point of the
+/// boundary of `t − oi_lag_ms`, none if that boundary closed unavailable
+/// or not at all, so the archive and a continuous live feed select the
+/// same boundaries. The event follows the SFP trigger of the same sweep,
+/// with its anchor, context and bias, and carries the SFP, both points and
+/// the change as evidence; the value is the last trigger. No magnitude
+/// threshold (ADR-013).
+///
+/// - Parameters: `compare_rule` = `strict`, `oi_lag_ms` = 25 000,
+///   `rejection` = `sfp`, `timeframe_ms` = 900 000.
+/// - Inputs: `structure.levels.15m@1` (the rejection), `derivatives.oi.5m@1`
+///   (the points), `location.auction.prior_day@1` (the context's copy) and
+///   `bias.context@1`.
+/// - Warm-up: none of its own; the value is warming up or unavailable
+///   exactly while `structure.levels.15m@1` is, and otherwise holds the
+///   last trigger (`None` before the first). A point that is not there
+///   means no trigger, not an invalid value.
+/// - Gap policy: that of `structure.levels.15m@1`; an open-interest hole
+///   leaves the boundaries it covers without a point.
+pub const TRIGGER_OI_EXPANSION_REJECTION_15M_V1: FeatureDefinition = trigger_v1(
+    "trigger.oi_expansion_rejection.15m",
+    &OI_SFP_TRIGGER_PARAMS_15M,
+    &[
+        Input::Feature(STRUCTURE_LEVELS_15M_V1.key),
+        Input::Feature(DERIVATIVES_OI_5M_V1.key),
+        Input::Feature(LOCATION_AUCTION_PRIOR_DAY_V1.key),
+        Input::Feature(BIAS_CONTEXT_V1.key),
+    ],
+);
+
+/// `trigger.oi_expansion_rejection.1h@1`: open-interest expansion followed
+/// by rejection on 1h structure (ADR-053 D7).
+///
+/// Parameters as [`TRIGGER_OI_EXPANSION_REJECTION_15M_V1`] with
+/// `timeframe_ms` = 3 600 000. Inputs: `structure.levels.1h@1`,
+/// `derivatives.oi.5m@1`, `location.auction.prior_day@1` and
+/// `bias.context@1`. Warm-up and gap policy as
+/// [`TRIGGER_OI_EXPANSION_REJECTION_15M_V1`], on `structure.levels.1h@1`.
+pub const TRIGGER_OI_EXPANSION_REJECTION_1H_V1: FeatureDefinition = trigger_v1(
+    "trigger.oi_expansion_rejection.1h",
+    &OI_SFP_TRIGGER_PARAMS_1H,
+    &[
+        Input::Feature(STRUCTURE_LEVELS_1H_V1.key),
+        Input::Feature(DERIVATIVES_OI_5M_V1.key),
+        Input::Feature(LOCATION_AUCTION_PRIOR_DAY_V1.key),
+        Input::Feature(BIAS_CONTEXT_V1.key),
+    ],
+);
+
+/// `trigger.oi_expansion_rejection.4h@1`: open-interest expansion followed
+/// by rejection on 4h structure (ADR-053 D7).
+///
+/// Parameters as [`TRIGGER_OI_EXPANSION_REJECTION_15M_V1`] with
+/// `timeframe_ms` = 14 400 000. Inputs: `structure.levels.4h@1`,
+/// `derivatives.oi.5m@1`, `location.auction.prior_day@1` and
+/// `bias.context@1`. Warm-up and gap policy as
+/// [`TRIGGER_OI_EXPANSION_REJECTION_15M_V1`], on `structure.levels.4h@1`.
+pub const TRIGGER_OI_EXPANSION_REJECTION_4H_V1: FeatureDefinition = trigger_v1(
+    "trigger.oi_expansion_rejection.4h",
+    &OI_SFP_TRIGGER_PARAMS_4H,
+    &[
+        Input::Feature(STRUCTURE_LEVELS_4H_V1.key),
+        Input::Feature(DERIVATIVES_OI_5M_V1.key),
+        Input::Feature(LOCATION_AUCTION_PRIOR_DAY_V1.key),
+        Input::Feature(BIAS_CONTEXT_V1.key),
+    ],
+);
+
+/// `trigger.oi_expansion_rejection.1d@1`: open-interest expansion followed
+/// by rejection on 1d structure (ADR-053 D7).
+///
+/// Parameters as [`TRIGGER_OI_EXPANSION_REJECTION_15M_V1`] with
+/// `timeframe_ms` = 86 400 000. Inputs: `structure.levels.1d@1`,
+/// `derivatives.oi.5m@1`, `location.auction.prior_day@1` and
+/// `bias.context@1`. Warm-up and gap policy as
+/// [`TRIGGER_OI_EXPANSION_REJECTION_15M_V1`], on `structure.levels.1d@1`.
+pub const TRIGGER_OI_EXPANSION_REJECTION_1D_V1: FeatureDefinition = trigger_v1(
+    "trigger.oi_expansion_rejection.1d",
+    &OI_SFP_TRIGGER_PARAMS_1D,
+    &[
+        Input::Feature(STRUCTURE_LEVELS_1D_V1.key),
+        Input::Feature(DERIVATIVES_OI_5M_V1.key),
+        Input::Feature(LOCATION_AUCTION_PRIOR_DAY_V1.key),
+        Input::Feature(BIAS_CONTEXT_V1.key),
+    ],
+);
+
+/// The OI-expansion trigger rejected by the SFP of each structure
+/// timeframe, shortest first, in [`TRIGGER_SFP`] order.
+pub const TRIGGER_OI_EXPANSION_REJECTION: [(Timeframe, &FeatureDefinition); 4] = [
+    (Timeframe::M15, &TRIGGER_OI_EXPANSION_REJECTION_15M_V1),
+    (Timeframe::H1, &TRIGGER_OI_EXPANSION_REJECTION_1H_V1),
+    (Timeframe::H4, &TRIGGER_OI_EXPANSION_REJECTION_4H_V1),
+    (Timeframe::D1, &TRIGGER_OI_EXPANSION_REJECTION_1D_V1),
+];
+
+/// `trigger.oi_expansion_rejection.prior_day@1`: open-interest expansion
+/// followed by rejection at the prior day's value (ADR-053 D7). A
+/// `trigger.failed_auction@1` failure is a trigger if the
+/// `derivatives.oi.5m@1` point at the failing close lies on a later
+/// boundary than the point at the close where the failed probe toward
+/// above or below started or last retargeted, with the same
+/// `resolution_ms` and strictly higher open interest; points as
+/// [`TRIGGER_OI_EXPANSION_REJECTION_15M_V1`]. The probe's start is read
+/// from the committed `location.auction.prior_day@1` status the first
+/// time the stage sees the probe. The event follows the failed-auction
+/// trigger, with its anchor (the crossed edge), context and bias, and
+/// carries the failing status, both points and the change as evidence.
+///
+/// - Parameters: `compare_rule` = `strict`, `oi_lag_ms` = 25 000,
+///   `rejection` = `failed_auction`.
+/// - Inputs: `location.auction.prior_day@1` (the rejection, the probe and
+///   the context's copy), `derivatives.oi.5m@1` and `bias.context@1`.
+/// - Warm-up and gap policy: those of `location.auction.prior_day@1`, as
+///   [`TRIGGER_FAILED_AUCTION_V1`]; an open-interest hole leaves the
+///   boundaries it covers without a point.
+pub const TRIGGER_OI_EXPANSION_REJECTION_PRIOR_DAY_V1: FeatureDefinition = trigger_v1(
+    "trigger.oi_expansion_rejection.prior_day",
+    &[
+        OI_TRIGGER_COMPARE_RULE,
+        OI_TRIGGER_LAG,
+        Param {
+            name: "rejection",
+            value: ParamValue::Text("failed_auction"),
+        },
+    ],
+    &[
+        Input::Feature(LOCATION_AUCTION_PRIOR_DAY_V1.key),
+        Input::Feature(DERIVATIVES_OI_5M_V1.key),
+        Input::Feature(BIAS_CONTEXT_V1.key),
+    ],
+);
+
 /// Every version of every feature. Never shrinks.
 pub const DEFINITIONS: &[&FeatureDefinition] = &[
     &TRADE_LAST_PRICE_V1,
@@ -2706,6 +2888,11 @@ pub const DEFINITIONS: &[&FeatureDefinition] = &[
     &TRIGGER_ABSORPTION_5M_V1,
     &TRIGGER_ABSORPTION_15M_V1,
     &TRIGGER_ABSORPTION_1H_V1,
+    &TRIGGER_OI_EXPANSION_REJECTION_15M_V1,
+    &TRIGGER_OI_EXPANSION_REJECTION_1H_V1,
+    &TRIGGER_OI_EXPANSION_REJECTION_4H_V1,
+    &TRIGGER_OI_EXPANSION_REJECTION_1D_V1,
+    &TRIGGER_OI_EXPANSION_REJECTION_PRIOR_DAY_V1,
 ];
 
 /// The fingerprint each published `id@version` must keep. Append-only: one
@@ -2794,6 +2981,31 @@ pub const LOCK: &[LockEntry] = &[
     LockEntry::new("trigger.absorption.5m", 1, 0xa3aa_1a5c_4dd4_7e4b),
     LockEntry::new("trigger.absorption.15m", 1, 0xb442_1293_cdf7_cc00),
     LockEntry::new("trigger.absorption.1h", 1, 0x53d5_9a84_1d8d_4292),
+    LockEntry::new(
+        "trigger.oi_expansion_rejection.15m",
+        1,
+        0xc559_2732_9b66_11f9,
+    ),
+    LockEntry::new(
+        "trigger.oi_expansion_rejection.1h",
+        1,
+        0x0a78_563c_f67d_10a3,
+    ),
+    LockEntry::new(
+        "trigger.oi_expansion_rejection.4h",
+        1,
+        0x10b2_021a_61ec_9042,
+    ),
+    LockEntry::new(
+        "trigger.oi_expansion_rejection.1d",
+        1,
+        0x02ea_0d6c_3f9c_6f78,
+    ),
+    LockEntry::new(
+        "trigger.oi_expansion_rejection.prior_day",
+        1,
+        0x5cbf_cf4a_94a7_8630,
+    ),
 ];
 
 /// The default feature set: the latest version of each computed feature.
@@ -2880,6 +3092,11 @@ pub const CURRENT: &[FeatureKey] = &[
     TRIGGER_ABSORPTION_5M_V1.key,
     TRIGGER_ABSORPTION_15M_V1.key,
     TRIGGER_ABSORPTION_1H_V1.key,
+    TRIGGER_OI_EXPANSION_REJECTION_15M_V1.key,
+    TRIGGER_OI_EXPANSION_REJECTION_1H_V1.key,
+    TRIGGER_OI_EXPANSION_REJECTION_4H_V1.key,
+    TRIGGER_OI_EXPANSION_REJECTION_1D_V1.key,
+    TRIGGER_OI_EXPANSION_REJECTION_PRIOR_DAY_V1.key,
 ];
 
 /// Older versions the engine still computes on request, each in place of
@@ -2975,10 +3192,10 @@ mod tests {
             hasher.write_u32(entry.key.version.get());
             hasher.write_u64(entry.fingerprint.value());
         }
-        assert_eq!(LOCK.len(), 83, "lock lines");
+        assert_eq!(LOCK.len(), 88, "lock lines");
         assert_eq!(
             hasher.finish().to_string(),
-            "7a763f887730020f",
+            "7af7c484ad92bf5f",
             "lock digest"
         );
     }
@@ -3798,6 +4015,87 @@ mod tests {
             CANDIDATE_GATE_KINDS.value,
             ParamValue::Text("poc,vah,val,hvn,lvn,structural_high,structural_low,sfp_zone,vwap")
         );
+        // ADR-053 D7: the OI-expansion triggers, one per SFP timeframe and
+        // one on the failed auction, each reading its rejection's fact
+        // feature, the 5-minute open interest, the auction state and the
+        // bias, with the lag of the code in the parameters.
+        assert_eq!(
+            OI_TRIGGER_LAG.value,
+            ParamValue::Int(crate::trigger::OI_LAG_MS)
+        );
+        assert_eq!(
+            TRIGGER_OI_EXPANSION_REJECTION.map(|(timeframe, _)| timeframe),
+            STRUCTURE_TIMEFRAMES
+        );
+        for ((timeframe, definition), (_, levels)) in TRIGGER_OI_EXPANSION_REJECTION
+            .into_iter()
+            .zip(STRUCTURE_LEVELS)
+        {
+            assert_eq!(
+                definition.key.id.as_str(),
+                format!("trigger.oi_expansion_rejection.{}", timeframe.label())
+            );
+            assert_eq!(
+                definition.params,
+                &oi_sfp_trigger_params(timeframe.millis())[..],
+                "{}",
+                definition.key
+            );
+            assert_eq!(
+                definition.inputs,
+                &[
+                    Input::Feature(levels.key),
+                    Input::Feature(DERIVATIVES_OI_5M_V1.key),
+                    Input::Feature(LOCATION_AUCTION_PRIOR_DAY_V1.key),
+                    Input::Feature(BIAS_CONTEXT_V1.key),
+                ],
+                "{}",
+                definition.key
+            );
+            assert_eq!(definition.warm_up, WarmUp::None, "{}", definition.key);
+            assert!(CURRENT.contains(&definition.key), "{}", definition.key);
+        }
+        let prior_day = &TRIGGER_OI_EXPANSION_REJECTION_PRIOR_DAY_V1;
+        assert_eq!(
+            prior_day.key.id.as_str(),
+            "trigger.oi_expansion_rejection.prior_day"
+        );
+        assert_eq!(
+            prior_day.params,
+            &[
+                OI_TRIGGER_COMPARE_RULE,
+                OI_TRIGGER_LAG,
+                Param {
+                    name: "rejection",
+                    value: ParamValue::Text("failed_auction"),
+                },
+            ]
+        );
+        assert_eq!(
+            prior_day.inputs,
+            &[
+                Input::Feature(LOCATION_AUCTION_PRIOR_DAY_V1.key),
+                Input::Feature(DERIVATIVES_OI_5M_V1.key),
+                Input::Feature(BIAS_CONTEXT_V1.key),
+            ]
+        );
+        assert_eq!(prior_day.warm_up, WarmUp::None);
+        assert!(CURRENT.contains(&prior_day.key));
+        // Every parameter list is sorted by name.
+        for definition in TRIGGER_OI_EXPANSION_REJECTION
+            .map(|(_, definition)| definition)
+            .into_iter()
+            .chain([prior_day])
+        {
+            assert!(
+                definition
+                    .params
+                    .windows(2)
+                    .all(|pair| pair[0].name < pair[1].name),
+                "{}",
+                definition.key
+            );
+        }
     }
 
     #[test]
@@ -3870,10 +4168,13 @@ mod tests {
              trigger.cvd_divergence.1h@1,trigger.cvd_divergence.4h@1,\
              trigger.effort_result.15m@1,trigger.effort_result.1h@1,\
              trigger.effort_result.5m@1,trigger.exhaustion@1,trigger.failed_auction@1,\
-             trigger.failed_reclaim@1,trigger.sfp.15m@1,trigger.sfp.1d@1,\
+             trigger.failed_reclaim@1,trigger.oi_expansion_rejection.15m@1,\
+             trigger.oi_expansion_rejection.1d@1,trigger.oi_expansion_rejection.1h@1,\
+             trigger.oi_expansion_rejection.4h@1,trigger.oi_expansion_rejection.prior_day@1,\
+             trigger.sfp.15m@1,trigger.sfp.1d@1,\
              trigger.sfp.1h@1,trigger.sfp.4h@1,\
              volatility.atr.1h@1,volatility.regime.1h@1"
         );
-        assert_eq!(set.version().to_string(), "adc14850f98d3011");
+        assert_eq!(set.version().to_string(), "4c844593779da2e3");
     }
 }

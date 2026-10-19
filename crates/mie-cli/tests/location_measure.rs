@@ -281,9 +281,10 @@ fn half_label(half: Option<usize>) -> &'static str {
 /// Whether `a` and `b` are equal in every field but the feature-set stamp
 /// and the level registry (#96 rule I). Exhaustive, so a new field does not
 /// compile until it is compared. The triggers compare through
-/// `Triggers::equal_but_registry`, exhaustive in turn, which leaves out the
-/// candidate trigger values: they depend on the selected registry by design,
-/// since their location gate reads it (ADR-053 D4).
+/// `Triggers::equal_but_registry`, exhaustive in turn, which compares the
+/// bias and the auction, SFP and OI-expansion trigger values and leaves out
+/// the candidate trigger values: they depend on the selected registry by
+/// design, since their location gate reads it (ADR-053 D4, D7).
 fn equal_but_registry(a: &MarketState, b: &MarketState) -> bool {
     let MarketState {
         feature_set: _,

@@ -161,9 +161,13 @@ pub struct MarketState {
     /// triggers `trigger.cvd_divergence.<tf>@1`
     /// ([`catalog::TRIGGER_CVD_DIVERGENCE`]),
     /// `trigger.effort_result.<w>@1`, `trigger.exhaustion@1` and
-    /// `trigger.absorption.<w>@1` (live only). Each trigger value follows
-    /// its fact input's validity. Never an execution instruction (ADR-010,
-    /// ADR-012). The last field, appended after `candidates` (ADR-053 D1).
+    /// `trigger.absorption.<w>@1` (live only), and the OI-expansion
+    /// triggers `trigger.oi_expansion_rejection.<tf>@1`
+    /// ([`catalog::TRIGGER_OI_EXPANSION_REJECTION`]) and
+    /// `trigger.oi_expansion_rejection.prior_day@1` on the SFPs and the
+    /// failed auction. Each trigger value follows its fact input's
+    /// validity. Never an execution instruction (ADR-010, ADR-012). The last
+    /// field, appended after `candidates` (ADR-053 D1).
     pub triggers: Triggers,
 }
 
@@ -692,6 +696,7 @@ impl MarketStateEngine {
         let MarketState {
             regime,
             structure,
+            derivatives,
             location,
             candidates,
             triggers,
@@ -706,6 +711,7 @@ impl MarketStateEngine {
                 structure,
                 location,
                 candidates,
+                oi_5m: &derivatives.oi_5m,
             },
             triggers,
             &mut self.trigger_pending,
@@ -783,6 +789,12 @@ impl MarketStateEngine {
     /// leaves them unchanged.
     pub fn trigger_events(&self) -> &[TriggerEvent] {
         &self.trigger_events
+    }
+
+    /// The trigger engine state, for tests of its records.
+    #[cfg(test)]
+    pub(crate) fn trigger_tracker(&self) -> &TriggerTracker {
+        &self.triggers
     }
 }
 
@@ -1245,7 +1257,10 @@ mod tests {
              trigger.cvd_divergence.1h@1,trigger.cvd_divergence.4h@1,\
              trigger.effort_result.15m@1,trigger.effort_result.1h@1,\
              trigger.effort_result.5m@1,trigger.exhaustion@1,trigger.failed_auction@1,\
-             trigger.failed_reclaim@1,trigger.sfp.15m@1,trigger.sfp.1d@1,\
+             trigger.failed_reclaim@1,trigger.oi_expansion_rejection.15m@1,\
+             trigger.oi_expansion_rejection.1d@1,trigger.oi_expansion_rejection.1h@1,\
+             trigger.oi_expansion_rejection.4h@1,trigger.oi_expansion_rejection.prior_day@1,\
+             trigger.sfp.15m@1,trigger.sfp.1d@1,\
              trigger.sfp.1h@1,trigger.sfp.4h@1,\
              volatility.atr.1h@1,volatility.regime.1h@1"
         );
