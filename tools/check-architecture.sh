@@ -11,7 +11,9 @@
 # dependencies and never touch the wall clock, the filesystem, the network,
 # the environment, threads, processes, async or hash-ordered collections.
 # The purity scan is a pattern guard over source text, not a proof — review
-# still applies. Dev-dependencies are exempt from the graph rules.
+# still applies. Dev-dependencies are exempt from the graph rules. A third
+# text guard keeps forward outcome labels out of every core file but the
+# labeler and its replay driver (ADR-055 D11).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -71,7 +73,23 @@ if [[ -n "$hits" ]]; then
   echo "$hits"
 fi
 
+# Label isolation (ADR-055 D11): forward outcome labels read the trades
+# after the decision time, so no core file may name them except the labeler
+# itself and its replay driver. Features are computed only in mie-domain
+# (ADR-019, ADR-025), so this closes the path from a label into a feature.
+# `mie_domain::conditional` declares `pub mod label;` without a re-export,
+# so every use names `label::`, or imports the module as
+# `conditional::label` (also renamed, also in a one-line group). Comments
+# count too: the guard is about naming, not only about code.
+label_hits=$(grep -rnE 'label::|ForwardLabel|conditional::label\b|conditional::\{[^}]*\blabel\b' \
+  crates/mie-domain/src crates/mie-ports/src crates/mie-app/src \
+  | grep -vE '^crates/mie-domain/src/conditional/label[^:]*:|^crates/mie-app/src/conditional\.rs:' || true)
+if [[ -n "$label_hits" ]]; then
+  fail "forward labels named outside the labeler and its replay driver (ADR-055 D11):"
+  echo "$label_hits"
+fi
+
 if [[ $status -eq 0 ]]; then
-  echo "OK: $(wc -w <<<"$members") crates — crate graph and core purity hold (ADR-025)"
+  echo "OK: $(wc -w <<<"$members") crates — crate graph, core purity (ADR-025) and label isolation (ADR-055) hold"
 fi
 exit $status

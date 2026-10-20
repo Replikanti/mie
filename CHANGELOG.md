@@ -12,6 +12,28 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
 
 ### Added
 
+- **Forward outcome labels (ADR-055, proposed; part of #26).** The new
+  domain module `mie_domain::conditional::label` labels every ADR-054
+  context record from the trades strictly after its decision event, in
+  canonical order, with the record's `trade.last_price@1` as the reference
+  and its `volatility.atr.1h@1` as the scale. `ForwardLabeler` emits one
+  `ForwardLabel` per record, in record order, keyed `(event, ordinal)`: per
+  horizon (5m, 15m, 1h, 4h, 1d) a race between barriers at reference ±
+  b_H · ATR with b_H = √(π · H / 32 h) (`BARRIER_MULTIPLE_E5`, a null mean
+  exit time of H/4), ties to the earlier trade id with a `same_ms` flag, the
+  up and down excursions with the time of the earliest trade at each, the
+  last trade, and a `clear` flag that thins each stream to disjoint
+  windows; for trigger records, first passages within 1d to the evidence's
+  level and extreme (`evidence_prices`). Trades gaps, a stale reference,
+  rejected trades-stream events and the end of data censor what was not
+  resolved strictly before the censor time; no label is dropped, and an
+  emitted label is never reopened (late gaps are counted in
+  `LabelStats.reach_backs`). `LabelProvenance` adds the labeling
+  `conditional.labels@1` and its fingerprint to the records' provenance.
+  `tools/check-architecture.sh` now rejects any core file outside the
+  labeler and its replay driver that names a label. No engine, catalog,
+  state-hash or record change. The replay driver and the measurement tool
+  follow in M2.
 - **ADR-054 is `accepted` (#25 M3).** The *Accept when* measurement on the
   #12 year and the ADR-051 R0 live store passed: 603 323 345 events, 0
   mismatches against the independent model, 0 grid violations, every
