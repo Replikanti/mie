@@ -251,14 +251,33 @@ is unknown.
   millisecond does not count: the last millisecond may be incomplete. On
   healthy data, where trades run up to the end, this moves c from the last
   event to the last trade, milliseconds earlier.
+  `finish()` then closes every window that ends at or before c, as an
+  event at c would: the trades are complete up to c, so those windows are
+  covered. *Why:* the censor reaches only the windows ending after c, and
+  a rejected trades-stream event can be later than every observed event:
+  every rejection that passed the engine's canonical-order check (a
+  duplicate or regressing exchange id, an overflow, a time jump), and an
+  inverted gap, ordered at its end. `reject` closes nothing, so the
+  windows ending between the last observed event and the rejection would
+  stay open, and their label and every later one would never be emitted;
+  a time jump, more than `MAX_BARS_PER_EVENT` = 44 640 one-minute bars
+  (31 days) ahead (ADR-031), would lose every open label. Closing at c
+  keeps "each label once, in record order" for every way the data can
+  end. *Rejected:* censoring at the last observed event instead (the rule
+  before c moved to the trades stream) brings back the dependence on
+  other streams above; closing in `reject` as well would only repeat, at
+  every rejection, what the next `observe` or `finish()` does anyway.
 - **Trailing gaps: the replay driver's contract (M2).** A provider does
   not deliver a gap still open at its window's end; it lists it in
   `trailing_gaps()` (archive, live and chained replay alike). After the
   provider's last event the driver passes exactly the `Stream::Trades`
-  entries of `trailing_gaps()` to `observe`, in canonical order (their
-  ends lie at or after the window's end, so after every delivered event),
-  passes no other stream's trailing gap to the labeler, and then calls
-  `finish()`.
+  entries of `trailing_gaps()` to `observe`, in canonical order (each
+  ends at or before the window's end, after the stream's last delivered
+  event: an archive trailing gap ends at the earlier of its last missing
+  day's end (plus the stream's source offset) and the window's end; the
+  labeler's result does not depend on where it sorts among the other
+  streams' last events), passes no other stream's trailing gap to the
+  labeler, and then calls `finish()`.
   - With the end-of-data rule above, the trades entries are redundant for
     coverage, not required: a trailing trades gap starts at the stream's
     last delivered event, at or before the end-of-data c, so it cuts the
@@ -284,7 +303,10 @@ is unknown.
   `finish()` emits every remaining label after the end-of-data censor
   (above), which reaches each of their windows that ends after the last
   trades-stream event, closed or not: a complete label still waiting for
-  the trades stream comes out censored there, never as fully covered.
+  the trades stream comes out censored there, never as fully covered. The
+  windows ending at or before that event, which no `observe` closed when
+  it was a rejected one, close there as well, so every opened label is
+  emitted exactly once.
   - *Why the trades stream:* ADR-028 orders a gap at its `end` with rank 0,
     so it precedes the stream's first resumed event in that millisecond,
     and the providers open a trades gap at the last trade they delivered:

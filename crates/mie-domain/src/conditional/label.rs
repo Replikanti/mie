@@ -933,17 +933,22 @@ impl ForwardLabeler {
     }
 
     /// Ends the data: censors every unemitted label at the last
-    /// trades-stream event, closed windows included, and emits every
-    /// remaining label, in record order (ADR-055 D6). Trades that stop
-    /// before the data does look the same as an outage nobody announced,
-    /// so the trades are known to be complete only up to that event.
-    /// Without one, every label is censored at its decision.
+    /// trades-stream event, closed windows included, closes every window
+    /// that ends at or before it, and emits every remaining label, in
+    /// record order (ADR-055 D6). Trades that stop before the data does
+    /// look the same as an outage nobody announced, so the trades are
+    /// known to be complete only up to that event. Without one, every
+    /// label is censored at its decision.
     pub fn finish(&mut self, mut emit: impl FnMut(ForwardLabel)) {
         let last = self
             .trades_until
             .or_else(|| self.labels.front().map(|open| open.label.event.time));
         if let Some(last) = last {
             self.censor(last, CensorReason::EndOfData);
+            // The censor reaches the windows ending after `last`; this
+            // closes the rest. A rejected trades-stream event can be later
+            // than every observed event, so no `observe` closed them.
+            self.close_until(last);
         }
         self.emit_complete(&mut emit, true);
         debug_assert!(self.labels.is_empty(), "every window closes at the end");

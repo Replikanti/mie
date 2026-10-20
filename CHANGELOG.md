@@ -30,7 +30,12 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   yet emitted included (a trades outage is silent until trades resume, so
   a complete label is emitted only after a trades-stream event at or after
   its 1d end or 1d censor); no label is dropped, and an emitted label is never reopened (late gaps are
-  counted in `LabelStats.reach_backs`). `LabelProvenance` adds the labeling
+  counted in `LabelStats.reach_backs`). The end of the data censors at the
+  last trades-stream event (accepted or rejected), not at the last event of
+  any stream, and closes every window ending at or before it, so data ending
+  on a rejected trades event loses no label; the M2 replay driver passes
+  only the trades-stream trailing gaps to the labeler, then `finish`.
+  `LabelProvenance` adds the labeling
   `conditional.labels@1` and its fingerprint to the records' provenance.
   `tools/check-architecture.sh` now rejects any core file outside the
   labeler and its replay driver that names a label, also through a renamed,
