@@ -12,6 +12,15 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
 
 ### Added
 
+- **ADR-054 is `accepted` (#25 M3).** The *Accept when* measurement on the
+  #12 year and the ADR-051 R0 live store passed: 603 323 345 events, 0
+  mismatches against the independent model, 0 grid violations, every
+  archive-reachable trigger id with an episode, and the absorption ids with
+  15 / 10 / 2 episodes on the live store. The year yields 525 599 baseline
+  samples and 36 096 trigger samples in 25 714 episodes, with no bridge and
+  no truncated episode; the ADR records the per-id tables, the cross-id
+  co-emissions, the baseline split and the cost, and why absorption has no
+  sample in the archive (no book stream). No code changes.
 - **The context-sampling driver and the measurement tool (ADR-054 D5, D6,
   proposed; part of #25).** `mie_app::conditional::sample_contexts` runs a
   `ContextSampler` through `drive_tolerant_observed` and feeds it accepted

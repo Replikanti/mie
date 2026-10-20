@@ -1,6 +1,6 @@
 # ADR-054: Context records and sampling — trigger and baseline samples, episodes from evidence overlap
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-10-19
 
 ## Context
@@ -471,3 +471,159 @@ year, 2025-10-01 … 2026-09-30, and on the ADR-051 R0 live store:
 
 Every criterion is reachable on the stores that exist today: the #12 year
 is imported, and the R0 live store holds absorption facts.
+
+## Acceptance
+
+Accepted 2026-10-20. Both runs used the `context_measure` ignored tests
+(`measure_contexts`, `measure_contexts_live`) of main `67715b5` (M2),
+release build, with the policy `conditional.sampling@1`, fingerprint
+`2c71fff23e8b0415`, and the engine key `4c844593779da2e3-1`. The year run
+covered 2025-10-01 00:00 UTC (inclusive) to 2026-10-01 00:00 UTC
+(exclusive), the window `1759276800000..1790812800000` ms, with
+`MIE_MEASURE_EVENTS=603323345`, under the same 8 GB memory cap as the live run, and its provenance
+data version is `5d9e27f862ac54dd93cff904458e9ee92767d5105a9d13a144351cba069f224d`.
+The live run replayed ADR-051's R0 live store under an 8 GB memory cap;
+the store holds one cleanly ended run, `20261016T225606Z`, with the data
+version `9348410a56c0d05d469f3f7e78c1c405d80db333d9d34df694b45ce256caca2d`.
+Every measured number below is from these two runs.
+
+**Criteria**, each checked against the printed reports:
+
+- **T0 (asserted): met.** The year replayed 603 323 345 events, the
+  expected count, with 0 rejections and 0 mismatches over 561 695 records
+  (525 599 baseline + 36 096 trigger samples). The live run: 2 042 225
+  events, 0 rejections, 0 mismatches over 2 185 records (2 067 baseline +
+  118 trigger samples). The sampler's counts (samples, episodes, bridges,
+  truncated) also equal the model's in both runs, or the run would have
+  stopped.
+- **Grid invariant (asserted): met.** 0 grid violations in the year (36 096
+  trigger samples) and on the live store (118): every trigger record's
+  event is a baseline instant, so the derivation of D3 holds on BTC data.
+- **Reachability (asserted): met.** Archive: ids without an episode in the
+  year, none, with the absorption ids excluded as D2 and ADR-053 define
+  them. Live: the three absorption ids have 15 / 10 / 2 episodes (5m / 15m
+  / 1h), at least 1 each.
+- **Reported, no threshold: reported** in the tables below: per id,
+  cross-id co-emissions, the baseline split, the wall time and the peak
+  RSS. The tool prints two durations per episode, the member span and the
+  data hull (D4); the hull is "episode duration" of *Accept when*.
+- **No hold-out needed:** no constant is fitted; nothing to check.
+
+All five hold, so the ADR is accepted.
+
+**Why absorption has 0 samples in the year.** Not a defect of the sampler.
+`trigger.absorption.<5m|15m|1h>@1` fires on `candidate.absorption.*`
+(ADR-053), which is built on `book.liquidity.window.*` (ADR-051 D7). Order
+book depth is captured live only (ADR-043); the archive has no book stream,
+so those windows stay warming up in every archive replay (D2 says the same
+of the snapshot's `liquidity` field) and the candidate never evaluates. The
+year therefore has 0 absorption samples, as ADR-053's year run had (its
+Acceptance table). This is why *Accept when* asks for the absorption ids
+on the live store, where they have episodes.
+
+**Per id, the year.** Samples, episodes and samples per episode
+(p50 / p90 / p99 / max); duration in minutes (p50 / p99 / max) as the member
+span and the data hull. Bridges and truncated episodes are 0 in every row.
+
+| Trigger id | Samples | Episodes | Per episode | Member span | Data hull |
+|---|---|---|---|---|---|
+| `trigger.failed_auction@1` | 697 | 697 | 1 / 1 / 1 / 1 | 0 / 0 / 0 | 1 / 1 / 1 |
+| `trigger.failed_reclaim@1` | 430 | 430 | 1 / 1 / 1 / 1 | 0 / 0 / 0 | 1 / 1 / 1 |
+| `trigger.breakout_acceptance@1` | 367 | 367 | 1 / 1 / 1 / 1 | 0 / 0 / 0 | 1 / 1 / 1 |
+| `trigger.sfp.15m@1` | 4 267 | 3 313 | 1 / 2 / 4 / 7 | 0 / 15 / 15 | 10.9 / 29.5 / 30.0 |
+| `trigger.sfp.1h@1` | 1 063 | 818 | 1 / 2 / 4 / 6 | 0 / 60 / 60 | 38.8 / 117.5 / 172.3 |
+| `trigger.sfp.4h@1` | 257 | 203 | 1 / 2 / 3 / 3 | 0 / 240 / 240 | 142.8 / 465.7 / 479.9 |
+| `trigger.sfp.1d@1` | 44 | 35 | 1 / 2 / 2 / 2 | 0 / 1 440 / 1 440 | 512.1 / 2 661.5 / 2 661.5 |
+| `trigger.cvd_divergence.15m@1` | 711 | 590 | 1 / 2 / 3 / 5 | 0 / 345 / 495 | 192.7 / 581.3 / 687.6 |
+| `trigger.cvd_divergence.1h@1` | 182 | 144 | 1 / 2 / 3 / 3 | 0 / 1 380 / 1 560 | 737.1 / 2 409.0 / 2 518.1 |
+| `trigger.cvd_divergence.4h@1` | 42 | 38 | 1 / 2 / 2 / 2 | 0 / 6 720 / 6 720 | 2 871.1 / 10 866.6 / 10 866.6 |
+| `trigger.cvd_divergence.1d@1` | 3 | 3 | 1 / 1 / 1 / 1 | 0 / 0 / 0 | 13 403.7 / 14 306.7 / 14 306.7 |
+| `trigger.effort_result.5m@1` | 12 952 | 10 691 | 1 / 2 / 3 / 7 | 0 / 7 / 16 | 5 / 12 / 21 |
+| `trigger.effort_result.15m@1` | 7 496 | 4 388 | 1 / 3 / 6 / 10 | 0 / 29 / 57 | 15 / 44 / 72 |
+| `trigger.effort_result.1h@1` | 3 738 | 1 305 | 2 / 6 / 11 / 14 | 10 / 146 / 208 | 70 / 206 / 268 |
+| `trigger.absorption.5m@1` | 0 | 0 | - | - | - |
+| `trigger.absorption.15m@1` | 0 | 0 | - | - | - |
+| `trigger.absorption.1h@1` | 0 | 0 | - | - | - |
+| `trigger.oi_expansion_rejection.15m@1` | 1 469 | 1 172 | 1 / 2 / 4 / 7 | 0 / 15 / 30 | 15 / 30 / 65 |
+| `trigger.oi_expansion_rejection.1h@1` | 453 | 369 | 1 / 2 / 3 / 6 | 0 / 60 / 60 | 40 / 120 / 120 |
+| `trigger.oi_expansion_rejection.4h@1` | 125 | 105 | 1 / 2 / 3 / 3 | 0 / 240 / 240 | 155 / 470 / 485 |
+| `trigger.oi_expansion_rejection.1d@1` | 19 | 17 | 1 / 2 / 2 / 2 | 0 / 0 / 0 | 515 / 2 665 / 2 665 |
+| `trigger.exhaustion@1` | 1 462 | 716 | 1 / 4 / 8 / 11 | 0 / 113 / 179 | 65 / 178 / 244 |
+| `trigger.oi_expansion_rejection.prior_day@1` | 319 | 313 | 1 / 1 / 2 / 2 | 0 / 10 / 10 | 19 / 66 / 87 |
+| All ids | 36 096 | 25 714 | | | |
+
+The sample counts equal ADR-053's year table row for row. **Per id, the live
+store** (run `20261016T225606Z`), samples / episodes / per episode
+(p50 / p90 / p99 / max), 0 bridges and 0 truncated in every row; ids not
+listed have 0 samples:
+
+| Trigger id | Samples | Episodes | Per episode |
+|---|---|---|---|
+| `trigger.failed_auction@1` | 2 | 2 | 1 / 1 / 1 / 1 |
+| `trigger.breakout_acceptance@1` | 2 | 2 | 1 / 1 / 1 / 1 |
+| `trigger.sfp.15m@1` | 15 | 11 | 1 / 2 / 3 / 3 |
+| `trigger.sfp.1h@1` | 3 | 2 | 1 / 2 / 2 / 2 |
+| `trigger.cvd_divergence.15m@1` | 3 | 2 | 1 / 2 / 2 / 2 |
+| `trigger.effort_result.5m@1` | 17 | 16 | 1 / 1 / 2 / 2 |
+| `trigger.effort_result.15m@1` | 16 | 10 | 1 / 3 / 3 / 3 |
+| `trigger.effort_result.1h@1` | 10 | 2 | 1 / 9 / 9 / 9 |
+| `trigger.absorption.5m@1` | 16 | 15 | 1 / 1 / 2 / 2 |
+| `trigger.absorption.15m@1` | 15 | 10 | 1 / 3 / 3 / 3 |
+| `trigger.absorption.1h@1` | 6 | 2 | 1 / 5 / 5 / 5 |
+| `trigger.oi_expansion_rejection.15m@1` | 6 | 4 | 1 / 2 / 2 / 2 |
+| `trigger.oi_expansion_rejection.1h@1` | 2 | 2 | 1 / 1 / 1 / 1 |
+| `trigger.exhaustion@1` | 4 | 2 | 1 / 3 / 3 / 3 |
+| `trigger.oi_expansion_rejection.prior_day@1` | 1 | 1 | 1 / 1 / 1 / 1 |
+| All ids | 118 | 83 | |
+
+Reading. Episodes reduce the 36 096 samples to 25 714 (1.40 times; the live
+store 118 to 83). The effort-vs-result and exhaustion ids reduce most
+(1h effort 3 738 to 1 305, 15m effort 7 496 to 4 388, exhaustion 1 462 to
+716). Chaining is bounded by the data and not by a number: the longest
+episode of a windowed id has a data hull of 268 minutes (1h effort, 14
+members), and the multi-day hulls belong to the structural ids whose own
+evidence spans days (4h and 1d divergences and 1d SFPs; a 1d divergence's
+confirmation alone is 3 days, D4). No id has a bridge, so no episode count
+is an upper bound for lack of repair, and no episode is truncated (the
+year replays from a cold engine, so no trigger's evidence reaches back
+before the first observed event).
+Whether these episode lengths are the right unit is #26's reading before it
+fixes horizons.
+
+**Cross-id co-emissions** (D4): the events at which two or more ids of a
+family emit, and the samples at those events, against the family's samples:
+
+| Family | Year events | Year samples | Share of family | Live events | Live samples |
+|---|---|---|---|---|---|
+| sfp | 308 | 853 | 15.1 % of 5 631 | 1 | 5 |
+| effort_vs_result | 1 260 | 2 570 | 10.6 % of 24 186 | 2 | 4 |
+| cvd_divergence | 7 | 14 | 1.5 % of 938 | 0 | 0 |
+| oi_expansion_rejection | 120 | 312 | 13.1 % of 2 385 | 1 | 3 |
+| absorption | 0 | 0 | - | 1 | 2 |
+| failed_auction, failed_reclaim, breakout_acceptance, exhaustion | 0 | 0 | - | 0 | 0 |
+
+A family-pooled count that does not de-duplicate on `event` is therefore
+inflated by up to about 15 % for SFPs and 11 % for effort vs result in the
+year.
+
+**Baseline samples.** The year: 525 599 (the window holds 525 600 minutes). By regime label
+low / medium / high / extreme / unlabelled: 145 920 / 142 380 / 104 400 /
+120 000 / 12 899; the unlabelled ones are the regime's warm-up over 214
+closed 1h bars (ADR-053) at the start of the window. By location bin
+(`value_edge` / `structural_extreme` / `neither` / levels not ready):
+52 041 / 16 244 / 460 195 / 0. The first two bins overlap by construction
+(ADR-051), so the bins sum to 528 480, 2 881 more than the samples: those are
+the samples in both. Instants that close only empty minutes: 0; instants that
+close more than one minute: 0, so the archive year has no trades gap that
+spans a minute. The live store: 2 067 samples, all unlabelled (the 34 h run
+is shorter than the 214 closed 1h bars the regime needs); bins 696 / 289 /
+1 241 / 0 (sum 2 226, 159 in both); 0 empty-only instants; 4 instants that
+close several minutes.
+
+**Cost.** The year run took a process wall time of 58:00.25 (the tool
+reports 3 479.5 s) at a peak RSS of 425 684 kB, for 603 323 345 events;
+ADR-053's `trigger_measure` on the same window took 4 078.1 s at 423 MB, so
+sampling adds no memory (records stream, D6). The live run took a process
+wall time of 1:13.90 (the tool reports 40.9 s of replay) at a peak RSS of
+6 248 084 kB: the 6.1 GB that ADR-053's Acceptance records for
+`LiveReplay::run_replay` collecting a whole run (#140), not the sampler.
