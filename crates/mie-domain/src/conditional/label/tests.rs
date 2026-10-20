@@ -62,6 +62,13 @@ fn tick_of_time(millis: i64) -> MarketEvent {
     })
 }
 
+/// A trade at the 1d end of a decision at `T0`, at its reference: outside
+/// every window, and the trades-stream event that shows them complete, so
+/// the label is emitted before `finish` (ADR-055 D6).
+fn day_end() -> MarketEvent {
+    trade(T0 + DAY, 99, usdt(60_000))
+}
+
 /// A baseline record from a two-minute tape, whose fields the tests
 /// replace.
 fn template() -> ContextRecord {
@@ -160,7 +167,7 @@ fn censor(at: i64, reason: CensorReason) -> Censor {
 
 #[test]
 fn barriers_are_symmetric_atr_multiples() {
-    let label = label_of(after_decision([see(tick_of_time(T0 + DAY))]));
+    let label = label_of(after_decision([see(day_end())]));
     let offsets = [
         cents(9_045),
         cents(15_666),
@@ -227,7 +234,7 @@ fn the_upper_and_the_lower_barrier_race() {
         see(trade(T0 + 3_000, 13, usdt(59_900))),
         // At or below 59 843.34: the 15m lower barrier.
         see(trade(T0 + 4_000, 14, usdt(59_800))),
-        see(tick_of_time(T0 + DAY)),
+        see(day_end()),
     ]));
     let [m5, m15, h1, h4, d1] = label.horizons;
     assert_eq!(
@@ -259,7 +266,7 @@ fn neither_barrier_at_the_vertical_barrier() {
         see(trade(T0 + MINUTE, 11, usdt(60_050))),
         see(trade(T0 + 2 * MINUTE, 12, usdt(59_950))),
         see(trade(T0 + 2 * MINUTE + 1, 13, usdt(60_050))),
-        see(tick_of_time(T0 + DAY)),
+        see(day_end()),
     ]));
     for horizon in label.horizons {
         assert_eq!(horizon.race, Race::Neither, "{horizon}");
@@ -278,7 +285,7 @@ fn the_race_is_unavailable_without_a_ready_atr_or_a_zero_offset() {
         see(event),
         Step::Open(Box::new(warming)),
         see(trade(T0 + 1_000, 11, usdt(70_000))),
-        see(tick_of_time(T0 + DAY)),
+        see(day_end()),
     ]);
     assert_eq!(label.atr, None);
     for horizon in label.horizons {
@@ -295,11 +302,7 @@ fn the_race_is_unavailable_without_a_ready_atr_or_a_zero_offset() {
         usdt(60_000),
         Some(Price::from_units(1)),
     );
-    let label = label_of(vec![
-        see(event),
-        Step::Open(Box::new(tiny)),
-        see(tick_of_time(T0 + DAY)),
-    ]);
+    let label = label_of(vec![see(event), Step::Open(Box::new(tiny)), see(day_end())]);
     let races: Vec<Race> = label.horizons.iter().map(|horizon| horizon.race).collect();
     assert_eq!(
         races,
@@ -322,7 +325,7 @@ fn the_window_end_is_exclusive() {
     // A trade at exactly t + 5m is outside the 5m window and closes it.
     let label = label_of(after_decision([
         see(trade(T0 + 5 * MINUTE, 11, usdt(60_100))),
-        see(tick_of_time(T0 + DAY)),
+        see(day_end()),
     ]));
     let [m5, m15, ..] = label.horizons;
     assert_eq!(m5.race, Race::Neither);
@@ -332,7 +335,7 @@ fn the_window_end_is_exclusive() {
     // One millisecond earlier it is inside.
     let label = label_of(after_decision([
         see(trade(T0 + 5 * MINUTE - 1, 11, usdt(60_100))),
-        see(tick_of_time(T0 + DAY)),
+        see(day_end()),
     ]));
     assert_eq!(
         label.horizons[0].race,
@@ -357,7 +360,7 @@ fn a_same_millisecond_tie_goes_to_the_lower_trade_id() {
         let label = label_of(after_decision([
             see(trade(at, 11, first)),
             see(trade(at, 12, second)),
-            see(tick_of_time(T0 + DAY)),
+            see(day_end()),
         ]));
         let expected = if upper_first {
             Race::Upper {
@@ -378,7 +381,7 @@ fn a_same_millisecond_tie_goes_to_the_lower_trade_id() {
     let label = label_of(after_decision([
         see(trade(at, 11, usdt(60_100))),
         see(trade(at + 1, 12, usdt(59_900))),
-        see(tick_of_time(T0 + DAY)),
+        see(day_end()),
     ]));
     assert_eq!(
         label.horizons[0].race,
@@ -394,7 +397,7 @@ fn a_single_trade_touches_one_barrier() {
     // Exactly at the upper barrier: a touch of it, and only of it.
     let label = label_of(after_decision([
         see(trade(T0 + 1_000, 11, cents(6_009_045))),
-        see(tick_of_time(T0 + DAY)),
+        see(day_end()),
     ]));
     assert_eq!(
         label.horizons[0].race,
@@ -410,13 +413,13 @@ fn a_single_trade_touches_one_barrier() {
             11,
             Price::from_units(cents(6_009_045).units() - 1),
         )),
-        see(tick_of_time(T0 + DAY)),
+        see(day_end()),
     ]));
     assert_eq!(label.horizons[0].race, Race::Neither);
     // Exactly at the lower barrier.
     let label = label_of(after_decision([
         see(trade(T0 + 1_000, 11, cents(5_990_955))),
-        see(tick_of_time(T0 + DAY)),
+        see(day_end()),
     ]));
     assert_eq!(
         label.horizons[0].race,
@@ -443,7 +446,7 @@ fn the_decision_trade_is_outside_the_window_and_a_later_same_ms_trade_inside() {
         see(trade(T0, 9, usdt(60_500))),
         see(decision_trade.clone()),
         Step::Open(Box::new(record.clone())),
-        see(tick_of_time(T0 + DAY)),
+        see(day_end()),
     ]);
     for horizon in label.horizons {
         assert_eq!(horizon.race, Race::Neither);
@@ -458,7 +461,7 @@ fn the_decision_trade_is_outside_the_window_and_a_later_same_ms_trade_inside() {
         see(decision_trade),
         Step::Open(Box::new(record)),
         see(trade(T0, 11, usdt(60_500))),
-        see(tick_of_time(T0 + DAY)),
+        see(day_end()),
     ]);
     assert_eq!(
         label.horizons[0].race,
@@ -479,7 +482,7 @@ fn a_gap_before_a_touch_censors_from_its_start() {
         see(trade(T0 + 1_500, 12, usdt(60_050))),
         see(gap(Stream::Trades, T0 + 2_000, T0 + 3_000)),
         see(trade(T0 + 4_000, 13, usdt(61_000))),
-        see(tick_of_time(T0 + DAY)),
+        see(day_end()),
     ]));
     let cut = censor(T0 + 2_000, CensorReason::Gap);
     for horizon in label.horizons {
@@ -497,7 +500,7 @@ fn a_gap_after_a_touch_keeps_the_race() {
     let label = label_of(after_decision([
         see(trade(T0 + 1_000, 11, usdt(60_100))),
         see(gap(Stream::Trades, T0 + 2_000, T0 + 3_000)),
-        see(tick_of_time(T0 + DAY)),
+        see(day_end()),
     ]));
     let cut = censor(T0 + 2_000, CensorReason::Gap);
     let [m5, m15, ..] = label.horizons;
@@ -514,7 +517,7 @@ fn a_gap_after_a_touch_keeps_the_race() {
     let label = label_of(after_decision([
         see(trade(T0 + 1_000, 11, usdt(60_050))),
         see(gap(Stream::Trades, T0 + 5 * MINUTE, T0 + 20 * MINUTE)),
-        see(tick_of_time(T0 + DAY)),
+        see(day_end()),
     ]));
     let [m5, m15, ..] = label.horizons;
     assert_eq!((m5.race, m5.censored), (Race::Neither, None));
@@ -529,7 +532,7 @@ fn a_late_gap_that_starts_before_the_decision_censors_from_the_decision() {
     let label = label_of(after_decision([
         see(trade(T0 + 1_000, 11, usdt(60_100))),
         see(gap(Stream::Trades, T0 - 10 * MINUTE, T0 + 2_000)),
-        see(tick_of_time(T0 + DAY)),
+        see(day_end()),
     ]));
     let cut = censor(T0, CensorReason::Gap);
     for horizon in label.horizons {
@@ -543,7 +546,7 @@ fn gaps_of_other_streams_do_not_censor() {
     let path = [
         see(trade(T0 + 1_000, 11, usdt(60_050))),
         see(trade(T0 + 10 * MINUTE, 12, usdt(59_000))),
-        see(tick_of_time(T0 + DAY)),
+        see(day_end()),
     ];
     let plain = label_of(after_decision(path.iter().map(|step| match step {
         Step::See(event) => see(event.clone()),
@@ -555,7 +558,7 @@ fn gaps_of_other_streams_do_not_censor() {
         see(gap(Stream::OpenInterest, T0 + 2_000, T0 + 4_000)),
         see(gap(Stream::Klines, T0 + 2_000, T0 + 5_000)),
         see(trade(T0 + 10 * MINUTE, 12, usdt(59_000))),
-        see(tick_of_time(T0 + DAY)),
+        see(day_end()),
     ]));
     assert_eq!(gapped, plain);
     assert!(
@@ -580,7 +583,7 @@ fn a_gap_since_the_last_trade_makes_the_reference_stale() {
         see(decision_gap),
         Step::Open(Box::new(record)),
         see(trade(T0 + 1_000, 11, usdt(60_100))),
-        see(tick_of_time(T0 + DAY)),
+        see(day_end()),
     ]);
     let cut = censor(T0, CensorReason::StaleReference);
     for horizon in label.horizons {
@@ -597,7 +600,7 @@ fn a_gap_since_the_last_trade_makes_the_reference_stale() {
         see(fresh),
         Step::Open(Box::new(record)),
         see(trade(T0 + 1_000, 11, usdt(60_100))),
-        see(tick_of_time(T0 + DAY)),
+        see(day_end()),
     ]);
     assert_eq!(
         label.horizons[0].race,
@@ -613,7 +616,7 @@ fn a_gap_since_the_last_trade_makes_the_reference_stale() {
     let label = label_of(vec![
         see(event),
         Step::Open(Box::new(record)),
-        see(tick_of_time(T0 + DAY)),
+        see(day_end()),
     ]);
     assert_eq!(label.reference, None);
     assert!(
@@ -633,7 +636,7 @@ fn a_rejected_trades_event_censors_from_its_time() {
         Step::Reject(tick_of_time(T0 + 1_500)),
         Step::Reject(trade(T0 + 2_000, 12, usdt(61_000))),
         see(trade(T0 + 3_000, 13, usdt(61_000))),
-        see(tick_of_time(T0 + DAY)),
+        see(day_end()),
     ]));
     let cut = censor(T0 + 2_000, CensorReason::Rejected);
     for horizon in label.horizons {
@@ -643,7 +646,7 @@ fn a_rejected_trades_event_censors_from_its_time() {
     // A rejection only: nothing was censored.
     let label = label_of(after_decision([
         Step::Reject(tick_of_time(T0 + 1_500)),
-        see(tick_of_time(T0 + DAY)),
+        see(day_end()),
     ]));
     assert!(
         label
@@ -853,6 +856,69 @@ fn a_short_outage_over_the_1d_end_censors_the_label() {
 }
 
 #[test]
+fn end_of_data_while_trades_are_silent_censors_at_the_last_trade() {
+    // Re-review regression (PR #148): one trade after the decision, then
+    // the trades fall silent and the data ends. An open-interest event
+    // after the 1d end closes the 1d window, but no trades-stream event
+    // shows the trades complete past the last trade, so `finish` censors
+    // there, exactly as on the tape without the other stream's event.
+    let tail = |other: bool, mut steps: Vec<Step>| {
+        steps.push(see(trade(T0 + 1_000, 11, usdt(60_050))));
+        if other {
+            steps.push(see(tick_of_time(T0 + DAY + HOUR)));
+        }
+        run(steps)
+    };
+    let (with, _) = tail(true, decision());
+    let (plain, _) = tail(false, decision());
+    assert_eq!(with, plain);
+    let cut = censor(T0 + 1_000, CensorReason::EndOfData);
+    for horizon in with[0].horizons {
+        assert_eq!(
+            (horizon.race, horizon.censored),
+            (Race::Censored(cut), Some(cut))
+        );
+    }
+    let (with, _) = tail(true, sfp_decision(usdt(60_200), usdt(59_000)));
+    let (plain, _) = tail(false, sfp_decision(usdt(60_200), usdt(59_000)));
+    assert_eq!(with, plain);
+    assert_eq!(with[0].level.unwrap().passage, Passage::Censored(cut));
+}
+
+#[test]
+fn trailing_gaps_of_the_driver_contract() {
+    // ADR-055 D6: after the last event the driver passes the trades-stream
+    // trailing gaps to `observe`, no other stream's, then calls `finish`.
+    let tail = |trailing: Option<MarketEvent>| {
+        let mut steps = after_decision([
+            see(trade(T0 + 1_000, 11, usdt(60_050))),
+            see(tick_of_time(T0 + DAY - HOUR)),
+        ]);
+        steps.extend(trailing.map(see));
+        label_of(steps)
+    };
+    let silent = tail(None);
+    let end = censor(T0 + 1_000, CensorReason::EndOfData);
+    assert!(silent.horizons.iter().all(|h| h.censored == Some(end)));
+    // The trades trailing gap starts at the last trade: the same cut, now
+    // named for the outage the provider announced.
+    let announced = tail(Some(gap(Stream::Trades, T0 + 1_000, T0 + DAY + 2 * HOUR)));
+    let cut = censor(T0 + 1_000, CensorReason::Gap);
+    assert!(announced.horizons.iter().all(|h| h.censored == Some(cut)));
+    for (announced, silent) in announced.horizons.iter().zip(silent.horizons) {
+        assert_eq!((announced.up, announced.down), (silent.up, silent.down));
+    }
+    // Another stream's trailing gap ends past the data end; it closes the
+    // 1d window and changes no label.
+    let other = tail(Some(gap(
+        Stream::OpenInterest,
+        T0 + DAY - HOUR,
+        T0 + DAY + HOUR,
+    )));
+    assert_eq!(other, silent);
+}
+
+#[test]
 fn a_late_gap_after_emission_reaches_back_and_changes_nothing() {
     let mut labeler = ForwardLabeler::new();
     let mut labels = Vec::new();
@@ -990,7 +1056,7 @@ fn passages_reach_a_price_on_the_side_fixed_at_decision() {
         see(trade(T0 + MINUTE, 11, usdt(60_100))),
         see(trade(T0 + 2 * MINUTE, 12, usdt(59_950))),
         see(trade(T0 + 3 * MINUTE, 13, usdt(60_300))),
-        see(tick_of_time(T0 + DAY)),
+        see(day_end()),
     ]);
     let label = label_of(steps);
     assert_eq!(
@@ -1439,7 +1505,9 @@ fn model_clear(infos: &[Info]) -> Vec<[bool; 5]> {
 /// censor time, or its 1d window end when that is uncensored. Every trades
 /// gap delivered before the label is emitted, at the index `emitted`
 /// (`None`: when it is ready), censors every horizon whose window ends
-/// after its c, closed windows included, keeping the earliest censor.
+/// after its c, closed windows included, keeping the earliest censor. A
+/// label never ready is censored the same way at the tape's last
+/// trades-stream event (`EndOfData`).
 fn model_censors(
     tape: &[MarketEvent],
     info: &Info,
@@ -1507,11 +1575,20 @@ fn model_censors(
         }
     }
     if ready.is_none() {
-        // `finish` censors every window still open at the last event.
-        let last_time = tape.last().unwrap().time().as_millis();
+        // Emitted by `finish`: the trades are known only up to the tape's
+        // last trades-stream event, so every horizon whose window ends
+        // after it is censored there, closed windows included, unless an
+        // earlier censor already cut it.
+        let at = tape
+            .iter()
+            .filter(|event| of_trades(event))
+            .map(|event| event.time().as_millis())
+            .max()
+            .map_or(decision, |last| last.max(decision));
         for position in 0..5 {
-            if !closed[position] {
-                censors[position] = Some(censor(last_time.max(decision), CensorReason::EndOfData));
+            let earlier = censors[position].is_some_and(|cut| cut.at.as_millis() <= at);
+            if at < ends[position] && !earlier {
+                censors[position] = Some(censor(at, CensorReason::EndOfData));
             }
         }
     }
@@ -1847,6 +1924,30 @@ fn labels_match_a_naive_model_on_random_tapes() {
         }
         late_closed += closed_before_the_gap(&tape, &run);
     }
+    // The data ends while the trades are silent: open-interest events run
+    // on past every 1d end, and no trades-stream event follows the last
+    // trade (ADR-055 D6). Every label whose 1d window ends after the last
+    // trade is censored there, the windows they closed included.
+    let mut tape = walk(0x6d69_6500_0026_0000 + 13, 3, 1);
+    let last = tape.last().unwrap().time().as_millis();
+    for step in 1..=(DAY + HOUR) / (5 * MINUTE) {
+        tape.push(tick_of_time(last + step * 5 * MINUTE));
+    }
+    let run = drive(&tape);
+    checked += check_model(&tape, &run, |_| true);
+    let end = tape.last().unwrap().time().as_millis();
+    let silent = run
+        .infos
+        .iter()
+        .zip(&run.labels)
+        .filter(|(info, (_, label))| {
+            info.event.time.as_millis() + DAY <= end
+                && label.horizons[4]
+                    .censored
+                    .is_some_and(|cut| cut.reason == CensorReason::EndOfData)
+        })
+        .count();
+    assert!(silent > 0, "{silent}");
     assert!(late_closed > 0, "{late_closed}");
     assert!(checked > 10_000, "{checked}");
     // Every outcome occurs; same_ms ties included.
@@ -2224,6 +2325,6 @@ fn print_label_golden() {
     println!("stats {:?}", golden.run.stats);
 }
 
-const GOLDEN_LABELING_FINGERPRINT: &str = "9bb8e0f62b27c86a";
+const GOLDEN_LABELING_FINGERPRINT: &str = "45648369af693211";
 const GOLDEN_LABELS: (usize, &str) = (46_403, "8d7c4cebfc62d7da");
 const GOLDEN_FIRST_TRIGGER_LABEL: &str = "117032157ms Trade seq 785 #1 ref=61922.67000000 atr=26.01616928 [5m clear barriers=61920.31683749..61925.02316251 race=lower@117098590ms up=0.64000000@117309050ms down=4.22000000@117248836ms last=61923.31000000] [15m clear barriers=61918.59430692..61926.74569308 race=lower@117248836ms up=0.64000000@117309050ms down=11.49000000@117700476ms last=61915.79000000] [1h clear barriers=61914.51835368..61930.82164632 race=lower@117700476ms up=7.40000000@120543138ms down=11.49000000@117700476ms last=61928.16000000] [4h clear barriers=61906.36670736..61938.97329264 race=lower@122609041ms up=23.70000000@129865828ms down=33.07000000@126265310ms last=61935.31000000] [1d barriers=61882.73544032..61962.60455968 race=upper@146208863ms up=134.65000000@185552262ms down=33.07000000@126265310ms last=62018.89000000] level=61910.65000000:touched@121677419ms extreme=61908.96000000:touched@121677419ms";

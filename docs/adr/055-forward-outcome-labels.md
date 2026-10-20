@@ -234,9 +234,41 @@ is unknown.
   windows included, like a trades gap: the engine refused data the path
   needs. A label it completes is emitted at the next `observe` or
   `finish`. Rejections of other streams are ignored.
-- **End of data.** `finish()` censors every open component at the time of
-  the last observed event (`EndOfData`). By the uniform rule a trade at that
-  very millisecond does not count: the last millisecond may be incomplete.
+- **End of data.** `finish()` censors every label not yet emitted at
+  c = max(the last trades-stream event's time, decision time)
+  (`EndOfData`), closed windows included, like a trades gap. The last
+  trades-stream event is the latest trade, trades gap (its end) or
+  rejected trades-stream event; with none, c is the decision time. *Why
+  the trades stream:* trades that stop before the data does are
+  indistinguishable from an outage no gap announced: an outage is silent
+  until the stream resumes (ADR-028), and at the end of the data it never
+  resumes. The trades are therefore known to be complete only up to the
+  last trades-stream event, and another stream's later events prove
+  nothing about them. Censored at the last event of any stream instead, a
+  label waiting for the trades stream (Emission, below) would come out
+  fully covered whenever another stream ticked after its 1d end, and
+  censored when none did. By the uniform rule a trade at c's very
+  millisecond does not count: the last millisecond may be incomplete. On
+  healthy data, where trades run up to the end, this moves c from the last
+  event to the last trade, milliseconds earlier.
+- **Trailing gaps: the replay driver's contract (M2).** A provider does
+  not deliver a gap still open at its window's end; it lists it in
+  `trailing_gaps()` (archive, live and chained replay alike). After the
+  provider's last event the driver passes exactly the `Stream::Trades`
+  entries of `trailing_gaps()` to `observe`, in canonical order (their
+  ends lie at or after the window's end, so after every delivered event),
+  passes no other stream's trailing gap to the labeler, and then calls
+  `finish()`.
+  - With the end-of-data rule above, the trades entries are redundant for
+    coverage, not required: a trailing trades gap starts at the stream's
+    last delivered event, at or before the end-of-data c, so it cuts the
+    same windows at the same time or earlier. Passing it names the cut
+    `Gap`, the outage the provider recorded, instead of `EndOfData`.
+  - Another stream's trailing gap ends past the data's end and so closes
+    windows the data never covered. Under the rule above it changes no
+    label, but under a censor at the last observed event it moved that
+    time past the data's end and dropped the `EndOfData` censor; labels
+    read trades only, so the labeler never takes it.
 - **Unavailable stays unavailable**, under every censor: no race existed.
   A passage price equal to the reference (`AtDecision`) counts as reached
   at the decision, so it survives a censor after the decision and not one
@@ -249,9 +281,10 @@ is unknown.
   a trades gap passed to `observe` (the gap's ordering time, its end), or a
   rejected trades-stream event (its time). Labels go out in record order,
   so a label also waits for every earlier one. At the end of the data
-  `finish()` emits every remaining label; the end-of-data censor still
-  reaches only windows that end after the last event, so a complete label
-  that was waiting comes out as it was.
+  `finish()` emits every remaining label after the end-of-data censor
+  (above), which reaches each of their windows that ends after the last
+  trades-stream event, closed or not: a complete label still waiting for
+  the trades stream comes out censored there, never as fully covered.
   - *Why the trades stream:* ADR-028 orders a gap at its `end` with rank 0,
     so it precedes the stream's first resumed event in that millisecond,
     and the providers open a trades gap at the last trade they delivered:
@@ -385,7 +418,9 @@ Each horizon gets a `clear` flag.
   The held labels go out when the stream resumes (its gap is the first
   trades-stream event) or at `finish()`.
 - **Replay only:** the labeler is built by the mie-app replay driver (M2)
-  and by tests, never wired into `mie ingest`.
+  and by tests, never wired into `mie ingest`. The driver ends a replay
+  as D6 states: the trades-stream trailing gaps to `observe`, then
+  `finish()`.
 - **Guard in `tools/check-architecture.sh`:** no file under
   `crates/mie-domain/src`, `crates/mie-ports/src` or `crates/mie-app/src`
   may name `label::` or `ForwardLabel` on any line, or a `label` path
