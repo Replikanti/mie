@@ -480,7 +480,7 @@ release build, with the policy `conditional.sampling@1`, fingerprint
 `2c71fff23e8b0415`, and the engine key `4c844593779da2e3-1`. The year run
 covered 2025-10-01 00:00 UTC (inclusive) to 2026-10-01 00:00 UTC
 (exclusive), the window `1759276800000..1790812800000` ms, with
-`MIE_MEASURE_EVENTS=603323345`, under a memory cap, and its provenance
+`MIE_MEASURE_EVENTS=603323345`, under the same 8 GB memory cap as the live run, and its provenance
 data version is `5d9e27f862ac54dd93cff904458e9ee92767d5105a9d13a144351cba069f224d`.
 The live run replayed ADR-051's R0 live store under an 8 GB memory cap;
 the store holds one cleanly ended run, `20261016T225606Z`, with the data
