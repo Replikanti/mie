@@ -229,44 +229,67 @@ is unknown.
   whole label is censored at the decision (`StaleReference`): the path from
   the reference to the decision is unknown.
 - **Rejected trades-stream event.** The driver reports a rejected event to
-  the labeler; one on the trades stream censors the labels not yet emitted
-  at that moment at c = max(its time, decision time) (`Rejected`), closed
-  windows included, like a trades gap: the engine refused data the path
-  needs. A label it completes is emitted at the next `observe` or
+  the labeler. A rejected event carries no information, its time
+  included. One on the trades stream censors the labels not yet emitted
+  at that moment at c = max(the last accepted trades-stream event's time,
+  decision time) (`Rejected`; with no accepted trades-stream event yet, c
+  is the decision time), closed windows included, like a trades gap: the
+  engine refused data the path needs, so nothing after the last data it
+  accepted is known. It closes no window, does not move the trades-stream
+  time that emission and the end of data use (below), and counts for no
+  emission. A label it completes is emitted at the next `observe` or
   `finish`. Rejections of other streams are ignored.
+  - *Why not its own time:* a rejected trades-stream event can carry any
+    time: before the last accepted event (`OutOfOrder`), a repeated or
+    regressing exchange id at any later time, an overflow, an inverted gap
+    ordered at its end, or a time jump more than `MAX_BARS_PER_EVENT` =
+    44 640 one-minute bars (31 days) ahead (ADR-031). The engine refused
+    the event, so its time is not evidence that the trades are complete up
+    to it, and only the accepted trades-stream events bound what is known
+    (the end-of-data rule below rests on the same fact).
+  - *Rejected alternative: censor at the rejected event's time*, max(its
+    time, decision time), which #26's plan first worded as "censored at its
+    time". A time jump refutes it: a decision trade at T0, one accepted
+    trade at T0 + 1 s, then a trade rejected as a time jump at T0 + 32 d.
+    The censor at T0 + 32 d reaches no window, and treating that time as
+    known coverage closes all five windows as fully covered: every horizon
+    comes out `Neither`, uncensored, from one second of trades, while the
+    same data without the rejected trade gives `EndOfData` at T0 + 1 s. A
+    time jump stops the replay or session (the engine's recovery rule), so
+    it is the last trades-stream event in practice and would turn up to a
+    day of unobserved path of every open label into "neither barrier was
+    touched". At its own time a rejection either says nothing (dated
+    earlier than the last accepted event) or claims coverage nobody
+    observed (dated later); at the last accepted event it says exactly
+    what is known, for every kind.
 - **End of data.** `finish()` censors every label not yet emitted at
-  c = max(the last trades-stream event's time, decision time)
+  c = max(the last accepted trades-stream event's time, decision time)
   (`EndOfData`), closed windows included, like a trades gap. The last
-  trades-stream event is the latest trade, trades gap (its end) or
-  rejected trades-stream event; with none, c is the decision time. *Why
-  the trades stream:* trades that stop before the data does are
-  indistinguishable from an outage no gap announced: an outage is silent
-  until the stream resumes (ADR-028), and at the end of the data it never
-  resumes. The trades are therefore known to be complete only up to the
-  last trades-stream event, and another stream's later events prove
-  nothing about them. Censored at the last event of any stream instead, a
-  label waiting for the trades stream (Emission, below) would come out
-  fully covered whenever another stream ticked after its 1d end, and
-  censored when none did. By the uniform rule a trade at c's very
-  millisecond does not count: the last millisecond may be incomplete. On
-  healthy data, where trades run up to the end, this moves c from the last
-  event to the last trade, milliseconds earlier.
-  `finish()` then closes every window that ends at or before c, as an
-  event at c would: the trades are complete up to c, so those windows are
-  covered. *Why:* the censor reaches only the windows ending after c, and
-  a rejected trades-stream event can be later than every observed event:
-  every rejection that passed the engine's canonical-order check (a
-  duplicate or regressing exchange id, an overflow, a time jump), and an
-  inverted gap, ordered at its end. `reject` closes nothing, so the
-  windows ending between the last observed event and the rejection would
-  stay open, and their label and every later one would never be emitted;
-  a time jump, more than `MAX_BARS_PER_EVENT` = 44 640 one-minute bars
-  (31 days) ahead (ADR-031), would lose every open label. Closing at c
-  keeps "each label once, in record order" for every way the data can
-  end. *Rejected:* censoring at the last observed event instead (the rule
-  before c moved to the trades stream) brings back the dependence on
-  other streams above; closing in `reject` as well would only repeat, at
-  every rejection, what the next `observe` or `finish()` does anyway.
+  accepted trades-stream event is the latest observed trade or trades gap
+  (its end); a rejected one does not count (above); with none, c is the
+  decision time. *Why the trades stream:* trades that stop before the
+  data does are indistinguishable from an outage no gap announced: an
+  outage is silent until the stream resumes (ADR-028), and at the end of
+  the data it never resumes. The trades are therefore known to be
+  complete only up to the last accepted trades-stream event, and another
+  stream's later events prove nothing about them. Censored at the last
+  event of any stream instead, a label waiting for the trades stream
+  (Emission, below) would come out fully covered whenever another stream
+  ticked after its 1d end, and censored when none did. By the uniform
+  rule a trade at c's very millisecond does not count: the last
+  millisecond may be incomplete. On healthy data, where trades run up to
+  the end, this moves c from the last event to the last trade,
+  milliseconds earlier.
+  Every window that ends at or before c was closed when the event at c
+  was observed (an event closes every window ending at or before its
+  time), and the censor reaches every window ending after c, so every
+  opened label is emitted exactly once, in record order, however the data
+  ends, a rejection included. *Rejected:* `finish()` also closing the
+  windows ending at or before the last rejected trades-stream event, so
+  that a rejection later than every observed event loses no label. That
+  closing took the rejected time as coverage; with a time jump it reported
+  windows nobody observed as fully covered (the counterexample above).
+  With c at the last accepted event there is nothing left for it to close.
 - **Trailing gaps: the replay driver's contract (M2).** A provider does
   not deliver a gap still open at its window's end; it lists it in
   `trailing_gaps()` (archive, live and chained replay alike). After the
@@ -297,16 +320,15 @@ is unknown.
   label ends, or is censored, later. A label is emitted at the end of the
   first `observe` after which all its windows are closed **and** a
   trades-stream event at or after its until has been observed: a trade or
-  a trades gap passed to `observe` (the gap's ordering time, its end), or a
-  rejected trades-stream event (its time). Labels go out in record order,
-  so a label also waits for every earlier one. At the end of the data
-  `finish()` emits every remaining label after the end-of-data censor
-  (above), which reaches each of their windows that ends after the last
-  trades-stream event, closed or not: a complete label still waiting for
-  the trades stream comes out censored there, never as fully covered. The
-  windows ending at or before that event, which no `observe` closed when
-  it was a rejected one, close there as well, so every opened label is
-  emitted exactly once.
+  a trades gap passed to `observe` (the gap's ordering time, its end); a
+  rejected trades-stream event does not count. Labels go out in record
+  order, so a label also waits for every earlier one. At the end of the
+  data `finish()` emits every remaining label after the end-of-data
+  censor (above), which reaches each of their windows that ends after the
+  last accepted trades-stream event, closed or not: a complete label still
+  waiting for the trades stream comes out censored there, never as fully
+  covered. The windows ending at or before that event closed when it was
+  observed, so every opened label is emitted exactly once.
   - *Why the trades stream:* ADR-028 orders a gap at its `end` with rank 0,
     so it precedes the stream's first resumed event in that millisecond,
     and the providers open a trades gap at the last trade they delivered:
@@ -323,16 +345,18 @@ is unknown.
   - *Where the guarantee does not hold, the cause reaches back* (below):
     a live hold-back `LateEvent` gap that stands in for a late trade
     (ADR-028 decision 6) starts at that trade's own time, which can lie
-    before trades already released; a rejected trades-stream event can
-    carry any time; and any provider that breaks the ADR-028 contract.
+    before trades already released; and any provider that breaks the
+    ADR-028 contract. A rejected trades-stream event never reaches back:
+    it censors at the last accepted trades-stream event, which no emitted
+    label's until is later than.
   - *Cost:* a complete label is held until the trades stream resumes; a
     record's own 1d censor makes its until earlier, so a gap that censors
     the 1d window emits the label at once (D11 states the memory bound).
 - **Late gaps after emission.** From its emission on a label is
   immutable, like a closed bar (ADR-031); before that every censor above
-  still reaches all its windows. A trades gap whose start, or a rejected
-  trades-stream event whose time, falls before the latest until of the
-  emitted labels reaches back into at least one of them. It does not reopen
+  still reaches all its windows. A trades gap whose start falls before the
+  latest until of the emitted labels reaches back into at least one of
+  them. It does not reopen
   any label; it is counted once in `LabelStats.reach_backs`. Unemitted
   labels it reaches are censored as above.
 - **`Neither` is an outcome, not censoring:** the window closed with full
@@ -542,6 +566,11 @@ There is no other number.
   event of another stream at the 1d end would again decide whether a trades
   outage over it is censored, even a ten-minute one. Rejected: emission
   waits for a trades-stream event at or after the label's until (D6).
+- **A rejected trades-stream event censoring at its own time.** Its time
+  is the one value the engine refused; a time jump at the end of the data
+  then reported up to a day of unobserved path of every open label as
+  fully covered (D6). Rejected: a rejection censors at the last accepted
+  trades-stream event.
 - **One label per event.** Two joins for #27 (D1). Rejected.
 - **Passages in a follow-up issue.** The issue names level revisit and
   invalidation; as neutral passages they need no hypothesis (D8). Rejected.

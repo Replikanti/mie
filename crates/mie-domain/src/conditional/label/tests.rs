@@ -629,20 +629,70 @@ fn a_gap_since_the_last_trade_makes_the_reference_stale() {
 }
 
 #[test]
-fn a_rejected_trades_event_censors_from_its_time() {
+fn a_rejected_trades_event_censors_from_the_last_accepted_one() {
+    // ADR-055 D6: a rejected event carries no information, its time
+    // included, so it censors at the last accepted trades-stream event,
+    // wherever its own time lies. The trade at that millisecond is not
+    // read: the millisecond may be incomplete.
+    for rejected_at in [T0 + 500, T0 + 2_000, T0 + 40 * DAY] {
+        let label = label_of(after_decision([
+            see(trade(T0 + 1_000, 11, usdt(60_050))),
+            see(trade(T0 + 1_200, 12, usdt(60_000))),
+            // Other streams are ignored.
+            Step::Reject(tick_of_time(T0 + 1_500)),
+            Step::Reject(trade(rejected_at, 13, usdt(61_000))),
+            see(trade(T0 + 3_000, 14, usdt(61_000))),
+            see(day_end()),
+        ]));
+        let cut = censor(T0 + 1_200, CensorReason::Rejected);
+        for horizon in label.horizons {
+            assert_eq!(
+                (horizon.race, horizon.censored),
+                (Race::Censored(cut), Some(cut))
+            );
+            assert_eq!(horizon.up, excursion(usdt(50), T0 + 1_000));
+            assert_eq!(horizon.last, Some(usdt(60_050)));
+        }
+    }
+    // Right after the decision trade: censored at the decision.
     let label = label_of(after_decision([
-        see(trade(T0 + 1_000, 11, usdt(60_050))),
-        // Other streams are ignored.
-        Step::Reject(tick_of_time(T0 + 1_500)),
-        Step::Reject(trade(T0 + 2_000, 12, usdt(61_000))),
-        see(trade(T0 + 3_000, 13, usdt(61_000))),
+        Step::Reject(trade(T0 + 2_000, 11, usdt(61_000))),
         see(day_end()),
     ]));
-    let cut = censor(T0 + 2_000, CensorReason::Rejected);
-    for horizon in label.horizons {
-        assert_eq!(horizon.race, Race::Censored(cut));
-        assert_eq!(horizon.up, excursion(usdt(50), T0 + 1_000));
-    }
+    let cut = censor(T0, CensorReason::Rejected);
+    assert!(
+        label
+            .horizons
+            .iter()
+            .all(|horizon| horizon.race == Race::Censored(cut))
+    );
+    // Nor does its time count for emission: a rejected trade dated two
+    // days ahead, then a record whose windows an open-interest event closes
+    // inside a trades outage. The record waits for the trades stream, so
+    // the gap announced when trades resume still censors it.
+    let later = trade(T0 + 2_000, 12, usdt(60_000));
+    let (labels, stats) = run(after_decision([
+        see(trade(T0 + 1_000, 11, usdt(60_050))),
+        Step::Reject(trade(T0 + 2 * DAY, 13, usdt(60_050))),
+        see(later.clone()),
+        Step::Open(Box::new(record_at(
+            later.canonical_key(),
+            usdt(60_000),
+            Some(usdt(1_000)),
+        ))),
+        see(tick_of_time(T0 + DAY + 3_000)),
+        see(gap(Stream::Trades, T0 + 3_000, T0 + DAY + 5_000)),
+    ]));
+    assert_eq!(stats.reach_backs, 0);
+    let first = censor(T0 + 1_000, CensorReason::Rejected);
+    assert!(labels[0].horizons.iter().all(|h| h.censored == Some(first)));
+    let cut = censor(T0 + 3_000, CensorReason::Gap);
+    assert!(
+        labels[1]
+            .horizons
+            .iter()
+            .all(|h| h.race == Race::Censored(cut))
+    );
     // A rejection only: nothing was censored.
     let label = label_of(after_decision([
         Step::Reject(tick_of_time(T0 + 1_500)),
@@ -656,60 +706,108 @@ fn a_rejected_trades_event_censors_from_its_time() {
     );
 }
 
+/// `label` with every censor of reason `from` renamed `to`.
+fn renamed(label: &ForwardLabel, from: CensorReason, to: CensorReason) -> ForwardLabel {
+    let swap = |cut: Censor| {
+        if cut.reason == from {
+            Censor { reason: to, ..cut }
+        } else {
+            cut
+        }
+    };
+    let mut label = label.clone();
+    for horizon in &mut label.horizons {
+        horizon.censored = horizon.censored.map(swap);
+        if let Race::Censored(cut) = horizon.race {
+            horizon.race = Race::Censored(swap(cut));
+        }
+    }
+    for passage in [&mut label.level, &mut label.extreme].into_iter().flatten() {
+        if let Passage::Censored(cut) = passage.passage {
+            passage.passage = Passage::Censored(swap(cut));
+        }
+    }
+    label
+}
+
 #[test]
 fn a_rejected_trade_as_the_final_event_loses_no_label() {
-    // Re-review regression (PR #148): the last accepted event is a trade at
-    // T0+5m-10ms, then a trade the engine rejects, at or after the 5m end,
-    // ends the data. `reject` moves the trades-stream time past the 5m end
-    // and no `observe` closes that window; `finish` closes it. The label
-    // comes out once: its 5m window covered, every later one censored at
-    // the rejected trade.
-    for rejected_at in [T0 + 5 * MINUTE, T0 + 5 * MINUTE + 5] {
-        let label = label_of(after_decision([
-            see(trade(T0 + 5 * MINUTE - 10, 11, usdt(60_050))),
-            Step::Reject(trade(rejected_at, 7, usdt(60_050))),
-        ]));
-        let first = &label.horizons[0];
-        assert_eq!((first.race, first.censored), (Race::Neither, None));
-        assert_eq!(first.up, excursion(usdt(50), T0 + 5 * MINUTE - 10));
-        assert_eq!(first.last, Some(usdt(60_050)));
-        let cut = censor(rejected_at, CensorReason::Rejected);
-        for horizon in &label.horizons[1..] {
+    // Re-review regressions (PR #148). The data ends on a trade the engine
+    // rejects: at the 5m end, just after it, or 32 days ahead (a
+    // `TimeJump`, after which the replay stops). Its time is not trusted,
+    // so the label comes out once, censored at the last accepted trade,
+    // with the reason `Rejected`, never covered up to the rejected time.
+    let base = || {
+        after_decision([
+            see(trade(T0 + 1_000, 11, usdt(60_050))),
+            see(trade(T0 + 5 * MINUTE - 10, 12, usdt(60_000))),
+        ])
+    };
+    let cut = censor(T0 + 5 * MINUTE - 10, CensorReason::Rejected);
+    for rejected_at in [T0 + 5 * MINUTE, T0 + 5 * MINUTE + 5, T0 + 32 * DAY] {
+        let mut steps = base();
+        steps.push(Step::Reject(trade(rejected_at, 7, usdt(60_050))));
+        let label = label_of(steps);
+        for horizon in &label.horizons {
             assert_eq!(
                 (horizon.race, horizon.censored),
                 (Race::Censored(cut), Some(cut))
             );
-            assert_eq!(horizon.up, excursion(usdt(50), T0 + 5 * MINUTE - 10));
+            assert_eq!(horizon.up, excursion(usdt(50), T0 + 1_000));
+            assert_eq!(horizon.last, Some(usdt(60_050)));
         }
+        // The data ending at the last accepted trade gives the same label,
+        // named `EndOfData`.
+        assert_eq!(
+            label,
+            renamed(
+                &label_of(base()),
+                CensorReason::EndOfData,
+                CensorReason::Rejected
+            )
+        );
     }
-    // A rejected trade more than 31 days ahead (a `TimeJump`) ends the data
-    // with three labels open: every window ends before it, so each closes
-    // covered, and the labels come out in record order.
-    let mut steps = Vec::new();
-    let mut events = Vec::new();
-    for (index, at) in [0, 2 * HOUR, 20 * HOUR].into_iter().enumerate() {
-        let event = trade(T0 + at, 10 + index as u64, usdt(60_000));
-        events.push(event.canonical_key());
-        steps.push(see(event.clone()));
-        steps.push(Step::Open(Box::new(record_at(
-            event.canonical_key(),
-            usdt(60_000),
-            Some(usdt(1_000)),
-        ))));
-    }
-    steps.push(see(trade(T0 + 20 * HOUR + 1_000, 20, usdt(60_010))));
-    steps.push(Step::Reject(trade(T0 + 32 * DAY, 21, usdt(60_010))));
-    let (labels, stats) = run(steps);
+    // A time jump with three labels open: they come out in record order,
+    // as the data ending at the last accepted trade gives them. The first
+    // record's 5m … 4h windows closed before; its 1d window and every
+    // window of the last record are censored at that trade.
+    let steps = |jump: bool| {
+        let mut steps = Vec::new();
+        for (index, at) in [0, 2 * HOUR, 20 * HOUR].into_iter().enumerate() {
+            let event = trade(T0 + at, 10 + index as u64, usdt(60_000));
+            steps.push(see(event.clone()));
+            steps.push(Step::Open(Box::new(record_at(
+                event.canonical_key(),
+                usdt(60_000),
+                Some(usdt(1_000)),
+            ))));
+        }
+        steps.push(see(trade(T0 + 20 * HOUR + 1_000, 20, usdt(60_010))));
+        if jump {
+            steps.push(Step::Reject(trade(T0 + 32 * DAY, 21, usdt(60_010))));
+        }
+        steps
+    };
+    let (labels, stats) = run(steps(true));
+    let (plain, _) = run(steps(false));
     assert_eq!((stats.opened, stats.emitted), (3, 3));
-    assert_eq!(
-        labels.iter().map(|label| label.event).collect::<Vec<_>>(),
-        events
-    );
+    let expected: Vec<ForwardLabel> = plain
+        .iter()
+        .map(|label| renamed(label, CensorReason::EndOfData, CensorReason::Rejected))
+        .collect();
+    assert_eq!(labels, expected);
+    let cut = censor(T0 + 20 * HOUR + 1_000, CensorReason::Rejected);
     assert!(
-        labels
+        labels[0].horizons[..4]
             .iter()
-            .flat_map(|label| label.horizons)
-            .all(|horizon| horizon.censored.is_none() && horizon.race == Race::Neither)
+            .all(|horizon| horizon.censored.is_none())
+    );
+    assert_eq!(labels[0].horizons[4].race, Race::Censored(cut));
+    assert!(
+        labels[2]
+            .horizons
+            .iter()
+            .all(|horizon| horizon.race == Race::Censored(cut))
     );
 }
 
@@ -808,18 +906,20 @@ fn a_gap_censors_a_closed_window_of_an_unemitted_label() {
         Step::Reject(trade(T0 + 3_000, 5, usdt(1))),
         see(tick_of_time(T0 + DAY)),
     ]));
-    let cut = censor(T0 + 3_000, CensorReason::Rejected);
+    let cut = censor(T0 + 1_000, CensorReason::Rejected);
     assert_eq!(label.horizons[0].race, Race::Censored(cut));
 }
 
 #[test]
 fn the_earliest_censor_of_an_unemitted_label_wins() {
-    // A rejected trade censors every window at T0+1h; a later gap that
-    // started earlier cuts them again before the label is emitted, while a
-    // later censor changes nothing.
+    // A rejected trade censors the 1h … 1d windows at the last accepted
+    // trade, T0+1h; a later gap that started earlier (a live hold-back gap
+    // can) cuts every window again before the label is emitted, the closed
+    // 5m and 15m ones included, while a later censor changes nothing.
     let label = label_of(after_decision([
         see(trade(T0 + 1_000, 11, usdt(60_050))),
-        Step::Reject(trade(T0 + HOUR, 5, usdt(1))),
+        see(trade(T0 + HOUR, 12, usdt(60_000))),
+        Step::Reject(trade(T0 + HOUR + 500, 5, usdt(1))),
         see(gap(Stream::Trades, T0 + 2_000, T0 + HOUR + 1_000)),
         see(tick_of_time(T0 + DAY)),
     ]));
@@ -836,7 +936,7 @@ fn the_earliest_censor_of_an_unemitted_label_wins() {
         see(gap(Stream::Trades, T0 + 3_000, T0 + HOUR)),
         see(tick_of_time(T0 + DAY)),
     ]));
-    let cut = censor(T0 + 2_000, CensorReason::Rejected);
+    let cut = censor(T0 + 1_000, CensorReason::Rejected);
     for horizon in label.horizons {
         assert_eq!(horizon.censored, Some(cut), "{horizon}");
     }
@@ -1011,14 +1111,16 @@ fn a_late_gap_after_emission_reaches_back_and_changes_nothing() {
     labeler.observe(&gap(Stream::Trades, T0 + DAY, T0 + DAY + 6_000), |label| {
         labels.push(label);
     });
-    // A rejected trade inside it does.
+    // A rejected trade dated inside it does not: its time is not trusted,
+    // and it censors at the last accepted trades-stream event, which no
+    // emitted label's until is later than.
     labeler.reject(&trade(T0 + 3_000, 5, usdt(1)));
     labeler.finish(|label| labels.push(label));
-    assert_eq!(labeler.stats().reach_backs, 2);
+    assert_eq!(labeler.stats().reach_backs, 1);
     assert_eq!(labels, [emitted]);
     // A label censored in every window is emitted by the gap itself: the
-    // gap is a trades-stream event at or after its 1d censor time, so a
-    // rejected trade from before that censor only reaches back.
+    // gap is a trades-stream event at or after its 1d censor time. A
+    // rejected trade dated before that censor does not reach back either.
     let mut labeler = ForwardLabeler::new();
     let mut labels = Vec::new();
     for step in decision() {
@@ -1038,21 +1140,35 @@ fn a_late_gap_after_emission_reaches_back_and_changes_nothing() {
     assert_eq!(labels.len(), 1);
     labeler.reject(&trade(T0 + 1_500, 5, usdt(1)));
     labeler.finish(|label| labels.push(label));
-    assert_eq!(labeler.stats().reach_backs, 1);
+    assert_eq!(labeler.stats().reach_backs, 0);
     let cut = censor(T0 + 2_000, CensorReason::Gap);
     assert!(labels[0].horizons.iter().all(|h| h.censored == Some(cut)));
-    // A rejected trades-stream event at or after the 1d end counts for
-    // emission too: the label goes out at the next observation, and a gap
-    // after it only reaches back.
-    let (labels, stats) = run(after_decision([
+    // A rejected trades-stream event dated at the 1d end does not count for
+    // emission: it censors the label, whose windows another stream closed,
+    // at the last accepted trade, and the next observation emits it there.
+    let mut labeler = ForwardLabeler::new();
+    let mut labels = Vec::new();
+    for step in after_decision([
         see(trade(T0 + 1_000, 11, usdt(60_050))),
         see(tick_of_time(T0 + DAY)),
         Step::Reject(trade(T0 + DAY, 5, usdt(1))),
-        see(tick_of_time(T0 + DAY + 1)),
-        see(gap(Stream::Trades, T0 + 2_000, T0 + DAY + 2)),
-    ]));
-    assert_eq!(stats.reach_backs, 1);
-    assert!(labels[0].horizons.iter().all(|h| h.censored.is_none()));
+    ]) {
+        match step {
+            Step::See(event) => labeler.observe(&event, |label| labels.push(label)),
+            Step::Open(record) => labeler.open(&record),
+            Step::Reject(event) => labeler.reject(&event),
+        }
+    }
+    assert!(labels.is_empty());
+    labeler.observe(&tick_of_time(T0 + DAY + 1), |label| labels.push(label));
+    assert_eq!(labels.len(), 1);
+    labeler.observe(&gap(Stream::Trades, T0 + 2_000, T0 + DAY + 2), |label| {
+        labels.push(label);
+    });
+    labeler.finish(|label| labels.push(label));
+    assert_eq!(labeler.stats().reach_backs, 0);
+    let cut = censor(T0 + 1_000, CensorReason::Rejected);
+    assert!(labels[0].horizons.iter().all(|h| h.censored == Some(cut)));
 }
 
 // ------------------------------------------------------------- passages
@@ -1567,14 +1683,16 @@ fn model_clear(infos: &[Info]) -> Vec<[bool; 5]> {
 /// event at whose observation it is ready (`tape.len()`: only by `finish`),
 /// written from ADR-055 D6. A window closes at the first event at or after
 /// its end, or when a censor reaches it. The label is ready once all its
-/// windows are closed and some trades-stream event so far (a trade or a
-/// trades gap, before the decision too) has a time at or after its 1d
-/// censor time, or its 1d window end when that is uncensored. Every trades
-/// gap delivered before the label is emitted, at the index `emitted`
-/// (`None`: when it is ready), censors every horizon whose window ends
-/// after its c, closed windows included, keeping the earliest censor. A
-/// label never ready is censored the same way at the tape's last
-/// trades-stream event (`EndOfData`).
+/// windows are closed and some accepted trades-stream event so far (a
+/// trade or a trades gap, before the decision too) has a time at or after
+/// its 1d censor time, or its 1d window end when that is uncensored. Every
+/// trades gap delivered before the label is emitted, at the index
+/// `emitted` (`None`: when it is ready), censors every horizon whose window
+/// ends after its c, closed windows included, keeping the earliest censor.
+/// A rejected trades-stream event tells nothing, not even its time: it
+/// censors the same way at the latest accepted trades-stream event before
+/// it (`Rejected`). A label never ready is censored the same way at the
+/// tape's last accepted trades-stream event (`EndOfData`).
 fn model_censors(
     tape: &[MarketEvent],
     rejected: &[Option<StateError>],
@@ -1588,12 +1706,16 @@ fn model_censors(
         MarketEvent::FeedGap(gap) => gap.stream == Stream::Trades,
         _ => false,
     };
-    // The latest trades-stream time up to the decision event.
-    let mut trades_until = tape[..=info.index]
-        .iter()
-        .filter(|event| of_trades(event))
-        .map(|event| event.time().as_millis())
-        .max();
+    // The latest accepted trades-stream time up to the decision event.
+    let accepted_trades_until = |end: usize| {
+        tape[..end]
+            .iter()
+            .zip(rejected)
+            .filter(|(event, rejection)| rejection.is_none() && of_trades(event))
+            .map(|(event, _)| event.time().as_millis())
+            .max()
+    };
+    let mut trades_until = accepted_trades_until(info.index + 1);
     let mut stale = info.reference.is_none();
     for (event, _) in tape[..=info.index]
         .iter()
@@ -1621,11 +1743,13 @@ fn model_censors(
         if ready.is_some() && emitted.is_none_or(|emitted| index > emitted) {
             break;
         }
-        // A rejected trades-stream event censors at its time, closes
-        // nothing and emits nothing; the next accepted event does.
+        // A rejected trades-stream event is no evidence of anything, its
+        // own time included: it censors at the latest accepted
+        // trades-stream event so far (or the decision), closes nothing,
+        // moves no trades-stream time and emits nothing.
         if rejected[index].is_some() {
             if of_trades(event) {
-                let at = event.time().as_millis().max(decision);
+                let at = trades_until.map_or(decision, |until| until.max(decision));
                 for position in 0..5 {
                     let earlier = censors[position].is_some_and(|cut| cut.at.as_millis() <= at);
                     if at < ends[position] && !earlier {
@@ -1633,7 +1757,6 @@ fn model_censors(
                         closed[position] = true;
                     }
                 }
-                trades_until = trades_until.max(Some(event.time().as_millis()));
             }
             continue;
         }
@@ -1665,16 +1788,11 @@ fn model_censors(
     }
     if ready.is_none() {
         // Emitted by `finish`: the trades are known only up to the tape's
-        // last trades-stream event, rejected ones included, so every
-        // horizon whose window ends after it is censored there, closed
-        // windows included, unless an earlier censor already cut it; every
-        // other window is covered, closed by an event or not.
-        let at = tape
-            .iter()
-            .filter(|event| of_trades(event))
-            .map(|event| event.time().as_millis())
-            .max()
-            .map_or(decision, |last| last.max(decision));
+        // last accepted trades-stream event, so every horizon whose window
+        // ends after it is censored there, closed windows included, unless
+        // an earlier censor already cut it; every other window ends at or
+        // before an accepted event, which closed it.
+        let at = accepted_trades_until(tape.len()).map_or(decision, |last| last.max(decision));
         for position in 0..5 {
             let earlier = censors[position].is_some_and(|cut| cut.at.as_millis() <= at);
             if at < ends[position] && !earlier {
@@ -2059,12 +2177,12 @@ fn labels_match_a_naive_model_on_random_tapes() {
 
 #[test]
 fn labels_match_a_naive_model_when_the_data_ends_on_a_rejection() {
-    // Re-review regression (PR #148): the engine rejects the tape's final
-    // event, a trades-stream event later than every accepted one, so no
-    // `observe` closes the windows that end in between. Every rejection
-    // the engine makes after its canonical-order check can land there;
-    // each kind leaves such windows, and every label still comes out once,
-    // in record order, as the model says.
+    // Re-review regressions (PR #148): the engine rejects the tape's final
+    // event, a trades-stream event dated before, or later than, every
+    // accepted one. Its time is not trusted (ADR-055 D6): every label still
+    // comes out once, in record order, as the model says, and exactly as
+    // the tape without that event gives it, with the end-of-data censor
+    // named `Rejected`.
     let base = walk(0x6d69_6500_0026_0000 + 14, 3, 1);
     let last = base.last().unwrap().time().as_millis();
     let &MarketEvent::Trade(final_trade) = base
@@ -2084,9 +2202,21 @@ fn labels_match_a_naive_model_when_the_data_ends_on_a_rejection() {
         })
     };
     let next = final_trade.trade_id + 1;
+    let plain = drive(&base);
     // Each rejected event, with a check of the engine's reason.
     type Kind = fn(&StateError) -> bool;
-    let rejections: [(MarketEvent, Kind); 4] = [
+    let rejections: [(MarketEvent, Kind); 6] = [
+        (
+            MarketEvent::Trade(Trade {
+                time: t(last - 1),
+                trade_id: next,
+                ..final_trade
+            }),
+            |error| matches!(error, StateError::OutOfOrder { .. }),
+        ),
+        (later(3, final_trade.trade_id, final_trade.qty), |error| {
+            matches!(error, StateError::Duplicate { .. })
+        }),
         (later(3, next, Qty::from_units(i64::MAX)), |error| {
             matches!(error, StateError::Overflow { .. })
         }),
@@ -2111,22 +2241,251 @@ fn labels_match_a_naive_model_when_the_data_ends_on_a_rejection() {
         assert!(accepted.iter().all(Option::is_none));
         assert!(rejected.as_ref().is_some_and(kind), "{rejected:?}");
         check_model(&tape, &run, |_| true);
-        // Windows that end after every accepted event, at or before the
-        // rejected one, and come out uncensored.
-        let rejected_at = tape.last().unwrap().time().as_millis();
-        let between = run
-            .infos
-            .iter()
-            .zip(&run.labels)
-            .flat_map(|(info, (_, label))| {
-                (0..5).filter(move |&position| {
-                    let end = info.event.time.as_millis() + HORIZONS[position].millis();
-                    end > last && end <= rejected_at && label.horizons[position].censored.is_none()
+        assert_eq!(run.labels.len(), plain.labels.len());
+        let mut cut = 0;
+        for ((_, label), (_, plain)) in run.labels.iter().zip(&plain.labels) {
+            assert_eq!(
+                *label,
+                renamed(plain, CensorReason::EndOfData, CensorReason::Rejected)
+            );
+            cut += label
+                .horizons
+                .iter()
+                .filter(|horizon| {
+                    horizon
+                        .censored
+                        .is_some_and(|cut| cut.reason == CensorReason::Rejected)
                 })
-            })
-            .count();
-        assert!(between > 0, "{rejected:?}");
+                .count();
+        }
+        assert!(cut > 0, "{rejected:?}");
     }
+}
+
+/// One drive like [`drive`], with the hand-built `records` instead of the
+/// sampler's: each is opened after the tape event at its index, in order.
+fn drive_records(tape: &[MarketEvent], records: &[(usize, ContextRecord)]) -> Drive {
+    let mut engine = MarketStateEngine::new();
+    let mut labeler = ForwardLabeler::new();
+    let mut run = Drive {
+        infos: Vec::new(),
+        lines: Vec::new(),
+        triggers: Vec::new(),
+        labels: Vec::new(),
+        stats: LabelStats::default(),
+        rejected: Vec::new(),
+    };
+    for (index, event) in tape.iter().enumerate() {
+        let rejection = engine.apply(event).err();
+        run.rejected.push(rejection);
+        if rejection.is_some() {
+            labeler.reject(event);
+            continue;
+        }
+        labeler.observe(event, |label| run.labels.push((index, label)));
+        for (_, record) in records.iter().filter(|(at, _)| *at == index) {
+            labeler.open(record);
+            run.infos.push(Info::of(index, record));
+        }
+    }
+    labeler.finish(|label| run.labels.push((tape.len(), label)));
+    run.stats = labeler.stats();
+    run
+}
+
+/// The ways the data can end, as the final event of
+/// [`every_way_the_data_can_end_matches_the_model_and_the_rule`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ending {
+    Trade,
+    OtherEvent,
+    TradesGap,
+    OtherGap,
+    Duplicate,
+    IdRegression,
+    Overflow,
+    InvalidGap,
+    OtherRejected,
+    OutOfOrder,
+    TimeJump,
+}
+
+#[test]
+fn every_way_the_data_can_end_matches_the_model_and_the_rule() {
+    // Re-review convergence (PR #148): every final event, accepted or
+    // rejected (each engine rejection kind, checked from its error), placed
+    // a millisecond before, at and after each window end of three open
+    // labels, with and without a trailing trades gap after it (the M2
+    // driver contract). Each run is model-checked (one label per record,
+    // in record order), and every horizon's censor is checked against the
+    // rule stated here from ADR-055 D6: the trades are known up to the last
+    // accepted trades-stream event, a rejected event tells nothing, and a
+    // trades gap cuts from its start.
+    //
+    // Trades at T0 (record A), +30 s, +90 s (record B), +2 m (touches both
+    // 5m uppers), and +3 m, the last trade (`last`); record C at an
+    // open-interest event at +4 m, after it. Every window ends after +4 m.
+    let last = T0 + 3 * MINUTE;
+    let mut tape = vec![
+        trade(T0, 10, usdt(60_000)),
+        trade(T0 + 30_000, 11, usdt(60_050)),
+        trade(T0 + 90_000, 12, usdt(60_000)),
+        trade(T0 + 2 * MINUTE, 13, usdt(60_100)),
+        trade(last, 14, usdt(59_990)),
+        tick_of_time(T0 + 4 * MINUTE),
+    ];
+    let records: Vec<(usize, ContextRecord)> = [0, 2, 5]
+        .into_iter()
+        .map(|index| {
+            let key = tape[index].canonical_key();
+            (index, record_at(key, usdt(60_000), Some(usdt(1_000))))
+        })
+        .collect();
+    let decisions: Vec<i64> = records
+        .iter()
+        .map(|(index, _)| tape[*index].time().as_millis())
+        .collect();
+    let base = tape.len();
+    let at = |millis: i64, trade_id: u64, qty: Qty| {
+        MarketEvent::Trade(Trade {
+            time: t(millis),
+            trade_id,
+            price: usdt(60_000),
+            qty,
+            aggressor: Aggressor::Buy,
+        })
+    };
+    let normal = Qty::from_units(10_000_000);
+    let final_event = |ending: Ending, p: i64| match ending {
+        Ending::Trade => at(p, 15, normal),
+        Ending::OtherEvent => tick_of_time(p),
+        Ending::TradesGap => gap(Stream::Trades, last, p),
+        Ending::OtherGap => gap(Stream::OrderBook, last, p),
+        Ending::Duplicate => at(p, 14, normal),
+        Ending::IdRegression => at(p, 13, normal),
+        Ending::Overflow => at(p, 15, Qty::from_units(i64::MAX)),
+        Ending::InvalidGap => gap(Stream::Trades, p + 1, p),
+        Ending::OtherRejected => gap(Stream::OrderBook, p + 1, p),
+        Ending::OutOfOrder => at(last - 1, 15, normal),
+        Ending::TimeJump => at(T0 + 32 * DAY, 15, normal),
+    };
+    // The engine's verdict on each ending.
+    let verdict = |ending: Ending, error: Option<&StateError>| match ending {
+        Ending::Trade | Ending::OtherEvent | Ending::TradesGap | Ending::OtherGap => {
+            error.is_none()
+        }
+        Ending::Duplicate => matches!(error, Some(StateError::Duplicate { .. })),
+        Ending::IdRegression => matches!(error, Some(StateError::IdRegression { .. })),
+        Ending::Overflow => matches!(error, Some(StateError::Overflow { .. })),
+        Ending::InvalidGap | Ending::OtherRejected => {
+            matches!(error, Some(StateError::InvalidGap { .. }))
+        }
+        Ending::OutOfOrder => matches!(error, Some(StateError::OutOfOrder { .. })),
+        Ending::TimeJump => matches!(error, Some(StateError::TimeJump { .. })),
+    };
+    let mut points: Vec<i64> = decisions
+        .iter()
+        .flat_map(|decision| {
+            HORIZONS.iter().flat_map(move |horizon| {
+                [-1, 0, 1].map(|offset| decision + horizon.millis() + offset)
+            })
+        })
+        .collect();
+    points.sort_unstable();
+    let positioned = [
+        Ending::Trade,
+        Ending::OtherEvent,
+        Ending::TradesGap,
+        Ending::OtherGap,
+        Ending::Duplicate,
+        Ending::IdRegression,
+        Ending::Overflow,
+        Ending::InvalidGap,
+        Ending::OtherRejected,
+    ];
+    let mut cases: Vec<(Ending, i64)> = positioned
+        .iter()
+        .flat_map(|&ending| points.iter().map(move |&p| (ending, p)))
+        .collect();
+    // Dated before the last trade, or a month ahead: one place each.
+    cases.push((Ending::OutOfOrder, last - 1));
+    cases.push((Ending::TimeJump, T0 + 32 * DAY));
+    let mut runs = 0;
+    let mut covered = 0;
+    for (ending, p) in cases {
+        for trailing in [false, true] {
+            tape.truncate(base);
+            tape.push(final_event(ending, p));
+            let rejected = !matches!(
+                ending,
+                Ending::Trade | Ending::OtherEvent | Ending::TradesGap | Ending::OtherGap
+            );
+            // The last accepted trades-stream event, by hand.
+            let known = match ending {
+                Ending::Trade | Ending::TradesGap => p,
+                _ => last,
+            };
+            if trailing {
+                // Starts at the trades stream's last delivered event and
+                // ends after every event the engine accepted, or would.
+                let end = if ending == Ending::TimeJump {
+                    last + 2 * MINUTE
+                } else {
+                    p.max(T0 + 4 * MINUTE) + 1
+                };
+                tape.push(gap(Stream::Trades, known, end));
+            }
+            let run = drive_records(&tape, &records);
+            let case = format!("{ending:?} at {} trailing={trailing}", p - T0);
+            assert!(verdict(ending, run.rejected[base].as_ref()), "{case}");
+            assert!(
+                run.rejected[base + 1..].iter().all(Option::is_none),
+                "{case}"
+            );
+            check_model(&tape, &run, |_| true);
+            // The rule: the censor time c and its reason, by hand.
+            let (c, reason) = match ending {
+                Ending::Trade if trailing => (p, CensorReason::Gap),
+                Ending::Trade => (p, CensorReason::EndOfData),
+                Ending::TradesGap => (last, CensorReason::Gap),
+                Ending::OtherEvent | Ending::OtherGap | Ending::OtherRejected if trailing => {
+                    (last, CensorReason::Gap)
+                }
+                Ending::OtherEvent | Ending::OtherGap | Ending::OtherRejected => {
+                    (last, CensorReason::EndOfData)
+                }
+                // Every trades-stream rejection, before or after the
+                // trailing gap, which starts at the same `last` and so
+                // does not replace it.
+                _ => {
+                    assert!(rejected, "{case}");
+                    (last, CensorReason::Rejected)
+                }
+            };
+            for ((_, label), decision) in run.labels.iter().zip(&decisions) {
+                for (position, horizon) in label.horizons.iter().enumerate() {
+                    let end = decision + HORIZONS[position].millis();
+                    // A window ending after c is censored at max(c,
+                    // decision); one ending at or before c is covered.
+                    let expected = (c < end).then(|| censor(c.max(*decision), reason));
+                    assert_eq!(horizon.censored, expected, "{case}: {label}");
+                    covered += usize::from(expected.is_none());
+                    let race = if position == 0 && *decision < T0 + 2 * MINUTE {
+                        Race::Upper {
+                            at: t(T0 + 2 * MINUTE),
+                            same_ms: false,
+                        }
+                    } else {
+                        expected.map_or(Race::Neither, Race::Censored)
+                    };
+                    assert_eq!(horizon.race, race, "{case}: {label}");
+                }
+            }
+            runs += 1;
+        }
+    }
+    assert_eq!(runs, 2 * (positioned.len() * 45 + 2));
+    assert!(covered > 0);
 }
 
 #[test]
@@ -2502,6 +2861,6 @@ fn print_label_golden() {
     println!("stats {:?}", golden.run.stats);
 }
 
-const GOLDEN_LABELING_FINGERPRINT: &str = "45648369af693211";
+const GOLDEN_LABELING_FINGERPRINT: &str = "d4c9921882a0dd0f";
 const GOLDEN_LABELS: (usize, &str) = (46_403, "8d7c4cebfc62d7da");
 const GOLDEN_FIRST_TRIGGER_LABEL: &str = "117032157ms Trade seq 785 #1 ref=61922.67000000 atr=26.01616928 [5m clear barriers=61920.31683749..61925.02316251 race=lower@117098590ms up=0.64000000@117309050ms down=4.22000000@117248836ms last=61923.31000000] [15m clear barriers=61918.59430692..61926.74569308 race=lower@117248836ms up=0.64000000@117309050ms down=11.49000000@117700476ms last=61915.79000000] [1h clear barriers=61914.51835368..61930.82164632 race=lower@117700476ms up=7.40000000@120543138ms down=11.49000000@117700476ms last=61928.16000000] [4h clear barriers=61906.36670736..61938.97329264 race=lower@122609041ms up=23.70000000@129865828ms down=33.07000000@126265310ms last=61935.31000000] [1d barriers=61882.73544032..61962.60455968 race=upper@146208863ms up=134.65000000@185552262ms down=33.07000000@126265310ms last=62018.89000000] level=61910.65000000:touched@121677419ms extreme=61908.96000000:touched@121677419ms";

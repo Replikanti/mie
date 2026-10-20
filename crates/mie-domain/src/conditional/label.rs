@@ -25,6 +25,8 @@
 //! - **Censoring** (D6): a trades gap, a stale reference, a rejected
 //!   trades-stream event and the end of data censor what is not resolved
 //!   strictly before the censor time; a censored label is never dropped.
+//!   A rejected event's time is not trusted: it and the end of data censor
+//!   at the last accepted trades-stream event.
 //!   Until a label is emitted, a censor also reaches its closed windows: a
 //!   trades outage is silent until trades resume (ADR-028). A complete label
 //!   is emitted only once a trades-stream event at or after its last window
@@ -120,7 +122,7 @@ pub fn labeling_text() -> String {
     ));
     text.push_str("touch upper=price_at_or_above lower=price_at_or_below tie=earlier_canonical_key same_ms=other_barrier_later_in_the_millisecond\n");
     text.push_str("excursion up=max0_high_minus_reference down=max0_reference_minus_low at=earliest_trade_at_the_extreme last=last_trade\n");
-    text.push_str("censor gap=trades_feed_gap_at_max_start_decision stale_reference=trades_gap_since_last_trade_or_no_trade rejected=trades_stream_event_at_max_time_decision end_of_data=last_trades_stream_event keep=resolved_strictly_before until=emitted closed_windows=too earliest=wins emitted=complete_and_trades_stream_event_at_or_after_1d_end_or_censor late_gap=immutable_reach_back\n");
+    text.push_str("censor gap=trades_feed_gap_at_max_start_decision stale_reference=trades_gap_since_last_trade_or_no_trade rejected=trades_stream_event_at_max_last_accepted_trades_stream_event_decision end_of_data=last_accepted_trades_stream_event keep=resolved_strictly_before until=emitted closed_windows=too earliest=wins emitted=complete_and_accepted_trades_stream_event_at_or_after_1d_end_or_censor late_gap=immutable_reach_back\n");
     text.push_str(&format!(
         "passage window={} side=fixed_at_decision equal=at_decision\n",
         HORIZONS[PASSAGE_HORIZON]
@@ -237,10 +239,12 @@ pub enum CensorReason {
     /// decision, or no trade preceded it: the path from the reference to the
     /// decision is unknown.
     StaleReference,
-    /// The engine rejected a trades-stream event while the label was open.
+    /// The engine rejected a trades-stream event while the label was open:
+    /// at the last accepted trades-stream event, since a rejected event's
+    /// time is not trusted.
     Rejected,
-    /// The data ended before the window did: at the last trades-stream
-    /// event, since the trades are known only up to there.
+    /// The data ended before the window did: at the last accepted
+    /// trades-stream event, since the trades are known only up to there.
     EndOfData,
 }
 
@@ -574,9 +578,8 @@ pub struct LabelStats {
     pub opened: u64,
     /// Labels emitted.
     pub emitted: u64,
-    /// Trades gaps and rejected trades-stream events whose time reaches
-    /// back into the window of an already emitted label, which stays as it
-    /// was (ADR-055 D6).
+    /// Trades gaps whose start reaches back into the window of an already
+    /// emitted label, which stays as it was (ADR-055 D6).
     pub reach_backs: u64,
 }
 
@@ -764,10 +767,11 @@ pub struct ForwardLabeler {
     below: BTreeSet<Touch>,
     /// A trades gap was delivered after the last trade.
     stale: bool,
-    /// The latest time of an observed or rejected trades-stream event (a
-    /// trade or a trades gap): a complete label is emitted once this
-    /// reaches its [`Open::until`], and the end of the data censors at it
-    /// (ADR-055 D6).
+    /// The latest time of an observed trades-stream event (a trade or a
+    /// trades gap, at its end): a complete label is emitted once this
+    /// reaches its [`Open::until`], and a rejected trades-stream event and
+    /// the end of the data censor at it (ADR-055 D6). Rejected events never
+    /// raise it: their time is not trusted.
     trades_until: Option<EventTime>,
     /// The event of the last opened record and its ordinal.
     ordinal: Option<(CanonicalKey, u32)>,
@@ -917,41 +921,45 @@ impl ForwardLabeler {
         self.emit_complete(&mut emit, false);
     }
 
-    /// Reports an event the engine rejected. A trades-stream event censors
-    /// the unemitted labels at the later of its time and their decision time
-    /// (ADR-055 D6), and counts as a trades-stream event for emission;
-    /// events of other streams are ignored, since labels read trades only.
-    /// Labels it completes are emitted by the next
+    /// Reports an event the engine rejected. A trades-stream event carries
+    /// no information, its time included: it censors the unemitted labels
+    /// at the later of the last accepted trades-stream event and their
+    /// decision time (ADR-055 D6), closes nothing and counts for no
+    /// emission. Events of other streams are ignored, since labels read
+    /// trades only. Labels it completes are emitted by the next
     /// [`observe`](Self::observe) or [`finish`](Self::finish).
     pub fn reject(&mut self, event: &MarketEvent) {
         if event.stream() != Stream::Trades {
             return;
         }
-        self.reach_back(event.time());
-        self.censor(event.time(), CensorReason::Rejected);
-        self.trades_until = self.trades_until.max(Some(event.time()));
+        if let Some(known) = self.known_until() {
+            self.censor(known, CensorReason::Rejected);
+        }
     }
 
-    /// Ends the data: censors every unemitted label at the last
-    /// trades-stream event, closed windows included, closes every window
-    /// that ends at or before it, and emits every remaining label, in
-    /// record order (ADR-055 D6). Trades that stop before the data does
-    /// look the same as an outage nobody announced, so the trades are
-    /// known to be complete only up to that event. Without one, every
-    /// label is censored at its decision.
+    /// Ends the data: censors every unemitted label at the last accepted
+    /// trades-stream event, closed windows included, and emits every
+    /// remaining label, in record order (ADR-055 D6). Trades that stop
+    /// before the data does look the same as an outage nobody announced,
+    /// so the trades are known to be complete only up to that event.
+    /// Without one, every label is censored at its decision. Every window
+    /// ending at or before that event was closed when it was observed, and
+    /// the censor reaches every later one.
     pub fn finish(&mut self, mut emit: impl FnMut(ForwardLabel)) {
-        let last = self
-            .trades_until
-            .or_else(|| self.labels.front().map(|open| open.label.event.time));
-        if let Some(last) = last {
-            self.censor(last, CensorReason::EndOfData);
-            // The censor reaches the windows ending after `last`; this
-            // closes the rest. A rejected trades-stream event can be later
-            // than every observed event, so no `observe` closed them.
-            self.close_until(last);
+        if let Some(known) = self.known_until() {
+            self.censor(known, CensorReason::EndOfData);
         }
         self.emit_complete(&mut emit, true);
         debug_assert!(self.labels.is_empty(), "every window closes at the end");
+    }
+
+    /// The time the trades are known to be complete up to: the last
+    /// accepted trades-stream event's, or with none the oldest unemitted
+    /// decision's, which a censor raises to each label's own decision.
+    /// `None` only without unemitted labels and trades-stream events.
+    fn known_until(&self) -> Option<EventTime> {
+        self.trades_until
+            .or_else(|| self.labels.front().map(|open| open.label.event.time))
     }
 
     /// The D9 `clear` flags of `record`, per horizon.
