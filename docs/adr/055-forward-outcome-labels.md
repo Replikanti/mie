@@ -100,7 +100,9 @@ features.* That is the leakage path this issue exists to close.
   not.
 - A window **closes** when an event (of any stream) at or after its end is
   observed: events are delivered in canonical order, so every trade before
-  the end has been seen.
+  the end has been seen. Whether a trades outage took some of them is known
+  only from the trades stream, so a closed window stays censorable until
+  its label is emitted (D6).
 - *Rejected:*
   - The context anchor as reference. A CVD divergence's anchor is the swing
     price, which can be days old, so the label would include moves that had
@@ -208,13 +210,14 @@ is unknown.
     censored too, as long as its label is not emitted. A trades outage is
     silent until trades resume (ADR-028), while book, mark-price, OI and
     kline events go on and close windows (D2). Closing proves the window
-    complete only provisionally; the label's emission is the point after
-    which it is final. Without this, whether a window ending inside an
-    outage is marked would depend on whether some other stream ticked
-    between its end and the gap, and it would come out as fully covered
-    (`Neither`, or a race winner that missing trades may have preceded).
-    The trades it needs are still held: they reach back to the oldest
-    unemitted label (D11);
+    complete only provisionally; the label's emission (below) is the point
+    after which it is final, and emission waits for the trades stream, so
+    this holds for the 1d window and the passages too. Without this,
+    whether a window ending inside an outage is marked would depend on
+    whether some other stream ticked between its end and the gap, and it
+    would come out as fully covered (`Neither`, or a race winner that
+    missing trades may have preceded). The trades it needs are still held:
+    they reach back to the oldest unemitted label (D11);
   - a horizon already censored keeps the earliest censor: a later censor
     with an earlier c replaces it, one with a later c changes nothing;
   - a gap that started before the decision but is delivered after it (a
@@ -238,15 +241,45 @@ is unknown.
   A passage price equal to the reference (`AtDecision`) counts as reached
   at the decision, so it survives a censor after the decision and not one
   at it.
-- **Late gaps after emission.** A label is emitted once all its windows are
-  closed (at the end of the `observe` that closes the last one, in record
-  order), and from then on it is immutable, like a closed bar (ADR-031);
-  before that every censor above still reaches all its windows. A
-  trades gap whose start, or a rejected trades-stream event whose time,
-  falls before the latest window end (or censor time) of the emitted labels
-  reaches back into at least one of them. It does not reopen any label; it
-  is counted once in `LabelStats.reach_backs`. Unemitted labels it reaches
-  are censored as above.
+- **Emission.** A label's **until** is its 1d censor time, or its 1d
+  window end when the 1d window is not censored; no other window of the
+  label ends, or is censored, later. A label is emitted at the end of the
+  first `observe` after which all its windows are closed **and** a
+  trades-stream event at or after its until has been observed: a trade or
+  a trades gap passed to `observe` (the gap's ordering time, its end), or a
+  rejected trades-stream event (its time). Labels go out in record order,
+  so a label also waits for every earlier one. At the end of the data
+  `finish()` emits every remaining label; the end-of-data censor still
+  reaches only windows that end after the last event, so a complete label
+  that was waiting comes out as it was.
+  - *Why the trades stream:* ADR-028 orders a gap at its `end` with rank 0,
+    so it precedes the stream's first resumed event in that millisecond,
+    and the providers open a trades gap at the last trade they delivered:
+    the live sequencer and the archive replay emit `FeedGap { start: the
+    last delivered trade's time (or the seed or window start), end: the
+    resumed event's time }` right before the resumed event, in replay and
+    live alike. Gap starts therefore do not fall back behind a delivered
+    trade, and once a trades-stream event at or after until has arrived,
+    every trades gap that starts before until has been delivered and
+    applied. Another stream's event carries no such guarantee: it can
+    close the 1d window in the middle of an outage of any length. ADR-031
+    decision 4 closes bars on trades-stream events only, for the same
+    reason.
+  - *Where the guarantee does not hold, the cause reaches back* (below):
+    a live hold-back `LateEvent` gap that stands in for a late trade
+    (ADR-028 decision 6) starts at that trade's own time, which can lie
+    before trades already released; a rejected trades-stream event can
+    carry any time; and any provider that breaks the ADR-028 contract.
+  - *Cost:* a complete label is held until the trades stream resumes; a
+    record's own 1d censor makes its until earlier, so a gap that censors
+    the 1d window emits the label at once (D11 states the memory bound).
+- **Late gaps after emission.** From its emission on a label is
+  immutable, like a closed bar (ADR-031); before that every censor above
+  still reaches all its windows. A trades gap whose start, or a rejected
+  trades-stream event whose time, falls before the latest until of the
+  emitted labels reaches back into at least one of them. It does not reopen
+  any label; it is counted once in `LabelStats.reach_backs`. Unemitted
+  labels it reaches are censored as above.
 - **`Neither` is an outcome, not censoring:** the window closed with full
   coverage, no censor reached it before its label was emitted, and neither
   barrier was touched.
@@ -343,7 +376,14 @@ Each horizon gets a `clear` flag.
 - **Pending touches:** two ordered sets keyed by `(price, label, target)`,
   one per side; a touch costs O(log n).
 - **Memory:** about one day of open labels and at most one day of trades
-  (the trades after the oldest unemitted record's event).
+  (the trades after the oldest unemitted record's event), plus, during a
+  trades outage that runs over a label's until, the labels of the outage's
+  first day and the records opened during it: a complete label waits for a
+  trades-stream event (D6). No trades arrive meanwhile, so the trades held
+  stay within one day, and few records open, since a baseline needs a 1m
+  bar close and only trades-stream events close bars (ADR-031 decision 4).
+  The held labels go out when the stream resumes (its gap is the first
+  trades-stream event) or at `finish()`.
 - **Replay only:** the labeler is built by the mie-app replay driver (M2)
   and by tests, never wired into `mie ingest`.
 - **Guard in `tools/check-architecture.sh`:** no file under
@@ -440,6 +480,11 @@ There is no other number.
   decide whether a window ending inside a silent trades outage is censored
   or reported as fully covered (D6). Rejected: a window is final when its
   label is emitted.
+- **A label emitted when its last window closes.** For the 1d window and
+  the passages, closing and emission would be the same event, so an
+  event of another stream at the 1d end would again decide whether a trades
+  outage over it is censored, even a ten-minute one. Rejected: emission
+  waits for a trades-stream event at or after the label's until (D6).
 - **One label per event.** Two joins for #27 (D1). Rejected.
 - **Passages in a follow-up issue.** The issue names level revisit and
   invalidation; as neutral passages they need no hypothesis (D8). Rejected.
