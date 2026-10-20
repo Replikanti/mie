@@ -78,11 +78,79 @@ fi
 # itself and its replay driver. Features are computed only in mie-domain
 # (ADR-019, ADR-025), so this closes the path from a label into a feature.
 # `mie_domain::conditional` declares `pub mod label;` without a re-export,
-# so every use names `label::`, or imports the module as
-# `conditional::label` (also renamed, also in a one-line group). Comments
-# count too: the guard is about naming, not only about code.
-label_hits=$(grep -rnE 'label::|ForwardLabel|conditional::label\b|conditional::\{[^}]*\blabel\b' \
-  crates/mie-domain/src crates/mie-ports/src crates/mie-app/src \
+# so every use names `label::` or imports the module itself, possibly
+# renamed (`label as x`), grouped across lines or through `super`/`self`.
+# Two scans: every line for `label::` and `ForwardLabel` (comments count
+# too: the guard is about naming, not only about code), and every `use`
+# item, joined onto one line, for a `label` path segment.
+label_lines='label::|ForwardLabel'
+label_use='(^|[^[:alnum:]_])label($|[^[:alnum:]_])'
+
+# Every `use` item of the given files on one line: `<file>:<line>:<item>`,
+# with line comments dropped.
+use_items() {
+  awk '
+    FNR == 1 { item = "" }
+    item == "" && /^[[:space:]]*(pub(\([^)]*\))?[[:space:]]+)?use[[:space:]]/ { start = FNR; item = " " }
+    item != "" {
+      line = $0
+      sub(/\/\/.*/, "", line)
+      item = item " " line
+      if (line ~ /;/) {
+        print FILENAME ":" start ":" item
+        item = ""
+      }
+    }
+  ' "$@"
+}
+
+# The label-isolation hits in the given directories or files.
+label_scan() {
+  local files
+  mapfile -d '' files < <(find "$@" -name '*.rs' -print0 | sort -z)
+  {
+    grep -rnHE "$label_lines" "$@" || true
+    if [[ ${#files[@]} -gt 0 ]]; then
+      use_items "${files[@]}" | grep -E "^[^:]+:[0-9]+:.*$label_use" || true
+    fi
+  } | sort -u
+}
+
+# Self-test of the label scan: each probe below must hit, each clean
+# snippet must not. A guard that silently stops matching would pass every
+# tree, so its blind spots are pinned here (PR #148 review).
+probe_dir=$(mktemp -d)
+trap 'rm -rf "$probe_dir"' EXIT
+probes=(
+  'use crate::conditional::label::ForwardLabel;'
+  'use crate::conditional::label as outcome;'
+  'use crate::conditional::{label, ContextRecord};'
+  $'use crate::conditional::{\n    ContextRecord as _A, ContextSampler as _B, label as outcome,\n};'
+  $'use mie_domain::conditional::{\n    ContextRecord,\n    label,\n};'
+  $'use crate::{\n    conditional::{label as x},\n};'
+  'use super::label as x;'
+  'use self::label as x;'
+  $'pub(crate) use super::{\n    label as x, // the labeler\n};'
+  'fn f(race: outcome::Race) -> bool { matches!(race, label::Race::Neither) }'
+)
+clean=(
+  'use crate::conditional::{ContextRecord, ContextSampler};'
+  $'use crate::regime::{\n    RegimeLabel,\n};'
+  'let label = regime.label(); // a regime label'
+  'pub fn label(self) -> RegimeLabel {'
+)
+for index in "${!probes[@]}"; do
+  printf '%s\n' "${probes[$index]}" >"$probe_dir/probe_$index.rs"
+  [[ -n "$(label_scan "$probe_dir/probe_$index.rs")" ]] \
+    || fail "label guard self-test: probe $index is not caught: ${probes[$index]}"
+done
+for index in "${!clean[@]}"; do
+  printf '%s\n' "${clean[$index]}" >"$probe_dir/clean_$index.rs"
+  [[ -z "$(label_scan "$probe_dir/clean_$index.rs")" ]] \
+    || fail "label guard self-test: clean snippet $index is flagged: ${clean[$index]}"
+done
+
+label_hits=$(label_scan crates/mie-domain/src crates/mie-ports/src crates/mie-app/src \
   | grep -vE '^crates/mie-domain/src/conditional/label[^:]*:|^crates/mie-app/src/conditional\.rs:' || true)
 if [[ -n "$label_hits" ]]; then
   fail "forward labels named outside the labeler and its replay driver (ADR-055 D11):"

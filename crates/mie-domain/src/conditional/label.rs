@@ -25,8 +25,10 @@
 //! - **Censoring** (D6): a trades gap, a stale reference, a rejected
 //!   trades-stream event and the end of data censor what is not resolved
 //!   strictly before the censor time; a censored label is never dropped.
-//!   Emitted labels are immutable: a later gap that reaches back into one
-//!   is counted in [`LabelStats::reach_backs`].
+//!   Until a label is emitted, a censor also reaches its closed windows: a
+//!   trades outage is silent until trades resume (ADR-028). Emitted labels
+//!   are immutable: a later gap that reaches back into one is counted in
+//!   [`LabelStats::reach_backs`].
 //! - **Thinning** (D9): a `clear` flag per horizon picks records whose
 //!   windows are disjoint, read from decision times and episode flags only.
 //!
@@ -115,7 +117,7 @@ pub fn labeling_text() -> String {
     ));
     text.push_str("touch upper=price_at_or_above lower=price_at_or_below tie=earlier_canonical_key same_ms=other_barrier_later_in_the_millisecond\n");
     text.push_str("excursion up=max0_high_minus_reference down=max0_reference_minus_low at=earliest_trade_at_the_extreme last=last_trade\n");
-    text.push_str("censor gap=trades_feed_gap_at_max_start_decision stale_reference=trades_gap_since_last_trade_or_no_trade rejected=trades_stream_event_at_max_time_decision end_of_data=last_event keep=resolved_strictly_before late_gap=immutable_reach_back\n");
+    text.push_str("censor gap=trades_feed_gap_at_max_start_decision stale_reference=trades_gap_since_last_trade_or_no_trade rejected=trades_stream_event_at_max_time_decision end_of_data=last_event keep=resolved_strictly_before until=emitted closed_windows=too earliest=wins late_gap=immutable_reach_back\n");
     text.push_str(&format!(
         "passage window={} side=fixed_at_decision equal=at_decision\n",
         HORIZONS[PASSAGE_HORIZON]
@@ -648,18 +650,30 @@ impl Open {
         !self.open.contains(&true)
     }
 
-    /// Censors every open horizon whose window reaches past `censor.at`,
-    /// with `read` the trades of the window strictly before it, and returns
-    /// which horizons it closed. A race touched strictly before the censor
-    /// keeps its result, an unavailable race stays unavailable; the
-    /// passages are censored with the 1d window, unless reached strictly
-    /// before it (a price at the reference counts as reached at the
-    /// decision).
+    /// Whether a censor at `at` reaches the horizon at `position`: its
+    /// window ends after `at`, open or already closed, since the label is
+    /// not emitted yet, and no earlier censor already cut it (ADR-055 D6).
+    fn reaches(&self, position: usize, at: EventTime) -> bool {
+        at < self.ends[position]
+            && self.label.horizons[position]
+                .censored
+                .is_none_or(|earlier| at < earlier.at)
+    }
+
+    /// Censors every horizon the censor [`reaches`](Self::reaches), with
+    /// `read` the trades of the window strictly before it, and returns
+    /// which open horizons it closed. A closed window is censored too: an
+    /// event of another stream at or after its end does not prove its
+    /// trades were delivered, since a trades outage is silent until trades
+    /// resume (ADR-028). A race touched strictly before the censor keeps
+    /// its result, an unavailable race stays unavailable; the passages are
+    /// censored with the 1d window, unless reached strictly before it (a
+    /// price at the reference counts as reached at the decision).
     fn censor(&mut self, censor: Censor, read: &Stretch) -> [bool; 5] {
         let decision = self.label.event.time;
         let mut closed = [false; 5];
         for (position, closed) in closed.iter_mut().enumerate() {
-            if !self.open[position] || censor.at >= self.ends[position] {
+            if !self.reaches(position, censor.at) {
                 continue;
             }
             let horizon = &mut self.label.horizons[position];
@@ -684,8 +698,8 @@ impl Open {
                     };
                 }
             }
+            *closed = self.open[position];
             self.open[position] = false;
-            *closed = true;
         }
         closed
     }
@@ -885,7 +899,7 @@ impl ForwardLabeler {
     }
 
     /// Reports an event the engine rejected. A trades-stream event censors
-    /// the open labels at the later of its time and their decision time
+    /// the unemitted labels at the later of its time and their decision time
     /// (ADR-055 D6); events of other streams are ignored, since labels read
     /// trades only. Labels it completes are emitted by the next
     /// [`observe`](Self::observe) or [`finish`](Self::finish).
@@ -951,9 +965,10 @@ impl ForwardLabeler {
         self.ticks[usize::try_from(seq - self.first_tick).expect("a held trade")]
     }
 
-    /// Censors every open component of every open label whose window
-    /// reaches past `max(start, decision time)` (ADR-055 D6). Reads the held
-    /// trades once, newest first, for every label at once.
+    /// Censors every component of every unemitted label whose window
+    /// reaches past `max(start, decision time)`, closed windows included
+    /// (ADR-055 D6). Reads the held trades once, newest first, for every
+    /// label at once: they reach back to the oldest unemitted label.
     fn censor(&mut self, start: EventTime, reason: CensorReason) {
         let mut before = self.ticks.partition_point(|tick| tick.key.time < start);
         let mut stretch = Stretch::default();
@@ -962,8 +977,7 @@ impl ForwardLabeler {
             let open = &mut self.labels[index];
             let decision = open.label.event;
             let at = start.max(decision.time);
-            if !(0..HORIZONS.len()).any(|position| open.open[position] && at < open.ends[position])
-            {
+            if !(0..HORIZONS.len()).any(|position| open.reaches(position, at)) {
                 continue;
             }
             // The trades after the decision and strictly before `at`: none

@@ -26,12 +26,14 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   windows; for trigger records, first passages within 1d to the evidence's
   level and extreme (`evidence_prices`). Trades gaps, a stale reference,
   rejected trades-stream events and the end of data censor what was not
-  resolved strictly before the censor time; no label is dropped, and an
-  emitted label is never reopened (late gaps are counted in
-  `LabelStats.reach_backs`). `LabelProvenance` adds the labeling
+  resolved strictly before the censor time, closed windows of a label not
+  yet emitted included (a trades outage is silent until trades resume); no
+  label is dropped, and an emitted label is never reopened (late gaps are
+  counted in `LabelStats.reach_backs`). `LabelProvenance` adds the labeling
   `conditional.labels@1` and its fingerprint to the records' provenance.
   `tools/check-architecture.sh` now rejects any core file outside the
-  labeler and its replay driver that names a label. No engine, catalog,
+  labeler and its replay driver that names a label, also through a renamed,
+  grouped or `super`/`self` import, and probes its own scan first. No engine, catalog,
   state-hash or record change. The replay driver and the measurement tool
   follow in M2.
 - **ADR-054 is `accepted` (#25 M3).** The *Accept when* measurement on the

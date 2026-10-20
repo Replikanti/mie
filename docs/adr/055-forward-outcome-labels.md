@@ -190,9 +190,10 @@ A censored label is never dropped: every record gets exactly one label. A
 resolved **strictly before c** keeps its result; everything else from c on
 is unknown.
 
-- **Trades gap.** A `FeedGap` on `Stream::Trades` delivered while the label
-  is open, with c = max(`gap.start`, decision time). Every open horizon whose
-  window ends after c is censored (`Censored { at: c, reason: Gap }`):
+- **Trades gap.** A `FeedGap` on `Stream::Trades` delivered before the
+  label is emitted, with c = max(`gap.start`, decision time). Every horizon
+  whose window ends after c is censored (`Censored { at: c, reason: Gap }`),
+  open or already closed:
   - a race touched strictly before c keeps its result;
   - the excursions and `last` keep what the trades strictly before c showed
     and the horizon is flagged `censored`, which makes the excursions lower
@@ -203,6 +204,19 @@ is unknown.
   - the gap is applied before the windows that end at or before its own
     ordering time close, because a gap ordered after a window's end
     (ADR-028 orders a gap at its end) may still have started inside it;
+  - a window that an event of another stream has already closed is
+    censored too, as long as its label is not emitted. A trades outage is
+    silent until trades resume (ADR-028), while book, mark-price, OI and
+    kline events go on and close windows (D2). Closing proves the window
+    complete only provisionally; the label's emission is the point after
+    which it is final. Without this, whether a window ending inside an
+    outage is marked would depend on whether some other stream ticked
+    between its end and the gap, and it would come out as fully covered
+    (`Neither`, or a race winner that missing trades may have preceded).
+    The trades it needs are still held: they reach back to the oldest
+    unemitted label (D11);
+  - a horizon already censored keeps the earliest censor: a later censor
+    with an earlier c replaces it, one with a later c changes nothing;
   - a gap that started before the decision but is delivered after it (a
     late detection, ADR-048) gives c = the decision time: nothing after the
     decision is known;
@@ -212,9 +226,11 @@ is unknown.
   whole label is censored at the decision (`StaleReference`): the path from
   the reference to the decision is unknown.
 - **Rejected trades-stream event.** The driver reports a rejected event to
-  the labeler; one on the trades stream censors the labels open at that
-  moment at c = max(its time, decision time) (`Rejected`): the engine
-  refused data the path needs. Rejections of other streams are ignored.
+  the labeler; one on the trades stream censors the labels not yet emitted
+  at that moment at c = max(its time, decision time) (`Rejected`), closed
+  windows included, like a trades gap: the engine refused data the path
+  needs. A label it completes is emitted at the next `observe` or
+  `finish`. Rejections of other streams are ignored.
 - **End of data.** `finish()` censors every open component at the time of
   the last observed event (`EndOfData`). By the uniform rule a trade at that
   very millisecond does not count: the last millisecond may be incomplete.
@@ -223,14 +239,17 @@ is unknown.
   at the decision, so it survives a censor after the decision and not one
   at it.
 - **Late gaps after emission.** A label is emitted once all its windows are
-  closed, and an emitted label is immutable, like a closed bar (ADR-031). A
+  closed (at the end of the `observe` that closes the last one, in record
+  order), and from then on it is immutable, like a closed bar (ADR-031);
+  before that every censor above still reaches all its windows. A
   trades gap whose start, or a rejected trades-stream event whose time,
   falls before the latest window end (or censor time) of the emitted labels
   reaches back into at least one of them. It does not reopen any label; it
-  is counted once in `LabelStats.reach_backs`. Open labels it reaches are
-  censored as above.
+  is counted once in `LabelStats.reach_backs`. Unemitted labels it reaches
+  are censored as above.
 - **`Neither` is an outcome, not censoring:** the window closed with full
-  coverage and neither barrier was touched.
+  coverage, no censor reached it before its label was emitted, and neither
+  barrier was touched.
 
 ### D7. Excursions and time to event, per horizon
 
@@ -329,10 +348,13 @@ Each horizon gets a `clear` flag.
   and by tests, never wired into `mie ingest`.
 - **Guard in `tools/check-architecture.sh`:** no file under
   `crates/mie-domain/src`, `crates/mie-ports/src` or `crates/mie-app/src`
-  may name `label::`, `ForwardLabel`, or import `conditional::label`,
-  except `crates/mie-domain/src/conditional/label*` and
+  may name `label::` or `ForwardLabel` on any line, or a `label` path
+  segment in any `use` item (joined across lines, so renamed, grouped and
+  `super`/`self` imports count), except
+  `crates/mie-domain/src/conditional/label*` and
   `crates/mie-app/src/conditional.rs`. `mie_domain::conditional` declares
-  the module without a re-export, so every use names its path. Features are
+  the module without a re-export, so every use names its path. The script
+  runs probes of these import shapes against its own scan first. Features are
   computed only in mie-domain (ADR-019, ADR-025), so this closes the only
   path from a label to a feature. It is a text guard, not a proof; review
   still applies.
@@ -414,6 +436,10 @@ There is no other number.
   Old moves, no archive stream, or pre-decision trades (D2). Rejected.
 - **Reopening emitted labels on late gaps.** Labels would no longer be a
   stream; counted instead (D6). Rejected.
+- **A window final when it closes.** An event of another stream would then
+  decide whether a window ending inside a silent trades outage is censored
+  or reported as fully covered (D6). Rejected: a window is final when its
+  label is emitted.
 - **One label per event.** Two joins for #27 (D1). Rejected.
 - **Passages in a follow-up issue.** The issue names level revisit and
   invalidation; as neutral passages they need no hypothesis (D8). Rejected.
