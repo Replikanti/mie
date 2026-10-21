@@ -22,7 +22,10 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   and the labeler are the caller's, so one drive per event equals one over
   the stream. `finish_labels` ends a replay as D6 states the driver
   contract: the provider's trades-stream trailing gaps to `observe`, in
-  canonical order, no other stream's, then `finish`. `label_window` opens
+  canonical order, no other stream's, then `finish`; it fails closed with
+  `ProviderError::Contract`, labeler untouched, on a trades entry that is
+  inverted, starts after the trades known up to then or ends before them
+  (the entries skip the engine's checks). `label_window` opens
   a replay window with its `LabelProvenance` (data version, engine key,
   both policy fingerprints), takes the provider's trailing gaps through a
   closure (they are reported out of band, not through the port), and
@@ -39,7 +42,8 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   reach-backs, the wall time and the peak RSS for M3; their CI twin runs
   on the seeded three-week tape with a same-millisecond burst, a late
   trades gap and three kinds of rejected trade. No engine, catalog,
-  state-hash, record or labeler change.
+  state-hash or record change; the labeler only gains the read-only
+  `ForwardLabeler::trades_known_until`.
 - **Forward outcome labels (ADR-055, proposed; part of #26).** The new
   domain module `mie_domain::conditional::label` labels every ADR-054
   context record from the trades strictly after its decision event, in

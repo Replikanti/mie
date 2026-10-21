@@ -258,21 +258,77 @@ where
 /// data's end and would close windows the data never covered; labels read
 /// trades only, so the labeler never takes it. The engine and the sampler
 /// see none of them.
+///
+/// # Errors
+///
+/// [`ProviderError::Contract`], with the labeler untouched, when a trades
+/// entry breaks that contract: it starts after its end (the engine's
+/// [`StateError::InvalidGap`]), starts after the time up to which the
+/// trades are known ([`ForwardLabeler::trades_known_until`]; an entry
+/// before it in canonical order counts, at its end), or ends before that
+/// time, sorting before a trades-stream event already observed. The
+/// entries skip the engine, so these checks stand in for its own, and a
+/// late start would close the windows between the known time and the
+/// start as fully covered: trades nobody delivered. A start at or before
+/// the known time only censors more, the D6 case of a gap opened at the
+/// last delivered trade.
 pub fn finish_labels(
     labeler: &mut ForwardLabeler,
     trailing_gaps: &[FeedGap],
     mut on_label: impl FnMut(ForwardLabel),
-) {
+) -> Result<(), ProviderError> {
     let mut gaps: Vec<MarketEvent> = trailing_gaps
         .iter()
         .filter(|gap| gap.stream == Stream::Trades)
         .map(|gap| MarketEvent::FeedGap(*gap))
         .collect();
     gaps.sort();
+    let entries = gaps.iter().filter_map(|gap| match gap {
+        MarketEvent::FeedGap(gap) => Some(gap),
+        _ => None,
+    });
+    // Every entry is checked before the labeler sees any: observing one
+    // moves the known time to its end.
+    let mut known = labeler.trades_known_until();
+    for gap in entries {
+        let broken = if gap.start > gap.end {
+            Some(
+                StateError::InvalidGap {
+                    start: gap.start,
+                    end: gap.end,
+                }
+                .to_string(),
+            )
+        } else {
+            known.and_then(|known| {
+                if gap.start > known {
+                    Some(format!(
+                        "it starts at {}, after the trades known up to {known}",
+                        gap.start
+                    ))
+                } else if gap.end < known {
+                    Some(format!(
+                        "it ends at {}, before the trades known up to {known}",
+                        gap.end
+                    ))
+                } else {
+                    None
+                }
+            })
+        };
+        if let Some(detail) = broken {
+            return Err(ProviderError::Contract(format!(
+                "trailing trades gap {} to {}: {detail}",
+                gap.start, gap.end
+            )));
+        }
+        known = Some(gap.end);
+    }
     for gap in &gaps {
         labeler.observe(gap, &mut on_label);
     }
     labeler.finish(on_label);
+    Ok(())
 }
 
 /// Labels the replay of `window` from `history` (ADR-055 D6, D10, D11):
@@ -293,7 +349,8 @@ pub fn finish_labels(
 ///
 /// # Errors
 ///
-/// [`ProviderError`] when the replay cannot be opened or its stream fails.
+/// [`ProviderError`] when the replay cannot be opened, its stream fails or
+/// its trailing gaps break the [`finish_labels`] contract.
 pub fn label_window<H>(
     history: &H,
     window: ReplayWindow,
@@ -324,7 +381,7 @@ where
         on_record,
         &mut on_label,
     )?;
-    finish_labels(&mut labeler, &trailing_gaps(&stream), on_label);
+    finish_labels(&mut labeler, &trailing_gaps(&stream), on_label)?;
     report.labels = labeler.stats();
     Ok((provenance, report))
 }
@@ -637,7 +694,7 @@ mod tests {
             |label| labels.push(label),
         )
         .unwrap();
-        finish_labels(&mut labeler, trailing, |label| labels.push(label));
+        finish_labels(&mut labeler, trailing, |label| labels.push(label)).unwrap();
         report.labels = labeler.stats();
         Labeled {
             records,
@@ -675,7 +732,8 @@ mod tests {
         finish_labels(&mut labeler, trailing, |label| {
             labels.push(label);
             emitted_at.push(tape.len());
-        });
+        })
+        .unwrap();
         Labeled {
             records,
             labels,
@@ -822,6 +880,73 @@ mod tests {
         assert_ne!(renamed, plain.labels);
         assert_eq!(with_trades.labels, renamed);
         assert_eq!(with_trades.records, plain.records);
+    }
+
+    #[test]
+    fn finish_labels_refuses_a_trades_trailing_gap_that_breaks_the_contract() {
+        let tape = walk(3);
+        let last_trade = tape
+            .iter()
+            .rev()
+            .find(|event| matches!(event, MarketEvent::Trade(_)))
+            .unwrap()
+            .time()
+            .as_millis();
+        let plain = label_whole(&tape, &[]);
+        let drive = || {
+            let mut engine = MarketStateEngine::new();
+            let mut sampler = ContextSampler::new(None);
+            let mut labeler = ForwardLabeler::new();
+            let mut labels = Vec::new();
+            label_contexts(
+                &mut feed(&tape),
+                &mut engine,
+                &mut sampler,
+                &mut labeler,
+                |_| {},
+                |_| {},
+                |label| labels.push(label),
+            )
+            .unwrap();
+            (labeler, labels)
+        };
+        // Past the last trade (a late start), inverted (the engine's
+        // InvalidGap), and sorting before the last trade: each would skip
+        // the engine's checks. The late start alone would close the
+        // windows ending before it as fully covered, where the end of the
+        // data censors them at the last trade.
+        for gap in [
+            trades_gap(
+                Stream::Trades,
+                last_trade + 30 * MINUTE,
+                last_trade + 2 * HOUR,
+            ),
+            trades_gap(Stream::Trades, last_trade + 2 * HOUR, last_trade + HOUR),
+            trades_gap(Stream::Trades, last_trade - HOUR, last_trade - 30 * MINUTE),
+        ] {
+            let (mut labeler, mut labels) = drive();
+            let before = labeler.clone();
+            let error = finish_labels(&mut labeler, &[gap], |label| labels.push(label))
+                .expect_err("a broken trailing gap");
+            assert!(matches!(error, ProviderError::Contract(_)), "{error}");
+            // The labeler is untouched: ending it without the gap gives the
+            // end-of-data labels.
+            assert_eq!(labeler, before);
+            finish_labels(&mut labeler, &[], |label| labels.push(label)).unwrap();
+            assert_eq!(labels, plain.labels, "{gap:?}");
+        }
+        // One opened earlier than the last trade only censors more: let
+        // through, like the D6 one opened at it.
+        let early = trades_gap(Stream::Trades, last_trade - MINUTE, last_trade + HOUR);
+        let censored = label_whole(&tape, &[early]);
+        assert_eq!(censored.labels.len(), plain.labels.len());
+        // Every trades entry is checked before the labeler sees one.
+        let (mut labeler, _) = drive();
+        let before = labeler.clone();
+        let valid = trades_gap(Stream::Trades, last_trade, last_trade + HOUR);
+        let late = trades_gap(Stream::Trades, last_trade + 2 * HOUR, last_trade + 3 * HOUR);
+        assert!(finish_labels(&mut labeler, &[valid, late], |_| {}).is_err());
+        assert_eq!(labeler, before);
     }
 
     #[test]

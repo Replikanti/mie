@@ -810,7 +810,8 @@ impl Run {
     /// Ends the replay with its trailing gaps and compares the counts.
     fn finish(&mut self, trailing: &[FeedGap]) {
         let mut labels = Vec::new();
-        finish_labels(&mut self.labeler, trailing, |label| labels.push(label));
+        finish_labels(&mut self.labeler, trailing, |label| labels.push(label))
+            .expect("the trailing gaps keep the driver contract (ADR-055 D6)");
         let mut expected = Vec::new();
         self.model.finish(trailing, &mut expected);
         self.compare("finish", &labels, &expected);

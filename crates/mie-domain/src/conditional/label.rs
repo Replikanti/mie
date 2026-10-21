@@ -801,6 +801,15 @@ impl ForwardLabeler {
         self.stats
     }
 
+    /// The time up to which the trades are known complete, where
+    /// [`finish`](Self::finish) censors (ADR-055 D6): the last accepted
+    /// trades-stream event's time or, with none, the oldest unemitted
+    /// label's decision. `None` with neither.
+    pub fn trades_known_until(&self) -> Option<EventTime> {
+        self.trades_until
+            .or_else(|| self.labels.front().map(|open| open.label.event.time))
+    }
+
     /// Opens the label of `record`, which the sampler emitted at the event
     /// just passed to [`observe`](Self::observe).
     pub fn open(&mut self, record: &ContextRecord) {
@@ -960,10 +969,7 @@ impl ForwardLabeler {
     /// ending at or before that event was closed when it was observed, and
     /// the censor reaches every later one.
     pub fn finish(&mut self, mut emit: impl FnMut(ForwardLabel)) {
-        let known = self
-            .trades_until
-            .or_else(|| self.labels.front().map(|open| open.label.event.time));
-        if let Some(known) = known {
+        if let Some(known) = self.trades_known_until() {
             self.censor(known, CensorReason::EndOfData);
         }
         self.emit_complete(&mut emit, true);
