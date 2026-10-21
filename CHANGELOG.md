@@ -12,6 +12,42 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
 
 ### Added
 
+- **Forward outcome labels (ADR-055, proposed; part of #26).** The new
+  domain module `mie_domain::conditional::label` labels every ADR-054
+  context record from the trades strictly after its decision event, in
+  canonical order, with the record's `trade.last_price@1` as the reference
+  and its `volatility.atr.1h@1` as the scale. `ForwardLabeler` emits one
+  `ForwardLabel` per record, in record order, keyed `(event, ordinal)`: per
+  horizon (5m, 15m, 1h, 4h, 1d) a race between barriers at reference ±
+  b_H · ATR with b_H = √(π · H / 32 h) (`BARRIER_MULTIPLE_E5`, a null mean
+  exit time of H/4), ties to the earlier trade id with a `same_ms` flag, the
+  up and down excursions with the time of the earliest trade at each, the
+  last trade, and a `clear` flag that thins each stream to disjoint
+  windows; for trigger records, first passages within 1d to the evidence's
+  level and extreme (`evidence_prices`). Trades gaps, a stale reference,
+  rejected trades-stream events and the end of data censor what was not
+  resolved strictly before the censor time, closed windows of a label not
+  yet emitted included (a trades outage is silent until trades resume, so
+  a complete label is emitted only after a trades-stream event at or after
+  its 1d end or 1d censor); no label is dropped, and an emitted label is never reopened (late gaps are
+  counted in `LabelStats.reach_backs`). A rejected trades-stream event
+  never extends the known trades coverage but may shorten it: it censors
+  at the earlier of its own time and the last accepted trades-stream
+  event (`Rejected`), closes no window and counts for no emission, so a
+  time jump at the end of the data no longer reports the windows before
+  it as fully covered, and an out-of-order trade still cuts the races won
+  after its time. The end of the data censors at
+  the last accepted trades-stream event, not at the last event of any
+  stream, so every label comes out once, in record order, however the data
+  ends; the M2 replay driver passes only the trades-stream trailing gaps to
+  the labeler, then `finish`.
+  `LabelProvenance` adds the labeling
+  `conditional.labels@1` and its fingerprint to the records' provenance.
+  `tools/check-architecture.sh` now rejects any core file outside the
+  labeler and its replay driver that names a label, also through a renamed,
+  grouped or `super`/`self` import, and probes its own scan first. No engine, catalog,
+  state-hash or record change. The replay driver and the measurement tool
+  follow in M2.
 - **ADR-054 is `accepted` (#25 M3).** The *Accept when* measurement on the
   #12 year and the ADR-051 R0 live store passed: 603 323 345 events, 0
   mismatches against the independent model, 0 grid violations, every

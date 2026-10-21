@@ -39,8 +39,14 @@
 //! No type, field or `Display` text says bullish, bearish, long, short,
 //! signal, reversal, continuation or entry, and nothing carries an
 //! execution meaning (ADR-010, ADR-054 D1).
+//!
+//! The forward outcome labels of these records live in [`label`] (ADR-055,
+//! proposed), deliberately without a re-export: every use names the
+//! module path, which `tools/check-architecture.sh` confines to the labeler
+//! and its replay driver, so no feature can read a label.
 
 pub mod episode;
+pub mod label;
 pub mod snapshot;
 
 pub use episode::{
@@ -368,7 +374,7 @@ impl ContextSampler {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::candidate::CandidateEvent;
     use crate::event::samples::t;
@@ -445,7 +451,7 @@ mod tests {
         "entry",
     ];
 
-    fn forbidden_in(line: &str) -> Option<&'static str> {
+    pub(crate) fn forbidden_in(line: &str) -> Option<&'static str> {
         let lower = line.to_lowercase();
         FORBIDDEN.into_iter().find(|word| lower.contains(word))
     }
