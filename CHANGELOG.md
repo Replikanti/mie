@@ -31,10 +31,12 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   a complete label is emitted only after a trades-stream event at or after
   its 1d end or 1d censor); no label is dropped, and an emitted label is never reopened (late gaps are
   counted in `LabelStats.reach_backs`). A rejected trades-stream event
-  carries no information, its time included: it censors at the last
-  accepted trades-stream event (`Rejected`), closes no window and counts
-  for no emission, so a time jump at the end of the data no longer reports
-  the windows before it as fully covered. The end of the data censors at
+  never extends the known trades coverage but may shorten it: it censors
+  at the earlier of its own time and the last accepted trades-stream
+  event (`Rejected`), closes no window and counts for no emission, so a
+  time jump at the end of the data no longer reports the windows before
+  it as fully covered, and an out-of-order trade still cuts the races won
+  after its time. The end of the data censors at
   the last accepted trades-stream event, not at the last event of any
   stream, so every label comes out once, in record order, however the data
   ends; the M2 replay driver passes only the trades-stream trailing gaps to

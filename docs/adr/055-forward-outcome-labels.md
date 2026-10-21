@@ -229,39 +229,52 @@ is unknown.
   whole label is censored at the decision (`StaleReference`): the path from
   the reference to the decision is unknown.
 - **Rejected trades-stream event.** The driver reports a rejected event to
-  the labeler. A rejected event carries no information, its time
-  included. One on the trades stream censors the labels not yet emitted
-  at that moment at c = max(the last accepted trades-stream event's time,
-  decision time) (`Rejected`; with no accepted trades-stream event yet, c
-  is the decision time), closed windows included, like a trades gap: the
-  engine refused data the path needs, so nothing after the last data it
-  accepted is known. It closes no window, does not move the trades-stream
-  time that emission and the end of data use (below), and counts for no
-  emission. A label it completes is emitted at the next `observe` or
-  `finish`. Rejections of other streams are ignored.
-  - *Why not its own time:* a rejected trades-stream event can carry any
-    time: before the last accepted event (`OutOfOrder`), a repeated or
-    regressing exchange id at any later time, an overflow, an inverted gap
-    ordered at its end, or a time jump more than `MAX_BARS_PER_EVENT` =
-    44 640 one-minute bars (31 days) ahead (ADR-031). The engine refused
-    the event, so its time is not evidence that the trades are complete up
-    to it, and only the accepted trades-stream events bound what is known
-    (the end-of-data rule below rests on the same fact).
-  - *Rejected alternative: censor at the rejected event's time*, max(its
-    time, decision time), which #26's plan first worded as "censored at its
-    time". A time jump refutes it: a decision trade at T0, one accepted
-    trade at T0 + 1 s, then a trade rejected as a time jump at T0 + 32 d.
-    The censor at T0 + 32 d reaches no window, and treating that time as
-    known coverage closes all five windows as fully covered: every horizon
-    comes out `Neither`, uncensored, from one second of trades, while the
-    same data without the rejected trade gives `EndOfData` at T0 + 1 s. A
-    time jump stops the replay or session (the engine's recovery rule), so
-    it is the last trades-stream event in practice and would turn up to a
-    day of unobserved path of every open label into "neither barrier was
-    touched". At its own time a rejection either says nothing (dated
-    earlier than the last accepted event) or claims coverage nobody
-    observed (dated later); at the last accepted event it says exactly
-    what is known, for every kind.
+  the labeler. **A rejection never extends the known trades coverage; it
+  may shorten it.** One on the trades stream, with time t, censors the
+  labels not yet emitted at that moment at
+  c = max(decision time, min(t, the last accepted trades-stream event's
+  time)) (`Rejected`; with no accepted trades-stream event yet, c is the
+  decision time), closed windows included, like a trades gap: the engine
+  refused data the path may need. It closes no window, does not move the
+  trades-stream time that emission and the end of data use (below), and
+  counts for no emission. A label it completes is emitted at the next
+  `observe` or `finish`. A c before the latest until of the emitted labels
+  reaches back (Late gaps, below). Rejections of other streams are
+  ignored.
+  - *Why the minimum:* a rejected trades-stream event can carry any time:
+    before the last accepted event (`OutOfOrder`; an inverted gap ordered
+    at its end), or at any later time (a repeated or regressing exchange
+    id, an overflow, or a time jump more than `MAX_BARS_PER_EVENT` =
+    44 640 one-minute bars (31 days) ahead, ADR-031). Dated later than the
+    last accepted trades-stream event, it proves nothing past that event:
+    the engine refused it, so its time is no evidence that the trades are
+    complete up to it, and only accepted trades-stream events bound what
+    is known (the end-of-data rule below rests on the same fact). Dated
+    earlier, the refused trade may have been in the path from t on, and
+    may have touched the other barrier first, so the races resolved in
+    [t, last accepted event) are not trustworthy. A bogus early t only
+    censors more, it never claims coverage.
+  - *Rejected alternative: censor at the rejected event's time*,
+    max(t, decision time), which #26's plan first worded as "censored at
+    its time". A time jump refutes it: a decision trade at T0, one
+    accepted trade at T0 + 1 s, then a trade rejected as a time jump at
+    T0 + 32 d. The censor at T0 + 32 d reaches no window, and treating that
+    time as known coverage closes all five windows as fully covered: every
+    horizon comes out `Neither`, uncensored, from one second of trades,
+    while the same data without the rejected trade gives `EndOfData` at
+    T0 + 1 s. A time jump stops the replay or session (the engine's
+    recovery rule), so it is the last trades-stream event in practice and
+    would turn up to a day of unobserved path of every open label into
+    "neither barrier was touched".
+  - *Rejected alternative: censor at the last accepted trades-stream event
+    whatever t is.* An out-of-order trade refutes it: accepted trades at
+    T0 + 10 m (the decision) and T0 + 11 m, the 5m upper barrier touched
+    at T0 + 10 m 30 s, then a trade refused as out of order at T0 + 1.5 s.
+    Censored at T0 + 11 m, the race keeps `Upper`, although the refused
+    trade, had it been in the path, could have touched the lower barrier
+    first; censored at max(T0 + 1.5 s, decision) = T0 + 10 m, it is
+    `Censored`. That rule also counted no reach-back for a rejection dated
+    inside an emitted label's window.
 - **End of data.** `finish()` censors every label not yet emitted at
   c = max(the last accepted trades-stream event's time, decision time)
   (`EndOfData`), closed windows included, like a trades gap. The last
@@ -345,18 +358,18 @@ is unknown.
   - *Where the guarantee does not hold, the cause reaches back* (below):
     a live hold-back `LateEvent` gap that stands in for a late trade
     (ADR-028 decision 6) starts at that trade's own time, which can lie
-    before trades already released; and any provider that breaks the
-    ADR-028 contract. A rejected trades-stream event never reaches back:
-    it censors at the last accepted trades-stream event, which no emitted
-    label's until is later than.
+    before trades already released; a rejected trades-stream event dated
+    before the last accepted one (out of order); and any provider that
+    breaks the ADR-028 contract.
   - *Cost:* a complete label is held until the trades stream resumes; a
     record's own 1d censor makes its until earlier, so a gap that censors
     the 1d window emits the label at once (D11 states the memory bound).
 - **Late gaps after emission.** From its emission on a label is
   immutable, like a closed bar (ADR-031); before that every censor above
-  still reaches all its windows. A trades gap whose start falls before the
-  latest until of the emitted labels reaches back into at least one of
-  them. It does not reopen
+  still reaches all its windows. A trades gap whose start, or a rejected
+  trades-stream event whose min(t, last accepted trades-stream event),
+  falls before the latest until of the emitted labels reaches back into
+  at least one of them. It does not reopen
   any label; it is counted once in `LabelStats.reach_backs`. Unemitted
   labels it reaches are censored as above.
 - **`Neither` is an outcome, not censoring:** the window closed with full
@@ -569,8 +582,12 @@ There is no other number.
 - **A rejected trades-stream event censoring at its own time.** Its time
   is the one value the engine refused; a time jump at the end of the data
   then reported up to a day of unobserved path of every open label as
-  fully covered (D6). Rejected: a rejection censors at the last accepted
-  trades-stream event.
+  fully covered (D6). Rejected.
+- **A rejected trades-stream event censoring at the last accepted one
+  whatever its time.** An out-of-order trade dated earlier then left races
+  won after its time standing (D6). Rejected: a rejection censors at the
+  earlier of its time and the last accepted trades-stream event, so it
+  never extends the known coverage and may shorten it.
 - **One label per event.** Two joins for #27 (D1). Rejected.
 - **Passages in a follow-up issue.** The issue names level revisit and
   invalidation; as neutral passages they need no hypothesis (D8). Rejected.
