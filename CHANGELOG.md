@@ -12,6 +12,38 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
 
 ### Added
 
+- **The labeling driver and the measurement tool (ADR-055 D6, D11,
+  proposed; part of #26).** `mie_app::conditional::label_contexts` adds
+  the `ForwardLabeler` to the guarded sampling drive in the D11 order: an
+  accepted event goes to the labeler first, then to the sampler, whose
+  records are opened as labels before they reach their sink; a rejected
+  event goes to `ForwardLabeler::reject` only, so it never opens or feeds
+  a label, and on the trades stream it censors. The engine, the sampler
+  and the labeler are the caller's, so one drive per event equals one over
+  the stream. `finish_labels` ends a replay as D6 states the driver
+  contract: the provider's trades-stream trailing gaps to `observe`, in
+  canonical order, no other stream's, then `finish`; it fails closed with
+  `ProviderError::Contract`, labeler untouched, on a trades entry that is
+  inverted, starts after the trades known up to then or ends before them
+  (the entries skip the engine's checks). `label_window` opens
+  a replay window with its `LabelProvenance` (data version, engine key,
+  both policy fingerprints), takes the provider's trailing gaps through a
+  closure (they are reported out of band, not through the port), and
+  labels only the records of a record window while every event up to the
+  window's end still feeds the labels, so the last records get their
+  lookahead. New ignored tests `measure_labels` (the archive, checking
+  every trigger record's label and the hourly baselines') and
+  `measure_labels_live` (each cleanly ended live run, every label) in
+  `crates/mie-cli/tests/label_measure.rs` check the labels against an
+  independent streaming model of ADR-055 D1–D9, including each label's
+  emission point, assert completeness, and report the per-horizon
+  `Neither` share next to the 0.92 % null prediction, the censored shares
+  per reason, the unavailable and `same_ms` races, the clear counts, the
+  reach-backs, the wall time and the peak RSS for M3; their CI twin runs
+  on the seeded three-week tape with a same-millisecond burst, a late
+  trades gap and three kinds of rejected trade. No engine, catalog,
+  state-hash or record change; the labeler only gains the read-only
+  `ForwardLabeler::trades_known_until`.
 - **Forward outcome labels (ADR-055, proposed; part of #26).** The new
   domain module `mie_domain::conditional::label` labels every ADR-054
   context record from the trades strictly after its decision event, in
