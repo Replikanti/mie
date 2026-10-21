@@ -1,6 +1,9 @@
 # ADR-055: Forward outcome labels — ATR-scaled barrier races, excursions and passages from the trades after the decision
 
 - Status: proposed
+- Measured: 2026-10-21 (M3, see *Measurement*); not accepted, the `Neither`
+  share misses the D4 prediction by 7 to 18 times; labeling v2 is tracked in
+  #151
 - Date: 2026-10-20
 
 ## Context
@@ -617,3 +620,86 @@ on the ADR-051 R0 live store:
   fixed.
 - **Reachability:** every criterion runs on stores that exist today: the
   #12 year is imported, and the R0 live store holds a cleanly ended run.
+
+## Measurement
+
+Measured 2026-10-21; **not accepted**. Both runs used the `label_measure`
+ignored tests (`measure_labels`, `measure_labels_live`) of main `b13318c`
+(M2), release build, each under an 8 GB memory cap (and a 400 % CPU cap), with
+the engine key `4c844593779da2e3-1`, the sampling policy
+`conditional.sampling@1`, fingerprint `2c71fff23e8b0415`, and the labeling
+policy `conditional.labels@1`, fingerprint `604b624cc2522df9`. The year run
+covered 2025-10-01 00:00 UTC (inclusive) to 2026-10-01 00:00 UTC
+(exclusive), the window `1759276800000..1790812800000` ms, with
+`MIE_MEASURE_EVENTS=603323345`; its provenance data version is
+`5d9e27f862ac54dd93cff904458e9ee92767d5105a9d13a144351cba069f224d`. The live
+run replayed ADR-051's R0 live store, the one cleanly ended run
+`20261016T225606Z`, with the data version
+`9348410a56c0d05d469f3f7e78c1c405d80db333d9d34df694b45ce256caca2d`. Every
+number below is from these two runs.
+
+**Criteria**, each checked against the printed reports:
+
+- **T0 (asserted): met.** The year replayed 603 323 345 events, the
+  expected count, with 0 rejections and no trailing gaps; 0 mismatches
+  (order 0) in 44 855 of 561 695 labels checked (every trigger record's
+  label plus the baseline labels at whole UTC hours). The live run: 2 042 225
+  events, 0 rejections, 0 mismatches (order 0) in 2 185 of 2 185 labels.
+- **Completeness (asserted): met.** 561 695 records and 561 695 labels in
+  the year (`opened` 561 695, `emitted` 561 695); 2 185 records and 2 185
+  labels on the live store (`opened` 2 185, `emitted` 2 185), 0 incomplete
+  runs.
+- **Reported, no threshold: reported** in the tables below: per horizon the
+  `Neither` share next to the 0.92 % prediction, the censored shares by
+  reason, `Unavailable`, `same_ms`, the clear counts, `reach_backs`, and the
+  cost.
+
+**Per horizon, the year** (561 695 labels). Censored windows by reason
+`gap` / `stale_reference` / `rejected` / `end_of_data`, as a share of the
+labels (counts in brackets where nonzero); clear counts are baseline /
+trigger.
+
+| H | Neither (null 0.92 %) | Censored | Unavailable | same_ms | Clear baseline / trigger |
+|---|---|---|---|---|---|
+| 5m | 91 769 (16.338 %) | 0 / 0 / 0 / 0.001 % (5) | 899 (0.160 %) | 0 | 94 333 / 25 519 |
+| 15m | 70 481 (12.548 %) | 0 / 0 / 0 / 0.003 % (17) | 899 (0.160 %) | 0 | 33 758 / 22 828 |
+| 1h | 56 372 (10.036 %) | 0 / 0 / 0 / 0.011 % (62) | 899 (0.160 %) | 0 | 8 678 / 16 654 |
+| 4h | 52 132 (9.281 %) | 0 / 0 / 0 / 0.044 % (245) | 899 (0.160 %) | 0 | 2 185 / 9 815 |
+| 1d | 34 776 (6.191 %) | 0 / 0 / 0 / 0.276 % (1 548) | 899 (0.160 %) | 0 | 365 / 3 604 |
+
+`reach_backs`: 0 in the year.
+
+**Per horizon, the live store** (2 185 labels), same columns:
+
+| H | Neither (null 0.92 %) | Censored | Unavailable | same_ms | Clear baseline / trigger |
+|---|---|---|---|---|---|
+| 5m | 143 (6.545 %) | 0.915 % (20) / 0.275 % (6) / 0 / 0.229 % (5) | 847 (38.764 %) | 0 | 373 / 82 |
+| 15m | 92 (4.211 %) | 2.838 % (62) / 0.275 % (6) / 0 / 0.778 % (17) | 847 (38.764 %) | 0 | 134 / 74 |
+| 1h | 49 (2.243 %) | 11.533 % (252) / 0.275 % (6) / 0 / 2.929 % (64) | 847 (38.764 %) | 0 | 35 / 58 |
+| 4h | 0 (0.000 %) | 40.092 % (876) / 0.275 % (6) / 0 / 4.851 % (106) | 847 (38.764 %) | 0 | 9 / 29 |
+| 1d | 0 (0.000 %) | 94.874 % (2 073) / 0.275 % (6) / 0 / 4.851 % (106) | 847 (38.764 %) | 0 | 2 / 16 |
+
+`reach_backs`: 497 on the live store. The live `Neither` shares are not
+comparable with the year's: at 4h and 1d most labels are censored (40.092 %
+and 94.874 %) and 38.764 % of the labels are `Unavailable` at every horizon.
+
+**Cost.** The year run took a process wall time of 1:26:36 (the tool reports
+5 196.5 s) at a peak RSS of 1 474 508 kB, for 603 323 345 events; ADR-054's
+sampling-only year run took 58:00.25 at 425 684 kB. The live run took a
+process wall time of 1:13.12 (the tool reports 42.1 s) at a peak RSS of
+6 248 076 kB, against 1:13.90 and 6 248 084 kB for ADR-054's live run, the
+6.1 GB that ADR-053's Acceptance records for `LiveReplay::run_replay`
+collecting a whole run (#140).
+
+**Verdict.** T0 and completeness are met. The `Neither` share misses the
+0.92 % prediction of D4 by 7 to 18 times in the year (16.338 / 12.548 /
+10.036 / 9.281 / 6.191 % at 5m / 15m / 1h / 4h / 1d, that is 17.8 / 13.6 /
+10.9 / 10.1 / 6.7 times), and at 5m and 15m it exceeds the 10.8 % that D4
+lists under "what breaks" (a mean exit time of H/2). The share falls
+monotonically as H grows; this is recorded as an observation, no mechanism
+is asserted here. Per *Consequences*, a large miss means a new labeling
+version from a stated reason, not a refit (no hold-out is left, ADR-053
+D7), so this ADR is **not accepted** and stays `proposed`. The labeling
+version that follows is tracked in #151. Upper-vs-lower shares, excursion
+and time quantiles and any split by trigger, regime or location are
+deliberately not reported (*Accept when*).
