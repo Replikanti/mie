@@ -28,7 +28,10 @@
 //!
 //! [`conditional`] drives the context sampler of ADR-054 through
 //! [`drive_tolerant_observed`] for accepted events only, and opens a replay
-//! window with its provenance (#25).
+//! window with its provenance (#25). In replay only, it labels the
+//! sampler's records with the forward outcomes of ADR-055 in the same
+//! drive, ends a replay with the provider's trades-stream trailing gaps,
+//! and labels a record window with the events after it as lookahead (#26).
 
 pub mod conditional;
 pub mod equivalence;
