@@ -12,6 +12,16 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
 
 ### Added
 
+- **ADR-055 is measured and not accepted (#26 M3).** The *Accept when*
+  measurement on the #12 year and the ADR-051 R0 live store met T0 (0
+  mismatches in 44 855 of 561 695 labels checked in the year, 2 185 of 2 185
+  on the live store) and completeness (one label per record, 561 695 and
+  2 185). The `Neither` share misses D4's 0.92 % Brownian-null prediction by
+  7 to 18 times (16.338 % at 5m down to 6.191 % at 1d) and exceeds the
+  10.8 % "what breaks" level at 5m and 15m, so per the ADR's Consequences
+  the ADR stays `proposed` and a new labeling version follows (#151); no
+  refit. The ADR records the per-horizon tables, the censored shares, the
+  clear counts and the cost. No code changes.
 - **The labeling driver and the measurement tool (ADR-055 D6, D11,
   proposed; part of #26).** `mie_app::conditional::label_contexts` adds
   the `ForwardLabeler` to the guarded sampling drive in the D11 order: an
