@@ -71,9 +71,11 @@
 //!   published share, and max_H N(H) ÷ min_H N(H) against the miss bound
 //!   1.62; the standard error of its log from a circular block bootstrap
 //!   over the UTC days of the decisions (28-day blocks, 10 000 resamples,
-//!   seed 151) and whether the log-spread lies outside two of them; the
-//!   miss (both); and the shape of N over the horizons with the reason
-//!   ADR-056 *Reading of a miss* names for it. The 1h `Neither` and
+//!   seed 151, at most 2.3 % of the resamples undefined) and whether the
+//!   log-spread lies outside two of them; the miss (both); and the shape of
+//!   N over the horizons, each of its four steps a rise or a fall only
+//!   outside two bootstrap SEs of its own log-difference and flat
+//!   otherwise, with the reason ADR-056 *Reading of a miss* names for it. The 1h `Neither` and
 //!   `Unavailable` counts are printed for the comparison with ADR-055's
 //!   published ones (the 1h identity).
 //! - Recorded only, over every label: per horizon the `Neither` share of
@@ -118,8 +120,9 @@
 //! the scale cross-check held at every record, that the bootstrap's days
 //! hold exactly the counts N(H) is read from, and that `label_window` over
 //! the same tape emits the same labels. The bootstrap itself (its
-//! generator, its seed and its width under serial dependence) and the
-//! shape cases have their own tests.
+//! generator, its seed, its width under serial dependence and its limit on
+//! undefined resamples), the miss rule, the step bands and the shape cases
+//! have their own tests.
 
 mod common;
 
@@ -192,12 +195,18 @@ const MISS_RATIO: f64 = 1.62;
 
 /// ADR-056 *Accept when*: the circular block bootstrap of the spread over
 /// UTC days: the block length in days (two ATR_1d memories of 14 days),
-/// the resamples, the seed (named before the run), and the band's width
-/// in standard errors.
+/// the resamples, the seed (named before the run), and the width in
+/// standard errors of the spread's band and of each step's band.
 const BLOCK_DAYS: usize = 28;
 const RESAMPLES: usize = 10_000;
 const SEED: u64 = 151;
 const BAND_SE: f64 = 2.0;
+
+/// ADR-056 *Accept when*: at most this share of the resamples, per mille,
+/// may have an undefined log-spread (no race or no `Neither` at a horizon
+/// of the pair) for the SE to be taken over the rest: 2.3 %, the one-sided
+/// normal tail beyond the band's two SE.
+const MAX_UNDEFINED_PER_MILLE: usize = 23;
 
 /// ADR-055 *Measurement*: v1's `Neither` share of all labels in the year,
 /// per horizon, in percent.
@@ -976,26 +985,43 @@ impl SplitMix64 {
     }
 }
 
+/// The bootstrap's standard error of one log-spread, and how many of its
+/// resamples left the log-spread undefined.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Band {
+    /// `None` when more than [`MAX_UNDEFINED_PER_MILLE`] of the resamples
+    /// are undefined, or fewer than two are defined.
+    se: Option<f64>,
+    undefined: usize,
+}
+
 /// ADR-056 *Accept when*: the standard error of the log-spread
 /// ln(N(hi) ÷ N(lo)) between the horizons at `pair`, from a circular block
 /// bootstrap (Politis and Romano 1992) over the days of `daily`: each
 /// resample joins blocks of `block` consecutive days, wrapping at the end,
 /// from uniform starts until it holds as many days as the run, and sums
-/// both horizons over the same days. `None` when a resample has no race or
-/// no `Neither` at either horizon, so its log-spread is undefined.
+/// both horizons over the same days. A resample with no race or no
+/// `Neither` at either horizon has no log-spread; the SE is taken over the
+/// others while they are at most [`MAX_UNDEFINED_PER_MILLE`] of all. The
+/// draws depend on the seed and the number of days only, so every pair of
+/// one run sees the same resamples.
 fn bootstrap_se(
     daily: &Daily,
     pair: (usize, usize),
     block: usize,
     resamples: usize,
     seed: u64,
-) -> Option<f64> {
+) -> Band {
     let days = daily.ran.len();
     if days == 0 || block == 0 || resamples < 2 {
-        return None;
+        return Band {
+            se: None,
+            undefined: resamples,
+        };
     }
     let mut rng = SplitMix64(seed);
     let mut spreads = Vec::with_capacity(resamples);
+    let mut undefined = 0;
     for _ in 0..resamples {
         let mut sums = [0_u64; 4];
         let mut filled = 0;
@@ -1012,50 +1038,123 @@ fn bootstrap_se(
             filled += take;
         }
         if sums.contains(&0) {
-            return None;
+            undefined += 1;
+            continue;
         }
         let share = |neither: u64, ran: u64| neither as f64 / ran as f64;
         spreads.push((share(sums[0], sums[1]) / share(sums[2], sums[3])).ln());
     }
-    let mean = spreads.iter().sum::<f64>() / resamples as f64;
+    let defined = spreads.len();
+    if !bootstrap_limit_holds(undefined, resamples) || defined < 2 {
+        return Band {
+            se: None,
+            undefined,
+        };
+    }
+    let mean = spreads.iter().sum::<f64>() / defined as f64;
     let squares: f64 = spreads.iter().map(|s| (s - mean) * (s - mean)).sum();
-    Some((squares / (resamples - 1) as f64).sqrt())
+    Band {
+        se: Some((squares / (defined - 1) as f64).sqrt()),
+        undefined,
+    }
 }
 
-/// ADR-056 *Reading of a miss*: the shape of N over the five horizons,
-/// shortest first, from the signs of its four steps, and the reason it
-/// names. Every sign sequence falls in exactly one case.
-fn shape(shares: &[f64; 5]) -> String {
-    let steps: Vec<std::cmp::Ordering> = shares
-        .windows(2)
-        .map(|pair| {
-            pair[1]
-                .partial_cmp(&pair[0])
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
-        .collect();
-    let rises = steps.iter().take_while(|step| step.is_gt()).count();
-    let falls = steps.iter().take_while(|step| step.is_lt()).count();
-    let rest =
-        |from: usize, ordering: std::cmp::Ordering| steps[from..].iter().all(|s| *s == ordering);
-    if falls == 4 {
-        "monotone fall: jumps".to_owned()
-    } else if rises == 4 {
-        "monotone rise: finite volatility memory".to_owned()
-    } else if rises > 0 && rest(rises, std::cmp::Ordering::Less) {
-        let reason = if rises == 1 {
-            "intraday sessions"
+/// ADR-056 *Accept when*: at most [`MAX_UNDEFINED_PER_MILLE`] of the
+/// `resamples` are undefined.
+fn bootstrap_limit_holds(undefined: usize, resamples: usize) -> bool {
+    undefined * 1000 <= resamples * MAX_UNDEFINED_PER_MILLE
+}
+
+/// ADR-056 *Accept when*: a log-difference lies outside its band when it
+/// exceeds [`BAND_SE`] standard errors; an undefined SE (more undefined
+/// resamples than the limit) counts as outside.
+fn outside(log_difference: f64, se: Option<f64>) -> bool {
+    se.is_none_or(|se| log_difference.abs() > BAND_SE * se)
+}
+
+/// ADR-056 *Miss criterion*: not accepted when max ÷ min exceeds
+/// [`MISS_RATIO`] and its log lies outside the spread's band; either
+/// alone does not miss.
+fn miss(ratio: f64, se: Option<f64>) -> bool {
+    ratio > MISS_RATIO && outside(ratio.ln(), se)
+}
+
+/// One step of N between adjacent horizons, read against its own band.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Step {
+    Rise,
+    Fall,
+    Flat,
+}
+
+impl Step {
+    /// ADR-056 *Reading of a miss*: the step from N = `from` to N = `to`
+    /// rises or falls only outside its band, else it is flat. Equal shares
+    /// (both 0 included) are flat; a step from or to 0 has an infinite log
+    /// and is read by its sign against the band.
+    fn of(from: f64, to: f64, se: Option<f64>) -> Self {
+        if from == to {
+            return Self::Flat;
+        }
+        let log_difference = to.ln() - from.ln();
+        if !outside(log_difference, se) {
+            Self::Flat
+        } else if log_difference > 0.0 {
+            Self::Rise
         } else {
-            "24 h seasonality"
-        };
-        format!("interior peak at {}: {reason}", HORIZONS[rises])
-    } else if falls > 0 && rest(falls, std::cmp::Ordering::Greater) {
-        format!(
-            "interior trough at {}: jumps and finite volatility memory",
-            HORIZONS[falls]
-        )
+            Self::Fall
+        }
+    }
+
+    fn letter(self) -> char {
+        match self {
+            Self::Rise => 'U',
+            Self::Fall => 'D',
+            Self::Flat => 'F',
+        }
+    }
+}
+
+/// The four steps of N over the horizons, shortest first, each against
+/// the SE of its own log-difference.
+fn steps(shares: &[f64; 5], ses: &[Option<f64>; 4]) -> [Step; 4] {
+    std::array::from_fn(|i| Step::of(shares[i], shares[i + 1], ses[i]))
+}
+
+/// ADR-056 *Reading of a miss*: the reading the four steps of N, 5m→15m
+/// to 4h→1d, name. Each case is a set of step sequences, the sets are
+/// disjoint, and every sequence no case names is `other`.
+fn shape(steps: [Step; 4]) -> &'static str {
+    use Step::{Fall, Flat, Rise};
+    let [s0, s1, s2, s3] = steps;
+    let no_rise = !steps.contains(&Rise);
+    let no_fall = !steps.contains(&Fall);
+    let at = |step: Step| (0..4).filter(move |&i| steps[i] == step);
+    // 24 h seasonality: 5m→15m flat, rises only into 1h or 4h (steps 1, 2),
+    // falls only out of them (steps 2, 3), at least one of each, every
+    // rise before every fall.
+    let day_cycle = s0 == Flat
+        && !no_rise
+        && !no_fall
+        && at(Rise).all(|i| i == 1 || i == 2)
+        && at(Fall).all(|i| i >= 2)
+        && at(Rise).max() < at(Fall).min();
+    if s0 == Fall && no_rise {
+        "fall from 5m: jumps"
+    } else if no_fall && s1 == Rise && (s0 == Rise || s3 == Rise) {
+        "rise below 1h: finite volatility memory"
+    } else if [s0, s1] == [Flat, Flat] && s2 != Fall && s3 == Rise {
+        "rise above 1h only: the week"
+    } else if steps == [Rise, Fall, Flat, Flat] {
+        "peak at 15m: intraday sessions"
+    } else if day_cycle {
+        "peak at 1h or 4h: 24 h seasonality"
+    } else if s0 == Fall && s1 == Rise && s2 != Fall && s3 == Rise {
+        "fall from 5m, rise below 1h: jumps and finite volatility memory"
+    } else if s0 == Fall && s1 != Rise && s3 == Rise {
+        "fall from 5m, rise above 1h only: jumps and the week"
     } else {
-        "other: no pre-registered reason".to_owned()
+        "other: no pre-registered reason"
     }
 }
 
@@ -1431,20 +1530,44 @@ fn report(run: &Run, wall: Duration) {
         HORIZONS[hi.0],
         HORIZONS[lo.0]
     );
-    let se = bootstrap_se(&run.daily, (hi.0, lo.0), BLOCK_DAYS, RESAMPLES, SEED);
-    // An undefined SE counts as outside the band (ADR-056 *Accept when*).
-    let outside = se.is_none_or(|se| ratio.ln() > BAND_SE * se);
+    let band = bootstrap_se(&run.daily, (hi.0, lo.0), BLOCK_DAYS, RESAMPLES, SEED);
+    let se_text = |band: Band| {
+        let se = band
+            .se
+            .map_or_else(|| "undefined".to_owned(), |se| format!("{se:.4}"));
+        format!("{se} ({} undefined resamples)", band.undefined)
+    };
     println!(
         "noise band: circular block bootstrap over {} UTC days, block {BLOCK_DAYS} d, \
-         {RESAMPLES} resamples, seed {SEED}: SE of ln(max / min) {}; ln(max / min) {:.4}; \
-         outside the {BAND_SE}-SE band {outside}; miss {}",
+         {RESAMPLES} resamples, seed {SEED}, at most {MAX_UNDEFINED_PER_MILLE} per mille \
+         undefined: SE of ln(max / min) {}; ln(max / min) {:.4}; outside the {BAND_SE}-SE band \
+         {}; miss {}",
         run.daily.ran.len(),
-        se.map_or_else(|| "undefined".to_owned(), |se| format!("{se:.4}")),
+        se_text(band),
         ratio.ln(),
-        ratio > MISS_RATIO && outside
+        outside(ratio.ln(), band.se),
+        miss(ratio, band.se)
     );
     if let [Some(a), Some(b), Some(c), Some(d), Some(e)] = shares {
-        println!("shape: {}", shape(&[a, b, c, d, e]));
+        let shares = [a, b, c, d, e];
+        // The same resamples for every step: the draws depend on the seed
+        // and the days only.
+        let bands: [Band; 4] = std::array::from_fn(|i| {
+            bootstrap_se(&run.daily, (i + 1, i), BLOCK_DAYS, RESAMPLES, SEED)
+        });
+        let steps = steps(&shares, &bands.map(|band| band.se));
+        for (i, step) in steps.iter().enumerate() {
+            println!(
+                "  step {} -> {}: ln {:.4}, SE {}: {}",
+                HORIZONS[i],
+                HORIZONS[i + 1],
+                shares[i + 1].ln() - shares[i].ln(),
+                se_text(bands[i]),
+                step.letter()
+            );
+        }
+        let letters: String = steps.iter().map(|step| step.letter()).collect();
+        println!("shape: {letters}: {}", shape(steps));
     }
     println!("wall {:.1} s, peak RSS {}", wall.as_secs_f64(), peak_rss());
 }
@@ -1975,7 +2098,7 @@ fn the_bootstrap_is_seeded_and_widens_under_serial_dependence() {
             if h == 0 { high(day / 28 % 2 == 0) } else { 10 }
         },
     );
-    let se = |daily: &Daily, seed| bootstrap_se(daily, (0, 4), BLOCK_DAYS, RESAMPLES, seed);
+    let se = |daily: &Daily, seed| bootstrap_se(daily, (0, 4), BLOCK_DAYS, RESAMPLES, seed).se;
     // Every 28-day block of the alternating days holds 14 high days, so
     // every resample is the same: no noise. Runs of 28 high or low days
     // are what a block sees whole, so the persistent days spread.
@@ -1986,55 +2109,190 @@ fn the_bootstrap_is_seeded_and_widens_under_serial_dependence() {
     // The seed fixes every resample; another seed draws others.
     assert_eq!(se(&persistent, SEED).unwrap().to_bits(), wide.to_bits());
     assert_ne!(se(&persistent, SEED + 1).unwrap().to_bits(), wide.to_bits());
-    // A resample without a `Neither` at a horizon of the pair: undefined.
+    // No `Neither` at a horizon of the pair: every resample undefined.
     let none = daily_of(364, 100, |_, h| if h == 0 { 0 } else { 10 });
-    assert_eq!(se(&none, SEED), None);
+    let band = bootstrap_se(&none, (0, 4), BLOCK_DAYS, RESAMPLES, SEED);
+    assert_eq!(
+        band,
+        Band {
+            se: None,
+            undefined: RESAMPLES
+        }
+    );
     assert_eq!(se(&Daily::default(), SEED), None);
 }
 
 #[test]
-fn every_shape_of_a_miss_has_one_reading() {
-    // ADR-056 *Reading of a miss*, including the review's two shapes.
-    let cases = [
-        ([16.0, 12.0, 10.0, 9.0, 6.0], "monotone fall: jumps"),
+fn a_few_undefined_resamples_are_dropped_and_more_leave_the_se_undefined() {
+    // ADR-056 *Accept when*: at most 2.3 % (230 of 10 000) undefined.
+    assert_eq!(MAX_UNDEFINED_PER_MILLE, 23);
+    let limit = |undefined| bootstrap_limit_holds(undefined, RESAMPLES);
+    assert!(limit(230));
+    assert!(!limit(231));
+    // Horizon 0's `Neither` falls on the first `days` days of 364 only, so
+    // a resample whose 13 blocks all miss those days has none.
+    let clustered = |days: usize| {
+        let daily = daily_of(364, 100, |day, h| match h {
+            0 if day < days => 10,
+            0 => 0,
+            _ => 10,
+        });
+        bootstrap_se(&daily, (0, 4), BLOCK_DAYS, RESAMPLES, SEED)
+    };
+    // A long cluster: a few resamples miss it, under the limit, so the SE
+    // is taken over the others.
+    let few = clustered(120);
+    assert!((1..=230).contains(&few.undefined), "{few:?}");
+    assert!(few.se.is_some_and(|se| se > 0.0), "{few:?}");
+    // One day of `Neither`: most resamples miss it.
+    let many = clustered(1);
+    assert!(many.undefined > 230, "{many:?}");
+    assert_eq!(many.se, None);
+    // An undefined SE counts as outside the band; a defined one only past
+    // two SE.
+    assert!(outside(0.01, None));
+    assert!(outside(0.5, Some(0.2)) && outside(-0.5, Some(0.2)));
+    assert!(!outside(0.4, Some(0.2)) && !outside(-0.4, Some(0.2)));
+}
+
+#[test]
+fn the_miss_needs_the_bound_and_the_band() {
+    // ln 1.7 = 0.531: outside two SE of 0.2, inside two SE of 0.3.
+    assert!(miss(1.7, Some(0.2)));
+    assert!(!miss(1.7, Some(0.3)), "inside the band");
+    // ln 1.6 = 0.470 is far outside two SE of 0.01, but within the bound.
+    assert!(!miss(1.6, Some(0.01)), "within the bound");
+    assert!(
+        !miss(MISS_RATIO, Some(0.01)),
+        "the bound itself does not miss"
+    );
+    // An undefined SE is outside the band; the bound still applies.
+    assert!(miss(1.7, None));
+    assert!(!miss(1.5, None));
+}
+
+#[test]
+fn steps_rise_or_fall_only_outside_their_band() {
+    use Step::{Fall, Flat, Rise};
+    // ln 1.2 = 0.182 against two SE of 0.05 and of 0.1.
+    assert_eq!(Step::of(10.0, 12.0, Some(0.05)), Rise);
+    assert_eq!(Step::of(12.0, 10.0, Some(0.05)), Fall);
+    assert_eq!(Step::of(10.0, 12.0, Some(0.1)), Flat);
+    assert_eq!(Step::of(12.0, 10.0, Some(0.1)), Flat);
+    // Equal shares are flat, 0 included; a step from or to 0 has an
+    // infinite log; an undefined SE reads the sign.
+    assert_eq!(Step::of(0.0, 0.0, None), Flat);
+    assert_eq!(Step::of(10.0, 10.0, None), Flat);
+    assert_eq!(Step::of(0.0, 0.1, Some(1.0)), Rise);
+    assert_eq!(Step::of(0.1, 0.0, Some(1.0)), Fall);
+    assert_eq!(Step::of(10.0, 10.1, None), Rise);
+}
+
+/// The reading of `letters`, U/D/F for rise/fall/flat, 5m→15m first.
+fn shape_of(letters: &str) -> &'static str {
+    let steps: Vec<Step> = letters
+        .chars()
+        .map(|letter| match letter {
+            'U' => Step::Rise,
+            'D' => Step::Fall,
+            _ => Step::Flat,
+        })
+        .collect();
+    shape(steps.try_into().expect("four steps"))
+}
+
+#[test]
+fn every_step_sequence_has_one_reading() {
+    // ADR-056 *Reading of a miss*: each reading's sequences, and `other`
+    // for the remaining 51 of the 81.
+    let readings: [(&str, &[&str]); 7] = [
         (
-            [6.0, 9.0, 10.0, 12.0, 16.0],
-            "monotone rise: finite volatility memory",
+            "fall from 5m: jumps",
+            &[
+                "DFFF", "DDFF", "DFDF", "DFFD", "DDDF", "DDFD", "DFDD", "DDDD",
+            ],
         ),
         (
-            [10.0, 12.0, 10.0, 9.0, 7.0],
-            "interior peak at 15m: intraday sessions",
+            "rise below 1h: finite volatility memory",
+            &["UUFF", "UUUF", "UUFU", "UUUU", "FUFU", "FUUU"],
+        ),
+        ("rise above 1h only: the week", &["FFFU", "FFUU"]),
+        ("peak at 15m: intraday sessions", &["UDFF"]),
+        (
+            "peak at 1h or 4h: 24 h seasonality",
+            &["FUDF", "FUDD", "FUFD", "FUUD", "FFUD"],
         ),
         (
-            [8.0, 9.0, 13.0, 9.0, 7.0],
-            "interior peak at 1h: 24 h seasonality",
+            "fall from 5m, rise below 1h: jumps and finite volatility memory",
+            &["DUFU", "DUUU"],
         ),
         (
-            [7.0, 8.0, 9.0, 13.0, 8.0],
-            "interior peak at 4h: 24 h seasonality",
-        ),
-        (
-            [12.0, 9.0, 8.0, 9.0, 11.5],
-            "interior trough at 1h: jumps and finite volatility memory",
-        ),
-        (
-            [12.0, 8.0, 9.0, 10.0, 11.0],
-            "interior trough at 15m: jumps and finite volatility memory",
-        ),
-        (
-            [10.0, 12.0, 9.0, 11.0, 7.0],
-            "other: no pre-registered reason",
-        ),
-        (
-            [12.0, 12.0, 10.0, 9.0, 7.0],
-            "other: no pre-registered reason",
-        ),
-        (
-            [7.0, 9.0, 10.0, 10.0, 12.0],
-            "other: no pre-registered reason",
+            "fall from 5m, rise above 1h only: jumps and the week",
+            &["DFFU", "DFUU", "DFDU", "DDFU", "DDUU", "DDDU"],
         ),
     ];
+    let mut named = 0;
+    for (reading, sequences) in readings {
+        for letters in sequences {
+            assert_eq!(shape_of(letters), reading, "{letters}");
+            named += 1;
+        }
+    }
+    assert_eq!(named, 30);
+    let mut other = 0;
+    for code in 0..81 {
+        let letters: String = (0..4)
+            .map(|k| ['U', 'D', 'F'][code / 3_usize.pow(k) % 3])
+            .collect();
+        let reading = shape_of(&letters);
+        if reading == "other: no pre-registered reason" {
+            other += 1;
+        } else {
+            assert!(
+                readings
+                    .iter()
+                    .any(|(name, sequences)| *name == reading
+                        && sequences.contains(&letters.as_str())),
+                "{letters}: {reading}"
+            );
+        }
+    }
+    assert_eq!(other, 51);
+    assert_eq!(shape_of("FFFF"), "other: no pre-registered reason");
+}
+
+#[test]
+fn noisy_shares_name_a_mechanism_only_past_their_bands() {
+    // The review's simulation (PR #153): per-horizon relative SE 1.5 times
+    // the binomial one at 10 % for 5m to 4h, 0.26 at 1d; a step's SE is
+    // the root sum of squares of its two horizons'.
+    let horizon_se = [0.015, 0.0255, 0.051, 0.102, 0.26];
+    let ses: [Option<f64>; 4] =
+        std::array::from_fn(|i| Some(f64::hypot(horizon_se[i], horizon_se[i + 1])));
+    let read = |shares: [f64; 5]| shape(steps(&shares, &ses));
+    let cases = [
+        // A flat truth with noise, including a 1d excursion past 1.62
+        // (15.9 / 9.6 = 1.66) that stays inside its step's band. Raw signs
+        // read both as an interior trough at 4h.
+        (
+            [10.2, 10.0, 9.9, 9.7, 11.5],
+            "other: no pre-registered reason",
+        ),
+        (
+            [10.1, 10.0, 9.8, 9.6, 15.9],
+            "other: no pre-registered reason",
+        ),
+        // The week on 1d only; raw signs read an interior trough at 1h.
+        ([10.1, 9.9, 9.8, 10.2, 18.5], "rise above 1h only: the week"),
+        // The week on 4h and 1d; raw signs read a monotone rise.
+        (
+            [9.9, 10.0, 10.1, 13.0, 23.0],
+            "rise above 1h only: the week",
+        ),
+        // Jumps with a flat tail; raw signs read an interior trough at 4h.
+        ([18.2, 12.9, 10.4, 9.9, 10.6], "fall from 5m: jumps"),
+    ];
     for (shares, reading) in cases {
-        assert_eq!(shape(&shares), reading, "{shares:?}");
+        assert_eq!(read(shares), reading, "{shares:?}");
     }
 }
