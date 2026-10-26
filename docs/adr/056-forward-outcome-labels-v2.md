@@ -255,7 +255,7 @@ touch it:
 | Day = UTC day of the decision | *Accept when*: the 1d horizon's bars are UTC days (ADR-031), and 1d noise is what the band is for | — (windows that cross midnight tie neighbouring days, which a block keeps together) |
 | 10 000 resamples | *Accept when*: the Monte Carlo error of an SD from B draws is 1/√(2(B − 1)), 0.71 % at 10 000, at about 10⁷ additions | 1 000: 2.2 %, the band moves by that much with the seed; more buys nothing the 1.62 bound would notice |
 | Scale memory 14 · H: 70 min (5m), 3.5 h (15m), 14 h, 56 h, 14 d | *Reading of a miss*: 14 bars of H's timeframe (D4′) | — (follows from the length) |
-| Step SE 0.03 / 0.06 / 0.11 / 0.28 in log, misreading rates 3.3 / 2.1 / 2.3 % | *Reading of a miss*: the review's shape simulation (per-horizon relative SE 1.5 times the binomial one at 10 % for 5m to 4h, 0.26 at 1d), rerun with the step bands | — (properties of the rule under the review's noise model, cited, not thresholds; the run prints the measured SEs) |
+| Step SE 0.03 / 0.06 / 0.11 / 0.28 in log, misreading rates 3.2 / 2.1 / 2.2 % | *Reading of a miss*: the review's shape simulation (per-horizon relative SE 1.5 times the binomial one at 10 % for 5m to 4h, 0.26 at 1d), rerun with the step bands | — (properties of the rule under the review's noise model, cited, not thresholds; the run prints the measured SEs) |
 | Flat steps alone within 1.62 | *Reading of a miss*: the miss bound itself, so a named reading needs the steps that cleared to carry what makes the spread a miss | Any tighter bound sends a reading to *other* while its cleared steps still make the miss on their own; none: the review's 10.7 / 10 / 10 / 10 / 6 % reads jumps for 57.9 % of its misses, from a 1d low inside the 4h→1d band |
 | 8 h funding cycle | ADR-041: the venue's funding settlement every 8 h, a fixed intraday time | — (a fact of the venue, named in the 15m reading) |
 | Seed 151, SplitMix64 | *Accept when*: the issue's number, named before the run so it cannot be chosen by its outcome; SplitMix64 (Steele, Lea and Flood 2014) is fully specified and pinned by its published seed-0 output | — (any fixed seed; another moves the SE by about the 0.71 %) |
@@ -427,8 +427,8 @@ store.
     | Peak at 15m (1) | UDFF | **Intraday sessions.** The 15m scale's memory of 3.5 h spans a session open or a funding time of the 8 h cycle while a 15m window sits on one side of it. Both sides must clear their bands (a lone rise is the previous ambiguity), and 1h on must be flat, since sessions act through the 15m scale only |
     | Peak at 1h or 4h (5) | 5m→15m flat; rises only at 15m→1h or 1h→4h, falls only at 1h→4h or 4h→1d, at least one of each, every rise before every fall (FUDF, FUDD, FUFD, FUUD, FFUD) | **24 h seasonality.** At those horizons the scale's memory (14 h, 56 h) spans about one daily cycle while the window sits in one phase of it, so ρ disperses most there; at 5m and 15m the memory follows the phase (so 5m→15m is flat), and a 1d window spans the cycle (so 1d falls back) |
     | Fall from 5m, rise below 1h (2) | 5m→15m falls; 15m→1h and 4h→1d rise; 1h→4h does not fall (DUFU, DUUU) | **Jumps and finite volatility memory together**, the first for the short end, the second for the long end; 4h→1d has to rise because a 24 h peak would make it fall. The next version addresses both, each from its own case's reason |
-    | Fall from 5m, rise above 1h only (6) | 5m→15m falls; 15m→1h does not rise; 4h→1d rises (DFFU, DFUU, DFDU, DDFU, DDUU, DDDU) | **Jumps and the week together**, each for its end, with the week case's ambiguity at the long end. The next version addresses both |
-    | Other (55) | Every other sequence, all four flat included | **No pre-registered reading.** ADR-056 is not accepted, and no reading is pre-registered for the miss. The next version needs its own new mechanism argument; it may name a listed mechanism, on that new argument and not on this table. A miss whose spread is shared by steps none of which clears its band, or lies in flat steps (next item), lands here |
+    | Fall from 5m, rise above 1h only (5) | 5m→15m falls; 15m→1h does not rise; no step falls after one that does not; 4h→1d rises (DFFU, DFUU, DDFU, DDUU, DDDU) | **Jumps and the week together**, each for its end, with the week case's ambiguity at the long end. A 1h→4h fall after a flat step (DFDU) is neither: the jump excess only shrinks with H, and the week leaves 1h→4h flat or rising. The next version addresses both |
+    | Other (56) | Every other sequence, all four flat included | **No pre-registered reading.** ADR-056 is not accepted, and no reading is pre-registered for the miss. The next version needs its own new mechanism argument; it may name a listed mechanism, on that new argument and not on this table. A miss whose spread is shared by steps none of which clears its band, or lies in flat steps (next item), lands here |
 
   - *Where the miss lies.* A case names its reading only when the miss
     lies in the steps that cleared their bands: the series rebuilt from
@@ -447,11 +447,11 @@ store.
     simulation), independent horizons, a miss by both conditions,
     200 000 draws per truth. Of the misses:
     - the week on 1d only (10 / 10 / 10 / 10 / 18 %): the week 72.9 %,
-      other 23.9 %, a wrong mechanism 3.3 % (raw signs: 36.5 %);
+      other 23.9 %, a wrong mechanism 3.2 % (raw signs: 36.5 %);
     - the week on 4h and 1d (10 / 10 / 10 / 12 / 18 %): the week 41.8 %,
       other 56.1 %, a wrong mechanism 2.1 % (raw signs: 64 %);
     - jumps with a flat tail (18 / 13 / 10.5 / 10 / 10 %): jumps 87.9 %,
-      other 9.8 %, a wrong mechanism 2.3 %, all of it jumps and the week
+      other 9.9 %, a wrong mechanism 2.2 %, all of it jumps and the week
       (97.0 % jumps without *Where the miss lies* and the falls-then-flat
       jumps steps; raw signs: jumps 28.7 %, a wrong mechanism 49.8 %);
     - a 5m excess inside the bound with a 1d low (10.7 / 10 / 10 / 10 /
@@ -460,7 +460,7 @@ store.
       falls-then-flat jumps steps);
     - a flat truth misses in 6.9 % of the draws (this model's noise is
       cruder than the AR(1) one: fixed SEs, independent horizons), and a
-      third of those misses (32.0 %) name a reading, mostly the week,
+      third of those misses (31.9 %) name a reading, mostly the week,
       because the 1d excursion that makes the miss also clears the 4h→1d
       band: 2.2 % of flat draws end in a named reading, about the step
       band's one-sided rate of 2.3 %.

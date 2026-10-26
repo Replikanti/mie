@@ -1149,6 +1149,9 @@ fn shape(steps: [Step; 4]) -> &'static str {
         .iter()
         .skip_while(|&&step| step == Fall)
         .all(|&step| step == Flat);
+    // Every fall comes before any other step: a fall after a flat step is
+    // no jump excess, and the week leaves 1h→4h flat or rising (DFDU).
+    let falls_first = at(Fall).enumerate().all(|(n, i)| n == i);
     if s0 == Fall && falls_from_5m {
         "fall from 5m: jumps"
     } else if no_fall && s1 == Rise && (s0 == Rise || s3 == Rise) {
@@ -1161,7 +1164,7 @@ fn shape(steps: [Step; 4]) -> &'static str {
         "peak at 1h or 4h: 24 h seasonality"
     } else if s0 == Fall && s1 == Rise && s2 != Fall && s3 == Rise {
         "fall from 5m, rise below 1h: jumps and finite volatility memory"
-    } else if s0 == Fall && s1 != Rise && s3 == Rise {
+    } else if s0 == Fall && s1 != Rise && s3 == Rise && falls_first {
         "fall from 5m, rise above 1h only: jumps and the week"
     } else {
         OTHER
@@ -2245,7 +2248,7 @@ fn shape_of(letters: &str) -> &'static str {
 #[test]
 fn every_step_sequence_has_one_reading() {
     // ADR-056 *Reading of a miss*: each reading's sequences, and `other`
-    // for the remaining 51 of the 81.
+    // for the remaining 56 of the 81.
     let readings: [(&str, &[&str]); 7] = [
         ("fall from 5m: jumps", &["DFFF", "DDFF", "DDDF", "DDDD"]),
         (
@@ -2264,7 +2267,7 @@ fn every_step_sequence_has_one_reading() {
         ),
         (
             "fall from 5m, rise above 1h only: jumps and the week",
-            &["DFFU", "DFUU", "DFDU", "DDFU", "DDUU", "DDDU"],
+            &["DFFU", "DFUU", "DDFU", "DDUU", "DDDU"],
         ),
     ];
     let mut named = 0;
@@ -2274,7 +2277,7 @@ fn every_step_sequence_has_one_reading() {
             named += 1;
         }
     }
-    assert_eq!(named, 26);
+    assert_eq!(named, 25);
     let mut other = 0;
     for code in 0..81 {
         let letters: String = (0..4)
@@ -2293,10 +2296,10 @@ fn every_step_sequence_has_one_reading() {
             );
         }
     }
-    assert_eq!(other, 55);
+    assert_eq!(other, 56);
     assert_eq!(shape_of("FFFF"), OTHER);
     // A fall after a flat step is no jump signature.
-    for letters in ["DFDF", "DFFD", "DDFD", "DFDD"] {
+    for letters in ["DFDF", "DFFD", "DDFD", "DFDD", "DFDU"] {
         assert_eq!(shape_of(letters), OTHER, "{letters}");
     }
 }
@@ -2332,6 +2335,10 @@ fn noisy_shares_name_a_mechanism_only_past_their_bands() {
         ([10.7, 10.0, 10.0, 10.0, 6.0], OTHER),
         // The same with 1d past its band: DFFD, a fall after flat steps.
         ([10.7, 10.0, 10.0, 10.0, 5.5], OTHER),
+        // The review's round-4 case (PR #153): the same 5m excess with a
+        // 4h trough, which no listed mechanism makes. Its misses read DFDU
+        // as jumps and the week until DFDU moved to other.
+        ([10.7, 10.0, 10.0, 6.0, 10.0], OTHER),
     ];
     let letters = |shares: [f64; 5]| -> String {
         steps(&shares, &ses)
