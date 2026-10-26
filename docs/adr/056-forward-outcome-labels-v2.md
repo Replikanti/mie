@@ -21,7 +21,9 @@ because no hold-out is left (ADR-053 D7). #151 asks for that version.
 This ADR states the mechanism, derives the barrier rule of
 `conditional.labels@2` from it, and pre-registers its prediction and the
 miss criterion before any v2 run on real data. Every step below is
-derived; no outside number is used.
+derived. The one outside number set is the review's simulation of
+serially dependent daily windows (*Accept when*), cited as the reason the
+noise floor is measured on the year rather than derived.
 
 ### The mechanism
 
@@ -60,9 +62,11 @@ derived; no outside number is used.
    time scale between 5m and 15 days (14 daily bars). Then the law of ρ_H,
    for an estimator built from 14 bars of length H, does not depend on H,
    so N(H) is the same at every H.
-5. **What can break it:** fixed-period seasonality (24 h, weekly) and
-   jumps, which are not scale free. The pre-registered reading of a miss
-   (*Accept when*) names which one.
+5. **What can break it:** what is not scale free: jumps, fixed-period
+   seasonality (intraday sessions, the 24 h cycle, the week), and a
+   characteristic time of volatility clustering. The pre-registered
+   reading of a miss (*Accept when*) maps every shape of N(H) to one of
+   them, or to none.
 
 Delivery is in two PRs under #151: this ADR (proposed, with the
 prediction) with the code and tests; then the measurement of *Accept when*
@@ -239,8 +243,16 @@ touch it:
 | Lag ratio 168 (5m) to 0.58 (1d) | Mechanism step 3: 14 h ÷ H | — (the second v1 effect) |
 | 0.92 % null `Neither` share | (4/π) e^(−π²/2), the leading term at H = 4 · mean exit time | — (stated next to the prediction, not the prediction) |
 | Prediction N(H) = 10.05 % at every H | *Accept when*: v1's 1h `Neither` count 56 372 over the 1h races that ran (561 695 labels − 899 `Unavailable` − at most 62 censored) | — (fixed by v1's published counts before the run; no constant is fitted) |
-| Miss bound 1.62 on max_H N(H) ÷ min_H N(H) | *Accept when*: √(16.338 / 6.191) = 1.6245 rounded down: v2 must remove more than half of v1's log-spread (ln 2.639 = 0.970) | ≥ 2.64 accepts a rule no flatter than v1; below about 1.38 sampling noise at 1d alone could miss a true prediction |
-| 1.38, 350 daily windows, SE 1.6 pp (16 % relative) | *Accept when*: about 350 disjoint daily windows after the warm-up; a 10 % share has SE √(0.1 · 0.9 / 350) = 1.6 pp; two SE in log, e^(2 · 0.16) ≈ 1.38 | — (the lower limit the bound must stay above) |
+| Miss bound 1.62 on max_H N(H) ÷ min_H N(H) | *Accept when*: √(16.338 / 6.191) = 1.6245 rounded down: v2 must remove more than half of v1's log-spread (ln 2.639 = 0.970) | ≥ 2.64 accepts a rule no flatter than v1; alone, without the noise band, a true prediction can exceed it from 1d noise (next rows) |
+| 1.38, 350 daily windows, SE 1.6 pp (16 % relative) | *Accept when*: the floor if the about 350 disjoint daily windows were independent: SE √(0.1 · 0.9 / 350) = 1.6 pp, two SE in log e^(2 · 0.16) ≈ 1.38 | — (not used: the windows are serially dependent, next row) |
+| 1.31 / 1.43 / 1.50 / 1.67 | *Accept when*: the review of this ADR (PR #153) simulated 350-day years with AR(1) log daily σ and a Wilder(14) ATR_1d; the 2-SE noise ratio at persistence φ = 0 / 0.8 / 0.9 / 0.95 | — (the reason the floor is measured, not derived: at φ = 0.95 it exceeds 1.62, and BTC's φ is not measured here) |
+| Noise band: ln(max ÷ min) > 2 SE | *Accept when*: two standard errors, the width the derived floor used; the SE is the bootstrap's, so it carries the year's own serial dependence | 1 SE: a flat truth clears the band about one time in six (one-sided normal, 16 %), so the 1.62 bound alone would decide most noise misses. 3 SE: a spread has to be half again as far from noise before it counts. The pair is the observed max and min, which noise pulls apart, so the band is weaker than its nominal rate: a guard beside the 1.62 bound, not a test on its own |
+| Block 28 UTC days | *Accept when*: two memories of the 1d scale; ATR_1d weighs an input k days back by (1/14)(13/14)^k, so (13/14)^14 = 35 % of its weight lies beyond 14 days and (13/14)^28 = 12.6 % beyond 28 | Below 14: blocks cut inside the scale's memory, correlated days count as independent and the band shrinks back towards the refuted binomial one. 56: 6.5 blocks a year, so the SE rests on six or seven units. Dependence longer than 28 days (volatility regimes of months) still narrows the band; the 1.62 bound is what holds then |
+| Day = UTC day of the decision | *Accept when*: the 1d horizon's bars are UTC days (ADR-031), and 1d noise is what the band is for | — (windows that cross midnight tie neighbouring days, which a block keeps together) |
+| 10 000 resamples | *Accept when*: the Monte Carlo error of an SD from B draws is 1/√(2(B − 1)), 0.71 % at 10 000, at about 10⁷ additions | 1 000: 2.2 %, the band moves by that much with the seed; more buys nothing the 1.62 bound would notice |
+| Scale memory 14 · H: 70 min (5m), 3.5 h (15m), 14 h, 56 h, 14 d | *Reading of a miss*: 14 bars of H's timeframe (D4′) | — (follows from the length) |
+| 8 h funding cycle | ADR-041: the venue's funding settlement every 8 h, a fixed intraday time | — (a fact of the venue, named in the 15m reading) |
+| Seed 151, SplitMix64 | *Accept when*: the issue's number, named before the run so it cannot be chosen by its outcome; SplitMix64 (Steele, Lea and Flood 2014) is fully specified and pinned by its published seed-0 output | — (any fixed seed; another moves the SE by about the 0.71 %) |
 | ±0.08 in the sd of log ρ | *Accept when*: under lognormal ρ at median 1, where N = 10.05 % needs an sd of 0.53, ±0.08 between horizons gives a max ÷ min of about 1.56 to 1.62 | — (what the bound allows, stated to read it) |
 | 1d passage window | ADR-055 D8: the longest horizon; unchanged by the scale | Shorter: levels of 1d evidence could not be revisited at their own scale |
 | Thinning step = H | ADR-055 D9: disjoint windows of one stream; unchanged by the scale | Shorter: clear windows overlap; longer: fewer clear records than disjointness needs |
@@ -284,7 +296,8 @@ There is no other number.
   label goldens.
 - If the prediction misses, this ADR stays `proposed` with a `- Measured:`
   line and the pre-registered reading, and the next version follows from
-  that reason, not from a refit.
+  that reason, not from a refit; in the *other* case, from a new mechanism
+  argument.
 
 ## Alternatives considered
 
@@ -332,34 +345,84 @@ store.
 - **Prediction:** N(H) = `Neither` ÷ the races that ran (`Upper` + `Lower`
   + `Neither`). N(H) = N(1h) at every H, and N(1h) is known before the run:
   10.05 % (v1's 10.036 % of all labels, over the races that ran).
-- **Miss criterion (the year):** max_H N(H) ÷ min_H N(H) > **1.62** means
-  not accepted.
-  - *Source:* √(16.338 / 6.191) = 1.6245, rounded down. The hypothesis
-    says v1's horizon dependence comes from the estimator–horizon
-    mismatch. "Comes from" is taken to mean that v2 removes more than half
-    of v1's log-spread (ln 2.639 = 0.970, so at most 0.485 remains).
-  - *What breaks:* a bound of 2.64 or more accepts a rule no flatter than
-    v1. Below about 1.38, sampling noise at 1d alone could miss a true
-    prediction: about 350 disjoint daily windows after the warm-up, so the
-    standard error of a 10 % share is 1.6 pp (16 % relative), and the bound
-    allows two standard errors, e^(2 · 0.16) ≈ 1.38.
+- **Miss criterion (the year):** not accepted when both hold:
+  max_H N(H) ÷ min_H N(H) > **1.62**, and the log-spread
+  ln(max ÷ min) lies outside the **2-SE** noise band, that is, exceeds
+  twice its standard error from the block bootstrap below. Either one
+  alone does not miss.
+  - *Source of 1.62:* √(16.338 / 6.191) = 1.6245, rounded down. The
+    hypothesis says v1's horizon dependence comes from the
+    estimator–horizon mismatch. "Comes from" is taken to mean that v2
+    removes more than half of v1's log-spread (ln 2.639 = 0.970, so at
+    most 0.485 remains).
+  - *What breaks at 1.62:* a bound of 2.64 or more accepts a rule no
+    flatter than v1. A bound alone, without the band, can miss a true
+    prediction from noise, because the noise floor is not known in
+    advance.
+  - *Why the floor is not derived:* if the about 350 disjoint daily
+    windows after the warm-up were independent, a 10 % share would have
+    a standard error of 1.6 pp (16 % relative), and two of them in log,
+    e^(2 · 0.16) ≈ 1.38, would sit safely below 1.62. They are not
+    independent: consecutive days' 1d races share most of ATR_1d's
+    14-day memory, and daily volatility is persistent, so their
+    `Neither` outcomes are positively correlated and N(1d) varies more
+    than a binomial share. The review of this ADR (PR #153) simulated
+    that: 350-day years with AR(1) log daily σ of persistence φ and a
+    Wilder(14) ATR_1d give a 2-SE noise ratio of 1.31 at φ = 0 (the
+    binomial figure), 1.43 at 0.8, 1.50 at 0.9 and 1.67 at 0.95, above
+    1.62. BTC's φ is not measured here, so the band measures the floor on
+    the year itself.
+  - *The band:* `label_measure` counts `Neither` and the races that ran
+    per horizon per UTC day of the decision, empty days included. A
+    circular block bootstrap (Politis and Romano 1992) resamples those
+    days in blocks of **28** consecutive days, wrapping at the end, from
+    uniform starts until a resample holds as many days as the year, and
+    sums the max and the min horizon over the same days, so their
+    correlation stays in. Over **10 000** resamples from SplitMix64 at
+    seed **151**, the SE is the standard deviation of
+    ln(N*(max) ÷ N*(min)). A resample without a race or a `Neither` at
+    either horizon leaves the SE undefined; that counts as outside the
+    band, since four weeks without a `Neither` at a horizon predicted at
+    10 % is not a flat N(H). Each number's source and what breaks at
+    another value are in D12′. The report prints the SE, the log-spread,
+    both conditions and the miss.
   - Under a lognormal ρ at median 1, 1.62 allows about ±0.08 of difference
     in the standard deviation of log ρ between horizons.
-- **Reading of a miss (pre-registered):**
-  - N still falls with H (5m highest): **jumps**. A jump adds its size to
-    one bar's true range whatever H is, while the diffusive range grows
+- **Reading of a miss (pre-registered):** the shape of the five N(H),
+  5m to 1d, from the signs of its four steps. Every sign sequence falls in
+  exactly one case, and `label_measure` prints which.
+  - **Monotone fall** (every step falls): **jumps**. A jump adds its size
+    to one bar's true range whatever H is, while the diffusive range grows
     with √H, so jumps inflate ATR_H, and widen the band, most at short H.
-  - The peak is at 1h or 4h: **24 h seasonality**. At those horizons the
-    scale's memory (14 h, 56 h) spans about one daily cycle while the
-    window sits in one phase of it, so ρ disperses most there; at 5m and
-    15m the memory follows the phase, and a 1d window spans the cycle.
-  - 1d highest: **weekly seasonality**. The 1d scale's memory spans two
-    weeks while a 1d window sits on a weekday or a weekend day.
+  - **Monotone rise** (every step rises): **finite volatility memory**.
+    If volatility clustering has a characteristic time, the scale's
+    memory of 14 bars (70 min at 5m, 14 days at 1d) outlasts it more the
+    longer H is, so the scale is staler, ρ disperses more and N rises at
+    every step. The week is not this reading: it acts on the 1d window
+    and at most the 4h window (a 4h scale's 56 h memory can span a weekend),
+    so it cannot raise N from 5m to 1h.
+  - **Interior peak** (rises up to one horizon, falls after it):
+    - at 15m: **intraday sessions**. The 15m scale's memory of 3.5 h
+      spans a session open or a funding time of the 8 h cycle while a 15m
+      window sits on one side of it;
+    - at 1h or 4h: **24 h seasonality**. At those horizons the scale's
+      memory (14 h, 56 h) spans about one daily cycle while the window
+      sits in one phase of it, so ρ disperses most there; at 5m and 15m
+      the memory follows the phase, and a 1d window spans the cycle.
+  - **Interior trough**, a U-shape (falls down to one horizon, rises
+    after it): **jumps and finite volatility memory together**, the first
+    for the short end, the second for the long end; the next version
+    addresses both, each from its own case's reason.
+  - **Other** (two or more turns, or a step with no change): no
+    pre-registered reason. ADR-056 is not accepted, and the next version
+    needs a new mechanism argument, not one of the readings above.
 
   The next version follows from that reason, not from a refit.
 - **Reported, no threshold:**
   - per horizon, N as a share of all labels and of the races that ran,
     next to the prediction and v1's share;
+  - the spread, the bootstrap's SE, whether each miss condition holds,
+    the miss, and the shape with its reading;
   - censored windows by reason, `Unavailable`, `same_ms`, the clear
     counts, `reach_backs`, `scale_breaks`;
   - wall time and peak RSS.

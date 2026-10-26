@@ -21,7 +21,10 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   dependent `Neither` miss (a fixed 1h bar length and 14 h memory scaled by
   √H), derives every number, and pre-registers the prediction (N(H) =
   10.05 % of the races that ran at every H, v1's measured 1h share) and the
-  miss bound (max ÷ min N(H) > 1.62) before any v2 run on real data;
+  miss criterion before any v2 run on real data: max ÷ min N(H) > 1.62 and
+  a log-spread outside two standard errors of a circular 28-day block
+  bootstrap over the year's UTC days (10 000 resamples, seed 151), with a
+  reading for every shape of a miss;
   ADR-055 is `superseded by ADR-056`. `ForwardLabeler::new` takes a
   `Labeling` (`V1`, `V2`; `CURRENT` = `V2`); under v2 it builds its own
   `BarSet` and five ATR(14) scales from the accepted events up to and
@@ -34,7 +37,8 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   built on it with bit-identical output. The `label_measure` model builds
   its own bars and Wilder ATR from the ADR-031/033 text, cross-checks its
   ATR_1h against every record's `state.atr`, and reports N(H) next to the
-  prediction and the max ÷ min spread. No v2 measurement on real data yet.
+  prediction, the max ÷ min spread, the bootstrap's SE, the miss and the
+  shape's reading. No v2 measurement on real data yet.
 - **ADR-055 is measured and not accepted (#26 M3).** The *Accept when*
   measurement on the #12 year and the ADR-051 R0 live store met T0 (0
   mismatches in 44 855 of 561 695 labels checked in the year, 2 185 of 2 185

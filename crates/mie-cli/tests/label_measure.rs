@@ -69,8 +69,13 @@
 //!   `Neither` ÷ the races that ran (upper + lower + neither), next to the
 //!   pre-registered N(1h) = 10.05 % (v1's measured 1h share) and v1's
 //!   published share, and max_H N(H) ÷ min_H N(H) against the miss bound
-//!   1.62. The 1h `Neither` and `Unavailable` counts are printed for the
-//!   comparison with ADR-055's published ones (the 1h identity).
+//!   1.62; the standard error of its log from a circular block bootstrap
+//!   over the UTC days of the decisions (28-day blocks, 10 000 resamples,
+//!   seed 151) and whether the log-spread lies outside two of them; the
+//!   miss (both); and the shape of N over the horizons with the reason
+//!   ADR-056 *Reading of a miss* names for it. The 1h `Neither` and
+//!   `Unavailable` counts are printed for the comparison with ADR-055's
+//!   published ones (the 1h identity).
 //! - Recorded only, over every label: per horizon the `Neither` share of
 //!   all labels, the shares of windows censored per reason, the unavailable
 //!   races, the `same_ms` races and the clear records per stream kind; the
@@ -110,8 +115,11 @@
 //! gap, once with the archive's selection and none. It asserts that every
 //! compared kind occurred, so T0 cannot pass vacuously, that every horizon
 //! has races with a ready scale (1d from day 15, after 15 daily bars), that
-//! the scale cross-check held at every record, and that `label_window` over
-//! the same tape emits the same labels.
+//! the scale cross-check held at every record, that the bootstrap's days
+//! hold exactly the counts N(H) is read from, and that `label_window` over
+//! the same tape emits the same labels. The bootstrap itself (its
+//! generator, its seed and its width under serial dependence) and the
+//! shape cases have their own tests.
 
 mod common;
 
@@ -178,8 +186,18 @@ const NULL_NEITHER_PERCENT: f64 = 0.92;
 /// *Measurement*).
 const PREDICTED_NEITHER_PERCENT: f64 = 10.05;
 
-/// ADR-056 *Accept when*: max_H N(H) ÷ min_H N(H) above this misses.
+/// ADR-056 *Accept when*: max_H N(H) ÷ min_H N(H) above this misses, if
+/// the spread is also outside the bootstrap's noise band.
 const MISS_RATIO: f64 = 1.62;
+
+/// ADR-056 *Accept when*: the circular block bootstrap of the spread over
+/// UTC days: the block length in days (two ATR_1d memories of 14 days),
+/// the resamples, the seed (named before the run), and the band's width
+/// in standard errors.
+const BLOCK_DAYS: usize = 28;
+const RESAMPLES: usize = 10_000;
+const SEED: u64 = 151;
+const BAND_SE: f64 = 2.0;
 
 /// ADR-055 *Measurement*: v1's `Neither` share of all labels in the year,
 /// per horizon, in percent.
@@ -913,6 +931,134 @@ struct Counts {
     clear_trigger: [u64; 5],
 }
 
+/// The same `Neither` and races-that-ran counts per UTC day of the
+/// decision, from the first label's day on, empty days included: the units
+/// the bootstrap resamples (ADR-056 *Accept when*).
+#[derive(Debug, Default)]
+struct Daily {
+    first: Option<i64>,
+    neither: Vec<[u64; 5]>,
+    ran: Vec<[u64; 5]>,
+}
+
+impl Daily {
+    /// The row of the day of `decision`; labels come in record order, so
+    /// in decision order.
+    fn row(&mut self, decision: i64) -> usize {
+        let day = decision.div_euclid(DAY_MS);
+        let first = *self.first.get_or_insert(day);
+        let row = usize::try_from(day - first).expect("labels come in decision order");
+        if row >= self.ran.len() {
+            self.neither.resize(row + 1, [0; 5]);
+            self.ran.resize(row + 1, [0; 5]);
+        }
+        row
+    }
+}
+
+/// SplitMix64 (Steele, Lea and Flood 2014): a fully specified generator,
+/// so the seed fixes every resample.
+struct SplitMix64(u64);
+
+impl SplitMix64 {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// Uniform in `0..n` from the high half of a 128-bit product (bias
+    /// below n / 2⁶⁴).
+    fn below(&mut self, n: usize) -> usize {
+        ((u128::from(self.next()) * n as u128) >> 64) as usize
+    }
+}
+
+/// ADR-056 *Accept when*: the standard error of the log-spread
+/// ln(N(hi) ÷ N(lo)) between the horizons at `pair`, from a circular block
+/// bootstrap (Politis and Romano 1992) over the days of `daily`: each
+/// resample joins blocks of `block` consecutive days, wrapping at the end,
+/// from uniform starts until it holds as many days as the run, and sums
+/// both horizons over the same days. `None` when a resample has no race or
+/// no `Neither` at either horizon, so its log-spread is undefined.
+fn bootstrap_se(
+    daily: &Daily,
+    pair: (usize, usize),
+    block: usize,
+    resamples: usize,
+    seed: u64,
+) -> Option<f64> {
+    let days = daily.ran.len();
+    if days == 0 || block == 0 || resamples < 2 {
+        return None;
+    }
+    let mut rng = SplitMix64(seed);
+    let mut spreads = Vec::with_capacity(resamples);
+    for _ in 0..resamples {
+        let mut sums = [0_u64; 4];
+        let mut filled = 0;
+        while filled < days {
+            let start = rng.below(days);
+            let take = block.min(days - filled);
+            for k in 0..take {
+                let day = (start + k) % days;
+                sums[0] += daily.neither[day][pair.0];
+                sums[1] += daily.ran[day][pair.0];
+                sums[2] += daily.neither[day][pair.1];
+                sums[3] += daily.ran[day][pair.1];
+            }
+            filled += take;
+        }
+        if sums.contains(&0) {
+            return None;
+        }
+        let share = |neither: u64, ran: u64| neither as f64 / ran as f64;
+        spreads.push((share(sums[0], sums[1]) / share(sums[2], sums[3])).ln());
+    }
+    let mean = spreads.iter().sum::<f64>() / resamples as f64;
+    let squares: f64 = spreads.iter().map(|s| (s - mean) * (s - mean)).sum();
+    Some((squares / (resamples - 1) as f64).sqrt())
+}
+
+/// ADR-056 *Reading of a miss*: the shape of N over the five horizons,
+/// shortest first, from the signs of its four steps, and the reason it
+/// names. Every sign sequence falls in exactly one case.
+fn shape(shares: &[f64; 5]) -> String {
+    let steps: Vec<std::cmp::Ordering> = shares
+        .windows(2)
+        .map(|pair| {
+            pair[1]
+                .partial_cmp(&pair[0])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .collect();
+    let rises = steps.iter().take_while(|step| step.is_gt()).count();
+    let falls = steps.iter().take_while(|step| step.is_lt()).count();
+    let rest =
+        |from: usize, ordering: std::cmp::Ordering| steps[from..].iter().all(|s| *s == ordering);
+    if falls == 4 {
+        "monotone fall: jumps".to_owned()
+    } else if rises == 4 {
+        "monotone rise: finite volatility memory".to_owned()
+    } else if rises > 0 && rest(rises, std::cmp::Ordering::Less) {
+        let reason = if rises == 1 {
+            "intraday sessions"
+        } else {
+            "24 h seasonality"
+        };
+        format!("interior peak at {}: {reason}", HORIZONS[rises])
+    } else if falls > 0 && rest(falls, std::cmp::Ordering::Greater) {
+        format!(
+            "interior trough at {}: jumps and finite volatility memory",
+            HORIZONS[falls]
+        )
+    } else {
+        "other: no pre-registered reason".to_owned()
+    }
+}
+
 /// What the checked labels showed, so T0 cannot pass vacuously.
 #[derive(Debug, Default)]
 struct Kinds {
@@ -994,6 +1140,7 @@ struct Run {
     labels: u64,
     checked: u64,
     counts: Counts,
+    daily: Daily,
     kinds: Kinds,
     /// The digest of every label's line, in order.
     digest: Fingerprinter,
@@ -1013,6 +1160,7 @@ impl Run {
             labels: 0,
             checked: 0,
             counts: Counts::default(),
+            daily: Daily::default(),
             kinds: Kinds::default(),
             digest: Fingerprinter::new(),
         }
@@ -1101,16 +1249,21 @@ impl Run {
     /// The report's counts over one label.
     fn count(&mut self, label: &ForwardLabel, baseline: bool) {
         let counts = &mut self.counts;
+        let daily = &mut self.daily;
+        let day = daily.row(label.event.time.as_millis());
         for (position, horizon) in label.horizons.iter().enumerate() {
             match horizon.race {
                 Race::Neither => {
                     counts.neither[position] += 1;
                     counts.ran[position] += 1;
+                    daily.neither[day][position] += 1;
+                    daily.ran[day][position] += 1;
                 }
                 Race::Unavailable => counts.unavailable[position] += 1,
                 Race::Upper { same_ms, .. } | Race::Lower { same_ms, .. } => {
                     counts.same_ms[position] += u64::from(same_ms);
                     counts.ran[position] += 1;
+                    daily.ran[day][position] += 1;
                 }
                 Race::Censored(_) => {}
             }
@@ -1240,7 +1393,7 @@ fn report(run: &Run, wall: Duration) {
         "prediction: N(H) = neither / races that ran (upper + lower + neither) = \
          {PREDICTED_NEITHER_PERCENT} % at every H (v1's 1h); miss when max / min > {MISS_RATIO}"
     );
-    let mut shares = Vec::new();
+    let mut shares = [None; 5];
     for (position, horizon) in HORIZONS.iter().enumerate() {
         let (neither, ran) = (counts.neither[position], counts.ran[position]);
         println!(
@@ -1250,17 +1403,49 @@ fn report(run: &Run, wall: Duration) {
             V1_NEITHER_PERCENT[position]
         );
         if ran > 0 {
-            shares.push(neither as f64 / ran as f64);
+            shares[position] = Some(neither as f64 / ran as f64);
         }
     }
-    let max = shares.iter().copied().fold(f64::NAN, f64::max);
-    let min = shares.iter().copied().fold(f64::NAN, f64::min);
+    let ran: Vec<(usize, f64)> = shares
+        .iter()
+        .enumerate()
+        .filter_map(|(position, share)| share.map(|share| (position, share)))
+        .collect();
+    let (Some(hi), Some(lo)) = (
+        ran.iter()
+            .copied()
+            .reduce(|a, b| if b.1 > a.1 { b } else { a }),
+        ran.iter()
+            .copied()
+            .reduce(|a, b| if b.1 < a.1 { b } else { a }),
+    ) else {
+        println!("spread: no horizon with races");
+        println!("wall {:.1} s, peak RSS {}", wall.as_secs_f64(), peak_rss());
+        return;
+    };
+    let ratio = hi.1 / lo.1;
     println!(
-        "spread: max / min N(H) over the {} horizons with races = {:.4} (miss bound \
-         {MISS_RATIO}; ADR-056 evaluates it on the year only)",
-        shares.len(),
-        max / min
+        "spread: max / min N(H) over the {} horizons with races = {ratio:.4} ({} / {}; miss \
+         bound {MISS_RATIO}; ADR-056 evaluates it on the year only)",
+        ran.len(),
+        HORIZONS[hi.0],
+        HORIZONS[lo.0]
     );
+    let se = bootstrap_se(&run.daily, (hi.0, lo.0), BLOCK_DAYS, RESAMPLES, SEED);
+    // An undefined SE counts as outside the band (ADR-056 *Accept when*).
+    let outside = se.is_none_or(|se| ratio.ln() > BAND_SE * se);
+    println!(
+        "noise band: circular block bootstrap over {} UTC days, block {BLOCK_DAYS} d, \
+         {RESAMPLES} resamples, seed {SEED}: SE of ln(max / min) {}; ln(max / min) {:.4}; \
+         outside the {BAND_SE}-SE band {outside}; miss {}",
+        run.daily.ran.len(),
+        se.map_or_else(|| "undefined".to_owned(), |se| format!("{se:.4}")),
+        ratio.ln(),
+        ratio > MISS_RATIO && outside
+    );
+    if let [Some(a), Some(b), Some(c), Some(d), Some(e)] = shares {
+        println!("shape: {}", shape(&[a, b, c, d, e]));
+    }
     println!("wall {:.1} s, peak RSS {}", wall.as_secs_f64(), peak_rss());
 }
 
@@ -1643,6 +1828,14 @@ fn model_reproduces_the_labeler_on_a_synthetic_tape() {
         "{first_daily}"
     );
     assert_eq!(kinds.censors[3], 0, "the trailing trades gap names the cut");
+    // The bootstrap's days hold exactly the counts N(H) is read from, over
+    // every day of the tape.
+    for position in 0..5 {
+        let sum = |rows: &[[u64; 5]]| rows.iter().map(|row| row[position]).sum::<u64>();
+        assert_eq!(sum(&full.daily.neither), full.counts.neither[position]);
+        assert_eq!(sum(&full.daily.ran), full.counts.ran[position]);
+    }
+    assert_eq!(full.daily.ran.len(), TAPE_DAYS as usize + 1);
 }
 
 #[test]
@@ -1737,4 +1930,111 @@ fn the_model_atr_follows_adr_033() {
     assert!(developing.feed_gap && developing.hlc.is_none());
     // [5, 10) anchored; [10, 15) and [15, 20) were empty and gapped: breaks.
     assert_eq!((series.atr.samples, series.atr.anchor), (0, None));
+}
+
+/// `days` of `ran` races per horizon, `neither_of(day, horizon)` of them
+/// `Neither`.
+fn daily_of(days: usize, ran: u64, neither_of: impl Fn(usize, usize) -> u64) -> Daily {
+    Daily {
+        first: Some(0),
+        neither: (0..days)
+            .map(|day| std::array::from_fn(|horizon| neither_of(day, horizon)))
+            .collect(),
+        ran: vec![[ran; 5]; days],
+    }
+}
+
+#[test]
+fn the_bootstrap_is_seeded_and_widens_under_serial_dependence() {
+    // SplitMix64's published output for seed 0.
+    let mut rng = SplitMix64(0);
+    assert_eq!(
+        [rng.next(), rng.next(), rng.next()],
+        [
+            0xE220_A839_7B1D_CDAF,
+            0x6E78_9E6A_A1B9_65F4,
+            0x06C4_5D18_8009_454F
+        ]
+    );
+    // The band's numbers are ADR-056's: two ATR_1d memories per block.
+    assert_eq!(BLOCK_DAYS, 2 * ATR_LENGTH as usize);
+    assert_eq!((RESAMPLES, SEED, BAND_SE), (10_000, 151, 2.0));
+
+    // 364 days = 13 blocks; horizon 4 is flat at 10 %, horizon 0 is 15 % or
+    // 5 % a day, with the same mean 10 % either way.
+    let high = |high: bool| if high { 15 } else { 5 };
+    let alternating = daily_of(
+        364,
+        100,
+        |day, h| if h == 0 { high(day % 2 == 0) } else { 10 },
+    );
+    let persistent = daily_of(
+        364,
+        100,
+        |day, h| {
+            if h == 0 { high(day / 28 % 2 == 0) } else { 10 }
+        },
+    );
+    let se = |daily: &Daily, seed| bootstrap_se(daily, (0, 4), BLOCK_DAYS, RESAMPLES, seed);
+    // Every 28-day block of the alternating days holds 14 high days, so
+    // every resample is the same: no noise. Runs of 28 high or low days
+    // are what a block sees whole, so the persistent days spread.
+    let flat = se(&alternating, SEED).unwrap();
+    let wide = se(&persistent, SEED).unwrap();
+    assert!(flat < 1e-9, "{flat}");
+    assert!(wide > 0.04, "{wide}");
+    // The seed fixes every resample; another seed draws others.
+    assert_eq!(se(&persistent, SEED).unwrap().to_bits(), wide.to_bits());
+    assert_ne!(se(&persistent, SEED + 1).unwrap().to_bits(), wide.to_bits());
+    // A resample without a `Neither` at a horizon of the pair: undefined.
+    let none = daily_of(364, 100, |_, h| if h == 0 { 0 } else { 10 });
+    assert_eq!(se(&none, SEED), None);
+    assert_eq!(se(&Daily::default(), SEED), None);
+}
+
+#[test]
+fn every_shape_of_a_miss_has_one_reading() {
+    // ADR-056 *Reading of a miss*, including the review's two shapes.
+    let cases = [
+        ([16.0, 12.0, 10.0, 9.0, 6.0], "monotone fall: jumps"),
+        (
+            [6.0, 9.0, 10.0, 12.0, 16.0],
+            "monotone rise: finite volatility memory",
+        ),
+        (
+            [10.0, 12.0, 10.0, 9.0, 7.0],
+            "interior peak at 15m: intraday sessions",
+        ),
+        (
+            [8.0, 9.0, 13.0, 9.0, 7.0],
+            "interior peak at 1h: 24 h seasonality",
+        ),
+        (
+            [7.0, 8.0, 9.0, 13.0, 8.0],
+            "interior peak at 4h: 24 h seasonality",
+        ),
+        (
+            [12.0, 9.0, 8.0, 9.0, 11.5],
+            "interior trough at 1h: jumps and finite volatility memory",
+        ),
+        (
+            [12.0, 8.0, 9.0, 10.0, 11.0],
+            "interior trough at 15m: jumps and finite volatility memory",
+        ),
+        (
+            [10.0, 12.0, 9.0, 11.0, 7.0],
+            "other: no pre-registered reason",
+        ),
+        (
+            [12.0, 12.0, 10.0, 9.0, 7.0],
+            "other: no pre-registered reason",
+        ),
+        (
+            [7.0, 9.0, 10.0, 10.0, 12.0],
+            "other: no pre-registered reason",
+        ),
+    ];
+    for (shares, reading) in cases {
+        assert_eq!(shape(&shares), reading, "{shares:?}");
+    }
 }
