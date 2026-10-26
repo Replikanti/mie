@@ -1,6 +1,6 @@
 //! Drives the context sampler of ADR-054 and the forward labeler of
 //! ADR-055 over a market-data provider (ADR-054 D5, D6, #25; ADR-055 D6,
-//! D11, #26).
+//! D11, #26; the barrier scale of labeling v2: ADR-056, #151).
 //!
 //! [`sample_contexts`] runs [`ContextSampler`] through the one rejection
 //! policy of long runs, [`drive_tolerant_observed`] (ADR-039 D9), and
@@ -34,7 +34,9 @@
 //! (`tools/check-architecture.sh`).
 
 use crate::drive_tolerant_observed;
-use mie_domain::conditional::label::{ForwardLabel, ForwardLabeler, LabelProvenance, LabelStats};
+use mie_domain::conditional::label::{
+    ForwardLabel, ForwardLabeler, LabelProvenance, LabelStats, Labeling,
+};
 use mie_domain::conditional::{ContextProvenance, ContextRecord, ContextSampler, SamplingStats};
 use mie_domain::event::{FeedGap, MarketEvent, Stream};
 use mie_domain::research::DataVersion;
@@ -331,9 +333,11 @@ pub fn finish_labels(
     Ok(())
 }
 
-/// Labels the replay of `window` from `history` (ADR-055 D6, D10, D11):
-/// a fresh engine, a fresh [`ContextSampler::new`]`(Some(records.start))`
-/// and a fresh [`ForwardLabeler`] observe every event of `window`, and the
+/// Labels the replay of `window` from `history` under `labeling` (ADR-055
+/// D6, D10, D11; ADR-056 for [`Labeling::V2`]): a fresh engine, a fresh
+/// [`ContextSampler::new`]`(Some(records.start))` and a fresh
+/// [`ForwardLabeler::new`]`(labeling)` observe every event of `window`, so
+/// the labeler's own bars start where the engine's do, and the
 /// records whose events fall in `records` are emitted to `on_record` and
 /// labeled to `on_label`; records outside it are neither emitted nor
 /// labeled. Events before `records.start` warm the engine and the
@@ -355,6 +359,7 @@ pub fn label_window<H>(
     history: &H,
     window: ReplayWindow,
     records: ReplayWindow,
+    labeling: Labeling,
     trailing_gaps: impl FnOnce(&H::Stream) -> Vec<FeedGap>,
     on_record: impl FnMut(ContextRecord),
     mut on_label: impl FnMut(ForwardLabel),
@@ -367,10 +372,12 @@ where
         dataset,
     } = history.replay(window)?;
     let mut engine = MarketStateEngine::new();
-    let provenance =
-        LabelProvenance::new(ContextProvenance::new(DataVersion::from(&dataset), &engine));
+    let provenance = LabelProvenance::new(
+        ContextProvenance::new(DataVersion::from(&dataset), &engine),
+        labeling,
+    );
     let mut sampler = ContextSampler::new(Some(records.start));
-    let mut labeler = ForwardLabeler::new();
+    let mut labeler = ForwardLabeler::new(labeling);
     let mut report = drive_labels(
         &mut stream,
         &mut engine,
@@ -390,7 +397,7 @@ where
 mod tests {
     use super::*;
     use mie_domain::conditional::label::{
-        Censor, CensorReason, LABELING_V1, Passage, Race, labeling_fingerprint,
+        Censor, CensorReason, LABELING_V2, Passage, Race, labeling_fingerprint,
     };
     use mie_domain::conditional::{SAMPLING_V1, Sample, policy_fingerprint};
     use mie_domain::event::{Aggressor, GapReason, MarketEvent, OpenInterest, Trade};
@@ -682,7 +689,7 @@ mod tests {
     fn label_whole(tape: &[MarketEvent], trailing: &[FeedGap]) -> Labeled {
         let mut engine = MarketStateEngine::new();
         let mut sampler = ContextSampler::new(None);
-        let mut labeler = ForwardLabeler::new();
+        let mut labeler = ForwardLabeler::new(Labeling::CURRENT);
         let (mut records, mut labels) = (Vec::new(), Vec::new());
         let mut report = label_contexts(
             &mut feed(tape),
@@ -709,7 +716,7 @@ mod tests {
     fn label_per_event(tape: &[MarketEvent], trailing: &[FeedGap]) -> Labeled {
         let mut engine = MarketStateEngine::new();
         let mut sampler = ContextSampler::new(None);
-        let mut labeler = ForwardLabeler::new();
+        let mut labeler = ForwardLabeler::new(Labeling::CURRENT);
         let (mut records, mut labels, mut emitted_at) = (Vec::new(), Vec::new(), Vec::new());
         let (mut events, mut rejections) = (0, 0);
         for (index, event) in tape.iter().enumerate() {
@@ -896,7 +903,7 @@ mod tests {
         let drive = || {
             let mut engine = MarketStateEngine::new();
             let mut sampler = ContextSampler::new(None);
-            let mut labeler = ForwardLabeler::new();
+            let mut labeler = ForwardLabeler::new(Labeling::CURRENT);
             let mut labels = Vec::new();
             label_contexts(
                 &mut feed(&tape),
@@ -962,6 +969,7 @@ mod tests {
             &history,
             window,
             window,
+            Labeling::V2,
             |_| Vec::new(),
             |record| records.push(record),
             |label| labels.push(label),
@@ -977,8 +985,11 @@ mod tests {
         );
         assert_eq!(provenance.context.policy, SAMPLING_V1);
         assert_eq!(provenance.context.policy_fingerprint, policy_fingerprint());
-        assert_eq!(provenance.labeling, LABELING_V1);
-        assert_eq!(provenance.labeling_fingerprint, labeling_fingerprint());
+        assert_eq!(provenance.labeling, LABELING_V2);
+        assert_eq!(
+            provenance.labeling_fingerprint,
+            labeling_fingerprint(Labeling::V2)
+        );
         assert_eq!(report.events, history.0.len() as u64);
         assert_eq!(report.rejections, 0);
         let count = records.len() as u64;
@@ -1011,6 +1022,7 @@ mod tests {
                 &history,
                 window,
                 records,
+                Labeling::V2,
                 |_| Vec::new(),
                 |record| taken.push(record),
                 |label| labels.push(label),

@@ -1,6 +1,6 @@
 # ADR-055: Forward outcome labels — ATR-scaled barrier races, excursions and passages from the trades after the decision
 
-- Status: proposed
+- Status: superseded by ADR-056
 - Measured: 2026-10-21 (M3, see *Measurement*); not accepted, the `Neither`
   share misses the D4 prediction by 7 to 18 times; labeling v2 is tracked in
   #151

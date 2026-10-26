@@ -118,9 +118,14 @@ enum Step {
     Reject(MarketEvent),
 }
 
-/// Runs `steps` through a fresh labeler and finishes it.
+/// Runs `steps` through a fresh v1 labeler and finishes it.
 fn run(steps: Vec<Step>) -> (Vec<ForwardLabel>, LabelStats) {
-    let mut labeler = ForwardLabeler::new();
+    run_with(Labeling::V1, steps)
+}
+
+/// Runs `steps` through a fresh labeler of `labeling` and finishes it.
+fn run_with(labeling: Labeling, steps: Vec<Step>) -> (Vec<ForwardLabel>, LabelStats) {
+    let mut labeler = ForwardLabeler::new(labeling);
     let mut labels = Vec::new();
     for step in steps {
         match step {
@@ -204,7 +209,7 @@ fn barrier_offsets_round_half_to_even() {
             let quotient = atr * multiple / MULTIPLE_SCALE;
             let expected = quotient + (quotient & 1);
             assert_eq!(
-                barrier_offset(Price::from_units(atr), position).map(Price::units),
+                barrier_offset(Price::from_units(atr), multiple).map(Price::units),
                 Some(expected).filter(|units| *units > 0),
                 "{position} {atr}"
             );
@@ -215,13 +220,19 @@ fn barrier_offsets_round_half_to_even() {
             .unwrap_or(0);
         if below > 0 {
             assert_eq!(
-                barrier_offset(Price::from_units(below), position).map(Price::units),
+                barrier_offset(Price::from_units(below), multiple).map(Price::units),
                 Some(below * multiple / MULTIPLE_SCALE).filter(|units| *units > 0)
             );
         }
     }
-    assert_eq!(barrier_offset(Price::from_units(0), 4), None);
-    assert_eq!(barrier_offset(Price::from_units(-5), 4), None);
+    assert_eq!(
+        barrier_offset(Price::from_units(0), BARRIER_MULTIPLE_E5[4]),
+        None
+    );
+    assert_eq!(
+        barrier_offset(Price::from_units(-5), BARRIER_MULTIPLE_E5[4]),
+        None
+    );
 }
 
 #[test]
@@ -1087,7 +1098,7 @@ fn trailing_gaps_of_the_driver_contract() {
 
 #[test]
 fn a_late_gap_after_emission_reaches_back_and_changes_nothing() {
-    let mut labeler = ForwardLabeler::new();
+    let mut labeler = ForwardLabeler::new(Labeling::V1);
     let mut labels = Vec::new();
     for step in decision() {
         match step {
@@ -1130,7 +1141,7 @@ fn a_late_gap_after_emission_reaches_back_and_changes_nothing() {
     // A label censored in every window is emitted by the gap itself: the
     // gap is a trades-stream event at or after its 1d censor time, so a
     // rejected trade dated before that censor only reaches back.
-    let mut labeler = ForwardLabeler::new();
+    let mut labeler = ForwardLabeler::new(Labeling::V1);
     let mut labels = Vec::new();
     for step in decision() {
         match step {
@@ -1155,7 +1166,7 @@ fn a_late_gap_after_emission_reaches_back_and_changes_nothing() {
     // A rejected trades-stream event dated at the 1d end does not count for
     // emission: it censors the label, whose windows another stream closed,
     // at the last accepted trade, and the next observation emits it there.
-    let mut labeler = ForwardLabeler::new();
+    let mut labeler = ForwardLabeler::new(Labeling::V1);
     let mut labels = Vec::new();
     for step in after_decision([
         see(trade(T0 + 1_000, 11, usdt(60_050))),
@@ -1493,7 +1504,7 @@ fn evidence_prices_follow_the_d8_table() {
     for (name, trigger, expected) in rows {
         assert_eq!(evidence_prices(&trigger), expected, "{name}");
         let record = trigger_record(golden_record, trigger);
-        let mut labeler = ForwardLabeler::new();
+        let mut labeler = ForwardLabeler::new(Labeling::V1);
         labeler.open(&record);
         let mut labels = Vec::new();
         labeler.finish(|label| labels.push(label));
@@ -1574,9 +1585,14 @@ struct Drive {
 }
 
 fn drive(tape: &[MarketEvent]) -> Drive {
+    drive_with(tape, Labeling::V1)
+}
+
+/// [`drive`] with a labeler of `labeling`.
+fn drive_with(tape: &[MarketEvent], labeling: Labeling) -> Drive {
     let mut engine = MarketStateEngine::new();
     let mut sampler = ContextSampler::new(None);
-    let mut labeler = ForwardLabeler::new();
+    let mut labeler = ForwardLabeler::new(labeling);
     let mut run = Drive {
         infos: Vec::new(),
         lines: Vec::new(),
@@ -1621,28 +1637,37 @@ struct Golden {
 
 fn golden() -> &'static Golden {
     static RUN: std::sync::OnceLock<Golden> = std::sync::OnceLock::new();
-    RUN.get_or_init(|| {
-        let tape = crate::candidate::tests::golden_tape();
-        let mut run = drive(&tape);
-        assert!(run.rejected.iter().all(Option::is_none));
-        let triggers = std::mem::take(&mut run.triggers);
-        let mut hasher = Fingerprinter::new();
-        let mut first_trigger = String::new();
-        for (_, label) in &run.labels {
-            let line = label.to_string();
-            hasher.write_str(&line);
-            if first_trigger.is_empty() && label.level.is_some() && label.atr.is_some() {
-                first_trigger = line;
-            }
+    RUN.get_or_init(|| golden_of(Labeling::V1))
+}
+
+/// [`golden`] under [`Labeling::V2`].
+fn golden_v2() -> &'static Golden {
+    static RUN: std::sync::OnceLock<Golden> = std::sync::OnceLock::new();
+    RUN.get_or_init(|| golden_of(Labeling::V2))
+}
+
+/// One drive of `labeling` over the candidate golden tape, and its golden.
+fn golden_of(labeling: Labeling) -> Golden {
+    let tape = crate::candidate::tests::golden_tape();
+    let mut run = drive_with(&tape, labeling);
+    assert!(run.rejected.iter().all(Option::is_none));
+    let triggers = std::mem::take(&mut run.triggers);
+    let mut hasher = Fingerprinter::new();
+    let mut first_trigger = String::new();
+    for (_, label) in &run.labels {
+        let line = label.to_string();
+        hasher.write_str(&line);
+        if first_trigger.is_empty() && label.level.is_some() && label.atr.is_some() {
+            first_trigger = line;
         }
-        let golden = (run.labels.len(), hasher.finish().to_string(), first_trigger);
-        Golden {
-            tape,
-            run,
-            triggers,
-            golden,
-        }
-    })
+    }
+    let golden = (run.labels.len(), hasher.finish().to_string(), first_trigger);
+    Golden {
+        tape,
+        run,
+        triggers,
+        golden,
+    }
 }
 
 // ----------------------------------------------------- the naive model
@@ -2289,7 +2314,7 @@ fn labels_match_a_naive_model_when_the_data_ends_on_a_rejection() {
 /// sampler's: each is opened after the tape event at its index, in order.
 fn drive_records(tape: &[MarketEvent], records: &[(usize, ContextRecord)]) -> Drive {
     let mut engine = MarketStateEngine::new();
-    let mut labeler = ForwardLabeler::new();
+    let mut labeler = ForwardLabeler::new(Labeling::V1);
     let mut run = Drive {
         infos: Vec::new(),
         lines: Vec::new(),
@@ -2770,11 +2795,12 @@ fn inserted(tape: &[MarketEvent], event: MarketEvent) -> Vec<MarketEvent> {
 }
 
 /// The leakage property (#26 acceptance): mutating only events after a
-/// decision event changes labels, never the records up to it or their
-/// clear flags, and leaves every label emitted before the first mutated
-/// event as it was.
-fn assert_no_leakage(tape: &[MarketEvent], cuts: &[i64]) -> usize {
-    let base = drive(tape);
+/// decision event changes labels, never the records up to it, their clear
+/// flags or their barriers (ADR-056: the v2 scale reads the bars closed up
+/// to the decision only), and leaves every label emitted before the first
+/// mutated event as it was.
+fn assert_no_leakage(tape: &[MarketEvent], cuts: &[i64], labeling: Labeling) -> usize {
+    let base = drive_with(tape, labeling);
     assert!(base.rejected.iter().all(Option::is_none));
     let mut mutations = 0;
     for &cut in cuts {
@@ -2832,7 +2858,7 @@ fn assert_no_leakage(tape: &[MarketEvent], cuts: &[i64]) -> usize {
             ),
         ];
         for (name, variant) in variants {
-            let mutated = drive(&variant);
+            let mutated = drive_with(&variant, labeling);
             assert!(mutated.rejected.iter().all(Option::is_none), "{name}");
             // The records up to the decision are identical.
             let before = |run: &Drive| -> Vec<(CanonicalKey, Fingerprint)> {
@@ -2863,6 +2889,13 @@ fn assert_no_leakage(tape: &[MarketEvent], cuts: &[i64]) -> usize {
                     .collect()
             };
             assert_eq!(flags(&old), flags(&new), "{name}");
+            let barriers = |labels: &[ForwardLabel]| -> Vec<[Option<Barriers>; 5]> {
+                labels
+                    .iter()
+                    .map(|label| label.horizons.map(|horizon| horizon.barriers))
+                    .collect()
+            };
+            assert_eq!(barriers(&old), barriers(&new), "{name}");
             assert!(
                 old != new,
                 "{name}: no label changed; last {}",
@@ -2892,18 +2925,346 @@ fn labels_never_leak_into_records_on_the_golden_tape() {
         .into_iter()
         .filter(|event| event.time().as_millis() < 11 * DAY)
         .collect();
-    let mutations = assert_no_leakage(
-        &tape,
-        &[3 * DAY + 7 * HOUR, 9 * DAY + 9 * HOUR + 30 * MINUTE],
-    );
-    assert_eq!(mutations, 10);
+    for labeling in [Labeling::V1, Labeling::V2] {
+        let mutations = assert_no_leakage(
+            &tape,
+            &[3 * DAY + 7 * HOUR, 9 * DAY + 9 * HOUR + 30 * MINUTE],
+            labeling,
+        );
+        assert_eq!(mutations, 10);
+    }
 }
 
 #[test]
 fn labels_never_leak_into_records_on_random_tapes() {
     for seed in [6, 7] {
         let tape = spaced(&walk(0x6d69_6500_0026_0000 + seed, 4, 1));
-        assert_eq!(assert_no_leakage(&tape, &[2 * DAY + 3 * HOUR]), 5);
+        for labeling in [Labeling::V1, Labeling::V2] {
+            assert_eq!(assert_no_leakage(&tape, &[2 * DAY + 3 * HOUR], labeling), 5);
+        }
+    }
+}
+
+// ------------------------------------------- labeling v2 (ADR-056 D4′)
+
+/// The true range of every closed bar of [`minute_tape`] that holds two
+/// consecutive minutes: 100 USDT.
+const MINUTE_RANGE: i64 = 100;
+
+/// One trade a minute, a second past each minute `0..minutes` except those
+/// in `skip`, at 60 000 USDT on even minutes and 60 100 USDT on odd ones.
+/// Every closed bar of a horizon timeframe that holds two consecutive
+/// minutes has a range of [`MINUTE_RANGE`] and a true range of exactly that
+/// (every close is one of the two prices), so every ready ATR_H is 100 USDT.
+fn minute_tape(minutes: i64, skip: std::ops::Range<i64>) -> Vec<MarketEvent> {
+    (0..minutes)
+        .filter(|minute| !skip.contains(minute))
+        .map(|minute| {
+            let price = usdt(60_000 + MINUTE_RANGE * (minute % 2));
+            trade(minute * MINUTE + 1_000, minute as u64 + 1, price)
+        })
+        .collect()
+}
+
+/// `tape` through a labeler of `labeling`, a baseline record with a
+/// warming-up ATR(1h) opened at the trade of each minute in `decisions`.
+fn label_minutes(
+    labeling: Labeling,
+    tape: &[MarketEvent],
+    decisions: &[i64],
+) -> (Vec<ForwardLabel>, LabelStats) {
+    let mut steps = Vec::new();
+    for event in tape {
+        steps.push(see(event.clone()));
+        let MarketEvent::Trade(at) = event else {
+            continue;
+        };
+        if decisions.contains(&(at.time.as_millis() / MINUTE)) {
+            let record = record_at(event.canonical_key(), at.price, None);
+            steps.push(Step::Open(Box::new(record)));
+        }
+    }
+    run_with(labeling, steps)
+}
+
+/// The v2 offset of a ready ATR_H of [`MINUTE_RANGE`] USDT: 31.333 USDT.
+fn minute_offset() -> i64 {
+    usdt(MINUTE_RANGE).units() * SCALE_MULTIPLE_E5 / MULTIPLE_SCALE
+}
+
+#[test]
+fn v2_scales_warm_up_on_fifteen_bars_of_each_horizon() {
+    // A scale is ready once 15 bars of its timeframe have closed: the
+    // partial first bar anchors, then 14 samples (ADR-033 decision 6), so
+    // at minute 15 · tf, read after the decision event closes the 15th.
+    let boundaries = HORIZONS.map(|horizon| 15 * horizon.millis() / MINUTE);
+    assert_eq!(boundaries, [75, 225, 900, 3_600, 21_600]);
+    let decisions: Vec<i64> = boundaries
+        .iter()
+        .flat_map(|minute| [minute - 1, *minute])
+        .collect();
+    let tape = minute_tape(boundaries[4] + 2, 0..0);
+    let (labels, stats) = label_minutes(Labeling::V2, &tape, &decisions);
+    assert_eq!(labels.len(), decisions.len());
+    assert_eq!(stats.scale_breaks, 0);
+    let offset = minute_offset();
+    assert_eq!(offset, 3_133_300_000);
+    for (label, minute) in labels.iter().zip(&decisions) {
+        let reference = label.reference.unwrap().units();
+        for (position, horizon) in label.horizons.iter().enumerate() {
+            if *minute >= boundaries[position] {
+                assert_eq!(
+                    horizon.barriers,
+                    Some(Barriers {
+                        lower: Price::from_units(reference - offset),
+                        upper: Price::from_units(reference + offset),
+                    }),
+                    "{minute} {}",
+                    horizon.horizon
+                );
+                assert_ne!(horizon.race, Race::Unavailable);
+            } else {
+                assert_eq!(horizon.barriers, None, "{minute} {}", horizon.horizon);
+                assert_eq!(horizon.race, Race::Unavailable);
+            }
+        }
+        // The record's ATR(1h) stays the record's; v2 does not read it.
+        assert_eq!(label.atr, None);
+    }
+    // Under v1 the same records have no race: their ATR(1h) is warming up.
+    let (labels, _) = label_minutes(Labeling::V1, &tape, &decisions);
+    assert!(labels.iter().all(|label| {
+        label
+            .horizons
+            .iter()
+            .all(|horizon| horizon.race == Race::Unavailable)
+    }));
+}
+
+#[test]
+fn an_empty_incomplete_bar_restarts_the_v2_scale_warm_up() {
+    // No trades in minutes 110..121, and a trades gap over them: the 5m
+    // bars [110, 115) and [115, 120) are empty and incomplete, a break
+    // (ADR-033 decision 6); [120, 125) only anchors, so the 5m scale is
+    // ready again after the 14 samples [125, 195).
+    let mut tape = minute_tape(200, 110..121);
+    let resumed = tape
+        .iter()
+        .position(|event| event.time().as_millis() > 110 * MINUTE)
+        .unwrap();
+    tape.insert(
+        resumed,
+        gap(Stream::Trades, 109 * MINUTE + 1_000, 121 * MINUTE),
+    );
+    let decisions = [100, 121, 194, 195];
+    let (labels, stats) = label_minutes(Labeling::V2, &tape, &decisions);
+    let ready: Vec<bool> = labels
+        .iter()
+        .map(|label| label.horizons[0].barriers.is_some())
+        .collect();
+    assert_eq!(ready, [true, false, false, true]);
+    let reference = labels[3].reference.unwrap().units();
+    assert_eq!(
+        labels[3].horizons[0].barriers.unwrap().upper.units(),
+        reference + minute_offset()
+    );
+    // A break of the bar series is the ATR's own rule, not a scale break.
+    assert_eq!(stats.scale_breaks, 0);
+}
+
+#[test]
+fn a_bar_error_restarts_every_v2_scale_and_is_counted() {
+    // A labeler alone takes any event; the engine would refuse a trade
+    // 40 days ahead as a time jump (more than MAX_BARS_PER_EVENT 1m bars),
+    // and so do the labeler's bars. The scales start over, the labels still
+    // come out.
+    let mut tape = minute_tape(100, 0..0);
+    tape.push(trade(40 * DAY, 1_000, usdt(60_000)));
+    tape.push(trade(40 * DAY + MINUTE, 1_001, usdt(60_050)));
+    let decisions = [80, 40 * DAY / MINUTE, 40 * DAY / MINUTE + 1];
+    let (labels, stats) = label_minutes(Labeling::V2, &tape, &decisions);
+    assert_eq!(stats.scale_breaks, 1);
+    assert_eq!((stats.opened, stats.emitted), (3, 3));
+    assert!(labels[0].horizons[0].barriers.is_some());
+    for label in &labels[1..] {
+        assert!(
+            label
+                .horizons
+                .iter()
+                .all(|horizon| horizon.race == Race::Unavailable),
+            "{label}"
+        );
+    }
+}
+
+/// `label` without the barriers and the races of every horizon but 1h.
+fn at_1h_only(label: &ForwardLabel) -> ForwardLabel {
+    let mut label = label.clone();
+    for (position, horizon) in label.horizons.iter_mut().enumerate() {
+        if position != 2 {
+            horizon.barriers = None;
+            horizon.race = Race::Unavailable;
+        }
+    }
+    label
+}
+
+#[test]
+fn v2_is_v1_at_1h_and_reads_its_own_scale_elsewhere() {
+    // The v2 1h scale is ATR(14) of the 1h bars, the record's ATR(1h), at
+    // the same multiple: the 1h band and race are v1's, and so is every
+    // field that does not depend on a barrier (ADR-056 D4′).
+    let mut tapes = vec![golden().tape.clone()];
+    tapes.extend([4, 5].map(|seed| walk(0x6d69_6500_0026_0000 + seed, 4, 1)));
+    let (mut ready_1h, mut differ) = (0, 0);
+    for tape in &tapes {
+        let (v1, v2) = (
+            drive_with(tape, Labeling::V1),
+            drive_with(tape, Labeling::V2),
+        );
+        assert_eq!(v1.labels.len(), v2.labels.len());
+        assert_eq!(v2.stats.scale_breaks, 0);
+        for ((at1, one), (at2, two)) in v1.labels.iter().zip(&v2.labels) {
+            assert_eq!(at1, at2, "the emission point");
+            assert_eq!(at_1h_only(one), at_1h_only(two), "\n{one}\n{two}");
+            ready_1h += usize::from(two.horizons[2].barriers.is_some());
+            differ += usize::from((0..5).any(|position| {
+                one.horizons[position].barriers != two.horizons[position].barriers
+            }));
+        }
+    }
+    assert!(ready_1h > 1_000, "{ready_1h}");
+    assert!(differ > 1_000, "{differ}");
+}
+
+#[test]
+fn a_rejected_trade_never_reaches_the_v2_bars() {
+    // A trade the engine refuses as a duplicate, 1 000 USDT above the one it
+    // repeats: accepted, it would raise its bars' highs and every scale.
+    let tape = walk(0x6d69_6500_0026_0000 + 4, 3, 1);
+    let (index, at) = tape
+        .iter()
+        .enumerate()
+        .find_map(|(index, event)| match event {
+            MarketEvent::Trade(trade) if trade.time.as_millis() >= 2 * DAY => Some((index, *trade)),
+            _ => None,
+        })
+        .unwrap();
+    let mut refused = tape.clone();
+    refused.insert(
+        index + 1,
+        MarketEvent::Trade(Trade {
+            price: Price::from_units(at.price.units() + 1_000 * SCALE),
+            ..at
+        }),
+    );
+    let (base, run) = (
+        drive_with(&tape, Labeling::V2),
+        drive_with(&refused, Labeling::V2),
+    );
+    assert!(matches!(
+        run.rejected[index + 1],
+        Some(StateError::Duplicate { .. })
+    ));
+    assert_eq!(base.labels.len(), run.labels.len());
+    let barriers = |run: &Drive| -> Vec<[Option<Barriers>; 5]> {
+        run.labels
+            .iter()
+            .map(|(_, label)| label.horizons.map(|horizon| horizon.barriers))
+            .collect()
+    };
+    assert_eq!(barriers(&base), barriers(&run));
+    // The labels after it have ready scales, and the rejection censored
+    // some open labels: the comparison is not vacuous.
+    let after = run
+        .labels
+        .iter()
+        .filter(|(_, label)| label.event.time > at.time)
+        .filter(|(_, label)| label.horizons[1].barriers.is_some())
+        .count();
+    assert!(after > 100, "{after}");
+    assert!(run.labels.iter().any(|(_, label)| {
+        label.horizons.iter().any(|horizon| {
+            horizon
+                .censored
+                .is_some_and(|censor| censor.reason == CensorReason::Rejected)
+        })
+    }));
+}
+
+#[test]
+fn the_labeling_versions_and_their_keys() {
+    assert_eq!(Labeling::CURRENT, Labeling::V2);
+    assert_eq!(Labeling::V1.key(), LABELING_V1);
+    assert_eq!(Labeling::V2.key(), LABELING_V2);
+    assert_eq!(LABELING_V2.to_string(), "conditional.labels@2");
+    assert_eq!(ForwardLabeler::new(Labeling::V2).labeling(), Labeling::V2);
+    // b = √(π / 32), v1's 1h multiple.
+    let derived = (std::f64::consts::PI / 32.0).sqrt();
+    assert_eq!(SCALE_MULTIPLE_E5, (derived * 1e5).round() as i64);
+    assert_eq!(SCALE_MULTIPLE_E5, BARRIER_MULTIPLE_E5[2]);
+}
+
+#[test]
+fn labeling_v2_fingerprint_golden() {
+    let (v1, v2) = (labeling_text(Labeling::V1), labeling_text(Labeling::V2));
+    assert_eq!(v2.lines().count(), v1.lines().count());
+    assert!(v2.ends_with('\n'));
+    // Only the labeling line and the barriers line differ.
+    let differing: Vec<usize> = v1
+        .lines()
+        .zip(v2.lines())
+        .enumerate()
+        .filter(|(_, (one, two))| one != two)
+        .map(|(line, _)| line)
+        .collect();
+    assert_eq!(differing, [1, 4]);
+    assert!(v2.contains("\nlabeling conditional.labels@2\n"));
+    assert!(v2.contains(
+        "\nbarriers atr=atr14_adr033_over_closed_adr031_bars_of_the_horizon_timeframe at=after_decision_event bar_error=restart_warm_up multiple_e5=31333 scale=100000 offset=round_half_even unavailable=scale_not_ready,zero_offset,out_of_range\n"
+    ));
+    assert_eq!(
+        labeling_fingerprint(Labeling::V2).to_string(),
+        GOLDEN_LABELING_V2_FINGERPRINT
+    );
+    // v1 is untouched.
+    assert_eq!(
+        labeling_fingerprint(Labeling::V1).to_string(),
+        GOLDEN_LABELING_FINGERPRINT
+    );
+}
+
+#[test]
+fn provenance_names_the_v2_labeling() {
+    let engine = MarketStateEngine::new();
+    let data = crate::research::DataVersion::from_hex(&"0f".repeat(32)).unwrap();
+    let context = ContextProvenance::new(data, &engine);
+    let provenance = LabelProvenance::new(context.clone(), Labeling::V2);
+    assert_eq!(provenance.labeling, LABELING_V2);
+    assert_eq!(
+        provenance.to_string(),
+        format!(
+            "{context} labeling=conditional.labels@2 labeling_fingerprint={GOLDEN_LABELING_V2_FINGERPRINT}"
+        )
+    );
+}
+
+#[test]
+fn golden_forward_labels_v2() {
+    let (count, digest, first) = &golden_v2().golden;
+    assert_eq!(first, GOLDEN_FIRST_TRIGGER_LABEL_V2);
+    assert_eq!((*count, digest.as_str()), GOLDEN_LABELS_V2);
+    // The same records as v1, one label each.
+    assert_eq!(*count, GOLDEN_LABELS.0);
+    let lines: Vec<String> = golden_v2()
+        .run
+        .labels
+        .iter()
+        .map(|(_, label)| label.to_string())
+        .chain([labeling_text(Labeling::V2)])
+        .collect();
+    for line in &lines {
+        assert_eq!(forbidden_in(line), None, "{line}");
     }
 }
 
@@ -2924,14 +3285,14 @@ fn barrier_multiples_are_the_derived_values() {
 
 #[test]
 fn labeling_fingerprint_golden() {
-    let text = labeling_text();
+    let text = labeling_text(Labeling::V1);
     assert!(text.starts_with(
         "mie-labeling 1\nlabeling conditional.labels@1\nreference trade.last_price@1 path=trades window=after_decision_key_before_decision_time_plus_h\nhorizons 5m,15m,1h,4h,1d\nbarriers atr=volatility.atr.1h@1 multiple_e5=9045,15666,31333,62666,153499 scale=100000 "
     ));
     assert_eq!(text.lines().count(), 16);
     assert!(text.ends_with('\n'));
     assert_eq!(
-        labeling_fingerprint().to_string(),
+        labeling_fingerprint(Labeling::V1).to_string(),
         GOLDEN_LABELING_FINGERPRINT
     );
 }
@@ -2941,10 +3302,13 @@ fn provenance_names_the_records_and_the_labeling() {
     let engine = MarketStateEngine::new();
     let data = crate::research::DataVersion::from_hex(&"0f".repeat(32)).unwrap();
     let context = ContextProvenance::new(data, &engine);
-    let provenance = LabelProvenance::new(context.clone());
+    let provenance = LabelProvenance::new(context.clone(), Labeling::V1);
     assert_eq!(provenance.context, context);
     assert_eq!(provenance.labeling, LABELING_V1);
-    assert_eq!(provenance.labeling_fingerprint, labeling_fingerprint());
+    assert_eq!(
+        provenance.labeling_fingerprint,
+        labeling_fingerprint(Labeling::V1)
+    );
     assert_eq!(
         provenance.to_string(),
         format!(
@@ -2962,7 +3326,7 @@ fn no_label_text_names_a_direction_or_an_execution() {
         .iter()
         .map(|(_, label)| label.to_string())
         .collect();
-    lines.push(labeling_text());
+    lines.push(labeling_text(Labeling::V1));
     lines.push(
         [
             CensorReason::Gap,
@@ -2989,12 +3353,20 @@ fn golden_forward_labels() {
 #[ignore = "prints the goldens: cargo test -p mie-domain print_label_golden -- --ignored --nocapture"]
 fn print_label_golden() {
     let golden = golden();
-    println!("labeling {}", labeling_fingerprint());
+    println!("labeling {}", labeling_fingerprint(Labeling::V1));
     println!("labels {} {}", golden.golden.0, golden.golden.1);
     println!("first {}", golden.golden.2);
     println!("stats {:?}", golden.run.stats);
+    let golden = golden_v2();
+    println!("labeling v2 {}", labeling_fingerprint(Labeling::V2));
+    println!("labels v2 {} {}", golden.golden.0, golden.golden.1);
+    println!("first v2 {}", golden.golden.2);
+    println!("stats v2 {:?}", golden.run.stats);
 }
 
 const GOLDEN_LABELING_FINGERPRINT: &str = "604b624cc2522df9";
 const GOLDEN_LABELS: (usize, &str) = (46_403, "8d7c4cebfc62d7da");
+const GOLDEN_LABELING_V2_FINGERPRINT: &str = "6f90bff079e746f2";
+const GOLDEN_LABELS_V2: (usize, &str) = (46_403, "d20a74869c28c233");
+const GOLDEN_FIRST_TRIGGER_LABEL_V2: &str = "117032157ms Trade seq 785 #1 ref=61922.67000000 atr=26.01616928 [5m clear barriers=61920.67209748..61924.66790252 race=lower@117098590ms up=0.64000000@117309050ms down=4.22000000@117248836ms last=61923.31000000] [15m clear barriers=61918.82876666..61926.51123334 race=lower@117098590ms up=0.64000000@117309050ms down=11.49000000@117700476ms last=61915.79000000] [1h clear barriers=61914.51835368..61930.82164632 race=lower@117700476ms up=7.40000000@120543138ms down=11.49000000@117700476ms last=61928.16000000] [4h clear barriers=- race=unavailable up=23.70000000@129865828ms down=33.07000000@126265310ms last=61935.31000000] [1d barriers=- race=unavailable up=134.65000000@185552262ms down=33.07000000@126265310ms last=62018.89000000] level=61910.65000000:touched@121677419ms extreme=61908.96000000:touched@121677419ms";
 const GOLDEN_FIRST_TRIGGER_LABEL: &str = "117032157ms Trade seq 785 #1 ref=61922.67000000 atr=26.01616928 [5m clear barriers=61920.31683749..61925.02316251 race=lower@117098590ms up=0.64000000@117309050ms down=4.22000000@117248836ms last=61923.31000000] [15m clear barriers=61918.59430692..61926.74569308 race=lower@117248836ms up=0.64000000@117309050ms down=11.49000000@117700476ms last=61915.79000000] [1h clear barriers=61914.51835368..61930.82164632 race=lower@117700476ms up=7.40000000@120543138ms down=11.49000000@117700476ms last=61928.16000000] [4h clear barriers=61906.36670736..61938.97329264 race=lower@122609041ms up=23.70000000@129865828ms down=33.07000000@126265310ms last=61935.31000000] [1d barriers=61882.73544032..61962.60455968 race=upper@146208863ms up=134.65000000@185552262ms down=33.07000000@126265310ms last=62018.89000000] level=61910.65000000:touched@121677419ms extreme=61908.96000000:touched@121677419ms";

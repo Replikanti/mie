@@ -1,6 +1,8 @@
-//! The ADR-055 measurement (issue #26, M2; run by M3): an independent model
-//! of the ADR-055 decision text, D1–D9, run next to the forward labeler,
-//! that checks the labels it emits and reports what *Accept when* asks for.
+//! The ADR-056 measurement (issue #151; the ADR-055 one of #26 M2/M3 with
+//! the labeling v2 barrier scale): an independent model of the ADR-055
+//! decision text, D1–D9, with D4 replaced by ADR-056 D4′, run next to the
+//! forward labeler under `Labeling::V2`, that checks the labels it emits and
+//! reports what ADR-056 *Accept when* asks for.
 //!
 //! The labeler runs through the app driver, `mie_app::conditional::
 //! label_contexts`, one event at a time: the engine, the sampler and the
@@ -16,9 +18,15 @@
 //!   records of that event;
 //! - the window (D2): the accepted trades with a canonical key after the
 //!   record's event and a time before `event.time + H`, for H in D3;
-//! - the barriers (D4): `reference ± b_H · ATR`, `b_H` per 10⁵ rounded half
-//!   to even to the price unit, unavailable without a ready ATR, at a zero
-//!   offset or outside the price range;
+//! - the barriers (ADR-056 D4′): `reference ± b · ATR_H`, `b` = 31 333 per
+//!   10⁵ rounded half to even to the price unit, ATR_H the ATR(14) of the
+//!   closed bars of H's timeframe after the decision event, unavailable
+//!   without a ready ATR_H, at a zero offset or outside the price range.
+//!   The model builds its own bars per horizon timeframe from the ADR-031
+//!   text (UTC-aligned `[open, open + tf)`, closed by trades-stream events
+//!   only, the first bar `partial_start`, a trades gap marking the open bars
+//!   it overlaps `feed_gap`, empty bars) and its own Wilder ATR from ADR-033
+//!   decisions 2 and 6; it shares no bar or ATR code with the labeler;
 //! - the race and its tie rule (D5): the first touching trade in canonical
 //!   order, `same_ms` when a later trade of its millisecond touches the
 //!   other barrier;
@@ -53,13 +61,23 @@
 //!   by decision time only (ADR-055 *Accept when*); elsewhere every label.
 //! - **Completeness** (asserted): exactly one label per record, in record
 //!   order.
-//! - Recorded only, over every label: per horizon the `Neither` share (next
-//!   to the 0.92 % null prediction of D4), the shares of windows censored
-//!   per reason, the unavailable races, the `same_ms` races and the clear
-//!   records per stream kind; the reach-backs; the wall time and the peak
-//!   RSS. Deliberately not reported: which barrier came first, excursion or
-//!   time quantiles, and any split by trigger, regime or location (*Accept
-//!   when*).
+//! - **Scale cross-check** (asserted): the model's ATR_1h equals the
+//!   record's `state.atr` at every record, in readiness and value, and the
+//!   labeler's `scale_breaks` is 0 (it is part of the counts T0 compares;
+//!   the model has none).
+//! - **Prediction** (reported; ADR-056 reads it): per horizon N(H) =
+//!   `Neither` ÷ the races that ran (upper + lower + neither), next to the
+//!   pre-registered N(1h) = 10.05 % (v1's measured 1h share) and v1's
+//!   published share, and max_H N(H) ÷ min_H N(H) against the miss bound
+//!   1.62. The 1h `Neither` and `Unavailable` counts are printed for the
+//!   comparison with ADR-055's published ones (the 1h identity).
+//! - Recorded only, over every label: per horizon the `Neither` share of
+//!   all labels, the shares of windows censored per reason, the unavailable
+//!   races, the `same_ms` races and the clear records per stream kind; the
+//!   reach-backs and the scale breaks; the wall time and the peak RSS.
+//!   Deliberately not reported: which barrier came first, excursion or time
+//!   quantiles, and any split by trigger, regime or location (ADR-055
+//!   restriction, kept by ADR-056 *Accept when*).
 //!
 //! Every count is printed before any assertion.
 //!
@@ -70,9 +88,10 @@
 //! --release -p mie-cli --test label_measure -- --ignored --exact
 //! --nocapture measure_labels` (`--exact` keeps the live test out);
 //! `MIE_MEASURE_TO` is included, as in `mie replay`, and an optional
-//! `MIE_MEASURE_EVENTS` asserts the replay's event count. M3 runs the #12
-//! development year, 2025-10-01 … 2026-09-30, with
-//! `MIE_MEASURE_EVENTS=603323345` (ADR-051 R0's count of the same replay).
+//! `MIE_MEASURE_EVENTS` asserts the replay's event count. ADR-056's
+//! acceptance run, like ADR-055's M3, runs the #12 development year,
+//! 2025-10-01 … 2026-09-30, with `MIE_MEASURE_EVENTS=603323345` (ADR-051
+//! R0's count of the same replay).
 //!
 //! `measure_labels_live` (`--ignored`) runs every cleanly ended run of a
 //! `mie ingest` capture alone through `LiveReplay::run_replay`, each into a
@@ -89,8 +108,10 @@
 //! three rejected trades (a repeat, a time jump, an out-of-order trade at a
 //! window end) added: once checking every label with a trailing trades
 //! gap, once with the archive's selection and none. It asserts that every
-//! compared kind occurred, so T0 cannot pass vacuously, and that
-//! `label_window` over the same tape emits the same labels.
+//! compared kind occurred, so T0 cannot pass vacuously, that every horizon
+//! has races with a ready scale (1d from day 15, after 15 daily bars), that
+//! the scale cross-check held at every record, and that `label_window` over
+//! the same tape emits the same labels.
 
 mod common;
 
@@ -106,8 +127,8 @@ use mie_cli::replay::parse_bound;
 use mie_domain::candidate::CandidateEvent;
 use mie_domain::conditional::label::{
     BARRIER_MULTIPLE_E5, Barriers, Censor, CensorReason, Excursion, ForwardLabel, ForwardLabeler,
-    HORIZONS, HorizonLabel, LABELING_V1, LabelProvenance, LabelStats, Passage, PassageLabel, Race,
-    barrier_offset,
+    HORIZONS, HorizonLabel, LABELING_V2, LabelProvenance, LabelStats, Labeling, Passage,
+    PassageLabel, Race, SCALE_MULTIPLE_E5, barrier_offset,
 };
 use mie_domain::conditional::{ContextProvenance, ContextRecord, ContextSampler, Sample};
 use mie_domain::event::{FeedGap, GapReason, MarketEvent, Stream, Trade};
@@ -135,14 +156,34 @@ const DAY_MS: i64 = 86_400_000;
 /// D3: the horizons, in ms, shortest first.
 const HORIZON_MS: [i64; 5] = [5 * MINUTE_MS, 15 * MINUTE_MS, HOUR_MS, 4 * HOUR_MS, DAY_MS];
 
-/// D4: `b_H = √(π · H / 32 h)` per 10⁵, per horizon.
+/// ADR-055 D4 (v1): `b_H = √(π · H / 32 h)` per 10⁵, per horizon. The model
+/// labels v2; the v1 multiples stay for the constants check.
 const MULTIPLE_E5: [i64; 5] = [9_045, 15_666, 31_333, 62_666, 153_499];
+
+/// ADR-056 D4′: `b = √(π / 32)` per 10⁵, at every horizon.
+const SCALE_E5: i64 = 31_333;
+
+/// ADR-033 decision 2: the ATR length.
+const ATR_LENGTH: i128 = 14;
 
 /// D8: the passages are read in the 1d window, the last horizon.
 const PASSAGE: usize = 4;
 
-/// D4's null prediction of the `Neither` share, in percent.
+/// The null prediction of the `Neither` share, in percent: under ADR-056
+/// D4′ the mean exit time is H / 4 at every H, as under ADR-055 D4.
 const NULL_NEITHER_PERCENT: f64 = 0.92;
+
+/// ADR-056 *Accept when*: the predicted N(H), `Neither` over the races that
+/// ran, in percent, at every H: v1's measured 1h share (ADR-055
+/// *Measurement*).
+const PREDICTED_NEITHER_PERCENT: f64 = 10.05;
+
+/// ADR-056 *Accept when*: max_H N(H) ÷ min_H N(H) above this misses.
+const MISS_RATIO: f64 = 1.62;
+
+/// ADR-055 *Measurement*: v1's `Neither` share of all labels in the year,
+/// per horizon, in percent.
+const V1_NEITHER_PERCENT: [f64; 5] = [16.338, 12.548, 10.036, 9.281, 6.191];
 
 /// The censor reasons, in the order the report prints them.
 const REASONS: [CensorReason; 4] = [
@@ -156,10 +197,10 @@ const REASONS: [CensorReason; 4] = [
 // The model's rules (D4, D8, D9)
 // ---------------------------------------------------------------------------
 
-/// D4: `b_H · ATR`, `b_H` per 10⁵, rounded half to even to the price unit;
-/// `None` at 0.
-fn offset(atr: Price, position: usize) -> Option<i64> {
-    let product = i128::from(atr.units()) * i128::from(MULTIPLE_E5[position]);
+/// D4 / D4′: `multiple_e5 / 10⁵ · scale`, rounded half to even to the price
+/// unit; `None` at 0.
+fn offset(scale: Price, multiple_e5: i64) -> Option<i64> {
+    let product = i128::from(scale.units()) * i128::from(multiple_e5);
     let (quotient, remainder) = (product.div_euclid(100_000), product.rem_euclid(100_000));
     let half_up = 2 * remainder > 100_000 || (2 * remainder == 100_000 && quotient % 2 != 0);
     i64::try_from(quotient + i128::from(half_up))
@@ -167,15 +208,155 @@ fn offset(atr: Price, position: usize) -> Option<i64> {
         .filter(|offset| *offset > 0)
 }
 
-/// D4: the barriers of the horizon at `position`; `None` without a reference
-/// or a ready ATR, at a zero offset or outside the price range.
-fn barriers(reference: Option<Price>, atr: Option<Price>, position: usize) -> Option<Barriers> {
+/// D4′: the barriers `reference ± b · ATR_H`; `None` without a reference or
+/// a ready ATR_H, at a zero offset or outside the price range.
+fn barriers(reference: Option<Price>, scale: Option<Price>) -> Option<Barriers> {
     let reference = reference?.units();
-    let offset = offset(atr?, position)?;
+    let offset = offset(scale?, SCALE_E5)?;
     Some(Barriers {
         lower: Price::from_units(reference.checked_sub(offset)?),
         upper: Price::from_units(reference.checked_add(offset)?),
     })
+}
+
+/// `numerator / denominator` rounded half to even; `denominator > 0`.
+fn half_even(numerator: i128, denominator: i128) -> i128 {
+    let (quotient, remainder) = (
+        numerator.div_euclid(denominator),
+        numerator.rem_euclid(denominator),
+    );
+    let up = 2 * remainder > denominator || (2 * remainder == denominator && quotient % 2 != 0);
+    quotient + i128::from(up)
+}
+
+/// One bar of the model's own builder (ADR-031): its open time, its high,
+/// low and close (none for an interval without trades), and its coverage.
+#[derive(Debug, Clone, Copy)]
+struct ModelBar {
+    open: i64,
+    hlc: Option<(i64, i64, i64)>,
+    partial_start: bool,
+    feed_gap: bool,
+}
+
+/// ADR-033 decisions 2 and 6, from the text: ATR(14) of one bar series.
+#[derive(Debug, Clone, Copy, Default)]
+struct ModelAtr {
+    /// The previous close.
+    anchor: Option<i64>,
+    /// Samples since the series (re)started.
+    samples: i128,
+    /// The sum of the first true ranges.
+    sum: i128,
+    /// The ATR, from the 14th sample on.
+    atr: Option<i128>,
+}
+
+impl ModelAtr {
+    /// Decision 6's table, then decision 2's true range and Wilder step.
+    fn close(&mut self, bar: &ModelBar) {
+        let complete = !bar.partial_start && !bar.feed_gap;
+        let range = match (bar.hlc, complete, self.anchor) {
+            // Empty, incomplete: a break, back to warming up.
+            (None, false, _) => {
+                *self = Self::default();
+                return;
+            }
+            // Trades, incomplete, no anchor: anchors only.
+            (Some((_, _, close)), false, None) => {
+                self.anchor = Some(close);
+                return;
+            }
+            // Empty, complete, no anchor: skipped.
+            (None, true, None) => return,
+            // Empty, complete, anchor: TR 0, the anchor stays.
+            (None, true, Some(_)) => 0,
+            // Trades, no anchor (complete): TR = H − L.
+            (Some((high, low, _)), _, None) => i128::from(high) - i128::from(low),
+            // Trades, anchor: TR with the previous close.
+            (Some((high, low, _)), _, Some(previous)) => {
+                let (high, low, previous) =
+                    (i128::from(high), i128::from(low), i128::from(previous));
+                (high - low)
+                    .max((high - previous).abs())
+                    .max((low - previous).abs())
+            }
+        };
+        if let Some((_, _, close)) = bar.hlc {
+            self.anchor = Some(close);
+        }
+        self.samples += 1;
+        self.atr = match self.atr {
+            Some(atr) => Some(half_even((ATR_LENGTH - 1) * atr + range, ATR_LENGTH)),
+            None => {
+                self.sum += range;
+                (self.samples == ATR_LENGTH).then(|| half_even(self.sum, ATR_LENGTH))
+            }
+        };
+    }
+
+    /// The ATR as a price, once ready.
+    fn ready(&self) -> Option<Price> {
+        self.atr
+            .map(|atr| Price::from_units(i64::try_from(atr).expect("an ATR in the price range")))
+    }
+}
+
+/// ADR-031, from the text: the bars of one timeframe, and their ATR.
+#[derive(Debug, Clone, Copy)]
+struct ModelSeries {
+    /// The timeframe, in ms.
+    tf: i64,
+    /// The bar the next trade goes to; none before the first trades-stream
+    /// event.
+    developing: Option<ModelBar>,
+    atr: ModelAtr,
+}
+
+impl ModelSeries {
+    fn new(tf: i64) -> Self {
+        Self {
+            tf,
+            developing: None,
+            atr: ModelAtr::default(),
+        }
+    }
+
+    /// Decision 6: whether a gap `[start, end]` overlaps the bar at `open`.
+    fn overlaps(&self, open: i64, gap: Option<(i64, i64)>) -> bool {
+        gap.is_some_and(|(start, end)| open <= end && start < open + self.tf)
+    }
+
+    /// A trades-stream event at `time` (a trade's time or a gap's end):
+    /// closes every bar ending at or before it (decision 4), each into the
+    /// ATR, marking every open bar a gap overlaps (decision 6), and adds a
+    /// trade's price to the bar containing it.
+    fn event(&mut self, time: i64, gap: Option<(i64, i64)>, price: Option<i64>) {
+        let mut bar = self.developing.unwrap_or(ModelBar {
+            open: time.div_euclid(self.tf) * self.tf,
+            hlc: None,
+            partial_start: true,
+            feed_gap: false,
+        });
+        bar.feed_gap |= self.overlaps(bar.open, gap);
+        while bar.open + self.tf <= time {
+            self.atr.close(&bar);
+            let open = bar.open + self.tf;
+            bar = ModelBar {
+                open,
+                hlc: None,
+                partial_start: false,
+                feed_gap: self.overlaps(open, gap),
+            };
+        }
+        if let Some(price) = price {
+            bar.hlc = Some(match bar.hlc {
+                None => (price, price, price),
+                Some((high, low, _)) => (high.max(price), low.min(price), price),
+            });
+        }
+        self.developing = Some(bar);
+    }
 }
 
 /// D8's row of an SFP: the swept level's price and the sweep's extreme.
@@ -240,7 +421,11 @@ struct Pending {
     ordinal: u32,
     baseline: bool,
     reference: Option<Price>,
+    /// The record's ATR(1h), which the label carries.
     atr: Option<Price>,
+    /// D4′: ATR_H per horizon after the decision event, from the model's
+    /// own bars.
+    scales: [Option<Price>; 5],
     level: Option<Price>,
     extreme: Option<Price>,
     clear: [bool; 5],
@@ -293,6 +478,15 @@ struct Model {
     /// D9's slots: the baseline stream, and one per trigger id.
     clear_baseline: [Option<i64>; 5],
     clear_triggers: Vec<(FeatureKey, [Option<i64>; 5])>,
+    /// D4′: the bars and the ATR of each horizon's timeframe, fed with every
+    /// accepted event.
+    series: [ModelSeries; 5],
+    /// The scale cross-check: records whose `state.atr` differs from the
+    /// model's ATR_1h, in readiness or value, a few of them noted.
+    scale_mismatches: u64,
+    scale_notes: Vec<String>,
+    /// Records whose ATR_1h the cross-check compared while ready.
+    scale_ready: u64,
 }
 
 impl Model {
@@ -310,6 +504,10 @@ impl Model {
             last_record: None,
             clear_baseline: [None; 5],
             clear_triggers: Vec::new(),
+            series: HORIZON_MS.map(ModelSeries::new),
+            scale_mismatches: 0,
+            scale_notes: Vec::new(),
+            scale_ready: 0,
         }
     }
 
@@ -317,6 +515,21 @@ impl Model {
     fn accepted(&mut self, event: &MarketEvent, out: &mut Vec<Expected>) {
         let key = event.canonical_key();
         let time = key.time.as_millis();
+        // ADR-031 decision 4: only trades-stream events reach the bars.
+        let bar_input = match event {
+            MarketEvent::Trade(trade) => Some((time, None, Some(trade.price.units()))),
+            MarketEvent::FeedGap(gap) if gap.stream == Stream::Trades => Some((
+                gap.end.as_millis(),
+                Some((gap.start.as_millis(), gap.end.as_millis())),
+                None,
+            )),
+            _ => None,
+        };
+        if let Some((at, gap, price)) = bar_input {
+            for series in &mut self.series {
+                series.event(at, gap, price);
+            }
+        }
         match event {
             MarketEvent::FeedGap(gap) if gap.stream == Stream::Trades => {
                 self.cause(gap.start.as_millis(), CensorReason::Gap, true);
@@ -391,12 +604,27 @@ impl Model {
         if checked {
             self.checked_events.push_back(event);
         }
+        let scales = self.series.map(|series| series.atr.ready());
+        // The scale cross-check: the 1h scale is the engine's ATR(1h).
+        let atr = record.state.atr.ready().copied();
+        if scales[2] != atr {
+            self.scale_mismatches += 1;
+            if self.scale_notes.len() < 20 {
+                self.scale_notes.push(format!(
+                    "{event}: the model's ATR_1h {:?}, the record's {:?}",
+                    scales[2], atr
+                ));
+            }
+        } else if atr.is_some() {
+            self.scale_ready += 1;
+        }
         self.pending.push_back(Pending {
             event,
             ordinal,
             baseline,
             reference,
-            atr: record.state.atr.ready().copied(),
+            atr,
+            scales,
             level,
             extreme,
             clear,
@@ -493,7 +721,7 @@ impl Model {
             })
         });
         let bars: [Option<Barriers>; 5] =
-            std::array::from_fn(|position| barriers(pending.reference, pending.atr, position));
+            std::array::from_fn(|position| barriers(pending.reference, pending.scales[position]));
         #[derive(Default, Clone, Copy)]
         struct Scan {
             high: Option<(Price, EventTime)>,
@@ -675,6 +903,8 @@ impl Check {
 #[derive(Debug, Default)]
 struct Counts {
     neither: [u64; 5],
+    /// Races that ran: upper, lower or neither.
+    ran: [u64; 5],
     unavailable: [u64; 5],
     same_ms: [u64; 5],
     /// Windows censored, per reason in [`REASONS`] order.
@@ -698,11 +928,21 @@ struct Kinds {
     not_within: u64,
     censored_passages: u64,
     clear: u64,
+    /// Per horizon, races with a ready scale, and the earliest decision of
+    /// one.
+    available: [u64; 5],
+    first_available: [Option<i64>; 5],
 }
 
 impl Kinds {
     fn add(&mut self, label: &ForwardLabel) {
-        for horizon in &label.horizons {
+        for (position, horizon) in label.horizons.iter().enumerate() {
+            if horizon.barriers.is_some() {
+                self.available[position] += 1;
+                let decision = label.event.time.as_millis();
+                let first = &mut self.first_available[position];
+                *first = Some(first.map_or(decision, |first| first.min(decision)));
+            }
             match horizon.race {
                 Race::Upper { same_ms, .. } => {
                     self.upper += 1;
@@ -764,7 +1004,7 @@ impl Run {
         Self {
             engine: MarketStateEngine::new(),
             sampler: ContextSampler::new(None),
-            labeler: ForwardLabeler::new(),
+            labeler: ForwardLabeler::new(Labeling::V2),
             model: Model::new(pick),
             check: Check::default(),
             events: 0,
@@ -863,10 +1103,14 @@ impl Run {
         let counts = &mut self.counts;
         for (position, horizon) in label.horizons.iter().enumerate() {
             match horizon.race {
-                Race::Neither => counts.neither[position] += 1,
+                Race::Neither => {
+                    counts.neither[position] += 1;
+                    counts.ran[position] += 1;
+                }
                 Race::Unavailable => counts.unavailable[position] += 1,
                 Race::Upper { same_ms, .. } | Race::Lower { same_ms, .. } => {
                     counts.same_ms[position] += u64::from(same_ms);
+                    counts.ran[position] += 1;
                 }
                 Race::Censored(_) => {}
             }
@@ -891,6 +1135,12 @@ impl Run {
             && self.labels == self.records
             && stats.opened == self.records
             && stats.emitted == self.records
+    }
+
+    /// The scale cross-check (ADR-056 *Accept when*): the model's ATR_1h is
+    /// every record's `state.atr`, and the labeler's scales never broke.
+    fn scales_hold(&self) -> bool {
+        self.model.scale_mismatches == 0 && self.labeler.stats().scale_breaks == 0
     }
 }
 
@@ -935,6 +1185,17 @@ fn report_t0(run: &Run) {
     for note in &run.check.notes {
         println!("T0 mismatch: {note}");
     }
+    println!(
+        "scale cross-check: ATR_1h mismatches {} (ready and equal at {} records); scale breaks \
+         {}; holds {}",
+        run.model.scale_mismatches,
+        run.model.scale_ready,
+        run.labeler.stats().scale_breaks,
+        run.scales_hold()
+    );
+    for note in &run.model.scale_notes {
+        println!("scale mismatch: {note}");
+    }
 }
 
 fn report(run: &Run, wall: Duration) {
@@ -965,12 +1226,46 @@ fn report(run: &Run, wall: Duration) {
             counts.clear_trigger[position]
         );
     }
-    println!("reach-backs {}", run.labeler.stats().reach_backs);
+    println!(
+        "reach-backs {}, scale breaks {}",
+        run.labeler.stats().reach_backs,
+        run.labeler.stats().scale_breaks
+    );
+    println!(
+        "1h identity: 1h neither {} and unavailable {}; ADR-055 v1 published 56 372 and 899 \
+         (year), 49 and 847 (live store)",
+        counts.neither[2], counts.unavailable[2]
+    );
+    println!(
+        "prediction: N(H) = neither / races that ran (upper + lower + neither) = \
+         {PREDICTED_NEITHER_PERCENT} % at every H (v1's 1h); miss when max / min > {MISS_RATIO}"
+    );
+    let mut shares = Vec::new();
+    for (position, horizon) in HORIZONS.iter().enumerate() {
+        let (neither, ran) = (counts.neither[position], counts.ran[position]);
+        println!(
+            "  {horizon}: N {} = {neither} of {ran} races that ran (predicted \
+             {PREDICTED_NEITHER_PERCENT} %); v1's share of all labels {} %",
+            share(neither, ran),
+            V1_NEITHER_PERCENT[position]
+        );
+        if ran > 0 {
+            shares.push(neither as f64 / ran as f64);
+        }
+    }
+    let max = shares.iter().copied().fold(f64::NAN, f64::max);
+    let min = shares.iter().copied().fold(f64::NAN, f64::min);
+    println!(
+        "spread: max / min N(H) over the {} horizons with races = {:.4} (miss bound \
+         {MISS_RATIO}; ADR-056 evaluates it on the year only)",
+        shares.len(),
+        max / min
+    );
     println!("wall {:.1} s, peak RSS {}", wall.as_secs_f64(), peak_rss());
 }
 
 #[test]
-#[ignore = "measures the archive for ADR-055; see the module docs"]
+#[ignore = "measures the archive for ADR-056; see the module docs"]
 fn measure_labels() {
     let raw_root = env("MIE_MEASURE_RAW_ROOT");
     let from = parse_bound("MIE_MEASURE_FROM", &env("MIE_MEASURE_FROM"), false).unwrap();
@@ -1000,10 +1295,10 @@ fn measure_labels() {
     // D10, as `label_window` builds it.
     println!(
         "provenance {}",
-        LabelProvenance::new(ContextProvenance::new(
-            DataVersion::from(&dataset),
-            &run.engine
-        ))
+        LabelProvenance::new(
+            ContextProvenance::new(DataVersion::from(&dataset), &run.engine),
+            Labeling::V2
+        )
     );
     while let Some(event) = stream.next_event().unwrap() {
         run.step(event);
@@ -1022,10 +1317,11 @@ fn measure_labels() {
         "the model disagrees with the labeler"
     );
     assert!(run.complete(), "not exactly one label per record");
+    assert!(run.scales_hold(), "the scale cross-check failed");
 }
 
 #[test]
-#[ignore = "labels the contexts of a live capture for ADR-055; see the module docs"]
+#[ignore = "labels the contexts of a live capture for ADR-056; see the module docs"]
 fn measure_labels_live() {
     let raw_root = env("MIE_MEASURE_RAW_ROOT");
     let journal = std::path::PathBuf::from(env("MIE_MEASURE_JOURNAL"));
@@ -1037,7 +1333,7 @@ fn measure_labels_live() {
         "BTCUSDT",
         runs.iter().map(JournaledRun::live_run).collect(),
     );
-    let (mut mismatches, mut incomplete, mut labels) = (0, 0, 0);
+    let (mut mismatches, mut incomplete, mut labels, mut scales) = (0, 0, 0, 0);
     for journaled in &runs {
         let id = &journaled.parameters.run_id;
         let Ok(mut replay) = live.run_replay(id) else {
@@ -1047,10 +1343,10 @@ fn measure_labels_live() {
         let mut run = Run::new(every);
         println!(
             "run {id}: provenance {}",
-            LabelProvenance::new(ContextProvenance::new(
-                DataVersion::from(replay.dataset()),
-                &run.engine
-            ))
+            LabelProvenance::new(
+                ContextProvenance::new(DataVersion::from(replay.dataset()), &run.engine),
+                Labeling::V2
+            )
         );
         let started = Instant::now();
         while let Some(event) = replay.next_event().unwrap() {
@@ -1060,11 +1356,16 @@ fn measure_labels_live() {
         report(&run, started.elapsed());
         mismatches += run.check.mismatches;
         incomplete += u64::from(!run.complete());
+        scales += u64::from(!run.scales_hold());
         labels += run.labels;
     }
-    println!("live T0: labels {labels}, mismatches {mismatches}, incomplete runs {incomplete}");
+    println!(
+        "live T0: labels {labels}, mismatches {mismatches}, incomplete runs {incomplete}, runs \
+         failing the scale cross-check {scales}"
+    );
     assert_eq!(mismatches, 0, "the model disagrees with the labeler");
     assert_eq!(incomplete, 0, "not exactly one label per record");
+    assert_eq!(scales, 0, "the scale cross-check failed");
 }
 
 // ---------------------------------------------------------------------------
@@ -1273,6 +1574,7 @@ fn model_reproduces_the_labeler_on_a_synthetic_tape() {
         &history,
         window,
         window,
+        Labeling::V2,
         |_| trailing.clone(),
         |_| records += 1,
         |label| {
@@ -1290,6 +1592,8 @@ fn model_reproduces_the_labeler_on_a_synthetic_tape() {
     for run in [&full, &hourly] {
         assert_eq!(run.check.mismatches, 0, "{:#?}", run.check.notes);
         assert!(run.complete(), "not exactly one label per record");
+        assert!(run.scales_hold(), "{:#?}", run.model.scale_notes);
+        assert!(run.model.scale_ready > 1_000, "{}", run.model.scale_ready);
         assert_eq!(run.rejections, 3, "the three refused trades");
     }
     assert_eq!(full.checked, full.labels);
@@ -1301,7 +1605,7 @@ fn model_reproduces_the_labeler_on_a_synthetic_tape() {
     assert_eq!(digest.finish(), full.digest.finish());
     assert_eq!(windowed.labels, full.labeler.stats());
     assert_eq!(provenance.context.data, DataVersion::from(&dataset));
-    assert_eq!(provenance.labeling, LABELING_V1);
+    assert_eq!(provenance.labeling, LABELING_V2);
 
     // Every compared kind occurred, so T0 did not pass vacuously.
     let kinds = &full.kinds;
@@ -1328,32 +1632,109 @@ fn model_reproduces_the_labeler_on_a_synthetic_tape() {
     for (kind, count) in checks {
         assert!(count > 0, "the tape compared no {kind}");
     }
+    // Every horizon has races with a ready scale (ADR-056 D4′); 1d from
+    // day 15, once the partial first day and 14 daily samples have closed.
+    for (position, horizon) in HORIZONS.iter().enumerate() {
+        assert!(kinds.available[position] > 0, "no {horizon} race ran");
+    }
+    let first_daily = kinds.first_available[4].expect("a 1d race");
+    assert!(
+        (TAPE_START + 15 * DAY_MS..TAPE_START + 16 * DAY_MS).contains(&first_daily),
+        "{first_daily}"
+    );
     assert_eq!(kinds.censors[3], 0, "the trailing trades gap names the cut");
 }
 
 #[test]
 fn the_model_constants_are_the_adrs() {
-    // D3's horizons and D4's multiples, as the model writes them.
+    // D3's horizons and ADR-055 D4's multiples, as the model writes them.
     assert_eq!(HORIZON_MS, HORIZONS.map(|horizon| horizon.millis()));
     assert_eq!(MULTIPLE_E5, BARRIER_MULTIPLE_E5);
     for (multiple, horizon) in MULTIPLE_E5.iter().zip(HORIZON_MS) {
         let derived = (std::f64::consts::PI * horizon as f64 / (32.0 * HOUR_MS as f64)).sqrt();
         assert_eq!(*multiple, (derived * 1e5).round() as i64);
     }
-    // D4's rounding: half to even at the price unit, and 0 is no offset.
+    // ADR-056 D4′: b = √(π / 32) at every horizon, v1's 1h multiple.
+    assert_eq!(SCALE_E5, SCALE_MULTIPLE_E5);
+    assert_eq!(
+        SCALE_E5,
+        ((std::f64::consts::PI / 32.0).sqrt() * 1e5).round() as i64
+    );
+    assert_eq!(SCALE_E5, MULTIPLE_E5[2]);
+    // The prediction is v1's 1h share over the races that ran (ADR-055
+    // *Measurement*: 56 372 neither, 899 unavailable and at most 62
+    // censored of 561 695), and the miss bound is √(16.338 / 6.191) rounded
+    // down.
+    let ran = |censored: f64| 561_695.0 - 899.0 - censored;
+    for censored in [0.0, 62.0] {
+        let share = 100.0 * 56_372.0 / ran(censored);
+        assert!((share - PREDICTED_NEITHER_PERCENT).abs() < 0.005, "{share}");
+    }
+    let spread = (V1_NEITHER_PERCENT[0] / V1_NEITHER_PERCENT[4]).sqrt();
+    assert_eq!((spread * 100.0).floor() / 100.0, MISS_RATIO);
+    // The rounding: half to even at the price unit, and 0 is no offset.
     let atr = Price::from_units;
-    assert_eq!(offset(atr(50_000), 0), Some(4_522)); // 4 522.5
-    assert_eq!(offset(atr(150_000), 0), Some(13_568)); // 13 567.5
-    assert_eq!(offset(atr(10), 0), Some(1)); // 0.9045
-    assert_eq!(offset(atr(5), 0), None); // 0.45225
-    // The model's offsets agree with the labeler's on a sweep of ATRs.
+    assert_eq!(offset(atr(50_000), MULTIPLE_E5[0]), Some(4_522)); // 4 522.5
+    assert_eq!(offset(atr(150_000), MULTIPLE_E5[0]), Some(13_568)); // 13 567.5
+    assert_eq!(offset(atr(10), MULTIPLE_E5[0]), Some(1)); // 0.9045
+    assert_eq!(offset(atr(5), MULTIPLE_E5[0]), None); // 0.45225
+    assert_eq!(offset(atr(50_000), SCALE_E5), Some(15_666)); // 15 666.5
+    assert_eq!(offset(atr(150_000), SCALE_E5), Some(47_000)); // 46 999.5
+    // The model's offsets agree with the labeler's on a sweep of scales.
     for units in (0..2_000).chain((0..2_000).map(|k| 1_000_000_000 + 7 * k)) {
-        for position in 0..5 {
+        for multiple in MULTIPLE_E5.into_iter().chain([SCALE_E5]) {
             assert_eq!(
-                offset(atr(units), position),
-                barrier_offset(atr(units), position).map(Price::units),
-                "{units} {position}"
+                offset(atr(units), multiple),
+                barrier_offset(atr(units), multiple).map(Price::units),
+                "{units} {multiple}"
             );
         }
     }
+}
+
+#[test]
+fn the_model_atr_follows_adr_033() {
+    // Decision 6's table on 1h bars, decision 2's seed and Wilder step.
+    let bar = |hlc: Option<(i64, i64, i64)>, partial_start, feed_gap| ModelBar {
+        open: 0,
+        hlc,
+        partial_start,
+        feed_gap,
+    };
+    let mut atr = ModelAtr::default();
+    // Trades, incomplete, no anchor: anchors only.
+    atr.close(&bar(Some((110, 90, 105)), true, false));
+    assert_eq!((atr.samples, atr.anchor), (0, Some(105)));
+    // Trades, complete, anchor: TR with the previous close (130 − 105).
+    atr.close(&bar(Some((130, 120, 125)), false, false));
+    assert_eq!((atr.samples, atr.sum), (1, 25));
+    // Empty, complete, anchor: TR 0, the anchor stays.
+    atr.close(&bar(None, false, false));
+    assert_eq!((atr.samples, atr.sum, atr.anchor), (2, 25, Some(125)));
+    // Empty, incomplete: a break.
+    atr.close(&bar(None, false, true));
+    assert_eq!((atr.samples, atr.anchor, atr.atr), (0, None, None));
+    // Empty, complete, no anchor: skipped.
+    atr.close(&bar(None, false, false));
+    assert_eq!(atr.samples, 0);
+    // Trades, complete, no anchor: TR = H − L; 14 of them seed the mean.
+    for _ in 0..14 {
+        atr.close(&bar(Some((1_014, 1_000, 1_000)), false, false));
+    }
+    assert_eq!(atr.ready(), Some(Price::from_units(14)));
+    // (13 · 14 + 21) / 14 = 14.5: a tie, to the even 14.
+    atr.close(&bar(Some((1_021, 1_000, 1_000)), false, false));
+    assert_eq!(atr.ready(), Some(Price::from_units(14)));
+    // The bars: the first is partial, a gap marks the open bars it overlaps,
+    // and every elapsed interval closes.
+    let mut series = ModelSeries::new(5 * MINUTE_MS);
+    series.event(7 * MINUTE_MS, None, Some(100));
+    let first = series.developing.unwrap();
+    assert_eq!((first.open, first.partial_start), (5 * MINUTE_MS, true));
+    series.event(21 * MINUTE_MS, Some((8 * MINUTE_MS, 21 * MINUTE_MS)), None);
+    let developing = series.developing.unwrap();
+    assert_eq!(developing.open, 20 * MINUTE_MS);
+    assert!(developing.feed_gap && developing.hlc.is_none());
+    // [5, 10) anchored; [10, 15) and [15, 20) were empty and gapped: breaks.
+    assert_eq!((series.atr.samples, series.atr.anchor), (0, None));
 }
