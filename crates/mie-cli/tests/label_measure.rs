@@ -75,7 +75,8 @@
 //!   log-spread lies outside two of them; the miss (both); and the shape of
 //!   N over the horizons, each of its four steps a rise or a fall only
 //!   outside two bootstrap SEs of its own log-difference and flat
-//!   otherwise, with the reason ADR-056 *Reading of a miss* names for it. The 1h `Neither` and
+//!   otherwise, with the reason ADR-056 *Reading of a miss* names for it
+//!   when the flat steps alone stay within 1.62. The 1h `Neither` and
 //!   `Unavailable` counts are printed for the comparison with ADR-055's
 //!   published ones (the 1h identity).
 //! - Recorded only, over every label: per horizon the `Neither` share of
@@ -1121,9 +1122,12 @@ fn steps(shares: &[f64; 5], ses: &[Option<f64>; 4]) -> [Step; 4] {
     std::array::from_fn(|i| Step::of(shares[i], shares[i + 1], ses[i]))
 }
 
+/// ADR-056 *Reading of a miss*: the case no reading is pre-registered for.
+const OTHER: &str = "other: no pre-registered reading";
+
 /// ADR-056 *Reading of a miss*: the reading the four steps of N, 5m→15m
 /// to 4h→1d, name. Each case is a set of step sequences, the sets are
-/// disjoint, and every sequence no case names is `other`.
+/// disjoint, and every sequence no case names is [`OTHER`].
 fn shape(steps: [Step; 4]) -> &'static str {
     use Step::{Fall, Flat, Rise};
     let [s0, s1, s2, s3] = steps;
@@ -1139,7 +1143,13 @@ fn shape(steps: [Step; 4]) -> &'static str {
         && at(Rise).all(|i| i == 1 || i == 2)
         && at(Fall).all(|i| i >= 2)
         && at(Rise).max() < at(Fall).min();
-    if s0 == Fall && no_rise {
+    // Jumps: falls from 5m on, then only flat steps; a fall after a flat
+    // step is not a jump excess, which only shrinks with H.
+    let falls_from_5m = steps
+        .iter()
+        .skip_while(|&&step| step == Fall)
+        .all(|&step| step == Flat);
+    if s0 == Fall && falls_from_5m {
         "fall from 5m: jumps"
     } else if no_fall && s1 == Rise && (s0 == Rise || s3 == Rise) {
         "rise below 1h: finite volatility memory"
@@ -1154,7 +1164,34 @@ fn shape(steps: [Step; 4]) -> &'static str {
     } else if s0 == Fall && s1 != Rise && s3 == Rise {
         "fall from 5m, rise above 1h only: jumps and the week"
     } else {
-        "other: no pre-registered reason"
+        OTHER
+    }
+}
+
+/// ADR-056 *Reading of a miss*: ln(max ÷ min) of the series rebuilt from
+/// the flat steps alone, every step that cleared its band set to 0 in log.
+/// Equal shares (both 0 included) add 0; any other flat step joins two
+/// positive shares, since a step from or to 0 is never flat.
+fn flat_spread(shares: &[f64; 5], steps: [Step; 4]) -> f64 {
+    let (mut level, mut low, mut high) = (0.0_f64, 0.0_f64, 0.0_f64);
+    for (i, step) in steps.into_iter().enumerate() {
+        if step == Step::Flat && shares[i] != shares[i + 1] {
+            level += shares[i + 1].ln() - shares[i].ln();
+        }
+        low = low.min(level);
+        high = high.max(level);
+    }
+    high - low
+}
+
+/// ADR-056 *Reading of a miss*: the case of the steps names its reading
+/// only when the miss lies in the steps that cleared their bands, i.e. the
+/// flat steps alone stay within [`MISS_RATIO`]; otherwise [`OTHER`].
+fn reading(shares: &[f64; 5], steps: [Step; 4]) -> &'static str {
+    if flat_spread(shares, steps) > MISS_RATIO.ln() {
+        OTHER
+    } else {
+        shape(steps)
     }
 }
 
@@ -1567,7 +1604,11 @@ fn report(run: &Run, wall: Duration) {
             );
         }
         let letters: String = steps.iter().map(|step| step.letter()).collect();
-        println!("shape: {letters}: {}", shape(steps));
+        println!(
+            "flat steps alone: ln(max / min) {:.4}; shape: {letters}: {}",
+            flat_spread(&shares, steps),
+            reading(&shares, steps)
+        );
     }
     println!("wall {:.1} s, peak RSS {}", wall.as_secs_f64(), peak_rss());
 }
@@ -2206,12 +2247,7 @@ fn every_step_sequence_has_one_reading() {
     // ADR-056 *Reading of a miss*: each reading's sequences, and `other`
     // for the remaining 51 of the 81.
     let readings: [(&str, &[&str]); 7] = [
-        (
-            "fall from 5m: jumps",
-            &[
-                "DFFF", "DDFF", "DFDF", "DFFD", "DDDF", "DDFD", "DFDD", "DDDD",
-            ],
-        ),
+        ("fall from 5m: jumps", &["DFFF", "DDFF", "DDDF", "DDDD"]),
         (
             "rise below 1h: finite volatility memory",
             &["UUFF", "UUUF", "UUFU", "UUUU", "FUFU", "FUUU"],
@@ -2238,14 +2274,14 @@ fn every_step_sequence_has_one_reading() {
             named += 1;
         }
     }
-    assert_eq!(named, 30);
+    assert_eq!(named, 26);
     let mut other = 0;
     for code in 0..81 {
         let letters: String = (0..4)
             .map(|k| ['U', 'D', 'F'][code / 3_usize.pow(k) % 3])
             .collect();
         let reading = shape_of(&letters);
-        if reading == "other: no pre-registered reason" {
+        if reading == OTHER {
             other += 1;
         } else {
             assert!(
@@ -2257,8 +2293,12 @@ fn every_step_sequence_has_one_reading() {
             );
         }
     }
-    assert_eq!(other, 51);
-    assert_eq!(shape_of("FFFF"), "other: no pre-registered reason");
+    assert_eq!(other, 55);
+    assert_eq!(shape_of("FFFF"), OTHER);
+    // A fall after a flat step is no jump signature.
+    for letters in ["DFDF", "DFFD", "DDFD", "DFDD"] {
+        assert_eq!(shape_of(letters), OTHER, "{letters}");
+    }
 }
 
 #[test]
@@ -2269,19 +2309,13 @@ fn noisy_shares_name_a_mechanism_only_past_their_bands() {
     let horizon_se = [0.015, 0.0255, 0.051, 0.102, 0.26];
     let ses: [Option<f64>; 4] =
         std::array::from_fn(|i| Some(f64::hypot(horizon_se[i], horizon_se[i + 1])));
-    let read = |shares: [f64; 5]| shape(steps(&shares, &ses));
+    let read = |shares: [f64; 5]| reading(&shares, steps(&shares, &ses));
     let cases = [
         // A flat truth with noise, including a 1d excursion past 1.62
         // (15.9 / 9.6 = 1.66) that stays inside its step's band. Raw signs
         // read both as an interior trough at 4h.
-        (
-            [10.2, 10.0, 9.9, 9.7, 11.5],
-            "other: no pre-registered reason",
-        ),
-        (
-            [10.1, 10.0, 9.8, 9.6, 15.9],
-            "other: no pre-registered reason",
-        ),
+        ([10.2, 10.0, 9.9, 9.7, 11.5], OTHER),
+        ([10.1, 10.0, 9.8, 9.6, 15.9], OTHER),
         // The week on 1d only; raw signs read an interior trough at 1h.
         ([10.1, 9.9, 9.8, 10.2, 18.5], "rise above 1h only: the week"),
         // The week on 4h and 1d; raw signs read a monotone rise.
@@ -2291,7 +2325,28 @@ fn noisy_shares_name_a_mechanism_only_past_their_bands() {
         ),
         // Jumps with a flat tail; raw signs read an interior trough at 4h.
         ([18.2, 12.9, 10.4, 9.9, 10.6], "fall from 5m: jumps"),
+        // The review's round-3 case (PR #153): 5m 7 % high, inside what
+        // the bound allows, and 1d 40 % low. The miss lies in the flat
+        // 4h→1d step (ln 0.6 = −0.51, past ln 1.62 alone), so DFFF does
+        // not read as jumps.
+        ([10.7, 10.0, 10.0, 10.0, 6.0], OTHER),
+        // The same with 1d past its band: DFFD, a fall after flat steps.
+        ([10.7, 10.0, 10.0, 10.0, 5.5], OTHER),
     ];
+    let letters = |shares: [f64; 5]| -> String {
+        steps(&shares, &ses)
+            .iter()
+            .map(|step| step.letter())
+            .collect()
+    };
+    let one_d_low = [10.7, 10.0, 10.0, 10.0, 6.0];
+    assert_eq!(letters(one_d_low), "DFFF");
+    assert!(miss(
+        10.7 / 6.0,
+        Some(f64::hypot(horizon_se[0], horizon_se[4]))
+    ));
+    assert!(flat_spread(&one_d_low, steps(&one_d_low, &ses)) > MISS_RATIO.ln());
+    assert_eq!(letters([10.7, 10.0, 10.0, 10.0, 5.5]), "DFFD");
     for (shares, reading) in cases {
         assert_eq!(read(shares), reading, "{shares:?}");
     }
