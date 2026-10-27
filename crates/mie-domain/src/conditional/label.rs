@@ -1,19 +1,28 @@
-//! Forward outcome labels of context records (ADR-055, proposed; #26).
+//! Forward outcome labels of context records (ADR-055, proposed; #26;
+//! labeling v2: ADR-056, proposed; #151).
 //!
 //! A label says what the trade path did after a record's decision event,
 //! and nothing else: it reads the trades strictly after the record's
-//! [`CanonicalKey`] (ADR-028) and two values the record holds at decision
-//! time, `trade.last_price@1` (the **reference**) and `volatility.atr.1h@1`
-//! (ADR-054 D2). It never sees the engine, and no engine, catalog or
-//! sampler code reads a label (D11, enforced by `tools/check-architecture.sh`).
+//! [`CanonicalKey`] (ADR-028), the value the record holds at decision time
+//! as `trade.last_price@1` (the **reference**, ADR-054 D2), and a barrier
+//! scale known at decision. Under [`Labeling::V1`] (ADR-055) the scale is
+//! the record's `volatility.atr.1h@1`; under [`Labeling::V2`] (ADR-056
+//! D4′) it is, per horizon, ATR(14) (ADR-033) over the closed ADR-031 bars
+//! of the horizon's own timeframe, which the labeler builds itself from the
+//! accepted events up to and including the decision event, with the
+//! engine's own bar and ATR code. It never sees the engine, and no engine,
+//! catalog or sampler code reads a label (D11, enforced by
+//! `tools/check-architecture.sh`).
 //!
 //! - **One label per record** (D1), keyed `(event, ordinal)`, emitted in
 //!   record order to a sink separate from the records.
 //! - **Windows** (D2): horizon H reads the trades with a key greater than the
 //!   record's event and a time before `event.time + H`, for H in
 //!   [`HORIZONS`] (D3).
-//! - **Races** (D4, D5): one symmetric barrier pair per horizon, `reference
-//!   ± b_H · ATR` with `b_H` = [`BARRIER_MULTIPLE_E5`] per 10⁵. A trade
+//! - **Races** (D4, D5): one symmetric barrier pair per horizon: v1
+//!   `reference ± b_H · ATR(1h)` with `b_H` = [`BARRIER_MULTIPLE_E5`] per
+//!   10⁵; v2 `reference ± b · ATR_H` with `b` = [`SCALE_MULTIPLE_E5`] per
+//!   10⁵ at every horizon (ADR-056 D4′). A trade
 //!   touches the upper barrier at or above it and the lower one at or below
 //!   it; the first touch in canonical order wins, and `same_ms` says the
 //!   other barrier was touched later in the same millisecond.
@@ -42,7 +51,9 @@
 //! the minimum per horizon, pending touches from ordered sets keyed by
 //! price, so a trade costs amortized O(1) per horizon plus O(log n) per
 //! touch. It holds about one day of records, plus those of a trades outage
-//! that runs over a 1d window end, and at most one day of trades.
+//! that runs over a 1d window end, and at most one day of trades. Under v2
+//! it also holds one [`BarSet`] and five [`AtrSeries`]: O(1) memory
+//! (ADR-056 D11′).
 //!
 //! No type, field or `Display` text names a direction or an execution
 //! (ADR-010, ADR-054 D1): the barriers are upper and lower, the excursions
@@ -50,7 +61,7 @@
 //! (#28).
 
 use super::{ContextProvenance, ContextRecord, Sample, TRIGGER_IDS, trigger_position};
-use crate::bars::Timeframe;
+use crate::bars::{Bar, BarSet, Timeframe};
 use crate::candidate::CandidateEvent;
 use crate::event::{MarketEvent, Stream};
 use crate::feature::catalog;
@@ -62,6 +73,7 @@ use crate::research::PipelineKey;
 use crate::structure::Sweep;
 use crate::time::EventTime;
 use crate::trigger::{OiRejection, TriggerEvent, TriggerEvidence};
+use crate::volatility::AtrSeries;
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, VecDeque};
 use std::fmt;
@@ -73,6 +85,35 @@ mod tests;
 /// rule, censoring, excursions, passages and thinning. Any change to them
 /// is a new version.
 pub const LABELING_V1: PipelineKey = PipelineKey::new("conditional.labels", 1);
+
+/// The labeling of ADR-056 (D10′): ADR-055's, with the barriers scaled by
+/// the ATR(14) of each horizon's own bars (D4′).
+pub const LABELING_V2: PipelineKey = PipelineKey::new("conditional.labels", 2);
+
+/// A labeling version: the rules a [`ForwardLabeler`] applies and the key
+/// its [`LabelProvenance`] names. Both stay executable, so every published
+/// fingerprint can be re-derived and every labeling re-run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Labeling {
+    /// [`LABELING_V1`] (ADR-055): barriers `reference ± b_H · ATR(1h)`.
+    V1,
+    /// [`LABELING_V2`] (ADR-056): barriers `reference ± b · ATR_H`, the
+    /// ATR(14) of the closed bars of the horizon's timeframe.
+    V2,
+}
+
+impl Labeling {
+    /// The labeling new runs use.
+    pub const CURRENT: Self = Self::V2;
+
+    /// Its pipeline key.
+    pub const fn key(self) -> PipelineKey {
+        match self {
+            Self::V1 => LABELING_V1,
+            Self::V2 => LABELING_V2,
+        }
+    }
+}
 
 /// The horizons (ADR-055 D3): the bar timeframes trigger evidence is built
 /// on (ADR-053), widest last.
@@ -89,7 +130,14 @@ pub const HORIZONS: [Timeframe; 5] = [
 /// null leaves the band `± b_H · ATR` after H / 4 on average.
 pub const BARRIER_MULTIPLE_E5: [i64; 5] = [9_045, 15_666, 31_333, 62_666, 153_499];
 
-/// The denominator of [`BARRIER_MULTIPLE_E5`].
+/// The barrier multiple `b = √(π / 32)` of every horizon under
+/// [`Labeling::V2`], per 10⁵ of the horizon's ATR_H (ADR-056 D4′): with
+/// the ATR(14) of H's own bars, a driftless Brownian null leaves the band
+/// `± b · ATR_H` after H / 4 on average at every H. It is v1's 1h multiple,
+/// so the v2 1h band is v1's.
+pub const SCALE_MULTIPLE_E5: i64 = 31_333;
+
+/// The denominator of [`BARRIER_MULTIPLE_E5`] and [`SCALE_MULTIPLE_E5`].
 const MULTIPLE_SCALE: i64 = 100_000;
 
 /// The position in [`HORIZONS`] of the window passages are read in: 1d.
@@ -100,27 +148,34 @@ const LEVEL: u8 = 5;
 /// See [`LEVEL`].
 const EXTREME: u8 = 6;
 
-/// The canonical parameter text of [`LABELING_V1`], which
-/// [`labeling_fingerprint`] hashes: one line per decision of ADR-055 D2–D9.
-/// Every line ends in `\n`.
-pub fn labeling_text() -> String {
+/// The canonical parameter text of `labeling`, which
+/// [`labeling_fingerprint`] hashes: one line per decision of ADR-055 D2–D9
+/// (ADR-056 D10′ for v2: the `labeling` and `barriers` lines differ). Every
+/// line ends in `\n`. The v1 text is byte-identical to the one ADR-055's
+/// fingerprint names.
+pub fn labeling_text(labeling: Labeling) -> String {
     let horizons: Vec<String> = HORIZONS.iter().map(ToString::to_string).collect();
     let multiples: Vec<String> = BARRIER_MULTIPLE_E5
         .iter()
         .map(ToString::to_string)
         .collect();
     let mut text = String::from("mie-labeling 1\n");
-    text.push_str(&format!("labeling {LABELING_V1}\n"));
+    text.push_str(&format!("labeling {}\n", labeling.key()));
     text.push_str(&format!(
         "reference {} path=trades window=after_decision_key_before_decision_time_plus_h\n",
         catalog::TRADE_LAST_PRICE_V1.key
     ));
     text.push_str(&format!("horizons {}\n", horizons.join(",")));
-    text.push_str(&format!(
-        "barriers atr={} multiple_e5={} scale={MULTIPLE_SCALE} offset=round_half_even unavailable=atr_not_ready,zero_offset\n",
-        catalog::VOLATILITY_ATR_1H_V1.key,
-        multiples.join(",")
-    ));
+    match labeling {
+        Labeling::V1 => text.push_str(&format!(
+            "barriers atr={} multiple_e5={} scale={MULTIPLE_SCALE} offset=round_half_even unavailable=atr_not_ready,zero_offset\n",
+            catalog::VOLATILITY_ATR_1H_V1.key,
+            multiples.join(",")
+        )),
+        Labeling::V2 => text.push_str(&format!(
+            "barriers atr=atr14_adr033_over_closed_adr031_bars_of_the_horizon_timeframe at=after_decision_event bar_error=restart_warm_up multiple_e5={SCALE_MULTIPLE_E5} scale={MULTIPLE_SCALE} offset=round_half_even unavailable=scale_not_ready,zero_offset,out_of_range\n"
+        )),
+    }
     text.push_str("touch upper=price_at_or_above lower=price_at_or_below tie=earlier_canonical_key same_ms=other_barrier_later_in_the_millisecond\n");
     text.push_str("excursion up=max0_high_minus_reference down=max0_reference_minus_low at=earliest_trade_at_the_extreme last=last_trade\n");
     text.push_str("censor gap=trades_feed_gap_at_max_start_decision stale_reference=trades_gap_since_last_trade_or_no_trade rejected=trades_stream_event_at_max_decision_min_time_last_accepted_trades_stream_event end_of_data=last_accepted_trades_stream_event keep=resolved_strictly_before until=emitted closed_windows=too earliest=wins emitted=complete_and_accepted_trades_stream_event_at_or_after_1d_end_or_censor late_gap=immutable_reach_back\n");
@@ -141,9 +196,9 @@ pub fn labeling_text() -> String {
 }
 
 /// FNV-1a 64 ([`Fingerprinter::write_str`]) of [`labeling_text`].
-pub fn labeling_fingerprint() -> Fingerprint {
+pub fn labeling_fingerprint(labeling: Labeling) -> Fingerprint {
     let mut hasher = Fingerprinter::new();
-    hasher.write_str(&labeling_text());
+    hasher.write_str(&labeling_text(labeling));
     hasher.finish()
 }
 
@@ -156,7 +211,7 @@ pub fn labeling_fingerprint() -> Fingerprint {
 pub struct LabelProvenance {
     /// The provenance of the labeled records (ADR-054 D5).
     pub context: ContextProvenance,
-    /// The labeling: [`LABELING_V1`].
+    /// The labeling: [`LABELING_V1`] or [`LABELING_V2`].
     pub labeling: PipelineKey,
     /// [`labeling_fingerprint`].
     pub labeling_fingerprint: Fingerprint,
@@ -164,12 +219,12 @@ pub struct LabelProvenance {
 
 impl LabelProvenance {
     /// The provenance of labels of the records `context` describes, under
-    /// [`LABELING_V1`].
-    pub fn new(context: ContextProvenance) -> Self {
+    /// `labeling`.
+    pub fn new(context: ContextProvenance, labeling: Labeling) -> Self {
         Self {
             context,
-            labeling: LABELING_V1,
-            labeling_fingerprint: labeling_fingerprint(),
+            labeling: labeling.key(),
+            labeling_fingerprint: labeling_fingerprint(labeling),
         }
     }
 }
@@ -184,10 +239,12 @@ impl fmt::Display for LabelProvenance {
     }
 }
 
-/// `b_H · atr` for the horizon at `position` in [`HORIZONS`], rounded half
-/// to even to the price unit (ADR-055 D4); `None` when it rounds to 0.
-pub fn barrier_offset(atr: Price, position: usize) -> Option<Price> {
-    let product = i128::from(atr.units()) * i128::from(BARRIER_MULTIPLE_E5[position]);
+/// `multiple_e5 / 10⁵ · scale`, rounded half to even to the price unit
+/// (ADR-055 D4, ADR-056 D4′); `None` when it rounds to 0 or below. v1
+/// passes the record's ATR(1h) and the horizon's [`BARRIER_MULTIPLE_E5`],
+/// v2 the horizon's ATR_H and [`SCALE_MULTIPLE_E5`].
+pub fn barrier_offset(scale: Price, multiple_e5: i64) -> Option<Price> {
+    let product = i128::from(scale.units()) * i128::from(multiple_e5);
     let scale = i128::from(MULTIPLE_SCALE);
     let (quotient, remainder) = (product.div_euclid(scale), product.rem_euclid(scale));
     let rounded = match (2 * remainder).cmp(&scale) {
@@ -213,11 +270,11 @@ pub struct Barriers {
 }
 
 impl Barriers {
-    /// The barriers around `reference` for the horizon at `position`, or
-    /// `None` without a ready ATR, with an offset that rounds to 0, or if a
+    /// The barriers `reference ± multiple_e5 / 10⁵ · scale`, or `None`
+    /// without a ready scale, with an offset that rounds to 0, or if a
     /// barrier leaves the price range.
-    fn around(reference: Price, atr: Option<Price>, position: usize) -> Option<Self> {
-        let offset = barrier_offset(atr?, position)?.units();
+    fn around(reference: Price, scale: Option<Price>, multiple_e5: i64) -> Option<Self> {
+        let offset = barrier_offset(scale?, multiple_e5)?.units();
         Some(Self {
             lower: Price::from_units(reference.units().checked_sub(offset)?),
             upper: Price::from_units(reference.units().checked_add(offset)?),
@@ -310,8 +367,8 @@ pub enum Race {
     Neither,
     /// Neither barrier was touched strictly before the censor.
     Censored(Censor),
-    /// No race: the ATR was not ready at decision, or the offset rounds
-    /// to 0.
+    /// No race: the barrier scale was not ready at decision, the offset
+    /// rounds to 0, or a barrier leaves the price range.
     Unavailable,
 }
 
@@ -472,7 +529,9 @@ pub struct ForwardLabel {
     pub ordinal: u32,
     /// The record's `trade.last_price@1`; `None` before the first trade.
     pub reference: Option<Price>,
-    /// The record's `volatility.atr.1h@1`; `None` while not ready.
+    /// The record's `volatility.atr.1h@1`; `None` while not ready. Under
+    /// v2 each horizon's scale is carried by its barriers instead: ATR_H =
+    /// offset / b (ADR-056 D2′).
     pub atr: Option<Price>,
     /// One label per horizon, in [`HORIZONS`] order.
     pub horizons: [HorizonLabel; 5],
@@ -584,6 +643,12 @@ pub struct LabelStats {
     /// reaches back into the window of an already emitted label, which
     /// stays as it was (ADR-055 D6).
     pub reach_backs: u64,
+    /// v2 only (ADR-056 D11′): accepted events the labeler's own bars
+    /// could not take, and closed bars a barrier scale could not take,
+    /// each of which restarted the scales' warm-up. Only an event the
+    /// engine never took can cause one: a trailing trades gap, or a
+    /// labeler started after the engine.
+    pub scale_breaks: u64,
 }
 
 /// One observed trade.
@@ -744,7 +809,8 @@ struct Lane {
 /// (a horizon's race `0..5`, [`LEVEL`] or [`EXTREME`]).
 type Touch = (Price, u64, u8);
 
-/// Labels context records from the trades after their decision (ADR-055).
+/// Labels context records from the trades after their decision (ADR-055;
+/// the barrier scale of [`Labeling::V2`]: ADR-056).
 ///
 /// Drive it with every accepted event in canonical order: call
 /// [`observe`](Self::observe) with the event first, then
@@ -752,8 +818,18 @@ type Touch = (Price, u64, u8);
 /// event, in emission order. Report rejected events to
 /// [`reject`](Self::reject), and call [`finish`](Self::finish) at the end
 /// of the data. Labels come out in record order, each once.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForwardLabeler {
+    /// The labeling applied.
+    labeling: Labeling,
+    /// v2: the bars of every accepted event, built as the engine builds
+    /// them (ADR-031), so the scales read the same closed bars.
+    bars: BarSet,
+    /// v2: scratch buffer for the bars one event closes.
+    closed: Vec<Bar>,
+    /// v2: per horizon, ATR(14) over the closed bars of its timeframe
+    /// (ADR-056 D4′).
+    scales: [AtrSeries; 5],
     /// Labels not yet emitted, in record order.
     labels: VecDeque<Open>,
     /// The sequence number of `labels[0]`.
@@ -791,9 +867,33 @@ pub struct ForwardLabeler {
 }
 
 impl ForwardLabeler {
-    /// A labeler with nothing observed.
-    pub fn new() -> Self {
-        Self::default()
+    /// A labeler with nothing observed, applying `labeling`.
+    pub fn new(labeling: Labeling) -> Self {
+        Self {
+            labeling,
+            bars: BarSet::new(),
+            closed: Vec::new(),
+            scales: HORIZONS.map(AtrSeries::new),
+            labels: VecDeque::new(),
+            first_label: 0,
+            ticks: VecDeque::new(),
+            first_tick: 0,
+            lanes: Default::default(),
+            above: BTreeSet::new(),
+            below: BTreeSet::new(),
+            stale: false,
+            trades_until: None,
+            ordinal: None,
+            clear_baseline: [None; 5],
+            clear_trigger: [[None; 5]; TRIGGER_IDS.len()],
+            emitted_until: None,
+            stats: LabelStats::default(),
+        }
+    }
+
+    /// The labeling applied.
+    pub fn labeling(&self) -> Labeling {
+        self.labeling
     }
 
     /// Counts so far.
@@ -821,14 +921,24 @@ impl ForwardLabeler {
         self.ordinal = Some((event, ordinal));
         let reference = record.state.last_price.ready().copied();
         let atr = record.state.atr.ready().copied();
+        // The scale of each horizon, read once, here: v2's from the bars
+        // closed by the decision event and before it (ADR-056 D4′).
+        let (scales, multiples) = match self.labeling {
+            Labeling::V1 => ([atr; 5], BARRIER_MULTIPLE_E5),
+            Labeling::V2 => (
+                std::array::from_fn(|position| self.scales[position].atr().ready().copied()),
+                [SCALE_MULTIPLE_E5; 5],
+            ),
+        };
         let clear = self.thin(record);
         let prices = match &record.sample {
             Sample::Trigger { trigger, .. } => evidence_prices(trigger),
             Sample::Baseline { .. } => EvidencePrices::default(),
         };
         let horizons = std::array::from_fn(|position| {
-            let barriers =
-                reference.and_then(|reference| Barriers::around(reference, atr, position));
+            let barriers = reference.and_then(|reference| {
+                Barriers::around(reference, scales[position], multiples[position])
+            });
             HorizonLabel {
                 horizon: HORIZONS[position],
                 clear: clear[position],
@@ -931,7 +1041,44 @@ impl ForwardLabeler {
         if event.stream() == Stream::Trades {
             self.trades_until = self.trades_until.max(Some(key.time));
         }
+        if self.labeling == Labeling::V2 {
+            self.step_scales(event);
+        }
         self.emit_complete(&mut emit, false);
+    }
+
+    /// v2 (ADR-056 D11′): applies `event` to the labeler's bars and pushes
+    /// the bars it closes into the scales of their timeframes. The engine
+    /// commits an event atomically and the driver passes accepted events
+    /// only, so these are the engine's bars; [`reject`](Self::reject)
+    /// never comes here. An event the bars cannot take, or a bar a scale
+    /// cannot take, can only come from an event the engine never took; it
+    /// restarts the warm-up (all scales, or that scale) and counts in
+    /// [`LabelStats::scale_breaks`].
+    fn step_scales(&mut self, event: &MarketEvent) {
+        self.closed.clear();
+        // On error the bars are unspecified: work on a copy, as the engine.
+        let mut bars = self.bars;
+        if bars.apply(event, &mut self.closed).is_err() {
+            self.closed.clear();
+            self.bars = BarSet::new();
+            self.scales = HORIZONS.map(AtrSeries::new);
+            self.stats.scale_breaks += 1;
+            return;
+        }
+        self.bars = bars;
+        for bar in &self.closed {
+            let Some(position) = HORIZONS
+                .iter()
+                .position(|horizon| *horizon == bar.timeframe)
+            else {
+                continue;
+            };
+            if self.scales[position].push(bar).is_err() {
+                self.scales[position] = AtrSeries::new(bar.timeframe);
+                self.stats.scale_breaks += 1;
+            }
+        }
     }
 
     /// Reports an event the engine rejected. A trades-stream event never

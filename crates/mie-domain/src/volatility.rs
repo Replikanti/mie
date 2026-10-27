@@ -11,7 +11,9 @@
 //!   bars — the mean of the first 14 true ranges, then Wilder smoothing —
 //!   held as a [`Price`], each step rounded half to even to 1e-8. The
 //!   deviation from the exact value stays below 7 units of 1e-8 (ADR-033,
-//!   decision 2).
+//!   decision 2). [`AtrSeries`] computes it on the bars of any timeframe;
+//!   only the 1h one is a Market State feature, the others scale the
+//!   forward-label barriers of ADR-056.
 //! - **Regime** (`volatility.regime.1h@1`, [`Regime`]): Pine Script v5
 //!   `ta.percentrank(atr, 200)` — the share of the previous 200 ATR values at
 //!   or below the current one, in half-steps from 0 to 100 — mapped onto the
@@ -331,14 +333,34 @@ impl MotionAnchors {
     }
 }
 
-/// ATR(14) and the ATR-percentile regime of one bar series:
-/// `volatility.atr.1h@1` and `volatility.regime.1h@1` (ADR-033).
+/// What one closed bar did to an [`AtrSeries`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AtrStep {
+    /// A bar of another timeframe: nothing changed.
+    Ignored,
+    /// An empty incomplete bar: the series started over.
+    Restarted,
+    /// Only the anchor changed, or nothing (an empty complete bar without
+    /// an anchor).
+    Anchored,
+    /// A true-range sample.
+    Sampled,
+}
+
+/// ATR(14) of one bar series (ADR-033, decisions 2 and 6): the mean of the
+/// first 14 true ranges, then Wilder smoothing, each step rounded half to
+/// even to 1e-8, with the series-continuity table of the module docs.
 ///
-/// A pure stepper over closed [`REGIME_TIMEFRAME`](catalog::REGIME_TIMEFRAME)
-/// bars; bars of other timeframes are ignored. The previous ATR values live
-/// in a fixed ring, so a step never allocates.
+/// A pure stepper over the closed bars of one timeframe; bars of other
+/// timeframes are ignored. On [`REGIME_TIMEFRAME`](catalog::REGIME_TIMEFRAME)
+/// it is `volatility.atr.1h@1` (inside [`AtrRegimeSeries`]); on the other
+/// timeframes it is no Market State feature: the forward labeler of
+/// ADR-056 scales each horizon's barriers with the ATR(14) of the
+/// horizon's own bars.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AtrRegimeSeries {
+pub struct AtrSeries {
+    /// The timeframe of the bars the series takes.
+    timeframe: Timeframe,
     /// The previous close.
     anchor: Option<Price>,
     /// Samples since the series (re)started.
@@ -347,74 +369,60 @@ pub struct AtrRegimeSeries {
     seed_sum: i128,
     /// The current ATR, after the seed.
     current: Option<Price>,
-    /// The latest ATR values, oldest overwritten first.
-    window: [Price; LOOKBACK],
-    /// How many of `window` hold a value.
-    filled: usize,
-    /// Where the next ATR value goes.
-    next: usize,
     atr: FeatureValue<Price>,
-    regime: FeatureValue<Regime>,
 }
 
-impl Default for AtrRegimeSeries {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl AtrRegimeSeries {
-    /// An empty series, warming up.
-    pub fn new() -> Self {
+impl AtrSeries {
+    /// An empty series over the closed bars of `timeframe`, warming up.
+    pub fn new(timeframe: Timeframe) -> Self {
         Self {
+            timeframe,
             anchor: None,
             samples: 0,
             seed_sum: 0,
             current: None,
-            window: [Price::from_units(0); LOOKBACK],
-            filled: 0,
-            next: 0,
             atr: FeatureValue::WarmingUp {
                 observed: 0,
                 required: u64::from(ATR_LENGTH),
             },
-            regime: FeatureValue::WarmingUp {
-                observed: 0,
-                required: u64::from(REGIME_WARM_UP),
-            },
         }
     }
 
-    /// ATR(14) after the last sample: `volatility.atr.1h@1`.
+    /// The timeframe of the bars the series takes.
+    pub fn timeframe(&self) -> Timeframe {
+        self.timeframe
+    }
+
+    /// ATR(14) after the last sample.
     pub fn atr(&self) -> FeatureValue<Price> {
         self.atr
     }
 
-    /// The regime after the last sample: `volatility.regime.1h@1`.
-    pub fn regime(&self) -> FeatureValue<Regime> {
-        self.regime
-    }
-
-    /// Consumes the next closed bar of the series (ADR-033, decisions 2, 3
-    /// and 6).
+    /// Consumes the next closed bar of the series (ADR-033, decisions 2
+    /// and 6); a bar of another timeframe changes nothing.
     ///
     /// # Errors
     ///
     /// [`VolatilityError::Overflow`] if the bar's true range leaves the
     /// `Price` range; the series is then unchanged.
     pub fn push(&mut self, bar: &Bar) -> Result<(), VolatilityError> {
-        if bar.timeframe != catalog::REGIME_TIMEFRAME {
-            return Ok(());
+        self.step(bar).map(|_| ())
+    }
+
+    /// [`push`](Self::push), saying what the bar did.
+    fn step(&mut self, bar: &Bar) -> Result<AtrStep, VolatilityError> {
+        if bar.timeframe != self.timeframe {
+            return Ok(AtrStep::Ignored);
         }
         let continuity = Continuity::of(bar, self.anchor);
         let previous_close = match continuity {
             Continuity::Break => {
-                *self = Self::new();
-                return Ok(());
+                *self = Self::new(self.timeframe);
+                return Ok(AtrStep::Restarted);
             }
             Continuity::AnchorOnly | Continuity::Skip => {
                 self.anchor = continuity.anchor_after(bar, self.anchor);
-                return Ok(());
+                return Ok(AtrStep::Anchored);
             }
             Continuity::Fresh => None,
             Continuity::Continued(previous_close) => Some(previous_close),
@@ -447,18 +455,92 @@ impl AtrRegimeSeries {
         self.samples = samples;
         self.seed_sum = seed_sum;
         self.current = current;
-        let Some(atr) = current else {
-            self.atr = FeatureValue::WarmingUp {
+        self.atr = match current {
+            Some(atr) => FeatureValue::Ready(atr),
+            None => FeatureValue::WarmingUp {
                 observed: samples,
                 required: u64::from(ATR_LENGTH),
-            };
+            },
+        };
+        Ok(AtrStep::Sampled)
+    }
+}
+
+/// ATR(14) and the ATR-percentile regime of one bar series:
+/// `volatility.atr.1h@1` and `volatility.regime.1h@1` (ADR-033).
+///
+/// A pure stepper over closed [`REGIME_TIMEFRAME`](catalog::REGIME_TIMEFRAME)
+/// bars; bars of other timeframes are ignored. The ATR is an [`AtrSeries`];
+/// the previous ATR values live in a fixed ring, so a step never allocates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AtrRegimeSeries {
+    /// ATR(14) of the 1h bars.
+    series: AtrSeries,
+    /// The latest ATR values, oldest overwritten first.
+    window: [Price; LOOKBACK],
+    /// How many of `window` hold a value.
+    filled: usize,
+    /// Where the next ATR value goes.
+    next: usize,
+    regime: FeatureValue<Regime>,
+}
+
+impl Default for AtrRegimeSeries {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AtrRegimeSeries {
+    /// An empty series, warming up.
+    pub fn new() -> Self {
+        Self {
+            series: AtrSeries::new(catalog::REGIME_TIMEFRAME),
+            window: [Price::from_units(0); LOOKBACK],
+            filled: 0,
+            next: 0,
+            regime: FeatureValue::WarmingUp {
+                observed: 0,
+                required: u64::from(REGIME_WARM_UP),
+            },
+        }
+    }
+
+    /// ATR(14) after the last sample: `volatility.atr.1h@1`.
+    pub fn atr(&self) -> FeatureValue<Price> {
+        self.series.atr()
+    }
+
+    /// The regime after the last sample: `volatility.regime.1h@1`.
+    pub fn regime(&self) -> FeatureValue<Regime> {
+        self.regime
+    }
+
+    /// Consumes the next closed bar of the series (ADR-033, decisions 2, 3
+    /// and 6).
+    ///
+    /// # Errors
+    ///
+    /// [`VolatilityError::Overflow`] if the bar's true range leaves the
+    /// `Price` range; the series is then unchanged.
+    pub fn push(&mut self, bar: &Bar) -> Result<(), VolatilityError> {
+        match self.series.step(bar)? {
+            AtrStep::Ignored | AtrStep::Anchored => return Ok(()),
+            // A break clears the window too.
+            AtrStep::Restarted => {
+                *self = Self::new();
+                return Ok(());
+            }
+            AtrStep::Sampled => {}
+        }
+        let samples = self.series.samples;
+        let FeatureValue::Ready(atr) = self.series.atr() else {
             self.regime = FeatureValue::WarmingUp {
                 observed: samples,
                 required: u64::from(REGIME_WARM_UP),
             };
             return Ok(());
         };
-        self.atr = FeatureValue::Ready(atr);
         self.regime = if self.filled == LOOKBACK {
             let rank = u16::try_from(at_or_below(&self.window, atr)).ok();
             match rank.and_then(|rank| AtrPercentile::from_rank(rank, REGIME_LOOKBACK).ok()) {
@@ -694,11 +776,14 @@ mod tests {
         series
             .push(&bar(Timeframe::H1, 0, Some([100, 110, 90, 105]), PARTIAL))
             .unwrap();
-        assert_eq!((series.samples, series.anchor), (0, Some(p(105))));
+        assert_eq!(
+            (series.series.samples, series.series.anchor),
+            (0, Some(p(105)))
+        );
         assert_eq!(series.atr(), warming(0, 14));
         // Trades, complete, anchor: TR against the previous close.
         series.push(&hour(1, [120, 130, 120, 125])).unwrap();
-        assert_eq!((series.samples, series.seed_sum), (1, 25));
+        assert_eq!((series.series.samples, series.series.seed_sum), (1, 25));
         assert_eq!(series.atr(), warming(1, 14));
         // Trades, incomplete, anchor: a sample on the observed prices.
         series
@@ -709,13 +794,13 @@ mod tests {
                 GAP,
             ))
             .unwrap();
-        assert_eq!((series.samples, series.seed_sum), (2, 28));
+        assert_eq!((series.series.samples, series.series.seed_sum), (2, 28));
         // Empty, complete, anchor: TR 0; the anchor stays.
         series
             .push(&bar(Timeframe::H1, 3 * HOUR, None, COMPLETE))
             .unwrap();
-        assert_eq!((series.samples, series.seed_sum), (3, 28));
-        assert_eq!(series.anchor, Some(p(126)));
+        assert_eq!((series.series.samples, series.series.seed_sum), (3, 28));
+        assert_eq!(series.series.anchor, Some(p(126)));
         // Empty, incomplete: break.
         series
             .push(&bar(Timeframe::H1, 4 * HOUR, None, GAP))
@@ -728,7 +813,7 @@ mod tests {
         assert_eq!(series, AtrRegimeSeries::new());
         // Trades, complete, no anchor: a sample with TR = high − low.
         series.push(&hour(6, [100, 110, 95, 105])).unwrap();
-        assert_eq!((series.samples, series.seed_sum), (1, 15));
+        assert_eq!((series.series.samples, series.series.seed_sum), (1, 15));
         // After a break, a bar with trades and no anchor only anchors, and
         // the next bar's TR uses its close.
         series
@@ -742,9 +827,12 @@ mod tests {
                 GAP,
             ))
             .unwrap();
-        assert_eq!((series.samples, series.anchor), (0, Some(p(200))));
+        assert_eq!(
+            (series.series.samples, series.series.anchor),
+            (0, Some(p(200)))
+        );
         series.push(&hour(9, [210, 220, 210, 215])).unwrap();
-        assert_eq!((series.samples, series.seed_sum), (1, 20));
+        assert_eq!((series.series.samples, series.series.seed_sum), (1, 20));
     }
 
     #[test]
@@ -1095,6 +1183,87 @@ mod tests {
             .map(|hour| format!("{hour} {}", rows[hour].3))
             .collect();
         assert_eq!(lines, GOLDEN_REGIME_1H);
+    }
+
+    #[test]
+    fn the_atr_series_is_the_regime_series_atr_bar_by_bar() {
+        // The regime tape: a partial start, varying step sizes, and a break.
+        let mut engine = MarketStateEngine::new();
+        let mut regime = AtrRegimeSeries::new();
+        let mut atr = AtrSeries::new(Timeframe::H1);
+        let mut ready = 0;
+        for event in regime_tape() {
+            engine.apply(&event).unwrap();
+            for bar in engine.closed_bars() {
+                regime.push(bar).unwrap();
+                atr.push(bar).unwrap();
+                assert_eq!(atr.atr(), regime.atr(), "{bar:?}");
+                ready += usize::from(atr.atr().is_ready());
+            }
+        }
+        assert!(ready > 200, "{ready}");
+        assert_eq!(atr.timeframe(), Timeframe::H1);
+    }
+
+    #[test]
+    fn the_atr_series_runs_on_any_timeframe() {
+        let five = |index: i64, range: i64| {
+            bar(
+                Timeframe::M5,
+                index * 300_000,
+                Some([1_000, 1_000 + range, 1_000, 1_000]),
+                COMPLETE,
+            )
+        };
+        let mut series = AtrSeries::new(Timeframe::M5);
+        // A partial first bar only anchors (ADR-033, decision 6).
+        series
+            .push(&bar(
+                Timeframe::M5,
+                0,
+                Some([1_000, 1_005, 990, 1_000]),
+                PARTIAL,
+            ))
+            .unwrap();
+        assert_eq!(series.atr(), warming(0, 14));
+        for index in 1..14 {
+            series.push(&five(index, 14)).unwrap();
+        }
+        assert_eq!(series.atr(), warming(13, 14));
+        // Bars of other timeframes change nothing.
+        let before = series.clone();
+        series.push(&hour(1, [1_000, 9_000, 1_000, 1_000])).unwrap();
+        assert_eq!(series, before);
+        // The 14th sample seeds the mean; then Wilder: (13 · 14 + 28) / 14.
+        series.push(&five(14, 14)).unwrap();
+        assert_eq!(series.atr(), FeatureValue::Ready(p(14)));
+        series.push(&five(15, 28)).unwrap();
+        assert_eq!(series.atr(), FeatureValue::Ready(p(15)));
+        // An empty incomplete bar breaks it.
+        series
+            .push(&bar(Timeframe::M5, 16 * 300_000, None, GAP))
+            .unwrap();
+        assert_eq!(series, AtrSeries::new(Timeframe::M5));
+        // Overflow leaves it unchanged.
+        series
+            .push(&bar(
+                Timeframe::M5,
+                17 * 300_000,
+                Some([i64::MIN; 4]),
+                COMPLETE,
+            ))
+            .unwrap();
+        let before = series.clone();
+        assert_eq!(
+            series.push(&bar(
+                Timeframe::M5,
+                18 * 300_000,
+                Some([i64::MAX; 4]),
+                COMPLETE
+            )),
+            Err(VolatilityError::Overflow)
+        );
+        assert_eq!(series, before);
     }
 
     const GOLDEN_MOTION_1M: [&str; 6] = [
