@@ -109,6 +109,63 @@
 //! --nocapture measure_labels_live`. A whole clean run has no gap still
 //! open at its end, so it has no trailing gaps.
 //!
+//! **Noise measurement** (issue #151, PR #153 review): three `--ignored`
+//! tests measure, on real data, the noise inputs ADR-056's simulation
+//! numbers assumed (the AR(1) persistence of daily volatility, the SEs of
+//! ln N(H) and of the steps, their correlation), without computing a
+//! single labeling v2 label: ADR-056 is pre-registered, and the only
+//! real-data inputs allowed before its acceptance run are the engine's bars
+//! and labeling v1, whose counts ADR-055 published.
+//!
+//! - `measure_label_noise` replays the archive as `measure_labels` does,
+//!   through the engine, the sampler and a labeler under `Labeling::V1`
+//!   (asserted), and reads:
+//!   - daily volatility from the engine's closed bars: the primary
+//!     estimator is ln σ from the realized variance of the day's 1m closes
+//!     (returns between consecutive priced, complete 1m bars, scaled to
+//!     1440 minutes over the minutes they span). The persistence the
+//!     review simulated is that of the latent ln σ; an estimator's own
+//!     noise attenuates an AR(1) slope by var(true) ÷ (var(true) +
+//!     var(noise)), and the realized variance of about 1440 returns has a
+//!     relative error near √(2 ÷ 1440) = 3.7 %, while one daily range has a
+//!     CV of 0.298 (ADR-056 D12′), about as large as the spread of ln σ
+//!     across days. ln of the 1d bar's log range is printed as the
+//!     attenuated cross-check. ATR_1d is not used: its Wilder smoothing
+//!     makes it persistent whatever σ does. For each: the AR(1) slope φ by
+//!     OLS, its SE if the innovations were independent, and the SD and 95 %
+//!     interval of a circular block bootstrap of the consecutive-day pairs
+//!     (28-day blocks, 10 000 resamples, seed 151, the band's numbers); the
+//!     autocorrelation at 1, 2, 7, 14 and 28 days next to φ^k, so a
+//!     dependence AR(1) does not describe shows;
+//!   - from labeling v1's labels, the per-UTC-day `Neither` and race
+//!     counts of the band, resampled by the band's bootstrap (the same
+//!     draws as `bootstrap_se`): the SE of ln N(H) per horizon with its
+//!     binomial SE and design effect, the SE of every pair's
+//!     log-difference with its 2-SE noise ratio e^(2 SE), the SE of v1's
+//!     ln(max ÷ min) and of each step, and the correlations of the steps
+//!     and of ln N(H);
+//!   - the shape evaluation of ADR-056 *What the rule achieves* on that
+//!     noise: 200 000 pseudo-years per named truth, each a resample of the
+//!     real days with its ln N*(H) shifted by the truth's log minus the
+//!     year's, so it keeps the year's noise, serial dependence and
+//!     cross-horizon correlation; the miss rule and the reading with the
+//!     measured SEs fixed; per truth the misses, and of them the truth's
+//!     reading, *other* and a wrong mechanism. v1 scales every horizon by
+//!     ATR_1h, so its 1d noise lacks the 14-day memory of v2's ATR_1d, and
+//!     its 1d share is 6.2 %, not 10 %: the evaluation carries v1's noise
+//!     around v2's truths.
+//!
+//!   `MIE_MEASURE_RAW_ROOT`, `MIE_MEASURE_FROM`, `MIE_MEASURE_TO` and
+//!   `MIE_MEASURE_EVENTS` as for `measure_labels`; an optional
+//!   `MIE_MEASURE_DAILY_OUT=<file>` writes the per-day inputs.
+//! - `measure_label_noise_from` reruns the analysis from that file
+//!   (`MIE_MEASURE_DAILY=<file>`), in seconds.
+//! - `measure_daily_vol_klines` reads the same daily volatility from the
+//!   archive's 1m and 1d klines (`MIE_MEASURE_RAW_ROOT`, `MIE_MEASURE_FROM`,
+//!   `MIE_MEASURE_TO`): a quick cross-check, since exchange klines can
+//!   differ from the engine's bars (the ADR-031 kline cross-check), and
+//!   bars come from trades.
+//!
 //! `model_reproduces_the_labeler_on_a_synthetic_tape` runs T0, completeness
 //! and the report in CI on the seeded three-week tape of `common::tapes`
 //! (its trades gap on day 9 censors the windows it falls in, and the 1d
@@ -123,7 +180,11 @@
 //! the same tape emits the same labels. The bootstrap itself (its
 //! generator, its seed, its width under serial dependence and its limit on
 //! undefined resamples), the miss rule, the step bands and the shape cases
-//! have their own tests.
+//! have their own tests, and so do the noise measurement's parts: the
+//! daily-volatility estimators, the AR(1) fit on a series of known
+//! persistence, the resamples against `bootstrap_se`'s, the shape
+//! evaluation without noise, and the noise run on the twin tape against
+//! `label_window` under labeling v1.
 
 mod common;
 
@@ -136,11 +197,12 @@ use mie_adapter_parquet::ParquetRawStore;
 use mie_app::conditional::{finish_labels, label_contexts, label_window};
 use mie_cli::journal::{JournaledRun, read_runs};
 use mie_cli::replay::parse_bound;
+use mie_domain::bars::{Bar, Timeframe};
 use mie_domain::candidate::CandidateEvent;
 use mie_domain::conditional::label::{
     BARRIER_MULTIPLE_E5, Barriers, Censor, CensorReason, Excursion, ForwardLabel, ForwardLabeler,
-    HORIZONS, HorizonLabel, LABELING_V2, LabelProvenance, LabelStats, Labeling, Passage,
-    PassageLabel, Race, SCALE_MULTIPLE_E5, barrier_offset,
+    HORIZONS, HorizonLabel, LABELING_V1, LABELING_V2, LabelProvenance, LabelStats, Labeling,
+    Passage, PassageLabel, Race, SCALE_MULTIPLE_E5, barrier_offset,
 };
 use mie_domain::conditional::{ContextProvenance, ContextRecord, ContextSampler, Sample};
 use mie_domain::event::{FeedGap, GapReason, MarketEvent, Stream, Trade};
@@ -944,7 +1006,7 @@ struct Counts {
 /// The same `Neither` and races-that-ran counts per UTC day of the
 /// decision, from the first label's day on, empty days included: the units
 /// the bootstrap resamples (ADR-056 *Accept when*).
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq)]
 struct Daily {
     first: Option<i64>,
     neither: Vec<[u64; 5]>,
@@ -963,6 +1025,22 @@ impl Daily {
             self.ran.resize(row + 1, [0; 5]);
         }
         row
+    }
+
+    /// Counts one label's `Neither` and races that ran on the day of its
+    /// decision.
+    fn add(&mut self, label: &ForwardLabel) {
+        let day = self.row(label.event.time.as_millis());
+        for (position, horizon) in label.horizons.iter().enumerate() {
+            match horizon.race {
+                Race::Neither => {
+                    self.neither[day][position] += 1;
+                    self.ran[day][position] += 1;
+                }
+                Race::Upper { .. } | Race::Lower { .. } => self.ran[day][position] += 1,
+                Race::Unavailable | Race::Censored(_) => {}
+            }
+        }
     }
 }
 
@@ -983,6 +1061,23 @@ impl SplitMix64 {
     /// below n / 2⁶⁴).
     fn below(&mut self, n: usize) -> usize {
         ((u128::from(self.next()) * n as u128) >> 64) as usize
+    }
+}
+
+/// One circular block resample of `days` units: blocks of `block`
+/// consecutive units, wrapping at the end, from uniform starts, until it
+/// holds `days` of them; `add` sees every unit drawn, in order. The draws
+/// depend on `rng`, `days` and `block` only. `days` and `block` are
+/// positive.
+fn resample(rng: &mut SplitMix64, days: usize, block: usize, mut add: impl FnMut(usize)) {
+    let mut filled = 0;
+    while filled < days {
+        let start = rng.below(days);
+        let take = block.min(days - filled);
+        for k in 0..take {
+            add((start + k) % days);
+        }
+        filled += take;
     }
 }
 
@@ -1025,19 +1120,12 @@ fn bootstrap_se(
     let mut undefined = 0;
     for _ in 0..resamples {
         let mut sums = [0_u64; 4];
-        let mut filled = 0;
-        while filled < days {
-            let start = rng.below(days);
-            let take = block.min(days - filled);
-            for k in 0..take {
-                let day = (start + k) % days;
-                sums[0] += daily.neither[day][pair.0];
-                sums[1] += daily.ran[day][pair.0];
-                sums[2] += daily.neither[day][pair.1];
-                sums[3] += daily.ran[day][pair.1];
-            }
-            filled += take;
-        }
+        resample(&mut rng, days, block, |day| {
+            sums[0] += daily.neither[day][pair.0];
+            sums[1] += daily.ran[day][pair.0];
+            sums[2] += daily.neither[day][pair.1];
+            sums[3] += daily.ran[day][pair.1];
+        });
         if sums.contains(&0) {
             undefined += 1;
             continue;
@@ -1387,22 +1475,18 @@ impl Run {
 
     /// The report's counts over one label.
     fn count(&mut self, label: &ForwardLabel, baseline: bool) {
+        self.daily.add(label);
         let counts = &mut self.counts;
-        let daily = &mut self.daily;
-        let day = daily.row(label.event.time.as_millis());
         for (position, horizon) in label.horizons.iter().enumerate() {
             match horizon.race {
                 Race::Neither => {
                     counts.neither[position] += 1;
                     counts.ran[position] += 1;
-                    daily.neither[day][position] += 1;
-                    daily.ran[day][position] += 1;
                 }
                 Race::Unavailable => counts.unavailable[position] += 1,
                 Race::Upper { same_ms, .. } | Race::Lower { same_ms, .. } => {
                     counts.same_ms[position] += u64::from(same_ms);
                     counts.ran[position] += 1;
-                    daily.ran[day][position] += 1;
                 }
                 Race::Censored(_) => {}
             }
@@ -1718,6 +1802,936 @@ fn measure_labels_live() {
     assert_eq!(mismatches, 0, "the model disagrees with the labeler");
     assert_eq!(incomplete, 0, "not exactly one label per record");
     assert_eq!(scales, 0, "the scale cross-check failed");
+}
+
+// ---------------------------------------------------------------------------
+// Noise measurement: engine bars and labeling v1 only
+// ---------------------------------------------------------------------------
+
+/// Pseudo-years per truth in the shape evaluation: the review's 200 000
+/// draws per truth (PR #153), so a rate near 5 % carries a Monte Carlo
+/// error of 0.05 pp. They are the bootstrap's resamples continued: the
+/// first [`RESAMPLES`] are the ones the SEs come from.
+const EVAL_RESAMPLES: usize = 200_000;
+
+/// Lags of the autocorrelation of ln σ, in days: one and two days, a week,
+/// the ATR's length of 14 and the bootstrap's block of 28.
+const ACF_LAGS: [usize; 5] = [1, 2, 7, 14, 28];
+
+/// The truths ADR-056 *What the rule achieves* evaluates, N(H) in percent
+/// from 5m to 1d, with the reading a miss of each should get: the flat
+/// prediction and the 5m excess inside the bound with a 1d low have none.
+const TRUTHS: [(&str, [f64; 5], &str); 5] = [
+    ("flat", [10.0, 10.0, 10.0, 10.0, 10.0], OTHER),
+    (
+        "the week on 1d only",
+        [10.0, 10.0, 10.0, 10.0, 18.0],
+        "rise above 1h only: the week",
+    ),
+    (
+        "the week on 4h and 1d",
+        [10.0, 10.0, 10.0, 12.0, 18.0],
+        "rise above 1h only: the week",
+    ),
+    (
+        "jumps with a flat tail",
+        [18.0, 13.0, 10.5, 10.0, 10.0],
+        "fall from 5m: jumps",
+    ),
+    (
+        "a 5m excess inside the bound with a 1d low",
+        [10.7, 10.0, 10.0, 10.0, 6.0],
+        OTHER,
+    ),
+];
+
+/// Per UTC day, what the daily-σ estimators read from the closed 1m and 1d
+/// bars.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct DayVol {
+    /// The sum of the squared log returns between consecutive priced,
+    /// complete 1m bars' closes whose later bar opens on the day.
+    rv: f64,
+    /// The minutes those returns span (an empty bar between two priced ones
+    /// adds its minute to the next return).
+    minutes: u64,
+    /// ln(high ÷ low) of the day's 1d bar, when it is complete and priced.
+    range: Option<f64>,
+}
+
+/// The [`DayVol`] of every UTC day from the first closed bar's day on.
+#[derive(Debug, Default, PartialEq)]
+struct DailyVol {
+    first: Option<i64>,
+    days: Vec<DayVol>,
+    /// The open time and close of the last priced, complete 1m bar, while
+    /// no incomplete one has closed since.
+    last: Option<(i64, f64)>,
+    /// Closed 1m and 1d bars left out as incomplete (`partial_start`,
+    /// `feed_gap`).
+    incomplete: u64,
+}
+
+impl DailyVol {
+    /// The row of the day of `open`; bars close in time order.
+    fn row(&mut self, open: i64) -> usize {
+        let day = open.div_euclid(DAY_MS);
+        let first = *self.first.get_or_insert(day);
+        let row = usize::try_from(day - first).expect("bars close in time order");
+        if row >= self.days.len() {
+            self.days.resize(row + 1, DayVol::default());
+        }
+        row
+    }
+
+    /// One closed bar of `timeframe` opening at `open`, with its (high,
+    /// low, close) when it traded. Other timeframes are ignored. An
+    /// incomplete 1m bar ends the run of returns: the next priced bar
+    /// starts a new one.
+    fn bar(
+        &mut self,
+        timeframe: Timeframe,
+        open: i64,
+        prices: Option<(f64, f64, f64)>,
+        complete: bool,
+    ) {
+        match timeframe {
+            Timeframe::M1 => {
+                if !complete {
+                    self.incomplete += 1;
+                    self.last = None;
+                    return;
+                }
+                let Some((_, _, close)) = prices else {
+                    return;
+                };
+                let row = self.row(open);
+                if let Some((before, previous)) = self.last {
+                    let ret = (close / previous).ln();
+                    self.days[row].rv += ret * ret;
+                    self.days[row].minutes += u64::try_from((open - before) / MINUTE_MS)
+                        .expect("bars close in time order");
+                }
+                self.last = Some((open, close));
+            }
+            Timeframe::D1 => {
+                let row = self.row(open);
+                if !complete {
+                    self.incomplete += 1;
+                } else if let Some((high, low, _)) = prices {
+                    self.days[row].range = Some((high / low).ln());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// One closed engine bar.
+    fn engine_bar(&mut self, bar: &Bar) {
+        let prices = bar.ohlc.map(|ohlc| {
+            (
+                ohlc.high.units() as f64,
+                ohlc.low.units() as f64,
+                ohlc.close.units() as f64,
+            )
+        });
+        self.bar(
+            bar.timeframe,
+            bar.open_time.as_millis(),
+            prices,
+            bar.is_complete(),
+        );
+    }
+
+    /// The primary estimator: ln σ per day from the 1m realized variance,
+    /// scaled to a whole day over the minutes its returns span; `None` for
+    /// a day without a nonzero return.
+    fn log_sigma(&self) -> Vec<Option<f64>> {
+        self.days
+            .iter()
+            .map(|day| {
+                (day.minutes > 0 && day.rv > 0.0)
+                    .then(|| 0.5 * (day.rv * 1440.0 / day.minutes as f64).ln())
+            })
+            .collect()
+    }
+
+    /// The cross-check: ln of the 1d bar's log range (Parkinson's ln σ up
+    /// to a constant); `None` without a complete bar or with a zero range.
+    fn log_range(&self) -> Vec<Option<f64>> {
+        self.days
+            .iter()
+            .map(|day| day.range.filter(|range| *range > 0.0).map(f64::ln))
+            .collect()
+    }
+}
+
+/// The OLS slope of `y` on `x` with an intercept; `None` for fewer than two
+/// pairs or a constant `x`.
+fn slope(pairs: &[(f64, f64)]) -> Option<f64> {
+    if pairs.len() < 2 {
+        return None;
+    }
+    let n = pairs.len() as f64;
+    let mean_x = pairs.iter().map(|p| p.0).sum::<f64>() / n;
+    let mean_y = pairs.iter().map(|p| p.1).sum::<f64>() / n;
+    let sxx: f64 = pairs.iter().map(|p| (p.0 - mean_x).powi(2)).sum();
+    let sxy: f64 = pairs.iter().map(|p| (p.0 - mean_x) * (p.1 - mean_y)).sum();
+    (sxx > 0.0).then(|| sxy / sxx)
+}
+
+/// An AR(1) fit x_(t+1) = c + φ x_t + e of a daily series over the pairs of
+/// consecutive days both present.
+#[derive(Clone, Copy, Debug)]
+struct Ar1 {
+    days: usize,
+    pairs: usize,
+    mean: f64,
+    sd: f64,
+    phi: f64,
+    /// √((1 − φ²) ÷ pairs): the SE if the innovations were independent.
+    iid_se: f64,
+    /// The SD of φ over the block bootstrap of the pairs, and its 2.5 and
+    /// 97.5 % quantiles.
+    boot_sd: f64,
+    interval: (f64, f64),
+}
+
+/// The AR(1) fit of `series`, with a circular block bootstrap of its pairs
+/// (`block` consecutive pairs, `resamples` draws from SplitMix64 at
+/// `seed`), so the interval carries the series' own dependence beyond lag
+/// one; `None` for fewer than two pairs or a constant series.
+fn ar1(series: &[Option<f64>], block: usize, resamples: usize, seed: u64) -> Option<Ar1> {
+    let present: Vec<f64> = series.iter().flatten().copied().collect();
+    let pairs: Vec<(f64, f64)> = series
+        .windows(2)
+        .filter_map(|pair| Some((pair[0]?, pair[1]?)))
+        .collect();
+    let phi = slope(&pairs)?;
+    let n = present.len() as f64;
+    let mean = present.iter().sum::<f64>() / n;
+    let sd = (present.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1.0)).sqrt();
+    let mut rng = SplitMix64(seed);
+    let mut phis = Vec::with_capacity(resamples);
+    let mut drawn = Vec::with_capacity(pairs.len());
+    for _ in 0..resamples {
+        drawn.clear();
+        resample(&mut rng, pairs.len(), block.max(1), |i| {
+            drawn.push(pairs[i])
+        });
+        phis.extend(slope(&drawn));
+    }
+    if phis.len() < 2 {
+        return None;
+    }
+    phis.sort_by(f64::total_cmp);
+    let boot_mean = phis.iter().sum::<f64>() / phis.len() as f64;
+    let boot_sd = (phis.iter().map(|p| (p - boot_mean).powi(2)).sum::<f64>()
+        / (phis.len() - 1) as f64)
+        .sqrt();
+    let quantile = |q: f64| phis[((phis.len() - 1) as f64 * q).round() as usize];
+    Some(Ar1 {
+        days: present.len(),
+        pairs: pairs.len(),
+        mean,
+        sd,
+        phi,
+        iid_se: ((1.0 - phi * phi).max(0.0) / pairs.len() as f64).sqrt(),
+        boot_sd,
+        interval: (quantile(0.025), quantile(0.975)),
+    })
+}
+
+/// The sample autocorrelation of `series` at `lag` over the pairs both
+/// present, against the mean and variance of every present day.
+fn autocorrelation(series: &[Option<f64>], lag: usize) -> Option<f64> {
+    let present: Vec<f64> = series.iter().flatten().copied().collect();
+    let n = present.len() as f64;
+    let mean = present.iter().sum::<f64>() / n;
+    let variance = present.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n;
+    let products: Vec<f64> = (0..series.len().saturating_sub(lag))
+        .filter_map(|t| Some((series[t]? - mean) * (series[t + lag]? - mean)))
+        .collect();
+    (!products.is_empty() && variance > 0.0)
+        .then(|| products.iter().sum::<f64>() / products.len() as f64 / variance)
+}
+
+fn report_vol(source: &str, vol: &DailyVol) {
+    let minutes = vol
+        .days
+        .iter()
+        .filter(|day| day.minutes > 0)
+        .map(|day| day.minutes);
+    println!(
+        "daily volatility from {source}: {} UTC days from day {:?} (days since 1970-01-01), {} \
+         incomplete 1m/1d bars left out, fewest minutes of 1m returns in a day {:?}",
+        vol.days.len(),
+        vol.first,
+        vol.incomplete,
+        minutes.min()
+    );
+    let estimators = [
+        (
+            "ln realized sigma from 1m closes (primary)",
+            vol.log_sigma(),
+        ),
+        (
+            "ln of the 1d log range (cross-check; its own noise attenuates phi)",
+            vol.log_range(),
+        ),
+    ];
+    for (name, series) in estimators {
+        let Some(fit) = ar1(&series, BLOCK_DAYS, RESAMPLES, SEED) else {
+            println!("  {name}: too few days");
+            continue;
+        };
+        println!(
+            "  {name}: {} days, {} consecutive pairs, mean {:.4}, SD {:.4}; AR(1) phi {:.4}, iid \
+             SE {:.4}; block bootstrap of the pairs ({BLOCK_DAYS} d, {RESAMPLES} resamples, seed \
+             {SEED}): SD {:.4}, 95 % interval {:.4} .. {:.4}",
+            fit.days,
+            fit.pairs,
+            fit.mean,
+            fit.sd,
+            fit.phi,
+            fit.iid_se,
+            fit.boot_sd,
+            fit.interval.0,
+            fit.interval.1
+        );
+        let lags: Vec<String> = ACF_LAGS
+            .iter()
+            .map(|&lag| {
+                let r = autocorrelation(&series, lag)
+                    .map_or_else(|| "-".to_owned(), |r| format!("{r:.3}"));
+                // r_k^(1/k): the AR(1) persistence that would carry the
+                // lag-k correlation, to set beside phi.
+                let implied = autocorrelation(&series, lag)
+                    .filter(|r| *r > 0.0)
+                    .map_or_else(
+                        || "-".to_owned(),
+                        |r| format!("{:.3}", r.powf(1.0 / lag as f64)),
+                    );
+                format!(
+                    "{lag} d {r} (phi^{lag} {:.3}, r^(1/{lag}) {implied})",
+                    fit.phi.powi(lag as i32)
+                )
+            })
+            .collect();
+        println!("    autocorrelation: {}", lags.join(", "));
+    }
+}
+
+/// The bootstrap's resampled years, the draws [`bootstrap_se`] makes: per
+/// resample, ln N*(H) per horizon, `None` where it holds no race or no
+/// `Neither` at H.
+fn resample_logs(
+    daily: &Daily,
+    block: usize,
+    resamples: usize,
+    seed: u64,
+) -> Vec<[Option<f64>; 5]> {
+    let days = daily.ran.len();
+    if days == 0 || block == 0 {
+        return vec![[None; 5]; resamples];
+    }
+    let mut rng = SplitMix64(seed);
+    (0..resamples)
+        .map(|_| {
+            let (mut neither, mut ran) = ([0_u64; 5], [0_u64; 5]);
+            resample(&mut rng, days, block, |day| {
+                for h in 0..5 {
+                    neither[h] += daily.neither[day][h];
+                    ran[h] += daily.ran[day][h];
+                }
+            });
+            std::array::from_fn(|h| {
+                (neither[h] > 0).then(|| (neither[h] as f64 / ran[h] as f64).ln())
+            })
+        })
+        .collect()
+}
+
+/// The value of Σ_H weights[H] · ln N*(H) in one resample; `None` when a
+/// weighted horizon is undefined there.
+fn combine(logs: &[Option<f64>; 5], weights: [f64; 5]) -> Option<f64> {
+    (0..5).try_fold(0.0, |sum, h| {
+        if weights[h] == 0.0 {
+            Some(sum)
+        } else {
+            logs[h].map(|log| sum + weights[h] * log)
+        }
+    })
+}
+
+/// The bootstrap SE of Σ_H weights[H] · ln N(H) over `logs`, with
+/// [`bootstrap_se`]'s rule on undefined resamples: for the weights +1 at
+/// one horizon and −1 at another, its band.
+fn combination_band(logs: &[[Option<f64>; 5]], weights: [f64; 5]) -> Band {
+    let values: Vec<f64> = shifted(logs.iter().filter_map(|l| combine(l, weights)).collect());
+    let undefined = logs.len() - values.len();
+    if !bootstrap_limit_holds(undefined, logs.len()) || values.len() < 2 {
+        return Band {
+            se: None,
+            undefined,
+        };
+    }
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    let squares: f64 = values.iter().map(|v| (v - mean) * (v - mean)).sum();
+    Band {
+        se: Some((squares / (values.len() - 1) as f64).sqrt()),
+        undefined,
+    }
+}
+
+/// `values` less the first of them, so a constant series has a variance
+/// of exactly 0 rather than its mean's rounding.
+fn shifted(mut values: Vec<f64>) -> Vec<f64> {
+    if let Some(&first) = values.first() {
+        values.iter_mut().for_each(|value| *value -= first);
+    }
+    values
+}
+
+/// The correlation of two weighted sums over the resamples where both are
+/// defined; `None` when either is constant.
+fn correlation(logs: &[[Option<f64>; 5]], a: [f64; 5], b: [f64; 5]) -> Option<f64> {
+    let (xs, ys): (Vec<f64>, Vec<f64>) = logs
+        .iter()
+        .filter_map(|l| Some((combine(l, a)?, combine(l, b)?)))
+        .unzip();
+    if xs.len() < 2 {
+        return None;
+    }
+    let pairs: Vec<(f64, f64)> = shifted(xs).into_iter().zip(shifted(ys)).collect();
+    let n = pairs.len() as f64;
+    let (ma, mb) = (
+        pairs.iter().map(|p| p.0).sum::<f64>() / n,
+        pairs.iter().map(|p| p.1).sum::<f64>() / n,
+    );
+    let cov: f64 = pairs.iter().map(|p| (p.0 - ma) * (p.1 - mb)).sum();
+    let va: f64 = pairs.iter().map(|p| (p.0 - ma).powi(2)).sum();
+    let vb: f64 = pairs.iter().map(|p| (p.1 - mb).powi(2)).sum();
+    (va > 0.0 && vb > 0.0).then(|| cov / (va * vb).sqrt())
+}
+
+/// The weights of ln N(H).
+fn unit(h: usize) -> [f64; 5] {
+    std::array::from_fn(|i| if i == h { 1.0 } else { 0.0 })
+}
+
+/// The weights of ln N(H_hi) − ln N(H_lo).
+fn difference(hi: usize, lo: usize) -> [f64; 5] {
+    std::array::from_fn(|i| {
+        if i == hi {
+            1.0
+        } else if i == lo {
+            -1.0
+        } else {
+            0.0
+        }
+    })
+}
+
+/// The measured SEs the miss rule and the step bands read: every pair's
+/// log-difference and every step's.
+struct Bands {
+    pair: [[Option<f64>; 5]; 5],
+    step: [Option<f64>; 4],
+}
+
+impl Bands {
+    fn of(logs: &[[Option<f64>; 5]]) -> Self {
+        Self {
+            pair: std::array::from_fn(|i| {
+                std::array::from_fn(|j| {
+                    if i == j {
+                        Some(0.0)
+                    } else {
+                        combination_band(logs, difference(i, j)).se
+                    }
+                })
+            }),
+            step: std::array::from_fn(|i| combination_band(logs, difference(i + 1, i)).se),
+        }
+    }
+}
+
+/// What the miss rule and its reading did over the pseudo-years of one
+/// truth.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Evaluation {
+    draws: u64,
+    /// Pseudo-years with an undefined horizon, left out.
+    undefined: u64,
+    misses: u64,
+    /// Of the misses: the truth's reading; *other* where the truth has a
+    /// named one; any other named reading.
+    expected: u64,
+    other: u64,
+    wrong: u64,
+}
+
+/// ADR-056's miss rule and reading over pseudo-years of `truth`: each
+/// resample of the real days, its ln N*(H) shifted by the truth's log minus
+/// the year's own `center`, so it keeps the year's noise, serial dependence
+/// and cross-horizon correlation around the truth. The bands are the
+/// measured `bands`, fixed, as the review's simulation fixed its SEs.
+fn evaluate(
+    logs: &[[Option<f64>; 5]],
+    center: [f64; 5],
+    truth: [f64; 5],
+    bands: &Bands,
+    expected: &str,
+) -> Evaluation {
+    let mut evaluation = Evaluation::default();
+    for resampled in logs {
+        evaluation.draws += 1;
+        let Some(logs) = resampled.iter().copied().collect::<Option<Vec<f64>>>() else {
+            evaluation.undefined += 1;
+            continue;
+        };
+        let shares: [f64; 5] = std::array::from_fn(|h| truth[h] * (logs[h] - center[h]).exp());
+        let (mut hi, mut lo) = (0, 0);
+        for h in 1..5 {
+            if shares[h] > shares[hi] {
+                hi = h;
+            }
+            if shares[h] < shares[lo] {
+                lo = h;
+            }
+        }
+        if !miss(shares[hi] / shares[lo], bands.pair[hi][lo]) {
+            continue;
+        }
+        evaluation.misses += 1;
+        let read = reading(&shares, steps(&shares, &bands.step));
+        if read == expected {
+            evaluation.expected += 1;
+        } else if read == OTHER {
+            evaluation.other += 1;
+        } else {
+            evaluation.wrong += 1;
+        }
+    }
+    evaluation
+}
+
+/// `part` of `whole` in percent, one decimal.
+fn percent(part: u64, whole: u64) -> String {
+    if whole == 0 {
+        return "-".to_owned();
+    }
+    format!("{:.1} %", part as f64 * 100.0 / whole as f64)
+}
+
+fn report_noise(daily: &Daily, resamples: usize, draws: usize) {
+    let days = daily.ran.len();
+    let total = |rows: &[[u64; 5]], h: usize| rows.iter().map(|row| row[h]).sum::<u64>();
+    let neither: [u64; 5] = std::array::from_fn(|h| total(&daily.neither, h));
+    let ran: [u64; 5] = std::array::from_fn(|h| total(&daily.ran, h));
+    println!(
+        "noise from labeling v1's per-day counts: {days} UTC days, circular block bootstrap, \
+         block {BLOCK_DAYS} d, {resamples} resamples, seed {SEED}"
+    );
+    if (0..5).any(|h| neither[h] == 0) {
+        println!("  a horizon without races or Neither: no noise measured");
+        return;
+    }
+    let p: [f64; 5] = std::array::from_fn(|h| neither[h] as f64 / ran[h] as f64);
+    let center = p.map(f64::ln);
+    let logs = resample_logs(daily, BLOCK_DAYS, draws.max(resamples), SEED);
+    let band_logs = &logs[..resamples];
+    let se_text =
+        |se: Option<f64>| se.map_or_else(|| "undefined".to_owned(), |se| format!("{se:.4}"));
+    for (h, horizon) in HORIZONS.iter().enumerate() {
+        let band = combination_band(band_logs, unit(h));
+        // The SE if every race that ran were an independent draw, the
+        // design effect against it, and the independent races it is worth.
+        let binomial = ((1.0 - p[h]) / (p[h] * ran[h] as f64)).sqrt();
+        let effective = band
+            .se
+            .map(|se| (1.0 - p[h]) / (p[h] * se * se))
+            .map_or_else(|| "-".to_owned(), |n| format!("{n:.0}"));
+        println!(
+            "  {horizon}: N {:.3} % = {} of {}; SE of ln N {} ({} undefined), binomial {:.4}, \
+             design effect {}, independent races worth {effective}",
+            p[h] * 100.0,
+            neither[h],
+            ran[h],
+            se_text(band.se),
+            band.undefined,
+            binomial,
+            band.se.map_or_else(
+                || "-".to_owned(),
+                |se| format!("{:.1}", (se / binomial).powi(2))
+            )
+        );
+    }
+    let bands = Bands::of(band_logs);
+    println!("  SE of ln N(row) - ln N(column), and the 2-SE noise ratio e^(2 SE):");
+    for (i, horizon) in HORIZONS.iter().enumerate() {
+        let cells: Vec<String> = (0..5)
+            .map(|j| match bands.pair[i][j] {
+                Some(se) if i != j => format!("{se:.4} ({:.3})", (BAND_SE * se).exp()),
+                Some(_) => "-".to_owned(),
+                None => "undefined".to_owned(),
+            })
+            .collect();
+        println!("    {horizon}: {}", cells.join(" | "));
+    }
+    let (hi, lo) = (
+        (0..5).max_by(|&a, &b| p[a].total_cmp(&p[b])).unwrap(),
+        (0..5).min_by(|&a, &b| p[a].total_cmp(&p[b])).unwrap(),
+    );
+    println!(
+        "  v1's spread {} / {} = {:.4}: SE of ln(max / min) {}",
+        HORIZONS[hi],
+        HORIZONS[lo],
+        p[hi] / p[lo],
+        se_text(bands.pair[hi][lo])
+    );
+    for i in 0..4 {
+        let band = combination_band(band_logs, difference(i + 1, i));
+        println!(
+            "  step {} -> {}: SE of the log-difference {} ({} undefined)",
+            HORIZONS[i],
+            HORIZONS[i + 1],
+            se_text(band.se),
+            band.undefined
+        );
+    }
+    let matrix = |weights: &dyn Fn(usize) -> [f64; 5], n: usize, name: &str| {
+        println!("  correlation of the {name} over the resamples:");
+        for i in 0..n {
+            let cells: Vec<String> = (0..n)
+                .map(|j| {
+                    correlation(band_logs, weights(i), weights(j))
+                        .map_or_else(|| "-".to_owned(), |r| format!("{r:+.3}"))
+                })
+                .collect();
+            println!("    {}", cells.join(" "));
+        }
+    };
+    matrix(&|i| difference(i + 1, i), 4, "steps (5m->15m .. 4h->1d)");
+    matrix(&unit, 5, "ln N(H) (5m .. 1d)");
+    println!(
+        "  shape evaluation: {} pseudo-years per truth, the resamples shifted to the truth in \
+         log, the bands above fixed; miss when max / min > {MISS_RATIO} and outside {BAND_SE} \
+         SE",
+        logs.len()
+    );
+    for (name, truth, expected) in TRUTHS {
+        let e = evaluate(&logs, center, truth, &bands, expected);
+        println!(
+            "    {name} ({}): misses {} of {} ({}; {} undefined); of the misses: {} {}, other {}, \
+             a wrong mechanism {}; of every draw a named wrong reading {}",
+            truth.map(|t| format!("{t}")).join(" / "),
+            e.misses,
+            e.draws,
+            percent(e.misses, e.draws),
+            e.undefined,
+            if expected == OTHER {
+                "other (expected)"
+            } else {
+                expected
+            },
+            percent(e.expected, e.misses),
+            percent(e.other, e.misses),
+            percent(e.wrong, e.misses),
+            percent(e.wrong, e.draws)
+        );
+    }
+}
+
+/// One drive for the noise measurement: the engine, the sampler and a
+/// labeler under labeling v1, with the engine's closed 1m and 1d bars and
+/// the v1 labels' `Neither` and race counts per UTC day. It computes no
+/// labeling v2 label: ADR-056's prediction is pre-registered, and its only
+/// real-data inputs before the acceptance run are the engine's bars and
+/// labeling v1, whose counts ADR-055 published.
+struct NoiseRun {
+    engine: MarketStateEngine,
+    sampler: ContextSampler,
+    labeler: ForwardLabeler,
+    events: u64,
+    rejections: u64,
+    labels: u64,
+    unavailable: [u64; 5],
+    daily: Daily,
+    vol: DailyVol,
+}
+
+impl NoiseRun {
+    fn new() -> Self {
+        Self {
+            engine: MarketStateEngine::new(),
+            sampler: ContextSampler::new(None),
+            labeler: ForwardLabeler::new(Labeling::V1),
+            events: 0,
+            rejections: 0,
+            labels: 0,
+            unavailable: [0; 5],
+            daily: Daily::default(),
+            vol: DailyVol::default(),
+        }
+    }
+
+    fn step(&mut self, event: MarketEvent) {
+        let mut labels = Vec::new();
+        let report = label_contexts(
+            &mut One(Some(event)),
+            &mut self.engine,
+            &mut self.sampler,
+            &mut self.labeler,
+            |_| {},
+            |_| {},
+            |label| labels.push(label),
+        )
+        .expect("a one-event provider cannot fail");
+        self.events += report.events;
+        self.rejections += report.rejections;
+        // A rejected event leaves the last accepted event's bars there.
+        if report.rejections == 0 {
+            for bar in self.engine.closed_bars() {
+                self.vol.engine_bar(bar);
+            }
+        }
+        for label in &labels {
+            self.add(label);
+        }
+    }
+
+    fn finish(&mut self, trailing: &[FeedGap]) {
+        let mut labels = Vec::new();
+        finish_labels(&mut self.labeler, trailing, |label| labels.push(label))
+            .expect("the trailing gaps keep the driver contract (ADR-055 D6)");
+        for label in &labels {
+            self.add(label);
+        }
+    }
+
+    fn add(&mut self, label: &ForwardLabel) {
+        self.labels += 1;
+        self.daily.add(label);
+        for (position, horizon) in label.horizons.iter().enumerate() {
+            self.unavailable[position] += u64::from(horizon.race == Race::Unavailable);
+        }
+    }
+
+    fn report(&self) {
+        println!(
+            "labeling v1: events {}, rejections {}, labels {}; labeler {:?}",
+            self.events,
+            self.rejections,
+            self.labels,
+            self.labeler.stats()
+        );
+        let total = |rows: &[[u64; 5]], h: usize| rows.iter().map(|row| row[h]).sum::<u64>();
+        for (h, horizon) in HORIZONS.iter().enumerate() {
+            println!(
+                "  {horizon}: neither {} ({} of all labels; ADR-055 published {} %), ran {}, \
+                 unavailable {}",
+                total(&self.daily.neither, h),
+                share(total(&self.daily.neither, h), self.labels),
+                V1_NEITHER_PERCENT[h],
+                total(&self.daily.ran, h),
+                self.unavailable[h]
+            );
+        }
+        println!(
+            "v1 check: labels, 1h neither, 1h unavailable {} / {} / {}; ADR-055 published 561 695 \
+             / 56 372 / 899 on the year",
+            self.labels,
+            total(&self.daily.neither, 2),
+            self.unavailable[2]
+        );
+    }
+}
+
+/// The first line of a per-day file.
+const DAILY_HEADER: &str = "# label_measure noise days: labels <day> <neither x5> <ran x5> | \
+                            vol <day> <rv> <minutes> <range or -> | incomplete <n>";
+
+/// The per-day inputs of the noise measurement as text, so the analysis
+/// can be rerun without the replay; days count from 1970-01-01.
+fn daily_text(daily: &Daily, vol: &DailyVol) -> String {
+    let mut text = format!("{DAILY_HEADER}\n");
+    let join = |row: &[u64; 5]| row.map(|n| n.to_string()).join("\t");
+    if let Some(first) = daily.first {
+        for (i, (neither, ran)) in daily.neither.iter().zip(&daily.ran).enumerate() {
+            let day = first + i as i64;
+            text.push_str(&format!(
+                "labels\t{day}\t{}\t{}\n",
+                join(neither),
+                join(ran)
+            ));
+        }
+    }
+    if let Some(first) = vol.first {
+        for (i, day) in vol.days.iter().enumerate() {
+            let range = day.range.map_or_else(|| "-".to_owned(), |r| r.to_string());
+            text.push_str(&format!(
+                "vol\t{}\t{}\t{}\t{range}\n",
+                first + i as i64,
+                day.rv,
+                day.minutes
+            ));
+        }
+    }
+    text.push_str(&format!("incomplete\t{}\n", vol.incomplete));
+    text
+}
+
+/// Reads [`daily_text`] back.
+fn parse_daily(text: &str) -> (Daily, DailyVol) {
+    let (mut daily, mut vol) = (Daily::default(), DailyVol::default());
+    for line in text.lines().filter(|line| !line.starts_with('#')) {
+        let fields: Vec<&str> = line.split('\t').collect();
+        let number = |i: usize| -> u64 { fields[i].parse().expect("a count") };
+        let day = || -> i64 { fields[1].parse().expect("a day") };
+        match fields[0] {
+            "labels" => {
+                let row = daily.row(day() * DAY_MS);
+                daily.neither[row] = std::array::from_fn(|h| number(2 + h));
+                daily.ran[row] = std::array::from_fn(|h| number(7 + h));
+            }
+            "vol" => {
+                let row = vol.row(day() * DAY_MS);
+                vol.days[row] = DayVol {
+                    rv: fields[2].parse().expect("a variance"),
+                    minutes: number(3),
+                    range: (fields[4] != "-").then(|| fields[4].parse().expect("a range")),
+                };
+            }
+            "incomplete" => vol.incomplete = number(1),
+            other => panic!("unknown line kind {other}"),
+        }
+    }
+    (daily, vol)
+}
+
+#[test]
+#[ignore = "measures ADR-056's noise inputs from engine bars and labeling v1; see the module docs"]
+fn measure_label_noise() {
+    let raw_root = env("MIE_MEASURE_RAW_ROOT");
+    let from = parse_bound("MIE_MEASURE_FROM", &env("MIE_MEASURE_FROM"), false).unwrap();
+    let to = parse_bound("MIE_MEASURE_TO", &env("MIE_MEASURE_TO"), true).unwrap();
+    let expected_events: Option<u64> = std::env::var("MIE_MEASURE_EVENTS")
+        .ok()
+        .map(|events| events.parse().expect("MIE_MEASURE_EVENTS is a count"));
+    let window = ReplayWindow {
+        start: EventTime::from_millis(from),
+        end: EventTime::from_millis(to),
+    };
+    let store = ParquetRawStore::new(&raw_root);
+    // The replay of `measure_labels` and of ADR-055's M3, so the v1 labels
+    // are the ones ADR-055 published.
+    let replay = ArchiveReplay::new(
+        &store,
+        "BTCUSDT",
+        &[ArchiveStream::AggTrades, ArchiveStream::Metrics],
+        TradeCorrection::Fold,
+    );
+    let Replay {
+        mut stream,
+        dataset,
+    } = replay.replay(window).unwrap();
+    let started = Instant::now();
+    let mut run = NoiseRun::new();
+    assert_eq!(run.labeler.labeling(), Labeling::V1, "labeling v1 only");
+    println!(
+        "provenance {}",
+        LabelProvenance::new(
+            ContextProvenance::new(DataVersion::from(&dataset), &run.engine),
+            Labeling::V1
+        )
+    );
+    while let Some(event) = stream.next_event().unwrap() {
+        run.step(event);
+    }
+    let trailing = stream.trailing_gaps().to_vec();
+    println!("trailing gaps {trailing:?}");
+    run.finish(&trailing);
+    println!("window {from}..{to} ms");
+    run.report();
+    if let Ok(path) = std::env::var("MIE_MEASURE_DAILY_OUT") {
+        std::fs::write(&path, daily_text(&run.daily, &run.vol)).unwrap();
+        println!("per-day inputs written to {path}");
+    }
+    report_vol("the engine's closed bars", &run.vol);
+    report_noise(&run.daily, RESAMPLES, EVAL_RESAMPLES);
+    println!(
+        "wall {:.1} s, peak RSS {}",
+        started.elapsed().as_secs_f64(),
+        peak_rss()
+    );
+    if let Some(expected) = expected_events {
+        println!("events {} (expected {expected})", run.events);
+        assert_eq!(run.events, expected, "the replay's event count differs");
+    }
+}
+
+#[test]
+#[ignore = "reruns the noise analysis from a per-day file; see the module docs"]
+fn measure_label_noise_from() {
+    let path = env("MIE_MEASURE_DAILY");
+    let (daily, vol) = parse_daily(&std::fs::read_to_string(&path).unwrap());
+    let started = Instant::now();
+    report_vol("the engine's closed bars", &vol);
+    report_noise(&daily, RESAMPLES, EVAL_RESAMPLES);
+    println!("wall {:.1} s", started.elapsed().as_secs_f64());
+}
+
+#[test]
+#[ignore = "estimates daily-volatility persistence from the archive's klines; see the module docs"]
+fn measure_daily_vol_klines() {
+    let raw_root = env("MIE_MEASURE_RAW_ROOT");
+    let from = parse_bound("MIE_MEASURE_FROM", &env("MIE_MEASURE_FROM"), false).unwrap();
+    let to = parse_bound("MIE_MEASURE_TO", &env("MIE_MEASURE_TO"), true).unwrap();
+    let window = ReplayWindow {
+        start: EventTime::from_millis(from),
+        end: EventTime::from_millis(to),
+    };
+    let store = ParquetRawStore::new(&raw_root);
+    let replay = ArchiveReplay::new(
+        &store,
+        "BTCUSDT",
+        &[
+            ArchiveStream::Klines(Timeframe::M1),
+            ArchiveStream::Klines(Timeframe::D1),
+        ],
+        TradeCorrection::Fold,
+    );
+    let Replay { mut stream, .. } = replay.replay(window).unwrap();
+    let started = Instant::now();
+    let mut vol = DailyVol::default();
+    let mut klines = 0_u64;
+    while let Some(event) = stream.next_event().unwrap() {
+        let MarketEvent::Kline(kline) = event else {
+            continue;
+        };
+        klines += 1;
+        let open = kline.open_time.as_millis();
+        let timeframe = match kline.close_time.as_millis() + 1 - open {
+            MINUTE_MS => Timeframe::M1,
+            DAY_MS => Timeframe::D1,
+            _ => continue,
+        };
+        // An exchange kline without trades carries the previous close: an
+        // empty bar.
+        let prices = (kline.trade_count > 0).then(|| {
+            (
+                kline.high.units() as f64,
+                kline.low.units() as f64,
+                kline.close.units() as f64,
+            )
+        });
+        vol.bar(timeframe, open, prices, true);
+    }
+    println!("window {from}..{to} ms, {klines} klines");
+    report_vol("the archive's 1m and 1d klines", &vol);
+    println!("wall {:.1} s", started.elapsed().as_secs_f64());
 }
 
 // ---------------------------------------------------------------------------
@@ -2357,4 +3371,230 @@ fn noisy_shares_name_a_mechanism_only_past_their_bands() {
     for (shares, reading) in cases {
         assert_eq!(read(shares), reading, "{shares:?}");
     }
+}
+
+#[test]
+fn daily_volatility_reads_complete_1m_returns_and_1d_ranges() {
+    let mut vol = DailyVol::default();
+    let m1 = |vol: &mut DailyVol, minute: i64, close: Option<f64>, complete: bool| {
+        let prices = close.map(|close| (close, close, close));
+        vol.bar(Timeframe::M1, minute * MINUTE_MS, prices, complete);
+    };
+    // Day 0: two returns over three minutes (an empty bar between), an
+    // incomplete bar that ends the run, and one return after it.
+    m1(&mut vol, 0, Some(100.0), true);
+    m1(&mut vol, 1, Some(110.0), true);
+    m1(&mut vol, 2, None, true);
+    m1(&mut vol, 3, Some(99.0), true);
+    m1(&mut vol, 4, Some(1.0), false);
+    m1(&mut vol, 5, Some(100.0), true);
+    m1(&mut vol, 6, Some(105.0), true);
+    vol.bar(Timeframe::M5, 0, Some((1.0, 1.0, 1.0)), true);
+    vol.bar(Timeframe::D1, 0, Some((120.0, 90.0, 105.0)), true);
+    // Day 1: the return from day 0's last close counts on day 1, over the
+    // minutes it spans; its 1d bar is incomplete.
+    m1(&mut vol, 1440, Some(100.0), true);
+    vol.bar(Timeframe::D1, DAY_MS, Some((101.0, 99.0, 100.0)), false);
+    let ln2 = |x: f64| x.ln() * x.ln();
+    assert_eq!(vol.first, Some(0));
+    assert_eq!(vol.incomplete, 2);
+    assert_eq!(vol.days.len(), 2);
+    let day0 = vol.days[0];
+    assert_eq!(day0.minutes, 4);
+    let rv0 = ln2(110.0 / 100.0) + ln2(99.0 / 110.0) + ln2(105.0 / 100.0);
+    assert!((day0.rv - rv0).abs() < 1e-15, "{}", day0.rv);
+    assert_eq!(day0.range, Some((120.0_f64 / 90.0).ln()));
+    assert_eq!(vol.days[1].minutes, 1440 - 6);
+    assert_eq!(vol.days[1].range, None);
+    let sigma = vol.log_sigma();
+    assert!((sigma[0].unwrap() - 0.5 * (rv0 * 1440.0 / 4.0).ln()).abs() < 1e-12);
+    assert_eq!(vol.log_range()[0], Some((120.0_f64 / 90.0).ln().ln()));
+    assert_eq!(vol.log_range()[1], None);
+
+    // The per-day text reads back to the same days.
+    let daily = daily_of(3, 50, |day, h| (day + h) as u64);
+    let (read, read_vol) = parse_daily(&daily_text(&daily, &vol));
+    assert_eq!(read, daily);
+    assert_eq!(
+        (read_vol.first, &read_vol.days, read_vol.incomplete),
+        (vol.first, &vol.days, vol.incomplete)
+    );
+}
+
+/// A standard normal from two uniforms (Box and Muller 1958).
+fn normal(rng: &mut SplitMix64) -> f64 {
+    let uniform = |rng: &mut SplitMix64| ((rng.next() >> 11) as f64 + 0.5) / (1_u64 << 53) as f64;
+    let (u, v) = (uniform(rng), uniform(rng));
+    (-2.0 * u.ln()).sqrt() * (std::f64::consts::TAU * v).cos()
+}
+
+#[test]
+fn the_ar1_fit_recovers_a_known_persistence() {
+    let series = |phi: f64, days: usize| -> Vec<Option<f64>> {
+        let mut rng = SplitMix64(7);
+        let mut x = 0.0;
+        (0..days)
+            .map(|day| {
+                x = phi * x + 0.2 * normal(&mut rng);
+                // Every 50th day missing: its pairs drop out.
+                (day % 50 != 49).then_some(-3.0 + x)
+            })
+            .collect()
+    };
+    let persistent = series(0.9, 4_000);
+    let fit = ar1(&persistent, BLOCK_DAYS, 1_000, SEED).unwrap();
+    assert_eq!(fit.days, 4_000 - 80);
+    assert_eq!(fit.pairs, 4_000 - 1 - 2 * 80 + 1);
+    assert!((fit.phi - 0.9).abs() < 0.03, "{fit:?}");
+    assert!(fit.interval.0 < 0.9 && 0.9 < fit.interval.1, "{fit:?}");
+    assert!((fit.mean + 3.0).abs() < 0.1, "{fit:?}");
+    // Stationary SD 0.2 / √(1 − 0.81) = 0.459.
+    assert!((fit.sd - 0.459).abs() < 0.05, "{fit:?}");
+    let lag14 = autocorrelation(&persistent, 14).unwrap();
+    assert!((lag14 - 0.9_f64.powi(14)).abs() < 0.1, "{lag14}");
+    // The seed fixes the interval.
+    let again = ar1(&persistent, BLOCK_DAYS, 1_000, SEED).unwrap();
+    assert_eq!(again.interval.0.to_bits(), fit.interval.0.to_bits());
+    let white = ar1(&series(0.0, 4_000), BLOCK_DAYS, 1_000, SEED).unwrap();
+    assert!(white.phi.abs() < 0.05, "{white:?}");
+    assert!(
+        white.interval.0 < 0.0 && 0.0 < white.interval.1,
+        "{white:?}"
+    );
+    assert!(ar1(&[Some(1.0), None, Some(2.0)], BLOCK_DAYS, 10, SEED).is_none());
+}
+
+#[test]
+fn the_resampled_logs_are_the_bands_draws() {
+    let high = |high: bool| if high { 15 } else { 5 };
+    // Horizons 0 and 1 swing together in 28-day runs; 2 to 4 are flat.
+    let persistent = daily_of(
+        364,
+        100,
+        |day, h| {
+            if h <= 1 { high(day / 28 % 2 == 0) } else { 10 }
+        },
+    );
+    let logs = resample_logs(&persistent, BLOCK_DAYS, RESAMPLES, SEED);
+    let pair = combination_band(&logs, difference(0, 4));
+    let band = bootstrap_se(&persistent, (0, 4), BLOCK_DAYS, RESAMPLES, SEED);
+    let (a, b) = (pair.se.unwrap(), band.se.unwrap());
+    assert!((a - b).abs() < 1e-12 * b, "{a} vs {b}");
+    assert_eq!(pair.undefined, band.undefined);
+    // A longer draw continues the same resamples.
+    let longer = resample_logs(&persistent, BLOCK_DAYS, RESAMPLES + 10, SEED);
+    assert_eq!(longer[..RESAMPLES], logs[..]);
+    // A flat horizon has no noise; two that swing together correlate fully.
+    assert!(combination_band(&logs, unit(4)).se.unwrap() < 1e-12);
+    let r = correlation(&logs, unit(0), unit(1)).unwrap();
+    assert!((r - 1.0).abs() < 1e-12, "{r}");
+    assert_eq!(correlation(&logs, unit(0), unit(4)), None);
+    let bands = Bands::of(&logs);
+    assert!(bands.pair[0][1].unwrap() < 1e-12);
+    assert!(bands.step[0].unwrap() < 1e-12);
+    assert!(bands.step[1].unwrap() > 0.04);
+    // No `Neither` at a horizon: every resample undefined there.
+    let none = daily_of(364, 100, |_, h| if h == 0 { 0 } else { 10 });
+    let logs = resample_logs(&none, BLOCK_DAYS, 100, SEED);
+    assert_eq!(
+        combination_band(&logs, difference(0, 4)),
+        Band {
+            se: None,
+            undefined: 100
+        }
+    );
+    assert_eq!(combination_band(&logs, difference(1, 4)).undefined, 0);
+}
+
+#[test]
+fn the_shape_evaluation_reads_each_truth_without_noise() {
+    // Every day the same counts: every resample is the year, every band 0.
+    let quiet = daily_of(364, 100, |_, h| [16, 12, 10, 9, 6][h]);
+    let logs = resample_logs(&quiet, BLOCK_DAYS, 500, SEED);
+    let center: [f64; 5] = std::array::from_fn(|h| logs[0][h].unwrap());
+    let bands = Bands::of(&logs);
+    assert!(
+        bands.step.iter().all(|se| se.unwrap() < 1e-12),
+        "{:?}",
+        bands.step
+    );
+    for (name, truth, expected) in TRUTHS {
+        let e = evaluate(&logs, center, truth, &bands, expected);
+        let misses = if name == "flat" { 0 } else { 500 };
+        assert_eq!(
+            e,
+            Evaluation {
+                draws: 500,
+                undefined: 0,
+                misses,
+                expected: misses,
+                other: 0,
+                wrong: 0
+            },
+            "{name}"
+        );
+    }
+    // A horizon without `Neither` leaves every pseudo-year undefined.
+    let none = daily_of(364, 100, |_, h| if h == 0 { 0 } else { 10 });
+    let logs = resample_logs(&none, BLOCK_DAYS, 50, SEED);
+    let e = evaluate(&logs, [0.0; 5], TRUTHS[0].1, &bands, OTHER);
+    assert_eq!((e.draws, e.undefined, e.misses), (50, 50, 0));
+}
+
+#[test]
+fn the_noise_run_counts_labeling_v1_and_engine_bars() {
+    let tape = twin_tape();
+    let end = TAPE_START + (TAPE_DAYS + 1) * DAY_MS;
+    let trailing = trailing_of(&tape, end, true);
+    let mut run = NoiseRun::new();
+    assert_eq!(run.labeler.labeling(), Labeling::V1);
+    for event in tape.iter().cloned() {
+        run.step(event);
+    }
+    run.finish(&trailing);
+    run.report();
+
+    // `label_window` under labeling v1 over the same tape counts the same
+    // days.
+    let dataset = DatasetVersion::from_hex(&"5b".repeat(32)).unwrap();
+    let history = History(tape, dataset);
+    let window = ReplayWindow {
+        start: EventTime::from_millis(TAPE_START),
+        end: EventTime::from_millis(TAPE_START + 60 * DAY_MS),
+    };
+    let mut daily = Daily::default();
+    let (provenance, windowed) = label_window(
+        &history,
+        window,
+        window,
+        Labeling::V1,
+        |_| trailing.clone(),
+        |_| {},
+        |label| daily.add(&label),
+    )
+    .unwrap();
+    assert_eq!(provenance.labeling, LABELING_V1);
+    assert_eq!(run.daily, daily);
+    assert_eq!(windowed.labels, run.labeler.stats());
+    assert_eq!(run.rejections, 3, "the three refused trades");
+    assert_eq!(run.daily.ran.len(), TAPE_DAYS as usize + 1);
+
+    // Every tape day has 1m returns; the first 1m and 1d bars are partial,
+    // the trades gaps of days 9 and 15 leave their days' 1d bars
+    // incomplete, and the last day's bar never closes.
+    let sigma = run.vol.log_sigma();
+    assert_eq!(run.vol.first, Some(TAPE_START.div_euclid(DAY_MS)));
+    assert!(
+        sigma.iter().flatten().count() >= TAPE_DAYS as usize,
+        "{sigma:?}"
+    );
+    assert!(run.vol.incomplete >= 2, "{}", run.vol.incomplete);
+    assert_eq!(run.vol.days[0].range, None);
+    let without: Vec<usize> = (0..run.vol.days.len())
+        .filter(|&day| run.vol.days[day].range.is_none())
+        .collect();
+    assert_eq!(without, [0, 9, 15]);
+    assert_eq!(run.vol.days.len(), TAPE_DAYS as usize);
+    report_vol("the twin tape's engine bars", &run.vol);
+    report_noise(&run.daily, 200, 400);
 }
