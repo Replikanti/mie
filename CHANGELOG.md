@@ -22,7 +22,7 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   √H), derives every number, and pre-registers the prediction (N(H) =
   10.05 % of the races that ran at every H, v1's measured 1h share) and the
   miss criterion before any v2 run on real data: max ÷ min N(H) > 1.62 and
-  a log-spread outside two standard errors of a circular 28-day block
+  a log-spread outside two standard errors of a circular 56-day block
   bootstrap over the year's UTC days (10 000 resamples, seed 151, at most
   2.3 % of them undefined), with a reading for every shape of a miss, each
   step of N between horizons a rise or a fall only outside two bootstrap
@@ -40,7 +40,12 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   its own bars and Wilder ATR from the ADR-031/033 text, cross-checks its
   ATR_1h against every record's `state.atr`, and reports N(H) next to the
   prediction, the max ÷ min spread, the bootstrap's SE, the miss, the
-  steps against their bands and the shape's reading. No v2 measurement on real data yet.
+  steps against their bands and the shape's reading. The noise numbers
+  ADR-056 cites (step SEs, the 2-SE noise floor of 1.26, the shape-reading
+  rates) and its 56-day block, chosen for daily volatility's measured long
+  memory (autocorrelation 0.37 at 28 days), are measured from the engine's
+  bars and labeling v1's per-day counts on the year (`measure_label_noise`,
+  `measure_label_noise_from`). No v2 measurement on real data yet.
 - **ADR-055 is measured and not accepted (#26 M3).** The *Accept when*
   measurement on the #12 year and the ADR-051 R0 live store met T0 (0
   mismatches in 44 855 of 561 695 labels checked in the year, 2 185 of 2 185

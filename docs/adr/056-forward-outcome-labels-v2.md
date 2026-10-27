@@ -21,11 +21,11 @@ because no hold-out is left (ADR-053 D7). #151 asks for that version.
 This ADR states the mechanism, derives the barrier rule of
 `conditional.labels@2` from it, and pre-registers its prediction and the
 miss criterion before any v2 run on real data. Every step below is
-derived. The outside numbers come from the review's simulations
-(PR #153): one of serially dependent daily windows (*Accept when*), cited
-as the reason the noise floor is measured on the year rather than
-derived, and one of noisy shapes, cited for how often *Reading of a miss*
-names the wrong mechanism.
+derived. The noise numbers are measured, not simulated: labeling v1's
+per-day counts on the #12 year (*The noise, measured on v1* below) give
+the step SEs, the noise floor and the rates at which *Reading of a miss*
+names a wrong mechanism. The review's simulations (PR #153), which these
+numbers first came from, are kept only as superseded history.
 
 ### The mechanism
 
@@ -69,6 +69,63 @@ names the wrong mechanism.
    characteristic time of volatility clustering. The pre-registered
    reading of a miss (*Accept when*) maps every shape of N(H) to one of
    them, or to none.
+
+### The noise, measured on v1
+
+Measured before any v2 label exists, so the pre-registration stands: the
+only real-data inputs are the engine's bars and labeling v1, whose counts
+ADR-055 published.
+
+- **Source.** `label_measure`'s `measure_label_noise` replays the #12 year
+  (data provenance `5d9e27f862ac54dd93cff904458e9ee92767d5105a9d13a144351cba069f224d`,
+  engine `4c844593779da2e3-1`, 603 323 345 events) through the engine, the
+  sampler and a labeler under `conditional.labels@1` (fingerprint
+  `604b624cc2522df9`); no v2 label is computed. Its v1 counts equal
+  ADR-055's published ones (561 695 labels, 1h `Neither` 56 372,
+  `Unavailable` 899). It writes the per-UTC-day `Neither` and race counts
+  of 365 days; `measure_label_noise_from` reruns the analysis below from
+  them with this ADR's bootstrap (56-day blocks, 10 000 resamples, seed
+  151).
+- **Persistence of daily volatility.** ln of the daily realized σ from
+  the engine's 1m closes: AR(1) slope φ = 0.560 (block-bootstrap 95 %
+  interval 0.425 … 0.647). Its autocorrelation is 0.562 / 0.327 / 0.542 /
+  0.418 / 0.373 / 0.233 at 1 / 2 / 7 / 14 / 28 / 56 days, where AR(1) at
+  φ = 0.56 gives 0.560 / 0.314 / 0.017 / 0.000 / 0.000 / 0.000: the memory
+  is long, and AR(1) does not describe it. ln of the 1d log range, whose
+  own noise attenuates φ to 0.339, shows the same long tail (0.454 /
+  0.304 / 0.296 / 0.235 at 7 / 14 / 28 / 56 days).
+- **SE of ln N(H)**, 5m / 15m / 1h / 4h / 1d: 0.045 / 0.049 / 0.057 /
+  0.075 / 0.132, 195 to 642 times the binomial variance (design effect),
+  that is, worth 870 to 2 900 independent races instead of 560 000.
+- **The horizons are not independent.** Over the resamples, ln N(H) of
+  neighbouring horizons correlate 0.985 / 0.944 / 0.897 / 0.738, and 5m
+  with 1d 0.508. The steps correlate too: 5m→15m with 15m→1h +0.66,
+  1h→4h with 4h→1d +0.61, 15m→1h with 4h→1d −0.30, the rest within
+  ±0.18. Every SE below is taken over the same resamples, so these
+  correlations are in it; nothing assumes independent horizons.
+- **Step SEs** (5m→15m … 4h→1d): 0.0091 / 0.0191 / 0.0348 / 0.0915 in log.
+- **Noise floor.** The widest pair is 1h with 1d, SE 0.116 of its
+  log-difference, so two SE are a ratio of e^(2 · 0.116) = 1.26; v1's own
+  5m / 1d spread has an SE of 0.115.
+- **Block length.** The same counts at blocks of 1 / 14 / 28 / 56 / 91 /
+  122 days give an SE of ln N(1d) of 0.103 / 0.093 / 0.111 / 0.131 /
+  0.145 / 0.150 and a widest-pair 2-SE ratio of 1.198 / 1.196 / 1.227 /
+  1.260 / 1.291 / 1.298 (a sensitivity rerun, 4 000 resamples, PR #153).
+  The floor stays below 1.62 at every block tried.
+- **Caveat: v1's 1d is not v2's 1d.** v1 scales every horizon by ATR(1h),
+  whose memory is 14 h, so its 1d races lack the dependence that ATR_1d's
+  14-day memory adds between consecutive days of v2's 1d races; and v1's
+  1d share is 6.2 %, not 10 %. v2's 1d noise is therefore likely wider.
+  The margin is why the band's numbers still hold: noise alone reaches the
+  bound only when two SE reach ln 1.62 = 0.48, a pair SE of 0.24, which is
+  2.1 times the measured 0.116. The acceptance run's band measures v2's own
+  floor in any case.
+- **Superseded history.** The review simulated AR(1) log daily σ with a
+  Wilder(14) ATR_1d and found a 2-SE noise ratio of 1.31 / 1.43 / 1.50 /
+  1.67 at φ = 0 / 0.8 / 0.9 / 0.95, and its shape simulation fixed
+  independent per-horizon SEs (1d: 0.26 relative, the φ = 0.95 value).
+  The measurement replaces both: BTC's φ is 0.56, the dependence is a
+  long memory the AR(1) model lacks, and the horizons are correlated.
 
 Delivery is in two PRs under #151: this ADR (proposed, with the
 prediction) with the code and tests; then the measurement of *Accept when*
@@ -247,16 +304,19 @@ touch it:
 | Prediction N(H) = 10.05 % at every H | *Accept when*: v1's 1h `Neither` count 56 372 over the 1h races that ran (561 695 labels − 899 `Unavailable` − at most 62 censored) | — (fixed by v1's published counts before the run; no constant is fitted) |
 | Miss bound 1.62 on max_H N(H) ÷ min_H N(H) | *Accept when*: √(16.338 / 6.191) = 1.6245 rounded down: v2 must remove more than half of v1's log-spread (ln 2.639 = 0.970) | ≥ 2.64 accepts a rule no flatter than v1; alone, without the noise band, a true prediction can exceed it from 1d noise (next rows) |
 | 1.38, 350 daily windows, SE 1.6 pp (16 % relative) | *Accept when*: the floor if the about 350 disjoint daily windows were independent: SE √(0.1 · 0.9 / 350) = 1.6 pp, two SE in log e^(2 · 0.16) ≈ 1.38 | — (not used: the windows are serially dependent, next row) |
-| 1.31 / 1.43 / 1.50 / 1.67 | *Accept when*: the review of this ADR (PR #153) simulated 350-day years with AR(1) log daily σ and a Wilder(14) ATR_1d; the 2-SE noise ratio at persistence φ = 0 / 0.8 / 0.9 / 0.95 | — (the reason the floor is measured, not derived: at φ = 0.95 it exceeds 1.62, and BTC's φ is not measured here) |
+| Noise floor 1.26; SE of ln N(H) 0.045 / 0.049 / 0.057 / 0.075 / 0.132 | *The noise, measured on v1*: labeling v1's per-day counts on the #12 year, this ADR's bootstrap; the widest pair (1h, 1d) has an SE of 0.116, e^(2 · 0.116) = 1.26 | — (measured, not thresholds; v2's 1d noise is likely wider, and the band measures it on the run; noise reaches 1.62 only at a pair SE of 0.24, 2.1 times the measured one) |
+| φ = 0.560; autocorrelation 0.562 / 0.327 / 0.542 / 0.418 / 0.373 / 0.233 at 1 / 2 / 7 / 14 / 28 / 56 d | *The noise, measured on v1*: ln daily realized σ from the engine's 1m closes; AR(1) predicts 0.017 at 7 d and 0.000 beyond | — (measured; the reason the floor is not taken from an AR(1) model, and the reason for the block length) |
+| 1.31 / 1.43 / 1.50 / 1.67 (superseded) | The review of this ADR (PR #153) simulated 350-day years with AR(1) log daily σ and a Wilder(14) ATR_1d: the 2-SE noise ratio at persistence φ = 0 / 0.8 / 0.9 / 0.95 | — (history only: replaced by the measured floor 1.26; BTC's φ is 0.56, and AR(1) does not describe its long memory) |
 | Noise band: ln(max ÷ min) > 2 SE | *Accept when*: two standard errors, the width the derived floor used; the SE is the bootstrap's, so it carries the year's own serial dependence | ln(max ÷ min) ≥ 0 folds both directions, so the rate is two-sided: 4.6 % at 2 SE. 1 SE: a flat truth clears the band about one time in three (32 %), so the 1.62 bound alone would decide most noise misses. 3 SE: a spread has to be half again as far from noise before it counts. The pair is the observed max and min, which noise pulls apart, so the band is weaker than its nominal rate: a guard beside the 1.62 bound, not a test on its own |
-| Step band: a step rises or falls only past 2 SE of its own log-difference | *Reading of a miss*: the same bootstrap as the spread's band, one adjacent pair at a time; a step equal in truth clears it in one direction 2.3 % of the time (one-sided normal) | 1 SE: 16 % per step one-sided, so a flat truth's four steps hold a spurious rise or fall about four times in five (one in six at 2 SE, steps taken as independent), and the readings return to the coin flips of raw signs. 3 SE: the review's week on 1d only, ln 1.8 = 0.59 against a 4h→1d step SE of 0.28 (2.1 SE), would clear about 18 % of the time instead of 54 %, and most week misses would read *other* |
-| At most 2.3 % undefined resamples (230 of 10 000) | *Accept when*: the one-sided normal tail beyond the band's 2 SE (2.275 %, rounded up to the next per mille). An undefined resample stands for an infinite spread; up to the tail the band leaves outside anyway it is dropped. At the limit the SD of the rest is at most 6 % below the full one (a normal cut at +2 SD keeps an SD of 0.94), less than the 10 to 18 % by which the review found the bootstrap SE above the true spread | 0, any undefined resample counting as outside: one resample of 10 000 decides the band. The review's simulation at φ = 0.98, rerun with the limit: 9 of 300 flat years held an undefined resample, at most 8 of 10 000; the joint false-miss rate falls from 5.0 % to 3.3 %. 4.6 % (both tails): cut at +1.69 SD the SD of the rest is 9.5 % low, and the band narrows by that much on exactly the years whose resamples come closest to an empty horizon |
-| Block 28 UTC days | *Accept when*: two memories of the 1d scale; ATR_1d weighs an input k days back by (1/14)(13/14)^k, so (13/14)^14 = 35 % of its weight lies beyond 14 days and (13/14)^28 = 12.6 % beyond 28 | Below 14: blocks cut inside the scale's memory, correlated days count as independent and the band shrinks back towards the refuted binomial one. 56: 6.5 blocks a year, so the SE rests on six or seven units. Dependence longer than 28 days (volatility regimes of months) still narrows the band; the 1.62 bound is what holds then |
+| Step band: a step rises or falls only past 2 SE of its own log-difference | *Reading of a miss*: the same bootstrap as the spread's band, one adjacent pair at a time; a step equal in truth clears it in one direction 2.3 % of the time (one-sided normal) | 1 SE: 16 % per step one-sided, so a flat truth's four steps hold a spurious rise or fall about four times in five (one in six at 2 SE, steps taken as independent), and the readings return to the coin flips of raw signs. 3 SE: on the measured 4h→1d SE of 0.092 the week's ln 1.8 = 0.59 step (6.4 SE) clears either way, so 3 SE buys nothing on v1's noise, and on v2's likely wider 1d noise a real week step would have to be half again as far from noise before it counts |
+| At most 2.3 % undefined resamples (230 of 10 000) | *Accept when*: the one-sided normal tail beyond the band's 2 SE (2.275 %, rounded up to the next per mille). An undefined resample stands for an infinite spread; up to the tail the band leaves outside anyway it is dropped. At the limit the SD of the rest is at most 6 % below the full one (a normal cut at +2 SD keeps an SD of 0.94), a small change beside the gap between the measured floor and the bound (2 SE = 0.23 against ln 1.62 = 0.48). On v1's counts no resample is undefined at any horizon (0 of 10 000); the limit guards v2's 1d, whose first 15 days have no race | 0, any undefined resample counting as outside: one resample of 10 000 decides the band. 4.6 % (both tails): cut at +1.69 SD the SD of the rest is 9.5 % low, and the band narrows by that much on exactly the years whose resamples come closest to an empty horizon |
+| Block 56 UTC days | *Accept when*: the measured autocorrelation of ln daily realized σ stays 0.54 / 0.42 / 0.37 at 7 / 14 / 28 days (*The noise, measured on v1*): a long memory that AR(1) at the measured φ = 0.56 does not fit (it predicts 0.017 at 7 days), so 28-day blocks cut dependence that is still there. At 56 days it is 0.23. 56 is four memories of the 1d scale ((13/14)^56 = 1.6 % of ATR_1d's weight lies beyond it) and keeps 6.5 blocks a year; it raises the SE of ln N(1d) from 0.111 (28 d) to 0.131 | 28: cuts the measured dependence and narrows the band (SE of ln N(1d) 0.111); below 14 the band shrinks back towards the refuted binomial one (0.093 at 14 d). 91: 4 blocks a year, so the SE rests on four units (0.145). Dependence beyond 56 days still narrows the band; the 1.62 bound, 2.1 times the measured 2 SE in log, is what holds then (the floor is 1.30 even at 122-day blocks) |
 | Day = UTC day of the decision | *Accept when*: the 1d horizon's bars are UTC days (ADR-031), and 1d noise is what the band is for | — (windows that cross midnight tie neighbouring days, which a block keeps together) |
 | 10 000 resamples | *Accept when*: the Monte Carlo error of an SD from B draws is 1/√(2(B − 1)), 0.71 % at 10 000, at about 10⁷ additions | 1 000: 2.2 %, the band moves by that much with the seed; more buys nothing the 1.62 bound would notice |
 | Scale memory 14 · H: 70 min (5m), 3.5 h (15m), 14 h, 56 h, 14 d | *Reading of a miss*: 14 bars of H's timeframe (D4′) | — (follows from the length) |
-| Step SE 0.03 / 0.06 / 0.11 / 0.28 in log, misreading rates 3.2 / 2.1 / 2.2 % | *Reading of a miss*: the review's shape simulation (per-horizon relative SE 1.5 times the binomial one at 10 % for 5m to 4h, 0.26 at 1d), rerun with the step bands | — (properties of the rule under the review's noise model, cited, not thresholds; the run prints the measured SEs) |
-| Flat steps alone within 1.62 | *Reading of a miss*: the miss bound itself, so a named reading needs the steps that cleared to carry what makes the spread a miss | Any tighter bound sends a reading to *other* while its cleared steps still make the miss on their own; none: the review's 10.7 / 10 / 10 / 10 / 6 % reads jumps for 57.9 % of its misses, from a 1d low inside the 4h→1d band |
+| Step SE 0.0091 / 0.0191 / 0.0348 / 0.0915 in log; step correlations up to +0.66 | *The noise, measured on v1*: the band's bootstrap of each adjacent pair, over the same resamples | — (measured, not thresholds; the run prints v2's own) |
+| Wrong-mechanism rates 4.2 / 4.1 / 1.4 / 0.0 % of the misses; flat truth 14 misses in 200 000 | *What the rule achieves*: the shape evaluation on pseudo-years resampled from v1's real days | — (properties of the rule under v1's measured noise, cited, not thresholds) |
+| Flat steps alone within 1.62 | *Reading of a miss*: the miss bound itself, so a named reading needs the steps that cleared to carry what makes the spread a miss | Any tighter bound sends a reading to *other* while its cleared steps still make the miss on their own; none: a spread carried by flat steps would be named by whichever short step cleared (the review's 10.7 / 10 / 10 / 10 / 6 % read jumps for 57.9 % of its misses under its superseded noise model, from a 1d low inside its ±0.56 4h→1d band) |
 | 8 h funding cycle | ADR-041: the venue's funding settlement every 8 h, a fixed intraday time | — (a fact of the venue, named in the 15m reading) |
 | Seed 151, SplitMix64 | *Accept when*: the issue's number, named before the run so it cannot be chosen by its outcome; SplitMix64 (Steele, Lea and Flood 2014) is fully specified and pinned by its published seed-0 output | — (any fixed seed; another moves the SE by about the 0.71 %) |
 | ±0.08 in the sd of log ρ | *Accept when*: under lognormal ρ at median 1, where N = 10.05 % needs an sd of 0.53, ±0.08 between horizons gives a max ÷ min of about 1.56 to 1.62 | — (what the bound allows, stated to read it) |
@@ -372,16 +432,16 @@ store.
     independent: consecutive days' 1d races share most of ATR_1d's
     14-day memory, and daily volatility is persistent, so their
     `Neither` outcomes are positively correlated and N(1d) varies more
-    than a binomial share. The review of this ADR (PR #153) simulated
-    that: 350-day years with AR(1) log daily σ of persistence φ and a
-    Wilder(14) ATR_1d give a 2-SE noise ratio of 1.31 at φ = 0 (the
-    binomial figure), 1.43 at 0.8, 1.50 at 0.9 and 1.67 at 0.95, above
-    1.62. BTC's φ is not measured here, so the band measures the floor on
-    the year itself.
+    than a binomial share. Measured on v1 (*The noise, measured on v1*),
+    daily volatility keeps an autocorrelation of 0.37 at 28 days, long
+    memory no AR(1) model fits, and the floor of the widest pair is 1.26,
+    below 1.62: ln 1.62 = 0.48 is 2.1 times its 2 SE of 0.23. v1's 1d lacks ATR_1d's
+    memory, so v2's floor is not known in advance either: the band
+    measures it on the year itself.
   - *The band:* `label_measure` counts `Neither` and the races that ran
     per horizon per UTC day of the decision, empty days included. A
     circular block bootstrap (Politis and Romano 1992) resamples those
-    days in blocks of **28** consecutive days, wrapping at the end, from
+    days in blocks of **56** consecutive days, wrapping at the end, from
     uniform starts until a resample holds as many days as the year, and
     sums the max and the min horizon over the same days, so their
     correlation stays in. Over **10 000** resamples from SplitMix64 at
@@ -403,15 +463,16 @@ store.
     ln N(H_(i+1)) − ln N(H_i) exceeds **2** standard errors of that
     log-difference, a **fall** when it is below minus two of them, and
     **flat** otherwise. The SE is the band's bootstrap applied to the pair:
-    the same UTC days, 28-day blocks, 10 000 resamples, seed 151 and limit
+    the same UTC days, 56-day blocks, 10 000 resamples, seed 151 and limit
     on undefined resamples, so all five SEs of a run come from the same
-    resamples. An undefined SE counts as outside, and the step takes its
+    resamples, and the steps' correlation (measured up to +0.66 on v1) is
+    in them. An undefined SE counts as outside, and the step takes its
     sign. Raw signs are not used: a step between two horizons that are
-    equal in truth gets a coin-flip sign, which in the review's simulation
-    named a wrong mechanism for 36 to 64 % of the week's misses.
-  - *Where a mechanism shows.* The bands widen with H; in the review's
-    simulation one SE of the four steps is about 0.03, 0.06, 0.11 and 0.28
-    in log. A mechanism that acts at every step therefore clears the
+    equal in truth gets a coin-flip sign, so the case a shape lands in
+    would be chance at every such step.
+  - *Where a mechanism shows.* The bands widen with H; measured on v1 one
+    SE of the four steps is 0.0091, 0.0191, 0.0348 and 0.0915 in log. A
+    mechanism that acts at every step therefore clears the
     short steps first, and a flat step at the short end with a departure
     further up reads as a mechanism that does not act at the short end.
   - *Cases.* Each case is a set of step sequences (U rise, D fall,
@@ -434,36 +495,43 @@ store.
     lies in the steps that cleared their bands: the series rebuilt from
     the flat steps alone, every cleared step set to 0 in log, has
     max ÷ min of at most 1.62. Otherwise the reading is *other*, whatever
-    the steps. A flat step can carry the miss on its own: the 4h→1d band
-    is ±0.56 in log, wider than ln 1.62 = 0.48. A case keyed on a short
-    step that cleared would then name the mechanism of a miss made
-    elsewhere. In the review's simulation, a 5m 7 % high (inside the
-    ±0.08 the bound allows) with a 1d 40 % low (10.7 / 10 / 10 / 10 / 6 %)
-    read jumps for 57.9 % of its misses before this rule. `label_measure`
-    prints the flat steps' ln(max ÷ min) next to the case.
-  - *What the rule achieves.* The review's shape simulation, rerun with
-    the step bands: per-horizon relative SE 1.5 times the binomial one at
-    10 % for 5m to 4h and 0.26 at 1d (the φ = 0.95 value of the AR(1)
-    simulation), independent horizons, a miss by both conditions,
-    200 000 draws per truth. Of the misses:
-    - the week on 1d only (10 / 10 / 10 / 10 / 18 %): the week 72.9 %,
-      other 23.9 %, a wrong mechanism 3.2 % (raw signs: 36.5 %);
-    - the week on 4h and 1d (10 / 10 / 10 / 12 / 18 %): the week 41.8 %,
-      other 56.1 %, a wrong mechanism 2.1 % (raw signs: 64 %);
-    - jumps with a flat tail (18 / 13 / 10.5 / 10 / 10 %): jumps 87.9 %,
-      other 9.9 %, a wrong mechanism 2.2 %, all of it jumps and the week
-      (97.0 % jumps without *Where the miss lies* and the falls-then-flat
-      jumps steps; raw signs: jumps 28.7 %, a wrong mechanism 49.8 %);
+    the steps. A flat step can carry the miss on its own when its band is
+    wider than ln 1.62 = 0.48, and a case keyed on a short step that
+    cleared would then name the mechanism of a miss made elsewhere. On
+    v1's measured noise it cannot: the widest band, 4h→1d, is ±0.18, and
+    all four flat steps at their band edges add up to 0.31. The rule
+    guards v2's 1d, whose 14-day scale memory v1 lacks; the review's
+    superseded noise model had a ±0.56 4h→1d band, under which a 5m 7 %
+    high (inside the ±0.08 the bound allows) with a 1d 40 % low
+    (10.7 / 10 / 10 / 10 / 6 %) read jumps for 57.9 % of its misses before
+    this rule. `label_measure` prints the flat steps' ln(max ÷ min) next to
+    the case.
+  - *What the rule achieves.* Measured on v1's noise
+    (`measure_label_noise_from`, *The noise, measured on v1*): 200 000
+    pseudo-years per truth, each a block resample of the year's real days
+    (56-day blocks, seed 151; the first 10 000 are the band's) with its
+    ln N*(H) shifted by the truth's log minus the year's, so it keeps the
+    year's noise, serial dependence and cross-horizon correlation; the
+    miss by both conditions and the reading with the measured SEs fixed.
+    Of the misses:
+    - the week on 1d only (10 / 10 / 10 / 10 / 18 %, misses in 87.7 % of
+      the draws): the week 91.7 %, other 4.1 %, a wrong mechanism 4.2 %;
+    - the week on 4h and 1d (10 / 10 / 10 / 12 / 18 %, 83.3 %): the week
+      92.5 %, other 3.4 %, a wrong mechanism 4.1 %;
+    - jumps with a flat tail (18 / 13 / 10.5 / 10 / 10 %, 99.8 %): jumps
+      98.4 %, other 0.2 %, a wrong mechanism 1.4 %;
     - a 5m excess inside the bound with a 1d low (10.7 / 10 / 10 / 10 /
-      6 %), a miss no listed mechanism makes: other 96.7 %, a wrong
-      mechanism 3.3 % (57.9 % jumps without *Where the miss lies* and the
-      falls-then-flat jumps steps);
-    - a flat truth misses in 6.9 % of the draws (this model's noise is
-      cruder than the AR(1) one: fixed SEs, independent horizons), and a
-      third of those misses (31.9 %) name a reading, mostly the week,
-      because the 1d excursion that makes the miss also clears the 4h→1d
-      band: 2.2 % of flat draws end in a named reading, about the step
-      band's one-sided rate of 2.3 %.
+      6 %, 82.1 %), a miss no listed mechanism makes: other 100.0 %, a
+      wrong mechanism 0.0 %. Its 5m→15m step, ln 1.07 = 0.068, is 7.4 step
+      SEs and falls in nearly every draw, but the 4h→1d fall that follows
+      a flat step is no listed signature;
+    - a flat truth misses in 14 of 200 000 draws (0.007 %), and 1 of
+      those names a reading: the measured floor (1.26) lies far below
+      1.62.
+
+    These rates carry v1's noise around v2's truths (caveat in *The
+    noise, measured on v1*); v2's wider 1d noise would lower the week's
+    share and raise *other*.
 
   The next version follows from that reason, not from a refit.
 - **Reported, no threshold:**

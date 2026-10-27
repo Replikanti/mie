@@ -70,7 +70,7 @@
 //!   pre-registered N(1h) = 10.05 % (v1's measured 1h share) and v1's
 //!   published share, and max_H N(H) ÷ min_H N(H) against the miss bound
 //!   1.62; the standard error of its log from a circular block bootstrap
-//!   over the UTC days of the decisions (28-day blocks, 10 000 resamples,
+//!   over the UTC days of the decisions (56-day blocks, 10 000 resamples,
 //!   seed 151, at most 2.3 % of the resamples undefined) and whether the
 //!   log-spread lies outside two of them; the miss (both); and the shape of
 //!   N over the horizons, each of its four steps a rise or a fall only
@@ -134,8 +134,8 @@
 //!     makes it persistent whatever σ does. For each: the AR(1) slope φ by
 //!     OLS, its SE if the innovations were independent, and the SD and 95 %
 //!     interval of a circular block bootstrap of the consecutive-day pairs
-//!     (28-day blocks, 10 000 resamples, seed 151, the band's numbers); the
-//!     autocorrelation at 1, 2, 7, 14 and 28 days next to φ^k, so a
+//!     (56-day blocks, 10 000 resamples, seed 151, the band's numbers); the
+//!     autocorrelation at 1, 2, 7, 14, 28 and 56 days next to φ^k, so a
 //!     dependence AR(1) does not describe shows;
 //!   - from labeling v1's labels, the per-UTC-day `Neither` and race
 //!     counts of the band, resampled by the band's bootstrap (the same
@@ -257,10 +257,11 @@ const PREDICTED_NEITHER_PERCENT: f64 = 10.05;
 const MISS_RATIO: f64 = 1.62;
 
 /// ADR-056 *Accept when*: the circular block bootstrap of the spread over
-/// UTC days: the block length in days (two ATR_1d memories of 14 days),
+/// UTC days: the block length in days (four ATR_1d memories of 14 days:
+/// daily volatility's autocorrelation is still 0.37 at 28 days),
 /// the resamples, the seed (named before the run), and the width in
 /// standard errors of the spread's band and of each step's band.
-const BLOCK_DAYS: usize = 28;
+const BLOCK_DAYS: usize = 56;
 const RESAMPLES: usize = 10_000;
 const SEED: u64 = 151;
 const BAND_SE: f64 = 2.0;
@@ -1815,8 +1816,9 @@ fn measure_labels_live() {
 const EVAL_RESAMPLES: usize = 200_000;
 
 /// Lags of the autocorrelation of ln σ, in days: one and two days, a week,
-/// the ATR's length of 14 and the bootstrap's block of 28.
-const ACF_LAGS: [usize; 5] = [1, 2, 7, 14, 28];
+/// the ATR's length of 14, the 28 days the block once had and the
+/// bootstrap's block of 56.
+const ACF_LAGS: [usize; 6] = [1, 2, 7, 14, 28, 56];
 
 /// The truths ADR-056 *What the rule achieves* evaluates, N(H) in percent
 /// from 5m to 1d, with the reading a miss of each should get: the flat
@@ -3137,11 +3139,11 @@ fn the_bootstrap_is_seeded_and_widens_under_serial_dependence() {
             0x06C4_5D18_8009_454F
         ]
     );
-    // The band's numbers are ADR-056's: two ATR_1d memories per block.
-    assert_eq!(BLOCK_DAYS, 2 * ATR_LENGTH as usize);
+    // The band's numbers are ADR-056's: four ATR_1d memories per block.
+    assert_eq!(BLOCK_DAYS, 4 * ATR_LENGTH as usize);
     assert_eq!((RESAMPLES, SEED, BAND_SE), (10_000, 151, 2.0));
 
-    // 364 days = 13 blocks; horizon 4 is flat at 10 %, horizon 0 is 15 % or
+    // 364 days = 6.5 blocks; horizon 4 is flat at 10 %, horizon 0 is 15 % or
     // 5 % a day, with the same mean 10 % either way.
     let high = |high: bool| if high { 15 } else { 5 };
     let alternating = daily_of(
@@ -3153,12 +3155,12 @@ fn the_bootstrap_is_seeded_and_widens_under_serial_dependence() {
         364,
         100,
         |day, h| {
-            if h == 0 { high(day / 28 % 2 == 0) } else { 10 }
+            if h == 0 { high(day / 56 % 2 == 0) } else { 10 }
         },
     );
     let se = |daily: &Daily, seed| bootstrap_se(daily, (0, 4), BLOCK_DAYS, RESAMPLES, seed).se;
-    // Every 28-day block of the alternating days holds 14 high days, so
-    // every resample is the same: no noise. Runs of 28 high or low days
+    // Every 56-day block of the alternating days holds 28 high days, so
+    // every resample is the same: no noise. Runs of 56 high or low days
     // are what a block sees whole, so the persistent days spread.
     let flat = se(&alternating, SEED).unwrap();
     let wide = se(&persistent, SEED).unwrap();
@@ -3188,7 +3190,8 @@ fn a_few_undefined_resamples_are_dropped_and_more_leave_the_se_undefined() {
     assert!(limit(230));
     assert!(!limit(231));
     // Horizon 0's `Neither` falls on the first `days` days of 364 only, so
-    // a resample whose 13 blocks all miss those days has none.
+    // a resample whose 7 blocks (the last one 28 days) all miss those days
+    // has none.
     let clustered = |days: usize| {
         let daily = daily_of(364, 100, |day, h| match h {
             0 if day < days => 10,
@@ -3467,12 +3470,12 @@ fn the_ar1_fit_recovers_a_known_persistence() {
 #[test]
 fn the_resampled_logs_are_the_bands_draws() {
     let high = |high: bool| if high { 15 } else { 5 };
-    // Horizons 0 and 1 swing together in 28-day runs; 2 to 4 are flat.
+    // Horizons 0 and 1 swing together in 56-day runs; 2 to 4 are flat.
     let persistent = daily_of(
         364,
         100,
         |day, h| {
-            if h <= 1 { high(day / 28 % 2 == 0) } else { 10 }
+            if h <= 1 { high(day / 56 % 2 == 0) } else { 10 }
         },
     );
     let logs = resample_logs(&persistent, BLOCK_DAYS, RESAMPLES, SEED);
