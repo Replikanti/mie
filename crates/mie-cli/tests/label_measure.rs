@@ -3573,11 +3573,11 @@ fn removing_weekday_means_separates_the_weekly_cycle_from_persistence() {
     assert_eq!(weekday(0), 3);
     assert_eq!(weekday(4), 0);
     assert_eq!(weekday(-1), 2);
-    // A weekend dip like BTC's (Saturday 0.64, Sunday 0.36 below the
+    // A weekend dip like BTC's (Saturday 0.64, Sunday 0.35 below the
     // weekdays) on an AR(1) at 0.725, from a Wednesday on, every 50th day
     // missing.
     let first = 20_000;
-    let dip = |day: i64| [0.0, 0.0, 0.0, 0.0, 0.0, -0.64, -0.36][weekday(day)];
+    let dip = |day: i64| [0.0, 0.0, 0.0, 0.0, 0.0, -0.64, -0.35][weekday(day)];
     let mut rng = SplitMix64(11);
     let mut x = 0.0;
     let series: Vec<Option<f64>> = (0..4_000_i64)
@@ -3588,7 +3588,7 @@ fn removing_weekday_means_separates_the_weekly_cycle_from_persistence() {
         .collect();
     let (rest, means) = deseasonalized(&series, first);
     for (day, mean) in means.iter().enumerate() {
-        let expected = -3.7 + [0.0, 0.0, 0.0, 0.0, 0.0, -0.64, -0.36][day];
+        let expected = -3.7 + [0.0, 0.0, 0.0, 0.0, 0.0, -0.64, -0.35][day];
         assert!((mean.unwrap() - expected).abs() < 0.05, "{day}: {mean:?}");
     }
     // The missing days stay missing; the present ones lose their mean.
