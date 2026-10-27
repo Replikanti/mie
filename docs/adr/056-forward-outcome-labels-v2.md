@@ -85,15 +85,30 @@ ADR-055 published.
   `Unavailable` 899). It writes the per-UTC-day `Neither` and race counts
   of 365 days; `measure_label_noise_from` reruns the analysis below from
   them with this ADR's bootstrap (56-day blocks, 10 000 resamples, seed
-  151).
+  151). The file also holds each day's 1d range, from which v2's 1d
+  `Neither` could be approximated (a range against a Wilder(14) average
+  of ranges is v2's 1d race); beyond the volatility below it stays
+  unanalysed until the acceptance run, so no v2 outcome is read before
+  it.
 - **Persistence of daily volatility.** ln of the daily realized σ from
-  the engine's 1m closes: AR(1) slope φ = 0.560 (block-bootstrap 95 %
-  interval 0.425 … 0.647). Its autocorrelation is 0.562 / 0.327 / 0.542 /
-  0.418 / 0.373 / 0.233 at 1 / 2 / 7 / 14 / 28 / 56 days, where AR(1) at
-  φ = 0.56 gives 0.560 / 0.314 / 0.017 / 0.000 / 0.000 / 0.000: the memory
-  is long, and AR(1) does not describe it. ln of the 1d log range, whose
-  own noise attenuates φ to 0.339, shows the same long tail (0.454 /
-  0.304 / 0.296 / 0.235 at 7 / 14 / 28 / 56 days).
+  the engine's 1m closes has a weekly cycle: Saturday's mean is 0.64 and
+  Sunday's 0.36 below the Monday to Friday means, and the weekday means
+  hold 28.8 % of its variance. Its raw autocorrelation, 0.562 / 0.327 /
+  0.542 / 0.418 / 0.373 / 0.233 at 1 / 2 / 7 / 14 / 28 / 56 days, rises
+  again at every whole week because of that cycle, not because of memory:
+  a day off a whole week it is 0.318 / 0.250 at 6 / 8 days, 0.142 / 0.113
+  at 27 / 29 and 0.004 / 0.012 at 55 / 57. With the weekday means removed,
+  the AR(1) slope is φ = 0.7235 (lag-1 autocorrelation 0.725,
+  block-bootstrap 95 % interval 0.610 … 0.781; the raw slope of 0.560 is
+  pulled down by the Friday to Saturday and Sunday to Monday steps), and
+  the autocorrelation is 0.725 / 0.591 / 0.359 / 0.177 / 0.124 / −0.063
+  at 1 / 2 / 7 / 14 / 28 / 56 days (−0.097 at 42, −0.060 / −0.053 at
+  55 / 57): the dependence left after the cycle is about 0.12 at 28 days
+  and gone by 42 to 56. ln of the 1d log range, whose own noise
+  attenuates φ (0.339 raw, 0.431 without weekday means), shows the same:
+  its weekday means hold 26.0 % of its variance, and without them its
+  autocorrelation is 0.267 / 0.063 / 0.068 / 0.002 at 7 / 14 / 28 / 56
+  days.
 - **SE of ln N(H)**, 5m / 15m / 1h / 4h / 1d: 0.045 / 0.049 / 0.057 /
   0.075 / 0.132, 195 to 642 times the binomial variance (design effect),
   that is, worth 870 to 2 900 independent races instead of 560 000.
@@ -108,9 +123,12 @@ ADR-055 published.
   log-difference, so two SE are a ratio of e^(2 · 0.116) = 1.26; v1's own
   5m / 1d spread has an SE of 0.115.
 - **Block length.** The same counts at blocks of 1 / 14 / 28 / 56 / 91 /
-  122 days give an SE of ln N(1d) of 0.103 / 0.093 / 0.111 / 0.131 /
-  0.145 / 0.150 and a widest-pair 2-SE ratio of 1.198 / 1.196 / 1.227 /
-  1.260 / 1.291 / 1.298 (a sensitivity rerun, 4 000 resamples, PR #153).
+  122 days give an SE of ln N(1d) of 0.103 / 0.091 / 0.111 / 0.131 /
+  0.146 / 0.150 and a widest-pair 2-SE ratio of 1.200 / 1.191 / 1.230 /
+  1.261 / 1.293 / 1.297 (`measure_label_noise_from`'s block-length
+  sensitivity: this ADR's bootstrap, 10 000 resamples, seed 151, at each
+  length; the widest pair is 1h with 1d at 14 to 56 days and 5m with 1d
+  at 1, 91 and 122).
   The floor stays below 1.62 at every block tried.
 - **Caveat: v1's 1d is not v2's 1d.** v1 scales every horizon by ATR(1h),
   whose memory is 14 h, so its 1d races lack the dependence that ATR_1d's
@@ -118,14 +136,24 @@ ADR-055 published.
   1d share is 6.2 %, not 10 %. v2's 1d noise is therefore likely wider.
   The margin is why the band's numbers still hold: noise alone reaches the
   bound only when two SE reach ln 1.62 = 0.48, a pair SE of 0.24, which is
-  2.1 times the measured 0.116. The acceptance run's band measures v2's own
-  floor in any case.
+  2.1 times the measured 0.116. The review of this ADR (PR #153) checked
+  that margin under v2's ATR_1d memory on synthetic years only (no v2
+  label on real data): ln σ as the measured weekday offsets plus a fast
+  and a slow AR(1) component fitted to the autocorrelation without them,
+  a Wilder(14) ATR_1d, 400 years. v2's 1d SE of ln N came out 0.09 (an
+  expected share per day) to 0.17 (one Bernoulli race per day), a 2-SE
+  ratio of 1.20 to 1.41, below 1.62; an AR(1) at φ = 0.725 with the same
+  SD gives the same. The 0.24 is 1.4 to 2.6 times those SEs, so v1's
+  noise is a usable proxy for the margin. The acceptance run's band
+  measures v2's own floor in any case.
 - **Superseded history.** The review simulated AR(1) log daily σ with a
   Wilder(14) ATR_1d and found a 2-SE noise ratio of 1.31 / 1.43 / 1.50 /
   1.67 at φ = 0 / 0.8 / 0.9 / 0.95, and its shape simulation fixed
   independent per-horizon SEs (1d: 0.26 relative, the φ = 0.95 value).
-  The measurement replaces both: BTC's φ is 0.56, the dependence is a
-  long memory the AR(1) model lacks, and the horizons are correlated.
+  The measurement replaces both, and not because of φ: without the
+  weekly cycle BTC's φ is 0.72, inside the simulated range. The simulated
+  ln σ had a stationary SD of 0.64 to 0.70, where the measured one is
+  0.44 (0.37 without the weekday means), and the horizons are correlated.
 
 Delivery is in two PRs under #151: this ADR (proposed, with the
 prediction) with the code and tests; then the measurement of *Accept when*
@@ -305,12 +333,12 @@ touch it:
 | Miss bound 1.62 on max_H N(H) ÷ min_H N(H) | *Accept when*: √(16.338 / 6.191) = 1.6245 rounded down: v2 must remove more than half of v1's log-spread (ln 2.639 = 0.970) | ≥ 2.64 accepts a rule no flatter than v1; alone, without the noise band, a true prediction can exceed it from 1d noise (next rows) |
 | 1.38, 350 daily windows, SE 1.6 pp (16 % relative) | *Accept when*: the floor if the about 350 disjoint daily windows were independent: SE √(0.1 · 0.9 / 350) = 1.6 pp, two SE in log e^(2 · 0.16) ≈ 1.38 | — (not used: the windows are serially dependent, next row) |
 | Noise floor 1.26; SE of ln N(H) 0.045 / 0.049 / 0.057 / 0.075 / 0.132 | *The noise, measured on v1*: labeling v1's per-day counts on the #12 year, this ADR's bootstrap; the widest pair (1h, 1d) has an SE of 0.116, e^(2 · 0.116) = 1.26 | — (measured, not thresholds; v2's 1d noise is likely wider, and the band measures it on the run; noise reaches 1.62 only at a pair SE of 0.24, 2.1 times the measured one) |
-| φ = 0.560; autocorrelation 0.562 / 0.327 / 0.542 / 0.418 / 0.373 / 0.233 at 1 / 2 / 7 / 14 / 28 / 56 d | *The noise, measured on v1*: ln daily realized σ from the engine's 1m closes; AR(1) predicts 0.017 at 7 d and 0.000 beyond | — (measured; the reason the floor is not taken from an AR(1) model, and the reason for the block length) |
-| 1.31 / 1.43 / 1.50 / 1.67 (superseded) | The review of this ADR (PR #153) simulated 350-day years with AR(1) log daily σ and a Wilder(14) ATR_1d: the 2-SE noise ratio at persistence φ = 0 / 0.8 / 0.9 / 0.95 | — (history only: replaced by the measured floor 1.26; BTC's φ is 0.56, and AR(1) does not describe its long memory) |
+| φ = 0.7235 without weekday means (0.560 raw); autocorrelation without them 0.725 / 0.591 / 0.359 / 0.177 / 0.124 / −0.063 at 1 / 2 / 7 / 14 / 28 / 56 d | *The noise, measured on v1*: ln daily realized σ from the engine's 1m closes, less its weekday means (28.8 % of its variance). The raw 0.542 / 0.418 / 0.373 / 0.233 at 7 / 14 / 28 / 56 d are the weekly cycle: a day off a whole week the raw lags are 0.318 / 0.250 (6 / 8), 0.142 / 0.113 (27 / 29), 0.004 / 0.012 (55 / 57) | — (measured; the reason for the block length: about 0.12 left at 28 d, none at 56 d) |
+| 1.31 / 1.43 / 1.50 / 1.67 (superseded) | The review of this ADR (PR #153) simulated 350-day years with AR(1) log daily σ and a Wilder(14) ATR_1d: the 2-SE noise ratio at persistence φ = 0 / 0.8 / 0.9 / 0.95 | — (history only: replaced by the measured floor 1.26. Not because of φ, which is 0.72 without the weekly cycle, but because the simulated ln σ had a stationary SD of 0.64 to 0.70 against the measured 0.44; the review's calibrated rerun gives v2's 1d a 2-SE ratio of 1.20 to 1.41) |
 | Noise band: ln(max ÷ min) > 2 SE | *Accept when*: two standard errors, the width the derived floor used; the SE is the bootstrap's, so it carries the year's own serial dependence | ln(max ÷ min) ≥ 0 folds both directions, so the rate is two-sided: 4.6 % at 2 SE. 1 SE: a flat truth clears the band about one time in three (32 %), so the 1.62 bound alone would decide most noise misses. 3 SE: a spread has to be half again as far from noise before it counts. The pair is the observed max and min, which noise pulls apart, so the band is weaker than its nominal rate: a guard beside the 1.62 bound, not a test on its own |
 | Step band: a step rises or falls only past 2 SE of its own log-difference | *Reading of a miss*: the same bootstrap as the spread's band, one adjacent pair at a time; a step equal in truth clears it in one direction 2.3 % of the time (one-sided normal) | 1 SE: 16 % per step one-sided, so a flat truth's four steps hold a spurious rise or fall about four times in five (one in six at 2 SE, steps taken as independent), and the readings return to the coin flips of raw signs. 3 SE: on the measured 4h→1d SE of 0.092 the week's ln 1.8 = 0.59 step (6.4 SE) clears either way, so 3 SE buys nothing on v1's noise, and on v2's likely wider 1d noise a real week step would have to be half again as far from noise before it counts |
 | At most 2.3 % undefined resamples (230 of 10 000) | *Accept when*: the one-sided normal tail beyond the band's 2 SE (2.275 %, rounded up to the next per mille). An undefined resample stands for an infinite spread; up to the tail the band leaves outside anyway it is dropped. At the limit the SD of the rest is at most 6 % below the full one (a normal cut at +2 SD keeps an SD of 0.94), a small change beside the gap between the measured floor and the bound (2 SE = 0.23 against ln 1.62 = 0.48). On v1's counts no resample is undefined at any horizon (0 of 10 000); the limit guards v2's 1d, whose first 15 days have no race | 0, any undefined resample counting as outside: one resample of 10 000 decides the band. 4.6 % (both tails): cut at +1.69 SD the SD of the rest is 9.5 % low, and the band narrows by that much on exactly the years whose resamples come closest to an empty horizon |
-| Block 56 UTC days | *Accept when*: the measured autocorrelation of ln daily realized σ stays 0.54 / 0.42 / 0.37 at 7 / 14 / 28 days (*The noise, measured on v1*): a long memory that AR(1) at the measured φ = 0.56 does not fit (it predicts 0.017 at 7 days), so 28-day blocks cut dependence that is still there. At 56 days it is 0.23. 56 is four memories of the 1d scale ((13/14)^56 = 1.6 % of ATR_1d's weight lies beyond it) and keeps 6.5 blocks a year; it raises the SE of ln N(1d) from 0.111 (28 d) to 0.131 | 28: cuts the measured dependence and narrows the band (SE of ln N(1d) 0.111); below 14 the band shrinks back towards the refuted binomial one (0.093 at 14 d). 91: 4 blocks a year, so the SE rests on four units (0.145). Dependence beyond 56 days still narrows the band; the 1.62 bound, 2.1 times the measured 2 SE in log, is what holds then (the floor is 1.30 even at 122-day blocks) |
+| Block 56 UTC days | *Accept when*: a whole number of weeks, so every block holds each weekday eight times and keeps daily volatility's weekly cycle (Saturday 0.64 and Sunday 0.36 below the weekdays in ln σ, 28.8 % of its variance) intact inside it; and long enough to cut the dependence left without the cycle, whose autocorrelation is about 0.12 at 28 days and none at 56 (−0.063; *The noise, measured on v1*). 56 is also four memories of the 1d scale ((13/14)^56 = 1.6 % of ATR_1d's weight lies beyond it) and keeps 6.5 blocks a year; it raises the SE of ln N(1d) from 0.111 (28 d) to 0.131 | Not a whole number of weeks: a block holds some weekdays once more than others, so the resamples' weekday mix varies and the weekend dip adds variance the year does not have. 28: cuts the 0.12 still left at 28 days and narrows the band (SE of ln N(1d) 0.111); below 14 the band shrinks back towards the refuted binomial one (0.091 at 14 d). 91: 4 blocks a year, so the SE rests on four units (0.146). Dependence beyond 56 days, none measured, would still narrow the band; the 1.62 bound, 2.1 times the measured 2 SE in log, is what holds then (the floor is 1.30 even at 122-day blocks) |
 | Day = UTC day of the decision | *Accept when*: the 1d horizon's bars are UTC days (ADR-031), and 1d noise is what the band is for | — (windows that cross midnight tie neighbouring days, which a block keeps together) |
 | 10 000 resamples | *Accept when*: the Monte Carlo error of an SD from B draws is 1/√(2(B − 1)), 0.71 % at 10 000, at about 10⁷ additions | 1 000: 2.2 %, the band moves by that much with the seed; more buys nothing the 1.62 bound would notice |
 | Scale memory 14 · H: 70 min (5m), 3.5 h (15m), 14 h, 56 h, 14 d | *Reading of a miss*: 14 bars of H's timeframe (D4′) | — (follows from the length) |
@@ -433,8 +461,9 @@ store.
     14-day memory, and daily volatility is persistent, so their
     `Neither` outcomes are positively correlated and N(1d) varies more
     than a binomial share. Measured on v1 (*The noise, measured on v1*),
-    daily volatility keeps an autocorrelation of 0.37 at 28 days, long
-    memory no AR(1) model fits, and the floor of the widest pair is 1.26,
+    daily volatility has a weekly cycle and, without it, an
+    autocorrelation of 0.72 at one day that falls to 0.12 at 28 days and
+    none at 56, and the floor of the widest pair is 1.26,
     below 1.62: ln 1.62 = 0.48 is 2.1 times its 2 SE of 0.23. v1's 1d lacks ATR_1d's
     memory, so v2's floor is not known in advance either: the band
     measures it on the year itself.

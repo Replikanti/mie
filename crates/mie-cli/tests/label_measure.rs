@@ -134,9 +134,14 @@
 //!     makes it persistent whatever σ does. For each: the AR(1) slope φ by
 //!     OLS, its SE if the innovations were independent, and the SD and 95 %
 //!     interval of a circular block bootstrap of the consecutive-day pairs
-//!     (56-day blocks, 10 000 resamples, seed 151, the band's numbers); the
-//!     autocorrelation at 1, 2, 7, 14, 28 and 56 days next to φ^k, so a
-//!     dependence AR(1) does not describe shows;
+//!     (56-day blocks, 10 000 resamples, seed 151, the band's numbers).
+//!     ln σ has a weekly cycle (a weekend dip), which lifts the
+//!     autocorrelation at every whole week and pulls the lag-1 slope down,
+//!     so each estimator is also read with its weekday means removed: the
+//!     seven means, the share of the variance they hold, the AR(1) fit of
+//!     the rest, and the autocorrelation raw and without them at whole
+//!     weeks and at the days either side (6, 8, 27, 29, 55, 57), next to
+//!     φ^k of the fit without them;
 //!   - from labeling v1's labels, the per-UTC-day `Neither` and race
 //!     counts of the band, resampled by the band's bootstrap (the same
 //!     draws as `bootstrap_se`): the SE of ln N(H) per horizon with its
@@ -153,7 +158,10 @@
 //!     reading, *other* and a wrong mechanism. v1 scales every horizon by
 //!     ATR_1h, so its 1d noise lacks the 14-day memory of v2's ATR_1d, and
 //!     its 1d share is 6.2 %, not 10 %: the evaluation carries v1's noise
-//!     around v2's truths.
+//!     around v2's truths;
+//!   - the block-length sensitivity: the SE of ln N(1d) and the widest
+//!     pair's SE and 2-SE noise ratio at blocks of 1, 14, 28, 56, 91 and
+//!     122 days, same resamples and seed.
 //!
 //!   `MIE_MEASURE_RAW_ROOT`, `MIE_MEASURE_FROM`, `MIE_MEASURE_TO` and
 //!   `MIE_MEASURE_EVENTS` as for `measure_labels`; an optional
@@ -182,6 +190,7 @@
 //! undefined resamples), the miss rule, the step bands and the shape cases
 //! have their own tests, and so do the noise measurement's parts: the
 //! daily-volatility estimators, the AR(1) fit on a series of known
+//! persistence, the weekday-mean removal on a weekend dip over a known
 //! persistence, the resamples against `bootstrap_se`'s, the shape
 //! evaluation without noise, and the noise run on the twin tape against
 //! `label_window` under labeling v1.
@@ -257,8 +266,10 @@ const PREDICTED_NEITHER_PERCENT: f64 = 10.05;
 const MISS_RATIO: f64 = 1.62;
 
 /// ADR-056 *Accept when*: the circular block bootstrap of the spread over
-/// UTC days: the block length in days (four ATR_1d memories of 14 days:
-/// daily volatility's autocorrelation is still 0.37 at 28 days),
+/// UTC days: the block length in days (a whole number of weeks, so a block
+/// keeps daily volatility's weekly cycle intact; without that cycle its
+/// autocorrelation is 0.12 at 28 days and none at 56; four ATR_1d memories
+/// of 14 days),
 /// the resamples, the seed (named before the run), and the width in
 /// standard errors of the spread's band and of each step's band.
 const BLOCK_DAYS: usize = 56;
@@ -1815,10 +1826,13 @@ fn measure_labels_live() {
 /// first [`RESAMPLES`] are the ones the SEs come from.
 const EVAL_RESAMPLES: usize = 200_000;
 
-/// Lags of the autocorrelation of ln σ, in days: one and two days, a week,
-/// the ATR's length of 14, the 28 days the block once had and the
-/// bootstrap's block of 56.
-const ACF_LAGS: [usize; 6] = [1, 2, 7, 14, 28, 56];
+/// Lags of the autocorrelation of ln σ, in days: one and two days, whole
+/// weeks (7, the ATR's length of 14, the 28 days the block once had, 42
+/// and the bootstrap's block of 56), and the days either side of a week, of
+/// 28 and of 56, which a weekly cycle does not lift: at whole weeks a
+/// weekday effect reads as memory, so a lag a day off shows how much of it
+/// is the cycle.
+const ACF_LAGS: [usize; 13] = [1, 2, 6, 7, 8, 14, 27, 28, 29, 42, 55, 56, 57];
 
 /// The truths ADR-056 *What the rule achieves* evaluates, N(H) in percent
 /// from 5m to 1d, with the reading a miss of each should get: the flat
@@ -2058,6 +2072,36 @@ fn autocorrelation(series: &[Option<f64>], lag: usize) -> Option<f64> {
         .then(|| products.iter().sum::<f64>() / products.len() as f64 / variance)
 }
 
+/// The weekday of UTC day `day` (days since 1970-01-01, a Thursday),
+/// Monday 0.
+fn weekday(day: i64) -> usize {
+    usize::try_from((day + 3).rem_euclid(7)).expect("0 to 6")
+}
+
+/// `series`, whose first row is UTC day `first`, less the mean of its
+/// present days on the same weekday, with those seven means, Monday first
+/// (`None` for a weekday without a present day). A weekly cycle of
+/// volatility lifts the autocorrelation at every multiple of 7 days and
+/// pulls down the lag-1 slope across its weekend steps; without the means
+/// both read the dependence that is left.
+fn deseasonalized(series: &[Option<f64>], first: i64) -> (Vec<Option<f64>>, [Option<f64>; 7]) {
+    let mut sums = [(0.0, 0_u32); 7];
+    for (i, x) in series.iter().enumerate() {
+        if let Some(x) = x {
+            let sum = &mut sums[weekday(first + i as i64)];
+            sum.0 += x;
+            sum.1 += 1;
+        }
+    }
+    let means = sums.map(|(sum, n)| (n > 0).then(|| sum / f64::from(n)));
+    let rest = series
+        .iter()
+        .enumerate()
+        .map(|(i, x)| Some((*x)? - means[weekday(first + i as i64)]?))
+        .collect();
+    (rest, means)
+}
+
 fn report_vol(source: &str, vol: &DailyVol) {
     let minutes = vol
         .days
@@ -2082,15 +2126,11 @@ fn report_vol(source: &str, vol: &DailyVol) {
             vol.log_range(),
         ),
     ];
-    for (name, series) in estimators {
-        let Some(fit) = ar1(&series, BLOCK_DAYS, RESAMPLES, SEED) else {
-            println!("  {name}: too few days");
-            continue;
-        };
-        println!(
-            "  {name}: {} days, {} consecutive pairs, mean {:.4}, SD {:.4}; AR(1) phi {:.4}, iid \
-             SE {:.4}; block bootstrap of the pairs ({BLOCK_DAYS} d, {RESAMPLES} resamples, seed \
-             {SEED}): SD {:.4}, 95 % interval {:.4} .. {:.4}",
+    let line = |fit: &Ar1| {
+        format!(
+            "{} days, {} consecutive pairs, mean {:.4}, SD {:.4}; AR(1) phi {:.4}, iid SE {:.4}; \
+             block bootstrap of the pairs ({BLOCK_DAYS} d, {RESAMPLES} resamples, seed {SEED}): \
+             SD {:.4}, 95 % interval {:.4} .. {:.4}",
             fit.days,
             fit.pairs,
             fit.mean,
@@ -2100,27 +2140,50 @@ fn report_vol(source: &str, vol: &DailyVol) {
             fit.boot_sd,
             fit.interval.0,
             fit.interval.1
+        )
+    };
+    let first = vol.first.unwrap_or(0);
+    for (name, series) in estimators {
+        let Some(fit) = ar1(&series, BLOCK_DAYS, RESAMPLES, SEED) else {
+            println!("  {name}: too few days");
+            continue;
+        };
+        println!("  {name}: {}", line(&fit));
+        let (rest, means) = deseasonalized(&series, first);
+        let Some(rest_fit) = ar1(&rest, BLOCK_DAYS, RESAMPLES, SEED) else {
+            println!("    without weekday means: too few days");
+            continue;
+        };
+        let means: Vec<String> = means
+            .iter()
+            .map(|mean| mean.map_or_else(|| "-".to_owned(), |mean| format!("{mean:.3}")))
+            .collect();
+        println!(
+            "    weekday means (Mon .. Sun) {}; the weekday effect holds {:.1} % of the variance",
+            means.join(" / "),
+            100.0 * (1.0 - (rest_fit.sd / fit.sd).powi(2))
         );
+        println!("    without weekday means: {}", line(&rest_fit));
         let lags: Vec<String> = ACF_LAGS
             .iter()
             .map(|&lag| {
-                let r = autocorrelation(&series, lag)
-                    .map_or_else(|| "-".to_owned(), |r| format!("{r:.3}"));
-                // r_k^(1/k): the AR(1) persistence that would carry the
-                // lag-k correlation, to set beside phi.
-                let implied = autocorrelation(&series, lag)
-                    .filter(|r| *r > 0.0)
-                    .map_or_else(
-                        || "-".to_owned(),
-                        |r| format!("{:.3}", r.powf(1.0 / lag as f64)),
-                    );
+                let r = |series: &[Option<f64>]| {
+                    autocorrelation(series, lag)
+                        .map_or_else(|| "-".to_owned(), |r| format!("{r:.3}"))
+                };
                 format!(
-                    "{lag} d {r} (phi^{lag} {:.3}, r^(1/{lag}) {implied})",
-                    fit.phi.powi(lag as i32)
+                    "{lag} d {} / {} (phi^{lag} {:.3})",
+                    r(&series),
+                    r(&rest),
+                    rest_fit.phi.powi(lag as i32)
                 )
             })
             .collect();
-        println!("    autocorrelation: {}", lags.join(", "));
+        println!(
+            "    autocorrelation, raw / without weekday means (next to the AR(1) at the latter's \
+             phi): {}",
+            lags.join(", ")
+        );
     }
 }
 
@@ -2555,6 +2618,41 @@ impl NoiseRun {
 const DAILY_HEADER: &str = "# label_measure noise days: labels <day> <neither x5> <ran x5> | \
                             vol <day> <rv> <minutes> <range or -> | incomplete <n>";
 
+/// Block lengths of the sensitivity rerun, in days: no blocks, the ATR's
+/// length, the block once chosen, the block, 13 weeks and four months.
+const SENSITIVITY_BLOCKS: [usize; 6] = [1, 14, 28, BLOCK_DAYS, 91, 122];
+
+/// The band's numbers at other block lengths, over the same per-day counts,
+/// resamples and seed: the SE of ln N(1d) and the widest pair's SE with its
+/// 2-SE noise ratio.
+fn report_blocks(daily: &Daily, resamples: usize) {
+    println!(
+        "block-length sensitivity: circular block bootstrap, {resamples} resamples, seed {SEED}"
+    );
+    for block in SENSITIVITY_BLOCKS {
+        let logs = resample_logs(daily, block, resamples, SEED);
+        let day = combination_band(&logs, unit(4)).se;
+        let bands = Bands::of(&logs);
+        let widest = (0..5)
+            .flat_map(|i| (i + 1..5).map(move |j| (i, j)))
+            .filter_map(|(i, j)| Some((bands.pair[i][j]?, i, j)))
+            .max_by(|a, b| a.0.total_cmp(&b.0));
+        println!(
+            "  {block} d: SE of ln N(1d) {}; widest pair {}",
+            day.map_or_else(|| "undefined".to_owned(), |se| format!("{se:.4}")),
+            widest.map_or_else(
+                || "undefined".to_owned(),
+                |(se, i, j)| format!(
+                    "{} with {}, SE {se:.4}, 2-SE ratio {:.3}",
+                    HORIZONS[i],
+                    HORIZONS[j],
+                    (BAND_SE * se).exp()
+                )
+            )
+        );
+    }
+}
+
 /// The per-day inputs of the noise measurement as text, so the analysis
 /// can be rerun without the replay; days count from 1970-01-01.
 fn daily_text(daily: &Daily, vol: &DailyVol) -> String {
@@ -2663,6 +2761,7 @@ fn measure_label_noise() {
     }
     report_vol("the engine's closed bars", &run.vol);
     report_noise(&run.daily, RESAMPLES, EVAL_RESAMPLES);
+    report_blocks(&run.daily, RESAMPLES);
     println!(
         "wall {:.1} s, peak RSS {}",
         started.elapsed().as_secs_f64(),
@@ -2682,6 +2781,7 @@ fn measure_label_noise_from() {
     let started = Instant::now();
     report_vol("the engine's closed bars", &vol);
     report_noise(&daily, RESAMPLES, EVAL_RESAMPLES);
+    report_blocks(&daily, RESAMPLES);
     println!("wall {:.1} s", started.elapsed().as_secs_f64());
 }
 
@@ -3465,6 +3565,74 @@ fn the_ar1_fit_recovers_a_known_persistence() {
         "{white:?}"
     );
     assert!(ar1(&[Some(1.0), None, Some(2.0)], BLOCK_DAYS, 10, SEED).is_none());
+}
+
+#[test]
+fn removing_weekday_means_separates_the_weekly_cycle_from_persistence() {
+    // 1970-01-01 was a Thursday; 1970-01-05 a Monday.
+    assert_eq!(weekday(0), 3);
+    assert_eq!(weekday(4), 0);
+    assert_eq!(weekday(-1), 2);
+    // A weekend dip like BTC's (Saturday 0.64, Sunday 0.36 below the
+    // weekdays) on an AR(1) at 0.725, from a Wednesday on, every 50th day
+    // missing.
+    let first = 20_000;
+    let dip = |day: i64| [0.0, 0.0, 0.0, 0.0, 0.0, -0.64, -0.36][weekday(day)];
+    let mut rng = SplitMix64(11);
+    let mut x = 0.0;
+    let series: Vec<Option<f64>> = (0..4_000_i64)
+        .map(|i| {
+            x = 0.725 * x + 0.25 * normal(&mut rng);
+            (i % 50 != 49).then_some(-3.7 + dip(first + i) + x)
+        })
+        .collect();
+    let (rest, means) = deseasonalized(&series, first);
+    for (day, mean) in means.iter().enumerate() {
+        let expected = -3.7 + [0.0, 0.0, 0.0, 0.0, 0.0, -0.64, -0.36][day];
+        assert!((mean.unwrap() - expected).abs() < 0.05, "{day}: {mean:?}");
+    }
+    // The missing days stay missing; the present ones lose their mean.
+    assert_eq!(rest[49], None);
+    let i = 100;
+    let mean = means[weekday(first + i as i64)].unwrap();
+    assert_eq!(rest[i], Some(series[i].unwrap() - mean));
+    // Raw, the cycle lifts whole weeks above the days beside them and pulls
+    // the lag-1 slope down; without the means the AR(1) is back.
+    let raw = |lag| autocorrelation(&series, lag).unwrap();
+    assert!(
+        raw(7) > raw(6) + 0.2 && raw(7) > raw(8) + 0.2,
+        "{} {} {}",
+        raw(6),
+        raw(7),
+        raw(8)
+    );
+    assert!(raw(56) > 0.2 && raw(55).abs() < 0.1 && raw(57).abs() < 0.1);
+    let raw_fit = ar1(&series, BLOCK_DAYS, 200, SEED).unwrap();
+    let fit = ar1(&rest, BLOCK_DAYS, 200, SEED).unwrap();
+    assert!(raw_fit.phi < 0.65, "{raw_fit:?}");
+    assert!((fit.phi - 0.725).abs() < 0.03, "{fit:?}");
+    let without = |lag| autocorrelation(&rest, lag).unwrap();
+    assert!(
+        (without(7) - 0.725_f64.powi(7)).abs() < 0.06,
+        "{}",
+        without(7)
+    );
+    assert!(without(56).abs() < 0.06, "{}", without(56));
+    // A pure cycle leaves nothing; a weekday without a present day has no
+    // mean and its days no value.
+    let cycle: Vec<Option<f64>> = (0..70).map(|i| Some(dip(first + i))).collect();
+    let (flat, _) = deseasonalized(&cycle, first);
+    assert!(flat.iter().all(|x| x.unwrap().abs() < 1e-12));
+    let (gap, gap_means) = deseasonalized(
+        &[Some(1.0), None, None, None, None, None, None, Some(3.0)],
+        0,
+    );
+    assert_eq!(gap_means[weekday(0)], Some(2.0));
+    assert_eq!(gap_means[weekday(1)], None);
+    assert_eq!(
+        gap,
+        vec![Some(-1.0), None, None, None, None, None, None, Some(1.0)]
+    );
 }
 
 #[test]

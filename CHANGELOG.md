@@ -42,10 +42,12 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   prediction, the max ÷ min spread, the bootstrap's SE, the miss, the
   steps against their bands and the shape's reading. The noise numbers
   ADR-056 cites (step SEs, the 2-SE noise floor of 1.26, the shape-reading
-  rates) and its 56-day block, chosen for daily volatility's measured long
-  memory (autocorrelation 0.37 at 28 days), are measured from the engine's
-  bars and labeling v1's per-day counts on the year (`measure_label_noise`,
-  `measure_label_noise_from`). No v2 measurement on real data yet.
+  rates) and its 56-day block, a whole number of weeks that keeps daily
+  volatility's weekly cycle inside a block and cuts the dependence left
+  without it (autocorrelation 0.12 at 28 days, none at 56), are measured
+  from the engine's bars and labeling v1's per-day counts on the year
+  (`measure_label_noise`, `measure_label_noise_from`). No v2 measurement
+  on real data yet.
 - **ADR-055 is measured and not accepted (#26 M3).** The *Accept when*
   measurement on the #12 year and the ADR-051 R0 live store met T0 (0
   mismatches in 44 855 of 561 695 labels checked in the year, 2 185 of 2 185
