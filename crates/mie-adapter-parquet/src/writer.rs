@@ -88,11 +88,23 @@ impl SealStep {
 }
 
 /// Hashes and counts every byte on its way to the file, so sealing needs no
-/// second pass over the data.
-struct HashingWriter {
-    file: File,
-    hasher: Sha256,
-    bytes: u64,
+/// second pass over the data. The outcome dataset writer seals its tables
+/// with it too.
+pub(crate) struct HashingWriter {
+    pub(crate) file: File,
+    pub(crate) hasher: Sha256,
+    pub(crate) bytes: u64,
+}
+
+impl HashingWriter {
+    /// A writer at the start of `file`.
+    pub(crate) fn new(file: File) -> Self {
+        Self {
+            file,
+            hasher: Sha256::new(),
+            bytes: 0,
+        }
+    }
 }
 
 impl Write for HashingWriter {
@@ -334,11 +346,7 @@ impl RawWriter {
             .create_new(true)
             .open(&path)
             .map_err(io_error("create", &path))?;
-        let sink = HashingWriter {
-            file,
-            hasher: Sha256::new(),
-            bytes: 0,
-        };
+        let sink = HashingWriter::new(file);
         let writer = ArrowWriter::try_new(
             sink,
             schema::schema(),

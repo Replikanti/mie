@@ -8,6 +8,7 @@ use mie_adapter_binance::transport::{
 };
 use mie_app::kline_check::KlineVerdict;
 use mie_cli::archive::{self, ArchiveTransports, ImportRequest};
+use mie_cli::conditional::{self, BuildRequest};
 use mie_cli::config::{ArchiveConfig, IngestConfig};
 use mie_cli::equivalence::{self, EquivalenceRequest};
 use mie_cli::experiment::{self, ExperimentRequest};
@@ -154,6 +155,31 @@ USAGE:
         provider failure or a result that differs from the stored one
         prints `FAIL: <reason>` and exits 1. Stored results are never
         overwritten.
+
+    mie conditional build --config <path> --from <ms|YYYY-MM-DD> --to <ms|YYYY-MM-DD>
+                          --out <dir> [--source live|archive]
+                          [--streams <a,b,...>] [--trade-correction fold|none]
+                          [--replay-from <ms|YYYY-MM-DD>] [--replay-to <ms|YYYY-MM-DD>]
+        Build the conditional outcome dataset (ADR-057): replay the source
+        (as mie replay; history is refused), take the context records of
+        [from, to) and label them under the current labeling, and write
+        contexts.parquet, outcomes.parquet and passages.parquet plus
+        dataset.manifest into <dir>, which must not exist. The replay
+        window defaults to [from, to); --replay-from and --replay-to widen
+        it, so earlier events warm the engine up and later ones give the
+        last records their lookahead (labels the data ends before are
+        censored end_of_data). The manifest names the source, both windows,
+        the data version, engine, sampling and labeling, the events and
+        rejections, each file's rows and SHA-256, the content hash of all
+        that, and the code version (outside the hash): the same inputs give
+        the same files and content hash. Prints the manifest, the record and
+        label counts and PASS (exit 0), or FAIL: <reason> (exit 1), in which
+        case <dir> holds no manifest and is no dataset.
+
+    mie conditional verify <dir>
+        Verify an outcome dataset: the manifest's content hash, each file's
+        SHA-256, rows, format and schema. Prints the manifest and PASS
+        (exit 0), or FAIL: <reason> (exit 1).
 
     mie --help
 ";
@@ -359,6 +385,68 @@ fn dispatch(args: &[String]) -> Result<ExitCode, String> {
             _ => Err(
                 "expected `mie experiment validate <spec>` or `mie experiment run <spec> …`"
                     .to_owned(),
+            ),
+        },
+        Some("conditional") => match (args.get(1).map(String::as_str), args.get(2)) {
+            (Some("build"), _) => {
+                let options = Options::parse(
+                    &args[2..],
+                    &[
+                        "--config",
+                        "--from",
+                        "--to",
+                        "--out",
+                        "--source",
+                        "--streams",
+                        "--trade-correction",
+                        "--replay-from",
+                        "--replay-to",
+                    ],
+                    &[],
+                )?;
+                let bound = |flag: &str, is_end: bool, default: Option<i64>| match (
+                    options.optional(flag),
+                    default,
+                ) {
+                    (Some(value), _) => replay::parse_bound(flag, value, is_end),
+                    (None, Some(default)) => Ok(default),
+                    (None, None) => Err(format!("{flag} is required")),
+                };
+                let from = bound("--from", false, None)?;
+                let to = bound("--to", true, None)?;
+                if from >= to {
+                    return Err(format!("--from {from} must be below --to {to}"));
+                }
+                let replay_from = bound("--replay-from", false, Some(from))?;
+                let replay_to = bound("--replay-to", true, Some(to))?;
+                if replay_from > from || replay_to < to {
+                    return Err(format!(
+                        "the replay window [{replay_from}, {replay_to}) must contain \
+                         [{from}, {to})"
+                    ));
+                }
+                let request = BuildRequest {
+                    source: options.replay_source(&options.path("--config")?)?,
+                    records: ReplayWindow {
+                        start: EventTime::from_millis(from),
+                        end: EventTime::from_millis(to),
+                    },
+                    replay: ReplayWindow {
+                        start: EventTime::from_millis(replay_from),
+                        end: EventTime::from_millis(replay_to),
+                    },
+                    out: options.path("--out")?,
+                };
+                let pass = conditional::build(&request, &mut std::io::stdout().lock())?;
+                Ok(exit(pass))
+            }
+            (Some("verify"), Some(dir)) => {
+                Options::parse(&args[3..], &[], &[])?;
+                let pass = conditional::verify(&PathBuf::from(dir), &mut std::io::stdout().lock())?;
+                Ok(exit(pass))
+            }
+            _ => Err(
+                "expected `mie conditional build …` or `mie conditional verify <dir>`".to_owned(),
             ),
         },
         Some(other) => Err(format!("unknown command {other:?}")),

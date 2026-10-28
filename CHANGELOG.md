@@ -12,6 +12,24 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
 
 ### Added
 
+- **Conditional outcome dataset writer and ADR-057 (proposed; #27 M1).**
+  `mie conditional build --config … --from … --to … --out <dir>` labels a
+  live or archive replay under the current labeling (v2) and writes the
+  context records and their forward labels as three long-format Parquet
+  tables (`contexts`, `outcomes` per horizon, `passages`) with the run's
+  provenance on every row, prices as exact `Decimal128(18, 8)`, row groups
+  of 122 880 rows (DuckDB's own), and a `dataset.manifest` written last:
+  source, windows, data version, engine, sampling and labeling, each
+  file's rows and SHA-256, a content hash over all of that, and the code
+  version (`git:<commit>[-dirty]` from the new `mie-cli` build script)
+  outside the hash, so a rebuild from the same inputs reproduces the hash.
+  `--replay-from`/`--replay-to` widen the replay for warm-up and
+  lookahead; the history chain is refused. `mie conditional verify <dir>`
+  re-checks a dataset. The writer is the `outcome` module of
+  `mie-adapter-parquet`; `mie_app::conditional::label_window_started`
+  hands it the provenance before the first record. ADR-057 also fixes the
+  DuckDB views, the pinned bundled engine and the blind acceptance that
+  M2 and M3 deliver.
 - **Seasonal volatility measurement for labeling v3 (#155 M1).**
   `crates/mie-cli/tests/season_measure.rs` measures, report-only, the
   seasonal volatility profile of the #12 design year before any v3 design

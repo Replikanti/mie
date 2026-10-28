@@ -26,7 +26,9 @@
 //! [`ForwardLabeler::finish`]. [`label_window`] does both over a replay
 //! window, with its [`LabelProvenance`], and labels only the records of a
 //! record window, so the events after it give the last records their
-//! lookahead.
+//! lookahead. [`label_window_started`] is the same run with the provenance
+//! handed to a sink before the first record, for the outcome dataset of
+//! #27 (ADR-057).
 //!
 //! The labeler is built here and in tests only, never in live ingestion
 //! (ADR-055 D11): labels read the trades after the decision, and this file
@@ -362,6 +364,41 @@ pub fn label_window<H>(
     labeling: Labeling,
     trailing_gaps: impl FnOnce(&H::Stream) -> Vec<FeedGap>,
     on_record: impl FnMut(ContextRecord),
+    on_label: impl FnMut(ForwardLabel),
+) -> Result<(LabelProvenance, LabelReport), ProviderError>
+where
+    H: HistoricalDataProvider,
+{
+    label_window_started(
+        history,
+        window,
+        records,
+        labeling,
+        trailing_gaps,
+        |_| {},
+        on_record,
+        on_label,
+    )
+}
+
+/// [`label_window`], with the run's provenance passed to `on_start` once
+/// the replay has opened and before its first event, so a sink that stores
+/// the provenance next to every row has it before the first record
+/// (ADR-057 D3, #27). `on_start` is not called when the replay cannot be
+/// opened.
+///
+/// # Errors
+///
+/// As [`label_window`].
+#[allow(clippy::too_many_arguments)]
+pub fn label_window_started<H>(
+    history: &H,
+    window: ReplayWindow,
+    records: ReplayWindow,
+    labeling: Labeling,
+    trailing_gaps: impl FnOnce(&H::Stream) -> Vec<FeedGap>,
+    on_start: impl FnOnce(&LabelProvenance),
+    on_record: impl FnMut(ContextRecord),
     mut on_label: impl FnMut(ForwardLabel),
 ) -> Result<(LabelProvenance, LabelReport), ProviderError>
 where
@@ -376,6 +413,7 @@ where
         ContextProvenance::new(DataVersion::from(&dataset), &engine),
         labeling,
     );
+    on_start(&provenance);
     let mut sampler = ContextSampler::new(Some(records.start));
     let mut labeler = ForwardLabeler::new(labeling);
     let mut report = drive_labels(
@@ -438,6 +476,17 @@ mod tests {
                 stream: feed(&events),
                 dataset: self.1.clone(),
             })
+        }
+    }
+
+    /// A replay source whose replays never open.
+    struct Refusing;
+
+    impl HistoricalDataProvider for Refusing {
+        type Stream = Feed;
+
+        fn replay(&self, _window: ReplayWindow) -> Result<Replay<Feed>, ProviderError> {
+            Err(ProviderError::Source("no data".to_owned()))
         }
     }
 
@@ -1002,6 +1051,69 @@ mod tests {
         let whole = label_whole(&history.0, &[]);
         assert_eq!(records, whole.records);
         assert_eq!(labels, whole.labels);
+    }
+
+    #[test]
+    fn label_window_started_passes_the_provenance_before_the_first_record() {
+        let dataset = DatasetVersion::from_hex(&"ab".repeat(32)).unwrap();
+        let history = History(walk(3), dataset);
+        let window = ReplayWindow {
+            start: EventTime::from_millis(0),
+            end: EventTime::from_millis(4 * HOUR),
+        };
+        // What reached the sinks, in order: the provenance, then a record
+        // or a label per entry.
+        let log = std::cell::RefCell::new(Vec::new());
+        let (provenance, report) = label_window_started(
+            &history,
+            window,
+            window,
+            Labeling::V2,
+            |_| Vec::new(),
+            |provenance| log.borrow_mut().push(provenance.to_string()),
+            |_| log.borrow_mut().push("record".to_owned()),
+            |_| log.borrow_mut().push("label".to_owned()),
+        )
+        .unwrap();
+        let log = log.into_inner();
+        assert_eq!(log[0], provenance.to_string());
+        assert_eq!(log.iter().filter(|e| e.starts_with("data=")).count(), 1);
+        assert!(report.sampling.records > 0);
+        assert_eq!(
+            log.iter().filter(|e| *e == "record").count() as u64,
+            report.sampling.records
+        );
+
+        // The same run as `label_window`'s.
+        let (mut records, mut labels) = (0_u64, 0_u64);
+        let (plain, plain_report) = label_window(
+            &history,
+            window,
+            window,
+            Labeling::V2,
+            |_| Vec::new(),
+            |_| records += 1,
+            |_| labels += 1,
+        )
+        .unwrap();
+        assert_eq!((plain, plain_report), (provenance, report));
+        assert_eq!(records, report.sampling.records);
+        assert_eq!(labels, report.labels.emitted);
+
+        // No provenance when the replay cannot be opened.
+        let mut started = false;
+        let refused = label_window_started(
+            &Refusing,
+            window,
+            window,
+            Labeling::V2,
+            |_| Vec::new(),
+            |_| started = true,
+            |_| {},
+            |_| {},
+        );
+        assert!(refused.is_err());
+        assert!(!started);
     }
 
     #[test]
