@@ -104,7 +104,10 @@
 //!   hour-of-week buckets, ln N_v2(H | bucket) against the bucket's mean
 //!   ln s_H: the correlation and the OLS slope. A seasonal hump predicts a
 //!   negative slope (a forward window more volatile than its ATR has fewer
-//!   `Neither`).
+//!   `Neither`). Where ln s_H is flat across the buckets (a pure
+//!   hour-of-day shape at 1d, whose s_1d is 1 up to rounding), r and the
+//!   slope are undefined, print `-` and the horizon reads "no evidence":
+//!   it never counts as the mechanism showing.
 //! - **Integer candidate tables**: per estimator and shape (the four, plus
 //!   the 5-minute diagnostic), the relative variance per 10⁶ with a mean of
 //!   exactly 10⁶ (largest-remainder rounding), written to
@@ -114,7 +117,8 @@
 //! In CI: the hour-of-week index across the week wrap and before 1970, the
 //! slot builder, the slot file round trip, the normalization, a planted
 //! hour-of-week profile recovered within its bootstrap SE, the mechanism's
-//! exact zero under a flat profile and at 1d under a daily one, ADR-056's
+//! exact zero under a flat profile and at 1d under a daily one (and an
+//! undefined mechanism check there), the evaluation-period guard, ADR-056's
 //! g(ρ) values and lognormal inversion, the US daylight-saving days of the
 //! design year, the candidate tables' exact mean, and the season run on the
 //! seeded tape of `common::tapes` against `label_window` under labeling v2.
@@ -893,15 +897,43 @@ fn mean_sd(values: &[f64]) -> (f64, f64) {
     (mean, var.sqrt())
 }
 
-fn correlation(pairs: &[(f64, f64)]) -> Option<f64> {
-    let (sxx, sxy, syy) = moments(pairs)?;
-    (sxx > 0.0 && syy > 0.0).then(|| sxy / (sxx * syy).sqrt())
+/// The variance, relative to the scale of the values, at or below which a
+/// series counts as flat: its spread is rounding, not signal, and a
+/// correlation or slope on it is undefined. The values here are logs and
+/// relative variances, whose rounding is absolute rather than relative:
+/// ln s_H subtracts means of prefix sums that reach about 5.5 · 10⁵ (a
+/// year plus `WARM_DAYS` and a day, in minutes, of a profile with mean 1);
+/// their ulp of about 1.2 · 10⁻¹⁰, over the 1 440 minutes of 1d, leaves an
+/// SD near 10⁻¹³, a variance near 10⁻²⁶. So the scale is the largest |x|
+/// but at least 1 (the unit of a log), and 10⁻²⁰ is an SD of 10⁻¹⁰:
+/// three orders above that rounding and eight below ADR-056's SE of the
+/// log-spread (0.0582), the smallest effect the gate acts on. A ratio to
+/// the largest |x| alone would call rounding around 0 a signal, as the
+/// noise is then its own scale; with no floor at all, the rounding of a
+/// flat 1d printed a slope of −2 · 10¹¹ on a synthetic year.
+const FLAT_VARIANCE: f64 = 1e-20;
+
+/// Whether a centred sum of squares `ss` of `n` values `values` is flat in
+/// the sense of `FLAT_VARIANCE`.
+fn flat(ss: f64, n: usize, values: impl Iterator<Item = f64>) -> bool {
+    let scale = values.fold(1.0_f64, |m, v| m.max(v.abs()));
+    ss / n as f64 <= FLAT_VARIANCE * scale * scale
 }
 
-/// The OLS slope of `y` on `x` with an intercept.
+/// Pearson's r; undefined (`None`) when either side is flat
+/// (`FLAT_VARIANCE`), which the mechanism check reads as no evidence.
+fn correlation(pairs: &[(f64, f64)]) -> Option<f64> {
+    let (sxx, sxy, syy) = moments(pairs)?;
+    let n = pairs.len();
+    (!flat(sxx, n, pairs.iter().map(|p| p.0)) && !flat(syy, n, pairs.iter().map(|p| p.1)))
+        .then(|| sxy / (sxx * syy).sqrt())
+}
+
+/// The OLS slope of `y` on `x` with an intercept; undefined (`None`) when
+/// `x` is flat (`FLAT_VARIANCE`).
 fn slope(pairs: &[(f64, f64)]) -> Option<f64> {
     let (sxx, sxy, _) = moments(pairs)?;
-    (sxx > 0.0).then(|| sxy / sxx)
+    (!flat(sxx, pairs.len(), pairs.iter().map(|p| p.0))).then(|| sxy / sxx)
 }
 
 /// The centred sums of squares and products of at least two pairs, taken
@@ -1525,13 +1557,7 @@ fn report_mechanism(year: &Year, profiles: &[ShapeProfiles], hourly: Option<&Hou
                             )
                         })
                         .collect();
-                    line.push(format!(
-                        "{} r {} slope {} ({} buckets)",
-                        HORIZONS[h],
-                        option_text(correlation(&pairs)),
-                        option_text(slope(&pairs)),
-                        pairs.len()
-                    ));
+                    line.push(check_text(HORIZONS[h], &pairs));
                 }
                 println!(
                     "  mechanism check, ln N_v2 by hour-of-week against mean ln s: {}",
@@ -1540,6 +1566,26 @@ fn report_mechanism(year: &Year, profiles: &[ShapeProfiles], hourly: Option<&Hou
             }
         }
     }
+}
+
+/// One horizon of the mechanism check: r and slope of ln N_v2 on the mean
+/// ln s_H over the buckets in `pairs`. Where ln s_H is flat
+/// (`FLAT_VARIANCE`) both print `-` and the horizon says "no evidence":
+/// the gate's mechanism condition needs a defined negative slope, and an
+/// undefined one never counts towards it.
+fn check_text(horizon: impl std::fmt::Display, pairs: &[(f64, f64)]) -> String {
+    let (r, b) = (correlation(pairs), slope(pairs));
+    format!(
+        "{horizon} r {} slope {} ({} buckets{})",
+        option_text(r),
+        option_text(b),
+        pairs.len(),
+        if r.is_none() || b.is_none() {
+            ", no evidence"
+        } else {
+            ""
+        }
+    )
 }
 
 /// The integer candidate tables, one line per estimator and shape.
@@ -1663,19 +1709,29 @@ fn bounds(period: (&str, &str)) -> (i64, i64) {
     )
 }
 
+/// The hold-out of ADR-057: the window `from..to` ms (end excluded) may
+/// not share a millisecond with the evaluation period.
+fn check_window(from: i64, to: i64) -> Result<(), String> {
+    let (start, end) = bounds(EVALUATION);
+    if to <= start || end <= from {
+        Ok(())
+    } else {
+        Err(format!(
+            "the window {from}..{to} ms overlaps the evaluation period {} .. {}: #155 reads only \
+             the design period before ADR-057's acceptance run",
+            EVALUATION.0, EVALUATION.1
+        ))
+    }
+}
+
 /// The measured window from the environment; panics before any read when
-/// it overlaps the evaluation period (the hold-out of ADR-057).
+/// it overlaps the evaluation period (`check_window`).
 fn window() -> (i64, i64) {
     let from = parse_bound("MIE_MEASURE_FROM", &env("MIE_MEASURE_FROM"), false).unwrap();
     let to = parse_bound("MIE_MEASURE_TO", &env("MIE_MEASURE_TO"), true).unwrap();
-    let (start, end) = bounds(EVALUATION);
-    assert!(
-        to <= start || end <= from,
-        "the window {from}..{to} ms overlaps the evaluation period {} .. {}: #155 reads only \
-         the design period before ADR-057's acceptance run",
-        EVALUATION.0,
-        EVALUATION.1
-    );
+    if let Err(message) = check_window(from, to) {
+        panic!("{message}");
+    }
     let design = bounds(DESIGN);
     println!(
         "window {from}..{to} ms ({}the design period {} .. {})",
@@ -2023,6 +2079,30 @@ fn profiles_are_normalized_to_a_mean_of_one() {
 }
 
 #[test]
+fn a_window_touching_the_evaluation_period_is_refused() {
+    let (start, end) = bounds(EVALUATION);
+    let design = bounds(DESIGN);
+    // The design year begins where the evaluation year ends.
+    assert_eq!(design.0, end);
+    assert_eq!(check_window(design.0, design.1), Ok(()));
+    // Adjacent on either side: the end is excluded.
+    assert_eq!(check_window(start - DAY_MS, start), Ok(()));
+    assert_eq!(check_window(end, end + DAY_MS), Ok(()));
+    // One millisecond over either edge, inside, around, and the year itself.
+    for (from, to) in [
+        (start - DAY_MS, start + 1),
+        (end - 1, end + DAY_MS),
+        (start + DAY_MS, start + 2 * DAY_MS),
+        (start - DAY_MS, end + DAY_MS),
+        (start, end),
+        (end - 1, design.1),
+    ] {
+        let error = check_window(from, to).unwrap_err();
+        assert!(error.contains("overlaps the evaluation period"), "{error}");
+    }
+}
+
+#[test]
 fn a_planted_hour_of_week_profile_is_recovered_within_its_bootstrap_se() {
     let planted = planted_profile();
     let truth = log_sigma(&planted);
@@ -2081,6 +2161,32 @@ fn a_flat_profile_has_no_mechanism_and_a_daily_one_none_at_1d() {
     assert!(m.ln_s[4].iter().all(|v| v.abs() < 1e-12));
     let (_, sd) = mean_sd(&m.ln_s[3]);
     assert!(sd > 0.01, "4h windows see the daily wave: {sd}");
+    // So the mechanism check is undefined at 1d, whatever N_v2 does by
+    // hour (ln s_1d is 0 up to rounding, not a regressor), and defined at
+    // 4h.
+    let n_v2 = |b: usize| ((b % 24) as f64 / 24.0 - 0.5) * 0.2;
+    let pairs = |h: usize| -> Vec<(f64, f64)> {
+        (0..WEEK_HOURS)
+            .map(|b| (m.bucket_mean[h][b], n_v2(b)))
+            .collect()
+    };
+    let day = pairs(4);
+    assert!(day.iter().all(|p| p.0.is_finite()));
+    assert_eq!(correlation(&day), None);
+    assert_eq!(slope(&day), None);
+    assert_eq!(
+        check_text("1d", &day),
+        "1d r - slope - (168 buckets, no evidence)"
+    );
+    let four = pairs(3);
+    assert!(correlation(&four).is_some() && slope(&four).is_some());
+    assert!(!check_text("4h", &four).contains("no evidence"));
+    // The floor is absolute below 1 and relative above: a tiny genuine
+    // spread on a large level is still flat, a small one around 0 is not.
+    let level: Vec<(f64, f64)> = (0..10).map(|x| (1e6 + 1e-6 * x as f64, x as f64)).collect();
+    assert_eq!(slope(&level), None);
+    let small: Vec<(f64, f64)> = (0..10).map(|x| (1e-6 * x as f64, x as f64)).collect();
+    assert!((slope(&small).unwrap() - 1e6).abs() < 1e-3);
     // The mechanism is invariant to the profile's scale: only ratios
     // enter s_H.
     let doubled = mechanism(
