@@ -83,7 +83,8 @@
 //!   (second Sunday of March to the day before the first Sunday of
 //!   November, by UTC date) against the rest, their correlation as is and
 //!   with the standard-time profile moved one hour earlier, and the
-//!   weekday US-open peak in 12:00 … 17:00 UTC of each, 5-minute resolution.
+//!   weekday US-open peak in 12:00 … 17:00 UTC (08:00 … 13:00 New York on
+//!   that clock) of each, 5-minute resolution.
 //!   `MIE_MEASURE_CLOCK=new-york` takes every profile bucket (and these
 //!   diagnostics) on the US Eastern clock instead of UTC, the
 //!   pre-registered rerun of the gate on #155.
@@ -212,8 +213,15 @@ const WARM_DAYS: i64 = 15;
 const QUANTILES: [f64; 7] = [0.01, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99];
 
 /// The US-open search window of the DST diagnostic, in 5-minute slots of
-/// the day: 12:00 … 17:00 UTC.
-const OPEN_SLOTS: std::ops::Range<usize> = 144..204;
+/// the day: 12:00 … 17:00 UTC, or the same window moved to 08:00 … 13:00
+/// New York (the 09:30 open inside it) on the New York clock.
+fn open_slots() -> (std::ops::Range<usize>, &'static str) {
+    if new_york() {
+        (96..156, "08:00 .. 13:00 New York")
+    } else {
+        (144..204, "12:00 .. 17:00 UTC")
+    }
+}
 
 const WEEKDAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 
@@ -232,14 +240,18 @@ fn hour_of_week(ms: i64) -> usize {
 /// daylight-saving days and UTC − 5 h otherwise (`us_dst`, by UTC date).
 /// Whole hours, so hour units stay aligned with their buckets.
 fn clock(ms: i64) -> i64 {
+    on_clock(ms, new_york())
+}
+
+/// Whether `MIE_MEASURE_CLOCK` selects the New York clock.
+fn new_york() -> bool {
     static NEW_YORK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let new_york = *NEW_YORK.get_or_init(|| match std::env::var("MIE_MEASURE_CLOCK") {
+    *NEW_YORK.get_or_init(|| match std::env::var("MIE_MEASURE_CLOCK") {
         Err(_) => false,
         Ok(value) if value == "utc" => false,
         Ok(value) if value == "new-york" => true,
         Ok(value) => panic!("MIE_MEASURE_CLOCK is utc or new-york, not {value}"),
-    });
-    on_clock(ms, new_york)
+    })
 }
 
 /// `ms` on the UTC clock, or on the US Eastern clock when `new_york`.
@@ -1303,8 +1315,8 @@ fn report_shares(year: &Year, levels: &[Option<f64>]) {
                 let y = 0.5 * (sum.rv / sum.minutes as f64 / level).ln();
                 ys.push((
                     y,
-                    hour,
-                    weekday(year.first_day + day as i64),
+                    Shape::HourOfDay.bucket(ms),
+                    Shape::Weekday.bucket(ms),
                     hour_of_week(ms),
                 ));
             }
@@ -1345,10 +1357,11 @@ fn report_shares(year: &Year, levels: &[Option<f64>]) {
             if s.minutes == 0 || s.rv <= 0.0 {
                 continue;
             }
+            let bucket = Shape::SlotOfDay.bucket(year.day_ms(day) + slot as i64 * SLOT_MS);
             ys.push((
                 0.5 * (s.rv / s.minutes as f64 / level).ln(),
-                slot,
-                slot / SLOTS_PER_HOUR,
+                bucket,
+                bucket / SLOTS_PER_HOUR,
             ));
         }
     }
@@ -1469,12 +1482,12 @@ fn report_dst(year: &Year, hours: &ShapeProfiles, slots: &ShapeProfiles) {
     };
     let peak = |days: Vec<usize>| -> Option<usize> {
         let p = profile(&slots.cells[e], SLOTS_PER_DAY, Estimator::Deflated, days)?;
-        OPEN_SLOTS.max_by(|a, b| p[*a].total_cmp(&p[*b]))
+        open_slots().0.max_by(|a, b| p[*a].total_cmp(&p[*b]))
     };
     match (peak(weekdays(&dst)), peak(weekdays(&standard))) {
         (Some(a), Some(b)) => println!(
-            "  weekday US-open peak (12:00 .. 17:00 UTC, 5-minute): DST {}, standard {}, shift \
-             {} min",
+            "  weekday US-open peak ({}, 5-minute): DST {}, standard {}, shift {} min",
+            open_slots().1,
             Shape::SlotOfDay.label(a),
             Shape::SlotOfDay.label(b),
             (b as i64 - a as i64) * 5
