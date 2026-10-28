@@ -1,6 +1,6 @@
 [package]
 name = "mie-adapter-parquet"
-description = "MIE raw-store adapter: immutable, verbatim Parquet files with sealed manifests and dataset versions (ADR-030)"
+description = "MIE Parquet adapter: the immutable raw store with sealed manifests and dataset versions (ADR-030), and the conditional outcome dataset (ADR-057)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

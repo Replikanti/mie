@@ -15,12 +15,17 @@
 //!   state checkpoints with the ones live journaled (#13, ADR-041);
 //! - `mie experiment validate <spec>` and `mie experiment run <spec> …`
 //!   ([`experiment`]): validates an experiment spec, or runs it and records
-//!   its result in the append-only result store (#29, ADR-040).
+//!   its result in the append-only result store (#29, ADR-040);
+//! - `mie conditional build --config <path> --from … --to … --out <dir>` and
+//!   `mie conditional verify <dir>` ([`conditional`]): builds the
+//!   conditional outcome dataset of a replay, or verifies one (#27,
+//!   ADR-057).
 //!
 //! The real network connectors are constructed in `main.rs` and nowhere
 //! else; tests drive [`ingest::run`] with fakes.
 
 pub mod archive;
+pub mod conditional;
 pub mod config;
 pub mod equivalence;
 pub mod experiment;

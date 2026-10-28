@@ -29,9 +29,15 @@
 //!
 //! Files in progress are hidden (`.part-NNNNN.parquet.tmp`) and never match
 //! `*.parquet`.
+//!
+//! [`outcome`] writes the conditional outcome dataset of #27 (ADR-057): the
+//! context records and forward labels of one labeling run as three
+//! content-hashed Parquet tables, sealed with the same protocol and read
+//! back only after verification.
 
 mod layout;
 mod manifest;
+pub mod outcome;
 mod reader;
 mod recovery;
 mod schema;
