@@ -84,6 +84,9 @@
 //!   November, by UTC date) against the rest, their correlation as is and
 //!   with the standard-time profile moved one hour earlier, and the
 //!   weekday US-open peak in 12:00 … 17:00 UTC of each, 5-minute resolution.
+//!   `MIE_MEASURE_CLOCK=new-york` takes every profile bucket (and these
+//!   diagnostics) on the US Eastern clock instead of UTC, the
+//!   pre-registered rerun of the gate on #155.
 //! - **Mechanism size per horizon**: over every minute t of the data,
 //!   s_H(t) = F_H(t) ÷ L_H(t), F_H(t) = √(the mean relative variance over
 //!   [t, t + H)) and L_H(t) the Wilder(14) average (ADR-033: the mean of the
@@ -218,10 +221,34 @@ const WEEKDAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 // Calendar
 // ---------------------------------------------------------------------------
 
-/// The hour of the week of `ms`, Monday 00:00 UTC = 0: 1970-01-01 was a
-/// Thursday, hour 72 of its week.
+/// The hour of the week of `ms` on the profile clock, Monday 00:00 = 0:
+/// 1970-01-01 was a Thursday, hour 72 of its week.
 fn hour_of_week(ms: i64) -> usize {
-    (ms.div_euclid(HOUR_MS) + 72).rem_euclid(WEEK_HOURS as i64) as usize
+    (clock(ms).div_euclid(HOUR_MS) + 72).rem_euclid(WEEK_HOURS as i64) as usize
+}
+
+/// The profile clock: `ms` itself (UTC, the default), or with
+/// `MIE_MEASURE_CLOCK=new-york` the US Eastern wall clock, UTC − 4 h on US
+/// daylight-saving days and UTC − 5 h otherwise (`us_dst`, by UTC date).
+/// Whole hours, so hour units stay aligned with their buckets.
+fn clock(ms: i64) -> i64 {
+    static NEW_YORK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let new_york = *NEW_YORK.get_or_init(|| match std::env::var("MIE_MEASURE_CLOCK") {
+        Err(_) => false,
+        Ok(value) if value == "utc" => false,
+        Ok(value) if value == "new-york" => true,
+        Ok(value) => panic!("MIE_MEASURE_CLOCK is utc or new-york, not {value}"),
+    });
+    on_clock(ms, new_york)
+}
+
+/// `ms` on the UTC clock, or on the US Eastern clock when `new_york`.
+fn on_clock(ms: i64, new_york: bool) -> i64 {
+    if !new_york {
+        return ms;
+    }
+    let offset = if us_dst(ms.div_euclid(DAY_MS)) { 4 } else { 5 };
+    ms - offset * HOUR_MS
 }
 
 /// The weekday of a day since 1970-01-01, Monday = 0.
@@ -691,9 +718,11 @@ impl Shape {
     fn bucket(self, ms: i64) -> usize {
         match self {
             Shape::HourOfWeek => hour_of_week(ms),
-            Shape::HourOfDay => ms.div_euclid(HOUR_MS).rem_euclid(24) as usize,
+            Shape::HourOfDay => clock(ms).div_euclid(HOUR_MS).rem_euclid(24) as usize,
             Shape::Weekday => hour_of_week(ms) / 24,
-            Shape::SlotOfDay => ms.div_euclid(SLOT_MS).rem_euclid(SLOTS_PER_DAY as i64) as usize,
+            Shape::SlotOfDay => clock(ms)
+                .div_euclid(SLOT_MS)
+                .rem_euclid(SLOTS_PER_DAY as i64) as usize,
         }
     }
 
@@ -1948,6 +1977,26 @@ fn us_daylight_saving_days_of_the_design_year_are_the_plans() {
         .collect();
     assert_eq!(dst, expected);
     assert!(!us_dst(day("2025-11-02")) && !us_dst(day("2026-03-07")));
+}
+
+#[test]
+fn the_new_york_clock_is_utc_minus_4_in_daylight_saving_and_minus_5_otherwise() {
+    let day = |text: &str| bounds((text, text)).0;
+    // Tuesday 2026-07-14 13:30 UTC is 09:30 in New York (EDT).
+    let summer = day("2026-07-14") + 13 * HOUR_MS + 30 * MINUTE_MS;
+    assert_eq!(on_clock(summer, false), summer);
+    assert_eq!(on_clock(summer, true), summer - 4 * HOUR_MS);
+    // Tuesday 2026-01-13 14:30 UTC is 09:30 in New York (EST).
+    let winter = day("2026-01-13") + 14 * HOUR_MS + 30 * MINUTE_MS;
+    assert_eq!(on_clock(winter, true), winter - 5 * HOUR_MS);
+    // Both US opens land in the same hour-of-week bucket, Tue 09h.
+    let tuesday_9 = 24 + 9;
+    let bucket = |ms: i64| (on_clock(ms, true).div_euclid(HOUR_MS) + 72).rem_euclid(168);
+    assert_eq!(bucket(summer), tuesday_9);
+    assert_eq!(bucket(winter), tuesday_9);
+    // Monday 03:00 UTC is still Sunday evening in New York.
+    let monday = day("2026-01-12") + 3 * HOUR_MS;
+    assert_eq!(bucket(monday), 6 * 24 + 22);
 }
 
 #[test]
