@@ -12,6 +12,27 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
 
 ### Added
 
+- **Seasonal volatility measurement for labeling v3 (#155 M1).**
+  `crates/mie-cli/tests/season_measure.rs` measures, report-only, the
+  seasonal volatility profile of the #12 design year before any v3 design
+  choice: `measure_seasonal_vol` replays the archive as `measure_labels`
+  does, through the engine and a labeler under labeling v2 (whose design-
+  year counts ADR-056 published, asserted as the replay identity), and
+  reads the engine's complete 1m bars per UTC 5-minute slot and v2's
+  `Neither` and races per UTC hour. It prints hour-of-week, hour-of-day,
+  weekday and 5-minute profiles by four estimators (pooled, 28-day
+  deflated, geometric, Parkinson), the variance shares, bootstrap SEs
+  (56-day blocks, 10 000 resamples, seed 155), a half-year stability
+  check, a US-DST diagnostic, the size of the mechanism per horizon
+  (F_H ÷ L_H, with L_H a Wilder(14) twin of ATR_H's bars), the v3 N(H)
+  that ADR-056's lognormal-ρ model predicts from it against the go/no-go
+  gate, and the correlation of v2's `Neither` share by hour-of-week with
+  the mechanism; integer candidate tables go to a file. `_from` reruns the
+  analysis from a rows file, `_klines` cross-checks against the archive's
+  1m klines. It computes no labeling v3 label and refuses any window that
+  overlaps the evaluation year (2024-10-01 … 2025-09-30). SplitMix64 and
+  the block resampler move to `tests/common/bootstrap.rs`, shared with
+  `label_measure` (no behaviour change).
 - **ADR-056 is measured and accepted (#151).** The *Accept when*
   measurement of `conditional.labels@2` (fingerprint `6f90bff079e746f2`) on
   the #12 year and the ADR-051 R0 live store met T0 (0 mismatches in 44 855
