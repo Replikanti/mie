@@ -12,6 +12,19 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
 
 ### Added
 
+- **ADR-056 is measured and accepted (#151).** The *Accept when*
+  measurement of `conditional.labels@2` (fingerprint `6f90bff079e746f2`) on
+  the #12 year and the ADR-051 R0 live store met T0 (0 mismatches in 44 855
+  of 561 695 labels checked in the year, 2 185 of 2 185 on the live store),
+  completeness, the ATR_1h scale cross-check and the 1h identity (56 372
+  and 899 on the year, 49 and 847 live). The prediction is not missed: N(H)
+  spread max ÷ min is 1.5811 (4h over 5m), within the 1.62 bound, though
+  outside the 2-SE band (SE 0.0582); a miss needs both. N(H) is not flat
+  (steps FUUD, 7.821 % at 5m, 12.366 % at 4h, 10.471 % at 1d against the
+  predicted 10.05 %); v2 removes 53 % of v1's log-spread. The shape matches
+  the 24 h seasonality reading, which the ADR pre-registers for misses
+  only, so it is recorded as an observation and the next version's
+  candidate. ADR-056 is `accepted`. No code changes.
 - **Labeling v2 and ADR-056 (proposed; part of #151).**
   `conditional.labels@2` keeps every rule of ADR-055 except the barrier
   scale: each horizon's band is `reference ± b · ATR_H`, with ATR_H the

@@ -1,6 +1,9 @@
 # ADR-056: Forward outcome labels v2 — barriers scaled by the ATR(14) of each horizon's own bars
 
-- Status: proposed
+- Status: accepted
+- Measured: 2026-10-28 (#151, see *Measurement*); accepted, T0 and
+  completeness met on both stores and the prediction not missed (spread
+  max ÷ min 1.5811 against the 1.62 bound)
 - Date: 2026-10-26
 
 ## Context
@@ -585,3 +588,128 @@ store.
 - **No hold-out needed:** no constant of the rule is fitted. b comes from
   the null; 14 and the bars carry their own reasons above. v1's published
   shares enter only the prediction and the threshold.
+
+## Measurement
+
+Measured 2026-10-28; **accepted**. Both runs used the `label_measure`
+ignored tests (`measure_labels`, `measure_labels_live`) of main `5f9d9e6`
+(the merge commit of this ADR's code, #153), release build, with the engine
+key `4c844593779da2e3-1`, the sampling policy `conditional.sampling@1`,
+fingerprint `2c71fff23e8b0415`, and the labeling policy
+`conditional.labels@2`, fingerprint `6f90bff079e746f2`. The year run covered
+2025-10-01 00:00 UTC (inclusive) to 2026-10-01 00:00 UTC (exclusive), the
+window `1759276800000..1790812800000` ms, with
+`MIE_MEASURE_EVENTS=603323345`; its provenance data version is
+`5d9e27f862ac54dd93cff904458e9ee92767d5105a9d13a144351cba069f224d`. The live
+run replayed ADR-051's R0 live store, the one cleanly ended run
+`20261016T225606Z`, with the data version
+`9348410a56c0d05d469f3f7e78c1c405d80db333d9d34df694b45ce256caca2d`. Every
+number below is from these two runs. The prediction, the miss criterion and
+the reading of a miss were on main before either run (*Accept when*).
+
+**Criteria**, each checked against the printed reports:
+
+- **T0 (asserted): met.** The year replayed 603 323 345 events, the
+  expected count, with 0 rejections and no trailing gaps; 0 mismatches
+  (order 0) in 44 855 of 561 695 labels checked (every trigger record's
+  label plus the baseline labels at whole UTC hours). The live run: 2 042 225
+  events, 0 rejections, 0 mismatches (order 0) in 2 185 of 2 185 labels.
+- **Completeness (asserted): met.** 561 695 records and 561 695 labels in
+  the year (`opened` 561 695, `emitted` 561 695); 2 185 records and 2 185
+  labels on the live store (`opened` 2 185, `emitted` 2 185), 0 incomplete
+  runs.
+- **Scale cross-check (asserted): met.** The model's ATR_1h equals the
+  record's `state.atr` in readiness and value: 0 mismatches, ready and equal
+  at 560 796 records in the year and at 1 338 on the live store; `scale_breaks`
+  0 on both.
+- **1h identity: holds.** v2's 1h `Neither` and `Unavailable` counts are
+  56 372 and 899 on the year and 49 and 847 on the live store, equal to
+  ADR-055's published counts.
+- **v1 reproducibility:** `conditional.labels@1` still derives
+  `604b624cc2522df9`, pinned by `GOLDEN_LABELING_FINGERPRINT` in the label
+  tests, which CI runs; this measurement did not re-run it.
+- **Prediction and miss criterion (the year): not a miss.** N(H) is
+  `Neither` ÷ the races that ran; predicted 10.05 % at every H. The spread
+  max ÷ min over the five horizons is **1.5811** (4h over 5m), within the
+  **1.62** bound. Its log-spread, 0.4581, lies outside the 2-SE band (the
+  bootstrap's SE of ln(max ÷ min) is 0.0582, 0 undefined resamples; 56-day
+  blocks, 10 000 resamples, seed 151), so one condition holds and the
+  other does not; a miss needs both. The live store is not evaluated for the
+  miss (*Reachability*).
+
+**Verdict.** T0, completeness, the scale cross-check and the 1h identity
+are met, and the prediction is not missed, so this ADR is **accepted**.
+
+**Per horizon, the year** (561 695 labels). N is `Neither` as a share of
+all labels and of the races that ran (`Upper` + `Lower` + `Neither`), next
+to the prediction (10.05 % at every H) and v1's share of all labels.
+Censored windows by reason `gap` / `stale_reference` / `rejected` /
+`end_of_data`, as a share of the labels (counts in brackets where nonzero);
+clear counts are baseline / trigger.
+
+| H | Neither, of all labels | N, of races that ran | v1, of all labels | Censored | Unavailable | same_ms | Clear baseline / trigger |
+|---|---|---|---|---|---|---|---|
+| 5m | 43 925 (7.820 %) | 7.821 % (43 925 of 561 620) | 16.338 % | 0 / 0 / 0 / 0.001 % (5) | 74 (0.013 %) | 0 | 94 333 / 25 519 |
+| 15m | 44 593 (7.939 %) | 7.942 % (44 593 of 561 465) | 12.548 % | 0 / 0 / 0 / 0.003 % (17) | 224 (0.040 %) | 0 | 33 758 / 22 828 |
+| 1h | 56 372 (10.036 %) | 10.053 % (56 372 of 560 765) | 10.036 % | 0 / 0 / 0 / 0.011 % (62) | 899 (0.160 %) | 0 | 8 678 / 16 654 |
+| 4h | 68 977 (12.280 %) | 12.366 % (68 977 of 557 794) | 9.281 % | 0 / 0 / 0 / 0.044 % (245) | 3 670 (0.653 %) | 0 | 2 185 / 9 815 |
+| 1d | 56 383 (10.038 %) | 10.471 % (56 383 of 538 492) | 6.191 % | 0 / 0 / 0 / 0.276 % (1 548) | 22 724 (4.046 %) | 0 | 365 / 3 604 |
+
+`reach_backs`: 0 and `scale_breaks`: 0 in the year.
+
+**Per horizon, the live store** (2 185 labels), same columns (the 4h and
+1d races are all `Unavailable`, so their N has no races):
+
+| H | Neither, of all labels | N, of races that ran | v1, of all labels (year) | Censored | Unavailable | same_ms | Clear baseline / trigger |
+|---|---|---|---|---|---|---|---|
+| 5m | 213 (9.748 %) | 10.157 % (213 of 2 097) | 16.338 % | 0.915 % (20) / 0.275 % (6) / 0 / 0.229 % (5) | 73 (3.341 %) | 0 | 373 / 82 |
+| 15m | 133 (6.087 %) | 6.873 % (133 of 1 935) | 12.548 % | 2.838 % (62) / 0.275 % (6) / 0 / 0.778 % (17) | 213 (9.748 %) | 0 | 134 / 74 |
+| 1h | 49 (2.243 %) | 3.781 % (49 of 1 296) | 10.036 % | 11.533 % (252) / 0.275 % (6) / 0 / 2.929 % (64) | 847 (38.764 %) | 0 | 35 / 58 |
+| 4h | 0 (0.000 %) | none (0 of 0) | 9.281 % | 40.092 % (876) / 0.275 % (6) / 0 / 4.851 % (106) | 2 185 (100.000 %) | 0 | 9 / 29 |
+| 1d | 0 (0.000 %) | none (0 of 0) | 6.191 % | 94.874 % (2 073) / 0.275 % (6) / 0 / 4.851 % (106) | 2 185 (100.000 %) | 0 | 2 / 16 |
+
+`reach_backs`: 497 on the live store. The live N is not comparable with the
+year's: one run of under 60 h holds 3 UTC days, and most 1h labels are
+censored (11.533 %) or `Unavailable` (38.764 %). The tool also printed a
+spread of 2.6865 (5m over 1h) for the three live horizons with races and an
+SE of 0 from the 3 days; neither is a criterion, the miss is evaluated on
+the year only.
+
+**Shape of N(H), the year.** The five steps against their own 2-SE bands
+(the bootstrap applied to each pair; U rise, D fall, F flat):
+
+| Step | ln change | SE | Step |
+|---|---|---|---|
+| 5m → 15m | +0.0154 | 0.0158 | F |
+| 15m → 1h | +0.2356 | 0.0323 | U |
+| 1h → 4h | +0.2071 | 0.0369 | U |
+| 4h → 1d | −0.1664 | 0.0620 | D |
+
+The sequence is FUUD. The series rebuilt from the flat step alone has
+max ÷ min of 1.0155. The tool prints the case "peak at 1h or 4h: 24 h
+seasonality".
+
+**Cost.** The year run took a process wall time of 1:20:17 (the tool reports
+4 817.3 s) at a peak RSS of 1 473 824 kB, for 603 323 345 events. The live
+run took a process wall time of 1:09 (the tool reports 41.2 s) at a peak RSS
+of 6 247 756 kB.
+
+**Observations, recorded and not concluded.**
+
+- N(H) is not flat. Three of the four steps clear their 2-SE bands (FUUD):
+  N rises 15m → 1h and 1h → 4h and falls 4h → 1d. The five values run from
+  7.821 % (5m) up to 12.366 % (4h) and back to 10.471 % (1d), against the
+  predicted 10.05 % at every H.
+- v2 removes 53 % of v1's log-spread: ln 1.5811 = 0.458 against v1's
+  ln 2.639 = 0.970, which is why the spread passes the 1.62 bound (that
+  bound asks for more than half). The noise band, separately, reports the
+  remaining spread as larger than noise alone would give.
+- The shape matches the pre-registered "peak at 1h or 4h: 24 h seasonality"
+  reading. *Accept when* pre-registers that reading for a miss only. This
+  run is not a miss, so it is recorded here as an observation and as the
+  candidate for the next labeling version, not as a conclusion of this ADR.
+  Whether the reading holds would need that version's own mechanism
+  argument and its own pre-registered run.
+- ADR-055's restriction stands: no upper-vs-lower shares, excursion or time
+  quantiles, and no split by trigger, regime or location are reported
+  (*Accept when*).
