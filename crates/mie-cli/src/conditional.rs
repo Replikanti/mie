@@ -103,6 +103,18 @@ fn run_build(request: &BuildRequest) -> Result<(OutcomeManifest, u64, u64), Stri
             request.out.display()
         ));
     }
+    // The dataset directory is created only once the replay has opened;
+    // an unusable parent would otherwise fail after the whole run.
+    let parent = match request.out.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    if !parent.is_dir() {
+        return Err(format!(
+            "the parent of {} is not an existing directory",
+            request.out.display()
+        ));
+    }
     let (records, replay) = (request.records, request.replay);
     if records.start >= records.end || replay.start > records.start || replay.end < records.end {
         return Err("the records window must be non-empty and inside the replay window".to_owned());

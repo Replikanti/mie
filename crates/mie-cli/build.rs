@@ -6,8 +6,14 @@
 //! content hash, so a rebuild that changes no versioned rule reproduces the
 //! hash and this line explains a hash that moved anyway.
 //!
-//! The script reruns when the checkout moves: the worktree's `HEAD`, the
-//! ref it points at and `packed-refs` (located with `git rev-parse
+//! The version is read only when the workspace root is the top level of
+//! the repository git finds; a source tree nested in another repository
+//! without a `.git` of its own is `unknown`.
+//!
+//! The script reruns when the checkout moves: the worktree's `HEAD`, its
+//! reflog `logs/HEAD` (appended to by every commit, checkout and reset, so
+//! a commit is seen even when the branch ref lived only in `packed-refs`),
+//! the ref `HEAD` points at and `packed-refs` (located with `git rev-parse
 //! --git-path`, which is right in a linked worktree too), plus the
 //! workspace's crates and manifests, whose edits flip `-dirty`.
 
@@ -48,9 +54,26 @@ fn main() {
     for path in ["crates", "Cargo.toml", "Cargo.lock"] {
         watch(&root, path);
     }
-    let version = match git(&root, &["rev-parse", "HEAD"]) {
+    // The workspace must be the top level of the repository git finds: a
+    // source tree without its own `.git` (an extracted source archive, a
+    // vendored copy) placed inside another repository would otherwise name
+    // that repository's commit and dirty state.
+    let own_repo = git(&root, &["rev-parse", "--show-toplevel"]).is_some_and(|top| {
+        match (Path::new(&top).canonicalize(), root.canonicalize()) {
+            (Ok(top), Ok(root)) => top == root,
+            _ => false,
+        }
+    });
+    let head = own_repo
+        .then(|| git(&root, &["rev-parse", "HEAD"]))
+        .flatten();
+    let version = match head {
         Some(commit) if commit.len() == 40 && commit.bytes().all(|b| b.is_ascii_hexdigit()) => {
-            for path in ["HEAD", "packed-refs"] {
+            // `logs/HEAD` gets a line on every commit, checkout and reset,
+            // including a commit whose branch ref lived only in
+            // `packed-refs` (no loose ref file to watch before it) or in a
+            // reftable.
+            for path in ["HEAD", "logs/HEAD", "packed-refs"] {
                 if let Some(path) = git(&root, &["rev-parse", "--git-path", path]) {
                     watch(&root, &path);
                 }

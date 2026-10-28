@@ -206,20 +206,29 @@ code <code version>
 
 - `git:<40 hex>` from `git rev-parse HEAD`, with `-dirty` when
   `git status --porcelain --untracked-files=no` lists a tracked file;
-- `unknown` outside a git checkout or without git.
+- `unknown` outside a git checkout, without git, or when the workspace
+  root is not the top level of the repository git finds
+  (`git rev-parse --show-toplevel`): a source tree without its own `.git`,
+  extracted or vendored inside another repository, would otherwise name
+  that repository's commit and dirty state.
 - `git status` runs with `GIT_OPTIONAL_LOCKS=0`, so a build never rewrites
   the index of the checkout it builds.
-- The script reruns when `HEAD`, the ref it points at or `packed-refs`
-  changes (located with `git rev-parse --git-path`, which resolves a
-  linked worktree's own `HEAD`), or anything under `crates/`, `Cargo.toml`
-  or `Cargo.lock`. A docs-only edit after the last build is not noticed
+- The script reruns when `HEAD`, its reflog `logs/HEAD`, the ref it
+  points at or `packed-refs` changes (located with `git rev-parse
+  --git-path`, which resolves a linked worktree's own `HEAD`), or anything
+  under `crates/`, `Cargo.toml` or `Cargo.lock`. The reflog is what sees a
+  commit whose branch ref lived only in `packed-refs` (after `git gc` or
+  `git pack-refs`) or in a reftable: no loose ref file existed to watch,
+  and every commit, checkout and reset appends to it. A docs-only edit after the last build is not noticed
   until the next code edit; the flag is about the code that built the
   rows, which those paths hold.
 
 ### D5. Write protocol
 
 - `--out` is created with `create_dir`, which fails if it exists: a
-  dataset is never overwritten.
+  dataset is never overwritten. Before the replay opens, the build also
+  refuses an existing `--out` and a parent that is not an existing
+  directory, so a typo fails at once instead of after the whole run.
 - Each table is written under a hidden temp name (`.<table>.tmp`), then
   fsynced, made read-only and renamed without replacing; the directory is
   fsynced.

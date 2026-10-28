@@ -240,6 +240,25 @@ fn refusals_leave_no_dataset() {
     );
     assert_eq!(fs::read_dir(&existing).unwrap().count(), 0);
 
+    // A missing parent is refused before the replay, and nothing is
+    // created; so is a parent that is a file.
+    for out in [
+        dir.path().join("no").join("such").join("dataset"),
+        dir.path().join("archive.toml").join("dataset"),
+    ] {
+        let (pass, text) = run_build(&BuildRequest {
+            out: out.clone(),
+            ..request.clone()
+        });
+        assert!(!pass);
+        assert!(
+            text.starts_with("FAIL: ") && text.contains("not an existing directory"),
+            "{text}"
+        );
+        assert!(!out.exists());
+    }
+    assert!(!dir.path().join("no").exists());
+
     // The history chain is refused (ADR-057 D6).
     let out = dir.path().join("history");
     let (pass, text) = run_build(&BuildRequest {

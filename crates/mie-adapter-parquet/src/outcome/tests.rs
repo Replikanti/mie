@@ -872,3 +872,87 @@ fn an_empty_run_writes_empty_tables() {
     assert_eq!(OutcomeDataset::open(&out).unwrap().manifest(), &manifest);
     assert_eq!(read(&out.join("outcomes.parquet")).num_rows(), 0);
 }
+
+#[test]
+fn many_batches_and_row_groups_reproduce_byte_for_byte() {
+    // 30 000 records: 150 000 outcome rows, so many 8 192-row batches per
+    // table and two 122 880-row row groups in `outcomes` (ADR-057 D2), the
+    // write path a year build takes.
+    const N: usize = 30_000;
+    let template = records();
+    let template_labels = labels(&template);
+    let records: Vec<ContextRecord> = (0..N)
+        .map(|i| {
+            let mut record = template[0].clone();
+            record.event = key(T0 + 1_000 * i as i64, i as u64);
+            record.sample = Sample::Baseline {
+                minute_end: t(T0 + 1_000 * i as i64 - 7),
+            };
+            record.context.anchor = p(8_500_000_000_000 + i as i64);
+            record
+        })
+        .collect();
+    let labels: Vec<ForwardLabel> = records
+        .iter()
+        .enumerate()
+        .map(|(i, record)| ForwardLabel {
+            event: record.event,
+            ordinal: 0,
+            horizons: template_labels[i % 2].horizons,
+            level: template_labels[1].level.filter(|_| i % 3 == 0),
+            extreme: template_labels[2].extreme.filter(|_| i % 5 == 0),
+            ..template_labels[0].clone()
+        })
+        .collect();
+    let write = |out: &Path| {
+        let mut writer = OutcomeWriter::create(out, header("unknown")).unwrap();
+        for (record, label) in records.iter().zip(&labels) {
+            writer.record(record).unwrap();
+            writer.label(label).unwrap();
+        }
+        writer.finish(N as u64, 0).unwrap()
+    };
+    let dir = TempDir::new("outcome-scale");
+    let a = write(&dir.path().join("a"));
+    let b = write(&dir.path().join("b"));
+    assert_eq!(a, b);
+    assert_eq!(
+        snapshot_dir(&dir.path().join("a")),
+        snapshot_dir(&dir.path().join("b"))
+    );
+    assert_eq!(a.rows("contexts.parquet"), Some(N as u64));
+    assert_eq!(a.rows("outcomes.parquet"), Some(5 * N as u64));
+    assert_eq!(
+        a.rows("passages.parquet"),
+        Some((N.div_ceil(3) + N.div_ceil(5)) as u64)
+    );
+    assert_eq!(
+        OutcomeDataset::open(&dir.path().join("a"))
+            .unwrap()
+            .manifest(),
+        &a
+    );
+
+    let builder = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(
+        fs::read(dir.path().join("a").join("outcomes.parquet")).unwrap(),
+    ))
+    .unwrap();
+    let groups: Vec<i64> = builder
+        .metadata()
+        .row_groups()
+        .iter()
+        .map(|group| group.num_rows())
+        .collect();
+    assert_eq!(groups, [122_880, 27_120]);
+    // `record` is in order, five rows each.
+    let mut expected = 0_u64;
+    for batch in builder.build().unwrap() {
+        let batch = batch.unwrap();
+        let record = col::<UInt64Array>(&batch, "record");
+        for row in 0..batch.num_rows() {
+            assert_eq!(record.value(row), expected / 5);
+            expected += 1;
+        }
+    }
+    assert_eq!(expected, 5 * N as u64);
+}
