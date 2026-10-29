@@ -20,11 +20,16 @@
 //! The report prints the manifest, `records <n> labels <n>`, then `PASS`
 //! or `FAIL: …`. `verify` re-checks a finished dataset and prints the same
 //! manifest and verdict.
+//!
+//! `query` verifies a dataset the same way and then prints one of its
+//! DuckDB views as TSV ([`OutcomeViews`], ADR-057 D7/D8); `views` prints
+//! the view definitions for other DuckDB clients.
 
 use crate::journal::read_runs;
 use crate::replay::{ReplaySource, archive_replay};
 use mie_adapter_binance::LiveReplay;
 use mie_adapter_binance::archive::ARCHIVE_SOURCE;
+use mie_adapter_duckdb::{OutcomeViews, VIEWS_SQL};
 use mie_adapter_parquet::ParquetRawStore;
 use mie_adapter_parquet::outcome::{OutcomeDataset, OutcomeHeader, OutcomeManifest, OutcomeWriter};
 use mie_app::conditional::{LabelReport, label_window_started};
@@ -258,6 +263,56 @@ pub fn verify(dir: &Path, out: &mut dyn Write) -> Result<bool, String> {
         .and_then(|()| out.flush())
         .map_err(|e| format!("write the report: {e}"))?;
     Ok(pass)
+}
+
+/// Verifies the dataset in `dir`, then writes `view` as TSV to `out`
+/// (ADR-057 D7): a header line and one line per row, ordered by the
+/// view's key columns. `n_min` is `outcome_summary`'s minimum clear-sample
+/// count, required there and refused elsewhere. A failure prints
+/// `FAIL: <reason>` instead, or after the rows written so far when the
+/// query fails midway. Returns whether it passed.
+///
+/// # Errors
+///
+/// A description when the output cannot be written.
+pub fn query(
+    dir: &Path,
+    view: &str,
+    n_min: Option<u64>,
+    out: &mut dyn Write,
+) -> Result<bool, String> {
+    // The views read the files by path; only a dataset whose manifest,
+    // content hash and file hashes check out is handed to them.
+    let ran = OutcomeDataset::open(dir)
+        .map_err(|error| error.to_string())
+        .and_then(|_| OutcomeViews::open(dir).map_err(|error| error.to_string()))
+        .and_then(|views| {
+            views
+                .query_tsv(view, n_min, out)
+                .map_err(|error| error.to_string())
+        });
+    match ran {
+        Ok(_) => Ok(true),
+        Err(error) => {
+            let mut report = Vec::new();
+            line(&mut report, &format!("FAIL: {error}"));
+            out.write_all(&report)
+                .and_then(|()| out.flush())
+                .map_err(|e| format!("write the report: {e}"))?;
+            Ok(false)
+        }
+    }
+}
+
+/// Writes the view definitions ([`VIEWS_SQL`]) to `out`.
+///
+/// # Errors
+///
+/// A description when the output cannot be written.
+pub fn views(out: &mut dyn Write) -> Result<(), String> {
+    out.write_all(VIEWS_SQL.as_bytes())
+        .and_then(|()| out.flush())
+        .map_err(|e| format!("write the views: {e}"))
 }
 
 fn line(report: &mut Vec<u8>, text: &str) {
