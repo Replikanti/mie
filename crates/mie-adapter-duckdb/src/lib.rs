@@ -117,8 +117,9 @@ impl OutcomeViews {
     ///
     /// # Errors
     ///
-    /// [`ViewsError::Missing`] without the directory or a table,
-    /// [`ViewsError::Path`] for a path DuckDB cannot take literally,
+    /// [`ViewsError::Missing`] without the directory or a table, or when
+    /// it cannot be canonicalized, [`ViewsError::Path`] for a path DuckDB
+    /// cannot take literally,
     /// [`ViewsError::Engine`] when DuckDB fails.
     pub fn open(dir: &Path) -> Result<Self, ViewsError> {
         if !dir.is_dir() {
@@ -135,7 +136,14 @@ impl OutcomeViews {
                 )));
             }
         }
-        let literal = sql_literal(dir)?;
+        // DuckDB rewrites some paths before it opens them (a leading `~`
+        // becomes the home directory, a `file:/` prefix is stripped), which
+        // Rust never does: it gets the canonical path of the directory the
+        // caller verified, absolute, so no rewrite applies.
+        let canonical = dir
+            .canonicalize()
+            .map_err(|error| ViewsError::Missing(format!("{}: {error}", dir.display())))?;
+        let literal = sql_literal(&canonical)?;
         let config = Config::default()
             .enable_autoload_extension(false)?
             .with("autoinstall_known_extensions", "false")?;
@@ -242,12 +250,19 @@ impl OutcomeViews {
 }
 
 /// `dir` as a DuckDB string literal: single quotes doubled, refused when
-/// not UTF-8 or when it holds a character `read_parquet` would expand as a
-/// glob (`*`, `?`, `[`), since then another file set could be read.
+/// not UTF-8, when it holds a character `read_parquet` would expand as a
+/// glob (`*`, `?`, `[`), or when it does not start with `/`: DuckDB rewrites
+/// a leading `~` and a `file:` prefix, and only an absolute path is safe
+/// from both. Either would read another file set than the verified one.
 fn sql_literal(dir: &Path) -> Result<String, ViewsError> {
     let Some(text) = dir.to_str() else {
         return Err(ViewsError::Path(format!("{} is not UTF-8", dir.display())));
     };
+    if !text.starts_with('/') {
+        return Err(ViewsError::Path(format!(
+            "{text} is not absolute; DuckDB would rewrite a leading ~ or file: prefix"
+        )));
+    }
     if let Some(glob) = text.chars().find(|c| matches!(c, '*' | '?' | '[')) {
         return Err(ViewsError::Path(format!(
             "{text} holds the glob character {glob:?}"

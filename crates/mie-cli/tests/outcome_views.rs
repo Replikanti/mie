@@ -1872,6 +1872,48 @@ fn query_verifies_first_and_views_prints_the_sql() {
     assert_eq!(out, VIEWS_SQL.as_bytes());
 }
 
+/// DuckDB rewrites a leading `~` to the home directory and strips a
+/// `file:/` prefix; Rust takes both literally. `mie conditional query`
+/// must read the directory it verified, never the rewritten one: each case
+/// puts the verified dataset at the literal relative path and a decoy with
+/// more records where DuckDB's rewrite would point.
+#[test]
+fn query_reads_the_verified_directory_not_a_rewritten_one() {
+    let temp = TempDir::new("rewrite");
+    let cwd = temp.path().join("cwd");
+    let home = temp.path().join("home");
+    let verified = fixture(0);
+    let decoy = fixture(3);
+    assert_ne!(verified.records.len(), decoy.records.len());
+    let rows = |arg: &str| {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_mie"))
+            .args(["conditional", "query", arg, "contexts"])
+            .current_dir(&cwd)
+            .env("HOME", &home)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(output.status.success(), "{arg}: {stdout}");
+        stdout.lines().count() - 1
+    };
+    // `~/ds`: Rust reads `<cwd>/~/ds`, DuckDB would read `$HOME/ds`.
+    std::fs::create_dir_all(cwd.join("~")).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    write_dataset(&cwd.join("~").join("ds"), &verified);
+    write_dataset(&home.join("ds"), &decoy);
+    assert_eq!(rows("~/ds"), verified.records.len());
+    // `file:<abs>`: Rust reads `<cwd>/file:<abs>`, DuckDB would read `<abs>`.
+    let target = temp.path().join("abs");
+    write_dataset(&target, &decoy);
+    let relative = target.strip_prefix("/").unwrap();
+    std::fs::create_dir_all(cwd.join("file:").join(relative.parent().unwrap())).unwrap();
+    write_dataset(&cwd.join("file:").join(relative), &verified);
+    assert_eq!(
+        rows(&format!("file:{}", target.display())),
+        verified.records.len()
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The M3 measurement (ADR-057 D9).
 

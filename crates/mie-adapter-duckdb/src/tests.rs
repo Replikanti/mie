@@ -80,6 +80,13 @@ fn tsv(views: &OutcomeViews, view: &str, n_min: Option<u64>) -> String {
 #[test]
 fn literal_doubles_quotes_and_refuses_globs() {
     assert_eq!(sql_literal(Path::new("/a/b")).unwrap(), "'/a/b'");
+    // DuckDB rewrites these two prefixes; only absolute paths pass.
+    for rewritten in ["~/ds", "~ds", "file:/tmp/ds", "file:///tmp/ds", "ds"] {
+        assert!(
+            matches!(sql_literal(Path::new(rewritten)), Err(ViewsError::Path(_))),
+            "{rewritten}"
+        );
+    }
     assert_eq!(sql_literal(Path::new("/a/it's")).unwrap(), "'/a/it''s'");
     for glob in ["/a/*", "/a/b?", "/a/[x]"] {
         assert!(matches!(
@@ -99,6 +106,26 @@ fn a_quote_in_the_path_reads_the_dataset() {
     let contexts = tsv(&views, "contexts", None);
     assert_eq!(contexts.lines().count(), 2, "{contexts}");
     assert!(contexts.starts_with("record\tdecision_time\tevent_kind\t"));
+}
+
+#[test]
+fn duckdb_gets_the_canonical_path() {
+    let temp = TempDir::new("canonical");
+    let dir = temp.0.join("ds");
+    fs::create_dir(&dir).unwrap();
+    fs::create_dir(temp.0.join("other")).unwrap();
+    write_fixture(&dir);
+    // A `..` component resolves to the verified directory.
+    let views = OutcomeViews::open(&temp.0.join("other").join("..").join("ds")).unwrap();
+    let mut out = Vec::new();
+    views
+        .write_tsv("SELECT getvariable('mie_dataset') AS dataset", &mut out)
+        .unwrap();
+    let canonical = dir.canonicalize().unwrap();
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        format!("dataset\n{}\n", canonical.display())
+    );
 }
 
 #[test]

@@ -395,9 +395,16 @@ race's touch, c for the race's censor:
   first statement: the bundled build compiles both on, which would mean
   network at query time. A test asserts that a query needing an unlinked
   extension (`json`) fails with DuckDB's catalog error instead.
-- The dataset path reaches DuckDB as a string literal with `'` doubled. A
-  path holding `*`, `?` or `[` is refused: `read_parquet` would expand it
-  as a glob and could read other files than the verified ones.
+- The dataset path reaches DuckDB as the canonical path of the directory
+  that was verified (`mie conditional query` canonicalizes once and uses
+  it for both), as a string literal with `'` doubled. DuckDB rewrites
+  some paths before it opens them, which Rust never does: a leading `~`
+  becomes the home directory and a `file:/` prefix is stripped, so a
+  relative `~/ds` or `file:/x` would read another directory than the
+  verified one. A canonical path is absolute, so neither rewrite applies,
+  and the adapter refuses any path that does not start with `/`. A path
+  holding `*`, `?` or `[` is refused too: `read_parquet` would expand it
+  as a glob.
 - **Revisiting ADR-030's C-build argument.** ADR-030 rejected ZSTD because
   the gain (smaller JSON payloads) did not pay for a C build and a new
   license. Here the C++ build is the engine ADR-004 chose; there is no

@@ -282,10 +282,18 @@ pub fn query(
     out: &mut dyn Write,
 ) -> Result<bool, String> {
     // The views read the files by path; only a dataset whose manifest,
-    // content hash and file hashes check out is handed to them.
-    let ran = OutcomeDataset::open(dir)
-        .map_err(|error| error.to_string())
-        .and_then(|_| OutcomeViews::open(dir).map_err(|error| error.to_string()))
+    // content hash and file hashes check out is handed to them. Both get
+    // the one canonical path, so DuckDB's own path rewrites (`~`, `file:`)
+    // cannot point it at another directory than the verified one.
+    let ran = dir
+        .canonicalize()
+        .map_err(|error| format!("{}: {error}", dir.display()))
+        .and_then(|dir| {
+            OutcomeDataset::open(&dir)
+                .map(|_| dir)
+                .map_err(|error| error.to_string())
+        })
+        .and_then(|dir| OutcomeViews::open(&dir).map_err(|error| error.to_string()))
         .and_then(|views| {
             views
                 .query_tsv(view, n_min, out)
