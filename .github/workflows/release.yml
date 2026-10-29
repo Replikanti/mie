@@ -21,8 +21,11 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
-    # Cold-cache build of the Arrow/rustls stack plus the test suite.
-    timeout-minutes: 20
+    # Cold-cache build of the Arrow/rustls stack plus the test suite, and the
+    # bundled DuckDB twice (test build, then optimized release build): 60.3
+    # min measured on four laptop cores, 30.1 min on the runner; derivation
+    # in ADR-057 D8.
+    timeout-minutes: 65
     steps:
       - uses: actions/checkout@v4
         with:

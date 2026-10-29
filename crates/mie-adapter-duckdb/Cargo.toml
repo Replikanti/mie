@@ -1,0 +1,26 @@
+[package]
+name = "mie-adapter-duckdb"
+description = "MIE DuckDB adapter: the research views over one conditional outcome dataset (ADR-004, ADR-057 D7/D8)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# An adapter depends on the domain, the ports and external crates, never on
+# another adapter (ADR-025). This one needs neither the domain nor the ports:
+# it reads the dataset's Parquet files by path, and the caller (mie-cli)
+# verifies the dataset first through mie-adapter-parquet. Every external
+# crate is justified below.
+[dependencies]
+# The query engine ADR-004 chose, linked from its bundled C++ sources and
+# pinned exactly, so every view result comes from one engine version recorded
+# in Cargo.lock (ADR-057 D8). 1.20000.0 bundles DuckDB v2.0.0 and uses
+# arrow 60, the major the workspace already compiles. No default features:
+# `download-lib` would fetch a prebuilt library over the network at build
+# time. `parquet` links the Parquet reader; `json` (raw-store research) is
+# out of scope.
+duckdb = { version = "=1.20000.0", default-features = false, features = ["bundled", "parquet"] }
+
+[lints]
+workspace = true

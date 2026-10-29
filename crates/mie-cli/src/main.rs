@@ -181,6 +181,23 @@ USAGE:
         SHA-256, rows, format and schema. Prints the manifest and PASS
         (exit 0), or FAIL: <reason> (exit 1).
 
+    mie conditional query <dir> <view> [--n-min <n>]
+        Verify an outcome dataset as verify does, then print one of its
+        DuckDB views (ADR-057 D7) as TSV, ordered by the view's key columns
+        (exit 0): contexts, outcomes, passages (the tables), labeled (one
+        row per record and horizon with the excursions in barrier offsets,
+        the time to the race, level_within and extreme_vs_opposite) or
+        outcome_summary (distributions per horizon and per every
+        combination of trigger, regime and location, plus trigger
+        families), which requires --n-min, the minimum clear-sample count
+        it flags (meets_min_sample = clear >= n). NULL prints as NULL,
+        times as epoch milliseconds, prices exactly. A failure prints
+        FAIL: <reason> (exit 1). No query downloads anything.
+
+    mie conditional views
+        Print the SQL of the views, for any DuckDB client of the pinned
+        version: SET VARIABLE mie_dataset = '<dir>'; then run it.
+
     mie --help
 ";
 
@@ -445,8 +462,32 @@ fn dispatch(args: &[String]) -> Result<ExitCode, String> {
                 let pass = conditional::verify(&PathBuf::from(dir), &mut std::io::stdout().lock())?;
                 Ok(exit(pass))
             }
+            (Some("query"), Some(dir)) => {
+                let view = args
+                    .get(3)
+                    .ok_or("expected `mie conditional query <dir> <view> [--n-min <n>]`")?;
+                let options = Options::parse(&args[4..], &["--n-min"], &[])?;
+                let n_min = options
+                    .optional("--n-min")
+                    .map(|value| {
+                        value
+                            .parse::<u64>()
+                            .map_err(|_| format!("--n-min {value:?} is not a count"))
+                    })
+                    .transpose()?;
+                let mut out = std::io::BufWriter::new(std::io::stdout().lock());
+                let pass = conditional::query(&PathBuf::from(dir), view, n_min, &mut out)?;
+                Ok(exit(pass))
+            }
+            (Some("views"), _) => {
+                Options::parse(&args[2..], &[], &[])?;
+                conditional::views(&mut std::io::stdout().lock())?;
+                Ok(ExitCode::SUCCESS)
+            }
             _ => Err(
-                "expected `mie conditional build …` or `mie conditional verify <dir>`".to_owned(),
+                "expected `mie conditional build …`, `mie conditional verify <dir>`, \
+                 `mie conditional query <dir> <view>` or `mie conditional views`"
+                    .to_owned(),
             ),
         },
         Some(other) => Err(format!("unknown command {other:?}")),

@@ -262,71 +262,125 @@ code <code version>
 
 ### D7. Views (M2)
 
-For one verified dataset (`OutcomeDataset::open` before any query):
+The views are `crates/mie-adapter-duckdb/src/views.sql`, created over one
+verified dataset (`OutcomeDataset::open` before any query). They read the
+dataset directory from the DuckDB variable `mie_dataset`, so the same file
+serves any DuckDB client of the pinned version (`mie conditional views`
+prints it).
 
 - **Base views** `contexts`, `outcomes`, `passages` over the files.
-- **`labeled`** (record × horizon) joins `contexts` and adds:
-  - `group_trigger` (the trigger id, or `baseline`) and `location_bins`, a
-    list over `value_edge`, `structural_extreme`, `neither`, `not_ready`;
+- **`labeled`** (record × horizon) joins `contexts`, `outcomes` and the
+  `level` and `extreme` passages, and adds:
+  - `group_trigger` (the trigger id, or `baseline`), `group_family` (the
+    trigger family, or `baseline`), `group_regime` (the regime label, or
+    `not_ready`);
+  - `location_bins`, a list over `value_edge`, `structural_extreme`,
+    `neither` (levels ready, in no bin), `not_ready`;
   - `offset = upper − reference`;
-  - `up_x`, `down_x` = excursion ÷ offset. NULL when the race is
+  - `up_x`, `down_x` = excursion ÷ offset, both in price units, so the
+    ratio is one IEEE division of two integers. NULL when the race is
     unavailable or the window is censored: those excursions are lower
     bounds (`HorizonLabel::censored`, ADR-055 D6/D7);
-  - `time_to_event_ms = race_at − decision_time` for `upper`/`lower`.
-- **`level_within` (the ADR-055 D8 composition):** `at_decision`;
-  `touched` when `at < decision + H`; `not_within` when touched at or after
-  the end, `not_within`, or censored at or after the end; `unknown` when
-  censored before the end; NULL without a level.
-- **`extreme_vs_opposite`**, a neutral name, because which side counts as
-  invalidation is the hypothesis's call (ADR-014). It is read from
-  first-touch times only. The opposite barrier is the one across the
-  reference from the extreme.
-  - Race won by the opposite barrier at t: `extreme_first` if the extreme
-    is touched before t's millisecond, `undetermined` if within it,
-    `opposite_first` if later or not within H; `unknown` if the extreme's
-    censor is at or before t.
-  - Race won on the extreme's side at t: `extreme_first` if the extreme is
-    touched before t's millisecond, or within it with `!same_ms`;
-    otherwise `undetermined`, because only first touches are stored.
-  - `neither`: `extreme_first` if the extreme is touched within H, else
-    `neither`.
-  - Race censored at c: `extreme_first` if the extreme is touched before
-    c, else `unknown`.
-  - Race unavailable: NULL. `at_decision` counts as `extreme_first`. Any
-    order a censor hides is `unknown`.
-- **`outcome_summary(n_min)`**, a table macro with no default, groups by
-  horizon × every combination of {trigger id, regime, location}: 8
-  grouping sets.
-  - The location sets come from a separate `UNION ALL` branch over the
-    unnested bins, so the other sets count each record once; a record in
-    both bins counts in both location groups (ADR-051 R1).
-  - A family rollup branch reports `samples` and `events` (distinct
-    decisions), with `episodes` and `clear` NULL: a family-pooled
-    independent count is undefined (ADR-054 *Consequences*).
-  - Rollup rows carry `all`.
-  - Columns: `samples`, `events`, `episodes`, `clear`,
-    `meets_min_sample = clear >= n_min`; counts of `upper`, `lower`,
-    `neither`, `censored`, `unavailable` and `same_ms`, and the shares of
-    the races that ran; five-number summaries (min, p25, p50, p75, max) of
-    `time_to_event_ms`, `up_x` and `down_x` with the count used;
-    `level_within` and `extreme_vs_opposite` counts.
+  - `time_to_event_ms = race_at − decision_time` for `upper`/`lower`;
+  - `level_within` and `extreme_vs_opposite`, the two compositions below.
+- All times are compared in milliseconds against the window end
+  E = `decision_time + H`, exclusive like the window (ADR-055 D2).
+
+**`level_within`** (the ADR-055 D8 composition "revisited within H"), from
+the level's passage, which is read over the 1d window:
+
+| Level passage | `level_within` at H |
+|---|---|
+| none | NULL |
+| `at_decision` | `at_decision` |
+| `touched` at a < E | `touched` |
+| `touched` at a ≥ E | `not_within` |
+| `not_within` | `not_within` |
+| `censored` at c ≥ E | `not_within` (not reached strictly before c, so not before E) |
+| `censored` at c < E | `unknown` |
+
+**`extreme_vs_opposite`**, a neutral name, because which side counts as
+invalidation is the hypothesis's call (ADR-014). It is read from first
+touches only: the race stores its winner's first touch, the passage the
+extreme's. The opposite barrier is the one across the reference from the
+extreme. Write te for the extreme's touch, ce for its censor, t for the
+race's touch, c for the race's censor:
+
+| Race | Extreme passage | `extreme_vs_opposite` |
+|---|---|---|
+| any | none | NULL |
+| `unavailable` | any | NULL |
+| any other | `at_decision` | `extreme_first` |
+| won by the opposite barrier at t | `touched`, te < t | `extreme_first` |
+| | `touched`, te = t (same ms, order unknown) | `undetermined` |
+| | `touched`, te > t; `not_within` | `opposite_first` |
+| | `censored`, ce > t | `opposite_first` (not reached up to ce > t) |
+| | `censored`, ce ≤ t | `unknown` (the censor hides whether it came first) |
+| won on the extreme's side at t | `touched`, te < t | `extreme_first` |
+| | `touched`, te = t and not `same_ms` | `extreme_first` (the opposite barrier was not touched in that ms, nor before) |
+| | `touched`, te = t with `same_ms`; te > t; `not_within`; `censored` | `undetermined`: the opposite barrier's first touch after t is not stored |
+| `neither` | `touched`, te < E | `extreme_first` |
+| | `censored`, ce < E | `unknown` (a labeler does not produce it: a censor before E censors the race too; defined for completeness) |
+| | otherwise | `neither` |
+| `censored` at c | `touched`, te < c | `extreme_first` (neither barrier was touched before c) |
+| | otherwise | `unknown` |
+
+**`outcome_summary(n_min)`**, a table macro with no default for `n_min`:
+
+- It groups by horizon × every combination of {trigger id, regime,
+  location}: 8 grouping sets. A dimension a row does not split by reads
+  `all`; the column `split` names the dimensions it does (`all`,
+  `trigger`, `regime`, `location`, `trigger,regime`, …), and `family`
+  repeats the trigger id's family.
+- The location sets count one row per bin of the record, the others one
+  row per record: both come from one `GROUP BY GROUPING SETS` over the
+  union of the plain rows (location `all`) and the unnested bins, with
+  location in every set. A record in both bins counts in both location
+  groups (ADR-051 R1).
+- A family branch (`split` = `family`) pools the trigger ids of one family
+  and reports only `samples` and `events` (distinct decisions, so a
+  co-emission of two ids counts once); every other column is NULL: a
+  family-pooled independent count is undefined (ADR-054 *Consequences*).
+  Baselines have no family row; their `trigger` row is the baseline.
+- Columns: `samples`, `events` (distinct decision keys), `episodes`
+  (distinct episode ids; 0 for baselines), `clear`,
+  `meets_min_sample = clear >= n_min`; the counts `n_upper`, `n_lower`,
+  `n_neither`, `n_censored`, `n_unavailable`, `n_same_ms`; the shares of
+  `upper`, `lower` and `neither` among the races that ran (upper + lower +
+  neither, NULL without any); the five-number summaries (min, p25, p50,
+  p75, max) of `time_to_event_ms`, `up_x` and `down_x` with the count used
+  (`tte_*`, `up_x_*`, `down_x_*`); the `level_within` counts
+  (`level_at_decision`, `level_touched`, `level_not_within`,
+  `level_unknown`) and the `extreme_vs_opposite` counts (`extreme_first`,
+  `opposite_first`, `extreme_neither`, `extreme_undetermined`,
+  `extreme_unknown`).
+- Rows are ordered by `horizon_ms`, `split`, `trigger`, `family`,
+  `regime`, `location`.
 - **The minimum-sample flag counts per-horizon `clear` records** (ADR-055
   D9), the only count whose windows are disjoint; a nominal sample count
   over overlapping windows must not be used as a sample size (ADR-054
   *Consequences*). The threshold is a query parameter without a default:
   it belongs to the study (#28), and any default here would be a number
-  without a derivation.
+  without a derivation. In a rollup over trigger ids (`trigger` = `all`),
+  `clear` is the sum of each stream's clear records, which are disjoint
+  within a stream only.
 - **Quantiles** are nearest-rank, `list_sort(list(x))[greatest(1,
   ceil(q · n))]`, the repo's convention (the context measurement): an
   observed value, no interpolation.
-- **Aggregates are order-independent** (counts, distinct counts, min/max,
-  nearest-rank). No floating-point sums or means, so results do not depend
-  on thread scheduling. Every view ends with `ORDER BY` all group columns.
-- Brief §12 mapping: threshold first → `race`; MFE/MAE → `up`/`down` and
-  `up_x`/`down_x`; time-to-event → `time_to_event_ms`; level revisit →
-  `level_within`; invalidation → `extreme_vs_opposite`; excursion
-  distribution → the five-number summaries; conditional on regime,
-  location and trigger → the grouping sets. A test asserts the schema.
+- **Aggregates are order-independent** (counts, distinct counts, sorted
+  lists, nearest-rank). No floating-point sums or means, so results do not
+  depend on thread scheduling. Every view ends with `ORDER BY` its key
+  columns, and `mie conditional query` orders by them again.
+- **Output.** `mie conditional query <dir> <view> [--n-min <n>]` prints TSV
+  with a header line: `NULL`, `true`/`false`, integers, doubles in Rust's
+  shortest round-trip form, decimals exactly at scale 8, times as epoch
+  milliseconds, lists as `[a,b]`.
+- Brief §12 mapping: threshold first → `race`, `n_upper`/`n_lower` and
+  their shares; MFE/MAE → `up`/`down` and `up_x`/`down_x`; time-to-event →
+  `time_to_event_ms` and `tte_*`; level revisit → `level_within`;
+  invalidation → `extreme_vs_opposite`; excursion distribution → the
+  five-number summaries; conditional on regime, location and trigger → the
+  grouping sets. A test pins both schemas and this mapping.
 
 ### D8. The DuckDB engine (M2)
 
@@ -336,25 +390,91 @@ For one verified dataset (`OutcomeDataset::open` before any query):
   major. Pinned exactly, so every view result comes from one engine.
 - Not enabled: `download-lib` (network at build time) and `json` (raw-store
   `json_extract` research is out of scope).
-- Each connection sets `autoinstall_known_extensions=false` and
-  `autoload_known_extensions=false`: the bundled build compiles both on,
-  which would mean network at query time. A test asserts that a query
-  needing an unlinked extension errors instead.
+- Each connection turns `autoinstall_known_extensions` and
+  `autoload_known_extensions` off in its open configuration, before its
+  first statement: the bundled build compiles both on, which would mean
+  network at query time. A test asserts that a query needing an unlinked
+  extension (`json`) fails with DuckDB's catalog error instead.
+- The dataset path reaches DuckDB as the canonical path of the directory
+  that was verified (`mie conditional query` canonicalizes once and uses
+  it for both), as a string literal with `'` doubled. DuckDB rewrites
+  some paths before it opens them, which Rust never does: a leading `~`
+  becomes the home directory and a `file:/` prefix is stripped, so a
+  relative `~/ds` or `file:/x` would read another directory than the
+  verified one. A canonical path is absolute, so neither rewrite applies,
+  and the adapter refuses any path that does not start with `/`. A path
+  holding `*`, `?` or `[` is refused too: `read_parquet` would expand it
+  as a glob.
 - **Revisiting ADR-030's C-build argument.** ADR-030 rejected ZSTD because
   the gain (smaller JSON payloads) did not pay for a C build and a new
   license. Here the C++ build is the engine ADR-004 chose; there is no
   pure-Rust DuckDB. The writer stays pure Rust (D2), so the raw store and
   the dataset bytes never depend on the C++ code; only view results do.
-- **Licenses.** DuckDB is MIT. Its vendored third-party code (zstd, snappy
-  and re2 are BSD-3-Clause, among others) is invisible to `cargo deny`;
-  M2 lists it here from the bundled sources, and `deny.toml` gets only the
-  exceptions `cargo deny check` itself demands, each with its reason.
-- **Build cost.** About 2 000 C++ files. M2 measures the cold build
-  (`cargo clippy` plus `cargo test` with `-j4`, as on the 4-vCPU CI
-  runner) and the size of `target/`, sets `debug = false` (and an
-  `opt-level` chosen from that measurement) for `libduckdb-sys` in the dev
-  profile, and raises the CI `timeout-minutes` only if the measurement
-  needs it, to a value derived from it and recorded here.
+- **Licenses.** DuckDB is MIT. `cargo deny check` sees only the Rust
+  crates; of the new ones it demands a single exception, `foldhash`
+  (Zlib: duckdb → hashlink → hashbrown → foldhash), which `deny.toml`
+  records with its reason. The C++ the build compiles or includes, read
+  from the headers of the sources `libduckdb-sys` 1.20000.0 bundles
+  (`third_party/`):
+  - MIT: brotli, fast_float, fmt, fsst, httplib, jaro_winkler, miniz,
+    skiplist, utf8proc, vergesort, yyjson;
+  - BSD-2-Clause: lz4; simplified BSD: concurrentqueue;
+  - BSD-3-Clause: hyperloglog, re2, snappy, zstd (zstd dual GPL-2.0, used
+    under BSD);
+  - Apache-2.0: fastpforlib, the Thrift runtime and the Parquet Thrift
+    types, tdigest; mbedtls (Apache-2.0 OR GPL-2.0-or-later, used under
+    Apache-2.0); pcg (Apache-2.0 OR MIT);
+  - Zlib: pdqsort; Boost-1.0: ska_sort.
+  All are permissive; none is copyleft as used. Distributing the `mie`
+  binary carries their notices, as DuckDB's own distribution does.
+- **The dev-profile build** (`[profile.dev.package.libduckdb-sys]`):
+  `debug = false` keeps DWARF out of the C++ objects and makes the build
+  script define `NDEBUG`, so DuckDB's debug-only verification paths stay
+  off in tests; `opt-level = 1`, chosen from a measurement with four cores
+  (`-j4` under a 400 % CPU quota, the CI runner's 4 vCPUs):
+
+  | opt-level | DuckDB alone, cold | rebuilt under the mie-cli tests | static library | DuckDB-bound view test |
+  |---|---|---|---|---|
+  | 0 | 790 s | — | 701 MB | 92 s |
+  | 1 | — | 1 016 s | 162 MB | 59 s |
+  | 2 | 1 225 s | 1 518 s | 163 MB | 50 s |
+
+  1 builds 502 s faster than 2 under the same conditions with nearly its
+  query speed; against 0 it cuts the library every CI cache entry and
+  every test binary carries from 701 to 162 MB and the DuckDB-bound test
+  by a third. Release builds keep the release profile (opt-level 3).
+- **Build cost and the CI timeouts.** Every binary that links `mie-cli`
+  links DuckDB whole (the bundled build links its extension autoregister
+  object whole-archive), and a cold cache compiles DuckDB twice per job:
+  the clippy (check) build and the test build each compile and run its
+  build script, as for every crate with one (`ring` too); the release job
+  compiles it for the tests and again optimized. Measured on the same four
+  laptop cores (the cold rows from an empty `target/`) and on this PR's CI
+  runs (4 vCPUs):
+
+  | Job | Where | Steps | Time |
+  |---|---|---|---|
+  | CI `check`, cold | four laptop cores | clippy 1 105 s + test 1 638 s (build 1 377 s, tests 261 s); 13 GB `target/` | 2 743 s (45.7 min) |
+  | Release `build`, cold | four laptop cores | test as above + `cargo build --release` 1 979 s; 14 GB | about 3 617 s (60.3 min) |
+  | CI `check`, warm dependency cache | four laptop cores | clippy 16 s + test 415 s | 431 s |
+  | Release `build`, cold (dry run, no cache found) | CI runner | test 821 s + release build 958 s | 1 806 s (30.1 min) |
+  | CI `check`, main's dependency cache (DuckDB cold) | CI runner | clippy 711 s + test 986 s | 1 723 s (28.7 min) |
+  | CI `check`, warm dependency cache (rerun) | CI runner | clippy 16 s + test 260 s | 295 s |
+
+  The warm rows are what `rust-cache` usually restores (dependencies,
+  never the workspace crates); the cold rows are what a lockfile change, a
+  new toolchain or an evicted cache costs.
+- **Timeouts.** A fully cold `check` job was not observed on the runner;
+  the laptop measurement bounds it. On the same work the runner took 0.50
+  of the laptop's time (the cold release job) and 0.68 (the warm `check`
+  job), so a cold `check` job needs at most about 0.68 × 45.7 = 31 min on
+  a runner like those, and the release job was observed at 30.1 min. Each
+  timeout is the laptop's own cold time, rounded up to whole 5 min:
+  `check` 50 min (from 15), release `build` 65 min (from 20). That is
+  1.47 times the slowest observed runner ratio, room for a slower runner
+  instance (the partially cached `check` run already needed 0.63 of the
+  laptop's fully cold time), and a hung job still fails within about an
+  hour. The old 15 and 20 min are below every cold measurement here.
 
 ### D9. Blind acceptance (M3)
 
@@ -406,6 +526,8 @@ the dataset and the views without reading an outcome:
 | 1 and 4 threads | D9: the single-threaded reference and the CI runner's vCPUs | — (two values suffice to expose order dependence) |
 | 561 695 / 525 599 / 36 096 / 2 808 475 | D9: ADR-054 *Acceptance* and ADR-056 *Measurement* on the same data and engine; 2 808 475 = 5 × 561 695 | — (published counts; a difference is a bug or a provenance change, checked first) |
 | Data `5d9e27f8…`, engine `4c844593779da2e3-1` | D9: the provenance of those published counts | — (a different value voids the reconciliation) |
+| `opt-level = 1`, `debug = false` for `libduckdb-sys` in the dev profile | D8: the measured build times, library sizes and view-test times at 0, 1 and 2 | 0: a 701 MB library in every cache entry and test binary and a third slower view tests; 2: 502 s more per DuckDB build for 9 s less test time; `debug = true`: DWARF in every object and DuckDB's debug verification paths in every test |
+| CI `check` 50 min, release `build` 65 min | D8: the cold jobs measured on four laptop cores, which bound the runner (0.50–0.68 of their time), rounded up to 5 min | Below a cold job's time: every lockfile change, toolchain update or cache eviction fails CI by timeout, as the old 15 and 20 min would; far above: a hung job holds a runner longer before it fails |
 | About 80 min per year build | ADR-056 *Measurement*: the same replay and labeling took 1:20:17 | — (an expectation for scheduling M3, not a criterion) |
 
 There is no other number.

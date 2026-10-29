@@ -12,6 +12,27 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
 
 ### Added
 
+- **DuckDB views over the conditional outcome dataset (#27 M2, ADR-057 D7,
+  D8).** The new adapter `mie-adapter-duckdb` links DuckDB v2.0.0 from its
+  bundled sources (`duckdb =1.20000.0`, only the Parquet reader, no
+  `download-lib`), turns extension autoinstall and autoload off, and
+  creates the views of `views.sql` over one dataset: the three tables,
+  `labeled` (one row per record and horizon with the trigger group,
+  ADR-051 R1 location bins, excursions in barrier offsets, time to the
+  race, and the ADR-055 D8 compositions `level_within` and
+  `extreme_vs_opposite`) and the table macro `outcome_summary(n_min)`
+  (counts, race shares, nearest-rank five-number summaries and the
+  minimum-clear-sample flag per horizon and per every combination of
+  trigger, regime and location, plus a family branch with samples and
+  distinct decisions only). Every aggregate is order-independent, so the
+  output is the same at any thread count. `mie conditional query <dir>
+  <view> [--n-min <n>]` verifies the dataset and prints a view as TSV;
+  `mie conditional views` prints the SQL for other DuckDB clients.
+  `crates/mie-cli/tests/outcome_views.rs` checks the views against an
+  independent Rust model and the D7 case tables, at 1 and 4 threads, and
+  holds the ignored `measure_outcome_views` tool for the M3 acceptance.
+  `deny.toml` admits `foldhash` (Zlib); ADR-057 D8 lists the licenses of
+  the vendored C++ code and the measured build cost.
 - **Conditional outcome dataset writer and ADR-057 (proposed; #27 M1).**
   `mie conditional build --config … --from … --to … --out <dir>` labels a
   live or archive replay under the current labeling (v2) and writes the

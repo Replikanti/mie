@@ -20,7 +20,11 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # A cold dependency cache compiles the bundled DuckDB twice (the clippy
+    # and the test build each run its build script) on top of the Rust
+    # stack: 45.7 min measured on four laptop cores, which bound the runner
+    # (it took 0.50-0.68 of their time); derivation in ADR-057 D8.
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@v4
       # Every PR closes its issue ("Closes #N") or states why none applies
