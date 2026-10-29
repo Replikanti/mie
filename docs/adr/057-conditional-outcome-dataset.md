@@ -440,21 +440,34 @@ race's touch, c for the race's censor:
   links DuckDB whole (the bundled build links its extension autoregister
   object whole-archive), and a cold cache compiles DuckDB twice per job:
   the clippy (check) build and the test build each compile and run its
-  build script, as for every crate with one (`ring` too). Measured cold on
-  the same four cores, from an empty `target/`:
+  build script, as for every crate with one (`ring` too); the release job
+  compiles it for the tests and again optimized. Measured on the same four
+  laptop cores (the cold rows from an empty `target/`) and on this PR's CI
+  runs (4 vCPUs):
 
-  | Job | Steps | Time | `target/` |
+  | Job | Where | Steps | Time |
   |---|---|---|---|
-  | CI `check` | clippy 1 105 s + test 1 638 s (build 1 377 s, tests 261 s) | 2 743 s (45.7 min) | 13 GB |
-  | Release `build` | test, as above, + `cargo build --release` 1 979 s | about 3 617 s (60.3 min) | 14 GB |
-  | CI `check`, warm dependency cache | clippy 16 s + test 415 s | 431 s | — |
+  | CI `check`, cold | four laptop cores | clippy 1 105 s + test 1 638 s (build 1 377 s, tests 261 s); 13 GB `target/` | 2 743 s (45.7 min) |
+  | Release `build`, cold | four laptop cores | test as above + `cargo build --release` 1 979 s; 14 GB | about 3 617 s (60.3 min) |
+  | CI `check`, warm dependency cache | four laptop cores | clippy 16 s + test 415 s | 431 s |
+  | Release `build`, cold (dry run, no cache found) | CI runner | test 821 s + release build 958 s | 1 806 s (30.1 min) |
+  | CI `check`, main's dependency cache (DuckDB cold) | CI runner | clippy 711 s + test 986 s | 1 723 s (28.7 min) |
+  | CI `check`, warm dependency cache (rerun) | CI runner | clippy 16 s + test 260 s | 295 s |
 
-  The warm row is what `rust-cache` usually restores (dependencies, never
-  the workspace crates); the cold rows are what a lockfile change, a new
-  toolchain or an evicted cache costs. Provisional timeouts, until the
-  runner's speed against these measurements is calibrated on this PR's CI
-  runs: `check` 60 min (45.7 min with 30 % headroom, rounded up to 5 min,
-  from 15) and release `build` 80 min (60.3 min likewise, from 20).
+  The warm rows are what `rust-cache` usually restores (dependencies,
+  never the workspace crates); the cold rows are what a lockfile change, a
+  new toolchain or an evicted cache costs.
+- **Timeouts.** A fully cold `check` job was not observed on the runner;
+  the laptop measurement bounds it. On the same work the runner took 0.50
+  of the laptop's time (the cold release job) and 0.68 (the warm `check`
+  job), so a cold `check` job needs at most about 0.68 × 45.7 = 31 min on
+  a runner like those, and the release job was observed at 30.1 min. Each
+  timeout is the laptop's own cold time, rounded up to whole 5 min:
+  `check` 50 min (from 15), release `build` 65 min (from 20). That is
+  1.47 times the slowest observed runner ratio, room for a slower runner
+  instance (the partially cached `check` run already needed 0.63 of the
+  laptop's fully cold time), and a hung job still fails within about an
+  hour. The old 15 and 20 min are below every cold measurement here.
 
 ### D9. Blind acceptance (M3)
 
@@ -507,7 +520,7 @@ the dataset and the views without reading an outcome:
 | 561 695 / 525 599 / 36 096 / 2 808 475 | D9: ADR-054 *Acceptance* and ADR-056 *Measurement* on the same data and engine; 2 808 475 = 5 × 561 695 | — (published counts; a difference is a bug or a provenance change, checked first) |
 | Data `5d9e27f8…`, engine `4c844593779da2e3-1` | D9: the provenance of those published counts | — (a different value voids the reconciliation) |
 | `opt-level = 1`, `debug = false` for `libduckdb-sys` in the dev profile | D8: the measured build times, library sizes and view-test times at 0, 1 and 2 | 0: a 701 MB library in every cache entry and test binary and a third slower view tests; 2: 502 s more per DuckDB build for 9 s less test time; `debug = true`: DWARF in every object and DuckDB's debug verification paths in every test |
-| CI `check` 60 min, release `build` 80 min | D8: the cold jobs measured on four cores, with headroom for the runner | Below a cold job's time: every lockfile change, toolchain update or cache eviction fails CI by timeout, as the old 15 and 20 min would; far above: a hung job holds a runner longer before it fails |
+| CI `check` 50 min, release `build` 65 min | D8: the cold jobs measured on four laptop cores, which bound the runner (0.50–0.68 of their time), rounded up to 5 min | Below a cold job's time: every lockfile change, toolchain update or cache eviction fails CI by timeout, as the old 15 and 20 min would; far above: a hung job holds a runner longer before it fails |
 | About 80 min per year build | ADR-056 *Measurement*: the same replay and labeling took 1:20:17 | — (an expectation for scheduling M3, not a criterion) |
 
 There is no other number.
