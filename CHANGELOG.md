@@ -12,6 +12,15 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
 
 ### Added
 
+- **ADR-057 is measured and accepted (#27 M3).** The D9 acceptance on
+  main `4ac1de8`: `mie conditional build` twice on the #12 year and twice
+  on the ADR-051 R0 live store gave byte-identical files and equal content
+  hashes per pair (year `47d9cb62…`, live `e14516f2…`), `verify` passed on
+  all four, and `measure_outcome_views` found 0 model mismatches, equal
+  view digests at DuckDB 1 and 4 threads, and the published counts
+  (561 695 contexts, 2 808 475 outcomes, the per-horizon counts of
+  ADR-056 *Measurement*). The run was blind: no outcome share, quantile or
+  per-context outcome was printed. ADR-057 is `accepted`. No code changes.
 - **DuckDB views over the conditional outcome dataset (#27 M2, ADR-057 D7,
   D8).** The new adapter `mie-adapter-duckdb` links DuckDB v2.0.0 from its
   bundled sources (`duckdb =1.20000.0`, only the Parquet reader, no

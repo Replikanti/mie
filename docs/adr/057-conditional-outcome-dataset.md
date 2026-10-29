@@ -1,6 +1,8 @@
 # ADR-057: Conditional outcome dataset — long-format Parquet with a content hash, DuckDB views over it
 
-- Status: proposed
+- Status: accepted
+- Measured: 2026-10-29 (#27 M3, see *Acceptance*); accepted, every D9
+  criterion met on the #12 year and the R0 live store
 - Date: 2026-10-28
 
 ## Context
@@ -604,3 +606,65 @@ M3, in the main session, from the merge commit of M2:
 The acceptance PR fills in an *Acceptance* section and sets this ADR to
 accepted. Every criterion is reachable: the #12 year is imported, and the
 R0 live store exists.
+
+## Acceptance
+
+Accepted 2026-10-29. All builds used one release binary of main `4ac1de8`
+(M2's merge commit), clean: every manifest reads `code
+git:4ac1de89999988bd4e65c992b790a3eb989f78af` with no `-dirty`. Each build
+ran under an 8 GB memory cap, one after another. The year builds covered
+2025-10-01 00:00 UTC (inclusive) to 2026-10-01 00:00 UTC (exclusive),
+records = replay = `1759276800000..1790812800000` ms, `--source archive
+--streams aggTrades,metrics --trade-correction fold`. The live builds
+covered the R0 store's one cleanly ended run, `20261016T225606Z`, records =
+replay = `1792191366185..1792315774245` ms. Every number below is from
+these builds and the `measure_outcome_views` run on the first year build.
+
+**Criteria**, each checked against the printed reports:
+
+- **Provenance (checked before reading): met.** The year manifests read
+  `data 5d9e27f862ac54dd93cff904458e9ee92767d5105a9d13a144351cba069f224d`
+  and `engine 4c844593779da2e3-1`, those of ADR-054 and ADR-056; sampling
+  `conditional.sampling@1 2c71fff23e8b0415`, labeling
+  `conditional.labels@2 6f90bff079e746f2`. The live manifests read data
+  `9348410a56c0d05d469f3f7e78c1c405d80db333d9d34df694b45ce256caca2d`, the
+  R0 store's version, with the same engine, sampling and labeling.
+- **Four builds pass: met.** Year: 603 323 345 events, 0 rejections,
+  561 695 records and 561 695 labels, wall time 1:08:26 and 1:10:11 (h:mm:ss), peak
+  RSS 0.97 GB. Live: 2 042 225 events, 0 rejections, 2 185 records and
+  2 185 labels, wall time 1:24.80 and 1:27.74 (m:ss), peak RSS 6.2 GB.
+- **Content hash (criterion 1): met.** Each pair's `dataset.manifest`,
+  `contexts.parquet`, `outcomes.parquet` and `passages.parquet` are
+  byte-identical (`cmp`). Content hashes: year
+  `47d9cb621aff5d1c361308c9935d183a66ea91594102d269b437c8fce549a683`,
+  live `e14516f2163d41d6102ffb353ba193aa45c44d6ea92254b122fd5cc166ac2aa1`.
+- **`verify`: met.** PASS on all four datasets.
+- **Views (criterion 2): met.** `measure_outcome_views` passed (333 s,
+  peak RSS 6.4 GB): 0 model mismatches against the independent Rust model
+  of `labeled` and `outcome_summary`, and equal row counts and SHA-256
+  digests for every view at DuckDB 1 and 4 threads:
+
+  | View | Rows | SHA-256 (1 and 4 threads) |
+  |------|-----:|---------------------------|
+  | `contexts` | 561 695 | `99e37cd126cd2e851df3367f6e39c250962252962ec3c0f4a0deb2a1fec45a4e` |
+  | `outcomes` | 2 808 475 | `9e6108194334481362b60809d75537424b10193c7db78dbaf9b8f0dcd72d7946` |
+  | `passages` | 20 545 | `39202f04b3812ae89b9d231c781fda7473eda16b4f520ca850a6b49396866882` |
+  | `labeled` | 2 808 475 | `b73f293cf434de0471bb917e000ba6277883cff55145c5d4e178ce32b9f22cc0` |
+  | `outcome_summary` | 2 180 | `74f67665b8c893ce8ff7c139006363adde1eb60207d0322b513195cd6b065d26` |
+
+- **Reconciliation (asserted): met.** 561 695 contexts (525 599 baseline
+  + 36 096 trigger), 2 808 475 outcomes, and per horizon the counts of the
+  ADR-056 *Measurement* table:
+
+  | Horizon | neither | unavailable | end_of_data | clear baseline | clear trigger |
+  |---------|--------:|------------:|------------:|---------------:|--------------:|
+  | 5m | 43 925 | 74 | 5 | 94 333 | 25 519 |
+  | 15m | 44 593 | 224 | 17 | 33 758 | 22 828 |
+  | 1h | 56 372 | 899 | 62 | 8 678 | 16 654 |
+  | 4h | 68 977 | 3 670 | 245 | 2 185 | 9 815 |
+  | 1d | 56 383 | 22 724 | 1 548 | 365 | 3 604 |
+
+- **Blindness: met.** The tool printed only the counts above, the mismatch
+  count and the row counts and digests per view: no upper/lower share,
+  quantile or per-context outcome. Outcome reading stays with #28 and the
+  calibration slice of `docs/direction.md`.
