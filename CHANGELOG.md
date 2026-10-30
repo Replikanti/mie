@@ -12,6 +12,27 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
 
 ### Added
 
+- **Order-flow conditional study, pre-registered and blind (#28 M1/M2,
+  ADR-058, proposed).** ADR-058 fixes the whole study before any outcome
+  is read: four hypothesis pairs on identical samples (absorption,
+  continuation, no acceptance, failed breakout, plus the effort trigger as
+  a secondary pair), the effect against a baseline standardized by New
+  York hour of week × location bins, a paired circular block bootstrap
+  over days (56-day blocks, 28-day sensitivity, 10 000 resamples, seed
+  28), n_min from `docs/direction.md` T1 compared with independent units
+  (episodes, then horizon thinning, per cell), the readings, the splits
+  and the output. `docs/research/028-order-flow-interactions.sql` holds
+  the study queries; `crates/mie-cli/tests/order_flow_study.rs` holds the
+  ignored tool `measure_order_flow_study`, which asserts the dataset's
+  provenance, the published counts and 0 mismatches against an independent
+  twin before it prints the pre-registered tables, and its fixture tests.
+  `mie-adapter-duckdb` gains `create_views` and `select_tsv` for a study's
+  queries, and every connection now turns DuckDB's external access off
+  after creating the views, with only the verified dataset's four tables
+  allowed, so a study script can read no other dataset and write no file. `docs/research/README.md` sets the report conventions. The New
+  York clock moves from `season_measure.rs` to `tests/common/clock.rs`
+  unchanged. The study runs in M3; nothing was read here.
+
 - **ADR-057 is measured and accepted (#27 M3).** The D9 acceptance on
   main `4ac1de8`: `mie conditional build` twice on the #12 year and twice
   on the ADR-051 R0 live store gave byte-identical files and equal content
@@ -484,6 +505,17 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
 
 ### Changed
 
+- **Breaking: conditional outcome dataset format 2 (#28 M1, ADR-058 D2).**
+  A new table `effort.parquet` holds each record's three effort-vs-result
+  evaluations (5m, 15m, 1h: state, aggressor, effort, `effort_high`,
+  progress, the median and high moves, coverage, `active`), and `contexts`
+  gains `auction_side`, `cvd_utc_day`, `cvd_partial_start` and
+  `cvd_feed_gap`. The manifest reads `mie-outcome-dataset 2` with a
+  `file effort.parquet` line, `verify` checks three effort rows per record,
+  and the DuckDB views gain an `effort` view. Format-1 datasets are refused
+  and must be rebuilt with `mie conditional build`; `measure_outcome_views`
+  checks a rebuilt year against ADR-057's published digests on the
+  format-1 columns.
 - **Breaking: archive replays, experiments and the aggTrades kline check
   fold by default (ADR-050, #102).** Trades the `aggTrades` archive omits
   (2025-10-01 … 2026-06-09, ADR-047) are restored from imported `trades`

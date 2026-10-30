@@ -18,8 +18,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub mod bootstrap;
+pub mod clock;
 pub mod tapes;
 pub mod warm;
+pub mod year;
 
 /// 2026-10-06T00:00:00Z in ms.
 pub const D0: i64 = 1_791_244_800_000;

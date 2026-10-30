@@ -114,7 +114,7 @@ fn rebuilding_from_the_same_inputs_gives_the_same_dataset() {
     assert_eq!(files(&dir.path().join("a")), files(&dir.path().join("b")));
     assert!(
         a.starts_with(&format!(
-            "mie-outcome-dataset 1\n\
+            "mie-outcome-dataset 2\n\
              source archive binance-archive/BTCUSDT streams aggTrades correction none\n\
              replay {} {}\n\
              records {} {}\n",
@@ -159,6 +159,7 @@ fn rebuilding_from_the_same_inputs_gives_the_same_dataset() {
     assert_eq!(manifest.rows(TABLES[0]), Some(records));
     assert_eq!(manifest.rows(TABLES[1]), Some(5 * records));
     assert_eq!(manifest.rows(TABLES[2]), Some(passages));
+    assert_eq!(manifest.rows(TABLES[3]), Some(3 * records));
     assert_eq!(
         (manifest.events, manifest.rejections),
         (report.events, report.rejections)

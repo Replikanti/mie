@@ -1,5 +1,5 @@
-//! The three tables of the outcome dataset (ADR-057 D1, D2): their Arrow
-//! schemas, their rows and the enum names they store.
+//! The four tables of the outcome dataset (ADR-057 D1, D2; ADR-058 D2):
+//! their Arrow schemas, their rows and the enum names they store.
 //!
 //! Every enum is stored as its snake_case name, produced by an exhaustive
 //! `match` (or the domain's own `as_str`/`label`, which are), never by
@@ -11,12 +11,15 @@ use arrow_array::{
     TimestampMillisecondArray, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
+use mie_domain::candidate::effort::EffortResult;
 use mie_domain::conditional::label::{
     Censor, ForwardLabel, HorizonLabel, LabelProvenance, Passage, PassageLabel, Race,
 };
 use mie_domain::conditional::{ContextRecord, Sample};
-use mie_domain::location::{AuctionState, LevelKind};
-use mie_domain::num::Price;
+use mie_domain::event::Aggressor;
+use mie_domain::feature::{FeatureValue, catalog};
+use mie_domain::location::{AuctionState, LevelKind, Region};
+use mie_domain::num::{Price, Qty};
 use mie_domain::order::EventKind;
 use mie_domain::regime::RegimeLabel;
 use parquet::basic::Compression;
@@ -26,21 +29,23 @@ use std::sync::Arc;
 
 /// Key-value metadata key holding the dataset format version.
 pub(crate) const KEY_FORMAT: &str = "mie.outcome.format";
-/// Dataset format version written by this crate.
-pub(crate) const FORMAT_VERSION: &str = "1";
+/// Dataset format version written by this crate: 2 adds `effort.parquet`
+/// and the order-flow columns of `contexts` (ADR-058 D2).
+pub(crate) const FORMAT_VERSION: &str = "2";
 
 /// Most rows per row group (ADR-057 D2): DuckDB's `DEFAULT_ROW_GROUP_SIZE`,
 /// its own Parquet write default and the unit its Parquet scan hands to one
 /// thread.
 pub(crate) const ROW_GROUP_ROWS: usize = 122_880;
 
-/// Precision of every price column: the most decimal digits Parquet stores
-/// in an INT64 (ADR-057 D2).
+/// Precision of every price and quantity column: the most decimal digits
+/// Parquet stores in an INT64 (ADR-057 D2).
 pub(crate) const PRICE_PRECISION: u8 = 18;
-/// Scale of every price column: the ADR-027 price unit, 1e-8.
+/// Scale of every price and quantity column: the ADR-027 unit, 1e-8 (USDT
+/// for prices, BTC for quantities).
 pub(crate) const PRICE_SCALE: i8 = 8;
-/// The largest price magnitude, in units, that `Decimal128(18, 8)` holds.
-const PRICE_MAX_UNITS: i64 = 999_999_999_999_999_999;
+/// The largest magnitude, in units, that `Decimal128(18, 8)` holds.
+const DECIMAL_MAX_UNITS: i64 = 999_999_999_999_999_999;
 
 /// The names of the six run-provenance columns every table ends with
 /// (ADR-054 D5, ADR-055 D10), in order.
@@ -58,6 +63,12 @@ fn utc_ms() -> DataType {
 }
 
 fn price() -> DataType {
+    DataType::Decimal128(PRICE_PRECISION, PRICE_SCALE)
+}
+
+/// A quantity column: the same exact `Decimal128(18, 8)`, in the ADR-027
+/// quantity unit (ADR-058 D2).
+fn quantity() -> DataType {
     DataType::Decimal128(PRICE_PRECISION, PRICE_SCALE)
 }
 
@@ -96,6 +107,11 @@ pub(crate) fn contexts_schema() -> SchemaRef {
         Field::new("anchor", price(), false),
         Field::new("reference", price(), true),
         Field::new("atr_1h", price(), true),
+        // Format 2 (ADR-058 D2): the order-flow context the studies read.
+        Field::new("auction_side", DataType::Utf8, true),
+        Field::new("cvd_utc_day", quantity(), true),
+        Field::new("cvd_partial_start", DataType::Boolean, true),
+        Field::new("cvd_feed_gap", DataType::Boolean, true),
     ])
 }
 
@@ -133,6 +149,26 @@ pub(crate) fn passages_schema() -> SchemaRef {
         Field::new("at", utc_ms(), true),
         Field::new("censor_at", utc_ms(), true),
         Field::new("censor_reason", DataType::Utf8, true),
+    ])
+}
+
+/// The schema of `effort.parquet` (ADR-058 D2): one row per record and
+/// effort window, in `catalog::CANDIDATE_EFFORT_RESULT` order. Every column
+/// after `state` is NULL unless the value is ready.
+pub(crate) fn effort_schema() -> SchemaRef {
+    with_provenance(vec![
+        Field::new("record", DataType::UInt64, false),
+        Field::new("window", DataType::Utf8, false),
+        Field::new("state", DataType::Utf8, false),
+        Field::new("aggressor", DataType::Utf8, true),
+        Field::new("effort", quantity(), true),
+        Field::new("effort_high", quantity(), true),
+        Field::new("progress", price(), true),
+        Field::new("move_median", price(), true),
+        Field::new("move_high", price(), true),
+        Field::new("partial_start", DataType::Boolean, true),
+        Field::new("feed_gap", DataType::Boolean, true),
+        Field::new("active", DataType::Boolean, true),
     ])
 }
 
@@ -189,6 +225,33 @@ pub(crate) const fn auction_state_name(state: AuctionState) -> &'static str {
     }
 }
 
+/// The snake_case name of a value region (ADR-044 D8): the side of value
+/// an auction label refers to.
+pub(crate) const fn region_name(region: Region) -> &'static str {
+    match region {
+        Region::Below => "below",
+        Region::In => "in",
+        Region::Above => "above",
+    }
+}
+
+/// The snake_case name of a taker side (ADR-023).
+pub(crate) const fn aggressor_name(aggressor: Aggressor) -> &'static str {
+    match aggressor {
+        Aggressor::Buy => "buy",
+        Aggressor::Sell => "sell",
+    }
+}
+
+/// The name of a feature value's validity state (ADR-029).
+pub(crate) const fn value_state_name<T>(value: &FeatureValue<T>) -> &'static str {
+    match value {
+        FeatureValue::WarmingUp { .. } => "warming",
+        FeatureValue::Ready(_) => "ready",
+        FeatureValue::Unavailable { .. } => "unavailable",
+    }
+}
+
 /// The name of a race outcome (ADR-055 D4).
 pub(crate) const fn race_name(race: &Race) -> &'static str {
     match race {
@@ -239,10 +302,21 @@ fn location_bins(record: &ContextRecord) -> Option<(bool, bool)> {
 
 /// A price in units, checked against the `Decimal128(18, 8)` range.
 fn units(column: &str, price: Price) -> Result<i64, OutcomeError> {
-    let units = price.units();
-    if units.unsigned_abs() > PRICE_MAX_UNITS.unsigned_abs() {
+    checked(column, price.units(), &price)
+}
+
+/// A quantity in units, checked against the `Decimal128(18, 8)` range
+/// (ADR-058 D2). Never rounded.
+fn qty_units(column: &str, quantity: Qty) -> Result<i64, OutcomeError> {
+    checked(column, quantity.units(), &quantity)
+}
+
+/// `units` if `Decimal128(18, 8)` holds it, else [`OutcomeError::Range`]
+/// naming `column` and the value as `shown`.
+fn checked(column: &str, units: i64, shown: &dyn std::fmt::Display) -> Result<i64, OutcomeError> {
+    if units.unsigned_abs() > DECIMAL_MAX_UNITS.unsigned_abs() {
         return Err(OutcomeError::Range(format!(
-            "{column} {price} exceeds Decimal128({PRICE_PRECISION}, {PRICE_SCALE})"
+            "{column} {shown} exceeds Decimal128({PRICE_PRECISION}, {PRICE_SCALE})"
         )));
     }
     Ok(units)
@@ -277,6 +351,10 @@ pub(crate) struct ContextRow {
     pub(crate) anchor: i64,
     pub(crate) reference: Option<i64>,
     pub(crate) atr_1h: Option<i64>,
+    pub(crate) auction_side: Option<&'static str>,
+    pub(crate) cvd_utc_day: Option<i64>,
+    pub(crate) cvd_partial_start: Option<bool>,
+    pub(crate) cvd_feed_gap: Option<bool>,
 }
 
 impl ContextRow {
@@ -298,6 +376,8 @@ impl ContextRow {
         };
         let regime = record.bias.regime.ready();
         let bins = location_bins(record);
+        let auction = record.context.auction.ready();
+        let cvd = record.state.cvd_utc_day.ready();
         Ok(Self {
             record: number,
             decision_time: record.event.time.as_millis(),
@@ -320,14 +400,16 @@ impl ContextRow {
             levels_ready: bins.is_some(),
             at_value_edge: bins.map(|bins| bins.0),
             at_structural_extreme: bins.map(|bins| bins.1),
-            auction_state: record
-                .context
-                .auction
-                .ready()
-                .map(|status| auction_state_name(status.state)),
+            auction_state: auction.map(|status| auction_state_name(status.state)),
             anchor: units("anchor", record.context.anchor)?,
             reference: opt_units("reference", record.state.last_price.ready().copied())?,
             atr_1h: opt_units("atr_1h", record.state.atr.ready().copied())?,
+            auction_side: auction.and_then(|status| status.side).map(region_name),
+            cvd_utc_day: cvd
+                .map(|cvd| qty_units("cvd_utc_day", cvd.cvd))
+                .transpose()?,
+            cvd_partial_start: cvd.map(|cvd| cvd.coverage.partial_start),
+            cvd_feed_gap: cvd.map(|cvd| cvd.coverage.feed_gap),
         })
     }
 }
@@ -437,6 +519,64 @@ impl PassageRow {
     }
 }
 
+/// One row of `effort.parquet` (ADR-058 D2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EffortRow {
+    pub(crate) record: u64,
+    pub(crate) window: &'static str,
+    pub(crate) state: &'static str,
+    pub(crate) aggressor: Option<&'static str>,
+    pub(crate) effort: Option<i64>,
+    pub(crate) effort_high: Option<i64>,
+    pub(crate) progress: Option<i64>,
+    pub(crate) move_median: Option<i64>,
+    pub(crate) move_high: Option<i64>,
+    pub(crate) partial_start: Option<bool>,
+    pub(crate) feed_gap: Option<bool>,
+    pub(crate) active: Option<bool>,
+}
+
+impl EffortRow {
+    /// The rows of `record`, the `number`-th record: one per effort window,
+    /// in `catalog::CANDIDATE_EFFORT_RESULT` order, the order of
+    /// `StateSnapshot::effort`.
+    pub(crate) fn of(number: u64, record: &ContextRecord) -> Result<Vec<Self>, OutcomeError> {
+        catalog::CANDIDATE_EFFORT_RESULT
+            .iter()
+            .zip(&record.state.effort)
+            .map(|((timeframe, _), value)| Self::new(number, timeframe.label(), value))
+            .collect()
+    }
+
+    fn new(
+        number: u64,
+        window: &'static str,
+        value: &FeatureValue<EffortResult>,
+    ) -> Result<Self, OutcomeError> {
+        let ready = value.ready();
+        let qty = |column: &str, pick: fn(&EffortResult) -> Qty| {
+            ready.map(|r| qty_units(column, pick(r))).transpose()
+        };
+        let price = |column: &str, pick: fn(&EffortResult) -> Price| {
+            ready.map(|r| units(column, pick(r))).transpose()
+        };
+        Ok(Self {
+            record: number,
+            window,
+            state: value_state_name(value),
+            aggressor: ready.map(|r| aggressor_name(r.aggressor)),
+            effort: qty("effort", |r| r.effort)?,
+            effort_high: qty("effort_high", |r| r.effort_high)?,
+            progress: price("progress", |r| r.progress)?,
+            move_median: price("move_median", |r| r.move_median)?,
+            move_high: price("move_high", |r| r.move_high)?,
+            partial_start: ready.map(|r| r.coverage.partial_start),
+            feed_gap: ready.map(|r| r.coverage.feed_gap),
+            active: ready.map(|r| r.active),
+        })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Batches.
 
@@ -468,6 +608,7 @@ fn timestamps(values: impl Iterator<Item = Option<i64>>) -> ArrayRef {
     )
 }
 
+/// Exact `Decimal128(18, 8)` values in units: prices and quantities alike.
 fn prices(values: impl Iterator<Item = Option<i64>>) -> ArrayRef {
     let array = values
         .map(|units| units.map(i128::from))
@@ -530,6 +671,10 @@ impl Row for ContextRow {
             prices(rows.iter().map(|r| Some(r.anchor))),
             prices(rows.iter().map(|r| r.reference)),
             prices(rows.iter().map(|r| r.atr_1h)),
+            texts(rows.iter().map(|r| r.auction_side)),
+            prices(rows.iter().map(|r| r.cvd_utc_day)),
+            flags(rows.iter().map(|r| r.cvd_partial_start)),
+            flags(rows.iter().map(|r| r.cvd_feed_gap)),
         ]
     }
 }
@@ -581,6 +726,29 @@ impl Row for PassageRow {
             timestamps(rows.iter().map(|r| r.at)),
             timestamps(rows.iter().map(|r| r.censor_at)),
             texts(rows.iter().map(|r| r.censor_reason)),
+        ]
+    }
+}
+
+impl Row for EffortRow {
+    fn schema() -> SchemaRef {
+        effort_schema()
+    }
+
+    fn columns(rows: &[Self]) -> Vec<ArrayRef> {
+        vec![
+            records(rows.iter().map(|r| r.record)),
+            texts(rows.iter().map(|r| Some(r.window))),
+            texts(rows.iter().map(|r| Some(r.state))),
+            texts(rows.iter().map(|r| r.aggressor)),
+            prices(rows.iter().map(|r| r.effort)),
+            prices(rows.iter().map(|r| r.effort_high)),
+            prices(rows.iter().map(|r| r.progress)),
+            prices(rows.iter().map(|r| r.move_median)),
+            prices(rows.iter().map(|r| r.move_high)),
+            flags(rows.iter().map(|r| r.partial_start)),
+            flags(rows.iter().map(|r| r.feed_gap)),
+            flags(rows.iter().map(|r| r.active)),
         ]
     }
 }
@@ -694,16 +862,44 @@ mod tests {
     }
 
     #[test]
+    fn format_2_names_are_pinned() {
+        // Stored names of ADR-058 D2: a change here changes every dataset.
+        let regions: Vec<&str> = [Region::Below, Region::In, Region::Above]
+            .into_iter()
+            .map(region_name)
+            .collect();
+        assert_eq!(regions, ["below", "in", "above"]);
+        assert_eq!(aggressor_name(Aggressor::Buy), "buy");
+        assert_eq!(aggressor_name(Aggressor::Sell), "sell");
+        let warming: FeatureValue<()> = FeatureValue::WarmingUp {
+            observed: 0,
+            required: 1,
+        };
+        let unavailable: FeatureValue<()> = FeatureValue::Unavailable {
+            reason: mie_domain::feature::Unavailability::InputInvalid,
+        };
+        assert_eq!(value_state_name(&warming), "warming");
+        assert_eq!(value_state_name(&FeatureValue::Ready(())), "ready");
+        assert_eq!(value_state_name(&unavailable), "unavailable");
+        // The effort windows, in the order of `StateSnapshot::effort`.
+        let windows: Vec<&str> = catalog::CANDIDATE_EFFORT_RESULT
+            .iter()
+            .map(|(timeframe, _)| timeframe.label())
+            .collect();
+        assert_eq!(windows, ["5m", "15m", "1h"]);
+    }
+
+    #[test]
     fn prices_beyond_decimal_18_8_are_refused_never_rounded() {
-        let max = Price::from_units(PRICE_MAX_UNITS);
-        assert_eq!(units("x", max), Ok(PRICE_MAX_UNITS));
+        let max = Price::from_units(DECIMAL_MAX_UNITS);
+        assert_eq!(units("x", max), Ok(DECIMAL_MAX_UNITS));
         assert_eq!(
-            units("x", Price::from_units(-PRICE_MAX_UNITS)),
-            Ok(-PRICE_MAX_UNITS)
+            units("x", Price::from_units(-DECIMAL_MAX_UNITS)),
+            Ok(-DECIMAL_MAX_UNITS)
         );
         for over in [
-            PRICE_MAX_UNITS + 1,
-            -PRICE_MAX_UNITS - 1,
+            DECIMAL_MAX_UNITS + 1,
+            -DECIMAL_MAX_UNITS - 1,
             i64::MIN,
             i64::MAX,
         ] {
@@ -711,6 +907,25 @@ mod tests {
                 units("x", Price::from_units(over)),
                 Err(OutcomeError::Range(_))
             ));
+        }
+    }
+
+    #[test]
+    fn quantities_beyond_decimal_18_8_are_refused_never_rounded() {
+        assert_eq!(
+            qty_units("x", Qty::from_units(DECIMAL_MAX_UNITS)),
+            Ok(DECIMAL_MAX_UNITS)
+        );
+        assert_eq!(
+            qty_units("x", Qty::from_units(-DECIMAL_MAX_UNITS)),
+            Ok(-DECIMAL_MAX_UNITS)
+        );
+        for over in [DECIMAL_MAX_UNITS + 1, -DECIMAL_MAX_UNITS - 1, i64::MIN] {
+            let error = qty_units("cvd_utc_day", Qty::from_units(over)).unwrap_err();
+            assert!(
+                matches!(&error, OutcomeError::Range(detail) if detail.starts_with("cvd_utc_day ")),
+                "{error}"
+            );
         }
     }
 

@@ -3,7 +3,7 @@
 //! UTF-8, `\n` line ends, lines in this fixed order:
 //!
 //! ```text
-//! mie-outcome-dataset 1
+//! mie-outcome-dataset 2
 //! source <archive|live> <source>/<instrument> streams <list> correction <fold|none>
 //! replay <start ms> <end ms>
 //! records <start ms> <end ms>
@@ -15,6 +15,7 @@
 //! file contexts.parquet <rows> <sha256>
 //! file outcomes.parquet <rows> <sha256>
 //! file passages.parquet <rows> <sha256>
+//! file effort.parquet <rows> <sha256>
 //! content <sha256 of every byte before this line>
 //! code <code version>
 //! ```
@@ -22,14 +23,17 @@
 //! The code version is the one line outside the content hash: a rebuild on
 //! another commit that changes no versioned rule reproduces the hash. The
 //! parser is strict: it accepts exactly what [`OutcomeManifest::render`]
-//! writes.
+//! writes. Format 2 (ADR-058 D2) added the `effort.parquet` line; a format-1
+//! manifest is refused with a request to rebuild the dataset.
 
 use super::{OutcomeError, TABLES};
 use crate::manifest::sha256_hex;
 use mie_ports::raw::is_sha256_hex;
 
+/// The format name on the first line of every manifest.
+const FORMAT_NAME: &str = "mie-outcome-dataset";
 /// First line of every manifest: the format name and version.
-const HEADER: &str = "mie-outcome-dataset 1";
+const HEADER: &str = "mie-outcome-dataset 2";
 
 /// One table of a dataset as its manifest names it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,8 +169,16 @@ impl OutcomeManifest {
                 .map_err(|_| bad(format!("{text:?} is not a count")))
         };
 
-        let header = next("mie-outcome-dataset")?;
-        if header != "1" {
+        let header = next(FORMAT_NAME)?;
+        if header == "1" {
+            // ADR-058 D2: format 1 lacks the order-flow table and columns.
+            return Err(bad(
+                "format 1 dataset: this build reads format 2 (ADR-058); rebuild it \
+                 with `mie conditional build`"
+                    .to_owned(),
+            ));
+        }
+        if format!("{FORMAT_NAME} {header}") != HEADER {
             return Err(bad(format!("unknown format version {header:?}")));
         }
         let source = next("source")?.to_owned();
@@ -245,7 +257,7 @@ mod tests {
             rejections: 0,
             files: TABLES
                 .iter()
-                .zip([561_695, 2_808_475, 70_000])
+                .zip([561_695, 2_808_475, 70_000, 1_685_085])
                 .map(|(name, rows)| OutcomeFile {
                     name: (*name).to_owned(),
                     rows,
@@ -264,7 +276,7 @@ mod tests {
         let manifest = sample();
         let text = manifest.render();
         let expected = format!(
-            "mie-outcome-dataset 1\n\
+            "mie-outcome-dataset 2\n\
              source archive binance-archive/BTCUSDT streams aggTrades,metrics correction fold\n\
              replay 1759276800000 1790812800000\n\
              records 1759276800000 1790812800000\n\
@@ -276,6 +288,7 @@ mod tests {
              file contexts.parquet 561695 {h}\n\
              file outcomes.parquet 2808475 {h}\n\
              file passages.parquet 70000 {h}\n\
+             file effort.parquet 1685085 {h}\n\
              content {content}\n\
              code git:0123456789abcdef0123456789abcdef01234567\n",
             data = "5d".repeat(32),
@@ -301,13 +314,34 @@ mod tests {
     }
 
     #[test]
+    fn a_format_1_manifest_is_refused_with_a_rebuild_request() {
+        // A format-1 manifest: header 1 and no effort line (ADR-057 D3).
+        let text = sample().render();
+        let effort = text.find("file effort.parquet").unwrap();
+        let end = effort + text[effort..].find('\n').unwrap() + 1;
+        let format_1 = format!("{}{}", &text[..effort], &text[end..]).replacen(
+            "mie-outcome-dataset 2",
+            "mie-outcome-dataset 1",
+            1,
+        );
+        let error = OutcomeManifest::parse(&format_1).unwrap_err();
+        assert!(
+            matches!(&error, OutcomeError::Integrity(detail)
+                if detail.contains("format 1") && detail.contains("rebuild")),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn the_parser_is_strict() {
         let text = sample().render();
         let broken = [
-            text.replacen("mie-outcome-dataset 1", "mie-outcome-dataset 2", 1),
+            text.replacen("mie-outcome-dataset 2", "mie-outcome-dataset 3", 1),
+            text.replacen("mie-outcome-dataset 2", "mie-outcome-dataset 02", 1),
             text.replacen("replay 1759276800000", "replay 01759276800000", 1),
             text.replacen("events 603323345", "events +603323345", 1),
             text.replacen("file outcomes.parquet", "file passages.parquet", 1),
+            text.replacen("file effort.parquet", "file effortx.parquet", 1),
             text.replacen("\ncode ", "\ncode  ", 1),
             text.trim_end().to_owned(),
             format!("{text}extra\n"),

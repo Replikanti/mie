@@ -1,6 +1,6 @@
 //! The conditional outcome dataset: context records and their forward
-//! outcome labels as versioned, content-hashed Parquet (#27, ADR-057,
-//! proposed).
+//! outcome labels as versioned, content-hashed Parquet (#27, ADR-057;
+//! format 2 of #28, ADR-058, proposed).
 //!
 //! One dataset is one directory written by [`OutcomeWriter`] from one
 //! labeling run (`mie_app::conditional::label_window_started`):
@@ -11,14 +11,21 @@
 //!   D9), in record order and then in horizon order;
 //! - `passages.parquet`: one row per present `level` or `extreme` passage
 //!   of a trigger record (ADR-055 D8);
+//! - `effort.parquet`: one row per record and effort window (`5m`, `15m`,
+//!   `1h`), the record's effort-vs-result evaluations (ADR-051 D5) as the
+//!   order-flow studies read them (ADR-058 D2);
 //! - `dataset.manifest`: the provenance, the row count and SHA-256 of each
 //!   file, the content hash and the code version (D3).
 //!
-//! `record` joins the three tables; the ADR-055 D1 key (`decision_time`,
+//! Format 2 (ADR-058) also stores the auction side and the UTC-day CVD on
+//! `contexts`. A format-1 dataset is refused: it has to be rebuilt.
+//!
+//! `record` joins the four tables; the ADR-055 D1 key (`decision_time`,
 //! `event_kind`, `event_seq`, `ordinal`) stays on `contexts`. Every row
 //! carries the run's provenance (ADR-054 D5, ADR-055 D10) in six constant
-//! columns. Prices are `Decimal128(18, 8)`, exact in the ADR-027 unit, and
-//! times `Timestamp(ms, "UTC")`; enums are their snake_case names.
+//! columns. Prices and quantities are `Decimal128(18, 8)`, exact in their
+//! ADR-027 units, and times `Timestamp(ms, "UTC")`; enums are their
+//! snake_case names.
 //!
 //! The manifest is written last, after every table is sealed (fsynced,
 //! read-only, renamed from a hidden temp name): a directory is a dataset if
@@ -50,7 +57,12 @@ use std::path::Path;
 pub const MANIFEST_FILE: &str = "dataset.manifest";
 
 /// The tables of a dataset, in manifest order.
-pub const TABLES: [&str; 3] = ["contexts.parquet", "outcomes.parquet", "passages.parquet"];
+pub const TABLES: [&str; 4] = [
+    "contexts.parquet",
+    "outcomes.parquet",
+    "passages.parquet",
+    "effort.parquet",
+];
 
 /// Why an outcome dataset could not be written or read.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,8 +73,8 @@ pub enum OutcomeError {
     /// the next unlabeled record, a record left without a label, a header
     /// that cannot be written on one manifest line.
     Contract(String),
-    /// A value does not fit its column: a price beyond `Decimal128(18, 8)`.
-    /// Never rounded.
+    /// A value does not fit its column: a price or quantity beyond
+    /// `Decimal128(18, 8)`. Never rounded.
     Range(String),
     /// The directory holds no `dataset.manifest`: the build did not finish.
     Incomplete(String),

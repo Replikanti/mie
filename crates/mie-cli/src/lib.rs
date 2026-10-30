@@ -20,7 +20,8 @@
 //!   `mie conditional verify <dir>`, `mie conditional query <dir> <view>`
 //!   and `mie conditional views` ([`conditional`]): builds the conditional
 //!   outcome dataset of a replay, verifies one, prints one of its DuckDB
-//!   views, or prints the view definitions (#27, ADR-057).
+//!   views, or prints the view definitions (#27, ADR-057; format 2 of #28,
+//!   ADR-058).
 //!
 //! The real network connectors are constructed in `main.rs` and nowhere
 //! else; tests drive [`ingest::run`] with fakes.

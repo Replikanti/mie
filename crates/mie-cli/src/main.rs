@@ -160,11 +160,12 @@ USAGE:
                           --out <dir> [--source live|archive]
                           [--streams <a,b,...>] [--trade-correction fold|none]
                           [--replay-from <ms|YYYY-MM-DD>] [--replay-to <ms|YYYY-MM-DD>]
-        Build the conditional outcome dataset (ADR-057): replay the source
-        (as mie replay; history is refused), take the context records of
-        [from, to) and label them under the current labeling, and write
-        contexts.parquet, outcomes.parquet and passages.parquet plus
-        dataset.manifest into <dir>, which must not exist. The replay
+        Build the conditional outcome dataset (ADR-057, format 2 of
+        ADR-058): replay the source (as mie replay; history is refused),
+        take the context records of [from, to) and label them under the
+        current labeling, and write contexts.parquet, outcomes.parquet,
+        passages.parquet and effort.parquet plus dataset.manifest into
+        <dir>, which must not exist. The replay
         window defaults to [from, to); --replay-from and --replay-to widen
         it, so earlier events warm the engine up and later ones give the
         last records their lookahead (labels the data ends before are
@@ -179,14 +180,16 @@ USAGE:
     mie conditional verify <dir>
         Verify an outcome dataset: the manifest's content hash, each file's
         SHA-256, rows, format and schema. Prints the manifest and PASS
-        (exit 0), or FAIL: <reason> (exit 1).
+        (exit 0), or FAIL: <reason> (exit 1). A format-1 dataset fails:
+        rebuild it.
 
     mie conditional query <dir> <view> [--n-min <n>]
         Verify an outcome dataset as verify does, then print one of its
         DuckDB views (ADR-057 D7) as TSV, ordered by the view's key columns
-        (exit 0): contexts, outcomes, passages (the tables), labeled (one
-        row per record and horizon with the excursions in barrier offsets,
-        the time to the race, level_within and extreme_vs_opposite) or
+        (exit 0): contexts, outcomes, passages, effort (the tables),
+        labeled (one row per record and horizon with the excursions in
+        barrier offsets, the time to the race, level_within and
+        extreme_vs_opposite) or
         outcome_summary (distributions per horizon and per every
         combination of trigger, regime and location, plus trigger
         families), which requires --n-min, the minimum clear-sample count

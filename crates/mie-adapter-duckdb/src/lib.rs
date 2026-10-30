@@ -1,16 +1,21 @@
 //! The research views over one conditional outcome dataset (#27, ADR-004,
-//! ADR-057 D7/D8, proposed).
+//! ADR-057 D7/D8; format 2, ADR-058 D2).
 //!
 //! [`OutcomeViews::open`] opens an in-memory DuckDB, the bundled engine
 //! `Cargo.lock` pins (ADR-057 D8), and creates the views of
-//! [`VIEWS_SQL`] over the dataset directory's three Parquet files:
+//! [`VIEWS_SQL`] over the dataset directory's four Parquet files:
 //!
-//! - `contexts`, `outcomes`, `passages`: the tables as written (ADR-057 D1);
+//! - `contexts`, `outcomes`, `passages`, `effort`: the tables as written
+//!   (ADR-057 D1, ADR-058 D2);
 //! - `labeled`: one row per record and horizon, with the trigger group, the
 //!   location bins, the excursions in barrier offsets, the time to the race
 //!   and the two passage compositions of ADR-055 D8;
 //! - `outcome_summary(n_min)`: the distributions per horizon and per every
 //!   combination of trigger id, regime and location, plus a family branch.
+//!
+//! A study adds its own views over these ([`OutcomeViews::create_views`],
+//! the committed queries under `docs/research/`, ADR-058) and reads them
+//! with [`OutcomeViews::select_tsv`].
 //!
 //! The adapter reads files by path and knows no internal crate: the caller
 //! verifies the dataset first (`mie_adapter_parquet::outcome::
@@ -43,10 +48,14 @@ pub const VIEWS_SQL: &str = include_str!("views.sql");
 
 /// The views [`OutcomeViews::query_tsv`] serves, each with the columns its
 /// output is ordered by (the view's own `ORDER BY`).
-pub const VIEWS: [(&str, &str); 5] = [
+pub const VIEWS: [(&str, &str); 6] = [
     ("contexts", "record"),
     ("outcomes", "record, horizon_ms"),
     ("passages", "record, target DESC"),
+    (
+        "effort",
+        "record, list_position(['5m', '15m', '1h'], \"window\")",
+    ),
     ("labeled", "record, horizon_ms"),
     (
         "outcome_summary",
@@ -58,7 +67,12 @@ pub const VIEWS: [(&str, &str); 5] = [
 const SUMMARY: &str = "outcome_summary";
 
 /// The dataset tables the views read.
-const TABLES: [&str; 3] = ["contexts.parquet", "outcomes.parquet", "passages.parquet"];
+const TABLES: [&str; 4] = [
+    "contexts.parquet",
+    "outcomes.parquet",
+    "passages.parquet",
+    "effort.parquet",
+];
 
 /// Why the views could not be opened or queried.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,7 +127,7 @@ impl fmt::Debug for OutcomeViews {
 impl OutcomeViews {
     /// Opens an in-memory DuckDB without extension autoinstall or autoload
     /// and creates the views over the tables in `dir`. The caller verifies
-    /// the dataset first; this only checks that the three tables exist.
+    /// the dataset first; this only checks that the four tables exist.
     ///
     /// # Errors
     ///
@@ -150,6 +164,19 @@ impl OutcomeViews {
         let connection = Connection::open_in_memory_with_flags(config)?;
         connection.execute_batch(&format!("SET VARIABLE mie_dataset = {literal};"))?;
         connection.execute_batch(VIEWS_SQL)?;
+        // From here on the connection reaches no file but the four tables
+        // of the verified dataset (ADR-058 Approach): a study script cannot
+        // read another dataset (a hold-out, a live store) or write a file.
+        // DuckDB refuses to turn external access back on, or to widen the
+        // allowed paths, while it is off.
+        let mut tables = Vec::with_capacity(TABLES.len());
+        for table in TABLES {
+            tables.push(sql_literal(&canonical.join(table))?);
+        }
+        connection.execute_batch(&format!(
+            "SET allowed_paths = [{}]; SET enable_external_access = false;",
+            tables.join(", ")
+        ))?;
         Ok(Self { connection })
     }
 
@@ -211,6 +238,33 @@ impl OutcomeViews {
         self.write_tsv(&format!("SELECT * FROM {source} ORDER BY {order}"), out)
     }
 
+    /// Runs `sql`, statements that define further views or macros over
+    /// these views: a study's committed queries (ADR-058). The connection
+    /// is in memory, links no extension but Parquet, and has external
+    /// access off with only the dataset's four tables allowed
+    /// ([`open`](Self::open)): a script that reads or writes any other file
+    /// fails with [`ViewsError::Engine`].
+    ///
+    /// # Errors
+    ///
+    /// [`ViewsError::Engine`] when DuckDB fails.
+    pub fn create_views(&self, sql: &str) -> Result<(), ViewsError> {
+        Ok(self.connection.execute_batch(sql)?)
+    }
+
+    /// Writes the result of the query `sql` as TSV to `out`, in the form
+    /// of [`query_tsv`](Self::query_tsv): a header line, then one line per
+    /// row, in the order the query's own `ORDER BY` gives (the caller's
+    /// responsibility; without one, DuckDB's order may depend on its
+    /// threads). Returns the row count.
+    ///
+    /// # Errors
+    ///
+    /// As for [`query_tsv`](Self::query_tsv), without the request checks.
+    pub fn select_tsv(&self, sql: &str, out: &mut dyn Write) -> Result<u64, ViewsError> {
+        self.write_tsv(sql, out)
+    }
+
     /// Runs `sql` and writes its result as TSV. Returns the row count.
     fn write_tsv(&self, sql: &str, out: &mut dyn Write) -> Result<u64, ViewsError> {
         let mut statement = self.connection.prepare(sql)?;
@@ -239,13 +293,6 @@ impl OutcomeViews {
         }
         out.flush().map_err(io)?;
         Ok(count)
-    }
-
-    /// Runs `sql` for its effect. Tests only: the views' own statements
-    /// and the extension refusal.
-    #[cfg(test)]
-    fn execute(&self, sql: &str) -> Result<(), ViewsError> {
-        Ok(self.connection.execute_batch(sql)?)
     }
 }
 

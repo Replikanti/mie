@@ -11,7 +11,9 @@
 //! offset, excursion ratios, time to event, `level_within`,
 //! `extreme_vs_opposite`) and every row of `outcome_summary(n_min)`, printed
 //! as `OutcomeViews::query_tsv` prints values, and compares them line by
-//! line with what DuckDB returns.
+//! line with what DuckDB returns. The input also carries the format-2
+//! order-flow columns and effort rows (ADR-058 D2), which the base views
+//! must return unchanged.
 //!
 //! - **Fixture tests** build a dataset with `OutcomeWriter` from hand-built
 //!   records whose labels hit the edge cases of the D7 case tables (both
@@ -26,7 +28,11 @@
 //!   dataset in `MIE_OUTCOME_DATASET`, verifies it, and asserts 0 model
 //!   mismatches, equal view digests at 1 and 4 threads, and the
 //!   reconciliation with the counts ADR-054 and ADR-056 published for the
-//!   #12 year. It is blind: it prints only those counts, the mismatch count
+//!   #12 year. On a format-2 dataset (ADR-058 D2) it also asserts the view
+//!   digests ADR-057 *Acceptance* published, with `contexts` and `labeled`
+//!   projected onto their format-1 columns, so the rebuilt year is shown to
+//!   hold the accepted content unchanged, and three `effort` rows per
+//!   context. It is blind: it prints only those counts, the mismatch count
 //!   and a row count and SHA-256 digest per view, never a share, a quantile
 //!   or a per-context outcome.
 //!
@@ -39,10 +45,12 @@ mod common;
 
 use common::TempDir;
 use common::tapes::Lcg;
+use common::year::{YEAR_CONTEXTS, YEAR_HORIZONS};
 use mie_adapter_duckdb::{OutcomeViews, VIEWS, VIEWS_SQL};
 use mie_adapter_parquet::outcome::{OutcomeHeader, OutcomeWriter};
 use mie_cli::conditional;
 use mie_domain::bars::{Coverage, Timeframe};
+use mie_domain::candidate::effort::EffortResult;
 use mie_domain::candidate::{ContextLevel, ContextLevels, LocationContext};
 use mie_domain::conditional::label::{
     Barriers, Censor, CensorReason, Excursion, ForwardLabel, HORIZONS, HorizonLabel,
@@ -51,9 +59,11 @@ use mie_domain::conditional::label::{
 use mie_domain::conditional::{
     ContextProvenance, ContextRecord, Episode, EpisodeId, Sample, StateSnapshot,
 };
-use mie_domain::feature::{FeatureDefinition, FeatureValue, catalog};
-use mie_domain::location::LevelKind;
-use mie_domain::num::Price;
+use mie_domain::event::Aggressor;
+use mie_domain::feature::{FeatureDefinition, FeatureValue, Unavailability, catalog};
+use mie_domain::flow::DayCvd;
+use mie_domain::location::{AuctionState, AuctionStatus, LevelKind, Origin, Position, Region};
+use mie_domain::num::{Price, Qty};
 use mie_domain::order::{CanonicalKey, EventKind};
 use mie_domain::regime::{AtrPercentile, Regime, RegimeLabel};
 use mie_domain::research::DataVersion;
@@ -382,6 +392,103 @@ fn races(reference: i64, races: [R5; 5]) -> [HorizonLabel; 5] {
     std::array::from_fn(|i| horizon(i, reference, races[i], None, (50, 30), true))
 }
 
+/// The columns format 2 adds to `contexts`, after `atr_1h` (ADR-058 D2).
+const FORMAT2_CONTEXT_COLUMNS: [&str; 4] = [
+    "auction_side",
+    "cvd_utc_day",
+    "cvd_partial_start",
+    "cvd_feed_gap",
+];
+
+/// The `contexts` columns of format 1 (ADR-057 D1), in order.
+const FORMAT1_CONTEXTS: [&str; 28] = [
+    "record",
+    "decision_time",
+    "event_kind",
+    "event_seq",
+    "ordinal",
+    "sample",
+    "minute_end",
+    "trigger",
+    "trigger_family",
+    "episode",
+    "opener",
+    "truncated",
+    "bridge",
+    "regime",
+    "regime_percentile",
+    "levels_ready",
+    "at_value_edge",
+    "at_structural_extreme",
+    "auction_state",
+    "anchor",
+    "reference",
+    "atr_1h",
+    "data_version",
+    "engine",
+    "sampling",
+    "sampling_fingerprint",
+    "labeling",
+    "labeling_fingerprint",
+];
+
+/// The `labeled` columns over a format-1 dataset (ADR-057 D7), in order.
+const FORMAT1_LABELED: [&str; 53] = [
+    "record",
+    "decision_time",
+    "event_kind",
+    "event_seq",
+    "ordinal",
+    "sample",
+    "minute_end",
+    "trigger",
+    "trigger_family",
+    "episode",
+    "opener",
+    "truncated",
+    "bridge",
+    "regime",
+    "regime_percentile",
+    "levels_ready",
+    "at_value_edge",
+    "at_structural_extreme",
+    "auction_state",
+    "anchor",
+    "reference",
+    "atr_1h",
+    "horizon",
+    "horizon_ms",
+    "clear",
+    "lower",
+    "upper",
+    "race",
+    "race_at",
+    "same_ms",
+    "race_censor_at",
+    "race_censor_reason",
+    "up",
+    "up_at",
+    "down",
+    "down_at",
+    "last",
+    "censor_at",
+    "censor_reason",
+    "level_price",
+    "level_passage",
+    "extreme_price",
+    "extreme_passage",
+    "group_trigger",
+    "group_family",
+    "group_regime",
+    "location_bins",
+    "offset",
+    "up_x",
+    "down_x",
+    "time_to_event_ms",
+    "level_within",
+    "extreme_vs_opposite",
+];
+
 /// The hand-built records, each named for the expectations in
 /// [`edge_cases_follow_the_case_tables`]. Decisions are one minute apart;
 /// every passage time is relative to its record's decision `d`.
@@ -652,12 +759,9 @@ fn random_records(fixture: &mut Fixture, events: usize, seed: u64) {
             } else {
                 (None, None)
             };
-            fixture.push(
-                record(event, kind, regime, levels, reference),
-                horizons,
-                level,
-                extreme,
-            );
+            let mut record = record(event, kind, regime, levels, reference);
+            random_flow(&mut lcg, &mut record);
+            fixture.push(record, horizons, level, extreme);
         }
     }
 }
@@ -665,6 +769,85 @@ fn random_records(fixture: &mut Fixture, events: usize, seed: u64) {
 /// A time in `[d, d + span]` on the 30 s grid from `d`.
 fn grid(lcg: &mut Lcg, d: i64, span: i64) -> i64 {
     d + 30_000 * lcg.below(span as u64 / 30_000 + 1)
+}
+
+/// Random order-flow values (ADR-058 D2) for `record`: each effort window
+/// ready (with random aggressor, values and coverage), warming or
+/// unavailable; the UTC-day CVD likewise; the auction ready in a random
+/// state with or without a side, or warming.
+fn random_flow(lcg: &mut Lcg, record: &mut ContextRecord) {
+    let coverage = |lcg: &mut Lcg| Coverage {
+        partial_start: lcg.below(6) == 0,
+        feed_gap: lcg.below(6) == 0,
+    };
+    for (position, (timeframe, definition)) in catalog::CANDIDATE_EFFORT_RESULT.iter().enumerate() {
+        record.state.effort[position] = match lcg.below(5) {
+            0 => warming(),
+            1 => FeatureValue::Unavailable {
+                reason: Unavailability::InputInvalid,
+            },
+            _ => FeatureValue::Ready(EffortResult {
+                feature: definition.key,
+                timeframe: *timeframe,
+                end: record.event.time,
+                aggressor: if lcg.below(2) == 0 {
+                    Aggressor::Buy
+                } else {
+                    Aggressor::Sell
+                },
+                effort: Qty::from_units(lcg.below(1_000) * 1_000_000),
+                progress: p((lcg.below(201) - 100) * USDT),
+                effort_high: Qty::from_units(500_000_000),
+                effort_median: Qty::from_units(200_000_000),
+                move_high: p(60 * USDT),
+                move_median: p(10 * USDT),
+                coverage: coverage(lcg),
+                active: lcg.below(2) == 0,
+            }),
+        };
+    }
+    record.state.cvd_utc_day = match lcg.below(4) {
+        0 => warming(),
+        _ => FeatureValue::Ready(DayCvd {
+            feature: catalog::FLOW_CVD_UTC_DAY_V1.key,
+            day_open: t(record.event.time.as_millis().div_euclid(86_400_000) * 86_400_000),
+            cvd: Qty::from_units((lcg.below(2_001) - 1_000) * 1_000_000),
+            coverage: coverage(lcg),
+        }),
+    };
+    let states = AuctionState::ALL;
+    record.context.auction = match lcg.below(8) {
+        0 => warming(),
+        _ => {
+            let state = states[lcg.below(states.len() as u64) as usize];
+            let side = [
+                None,
+                Some(Region::Above),
+                Some(Region::In),
+                Some(Region::Below),
+            ][lcg.below(4) as usize];
+            FeatureValue::Ready(AuctionStatus {
+                feature: catalog::LOCATION_AUCTION_PRIOR_DAY_V1.key,
+                reference_start: t(T0 - 86_400_000),
+                val: p(R - 500 * USDT),
+                vah: p(R + 500 * USDT),
+                state,
+                side,
+                accepted: Region::In,
+                origin: Origin::Start,
+                position: Position::In,
+                probe: None,
+                failure: None,
+                last_close: p(R),
+                bar_end: record.event.time,
+                known_at: record.event.time,
+                coverage: Coverage {
+                    partial_start: false,
+                    feed_gap: false,
+                },
+            })
+        }
+    };
 }
 
 /// The edge cases followed by `events` random decisions.
@@ -733,6 +916,22 @@ struct MOutcome {
     censor_reason: Option<String>,
 }
 
+/// An effort row, as stored (ADR-058 D2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MEffort {
+    window: String,
+    state: String,
+    aggressor: Option<String>,
+    effort: Option<i64>,
+    effort_high: Option<i64>,
+    progress: Option<i64>,
+    move_median: Option<i64>,
+    move_high: Option<i64>,
+    partial_start: Option<bool>,
+    feed_gap: Option<bool>,
+    active: Option<bool>,
+}
+
 /// A context record with its outcomes and passages, as stored.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MRecord {
@@ -748,6 +947,12 @@ struct MRecord {
     value_edge: Option<bool>,
     structural: Option<bool>,
     reference: Option<i64>,
+    auction_state: Option<String>,
+    auction_side: Option<String>,
+    cvd: Option<i64>,
+    cvd_partial_start: Option<bool>,
+    cvd_feed_gap: Option<bool>,
+    effort: Vec<MEffort>,
     level: Option<MPassage>,
     extreme: Option<MPassage>,
     outcomes: Vec<MOutcome>,
@@ -790,6 +995,53 @@ fn m_passage(label: Option<&PassageLabel>) -> Option<MPassage> {
         at,
         censor_at,
     })
+}
+
+const fn auction_name(state: AuctionState) -> &'static str {
+    match state {
+        AuctionState::InsideValue => "inside_value",
+        AuctionState::AtValueEdge => "at_value_edge",
+        AuctionState::OutsideValue => "outside_value",
+        AuctionState::Breakout => "breakout",
+        AuctionState::FailedBreakout => "failed_breakout",
+        AuctionState::FailedReclaim => "failed_reclaim",
+        AuctionState::Acceptance => "acceptance",
+    }
+}
+
+/// The effort rows of `record` as ADR-058 D2 stores them.
+fn m_effort(record: &ContextRecord) -> Vec<MEffort> {
+    ["5m", "15m", "1h"]
+        .iter()
+        .zip(&record.state.effort)
+        .map(|(window, value)| {
+            let ready = value.ready();
+            MEffort {
+                window: (*window).to_owned(),
+                state: match value {
+                    FeatureValue::WarmingUp { .. } => "warming",
+                    FeatureValue::Ready(_) => "ready",
+                    FeatureValue::Unavailable { .. } => "unavailable",
+                }
+                .to_owned(),
+                aggressor: ready.map(|r| {
+                    match r.aggressor {
+                        Aggressor::Buy => "buy",
+                        Aggressor::Sell => "sell",
+                    }
+                    .to_owned()
+                }),
+                effort: ready.map(|r| r.effort.units()),
+                effort_high: ready.map(|r| r.effort_high.units()),
+                progress: ready.map(|r| r.progress.units()),
+                move_median: ready.map(|r| r.move_median.units()),
+                move_high: ready.map(|r| r.move_high.units()),
+                partial_start: ready.map(|r| r.coverage.partial_start),
+                feed_gap: ready.map(|r| r.coverage.feed_gap),
+                active: ready.map(|r| r.active),
+            }
+        })
+        .collect()
 }
 
 /// The model input from the records and labels handed to the writer.
@@ -836,6 +1088,36 @@ fn from_fixture(fixture: &Fixture) -> Vec<MRecord> {
                 value_edge: bins.map(|b| b.0),
                 structural: bins.map(|b| b.1),
                 reference: record.state.last_price.ready().map(|price| price.units()),
+                auction_state: record
+                    .context
+                    .auction
+                    .ready()
+                    .map(|a| auction_name(a.state).to_owned()),
+                auction_side: record
+                    .context
+                    .auction
+                    .ready()
+                    .and_then(|a| a.side)
+                    .map(|side| {
+                        match side {
+                            Region::Above => "above",
+                            Region::In => "in",
+                            Region::Below => "below",
+                        }
+                        .to_owned()
+                    }),
+                cvd: record.state.cvd_utc_day.ready().map(|c| c.cvd.units()),
+                cvd_partial_start: record
+                    .state
+                    .cvd_utc_day
+                    .ready()
+                    .map(|c| c.coverage.partial_start),
+                cvd_feed_gap: record
+                    .state
+                    .cvd_utc_day
+                    .ready()
+                    .map(|c| c.coverage.feed_gap),
+                effort: m_effort(record),
                 level: m_passage(label.level.as_ref()),
                 extreme: m_passage(label.extreme.as_ref()),
                 outcomes: label
@@ -979,6 +1261,12 @@ fn from_views(views: &OutcomeViews) -> Vec<MRecord> {
             value_edge: opt_bool(get("at_value_edge")),
             structural: opt_bool(get("at_structural_extreme")),
             reference: opt_units(get("reference")),
+            auction_state: opt(get("auction_state")),
+            auction_side: opt(get("auction_side")),
+            cvd: opt_units(get("cvd_utc_day")),
+            cvd_partial_start: opt_bool(get("cvd_partial_start")),
+            cvd_feed_gap: opt_bool(get("cvd_feed_gap")),
+            effort: Vec::new(),
             level: None,
             extreme: None,
             outcomes: Vec::new(),
@@ -1004,6 +1292,22 @@ fn from_views(views: &OutcomeViews) -> Vec<MRecord> {
             up: units(&get("up")),
             down: units(&get("down")),
             censor_reason: opt(get("censor_reason")),
+        });
+    });
+    each_row(views, "effort", None, |get| {
+        let record: usize = get("record").parse().unwrap();
+        records[record].effort.push(MEffort {
+            window: get("window"),
+            state: get("state"),
+            aggressor: opt(get("aggressor")),
+            effort: opt_units(get("effort")),
+            effort_high: opt_units(get("effort_high")),
+            progress: opt_units(get("progress")),
+            move_median: opt_units(get("move_median")),
+            move_high: opt_units(get("move_high")),
+            partial_start: opt_bool(get("partial_start")),
+            feed_gap: opt_bool(get("feed_gap")),
+            active: opt_bool(get("active")),
         });
     });
     each_row(views, "passages", None, |get| {
@@ -1735,63 +2039,40 @@ fn the_columns_carry_the_brief_section_12_outputs() {
             .map(str::to_owned)
             .collect::<Vec<_>>()
     };
+    // Format 2 inserts its context columns after `atr_1h` (ADR-058 D2);
+    // without them each view is its format-1 projection.
+    let with_format_2 = |format_1: &[&str]| {
+        let at = format_1.iter().position(|c| *c == "atr_1h").unwrap() + 1;
+        let mut columns: Vec<String> = format_1.iter().map(|c| (*c).to_owned()).collect();
+        for (k, column) in FORMAT2_CONTEXT_COLUMNS.iter().enumerate() {
+            columns.insert(at + k, (*column).to_owned());
+        }
+        columns
+    };
+    assert_eq!(header("contexts", None), with_format_2(&FORMAT1_CONTEXTS));
     let labeled = header("labeled", None);
+    assert_eq!(labeled, with_format_2(&FORMAT1_LABELED));
     assert_eq!(
-        labeled,
+        header("effort", None),
         [
             "record",
-            "decision_time",
-            "event_kind",
-            "event_seq",
-            "ordinal",
-            "sample",
-            "minute_end",
-            "trigger",
-            "trigger_family",
-            "episode",
-            "opener",
-            "truncated",
-            "bridge",
-            "regime",
-            "regime_percentile",
-            "levels_ready",
-            "at_value_edge",
-            "at_structural_extreme",
-            "auction_state",
-            "anchor",
-            "reference",
-            "atr_1h",
-            "horizon",
-            "horizon_ms",
-            "clear",
-            "lower",
-            "upper",
-            "race",
-            "race_at",
-            "same_ms",
-            "race_censor_at",
-            "race_censor_reason",
-            "up",
-            "up_at",
-            "down",
-            "down_at",
-            "last",
-            "censor_at",
-            "censor_reason",
-            "level_price",
-            "level_passage",
-            "extreme_price",
-            "extreme_passage",
-            "group_trigger",
-            "group_family",
-            "group_regime",
-            "location_bins",
-            "offset",
-            "up_x",
-            "down_x",
-            "time_to_event_ms",
-            "level_within",
-            "extreme_vs_opposite",
+            "window",
+            "state",
+            "aggressor",
+            "effort",
+            "effort_high",
+            "progress",
+            "move_median",
+            "move_high",
+            "partial_start",
+            "feed_gap",
+            "active",
+            "data_version",
+            "engine",
+            "sampling",
+            "sampling_fingerprint",
+            "labeling",
+            "labeling_fingerprint",
         ]
         .map(str::to_owned)
     );
@@ -1832,6 +2113,40 @@ fn the_columns_carry_the_brief_section_12_outputs() {
         }
     }
     assert!(summary.iter().any(|c| c == "meets_min_sample"));
+}
+
+#[test]
+fn the_format_1_projection_drops_exactly_the_format_2_columns() {
+    // What `measure_outcome_views` hashes against ADR-057's digests: each
+    // view's TSV without the four format-2 `contexts` columns.
+    let built = built(200);
+    let views = OutcomeViews::open(&built.dir).unwrap();
+    for view in [
+        "contexts",
+        "labeled",
+        "outcomes",
+        "passages",
+        "outcome_summary",
+    ] {
+        let full = tsv(&views, view, (view == "outcome_summary").then_some(1), 1);
+        let header: Vec<&str> = full.lines().next().unwrap().split('\t').collect();
+        let keep: Vec<usize> = (0..header.len())
+            .filter(|i| !FORMAT2_CONTEXT_COLUMNS.contains(&header[*i]))
+            .collect();
+        let expected: String = full
+            .lines()
+            .map(|line| {
+                let cells: Vec<&str> = line.split('\t').collect();
+                let kept: Vec<&str> = keep.iter().map(|i| cells[*i]).collect();
+                format!("{}\n", kept.join("\t"))
+            })
+            .collect();
+        let mut projected = Vec::new();
+        views
+            .select_tsv(&format_1_query(view, 1), &mut projected)
+            .unwrap();
+        assert_eq!(String::from_utf8(projected).unwrap(), expected, "{view}");
+    }
 }
 
 #[test]
@@ -1917,19 +2232,69 @@ fn query_reads_the_verified_directory_not_a_rewritten_one() {
 // ---------------------------------------------------------------------------
 // The M3 measurement (ADR-057 D9).
 
-/// The published counts of the #12 year (ADR-054 *Acceptance*, ADR-056
-/// *Measurement*): contexts, baseline, trigger.
-const YEAR_CONTEXTS: (u64, u64, u64) = (561_695, 525_599, 36_096);
-
-/// Per horizon: `neither`, `unavailable`, windows censored `end_of_data`,
-/// clear baseline, clear trigger (ADR-056 *Measurement*, the year table).
-const YEAR_HORIZONS: [(&str, [u64; 5]); 5] = [
-    ("5m", [43_925, 74, 5, 94_333, 25_519]),
-    ("15m", [44_593, 224, 17, 33_758, 22_828]),
-    ("1h", [56_372, 899, 62, 8_678, 16_654]),
-    ("4h", [68_977, 3_670, 245, 2_185, 9_815]),
-    ("1d", [56_383, 22_724, 1_548, 365, 3_604]),
+/// The view row counts and digests ADR-057 *Acceptance* published for the
+/// #12 year (DuckDB 1 and 4 threads, `outcome_summary(1)`). `contexts` and
+/// `labeled` are compared as their format-1 projections.
+const ADR057_DIGESTS: [(&str, u64, &str); 5] = [
+    (
+        "contexts",
+        561_695,
+        "99e37cd126cd2e851df3367f6e39c250962252962ec3c0f4a0deb2a1fec45a4e",
+    ),
+    (
+        "outcomes",
+        2_808_475,
+        "9e6108194334481362b60809d75537424b10193c7db78dbaf9b8f0dcd72d7946",
+    ),
+    (
+        "passages",
+        20_545,
+        "39202f04b3812ae89b9d231c781fda7473eda16b4f520ca850a6b49396866882",
+    ),
+    (
+        "labeled",
+        2_808_475,
+        "b73f293cf434de0471bb917e000ba6277883cff55145c5d4e178ce32b9f22cc0",
+    ),
+    (
+        "outcome_summary",
+        2_180,
+        "74f67665b8c893ce8ff7c139006363adde1eb60207d0322b513195cd6b065d26",
+    ),
 ];
+
+/// The query that prints `view` as a format-1 dataset printed it:
+/// `contexts` and `labeled` projected onto their format-1 columns, in
+/// order, the other views whole; ordered by the view's key columns.
+fn format_1_query(view: &str, n_min: u64) -> String {
+    let order = VIEWS.iter().find(|(name, _)| *name == view).unwrap().1;
+    let columns = |names: &[&str]| {
+        names
+            .iter()
+            .map(|name| format!("\"{name}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    match view {
+        "contexts" => format!(
+            "SELECT {} FROM contexts ORDER BY {order}",
+            columns(&FORMAT1_CONTEXTS)
+        ),
+        "labeled" => format!(
+            "SELECT {} FROM labeled ORDER BY {order}",
+            columns(&FORMAT1_LABELED)
+        ),
+        "outcome_summary" => format!("SELECT * FROM outcome_summary({n_min}) ORDER BY {order}"),
+        _ => format!("SELECT * FROM {view} ORDER BY {order}"),
+    }
+}
+
+fn hex(digest: &[u8]) -> String {
+    digest.iter().fold(String::new(), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
 
 /// A `Write` that counts lines and hashes bytes.
 #[derive(Default)]
@@ -1981,17 +2346,31 @@ fn measure_outcome_views() {
                     &mut digest,
                 )
                 .unwrap();
-            let hex: String = digest
-                .hasher
-                .finalize()
-                .iter()
-                .fold(String::new(), |mut s, b| {
-                    let _ = write!(s, "{b:02x}");
-                    s
-                });
-            row.push((view.to_owned(), digest.lines - 1, hex));
+            row.push((
+                view.to_owned(),
+                digest.lines - 1,
+                hex(&digest.hasher.finalize()),
+            ));
         }
         digests.push(row);
+    }
+    // The format-1 projections, against the digests ADR-057 published.
+    let mut format_1: Vec<Vec<(String, u64, String)>> = Vec::new();
+    for threads in [1, 4] {
+        views.set_threads(threads).unwrap();
+        let mut row = Vec::new();
+        for (view, _, _) in ADR057_DIGESTS {
+            let mut digest = Digest256::default();
+            views
+                .select_tsv(&format_1_query(view, n_min), &mut digest)
+                .unwrap();
+            row.push((
+                view.to_owned(),
+                digest.lines - 1,
+                hex(&digest.hasher.finalize()),
+            ));
+        }
+        format_1.push(row);
     }
     views.set_threads(4).unwrap();
     let mismatched = mismatches(&views, &model, n_min, true);
@@ -2039,6 +2418,13 @@ fn measure_outcome_views() {
             println!("threads {threads} {view} rows {rows} sha256 {hex}");
         }
     }
+    for (threads, row) in [1, 4].iter().zip(&format_1) {
+        for (view, rows, hex) in row {
+            println!("threads {threads} format-1 {view} rows {rows} sha256 {hex}");
+        }
+    }
+    let effort_rows: u64 = model.iter().map(|r| r.effort.len() as u64).sum();
+    println!("effort rows {effort_rows}");
     println!("model mismatches {mismatched}");
 
     assert_eq!(mismatched, 0, "views and model disagree");
@@ -2048,6 +2434,21 @@ fn measure_outcome_views() {
     );
     assert_eq!((contexts, baseline, trigger), YEAR_CONTEXTS);
     assert_eq!(outcomes, 5 * YEAR_CONTEXTS.0);
+    assert_eq!(
+        effort_rows,
+        3 * YEAR_CONTEXTS.0,
+        "three effort rows per record"
+    );
+    let published: Vec<(String, u64, String)> = ADR057_DIGESTS
+        .iter()
+        .map(|(view, rows, hex)| ((*view).to_owned(), *rows, (*hex).to_owned()))
+        .collect();
+    for row in &format_1 {
+        assert_eq!(
+            row, &published,
+            "the format-1 content differs from ADR-057's"
+        );
+    }
     for (horizon, expected) in YEAR_HORIZONS {
         assert_eq!(per_horizon[horizon], expected, "{horizon}");
     }

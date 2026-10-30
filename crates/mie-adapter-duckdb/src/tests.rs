@@ -26,8 +26,9 @@ impl Drop for TempDir {
     }
 }
 
-/// One record with every column of the ADR-057 D1 schema, typed as the
-/// writer types them: a baseline at a value edge whose 5m race went up.
+/// One record with every column of the ADR-057 D1 and ADR-058 D2 schemas,
+/// typed as the writer types them: a baseline at a value edge whose 5m race
+/// went up, with its three effort rows written out of window order.
 const FIXTURE: &str = "
 CREATE TEMP TABLE prov AS SELECT
     'd' AS data_version, 'e' AS engine, 's' AS sampling, 'sf' AS sampling_fingerprint,
@@ -41,8 +42,24 @@ COPY (SELECT
     NULL::BOOLEAN AS bridge, 'low' AS regime, 12.5::DOUBLE AS regime_percentile,
     true AS levels_ready, true AS at_value_edge, false AS at_structural_extreme,
     NULL::VARCHAR AS auction_state, 100::DECIMAL(18, 8) AS anchor,
-    100::DECIMAL(18, 8) AS reference, 4::DECIMAL(18, 8) AS atr_1h, prov.*
+    100::DECIMAL(18, 8) AS reference, 4::DECIMAL(18, 8) AS atr_1h,
+    'above' AS auction_side, -2.5::DECIMAL(18, 8) AS cvd_utc_day,
+    false AS cvd_partial_start, false AS cvd_feed_gap, prov.*
     FROM prov) TO '{dir}/contexts.parquet' (FORMAT parquet);
+COPY (SELECT
+    0::UBIGINT AS record, w.name AS \"window\", w.state,
+    CASE WHEN w.state = 'ready' THEN 'buy' END AS aggressor,
+    CASE WHEN w.state = 'ready' THEN 3::DECIMAL(18, 8) END AS effort,
+    CASE WHEN w.state = 'ready' THEN 2::DECIMAL(18, 8) END AS effort_high,
+    CASE WHEN w.state = 'ready' THEN -1::DECIMAL(18, 8) END AS progress,
+    CASE WHEN w.state = 'ready' THEN 0.5::DECIMAL(18, 8) END AS move_median,
+    CASE WHEN w.state = 'ready' THEN 4::DECIMAL(18, 8) END AS move_high,
+    CASE WHEN w.state = 'ready' THEN false END AS partial_start,
+    CASE WHEN w.state = 'ready' THEN false END AS feed_gap,
+    CASE WHEN w.state = 'ready' THEN true END AS active, prov.*
+    FROM (VALUES ('1h', 'warming'), ('5m', 'ready'), ('15m', 'unavailable'))
+        w(name, state), prov)
+    TO '{dir}/effort.parquet' (FORMAT parquet);
 COPY (SELECT
     0::UBIGINT AS record, h.horizon, h.horizon_ms, true AS clear,
     98::DECIMAL(18, 8) AS lower, 102::DECIMAL(18, 8) AS upper,
@@ -204,7 +221,7 @@ fn a_query_needing_an_unlinked_extension_fails_instead_of_downloading() {
     let views = OutcomeViews::open(&temp.0).unwrap();
     // `json` is a known extension the bundled build does not link: with
     // autoinstall and autoload on, DuckDB would download and load it here.
-    let error = views.execute("SELECT '{\"a\": 1}'::JSON").unwrap_err();
+    let error = views.create_views("SELECT '{\"a\": 1}'::JSON").unwrap_err();
     // The catalog error names the extension; an attempted autoload would
     // fail differently (an install or HTTP error), or succeed online.
     assert!(
@@ -230,4 +247,122 @@ fn the_summary_takes_its_threshold() {
             .unwrap()
             .starts_with("5m\t300000\tall\tall\t")
     );
+}
+
+#[test]
+fn the_effort_view_orders_by_record_and_window() {
+    let temp = TempDir::new("effort");
+    write_fixture(&temp.0);
+    let views = OutcomeViews::open(&temp.0).unwrap();
+    let effort = tsv(&views, "effort", None);
+    let lines: Vec<&str> = effort.lines().collect();
+    assert_eq!(
+        lines[0],
+        "record\twindow\tstate\taggressor\teffort\teffort_high\tprogress\t\
+         move_median\tmove_high\tpartial_start\tfeed_gap\tactive\tdata_version\t\
+         engine\tsampling\tsampling_fingerprint\tlabeling\tlabeling_fingerprint"
+    );
+    let windows: Vec<&str> = lines[1..]
+        .iter()
+        .map(|line| line.split('\t').nth(1).unwrap())
+        .collect();
+    assert_eq!(windows, ["5m", "15m", "1h"]);
+    assert_eq!(
+        lines[1],
+        "0\t5m\tready\tbuy\t3.00000000\t2.00000000\t-1.00000000\t0.50000000\t\
+         4.00000000\tfalse\tfalse\ttrue\td\te\ts\tsf\tl\tlf"
+    );
+    assert_eq!(
+        lines[2],
+        "0\t15m\tunavailable\tNULL\tNULL\tNULL\tNULL\tNULL\tNULL\tNULL\tNULL\tNULL\t\
+         d\te\ts\tsf\tl\tlf"
+    );
+    // `labeled` carries the format-2 context columns through `c.*`.
+    let labeled = tsv(&views, "labeled", None);
+    let header: Vec<&str> = labeled.lines().next().unwrap().split('\t').collect();
+    let at = |name: &str| header.iter().position(|h| *h == name).unwrap();
+    assert_eq!(at("auction_side"), at("atr_1h") + 1);
+    assert_eq!(at("cvd_feed_gap"), at("atr_1h") + 4);
+    assert_eq!(at("horizon"), at("cvd_feed_gap") + 1);
+}
+
+#[test]
+fn a_study_defines_views_and_selects_them() {
+    let temp = TempDir::new("study");
+    write_fixture(&temp.0);
+    let views = OutcomeViews::open(&temp.0).unwrap();
+    views
+        .create_views(
+            "CREATE OR REPLACE VIEW ready_windows AS \
+             SELECT record, \"window\" FROM effort WHERE state = 'ready' \
+             ORDER BY record, \"window\";",
+        )
+        .unwrap();
+    let mut out = Vec::new();
+    let rows = views
+        .select_tsv("SELECT * FROM ready_windows ORDER BY record", &mut out)
+        .unwrap();
+    assert_eq!(rows, 1);
+    assert_eq!(String::from_utf8(out).unwrap(), "record\twindow\n0\t5m\n");
+    assert!(matches!(
+        views.create_views("CREATE VIEW broken AS SELECT nope FROM effort"),
+        Err(ViewsError::Engine(_))
+    ));
+}
+
+#[test]
+fn a_study_script_reaches_no_file_but_the_datasets_tables() {
+    let temp = TempDir::new("external");
+    let dataset = temp.0.join("ds");
+    let other = temp.0.join("other");
+    fs::create_dir(&dataset).unwrap();
+    fs::create_dir(&other).unwrap();
+    write_fixture(&dataset);
+    write_fixture(&other);
+    let views = OutcomeViews::open(&dataset).unwrap();
+    let outside = other.canonicalize().unwrap().join("contexts.parquet");
+    let outside = outside.to_str().unwrap();
+    // Reading another dataset's table (a hold-out, a live store) fails.
+    let mut out = Vec::new();
+    let error = views
+        .select_tsv(
+            &format!("SELECT * FROM read_parquet('{outside}')"),
+            &mut out,
+        )
+        .unwrap_err();
+    assert!(matches!(error, ViewsError::Engine(_)), "{error}");
+    // So does writing a file, inside the dataset directory or outside it.
+    for target in [
+        other.join("copy.parquet"),
+        dataset.canonicalize().unwrap().join("copy.parquet"),
+    ] {
+        let error = views
+            .create_views(&format!(
+                "COPY (SELECT 42 AS secret) TO '{}' (FORMAT parquet);",
+                target.display()
+            ))
+            .unwrap_err();
+        assert!(matches!(error, ViewsError::Engine(_)), "{error}");
+        assert!(!target.exists());
+    }
+    // External access cannot be turned back on, nor the paths widened.
+    for setting in [
+        "SET enable_external_access = true;".to_owned(),
+        format!("SET allowed_paths = ['{outside}'];"),
+        format!("SET allowed_directories = ['{}'];", other.display()),
+    ] {
+        assert!(views.create_views(&setting).is_err(), "{setting}");
+    }
+    let error = views
+        .select_tsv(
+            &format!("SELECT * FROM read_parquet('{outside}')"),
+            &mut out,
+        )
+        .unwrap_err();
+    assert!(matches!(error, ViewsError::Engine(_)), "{error}");
+    // The dataset's own views still read, at any thread count.
+    views.set_threads(4).unwrap();
+    assert_eq!(tsv(&views, "contexts", None).lines().count(), 2);
+    assert_eq!(tsv(&views, "effort", None).lines().count(), 4);
+    assert!(tsv(&views, "outcome_summary", Some(1)).lines().count() > 1);
 }
