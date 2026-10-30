@@ -1,6 +1,9 @@
 # ADR-058: Order-flow conditional studies — dataset format 2 and a pre-registered, blind study of four hypothesis pairs
 
-- Status: proposed
+- Status: accepted
+- Measured: 2026-10-30 (#28 M3, see *Acceptance*); accepted, every
+  *Accept when* criterion met on the calibration slice, the #12 year and
+  the R0 live store
 - Date: 2026-10-30
 
 ## Context
@@ -491,3 +494,104 @@ M3, in the main session, from the merge commit of this ADR's code:
 
 Null results and `insufficient` cells do not block acceptance. The
 acceptance PR adds an *Acceptance* section and sets this ADR to accepted.
+
+## Acceptance
+
+Accepted 2026-10-30. Every build and measurement ran under an 8 GB memory
+cap, one after another, from a release binary of a clean checkout. The
+report is [`docs/research/028-order-flow-interactions.md`](../research/028-order-flow-interactions.md).
+
+**M3a, the calibration slice.** Built from `8f3d5b5`, the merge commit of
+this ADR's code (#162), from the hold-out archive store: `--source archive
+--streams aggTrades,metrics --trade-correction fold --from 2024-10-01 --to
+2024-12-31`, records = replay = `1727740800000..1735689600000` ms, so
+nothing after 2024-12-31 was replayed. 149 571 237 events, 0 rejections,
+140 540 records and 421 620 effort rows, wall time 12:01.60 (m:ss), peak
+RSS 0.68 GB. `verify` PASS; content
+`c20761ef7e96acd21e3f6dae04cb9f2f20efb34c058dda1e775264e608f892ac`, data
+`50f0bd596e7e43db4b6cb750ba4f91d7e8f49446070db861df4b4cd43cf265d0`. It was
+not queried. The hash was reported on #28 and is the dataset version in
+`docs/direction.md`.
+
+**M3b**, from main `b648545`: every manifest reads `code
+git:b6485454e7609372203c17b0b27bd4513448f0e5` with no `-dirty`. The
+criteria, each checked against the printed reports:
+
+- **The owner's inputs are on main: met.** `docs/direction.md` *Personal
+  inputs* (#163): confidence 0.95, μ = 0.10 R, Binance USDⓈ-M VIP 0 taker
+  on both sides (10 bps round trip), calibration slice `c20761ef…`,
+  2024-10-01 … 2024-12-31. The slice lies outside the #12 year, so
+  `MIE_STUDY_EXCLUDE` was empty.
+- **The #12 year, built once in format 2: met.** Records = replay =
+  `1759276800000..1790812800000` ms with the ADR-057 D9 flags. 603 323 345
+  events, 0 rejections, 561 695 records and 561 695 labels, wall time
+  1:01:43 (h:mm:ss), peak RSS 0.97 GB. Provenance: data
+  `5d9e27f862ac54dd93cff904458e9ee92767d5105a9d13a144351cba069f224d`,
+  engine `4c844593779da2e3-1`, sampling `conditional.sampling@1
+  2c71fff23e8b0415`, labeling `conditional.labels@2 6f90bff079e746f2`,
+  those of D1. Content
+  `5e8e17b071487d358cb163d1dffae15efeda2fc8aa0250a9b9c4096c2a07f94c`:
+
+  | File | Rows | SHA-256 |
+  |------|-----:|---------|
+  | `contexts.parquet` | 561 695 | `64e85cf228d0d1f93d5b18247ab56ad81600d99b8dfc146ae6e273bfa7bbf296` |
+  | `outcomes.parquet` | 2 808 475 | `df5291e410878cedf72c4d70c2c9bee16be118dca673a42c1993004093c8362a` |
+  | `passages.parquet` | 20 545 | `8f9ae76484c02c2322802fb56d082578e756a6a8cbb0d7b33929050535dfa9a0` |
+  | `effort.parquet` | 1 685 085 | `8a72141184173f6453c6d8aa6bd6114cd5de7c10561fbf866c992ad9c7dc5f81` |
+
+- **Determinism, two R0 live builds: met.** Records = replay =
+  `1792191366185..1792315774245` ms, the R0 store's run of ADR-057
+  *Acceptance*. Each build: 2 042 225 events, 0 rejections, 2 185 records
+  and 6 555 effort rows, wall time 1:02.52 and 1:01.17 (m:ss), peak RSS
+  6.2 GB. `dataset.manifest`, `contexts.parquet`, `outcomes.parquet`,
+  `passages.parquet` and `effort.parquet` are byte-identical (`cmp`);
+  content `0119def9b91b7b324ccaebf6dd038f60a3d8e42c54b6ce856ae11bb13e7f665a`,
+  data `9348410a56c0d05d469f3f7e78c1c405d80db333d9d34df694b45ce256caca2d`.
+  Nothing was queried from them.
+- **`verify`: met.** PASS on the year and both live builds (and on the
+  calibration slice, M3a), including the format-2 check of 3 effort rows
+  per context.
+- **`measure_outcome_views` on the year: met.** It passed (7:45.34, peak
+  RSS 7.2 GB): 0 model mismatches, the ADR-057 *Acceptance* reconciliation
+  counts, and equal row counts and digests at DuckDB 1 and 4 threads. On
+  the format-1 projection every digest equals ADR-057's, so format 2
+  leaves the format-1 content unchanged:
+
+  | View | Rows | Format-1 projection (= ADR-057) | Format 2 |
+  |------|-----:|---------------------------------|----------|
+  | `contexts` | 561 695 | `99e37cd126cd2e851df3367f6e39c250962252962ec3c0f4a0deb2a1fec45a4e` | `3ffbd426415eebedc916154edb683ecdfb37562562cbe4f4cba537735640dbf6` |
+  | `outcomes` | 2 808 475 | `9e6108194334481362b60809d75537424b10193c7db78dbaf9b8f0dcd72d7946` | same |
+  | `passages` | 20 545 | `39202f04b3812ae89b9d231c781fda7473eda16b4f520ca850a6b49396866882` | same |
+  | `labeled` | 2 808 475 | `b73f293cf434de0471bb917e000ba6277883cff55145c5d4e178ce32b9f22cc0` | `7e35505475a8cce680d620e7770aef945695493b3fb440c5833fda4a0ac65cb3` |
+  | `outcome_summary` | 2 180 | `74f67665b8c893ce8ff7c139006363adde1eb60207d0322b513195cd6b065d26` | same |
+  | `effort` | 1 685 085 | – | `d626ea9517a9f2f15b2b1063eb506a50a36afe06aaa5084d314c97db2509951c` |
+
+- **`measure_order_flow_study`, once, with the inputs of
+  `docs/direction.md`: met.** `MIE_STUDY_CONFIDENCE=0.95
+  MIE_STUDY_MU=0.10 MIE_STUDY_FEE_BPS=10 MIE_STUDY_EXCLUDE=` on the year;
+  the D1 checks passed (excluded none, twin mismatches 0) before the first
+  table; queries SHA-256
+  `dd32d605081d6c80992655e16f453d143ee4e3ba5b17f4bbe399fcee0e7144a1`.
+  z = 1.959964, n_min = 385. Wall time 1:18.61 (m:ss), peak RSS 1.7 GB.
+- **The report records every table: met.** The dataset, the queries hash,
+  the commands, the inputs and the tool's whole output, null results and
+  `insufficient` cells included.
+
+**What the study found** (the report has every number). 62 of the 100
+primary cells and 334 of the 995 split cells could be read; the rest are
+`insufficient`, including every 1d cell (D6 *Consequence*). The interval
+of E excludes 0 in 17 primary cells against 3.1 expected by chance, and in
+77 split cells against 16.7. K is well above chance for P2 (primary 8 of
+12, mostly `counter` at 5m–1h), P1-sell (3 of 12, `hypothesis` at 4h) and
+P1-trig (4 of 12); P4 reads 0 of 11. Every effect read is a gross effect
+far below the taker round trip at its horizon (largest primary |E| 0.1055
+at 4h, fee 0.25 R; fees above 1 R at 5m and 15m), so no cell implies a net
+taker edge at μ = 0.10 R. Nothing is promoted: the cells go to the
+Research Lab (#30, #32) as hypotheses, without the FDR of T3.
+
+**Deviations:** none from the protocol. M3b ran from `b648545`, not from
+`8f3d5b5`: *Accept when* requires the owner's inputs on main before the
+run, and `b648545` (#163) differs from `8f3d5b5` only in
+`docs/direction.md`, so the code that ran is this ADR's code. The year was
+built once, as *Accept when* asks; format-2 determinism rests on the live
+pair.
