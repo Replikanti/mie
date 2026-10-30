@@ -60,7 +60,12 @@ its report, which flip this ADR. M1 and M2 land together.
   median barrier widths and P4's SFP compositions. `mie-adapter-duckdb`
   gains `create_views` (runs such a file on the in-memory connection,
   which links no extension but Parquet) and `select_tsv` (a query as TSV in
-  the form of ADR-057 D7).
+  the form of ADR-057 D7). Once the views exist, the connection turns
+  DuckDB's external access off and allows only the four tables of the
+  verified dataset, which DuckDB does not let a script undo: a study
+  script can read neither another dataset (the hold-out, a live store)
+  nor write a file. This is what makes D1's "not read" hold for any
+  committed query, not only for this study's.
 - **The tool** is the ignored test `measure_order_flow_study` in
   `crates/mie-cli/tests/order_flow_study.rs`, like the measurement tools of
   ADR-054 … ADR-057. It loads the SQL with `include_str!` and does in Rust
@@ -245,12 +250,17 @@ ready` with neither `partial_start` nor `feed_gap` ("covered").
        (ADR-054 D4). Each such cell holds one trigger id, so the count is
        defined; a family-pooled count is not (ADR-057 D7).
      - P1 and P2 (baseline records, which carry no episode, ADR-054 D4):
-       ADR-054 D4's join rule over each member's effort span `[decision −
-       w, decision − 1 ms]`, the span ADR-054 gives
-       `trigger.effort_result.<w>@1`. Every span has length w and ends at
-       its decision, so in decision order a member joins the open episode
-       when it lies less than w after the previous member, and otherwise
-       opens a new one.
+       ADR-054 D4's join rule over each member's effort span `[end − w,
+       end − 1 ms]`, the span ADR-054 gives
+       `trigger.effort_result.<w>@1`, where `end` is the end of the minute
+       the deciding event closed (`contexts.minute_end`, the effort
+       window's end). Every span has length w, so in record order a member
+       joins the open episode when its minute end lies less than w after
+       the previous member's, and otherwise opens a new one. *Why the
+       minute end and not the decision time:* the deciding event comes a
+       varying delay after the minute it closes, so two windows that end
+       exactly w apart (disjoint data) can be decided less than w apart; a
+       span on decision times would chain them.
      - P3: as P1, and members inside one held failure also chain. A
        failure run is a maximal stretch of consecutive baseline records
        with the same `auction_state` ∈ {`failed_breakout`,
@@ -388,7 +398,7 @@ No per-record output: no record number, decision time or episode id.
 | Undefined limit (1 − c)/2 | D5: more undefined resamples than the tail would put the interval's end on missing values | Higher: an end read from a resample set that misses its tail; lower: cells refused whose ends are well defined |
 | n_min = ⌈(z/μ)²⌉ | D6: T1 with σ ≤ 1 and the owner's c and μ | Larger: fewer cells read; smaller: cells read that cannot resolve μ |
 | Thinning step H | D6: the race's longest window | Shorter: counted races overlap; longer: fewer units than disjointness needs |
-| Chaining span w | D6: ADR-054 D4's evidence span for `trigger.effort_result.<w>@1`: two members less than w apart share window data | Shorter: members sharing window data counted twice; longer: members sharing no datum chained |
+| Chaining span w, ending at the minute end | D6: ADR-054 D4's evidence span for `trigger.effort_result.<w>@1`, `[end − w, end − 1 ms]`: two members whose minute ends lie less than w apart share window data | Shorter: members sharing window data counted twice; longer: members sharing no datum chained |
 | P3 failure runs | D6: ADR-044 decision 8 holds a failure for up to 60 counted closes or until a new probe | Without: one held failure counted once per disjoint burst |
 | 105 120 / 35 040 / 8 760 / 2 190 / 365 | D6: 365 days × 1 440 min ÷ H | — (arithmetic) |
 | Data `5d9e27f8…`, engine `4c844593779da2e3-1`, sampling and labeling keys; the reconciliation counts | D1: the provenance and counts of ADR-054 *Acceptance*, ADR-056 *Measurement* and ADR-057 *Acceptance* | — (a difference is a bug or a provenance change, checked first) |
@@ -435,7 +445,7 @@ There is no other number.
   writer holds one row group per table as before.
 - `mie-adapter-duckdb` can run statements a caller passes
   (`create_views`), on its in-memory connection without network or other
-  extensions.
+  extensions, and with file access limited to the dataset's four tables.
 
 ## Alternatives considered
 

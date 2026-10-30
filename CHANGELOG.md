@@ -27,7 +27,9 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   provenance, the published counts and 0 mismatches against an independent
   twin before it prints the pre-registered tables, and its fixture tests.
   `mie-adapter-duckdb` gains `create_views` and `select_tsv` for a study's
-  queries. `docs/research/README.md` sets the report conventions. The New
+  queries, and every connection now turns DuckDB's external access off
+  after creating the views, with only the verified dataset's four tables
+  allowed, so a study script can read no other dataset and write no file. `docs/research/README.md` sets the report conventions. The New
   York clock moves from `season_measure.rs` to `tests/common/clock.rs`
   unchanged. The study runs in M3; nothing was read here.
 

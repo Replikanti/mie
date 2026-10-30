@@ -225,6 +225,9 @@ struct Member {
     trigger: Option<String>,
     record: u64,
     decision: i64,
+    /// The end of the closed minute (baseline records): the end of the
+    /// effort windows the D6 chaining reads.
+    minute_end: Option<i64>,
     side: String,
     /// Whether the hypothesis barrier is the upper one.
     upper: bool,
@@ -407,6 +410,7 @@ fn load(views: &OutcomeViews) -> (Inputs, Lines) {
             trigger: opt(get("trigger")),
             record: get("record").parse().unwrap(),
             decision: get("decision_ms").parse().unwrap(),
+            minute_end: opt(get("minute_end_ms")).map(|ms| ms.parse().unwrap()),
             side: get("side"),
             upper: match get("hypothesis").as_str() {
                 "upper" => true,
@@ -625,15 +629,17 @@ fn failure_runs(baseline: &[Baseline]) -> BTreeMap<u64, u64> {
 }
 
 /// ADR-058 D6 stage 1 for members of a baseline population, in record
-/// order: a member joins the open episode when its effort span `[d − w,
-/// d − 1 ms]` overlaps the previous member's (it lies less than `w` after
-/// it), or when both lie in one failure run (`runs`, P3 only).
-fn chain_episodes(decisions: &[i64], span: i64, runs: &[Option<u64>]) -> Vec<u64> {
-    let mut episodes = Vec::with_capacity(decisions.len());
+/// order, given the ends of their closed minutes: a member joins the open
+/// episode when its effort span `[end − w, end − 1 ms]` (ADR-054 D4's span
+/// for `trigger.effort_result.<w>@1`) overlaps the previous member's (its
+/// end lies less than `w` after the previous end), or when both lie in one
+/// failure run (`runs`, P3 only).
+fn chain_episodes(ends: &[i64], span: i64, runs: &[Option<u64>]) -> Vec<u64> {
+    let mut episodes = Vec::with_capacity(ends.len());
     let mut episode = 0u64;
-    for i in 0..decisions.len() {
+    for i in 0..ends.len() {
         if i > 0 {
-            let overlaps = decisions[i] - decisions[i - 1] < span;
+            let overlaps = ends[i] - ends[i - 1] < span;
             let same_run = runs[i].is_some() && runs[i] == runs[i - 1];
             if !overlaps && !same_run {
                 episode += 1;
@@ -688,9 +694,13 @@ fn member_episodes(inputs: &Inputs, populations: &[Population]) -> Vec<u64> {
             }
         } else {
             let span = WINDOWS[population.window.unwrap()].1;
-            let decisions: Vec<i64> = indices
+            let ends: Vec<i64> = indices
                 .iter()
-                .map(|&i| inputs.members[i].decision)
+                .map(|&i| {
+                    inputs.members[i]
+                        .minute_end
+                        .expect("baseline records carry their minute end")
+                })
                 .collect();
             let member_runs: Vec<Option<u64>> = indices
                 .iter()
@@ -700,7 +710,7 @@ fn member_episodes(inputs: &Inputs, populations: &[Population]) -> Vec<u64> {
                         .flatten()
                 })
                 .collect();
-            for (k, episode) in chain_episodes(&decisions, span, &member_runs)
+            for (k, episode) in chain_episodes(&ends, span, &member_runs)
                 .into_iter()
                 .enumerate()
             {
@@ -1060,11 +1070,27 @@ fn bootstrap(
     all
 }
 
-/// The nearest-rank quantile `q` of the sorted `values`: the
-/// ⌈q·n⌉-th, at least the first.
+/// `x` with the rounding error of a decimal input removed: a value within
+/// 1e-9 (relative) of an integer is that integer. `(1 − 0.95) / 2` is
+/// 0.025000000000000022 in binary, so ⌈0.025 · 10 000⌉ would read 251.
+fn snap(x: f64) -> f64 {
+    let nearest = x.round();
+    if (x - nearest).abs() <= 1e-9 * nearest.abs().max(1.0) {
+        nearest
+    } else {
+        x
+    }
+}
+
+/// The nearest-rank index (1-based) of the quantile `q` among `n` sorted
+/// values: ⌈q·n⌉, at least 1.
+fn rank_index(n: usize, q: f64) -> usize {
+    (snap(q * n as f64).ceil() as usize).max(1)
+}
+
+/// The nearest-rank quantile `q` of the sorted `values`.
 fn rank(sorted: &[f64], q: f64) -> f64 {
-    let k = ((q * sorted.len() as f64).ceil() as usize).max(1);
-    sorted[k - 1]
+    sorted[rank_index(sorted.len(), q) - 1]
 }
 
 /// A reading (ADR-058 D7).
@@ -1101,7 +1127,7 @@ fn interval(values: &[Option<f64>], units: u64, n_min: u64, confidence: f64) -> 
     defined.sort_by(f64::total_cmp);
     let undefined = values.len() - defined.len();
     let tail = (1.0 - confidence) / 2.0;
-    let too_many = undefined as f64 > tail * values.len() as f64;
+    let too_many = undefined as f64 > snap(tail * values.len() as f64);
     let (low, high) = if defined.is_empty() {
         (f64::NAN, f64::NAN)
     } else {
@@ -1413,6 +1439,8 @@ struct TRecord {
     trigger: Option<String>,
     episode: Option<String>,
     decision: i64,
+    /// The end of the closed minute (baseline records).
+    minute_end: Option<i64>,
     regime: String,
     location: String,
     auction_state: Option<String>,
@@ -1447,7 +1475,8 @@ fn twin_records(views: &OutcomeViews, exclude: &[(i64, i64)]) -> Vec<TRecord> {
     let mut records: Vec<TRecord> = Vec::new();
     each_selected(
         views,
-        "SELECT record, sample, trigger, episode, decision_time, regime, levels_ready, \
+        "SELECT record, sample, trigger, episode, decision_time, minute_end, regime, \
+         levels_ready, \
          at_value_edge, at_structural_extreme, auction_state, auction_side, cvd_utc_day, \
          cvd_partial_start, cvd_feed_gap FROM contexts ORDER BY record",
         |get| {
@@ -1468,6 +1497,7 @@ fn twin_records(views: &OutcomeViews, exclude: &[(i64, i64)]) -> Vec<TRecord> {
                 trigger: opt(get("trigger")),
                 episode: opt(get("episode")),
                 decision: get("decision_time").parse().unwrap(),
+                minute_end: opt(get("minute_end")).map(|ms| ms.parse().unwrap()),
                 regime: opt(get("regime")).unwrap_or_else(|| "not_ready".to_owned()),
                 location: location.to_owned(),
                 auction_state: opt(get("auction_state")),
@@ -1716,7 +1746,7 @@ fn twin_lines(records: &[TRecord], members: &[TMember]) -> Lines {
         ));
     }
     lines.members.push(
-        "pair\teffort_window\ttrigger\trecord\tdecision_ms\tside\thypothesis\tregime\t\
+        "pair\teffort_window\ttrigger\trecord\tdecision_ms\tminute_end_ms\tside\thypothesis\tregime\t\
          location\tepisode\tcvd\tout_5m\tout_15m\tout_1h\tout_4h\tout_1d"
             .to_owned(),
     );
@@ -1729,12 +1759,13 @@ fn twin_lines(records: &[TRecord], members: &[TMember]) -> Lines {
             .map(|race| twin_outcome(race, m.hypothesis))
             .collect();
         lines.members.push(format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             m.pair,
             cell_text(m.window.map(|w| WINDOWS[w].0)),
             cell_text(m.trigger.as_deref()),
             r.record,
             r.decision,
+            cell_text(r.minute_end.map(|ms| ms.to_string()).as_deref()),
             m.side,
             m.hypothesis,
             r.regime,
@@ -1856,8 +1887,10 @@ fn twin_units(
             let mut hull: Option<(i64, i64, BTreeSet<u64>)> = None;
             let mut count = 0;
             for m in &mine {
-                let d = records[m.record].decision;
-                let (first, last) = (d - w, d - 1);
+                // ADR-054 D4's span of the effort window ending at the
+                // closed minute's end.
+                let end = records[m.record].minute_end.unwrap();
+                let (first, last) = (end - w, end - 1);
                 let run = if population.pair == "P3" {
                     runs.get(&m.record).copied()
                 } else {
@@ -2242,7 +2275,11 @@ fn context_record(rec: &Rec) -> ContextRecord {
     };
     let sample = match rec.kind {
         RecKind::Baseline => Sample::Baseline {
-            minute_end: EventTime::from_millis(time.as_millis() - 1),
+            // The end of the minute the deciding event closed: the minute
+            // boundary at or before the decision.
+            minute_end: EventTime::from_millis(
+                time.as_millis() - time.as_millis().rem_euclid(MINUTE_MS),
+            ),
         },
         RecKind::Trigger {
             definition,
@@ -2429,7 +2466,9 @@ fn random_recs(days: i64, seed: u64) -> Vec<Rec> {
     let mut openers: BTreeMap<String, (i64, u64)> = BTreeMap::new();
     let mut seq = 0u64;
     for minute in 0..days * 1_440 {
-        let decision = T0 + minute * MINUTE_MS + 1_000;
+        // The deciding event comes 1 ms to 59 s after its minute's end, so
+        // decision gaps and minute-end gaps differ (ADR-058 D6).
+        let decision = T0 + minute * MINUTE_MS + 1 + lcg.below(59_000);
         seq += 1;
         let mut rec = Rec::baseline(decision, seq);
         if lcg.below(120) == 0 {
@@ -2916,6 +2955,49 @@ fn members_w_apart_open_two_episodes_and_closer_ones_chain() {
 }
 
 #[test]
+fn episodes_chain_on_the_minute_end_not_on_the_deciding_event() {
+    // Two P1-buy members at w = 1h whose minutes end exactly 1 h apart,
+    // decided 900 ms and 100 ms after those ends: their ADR-054 spans
+    // [t − 1h, t − 1 ms] and [t, t + 1h − 1 ms] are disjoint, although the
+    // decisions lie 59:59.2 apart (the #162 review's repro).
+    let t = T0 + 10 * HOUR_MS;
+    let member = |end: i64, delay: i64| Member {
+        pair: "P1-buy".to_owned(),
+        window: Some("1h".to_owned()),
+        trigger: None,
+        record: end as u64,
+        decision: end + delay,
+        minute_end: Some(end),
+        side: "buy".to_owned(),
+        upper: false,
+        regime: "low".to_owned(),
+        location: "neither".to_owned(),
+        episode: None,
+        cvd: Some("with".to_owned()),
+        outcomes: [Outcome::Neither; 5],
+    };
+    let inputs = Inputs {
+        members: vec![member(t, 900), member(t + HOUR_MS, 100)],
+        ..Inputs::default()
+    };
+    let populations = populations();
+    let episodes = member_episodes(&inputs, &populations);
+    assert_eq!(episodes, [0, 1]);
+    let cells = cells(&inputs, &populations);
+    let primary_5m = cells
+        .iter()
+        .find(|c| c.split == Split::All && c.horizon == 0 && !c.members.is_empty())
+        .unwrap();
+    assert_eq!(cell_units(&inputs, &episodes, primary_5m), (2, 2));
+    // One minute end less than w apart chains, whatever the delays.
+    let inputs = Inputs {
+        members: vec![member(t, 100), member(t + HOUR_MS - MINUTE_MS, 59_000)],
+        ..Inputs::default()
+    };
+    assert_eq!(member_episodes(&inputs, &populations), [0, 0]);
+}
+
+#[test]
 fn representatives_h_apart_count_twice_and_closer_ones_once() {
     for (h_name, h) in HORIZONS {
         let members = [(T0, 0, true), (T0 + h, 1, true)];
@@ -2958,6 +3040,7 @@ fn a_split_cell_keeps_an_episode_whose_opener_is_in_the_other_split() {
         trigger: None,
         record: k as u64,
         decision: T0 + k * MINUTE_MS,
+        minute_end: Some(T0 + k * MINUTE_MS),
         side: "buy".to_owned(),
         upper: false,
         regime: regime.to_owned(),
@@ -3001,6 +3084,7 @@ fn bursts_in_one_held_failure_are_one_p3_episode() {
         trigger: None,
         record: k as u64,
         decision: T0 + k * MINUTE_MS,
+        minute_end: Some(T0 + k * MINUTE_MS),
         side: "buy".to_owned(),
         upper: false,
         regime: "low".to_owned(),
@@ -3134,6 +3218,38 @@ fn units_equal_outcome_summarys_clear_for_a_trigger_whose_openers_ran() {
 }
 
 #[test]
+fn the_interval_ends_are_the_pre_registered_ranks() {
+    // ADR-058 D5: nearest rank ⌈q·B⌉ at q = (1 − c)/2 and (1 + c)/2.
+    assert_eq!(rank_index(10_000, (1.0 - 0.95) / 2.0), 250);
+    assert_eq!(rank_index(10_000, 1.0 - (1.0 - 0.95) / 2.0), 9_750);
+    assert_eq!(rank_index(10_000, (1.0 - 0.99) / 2.0), 50);
+    assert_eq!(rank_index(10_000, 1.0 - (1.0 - 0.99) / 2.0), 9_950);
+    assert_eq!(rank_index(200, 0.025), 5);
+    assert_eq!(rank_index(201, 0.025), 6);
+    assert_eq!(rank_index(10, 0.0), 1);
+    let values: Vec<Option<f64>> = (1..=10_000).map(|v| Some(f64::from(v))).collect();
+    let read = interval(&values, 1_000, 385, 0.95);
+    assert_eq!((read.low, read.high), (250.0, 9_750.0));
+    let read = interval(&values, 1_000, 385, 0.99);
+    assert_eq!((read.low, read.high), (50.0, 9_950.0));
+    // Exactly (1 − c)/2 of the resamples undefined still reads; one more
+    // does not.
+    let mut sparse = values.clone();
+    for value in sparse.iter_mut().take(250) {
+        *value = None;
+    }
+    assert_ne!(
+        interval(&sparse, 1_000, 385, 0.95).reading,
+        Reading::Insufficient
+    );
+    sparse[250] = None;
+    assert_eq!(
+        interval(&sparse, 1_000, 385, 0.95).reading,
+        Reading::Insufficient
+    );
+}
+
+#[test]
 fn n_min_follows_t1() {
     assert!((z_of(0.95) - 1.959_964).abs() < 1e-6);
     assert!((z_of(0.90) - 1.644_854).abs() < 1e-6);
@@ -3240,6 +3356,7 @@ fn planted(days: i64, p_hypothesis: u64, seed: u64) -> Inputs {
                 trigger: None,
                 record: hour as u64,
                 decision,
+                minute_end: Some(decision),
                 side: if upper { "buy" } else { "sell" }.to_owned(),
                 upper,
                 regime: "low".to_owned(),

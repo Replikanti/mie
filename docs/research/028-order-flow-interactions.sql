@@ -22,6 +22,8 @@ CREATE TABLE IF NOT EXISTS study_exclude (from_ms BIGINT NOT NULL, to_ms BIGINT 
 
 -- The records the study reads. `location` is the record's ADR-051 R1 bin
 -- set: 'both' when it lies in a value edge and at a structural extreme.
+-- `minute_end_ms` (baseline records) is the end of the closed minute: the
+-- end of the effort windows ADR-058 D6 chains on.
 CREATE OR REPLACE VIEW study_records AS
 SELECT
     c.record,
@@ -29,6 +31,7 @@ SELECT
     c.trigger,
     c.episode,
     epoch_ms(c.decision_time) AS decision_ms,
+    epoch_ms(c.minute_end) AS minute_end_ms,
     coalesce(c.regime, 'not_ready') AS regime,
     CASE
         WHEN NOT c.levels_ready THEN 'not_ready'
@@ -185,7 +188,8 @@ members AS (
       AND e.covered
 )
 SELECT
-    m.pair, m.effort_window, m.trigger, m.record, r.decision_ms, m.side,
+    m.pair, m.effort_window, m.trigger, m.record, r.decision_ms,
+    r.minute_end_ms, m.side,
     m.hypothesis, r.regime, r.location, r.episode,
     CASE WHEN m.pair IN ('P1-buy', 'P1-sell', 'P2') THEN
         CASE

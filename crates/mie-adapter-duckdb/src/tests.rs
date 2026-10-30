@@ -309,3 +309,60 @@ fn a_study_defines_views_and_selects_them() {
         Err(ViewsError::Engine(_))
     ));
 }
+
+#[test]
+fn a_study_script_reaches_no_file_but_the_datasets_tables() {
+    let temp = TempDir::new("external");
+    let dataset = temp.0.join("ds");
+    let other = temp.0.join("other");
+    fs::create_dir(&dataset).unwrap();
+    fs::create_dir(&other).unwrap();
+    write_fixture(&dataset);
+    write_fixture(&other);
+    let views = OutcomeViews::open(&dataset).unwrap();
+    let outside = other.canonicalize().unwrap().join("contexts.parquet");
+    let outside = outside.to_str().unwrap();
+    // Reading another dataset's table (a hold-out, a live store) fails.
+    let mut out = Vec::new();
+    let error = views
+        .select_tsv(
+            &format!("SELECT * FROM read_parquet('{outside}')"),
+            &mut out,
+        )
+        .unwrap_err();
+    assert!(matches!(error, ViewsError::Engine(_)), "{error}");
+    // So does writing a file, inside the dataset directory or outside it.
+    for target in [
+        other.join("copy.parquet"),
+        dataset.canonicalize().unwrap().join("copy.parquet"),
+    ] {
+        let error = views
+            .create_views(&format!(
+                "COPY (SELECT 42 AS secret) TO '{}' (FORMAT parquet);",
+                target.display()
+            ))
+            .unwrap_err();
+        assert!(matches!(error, ViewsError::Engine(_)), "{error}");
+        assert!(!target.exists());
+    }
+    // External access cannot be turned back on, nor the paths widened.
+    for setting in [
+        "SET enable_external_access = true;".to_owned(),
+        format!("SET allowed_paths = ['{outside}'];"),
+        format!("SET allowed_directories = ['{}'];", other.display()),
+    ] {
+        assert!(views.create_views(&setting).is_err(), "{setting}");
+    }
+    let error = views
+        .select_tsv(
+            &format!("SELECT * FROM read_parquet('{outside}')"),
+            &mut out,
+        )
+        .unwrap_err();
+    assert!(matches!(error, ViewsError::Engine(_)), "{error}");
+    // The dataset's own views still read, at any thread count.
+    views.set_threads(4).unwrap();
+    assert_eq!(tsv(&views, "contexts", None).lines().count(), 2);
+    assert_eq!(tsv(&views, "effort", None).lines().count(), 4);
+    assert!(tsv(&views, "outcome_summary", Some(1)).lines().count() > 1);
+}

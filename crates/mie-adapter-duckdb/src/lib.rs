@@ -164,6 +164,19 @@ impl OutcomeViews {
         let connection = Connection::open_in_memory_with_flags(config)?;
         connection.execute_batch(&format!("SET VARIABLE mie_dataset = {literal};"))?;
         connection.execute_batch(VIEWS_SQL)?;
+        // From here on the connection reaches no file but the four tables
+        // of the verified dataset (ADR-058 Approach): a study script cannot
+        // read another dataset (a hold-out, a live store) or write a file.
+        // DuckDB refuses to turn external access back on, or to widen the
+        // allowed paths, while it is off.
+        let mut tables = Vec::with_capacity(TABLES.len());
+        for table in TABLES {
+            tables.push(sql_literal(&canonical.join(table))?);
+        }
+        connection.execute_batch(&format!(
+            "SET allowed_paths = [{}]; SET enable_external_access = false;",
+            tables.join(", ")
+        ))?;
         Ok(Self { connection })
     }
 
@@ -227,8 +240,10 @@ impl OutcomeViews {
 
     /// Runs `sql`, statements that define further views or macros over
     /// these views: a study's committed queries (ADR-058). The connection
-    /// is in memory and links no extension but Parquet, so nothing a
-    /// script does reaches past this process or the dataset it reads.
+    /// is in memory, links no extension but Parquet, and has external
+    /// access off with only the dataset's four tables allowed
+    /// ([`open`](Self::open)): a script that reads or writes any other file
+    /// fails with [`ViewsError::Engine`].
     ///
     /// # Errors
     ///
