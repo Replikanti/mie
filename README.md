@@ -51,10 +51,10 @@ enforces the boundary (ADR-025):
 | [`mie-domain`](crates/mie-domain) | Market observations, Market State, regime, location, trigger and strategy vocabulary. No dependencies, no I/O, no clock. |
 | [`mie-ports`](crates/mie-ports) | Use-case (inbound) and infrastructure (outbound) contracts owned by the core. |
 | [`mie-app`](crates/mie-app) | Use-case services that drive the domain through ports. |
-| [`mie-adapter-parquet`](crates/mie-adapter-parquet) | Immutable raw store: verbatim messages in sealed Parquet files with manifests and dataset versions (ADR-030); the conditional outcome dataset: context records and forward labels as content-hashed Parquet tables (ADR-057). |
+| [`mie-adapter-parquet`](crates/mie-adapter-parquet) | Immutable raw store: verbatim messages in sealed Parquet files with manifests and dataset versions (ADR-030); the conditional outcome dataset: context records, their forward labels and their order-flow evaluations as content-hashed Parquet tables (ADR-057, format 2 of ADR-058). |
 | [`mie-adapter-binance`](crates/mie-adapter-binance) | Binance USDⓈ-M live capture: raw-first persistence, shared normalization, feed gaps, canonical merge (ADR-032); order-book sync from depth diffs and REST snapshots with audited checkpoints (ADR-038, ADR-049); public-archive backfill: checksum-verified, exactly-once import (ADR-034); replay of both from the raw store (ADR-039), and the history chain over both (ADR-052). |
 | [`mie-adapter-fs`](crates/mie-adapter-fs) | Research result store: append-only, read-only result files with SHA-256 trailers, keyed by experiment, pipeline and, for state-reading pipelines, engine (ADR-040, ADR-052). |
-| [`mie-adapter-duckdb`](crates/mie-adapter-duckdb) | Research views over one conditional outcome dataset in a pinned, bundled DuckDB without extension downloads: the tables, `labeled` and `outcome_summary(n_min)` (ADR-004, ADR-057). |
+| [`mie-adapter-duckdb`](crates/mie-adapter-duckdb) | Research views over one conditional outcome dataset in a pinned, bundled DuckDB without extension downloads: the tables, `labeled` and `outcome_summary(n_min)` (ADR-004, ADR-057), plus a study's own committed queries over them (ADR-058). |
 | `mie-adapter-*` *(planned)* | Telegram, LLM operators, backtest engine. |
 | [`mie-cli`](crates/mie-cli) | Composition root, the `mie` binary: wires adapters to ports. Today `ingest`, `capture-report`, `archive-import` / `archive-verify` / `archive-kline-check`, `replay`, `equivalence`, `experiment validate` / `experiment run` and `conditional build` / `conditional verify` / `conditional query` / `conditional views`; report follows. |
 
@@ -78,6 +78,7 @@ dataset → DuckDB replay/research → Strategy Research Lab → Telegram
 | [Strategy Research Lab](docs/design/BTC_MIE_Strategy_Research_Lab.md) | Research loop, experiment definition, anti-overfitting |
 | [Strategy Registry & Suitability](docs/design/BTC_MIE_Strategy_Registry_and_Suitability.md) | Lifecycle, runtime suitability, edge decay |
 | [ADR-025 onwards](docs/adr/) | Decisions made during implementation |
+| [Research studies](docs/research/) | Committed study queries and their reports, each pre-registered by an ADR |
 | [Direction](docs/direction.md) | What the first measured answer decides: three directions and their pre-registered criteria |
 | [Releasing](docs/release.md) | Versioning, changelog, tag-triggered GitHub Releases |
 

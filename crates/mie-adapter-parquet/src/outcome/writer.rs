@@ -1,7 +1,7 @@
 //! The outcome dataset writer and its write protocol (ADR-057 D5).
 
 use super::manifest::{OutcomeFile, OutcomeManifest};
-use super::schema::{self, ContextRow, OutcomeRow, PassageRow, Row};
+use super::schema::{self, ContextRow, EffortRow, OutcomeRow, PassageRow, Row};
 use super::{MANIFEST_FILE, OutcomeError, TABLES, io_error};
 use crate::manifest::hex;
 use crate::recovery::{mark_read_only, rename_no_replace};
@@ -136,6 +136,7 @@ pub struct OutcomeWriter {
     contexts: Table<ContextRow>,
     outcomes: Table<OutcomeRow>,
     passages: Table<PassageRow>,
+    effort: Table<EffortRow>,
     pending: VecDeque<Pending>,
     next_record: u64,
     /// The event of the last record and its ordinal (ADR-055 D1).
@@ -204,6 +205,7 @@ impl OutcomeWriter {
             contexts: Table::create(dir, TABLES[0])?,
             outcomes: Table::create(dir, TABLES[1])?,
             passages: Table::create(dir, TABLES[2])?,
+            effort: Table::create(dir, TABLES[3])?,
             pending: VecDeque::new(),
             next_record: 0,
             last: None,
@@ -238,8 +240,8 @@ impl OutcomeWriter {
         result
     }
 
-    /// Writes the `contexts` row of the next record and waits for its
-    /// label.
+    /// Writes the `contexts` row and the three `effort` rows of the next
+    /// record and waits for its label.
     ///
     /// # Errors
     ///
@@ -259,7 +261,11 @@ impl OutcomeWriter {
         };
         let number = self.next_record;
         let row = ContextRow::new(number, ordinal, record)?;
+        let effort = EffortRow::of(number, record)?;
         self.contexts.push(row, &self.provenance)?;
+        for row in effort {
+            self.effort.push(row, &self.provenance)?;
+        }
         self.last = Some((record.event, ordinal));
         self.pending.push_back(Pending {
             number,
@@ -345,12 +351,14 @@ impl OutcomeWriter {
             contexts,
             outcomes,
             passages,
+            effort,
             ..
         } = self;
         let files = vec![
             contexts.seal(&dir, &provenance)?,
             outcomes.seal(&dir, &provenance)?,
             passages.seal(&dir, &provenance)?,
+            effort.seal(&dir, &provenance)?,
         ];
         sync_dir(&dir)?;
 

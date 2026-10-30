@@ -1,7 +1,7 @@
 //! Round trip, determinism, integrity and contract tests of the outcome
-//! dataset (ADR-057 D1–D5).
+//! dataset (ADR-057 D1–D5; format 2, ADR-058 D2).
 
-use super::schema::{self, ContextRow, event_kind_name, to_batch};
+use super::schema::{self, ContextRow, EffortRow, event_kind_name, to_batch};
 use super::*;
 use crate::testutil::TempDir;
 use arrow_array::{
@@ -10,6 +10,7 @@ use arrow_array::{
 };
 use bytes::Bytes;
 use mie_domain::bars::{Coverage, Timeframe};
+use mie_domain::candidate::effort::EffortResult;
 use mie_domain::candidate::{ContextLevel, ContextLevels, LocationContext};
 use mie_domain::conditional::label::{
     Barriers, Censor, CensorReason, Excursion, ForwardLabel, HORIZONS, HorizonLabel,
@@ -18,9 +19,11 @@ use mie_domain::conditional::label::{
 use mie_domain::conditional::{
     ContextProvenance, ContextRecord, Episode, EpisodeId, Sample, StateSnapshot,
 };
-use mie_domain::feature::{FeatureValue, catalog};
-use mie_domain::location::LevelKind;
-use mie_domain::num::Price;
+use mie_domain::event::Aggressor;
+use mie_domain::feature::{FeatureValue, Unavailability, catalog};
+use mie_domain::flow::DayCvd;
+use mie_domain::location::{AuctionState, AuctionStatus, LevelKind, Origin, Position, Region};
+use mie_domain::num::{Price, Qty};
 use mie_domain::order::{CanonicalKey, EventKind};
 use mie_domain::regime::{AtrPercentile, Regime};
 use mie_domain::research::DataVersion;
@@ -176,10 +179,97 @@ fn trigger(event: CanonicalKey, context: LocationContext, opener: bool) -> Conte
     }
 }
 
+fn coverage(partial_start: bool, feed_gap: bool) -> Coverage {
+    Coverage {
+        partial_start,
+        feed_gap,
+    }
+}
+
+/// An effort evaluation of the window at `position` (`5m`, `15m`, `1h`)
+/// whose values are distinct multiples of `base` units, progress negative.
+fn effort(position: usize, aggressor: Aggressor, base: i64, coverage: Coverage) -> EffortResult {
+    let (timeframe, definition) = catalog::CANDIDATE_EFFORT_RESULT[position];
+    EffortResult {
+        feature: definition.key,
+        timeframe,
+        end: t(T0),
+        aggressor,
+        effort: Qty::from_units(3 * base),
+        progress: p(-base),
+        effort_high: Qty::from_units(2 * base),
+        effort_median: Qty::from_units(base),
+        move_high: p(4 * base),
+        move_median: p(base / 2),
+        coverage,
+        active: position != 1,
+    }
+}
+
+fn day_cvd(units: i64, coverage: Coverage) -> DayCvd {
+    DayCvd {
+        feature: catalog::FLOW_CVD_UTC_DAY_V1.key,
+        day_open: t(T0),
+        cvd: Qty::from_units(units),
+        coverage,
+    }
+}
+
+fn auction(state: AuctionState, side: Option<Region>) -> AuctionStatus {
+    AuctionStatus {
+        feature: catalog::LOCATION_AUCTION_PRIOR_DAY_V1.key,
+        reference_start: t(T0 - 86_400_000),
+        val: p(8_400_000_000_000),
+        vah: p(8_600_000_000_000),
+        state,
+        side,
+        accepted: Region::In,
+        origin: Origin::Start,
+        position: Position::In,
+        probe: None,
+        failure: None,
+        last_close: p(8_500_000_000_000),
+        bar_end: t(T0),
+        known_at: t(T0 + 1),
+        coverage: coverage(false, false),
+    }
+}
+
 /// Four records: three of one event (a baseline whose levels hold both a
 /// value edge and a structural extreme, then two triggers), then a
-/// baseline before the first trade.
+/// baseline before the first trade. Their order-flow values (ADR-058 D2)
+/// cover every effort and CVD state and coverage flag, both aggressors,
+/// an auction side, an auction without a side and a missing auction.
 fn records() -> Vec<ContextRecord> {
+    let mut records = base_records();
+    let unavailable = || FeatureValue::Unavailable {
+        reason: Unavailability::InputInvalid,
+    };
+    records[0].state.effort = [
+        FeatureValue::Ready(effort(0, Aggressor::Buy, 1_000, coverage(false, false))),
+        warming(),
+        FeatureValue::Ready(effort(2, Aggressor::Sell, 7_000, coverage(true, false))),
+    ];
+    records[0].state.cvd_utc_day = FeatureValue::Ready(day_cvd(-12_345, coverage(false, false)));
+    records[0].context.auction =
+        FeatureValue::Ready(auction(AuctionState::FailedBreakout, Some(Region::Above)));
+    records[1].state.effort = [
+        unavailable(),
+        FeatureValue::Ready(effort(1, Aggressor::Sell, 5_000, coverage(false, true))),
+        warming(),
+    ];
+    records[1].context.auction = FeatureValue::Ready(auction(AuctionState::InsideValue, None));
+    records[2].state.cvd_utc_day = FeatureValue::Ready(day_cvd(0, coverage(true, true)));
+    records[2].context.auction =
+        FeatureValue::Ready(auction(AuctionState::FailedReclaim, Some(Region::Below)));
+    records[3].state.cvd_utc_day = FeatureValue::Unavailable {
+        reason: Unavailability::InputInvalid,
+    };
+    records
+}
+
+/// The records of [`records`] before their order-flow values.
+fn base_records() -> Vec<ContextRecord> {
     let first = key(T0 + 1_000, 5);
     vec![
         baseline(
@@ -443,7 +533,123 @@ fn opt_censor(at: &TimestampMillisecondArray, reason: &StringArray, row: usize) 
     }
 }
 
-/// The labels rebuilt from the three tables alone.
+/// One stored effort row: the window, the state, and the stored fields
+/// when ready.
+type StoredEffort = (
+    String,
+    String,
+    Option<(Aggressor, Qty, Qty, Price, Price, Price, Coverage, bool)>,
+);
+
+/// The effort rows rebuilt from `effort.parquet` alone, per record. Every
+/// nullable column is NULL exactly when the state is not ready.
+fn rebuild_effort(dir: &Path) -> Vec<Vec<StoredEffort>> {
+    let effort = read(&dir.join("effort.parquet"));
+    let record = col::<UInt64Array>(&effort, "record");
+    let window = col::<StringArray>(&effort, "window");
+    let state = col::<StringArray>(&effort, "state");
+    let aggressor = col::<StringArray>(&effort, "aggressor");
+    let quantity = |name: &str, row: usize| {
+        opt_price(col::<Decimal128Array>(&effort, name), row).map(|p| Qty::from_units(p.units()))
+    };
+    let price = |name: &str, row: usize| opt_price(col::<Decimal128Array>(&effort, name), row);
+    let flag = |name: &str, row: usize| {
+        let array = col::<BooleanArray>(&effort, name);
+        array.is_valid(row).then(|| array.value(row))
+    };
+    let mut rows: Vec<Vec<StoredEffort>> = Vec::new();
+    for row in 0..effort.num_rows() {
+        assert_eq!(record.value(row), (row / 3) as u64, "three rows per record");
+        let fields = (
+            aggressor.is_valid(row).then(|| match aggressor.value(row) {
+                "buy" => Aggressor::Buy,
+                "sell" => Aggressor::Sell,
+                other => panic!("aggressor {other}"),
+            }),
+            quantity("effort", row),
+            quantity("effort_high", row),
+            price("progress", row),
+            price("move_median", row),
+            price("move_high", row),
+            flag("partial_start", row),
+            flag("feed_gap", row),
+            flag("active", row),
+        );
+        let stored = match fields {
+            (
+                Some(aggressor),
+                Some(effort),
+                Some(high),
+                Some(progress),
+                Some(median),
+                Some(move_high),
+                Some(partial_start),
+                Some(feed_gap),
+                Some(active),
+            ) => Some((
+                aggressor,
+                effort,
+                high,
+                progress,
+                median,
+                move_high,
+                coverage(partial_start, feed_gap),
+                active,
+            )),
+            (None, None, None, None, None, None, None, None, None) => None,
+            other => panic!("row {row} is only partly NULL: {other:?}"),
+        };
+        assert_eq!(
+            stored.is_some(),
+            state.value(row) == "ready",
+            "row {row}: NULLs follow the state"
+        );
+        if row % 3 == 0 {
+            rows.push(Vec::new());
+        }
+        rows.last_mut().unwrap().push((
+            window.value(row).to_owned(),
+            state.value(row).to_owned(),
+            stored,
+        ));
+    }
+    rows
+}
+
+/// What `effort.parquet` must hold for `records`.
+fn expected_effort(records: &[ContextRecord]) -> Vec<Vec<StoredEffort>> {
+    records
+        .iter()
+        .map(|record| {
+            ["5m", "15m", "1h"]
+                .iter()
+                .zip(&record.state.effort)
+                .map(|(window, value)| {
+                    let state = match value {
+                        FeatureValue::WarmingUp { .. } => "warming",
+                        FeatureValue::Ready(_) => "ready",
+                        FeatureValue::Unavailable { .. } => "unavailable",
+                    };
+                    let stored = value.ready().map(|r| {
+                        (
+                            r.aggressor,
+                            r.effort,
+                            r.effort_high,
+                            r.progress,
+                            r.move_median,
+                            r.move_high,
+                            r.coverage,
+                            r.active,
+                        )
+                    });
+                    ((*window).to_owned(), state.to_owned(), stored)
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// The labels rebuilt from the three label tables alone.
 fn rebuild(dir: &Path) -> Vec<ForwardLabel> {
     let contexts = read(&dir.join("contexts.parquet"));
     let outcomes = read(&dir.join("outcomes.parquet"));
@@ -587,10 +793,22 @@ fn round_trip_rebuilds_every_label_and_the_record_projection() {
     assert_eq!(manifest.rows("contexts.parquet"), Some(4));
     assert_eq!(manifest.rows("outcomes.parquet"), Some(20));
     assert_eq!(manifest.rows("passages.parquet"), Some(4));
+    assert_eq!(manifest.rows("effort.parquet"), Some(12));
     assert_eq!((manifest.events, manifest.rejections), (100, 3));
     assert_eq!(OutcomeDataset::open(&out).unwrap().manifest(), &manifest);
 
     assert_eq!(rebuild(&out), labels);
+    // Every effort row rebuilds its evaluation's stored fields (ADR-058
+    // D2), and its NULLs match its state.
+    assert_eq!(rebuild_effort(&out), expected_effort(&records));
+    let effort = read(&out.join("effort.parquet"));
+    let rows: Vec<EffortRow> = records
+        .iter()
+        .enumerate()
+        .flat_map(|(i, record)| EffortRow::of(i as u64, record).unwrap())
+        .collect();
+    let expected = to_batch(&rows, &schema::provenance_values(&provenance()));
+    assert_eq!(effort.columns(), expected.columns());
 
     // The record projection: what was written is read back unchanged.
     let contexts = read(&out.join("contexts.parquet"));
@@ -639,6 +857,27 @@ fn round_trip_rebuilds_every_label_and_the_record_projection() {
     assert!(minute_end.is_null(1));
     let data = col::<StringArray>(&contexts, "data_version");
     assert_eq!(data.value(3), "5d".repeat(32));
+
+    // The format-2 columns (ADR-058 D2): the side only when the auction is
+    // ready and has one; the CVD and its coverage only when ready.
+    let side = col::<StringArray>(&contexts, "auction_side");
+    let cvd = col::<Decimal128Array>(&contexts, "cvd_utc_day");
+    let cvd_partial = col::<BooleanArray>(&contexts, "cvd_partial_start");
+    let cvd_gap = col::<BooleanArray>(&contexts, "cvd_feed_gap");
+    let state = col::<StringArray>(&contexts, "auction_state");
+    assert_eq!(
+        (side.value(0), state.value(0)),
+        ("above", "failed_breakout")
+    );
+    assert!(side.is_null(1) && state.value(1) == "inside_value");
+    assert_eq!(side.value(2), "below");
+    assert!(side.is_null(3) && state.is_null(3));
+    assert_eq!(opt_price(cvd, 0), Some(p(-12_345)));
+    assert!(!cvd_partial.value(0) && !cvd_gap.value(0));
+    assert!(cvd.is_null(1) && cvd_partial.is_null(1) && cvd_gap.is_null(1));
+    assert_eq!(opt_price(cvd, 2), Some(p(0)));
+    assert!(cvd_partial.value(2) && cvd_gap.value(2));
+    assert!(cvd.is_null(3) && cvd_partial.is_null(3) && cvd_gap.is_null(3));
 }
 
 #[test]
@@ -700,6 +939,7 @@ fn the_same_inputs_write_the_same_bytes_and_content_hash() {
         [
             "contexts.parquet",
             "dataset.manifest",
+            "effort.parquet",
             "outcomes.parquet",
             "passages.parquet"
         ]
@@ -735,6 +975,7 @@ fn tampering_is_an_integrity_error_and_no_manifest_is_incomplete() {
     for (name, flip) in [
         ("outcomes.parquet", 200),
         ("passages.parquet", 0),
+        ("effort.parquet", 100),
         ("dataset.manifest", 30),
     ] {
         let out = dir.path().join(name);
@@ -926,6 +1167,7 @@ fn many_batches_and_row_groups_reproduce_byte_for_byte() {
         a.rows("passages.parquet"),
         Some((N.div_ceil(3) + N.div_ceil(5)) as u64)
     );
+    assert_eq!(a.rows("effort.parquet"), Some(3 * N as u64));
     assert_eq!(
         OutcomeDataset::open(&dir.path().join("a"))
             .unwrap()
@@ -955,4 +1197,107 @@ fn many_batches_and_row_groups_reproduce_byte_for_byte() {
         }
     }
     assert_eq!(expected, 5 * N as u64);
+}
+
+/// Replaces `name` in the dataset `dir` by `batch` and re-seals the
+/// manifest around it (rows, SHA-256, content hash), as a writer that
+/// produced that table would have.
+fn replace_table(dir: &Path, name: &str, batch: Option<&RecordBatch>) {
+    let path = dir.join(name);
+    make_writable(&path);
+    fs::remove_file(&path).unwrap();
+    let manifest_path = dir.join(MANIFEST_FILE);
+    let mut manifest =
+        OutcomeManifest::parse(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    if let Some(batch) = batch {
+        let mut bytes = Vec::new();
+        let mut writer = parquet::arrow::ArrowWriter::try_new(
+            &mut bytes,
+            batch.schema(),
+            Some(schema::writer_properties()),
+        )
+        .unwrap();
+        writer.write(batch).unwrap();
+        writer.close().unwrap();
+        fs::write(&path, &bytes).unwrap();
+        let file = manifest.files.iter_mut().find(|f| f.name == name).unwrap();
+        file.rows = batch.num_rows() as u64;
+        file.sha256 = crate::manifest::sha256_hex(&bytes);
+    }
+    manifest.content = manifest.compute_content();
+    make_writable(&manifest_path);
+    fs::write(&manifest_path, manifest.render()).unwrap();
+}
+
+#[test]
+fn verify_catches_a_missing_extra_or_tampered_effort_table() {
+    let dir = TempDir::new("outcome-effort-verify");
+    let records = records();
+    let labels = labels(&records);
+
+    // Missing.
+    let out = dir.path().join("missing");
+    build(&out, header("unknown"), &records, &labels);
+    replace_table(&out, "effort.parquet", None);
+    let error = OutcomeDataset::open(&out).unwrap_err();
+    assert!(
+        matches!(&error, OutcomeError::Integrity(detail) if detail.contains("effort.parquet: missing")),
+        "{error}"
+    );
+
+    // Extra rows: a fourth row for one record, under a consistent manifest.
+    let out = dir.path().join("extra");
+    build(&out, header("unknown"), &records, &labels);
+    let mut rows: Vec<EffortRow> = records
+        .iter()
+        .enumerate()
+        .flat_map(|(i, record)| EffortRow::of(i as u64, record).unwrap())
+        .collect();
+    rows.push(rows[0].clone());
+    let batch = to_batch(&rows, &schema::provenance_values(&provenance()));
+    replace_table(&out, "effort.parquet", Some(&batch));
+    let error = OutcomeDataset::open(&out).unwrap_err();
+    assert!(
+        matches!(&error, OutcomeError::Integrity(detail) if detail.contains("not three per record")),
+        "{error}"
+    );
+
+    // Tampered: one flipped byte (also in the tamper test above), and a
+    // table of the right row count but another schema.
+    let out = dir.path().join("schema");
+    build(&out, header("unknown"), &records, &labels);
+    let passages: Vec<schema::PassageRow> = (0..3)
+        .flat_map(|_| labels.iter().enumerate())
+        .flat_map(|(i, label)| schema::PassageRow::of(i as u64, label).unwrap())
+        .collect();
+    let padded = to_batch(&passages, &schema::provenance_values(&provenance()));
+    assert_eq!(padded.num_rows(), 12);
+    replace_table(&out, "effort.parquet", Some(&padded));
+    let error = OutcomeDataset::open(&out).unwrap_err();
+    assert!(
+        matches!(&error, OutcomeError::Integrity(detail) if detail.contains("schema is not the dataset format 2")),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_quantity_beyond_decimal_18_8_is_a_range_error() {
+    let dir = TempDir::new("outcome-qty-range");
+    let mut records = records();
+    records[0].state.cvd_utc_day = FeatureValue::Ready(day_cvd(i64::MAX, coverage(false, false)));
+    let mut writer = OutcomeWriter::create(&dir.path().join("a"), header("unknown")).unwrap();
+    assert!(matches!(
+        writer.record(&records[0]),
+        Err(OutcomeError::Range(_))
+    ));
+    let mut records = super::tests::records();
+    let mut too_much = effort(1, Aggressor::Buy, 1, coverage(false, false));
+    too_much.effort_high = Qty::from_units(i64::MIN);
+    records[0].state.effort[1] = FeatureValue::Ready(too_much);
+    let mut writer = OutcomeWriter::create(&dir.path().join("b"), header("unknown")).unwrap();
+    let error = writer.record(&records[0]).unwrap_err();
+    assert!(
+        matches!(&error, OutcomeError::Range(detail) if detail.starts_with("effort_high ")),
+        "{error}"
+    );
 }

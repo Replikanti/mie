@@ -1,5 +1,5 @@
 //! Opening a finished dataset: verified before anything reads it
-//! (ADR-057 D3, D5).
+//! (ADR-057 D3, D5; ADR-058 D2).
 
 use super::manifest::OutcomeManifest;
 use super::schema;
@@ -22,7 +22,7 @@ impl OutcomeDataset {
     /// Opens the dataset in `dir` and verifies it: the manifest parses and
     /// its `content` line is the hash of the lines before it; every table
     /// has the manifest's SHA-256, row count, format metadata and schema;
-    /// `outcomes` has five rows per `contexts` row.
+    /// `outcomes` has five rows and `effort` three rows per `contexts` row.
     ///
     /// # Errors
     ///
@@ -52,6 +52,7 @@ impl OutcomeDataset {
             schema::contexts_schema(),
             schema::outcomes_schema(),
             schema::passages_schema(),
+            schema::effort_schema(),
         ];
         for ((file, name), expected) in manifest.files.iter().zip(TABLES).zip(schemas) {
             verify_table(&dir.join(name), name, file.rows, &file.sha256, &expected)?;
@@ -61,6 +62,13 @@ impl OutcomeDataset {
             return Err(OutcomeError::Integrity(format!(
                 "{} outcome rows for {} contexts: not five per record",
                 rows(TABLES[1]),
+                rows(TABLES[0])
+            )));
+        }
+        if rows(TABLES[3]) != 3 * rows(TABLES[0]) {
+            return Err(OutcomeError::Integrity(format!(
+                "{} effort rows for {} contexts: not three per record",
+                rows(TABLES[3]),
                 rows(TABLES[0])
             )));
         }
@@ -123,7 +131,10 @@ fn verify_table(
         )));
     }
     if builder.schema().fields() != expected.fields() {
-        return Err(integrity("schema is not the dataset format 1".to_owned()));
+        return Err(integrity(format!(
+            "schema is not the dataset format {}",
+            schema::FORMAT_VERSION
+        )));
     }
     Ok(())
 }

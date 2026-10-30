@@ -1,4 +1,5 @@
--- The research views over one conditional outcome dataset (#27, ADR-057 D7).
+-- The research views over one conditional outcome dataset (#27, ADR-057 D7;
+-- format 2, ADR-058 D2).
 --
 -- Usable from any DuckDB client of the version Cargo.lock pins (ADR-057 D8):
 -- set the dataset directory first, then run this file, e.g.
@@ -16,7 +17,7 @@
 -- so a result does not depend on how DuckDB schedules its threads. Every view
 -- ends with an ORDER BY over its key columns.
 
--- The base tables, one view per Parquet file (ADR-057 D1).
+-- The base tables, one view per Parquet file (ADR-057 D1, ADR-058 D2).
 CREATE OR REPLACE VIEW contexts AS
 SELECT * FROM read_parquet(getvariable('mie_dataset') || '/contexts.parquet')
 ORDER BY record;
@@ -28,6 +29,12 @@ ORDER BY record, horizon_ms;
 CREATE OR REPLACE VIEW passages AS
 SELECT * FROM read_parquet(getvariable('mie_dataset') || '/passages.parquet')
 ORDER BY record, target DESC;
+
+-- Three rows per record, one per effort window, in the writer's order
+-- (5m, 15m, 1h). `window` is a keyword in SQL, so the column is quoted.
+CREATE OR REPLACE VIEW effort AS
+SELECT * FROM read_parquet(getvariable('mie_dataset') || '/effort.parquet')
+ORDER BY record, list_position(['5m', '15m', '1h'], "window");
 
 -- A price column in its integer unit, 1e-8 USDT (ADR-027): exact, so the
 -- excursion ratios below are integer divisions in IEEE double. Widened
@@ -42,7 +49,8 @@ CREATE OR REPLACE MACRO mie_rank(sorted, q) AS
     sorted[greatest(1, CAST(ceil(q * len(sorted)) AS BIGINT))];
 
 -- One row per record and horizon: the record's context, its outcome, and
--- the compositions ADR-055 D8 left to these views (ADR-057 D7).
+-- the compositions ADR-055 D8 left to these views (ADR-057 D7). The context
+-- columns are every `contexts` column (format 2 adds four, ADR-058 D2).
 --
 -- - group_trigger: the trigger id, or 'baseline'.
 -- - location_bins: ADR-051 R1's bins, a record in both value_edge and

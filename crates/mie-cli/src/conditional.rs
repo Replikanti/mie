@@ -1,5 +1,5 @@
 //! `mie conditional build` and `mie conditional verify`: the conditional
-//! outcome dataset of #27 (ADR-057, proposed).
+//! outcome dataset of #27 (ADR-057), in format 2 (#28, ADR-058, proposed).
 //!
 //! `build` labels a replay through
 //! [`label_window_started`](mie_app::conditional::label_window_started)
