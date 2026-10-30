@@ -75,15 +75,37 @@ Every outcome is measured in R, net of:
 
 | Input | Value |
 |---|---|
-| Confidence level (sets z, T2, T5) | to be set |
+| Confidence level (sets z, T2, T5) | 0.95 |
 | False discovery rate (T3) | to be set |
-| Smallest net expectancy worth trading, in R per trade (T1) | to be set |
-| Fee tier | to be set |
+| Smallest net expectancy worth trading, in R per trade (T1) | 0.10 |
+| Fee tier | Binance USDⓈ-M VIP 0, taker on both sides (10 bps round trip) |
 | Maximum acceptable out-of-sample drawdown, in R | to be set |
 | Minimum frequency for A, setups per week | to be set |
 | Minimum frequency for B, alerts per week | to be set |
 | Waiting period for outside interest in C | to be set |
-| Calibration slice, dataset version and date range | to be set |
+| Calibration slice, dataset version and date range | `c20761ef7e96acd21e3f6dae04cb9f2f20efb34c058dda1e775264e608f892ac`, 2024-10-01 … 2024-12-31 |
+
+Why these values (set 2026-10-30, before any #28 outcome was read):
+
+- **Confidence 0.95.** T2 and T5 use it as a lower bound, where caution
+  is wanted. Until the Research Lab applies the false discovery rate (T3),
+  it also keeps the chance readings per family low: about 5 in 100 cells
+  instead of 10 at 0.90.
+- **μ = 0.10 R.** A smaller edge would sit inside the cost uncertainty.
+  The barrier half-widths measured on the #12 year (medians 4.7 / 8.9 /
+  19 / 39 / 109 bps at 5m / 15m / 1h / 4h / 1d; barrier widths only, no
+  race outcome read) put the taker round trip at 2.1 / 1.1 / 0.53 / 0.26 /
+  0.09 R. Taking one leg as maker instead moves it by about 3 bps, which
+  is 0.08 R at the 4h median. This value is a judgment: the data show only
+  that a smaller edge is not worth trading.
+- **Fee tier VIP 0, taker on both sides.** This is the worst realistic
+  case with no volume commitment. Maker legs are a sensitivity, not the
+  default.
+- **Calibration slice.** It is the earliest contiguous part of the history
+  (§ Calibration slice): the first quarter of the hold-out year. The #12
+  year stays whole, and the walk-forward and forward hold-out is
+  2025-01-01 … 2025-09-30 plus all live data. The version is the slice's
+  format-2 `content` hash, built and verified in #28 M3a.
 
 The drawdown is recorded in R only. The capital and the risk per trade it
 is derived from stay out of this public repository.
