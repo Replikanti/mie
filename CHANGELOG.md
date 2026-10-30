@@ -12,6 +12,23 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
 
 ### Added
 
+- **Order-flow study run and ADR-058 accepted (#28 M3).** The
+  calibration slice (2024-10-01 … 2024-12-31 of the hold-out archive) was
+  built in format 2 and verified, not queried (content `c20761ef…`). From
+  main `b648545`, the #12 year was built once in format 2 (content
+  `5e8e17b0…`), two builds of the R0 live store were byte-identical,
+  `verify` passed on all three, and `measure_outcome_views` found 0 model
+  mismatches and ADR-057's digests on the format-1 projection.
+  `measure_order_flow_study` ran once with the `docs/direction.md` inputs
+  (c = 0.95, μ = 0.10 R, n_min = 385, 10 bps taker round trip). The report
+  `docs/research/028-order-flow-interactions.md` records every table, null
+  results and `insufficient` cells included: 62 of 100 primary cells were
+  read and 17 exclude 0 against 3.1 expected by chance, with P2, P1-sell
+  and P1-trig well above chance and P4 at 0 of 11. Every effect is far
+  below the taker round trip in R at its horizon, so no cell implies a net
+  taker edge at μ = 0.10 R. Nothing is promoted; the cells go to the
+  Research Lab (#30, #32) as hypotheses. ADR-058 is `accepted`. No code
+  changes.
 - **Order-flow conditional study, pre-registered and blind (#28 M1/M2,
   ADR-058, proposed).** ADR-058 fixes the whole study before any outcome
   is read: four hypothesis pairs on identical samples (absorption,

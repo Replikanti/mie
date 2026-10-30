@@ -33,4 +33,4 @@ is rebuilt from versioned raw data (ADR-057 D3).
 
 | Study | Issue | Pre-registered by | Queries | Report |
 |---|---|---|---|---|
-| Order-flow interactions and counter-hypotheses | #28 | ADR-058 | [`028-order-flow-interactions.sql`](028-order-flow-interactions.sql) | pending (#28 M3) |
+| Order-flow interactions and counter-hypotheses | #28 | ADR-058 | [`028-order-flow-interactions.sql`](028-order-flow-interactions.sql) | [`028-order-flow-interactions.md`](028-order-flow-interactions.md) |
