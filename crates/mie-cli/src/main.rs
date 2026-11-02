@@ -7,6 +7,7 @@ use mie_adapter_binance::transport::{
     DownloadTimeouts, NetTimeouts, SystemClock, TungsteniteConnector, UreqDownload, UreqHttp,
 };
 use mie_app::kline_check::KlineVerdict;
+use mie_cli::alerts;
 use mie_cli::archive::{self, ArchiveTransports, ImportRequest};
 use mie_cli::conditional::{self, BuildRequest};
 use mie_cli::config::{ArchiveConfig, IngestConfig};
@@ -200,6 +201,33 @@ USAGE:
     mie conditional views
         Print the SQL of the views, for any DuckDB client of the pinned
         version: SET VARIABLE mie_dataset = '<dir>'; then run it.
+
+    mie alerts replay --config <path> --from <ms|YYYY-MM-DD> --to <ms|YYYY-MM-DD>
+                      --out <file> [--source live|archive|history]
+                      [--streams <a,b,...>] [--trade-correction fold|none]
+                      [--replay-from <ms|YYYY-MM-DD>]
+        Alert dry-run (ADR-059): replay the source (as mie replay) through
+        the alert decision path live ingestion uses, and write the alert
+        log of [from, to) to <file>, which must not exist: JSON Lines with
+        a header (source, windows, data version, engine, alert policy and
+        its fingerprint), one message line per message (event time, event
+        key, the alerts' canonical lines, the rendered text) and a summary
+        (events, rejections, messages, alerts per kind, messages per UTC
+        day p50/p95/max). --replay-from starts the replay earlier, so the
+        engine and the monitor warm up without a message. The same inputs
+        give the same bytes. Prints the provenance and the counts, then
+        PASS (exit 0), or FAIL: <reason> (exit 1) when the replay failed
+        or the window holds no event; nothing is written then. Nothing is
+        sent anywhere.
+
+    mie alerts report --config <path> --from <ms|YYYY-MM-DD> --to <ms|YYYY-MM-DD>
+                      [--source live|archive|history] [--streams <a,b,...>]
+                      [--trade-correction fold|none]
+        Replay [from, to) and print the market report as of its end, in
+        the text a report message carries: last price, volatility regime,
+        UTC-day VWAP, prior-day auction state, the monitored prior-day
+        levels with their zones and the active monitors. PASS (exit 0), or
+        FAIL: <reason> (exit 1) when the window holds no event.
 
     mie --help
 ";
@@ -492,6 +520,78 @@ fn dispatch(args: &[String]) -> Result<ExitCode, String> {
                  `mie conditional query <dir> <view>` or `mie conditional views`"
                     .to_owned(),
             ),
+        },
+        Some("alerts") => match args.get(1).map(String::as_str) {
+            Some("replay") => {
+                let options = Options::parse(
+                    &args[2..],
+                    &[
+                        "--config",
+                        "--from",
+                        "--to",
+                        "--out",
+                        "--source",
+                        "--streams",
+                        "--trade-correction",
+                        "--replay-from",
+                    ],
+                    &[],
+                )?;
+                let from = replay::parse_bound("--from", options.value("--from")?, false)?;
+                let to = replay::parse_bound("--to", options.value("--to")?, true)?;
+                if from >= to {
+                    return Err(format!("--from {from} must be below --to {to}"));
+                }
+                let replay_from = match options.optional("--replay-from") {
+                    Some(value) => replay::parse_bound("--replay-from", value, false)?,
+                    None => from,
+                };
+                if replay_from > from {
+                    return Err(format!(
+                        "--replay-from {replay_from} must not be after --from {from}"
+                    ));
+                }
+                let request = alerts::ReplayRequest {
+                    source: options.replay_source(&options.path("--config")?)?,
+                    replay: ReplayWindow {
+                        start: EventTime::from_millis(replay_from),
+                        end: EventTime::from_millis(to),
+                    },
+                    emit_from: EventTime::from_millis(from),
+                    out: options.path("--out")?,
+                };
+                let pass = alerts::replay(&request, &mut std::io::stdout().lock())?;
+                Ok(exit(pass))
+            }
+            Some("report") => {
+                let options = Options::parse(
+                    &args[2..],
+                    &[
+                        "--config",
+                        "--from",
+                        "--to",
+                        "--source",
+                        "--streams",
+                        "--trade-correction",
+                    ],
+                    &[],
+                )?;
+                let from = replay::parse_bound("--from", options.value("--from")?, false)?;
+                let to = replay::parse_bound("--to", options.value("--to")?, true)?;
+                if from >= to {
+                    return Err(format!("--from {from} must be below --to {to}"));
+                }
+                let request = alerts::ReportRequest {
+                    source: options.replay_source(&options.path("--config")?)?,
+                    window: ReplayWindow {
+                        start: EventTime::from_millis(from),
+                        end: EventTime::from_millis(to),
+                    },
+                };
+                let pass = alerts::report(&request, &mut std::io::stdout().lock())?;
+                Ok(exit(pass))
+            }
+            _ => Err("expected `mie alerts replay …` or `mie alerts report …`".to_owned()),
         },
         Some(other) => Err(format!("unknown command {other:?}")),
     }

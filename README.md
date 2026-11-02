@@ -56,7 +56,7 @@ enforces the boundary (ADR-025):
 | [`mie-adapter-fs`](crates/mie-adapter-fs) | Research result store: append-only, read-only result files with SHA-256 trailers, keyed by experiment, pipeline and, for state-reading pipelines, engine (ADR-040, ADR-052). |
 | [`mie-adapter-duckdb`](crates/mie-adapter-duckdb) | Research views over one conditional outcome dataset in a pinned, bundled DuckDB without extension downloads: the tables, `labeled` and `outcome_summary(n_min)` (ADR-004, ADR-057), plus a study's own committed queries over them (ADR-058). |
 | `mie-adapter-*` *(planned)* | Telegram, LLM operators, backtest engine. |
-| [`mie-cli`](crates/mie-cli) | Composition root, the `mie` binary: wires adapters to ports. Today `ingest`, `capture-report`, `archive-import` / `archive-verify` / `archive-kline-check`, `replay`, `equivalence`, `experiment validate` / `experiment run` and `conditional build` / `conditional verify` / `conditional query` / `conditional views`; report follows. |
+| [`mie-cli`](crates/mie-cli) | Composition root, the `mie` binary: wires adapters to ports. Today `ingest`, `capture-report`, `archive-import` / `archive-verify` / `archive-kline-check`, `replay`, `equivalence`, `experiment validate` / `experiment run`, `conditional build` / `conditional verify` / `conditional query` / `conditional views` and the alert dry-run `alerts replay` / `alerts report` (ADR-059); Telegram delivery follows. |
 
 First milestone data path (brief §19):
 
@@ -187,6 +187,22 @@ records next to the old result:
 ```sh
 cargo run --release -p mie-cli -- experiment run <spec> \
     --source history --config <ingest config with [history]> --results data/results
+```
+
+Dry-run the informational alerts of a window (ADR-059, proposed): the
+replay goes through the decision path live ingestion will use, and the
+messages a chat would get are written to a JSON Lines log instead — header
+with provenance, one line per message with its rendered text, and a summary
+with messages per UTC day. `--replay-from` warms the engine up first (the
+regime needs about nine days). Nothing is sent anywhere; the same inputs
+give the same bytes. `alerts report` prints the market report as of `--to`:
+
+```sh
+cargo run --release -p mie-cli -- alerts replay --source archive \
+    --config crates/mie-cli/archive.example.toml --from 2026-09-29 --to 2026-09-29 \
+    --replay-from 2026-09-19 --out data/alerts-2026-09-29.jsonl
+cargo run --release -p mie-cli -- alerts report --source archive \
+    --config crates/mie-cli/archive.example.toml --from 2026-09-19 --to 2026-09-29
 ```
 
 ## Out of scope for now

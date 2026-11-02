@@ -12,6 +12,28 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
 
 ### Added
 
+- **Informational alerts: decision path, dry-run and measurement tool
+  (#38 M1, ADR-059, proposed).** `mie_domain::alert` decides alerts after
+  each accepted event under `alert.policy@1` (fingerprint pinned): zone
+  entered and left for the prior day's POC, VAH and VAL (a leave only after
+  an alerted enter; retired levels and chain restarts close silently), a
+  side-neutral guide at a VAH or VAL with explicit thresholds from the
+  auction classifier's own rules (each outcome the invalidation of the
+  other), the failed-auction, failed-reclaim and breakout-acceptance
+  triggers, regime label changes, and a market report at every UTC
+  rollover; seeded from the engine's state so a warm and a cold start
+  agree. `mie-ports` gains the outbound `AlertGateway` (best effort, never
+  blocking) and the inbound `GenerateMarketReport`. `mie_app::alert`
+  bundles one message per event, renders plain ASCII text under the D4
+  wording rule and 4 096 characters, and drives replays and the history
+  chain (`alert_window`, `alert_chain_window`, `ReportService`).
+  `mie alerts replay` writes a byte-reproducible JSON Lines alert log of a
+  window, `mie alerts report` prints the report as of a window's end. The
+  ignored tool `crates/mie-cli/tests/alert_measure.rs` measures the volume
+  (A1 wording, A2 seeding, messages per day per half and kind, bursts,
+  FIFO delay, visits, regime dwell, silence and the option table) for the
+  year run that precedes the gate decisions. No Telegram adapter yet;
+  nothing is sent.
 - **Order-flow study run and ADR-058 accepted (#28 M3).** The
   calibration slice (2024-10-01 … 2024-12-31 of the hold-out archive) was
   built in format 2 and verified, not queried (content `c20761ef…`). From

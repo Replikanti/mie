@@ -29,6 +29,7 @@
 //! | Location / auction state (ADR-044)        | [`location`]                 |
 //! | Order-flow candidates (ADR-051)           | [`candidate`]                |
 //! | Bias / trigger (ADR-012, ADR-024, ADR-053)| [`trigger`]                  |
+//! | Informational alerts (ADR-010, ADR-059)   | [`alert`]                    |
 //! | Conditional Behavior samples (ADR-054)    | [`conditional`]              |
 //! | Strategy lifecycle / edge health          | [`strategy`]                 |
 //! | Experiments and results (ADR-040)         | [`research`]                 |
@@ -36,6 +37,7 @@
 //! Risk and validation rules join as modules here when their issues land —
 //! never as a dependency on a port or adapter.
 
+pub mod alert;
 pub mod bars;
 pub mod book;
 pub mod candidate;

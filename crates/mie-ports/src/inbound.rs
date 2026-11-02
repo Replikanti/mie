@@ -1,11 +1,12 @@
 //! Driving (inbound) ports: the use cases the outside world invokes.
 //!
-//! Present: [`ReplayMarket`], [`RunResearchExperiment`] (ADR-040).
-//! Planned, each landing with its issue: `AnalyzeMarket`,
-//! `EvaluateStrategy`, `ValidateCandidate`, `GenerateMarketReport`.
+//! Present: [`ReplayMarket`], [`RunResearchExperiment`] (ADR-040),
+//! [`GenerateMarketReport`] (ADR-059, proposed). Planned, each landing with
+//! its issue: `AnalyzeMarket`, `EvaluateStrategy`, `ValidateCandidate`.
 
 use crate::outbound::{ProviderError, ReplayWindow, ResultStoreError};
 use crate::raw::DatasetVersion;
+use mie_domain::alert::MarketReport;
 use mie_domain::event_hash::EventStreamHash;
 use mie_domain::feature::FeatureKey;
 use mie_domain::research::{DataVersion, ExperimentResult, ExperimentSpec, ResultKey};
@@ -25,6 +26,18 @@ pub trait ReplayMarket {
     ///
     /// [`UseCaseError::Provider`] when the data source fails.
     fn replay(&self, window: ReplayWindow) -> Result<ReplayReport, UseCaseError>;
+}
+
+/// Reports the market as of the end of a window (brief §17, ADR-059 D2f).
+pub trait GenerateMarketReport {
+    /// Replays `window` and reports the market as of `window.end`: the
+    /// state after the window's last event. A domain rejection is counted
+    /// and the replay continues, as in [`ReplayMarket::replay`].
+    ///
+    /// # Errors
+    ///
+    /// [`UseCaseError::Provider`] when the data source fails.
+    fn report(&self, window: ReplayWindow) -> Result<MarketReport, UseCaseError>;
 }
 
 /// Outcome of a replay.
