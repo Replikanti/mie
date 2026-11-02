@@ -14,8 +14,9 @@
 //!   over the length bound or not ASCII (both 0 by construction).
 //! - **A2** (asserted): a monitor seeded at the window start and one seeded
 //!   at the second half's first accepted event — from the engine's state
-//!   before it, read at the last 1m close, the only events that change
-//!   what a seed reads — both emitting from the split emit identical alerts
+//!   before it, read at the last event that closed a bar or announced a
+//!   feed gap, the only events that change what a seed reads — both
+//!   emitting from the split emit identical alerts
 //!   at every event (ADR-059 D2g). Both emit from the split: a monitor that
 //!   emitted before it alerts the leave of a visit it saw entered, which the
 //!   later seed by design does not (D2b).
@@ -67,7 +68,10 @@
 //!
 //! `measure_alerts_on_a_synthetic_tape` runs the whole tool in CI on the
 //! seeded synthetic tape and asserts that every alert kind occurred, so A1
-//! and A2 cannot pass vacuously; `option_table_on_a_synthetic_stream`
+//! and A2 cannot pass vacuously; `a2_holds_across_a_trades_hole_before_the_split`
+//! runs it with a two-hour trades hole after the regime is ready and before
+//! the split, so the regime re-warms across the split (ADR-059 D2e);
+//! `option_table_on_a_synthetic_stream`
 //! checks the post-processing against hand-computed values.
 
 mod common;
@@ -82,7 +86,7 @@ use mie_cli::alerts::quantiles;
 use mie_cli::replay::parse_bound;
 use mie_domain::alert::{ALERT_TRIGGERS, Alert, AlertKind, AlertMonitor};
 use mie_domain::bars::Timeframe;
-use mie_domain::event::MarketEvent;
+use mie_domain::event::{FeedGap, GapReason, MarketEvent, Stream as EventStream};
 use mie_domain::location::LevelKind;
 use mie_domain::regime::RegimeLabel;
 use mie_domain::state::MarketStateEngine;
@@ -733,8 +737,11 @@ fn measure<P: MarketDataProvider>(provider: &mut P, from: i64, to: i64) -> Run {
                 }
             }
             // The seed reads the regime and the in-zone flags, which change
-            // only at a closed 1m bar.
-            if event.time() < mid && closed.iter().any(|bar| bar.timeframe == Timeframe::M1) {
+            // only at an event that closes a bar or announces a feed gap
+            // (a gap can send the regime back to warming up).
+            if event.time() < mid
+                && (!closed.is_empty() || matches!(event, MarketEvent::FeedGap(_)))
+            {
                 candidate = AlertMonitor::new(Some(mid), engine.state());
             }
             let day = day_of(at);
@@ -969,6 +976,56 @@ fn measure_alerts_on_a_synthetic_tape() {
     assert_eq!(rows[0].0, BASE);
     assert_eq!(rows[0].1, run.stream.daily(&all));
     assert_eq!(run.stream.simulate(&BASE), all);
+}
+
+#[test]
+fn a2_holds_across_a_trades_hole_before_the_split() {
+    // The synthetic tape with a two-hour trades hole at day 9 12:00, after
+    // the regime is ready and before the split at day 10 12:00: the regime
+    // warms up again until about day 18.5, so the first label after the
+    // re-warm is compared by monitors seeded before the hole and during it.
+    let (from, to) = (TAPE_START, TAPE_START + TAPE_DAYS * DAY_MS);
+    let (start, end) = (
+        from + 9 * DAY_MS + 12 * HOUR_MS,
+        from + 9 * DAY_MS + 14 * HOUR_MS - 1,
+    );
+    let mut events: Vec<MarketEvent> = synthetic_tape()
+        .into_iter()
+        .filter(|event| {
+            let at = event.time().as_millis();
+            at < to && !(matches!(event, MarketEvent::Trade(_)) && start <= at && at <= end)
+        })
+        .collect();
+    events.push(MarketEvent::FeedGap(FeedGap {
+        stream: EventStream::Trades,
+        start: EventTime::from_millis(start),
+        end: EventTime::from_millis(end),
+        reason: GapReason::MissingData,
+    }));
+    events.sort();
+    let run = measure(&mut Feed(events.into()), from, to);
+    assert_eq!(run.rejections, 0);
+    let flips = |pick: &dyn Fn(i64) -> bool| {
+        run.stream
+            .times(|kept| {
+                kept.items
+                    .iter()
+                    .any(|i| i.kind() == AlertKind::RegimeChanged)
+            })
+            .into_iter()
+            .filter(|at| pick(*at))
+            .count()
+    };
+    assert!(
+        flips(&|at| at < start) > 0,
+        "the regime is not ready before the hole"
+    );
+    assert!(
+        flips(&|at| at >= run.stream.mid) > 0,
+        "no regime change after the re-warm"
+    );
+    assert_eq!(run.a2.2, 0, "{:?}", run.a2.3);
+    assert!(run.a2.1 > 0);
 }
 
 /// A hand-built stream over four days, day 0 warming up; the split at the

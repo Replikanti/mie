@@ -21,7 +21,10 @@
 //! - **Confirmations** (D2d): [`Alert::TriggerFired`] for the three
 //!   auction triggers the guide names ([`ALERT_TRIGGERS`]) only.
 //! - **Regime** (D2e): [`Alert::RegimeChanged`] when the label of
-//!   `volatility.regime.1h@1` differs between two consecutive ready values.
+//!   `volatility.regime.1h@1` differs between two consecutive ready values
+//!   with no not-ready stretch between them: a stretch where the regime is
+//!   not ready (warming up again after a feed hole, or a fresh engine after
+//!   a chain restart) forgets the label.
 //! - **Market report** (D2f): [`Alert::Report`] at every event that closes a
 //!   1d bar, a [`MarketReport`] read from the committed state.
 //!
@@ -90,9 +93,9 @@ pub const ALERT_TRIGGERS: [FeatureKey; 3] = [
 /// zone_left on=left causes=departed requires=emitted_zone_entered silent=retired,vanished
 /// guide on=zone_entered kinds=vah,val requires=location.auction.prior_day@1 tolerance_bps=6 acceptance_closes=60
 /// trigger ids=trigger.failed_auction@1,trigger.failed_reclaim@1,trigger.breakout_acceptance@1
-/// regime feature=volatility.regime.1h@1 on=label_change_between_ready_values hysteresis=none
+/// regime feature=volatility.regime.1h@1 on=label_change_between_consecutive_ready_values not_ready=forget hysteresis=none
 /// report on=1d_close
-/// seed regime=last_ready visits=in_zone_not_alerted
+/// seed regime=ready_label visits=in_zone_not_alerted
 /// bundle per=event order=zone_left,zone_entered,trigger,regime,report
 /// ```
 ///
@@ -118,11 +121,12 @@ pub fn policy_text() -> String {
     ));
     text.push_str(&format!("trigger ids={}\n", triggers.join(",")));
     text.push_str(&format!(
-        "regime feature={} on=label_change_between_ready_values hysteresis=none\n",
+        "regime feature={} on=label_change_between_consecutive_ready_values \
+         not_ready=forget hysteresis=none\n",
         catalog::VOLATILITY_REGIME_1H_V1.key
     ));
     text.push_str("report on=1d_close\n");
-    text.push_str("seed regime=last_ready visits=in_zone_not_alerted\n");
+    text.push_str("seed regime=ready_label visits=in_zone_not_alerted\n");
     text.push_str("bundle per=event order=zone_left,zone_entered,trigger,regime,report\n");
     text
 }
@@ -566,7 +570,7 @@ pub enum Alert {
     /// An auction trigger the guide names fired (D2d), as emitted. Boxed:
     /// several times the size of the other alerts.
     TriggerFired(Box<TriggerEvent>),
-    /// The regime label changed between two ready values (D2e).
+    /// The regime label changed between two consecutive ready values (D2e).
     RegimeChanged {
         /// The previous ready label.
         from: RegimeLabel,
@@ -644,15 +648,16 @@ pub struct AlertMonitor {
     /// The open visit of each monitored kind, in [`MONITORED_KINDS`] order:
     /// one prior day holds one level of each.
     visits: [Option<Visit>; 3],
-    /// The label of the last ready regime value.
+    /// The label of the regime value after the last observed event, `None`
+    /// while it is not ready (D2e).
     regime: Option<RegimeLabel>,
 }
 
 impl AlertMonitor {
     /// A monitor that emits the alerts of events at or after `emit_from`
     /// (all with `None`), seeded from `seed`, the state the engine holds
-    /// before the first event the monitor observes (D2g): the last ready
-    /// regime label, and every monitored level in zone as an open visit
+    /// before the first event the monitor observes (D2g): the regime label
+    /// if the regime is ready, and every monitored level in zone as an open visit
     /// whose enter was not emitted. Pass a fresh engine's state to start
     /// from nothing.
     pub fn new(emit_from: Option<EventTime>, seed: &MarketState) -> Self {
@@ -750,6 +755,11 @@ impl AlertMonitor {
                 });
             }
             self.regime = Some(regime.label);
+        } else {
+            // A not-ready stretch forgets the label (D2e): a monitor seeded
+            // during it cannot see the label before it, and after a chain
+            // restart that label belongs to the replaced engine.
+            self.regime = None;
         }
         if emitting
             && engine

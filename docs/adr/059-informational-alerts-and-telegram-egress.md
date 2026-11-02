@@ -103,7 +103,11 @@ person reads a day, which D6 sets from measured data.
 A `PipelineKey` with a canonical `policy_text()` and an FNV-1a fingerprint
 pinned by a golden test, as `conditional.sampling@1` (ADR-054 D5). Any
 change below is `alert.policy@2`; the M1 logs stay attributable through
-the `@1` text and fingerprint recorded here.
+the `@1` text and fingerprint recorded here: `policy_fingerprint()` of `@1`
+is `3b72bf634edcf2dc`. (`@1` was revised once before any log was
+published, in review of its M1 PR: the regime rule of e. and the seed of
+g.; the earlier draft's fingerprint `3af0eaa35270b4e6` names no published
+log.)
 
 - **a. Monitored levels.** The registry's POC, VAH and VAL whose source is
   `profile.volume.prior_day@1`. *Why these:* the prior day's value area is
@@ -156,9 +160,18 @@ the `@1` text and fingerprint recorded here.
   absorption, OI expansion) are outside `@1`: they fire away from the
   monitored levels and no guide announces them.
 - **e. Regime.** `RegimeChanged` when the label of `volatility.regime.1h@1`
-  differs between two consecutive ready values. No hysteresis constant in
-  `@1`: the flip rate is unmeasured; the M1 tool measures it and gate G
-  decides whether a rule is needed (G4).
+  differs between two consecutive ready values, with no not-ready stretch
+  between them. A stretch where the regime is not ready — warming up again
+  after a trades hole, or a fresh engine after a chain restart (ADR-052
+  D4) — **forgets** the label, so the first ready value after it is not
+  alerted; the next report shows it. *Why:* a monitor seeded during the
+  stretch cannot see the label before it, so remembering it would make the
+  alerts depend on where observation started (g.), and after a restart the
+  label belongs to the engine the restart replaced. *Cost:* a change
+  across a hole of about 9 days of re-warm (214 hourly samples, ADR-052)
+  goes unannounced as a change. No hysteresis constant in `@1`: the flip
+  rate is unmeasured; the M1 tool measures it and gate G decides whether a
+  rule is needed (G4).
 - **f. Market report.** At every event that closes a 1d bar — the UTC
   rollover that publishes the new prior day, so the report shows the day's
   new monitored levels: the event time, the last price, the regime (label
@@ -170,12 +183,14 @@ the `@1` text and fingerprint recorded here.
   an intraday report is a gate G option (G3), since its cost in messages is
   unmeasured.
 - **g. Seeding.** The monitor is built from the state the engine holds
-  before its first observed event: the last ready regime label, and every
+  before its first observed event: the regime label if the regime is
+  ready (none otherwise, as e. forgets it while not ready), and every
   monitored level in zone as an open visit whose enter was not emitted.
   Events before `emit_from` are decided but not emitted. *Why:* decisions at
   or after `emit_from` then do not depend on where observation started, so
-  a warm live run and a replay of the same events agree (ADR-019). A test
-  seeds at three points and compares; A2 checks it on the year.
+  a warm live run and a replay of the same events agree (ADR-019). Tests
+  seed at three points and compare, also with a trades hole before the
+  split and across a chain restart; A2 checks it on the year.
 
 ### D3. The port contract
 

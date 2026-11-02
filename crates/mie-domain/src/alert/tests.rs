@@ -26,14 +26,14 @@ fn policy_text_and_fingerprint_are_pinned() {
          tolerance_bps=6 acceptance_closes=60\n\
          trigger ids=trigger.failed_auction@1,trigger.failed_reclaim@1,\
          trigger.breakout_acceptance@1\n\
-         regime feature=volatility.regime.1h@1 on=label_change_between_ready_values \
-         hysteresis=none\n\
+         regime feature=volatility.regime.1h@1 \
+         on=label_change_between_consecutive_ready_values not_ready=forget hysteresis=none\n\
          report on=1d_close\n\
-         seed regime=last_ready visits=in_zone_not_alerted\n\
+         seed regime=ready_label visits=in_zone_not_alerted\n\
          bundle per=event order=zone_left,zone_entered,trigger,regime,report\n"
     );
     // Any change of the policy text is `alert.policy@2` (ADR-059 D2).
-    assert_eq!(policy_fingerprint().to_string(), "3af0eaa35270b4e6");
+    assert_eq!(policy_fingerprint().to_string(), "3b72bf634edcf2dc");
 }
 
 #[test]
@@ -554,14 +554,14 @@ fn regime_changes_between_ready_values_only() {
     let mut last = None;
     let mut expected = Vec::new();
     for (index, facts) in run.facts.iter().enumerate() {
-        if let Some(label) = facts.regime {
-            if let Some(from) = last
-                && from != label
-            {
-                expected.push((index, from, label));
-            }
-            last = Some(label);
+        if let Some(label) = facts.regime
+            && let Some(from) = last
+            && from != label
+        {
+            expected.push((index, from, label));
         }
+        // A not-ready stretch forgets the label (D2e).
+        last = facts.regime;
     }
     let alerted: Vec<(usize, RegimeLabel, RegimeLabel)> =
         of_kind(&run.all, AlertKind::RegimeChanged)
@@ -719,4 +719,124 @@ fn a_report_reads_values_that_are_not_ready() {
             .to_string()
             .contains("auction=unavailable")
     );
+}
+
+/// The candidate golden tape with its trades removed for two hours from
+/// hour `hole_hour` and a trades gap announcing the hole: the regime warms
+/// up again after it (ADR-033). Returns the tape and the index of the
+/// first event after the hole.
+fn tape_with_hole(hole_hour: i64) -> (Vec<MarketEvent>, usize) {
+    use crate::event::{FeedGap, GapReason, Stream};
+    let mut tape = crate::candidate::tests::golden_tape();
+    let (start, end) = (hole_hour * 3_600_000, (hole_hour + 2) * 3_600_000 - 1);
+    tape.retain(|event| {
+        let at = event.time().as_millis();
+        !(matches!(event, MarketEvent::Trade(_)) && start <= at && at <= end)
+    });
+    let after = tape
+        .iter()
+        .position(|event| event.time().as_millis() > end)
+        .unwrap();
+    tape.insert(
+        after,
+        MarketEvent::FeedGap(FeedGap {
+            stream: Stream::Trades,
+            start: t(start),
+            end: t(end),
+            reason: GapReason::MissingData,
+        }),
+    );
+    (tape, after + 1)
+}
+
+#[test]
+fn a_regime_hole_before_the_split_does_not_make_alerts_depend_on_the_seed() {
+    // A two-hour trades hole at hour 500 (day 20 20:00), the split three
+    // days later: the regime is ready before the hole, warming up at the
+    // split, and its first ready label after the re-warm differs from the
+    // last one before the hole, so a remembered label would alert a change
+    // the later seed cannot see.
+    let (tape, after) = tape_with_hole(500);
+    let split = tape
+        .iter()
+        .position(|event| event.time().as_millis() >= tape[after].time().as_millis() + 3 * DAY)
+        .unwrap();
+    let split_time = tape[split].time();
+    let mut engine = MarketStateEngine::new();
+    let mut early = AlertMonitor::new(Some(split_time), engine.state());
+    let mut late = None;
+    let (mut from_start, mut from_split) = (Vec::new(), Vec::new());
+    let mut before_hole = None;
+    let mut first_after = None;
+    let mut ready_at_split = true;
+    for (index, event) in tape.iter().enumerate() {
+        if index == after - 1 {
+            before_hole = engine.state().regime.ready().map(|regime| regime.label);
+        }
+        if index > split && first_after.is_none() {
+            first_after = engine.state().regime.ready().map(|regime| regime.label);
+        }
+        if index == split {
+            ready_at_split = engine.state().regime.is_ready();
+            late = Some(AlertMonitor::new(Some(split_time), engine.state()));
+        }
+        engine.apply(event).unwrap();
+        early.observe(event, &engine, |alert| from_start.push((index, alert)));
+        if let Some(monitor) = &mut late {
+            monitor.observe(event, &engine, |alert| from_split.push((index, alert)));
+        }
+    }
+    assert!(
+        before_hole.is_some() && !ready_at_split,
+        "the hole does not reset the regime"
+    );
+    assert!(
+        first_after.is_some() && first_after != before_hole,
+        "{before_hole:?}"
+    );
+    let changes = |alerts: &Emitted| {
+        alerts
+            .iter()
+            .filter(|(_, alert)| alert.kind() == AlertKind::RegimeChanged)
+            .count()
+    };
+    assert!(
+        changes(&from_split) > 0,
+        "the regime never changes after the re-warm"
+    );
+    assert_eq!(from_start, from_split);
+}
+
+#[test]
+fn a_chain_restart_does_not_carry_the_regime_label() {
+    // ADR-052 D4: a fresh engine takes over at hour 500 with the monitor
+    // that observed the replaced one; it must emit what a monitor seeded
+    // from the fresh engine emits.
+    let tape = crate::candidate::tests::golden_tape();
+    let restart = tape
+        .iter()
+        .position(|event| event.time().as_millis() >= 500 * 3_600_000)
+        .unwrap();
+    let restart_time = tape[restart].time();
+    let mut engine = MarketStateEngine::new();
+    let mut carried = AlertMonitor::new(Some(restart_time), engine.state());
+    for event in &tape[..restart] {
+        engine.apply(event).unwrap();
+        carried.observe(event, &engine, |_| {});
+    }
+    assert!(engine.state().regime.is_ready());
+    let mut engine = MarketStateEngine::new();
+    let mut fresh = AlertMonitor::new(Some(restart_time), engine.state());
+    let (mut a, mut b) = (Vec::new(), Vec::new());
+    for (index, event) in tape[restart..].iter().enumerate() {
+        engine.apply(event).unwrap();
+        carried.observe(event, &engine, |alert| a.push((index, alert)));
+        fresh.observe(event, &engine, |alert| b.push((index, alert)));
+    }
+    assert!(
+        a.iter()
+            .any(|(_, alert)| alert.kind() == AlertKind::RegimeChanged),
+        "no regime change after the restart"
+    );
+    assert_eq!(a, b);
 }
