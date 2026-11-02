@@ -21,11 +21,16 @@
 //!   and `mie conditional views` ([`conditional`]): builds the conditional
 //!   outcome dataset of a replay, verifies one, prints one of its DuckDB
 //!   views, or prints the view definitions (#27, ADR-057; format 2 of #28,
-//!   ADR-058).
+//!   ADR-058);
+//! - `mie alerts replay --config <path> --from … --to … --out <file>` and
+//!   `mie alerts report --config <path> --from … --to …` ([`alerts`]): the
+//!   alert dry-run of a replay window into a JSON Lines log, and the market
+//!   report as of a window's end (#38, ADR-059).
 //!
 //! The real network connectors are constructed in `main.rs` and nowhere
 //! else; tests drive [`ingest::run`] with fakes.
 
+pub mod alerts;
 pub mod archive;
 pub mod conditional;
 pub mod config;

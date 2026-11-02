@@ -32,7 +32,15 @@
 //! sampler's records with the forward outcomes of ADR-055 in the same
 //! drive, ends a replay with the provider's trades-stream trailing gaps,
 //! and labels a record window with the events after it as lookahead (#26).
+//!
+//! [`alert`] bundles the alerts the domain's monitor decides after each
+//! accepted event into one message per event, renders its plain text and
+//! hands it to an `AlertGateway` (ADR-059, #38), through
+//! [`drive_tolerant_observed`] or, on the history chain,
+//! [`drive_chain_observed`]; a replay window gives the dry-run's alert log,
+//! and [`alert::ReportService`] reports the market at a window's end.
 
+pub mod alert;
 pub mod conditional;
 pub mod equivalence;
 pub mod kline_check;

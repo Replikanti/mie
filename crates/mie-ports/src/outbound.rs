@@ -1,13 +1,16 @@
 //! Driven (outbound) ports.
 //!
-//! Present: live and historical market data, and the research result store
-//! ([`ResearchResultReader`], [`ResearchResultStore`], ADR-040). Planned,
-//! each landing with the issue that first needs it: `FeatureStore`,
-//! `StrategyRepository`, `BacktestEngine`, `AlertGateway`. There is
-//! deliberately no `ExecutionGateway`: the MVP is informational (ADR-010).
+//! Present: live and historical market data, the research result store
+//! ([`ResearchResultReader`], [`ResearchResultStore`], ADR-040), and the
+//! informational egress [`AlertGateway`] (ADR-059, proposed). Planned, each
+//! landing with the issue that first needs it: `FeatureStore`,
+//! `StrategyRepository`, `BacktestEngine`. There is deliberately no
+//! `ExecutionGateway`: the MVP is informational (ADR-010).
 
 use crate::raw::DatasetVersion;
+use mie_domain::alert::Alert;
 use mie_domain::event::MarketEvent;
+use mie_domain::order::CanonicalKey;
 use mie_domain::research::{ExperimentId, ExperimentResult, HypothesisId, ResultKey};
 use mie_domain::time::EventTime;
 use std::fmt;
@@ -230,6 +233,62 @@ impl fmt::Display for ResultStoreError {
 
 impl std::error::Error for ResultStoreError {}
 
+/// The informational egress (brief §17, ADR-010, ADR-059 D3): delivers one
+/// rendered message per engine event that produced at least one alert.
+///
+/// Contract:
+/// - best effort, and `deliver` never blocks the caller on I/O: the core
+///   thread calls it, and a stalled core thread blocks the capture through
+///   the bounded core channel (ADR-026). An adapter queues and sends on
+///   its own thread;
+/// - a delivery error is counted by the caller and never stops the drive;
+/// - the decision log is the record of what was decided; delivery is not.
+///
+/// There is no path from a message to an order (ADR-010).
+pub trait AlertGateway {
+    /// Hands `message` over for delivery.
+    ///
+    /// # Errors
+    ///
+    /// [`AlertError`] when the message is not taken; the caller counts it
+    /// and goes on.
+    fn deliver(&mut self, message: &AlertMessage) -> Result<(), AlertError>;
+}
+
+/// One message: the alerts of one engine event, bundled, and their
+/// rendered text (ADR-059 D1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlertMessage {
+    /// The event's time, the decision time of every alert in it.
+    pub known_at: EventTime,
+    /// The event's canonical key (ADR-028).
+    pub event: CanonicalKey,
+    /// The alerts, in bundling order.
+    pub alerts: Vec<Alert>,
+    /// The plain text a person reads (ADR-059 D4).
+    pub text: String,
+}
+
+/// Why a gateway did not take a message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AlertError {
+    /// The gateway cannot deliver now (closed, disabled, full).
+    Unavailable(String),
+    /// The message can never be delivered (for example, too long).
+    Rejected(String),
+}
+
+impl fmt::Display for AlertError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unavailable(detail) => write!(f, "alert gateway unavailable: {detail}"),
+            Self::Rejected(detail) => write!(f, "alert message rejected: {detail}"),
+        }
+    }
+}
+
+impl std::error::Error for AlertError {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,6 +348,18 @@ mod tests {
         for (error, text) in cases {
             assert_eq!(error.to_string(), text);
         }
+    }
+
+    #[test]
+    fn alert_errors_describe_themselves() {
+        assert_eq!(
+            AlertError::Unavailable("closed".to_owned()).to_string(),
+            "alert gateway unavailable: closed"
+        );
+        assert_eq!(
+            AlertError::Rejected("too long".to_owned()).to_string(),
+            "alert message rejected: too long"
+        );
     }
 
     #[test]
