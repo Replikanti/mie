@@ -192,9 +192,12 @@ the reverse.
 - *Risk:* R = |reference − stop| in price units. This is planned risk
   (STOP 1 decision 2), so cost assumptions never change the unit.
 - *Validity:* the stop needs σ · (reference − stop) > 0.
-  - With `invalidation.atr@1`, an unready ATR, an offset that rounds to 0,
-    or a level outside the price range skips the decision as `no_risk`
-    (ADR-055 D4's `Unavailable` causes).
+  - With `invalidation.atr@1`, an unready ATR or an offset that rounds to
+    0 skips the decision as `no_risk` (ADR-055 D4's `Unavailable` causes).
+  - Under either invalidation rule, a stop or a target outside the price
+    range skips it as `no_risk` (ADR-055 D4: either barrier outside the
+    range makes the race `Unavailable`). The levels are fixed at the
+    decision, so no overflow comes before the entry fill (D10).
   - With `invalidation.beyond_extreme@1`, a stop on the wrong side skips
     it as `stop_side`.
 - *Offset rule:* the offset is ATR × m, rounded half to even once, the
@@ -264,9 +267,11 @@ the reverse.
     chain's cutover, because live delivers no settlement event
     (`docs/data-availability.md`). This is checked before any drive
     (`FundingNotDelivered`, D13).
-  - A `FeedGap` on `Stream::Funding` that overlaps an open position
-    censors the trade (`funding_gap`).
-- `funding.none@1` books no funding, and says so in the text.
+  - Under `funding.recorded@1`, a `FeedGap` on `Stream::Funding` that
+    meets the booking span censors the trade (`funding_gap`; the span,
+    c and the trailing funding gaps are in D9).
+- `funding.none@1` books no funding, and says so in the text. A funding
+  gap then changes nothing, because nothing is booked.
 
 ### D8. Overlap
 
@@ -277,13 +282,35 @@ than once, the first emission is taken.
 
 ### D9. Censoring: ADR-055 D6's rules applied to the position
 
-- **Censor time c**, as for a label opened at the decision:
-  - a trades `FeedGap`: max(gap start, decision time);
-  - a rejected trades-stream event: ADR-055 D6's min rule;
-  - end of data: the last accepted trades-stream event's time;
-  - a chain restart (ADR-052 D4): the last accepted trades-stream event
-    before it;
-  - `funding_gap` (D7).
+- **Censor time c**, as for a label opened at the decision, with its
+  reason token (D12):
+  - a trades `FeedGap` (`gap`): max(gap start, decision time);
+  - a rejected trades-stream event (`rejected`): ADR-055 D6's min rule;
+  - end of data (`end_of_data`): max(decision time, the last accepted
+    trades-stream event's time), the form of ADR-055 D6's end-of-data
+    rule;
+  - a chain restart (ADR-052 D4; `chain_restart`): the same max, taken
+    over the trades-stream events accepted before the restart;
+  - a funding gap (`funding_gap`, D7), under `funding.recorded@1` only:
+    a `FeedGap` on `Stream::Funding` hits a trade when its closed interval
+    `[start, end]` meets D7's booking span, that is, when `start` is
+    before the exit fill trade's time (or the position is still open) and
+    `end` is at or after the entry fill trade's time. c = max(gap start,
+    entry fill time). *Why:* ADR-055 D6's uniform rule puts c where the
+    unknown begins, bounded below by the start of the span the value
+    reads. Funding is booked from the entry fill (D7), and a pending entry
+    books nothing, so the bound is the fill and not the decision;
+  - an overflow (`overflow`, D10): the time of the event whose value
+    overflowed, that is the entry fill trade (E′, the entry fee,
+    displacement), a monitored trade (MFE, MAE), a settlement (funding)
+    or the exit fill trade (X′, the exit fee, gross, net).
+- `funding_gap` and `overflow` censor the trade outright, even when its
+  exit would stand by the rule below: they make a value on the line
+  unknown, not the path.
+- **Precedence:** when one trade gets several censors, the earliest c
+  wins, and at equal c the first one applied stays (ADR-055 D6;
+  `crates/mie-domain/src/conditional/label.rs` replaces a censor only
+  when the new c is strictly earlier).
 - **When an outcome stands:** it is fixed by the trades **strictly before
   c**. A stop or target exit stands when its touch is before c. A time
   exit stands when its deadline is ≤ c, because the window
@@ -295,9 +322,20 @@ than once, the first emission is taken.
   in a later millisecond than its touch, or at or after its deadline. This
   is ADR-055 D6's emission rule. A later gap reaching back into a final
   trade does not reopen it; it is counted in `reach-backs`.
+- **A funding gap is never a reach-back.** It censors whenever it is
+  delivered, including after the trade has closed, for two reasons:
+  finality is trades-stream finality and does not cover funding, and the
+  result is written only after `finish`, so nothing has been emitted that
+  would need reopening. The slot history (D8) does not change.
 - At the sample end the driver passes the trades-stream trailing gaps,
-  then finishes (the ADR-055 D6 contract). Nothing runs past the sample,
-  so a result depends only on `[origin, sample end)`.
+  then finishes (the ADR-055 D6 contract). Under `funding.recorded@1` it
+  also passes the `Stream::Funding` entries of `trailing_gaps()`,
+  together with the trades entries in canonical order, before `finish`.
+  *Why:* a trailing gap is listed, not delivered (ADR-055 D6, *Trailing
+  gaps*), and without it a missing last month would book zero funding,
+  which D7 forbids. A funding gap moves no trades-stream time and closes
+  nothing. Nothing runs past the sample, so a result depends only on
+  `[origin, sample end)`.
 - Censored trades keep their fields up to c and are counted, but they are
   excluded from every metric, because their outcome is unknown.
 - *Why these rules:* they are what the trades stream can prove about
@@ -314,14 +352,23 @@ legs' fees, funding the D7 sum.
 - gross R = σ(x − e) / R, on trade prices;
 - net R = (σ(X′ − E′) − fees − funding) / R;
 - displacement = σ(e − reference) / R; positive means adverse;
-- MFE and MAE: the largest favourable and adverse excursion from e, over
-  the trades from the entry fill trade through the exit fill trade. Both
-  are ≥ 0.
+- MFE and MAE, in R: MFE = max(0, max σ(p − e)) / R and
+  MAE = max(0, max σ(e − p)) / R, with p over the trades from the entry
+  fill trade through the exit fill trade. Both are ≥ 0. *Why R:*
+  `docs/direction.md` (*Net outcome*): "Every outcome is measured in R".
+  A mean of price excursions over trades would mix volatility regimes
+  and mostly restate the regime, ADR-055 D4's argument, and R is an ATR
+  multiple. Price units can still be derived as value × `risk`.
+  *Rejected:* price units.
 - Each R value is (price units × 10⁸) / R units, rounded half to even
   once, to 8 decimals: the ADR-027 decimal form that result text v1
   already uses.
 - Arithmetic is i128 integer, with no float. Overflow is checked and
-  censors the trade as `overflow`; it never wraps.
+  censors the trade as `overflow` (c in D9); it never wraps. Overflow
+  means an i128 step overflowing, or a value leaving the i64 range of
+  10⁻⁸ units, which is the range of `Price` and `Rate` (ADR-027,
+  `crates/mie-domain/src/num.rs`). That keeps every rendered value
+  readable by the existing decimal parser.
 - *Rejected: floats*, which ADR-027 allows for derived statistics. The
   result text is the identity used for reproduction, and fixed point
   renders in the existing form without a float-formatting rule.
@@ -338,13 +385,20 @@ legs' fees, funding the D7 sum.
   - max drawdown = the largest fall of cumulative net R from its running
     peak, which starts at 0, in exit order (equal to decision order under
     D8);
-  - time to target = the mean of (touch − decision) in ms over target
-    exits;
+  - time to target = the mean of (touch − decision) over target exits,
+    in integer ms: Σ(touch − decision) ÷ the number of target exits,
+    rounded half to even once;
   - mean MFE, MAE and displacement.
 - Sums are exact over the per-trade values, with one half-to-even rounding
   at each final division (`div_half_even`, which S2 moves to `num.rs`).
-  Why: anyone can re-derive every metric from the stored trade lines with
-  integer arithmetic.
+  Every metric except time to target is one rounding of an exact sum
+  divided by a count (or by |Σ negative net R| for profit factor), scaled
+  by 10⁸ for the 8-place values. Why: anyone can re-derive every metric
+  from the stored trade lines with integer arithmetic.
+- *Why integer ms for time to target:* the ms is the resolution of event
+  time (ADR-028) and the unit of every time in result text v1 (`origin`,
+  `sample`, `latency`) and of ADR-057's `time_to_event_ms`. *Rejected:*
+  8 decimals, which would put a second time form into one text.
 - *Means only, no quantiles:* the trade lines hold every value, so any
   other statistic can be derived from the stored result, and a quantile
   choice would be a number without a source.
@@ -370,25 +424,96 @@ order:
 3. one `trade` line per taken decision, in decision order;
 4. the `metrics` lines (D11): `all` first, then the buckets.
 
-The `trade` fields, in order:
-
-- the decision's time in ms, event kind and sequence id (the snake_case
-  names ADR-057 D2 pins in `event_kind_name`);
-- `side`;
-- the regime label of each regime feature;
-- `reference`, `stop`, `target`, `risk`;
-- `entry=<ms>:<price>|-`;
-- `exit=target|stop|time|unfilled|censored`;
-- `exit-at=<ms>` (the touch, the deadline or c);
-- `fill=<ms>:<price>|-`;
-- `funding`;
-- `gross`, `net`, `displacement`, `mfe`, `mae`;
-- `censor=<reason>|-`.
-
 `-` marks an undefined value. Parsing is strict and canonical-only
-(ADR-040 D6). *Why the event key:* it is ADR-055 D1's join key
-(`decision_time`, `event_kind`, `event_seq` on ADR-057's `contexts`), so
-S6 joins without any mapping.
+(ADR-040 D6).
+
+**The `trade` line:**
+
+```
+trade <decision ms> <event_kind> <seq> side=<long|short> regime=<labels> reference=<price> stop=<price> target=<price> risk=<price> entry=<ms>:<price>|- exit=<target|stop|time|unfilled|censored> exit_at=<ms> fill=<ms>:<price>|- funding=<price>|- gross=<R|-> net=<R|-> displacement=<R|-> mfe=<R|-> mae=<R|-> censor=<reason|->
+```
+
+- The decision key is positional: `CanonicalKey`'s (time, kind, seq)
+  (`crates/mie-domain/src/order.rs`) in ADR-057's column order
+  (`decision_time`, `event_kind`, `event_seq`). Time and seq are decimal
+  integers. The kind uses the strings of ADR-057 D2's `event_kind_name`.
+  That table lives in the parquet adapter, which the domain cannot
+  import, so S3 adds a domain table with the same strings, pinned by a
+  test. Every other field is `name=value`, in the fixed order shown.
+  *Why the event key:* it is ADR-055 D1's join key (`decision_time`,
+  `event_kind`, `event_seq` on ADR-057's `contexts`), so S6 joins without
+  any mapping.
+- `side` is σ as D2 names it (long +1, short −1).
+- `regime` holds the label at the decision of each regime feature in the
+  spec's set, comma-separated in feature-id order. Labels are `LOW` …
+  `EXTREME` (spec text v1's upper-case form) or `-` when unready. The
+  value is `none` when the set has no regime feature, which is spec text
+  v1's `none` for an empty list.
+- `reference`, `stop`, `target`, `risk` (R, in price units) and `funding`
+  use the 8-place price form. `funding` is per unit of base, with
+  positive meaning paid (D7), and is `0.00000000` under `funding.none@1`.
+- `entry` and `fill` hold the time and price of the fill **trades** (e,
+  x), not the slipped fills. E′, X′ and both fees follow from e and x,
+  the spec's `slippage` and `taker`, by D6, so every value on the line
+  can be re-derived with integer arithmetic (D11's reason). *Rejected:*
+  storing E′, which would lose e to rounding.
+- `exit_at` is always set: the touch, the deadline or c.
+- The `-` cases:
+  - `entry`, `displacement`, `mfe` and `mae` are `-` when there is no
+    entry fill, or on a censored line whose entry fill trade is not
+    strictly before c;
+  - `fill`, `funding`, `gross` and `net` are `-` on `unfilled` and
+    `censored` lines;
+  - any value whose computation overflowed is `-`;
+  - `censor` is `-` exactly when `exit` is not `censored`.
+- On a censored line, `mfe` and `mae` cover the trades strictly before c
+  and are lower bounds (ADR-055 D6).
+
+**The censor reason tokens:** `censor=` takes exactly `gap`, `rejected`,
+`end_of_data`, `chain_restart`, `funding_gap` and `overflow` (D9).
+
+- The first three are the strings of `CensorReason::as_str`
+  (`crates/mie-domain/src/conditional/label.rs`) and therefore ADR-057's
+  `race_censor_reason`, so S6 compares the text directly. The backtest
+  defines its own enum with these strings, because D15 keeps it off
+  `label::`. S3 pins the name table with a test, as ADR-057 D2 pins its
+  tables.
+- `stale_reference` is a skip in the backtest (D4) and never a censor
+  token.
+- `chain_restart` is the name ADR-052 D6 already uses for the journal
+  record of the same event.
+
+**The `metrics` lines:**
+
+```
+metrics all <fields>
+metrics <regime feature id@N> <LOW|MEDIUM|HIGH|EXTREME|-> <fields>
+<fields> = trades=<n> censored=<n> unfilled=<n> expectancy=<R|-> mean_gross=<R|-> profit_factor=<x|-> win_rate=<x|-> max_drawdown=<R> time_to_target=<ms|-> mean_mfe=<R|-> mean_mae=<R|-> mean_displacement=<R|->
+```
+
+- The bucket form copies spec text v1's `regime-filter <id@N> <LABEL,…>`:
+  the feature key, then one label. Buckets come in feature-id order (the
+  canonical spec sorts features by id), with labels in the order `LOW`,
+  `MEDIUM`, `HIGH`, `EXTREME`, then `-`. A spec set without a regime
+  feature gives only the `all` line.
+- Field names are the Research Lab brief's metric list (expectancy,
+  profit factor, win rate, MFE / MAE, drawdown, entry displacement,
+  time-to-target) in snake_case. That is the pair-name grammar of spec
+  text v1 rule references (`[a-z][a-z0-9_]*`), which the `skipped` line
+  and the `trade` line (`exit_at`) use too, so every pair name follows
+  one grammar. Line keys stay kebab-case, as in result text v1
+  (`effective-origin`) and in this kind's `reach-backs`. Fields come in
+  D11's order.
+- Value forms: `<n>` is a decimal integer. R values, `profit_factor` and
+  `win_rate` use the signed 8-place form of `num.rs` (`-0.12345678`, with
+  zero as `0.00000000`). `win_rate` is a fraction from 0 to 1, not a
+  percent; that is `Rate`'s dimensionless form (ADR-027).
+  `time_to_target` is in ms (D11).
+- `-` appears in these cases: every mean and `win_rate` when `trades=0`;
+  `time_to_target` with no target exit; `profit_factor` with no losing
+  trade or no trade (D11); and any metric whose value leaves the i64 unit
+  range (D10), which only an unbounded ratio can reach. `max_drawdown` is
+  `0.00000000` with no trade, because the running peak starts at 0 (D11).
 
 ### D13. Pipeline `research.backtest@1`
 
@@ -408,7 +533,8 @@ S6 joins without any mapping.
      the rules (D2), and check funding coverage (D7).
   2. Then ADR-052 D10's order: the prefix drive (not evaluated), then the
      sample drive through `drive_chain_with`, so restarts reach the
-     simulator; then the trailing trades gaps and finish.
+     simulator; then the trailing trades gaps (and, under
+     `funding.recorded@1`, the trailing funding gaps, D9) and finish.
   3. Compute the metrics and store the result as `Recorded`, `Reproduced`
      or `Diverged` (ADR-040 D7).
 - **New `ResearchError` variants:** `Unresolved` (every resolution error)
@@ -484,6 +610,8 @@ S6 joins without any mapping.
 | S6 `maker=0.00020000` | `docs/direction.md`: one maker leg moves the round trip by about 3 bps (5 bps taker − 2 bps maker) | unused by registry v1, but part of the id |
 | S6 slippage 0, latency 0 | #30 decision 6: nothing is calibrated or measured, so explicit zeros | latency > 0 breaks the window alignment (D6) |
 | 604 001 515 events, 0 rejections | ADR-040 *Acceptance* (nine streams) = ADR-055's 603 323 345 (`aggTrades` + `metrics`) + 677 075 klines (365 days × 1 855 bars of the six intervals, 0 missing) + 1 095 settlements (365 days × 3); the fold changes quantities, not the count (ADR-050 *Acceptance*: 0 unattributed) | any other count: a day, a stream or a fold differs |
+| Integer ms for time to target | ADR-028's event-time resolution; the time unit of result text v1 | 8 decimals: a second time form in one text |
+| i64 range of 10⁻⁸ units for every rendered value | ADR-027 `Price`/`Rate` (`num.rs`): the range the existing decimal parser reads | wider: the text no longer parses with the existing parser |
 | 0 expected mismatches | the derivation in *Accept when* | — (a single mismatch is a bug) |
 | ≈ 25 min, < 0.4 GB per run | the nearest measured analog, ADR-040 *Acceptance* (26.1 and 24.9 min, 361 MB, nine streams) | — (a forecast, not a criterion) |
 
@@ -505,8 +633,14 @@ There is no other number.
 
 - **What S2–S5 must pin**, as test obligations:
   - S2: D6, D7 and D9, including a touch by the fill trade, `unfilled`,
-    finality and every censor reason;
-  - S3: the D12 golden and the D10/D11 arithmetic;
+    finality and every censor reason; a funding gap inside a position's
+    span, one that reaches back into a closed trade, a trailing funding
+    gap and a funding gap under `funding.none@1` (no effect); an overflow
+    at each event class; a chain restart; precedence at equal c;
+  - S3: the D12 golden and the D10/D11 arithmetic; the golden covers
+    every censor token, every `-` case, `regime=none` and a metric
+    outside the range; tests pin the censor-token and event-kind name
+    tables;
   - S4: the D2 errors, the D3 table and the golden spec not resolving;
   - S5: the D13 order and errors.
 - **The weak spots of spec text v1** (D1): exactly-once slots, the closed
@@ -600,14 +734,19 @@ S6 (#171). The main session runs it under the repo's 8 GB memory and
    - (b) **Outcomes:** each decision except an `overlap` skip is compared
      with its 1h `outcomes` row:
      - target ↔ `upper` for a long and `lower` for a short, stop the
-       reverse, with `exit-at` = `race_at`;
+       reverse, with `exit_at` = `race_at`;
      - time ↔ `neither`;
      - `unfilled` ↔ `neither` with `last` NULL;
-     - censored ↔ `censored` with the same reason and
-       `race_censor_at` = c;
+     - censored ↔ `censored` with the same reason
+       (`race_censor_reason`) and `race_censor_at` = c;
      - `stale_reference` ↔ censored `stale_reference`;
      - `no_risk` ↔ `unavailable`;
-     - `no_side` must be 0, because the aggressor is always set.
+     - `no_side` must be 0, because the aggressor is always set;
+     - `chain_restart`, `funding_gap` and `overflow` have no label
+       counterpart, so each counts as a mismatch. Expected count: 0.
+       `effective-origin -` is asserted (item 3), so there is no restart,
+       and the year has 0 missing `fundingRate` months
+       (`docs/data-availability.md`), so there is no funding gap.
    - (c) **Levels:** (stop, target) = (`lower`, `upper`) for a long or
      (`upper`, `lower`) for a short, and `reference` =
      `contexts.reference`, exactly to the price unit.
