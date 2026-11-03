@@ -26,6 +26,14 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   partition, the grid, the ACF and the ESS. Report-only: the engine, the
   sampler and the records are unchanged. The runs and the ADR-054
   addendum follow in M2.
+- **ADR-054 justification addendum: effective sample size and time of day
+  (#147 M2).** Records the year and live-store runs of the M1 tables. Over
+  the #12 year a location-bin share rests on about 1 450–2 660 effective
+  observations, not 525 599 (τ 197–363, dependence lasting 1.8–3.5 days),
+  while the 1m return is close to uncorrelated (τ ≈ 0.96). Triggers
+  concentrate in 13–16 UTC (share ratio to the baseline 1.43–1.77) and
+  the `us` session holds 42.55 % of them against 33.33 % of the baseline.
+  No value, criterion or decision changes.
 - **Informational alerts: decision path, dry-run and measurement tool
   (#38 M1, ADR-059, proposed).** `mie_domain::alert` decides alerts after
   each accepted event under `alert.policy@1` (fingerprint pinned): zone
