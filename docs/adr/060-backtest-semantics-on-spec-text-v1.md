@@ -1,0 +1,639 @@
+# ADR-060: Backtest semantics on spec text v1
+
+- Status: proposed
+- Date: 2026-11-03
+
+## Context
+
+#30 asks for the backtest: an experiment spec goes in, and a result with
+net outcomes in R comes out through the ADR-040 store, reproducible and
+with its provenance. The Strategy Research Lab brief names the inputs
+(trigger, location, entry, invalidation, target, fees, slippage, funding,
+latency, sample period, data and feature versions), and its acceptance
+asks for reproduction and for a check against an independent value.
+
+ADR-040 left two things open for this issue:
+
+- **Rule ids.** ADR-040 D3 validates the rule references of the
+  `location`, `trigger`, `entry`, `invalidation`, `target`, `slippage` and
+  `funding` slots for syntax and feature membership only. No rule id is
+  resolved, so no spec has meaning yet.
+- **Spec text v1 or v2.** ADR-040 *Consequences*: #30 either records its
+  results through the store with spec text v1, or lands the spec-text-v2
+  ADR first.
+
+#30 was decomposed into S1 (this ADR, #166), S2–S5 (#167–#170, the
+simulator, the outcome text and metrics, the rule registry, the pipeline)
+and S6 (#171, the acceptance run). The decomposition and its STOP 1
+resolution are in
+https://github.com/Replikanti/mie/issues/30#issuecomment-6592036297
+(§5–§6). Its decisions 1–7 are inputs here: the decision is taken on spec
+text v1 (1), R is planned risk (2), one open position per spec (3), the
+S6 trigger family (4), taker fees on both legs (5), the S6 values with
+nothing calibrated (6), and the history chain as the only source (7).
+
+Delivery: this ADR stays proposed. S2–S5 may refine it in place (README
+lifecycle), and each refinement is named in the PR that makes it. S6
+records the *Acceptance* section and flips the status.
+
+## Decision
+
+### Approach
+
+One ADR settles every semantic question and number that S2–S5 implement
+and S6 accepts, on spec text v1. The decisions below are D1–D17.
+
+*Rejected: a spec-text-v2 ADR first.* The canonical text is the identity
+(ADR-040 D2), so v2 would orphan every stored result, and it would fill
+no slot the backtest lacks (D1). *Rejected: one ADR per sub-issue.* S2–S5
+share one decision model, and S6's independent check has to be
+pre-registered in a single text before any backtest result exists.
+
+### D1. Spec text v1 suffices (the answer to ADR-040 *Consequences*)
+
+- #30 records through the ADR-040 store with spec text v1. The backtest
+  uses only the extension paths ADR-040 allows: registries for its opaque
+  rule ids (ADR-040 D3) and a new outcome kind (ADR-040 D6). Every #30
+  input already has a v1 slot (#30 plan §1 table).
+- Three weak spots of v1 are recorded here:
+  1. *Exactly-once slots.* `entry`, `invalidation`, `target` and `trigger`
+     may appear once each (`crates/mie-domain/src/research/spec.rs`).
+     Scale-outs, trailing stages and "trigger + N confirmations" (#31) fit
+     only as composite rule ids or as a new repeatable line kind. Changing
+     the cardinality of an existing key is v2, and the first consumer that
+     needs it writes the v2 ADR.
+  2. *Closed `fees` line.* It accepts exactly two names, `maker` and
+     `taker`, so a third fee concept needs a new line kind or v2.
+  3. *Resolution after parsing.* A spec can pass `validate` and still not
+     run, and a misspelled parameter would give a new id with the same
+     behaviour. Mitigation: the strict resolver (D2) and a second
+     `validate` stage (D13).
+- The ADR-040 golden spec (the `crates/mie-domain/src/research.rs` module
+  docs, id `3f902847001e1998`) stays a parse and identity golden. It does
+  **not** resolve under registry v1: it uses `location.at_level@1`, uses
+  `trigger.failed_auction@1` as a rule id, uses `target.level@1` (#31),
+  and lacks the `side`, `atr` and `buffer` parameters. S4 pins that as a
+  resolution-error test.
+
+### D2. Rule registry v1
+
+Every parameter is required and none has a default, so every value a run
+uses is in the canonical text and the id names it.
+
+| Slot | Rule | Parameters | Valid range | Effect |
+|---|---|---|---|---|
+| trigger | `trigger.fires@1` | `feature=feature:<trigger.*@N>` | a `trigger.` member of the spec's set | a decision at each emission of that id |
+| location | `location.any@1` | none | — | admits every decision |
+| entry | `entry.next_trade@1` | `side=text:with\|against` | these two | D3, D6 |
+| invalidation | `invalidation.atr@1` | `atr=feature:<volatility.atr.*@N>`, `multiple=rate:m` | m > 0 | stop = reference ∓ ⟨m·ATR⟩ |
+| invalidation | `invalidation.beyond_extreme@1` | `atr=feature:…`, `buffer=rate:b` | b ≥ 0; only ids with an extreme (below) | stop = extreme ∓ ⟨b·ATR⟩ |
+| target | `target.r_multiple@1` | `r=rate:k`, `max_hold_ms=int:n` | k > 0; 1 ≤ n ≤ sample end − start; `latency` < n | target = reference ± ⟨k·R⟩; time stop at decision + n |
+| slippage | `slippage.fixed@1` | `rate=rate:s` | 0 ≤ s < 1 | D6 |
+| funding | `funding.recorded@1`, `funding.none@1` | none | — | D7 |
+| state-filter | `none` only | — | — | state-filter rules belong to #31 |
+| regime-filter | unchanged (ADR-040 D1) | — | — | an unready label fails every line |
+
+⟨x⟩ is x rounded half to even, once, to 1e-8 USDT. ∓ and ± are taken with
+the side's sign σ (long +1, short −1).
+
+- *Why `trigger.fires@1 feature=…`:* one registry entry covers every
+  trigger id, current and future, and the spec's `features` set pins the
+  trigger's version (ADR-053 *Approach*). *Rejected:* the trigger id as
+  the rule id, the golden spec's form, which needs one registry entry per
+  trigger id and version.
+- *Why `location.any@1` only:* every trigger is already location-gated
+  (ADR-053 D4). A finer location filter refines a hypothesis, which is
+  #31's job.
+- *Why an explicit `atr` feature parameter:* the text then pins the ATR
+  version, as it pins the trigger's. *Why ATR multiples, not bps:*
+  ADR-055 D4's argument; a bps distance would restate the regime.
+- *The ranges are the domain of definition, not plausibility caps.*
+  - m = 0 gives R = 0.
+  - b < 0 puts the stop inside the extreme, which is a different rule.
+  - k ≤ 0 puts the target on the stop's side.
+  - s ≥ 1 gives a fill price ≤ 0.
+  - A hold longer than the sample changes no result: such a deadline lies
+    past the sample end, and the trade censors at end of data either way
+    (D9). The bound also rules out deadline overflow.
+  - `latency` ≥ hold can never fill (D6).
+  - There is no upper cap on m, b or k: a cap would be a number without a
+    source.
+- *Which ids have an extreme.* `beyond_extreme` is allowed for
+  `trigger.sfp.*`, `trigger.cvd_divergence.*`, `trigger.exhaustion@1` and
+  `trigger.oi_expansion_rejection.<15m|1h|4h|1d>@1`, the ids with an
+  ADR-055 D8 extreme. It is refused for the three auction ids
+  (`failed_auction`, `failed_reclaim`, `breakout_acceptance`),
+  `effort_result.*`, `absorption.*` and
+  `oi_expansion_rejection.prior_day@1` (a failed-auction rejection, which
+  has no extreme). v1 adds no extreme for those families: a new evidence
+  price needs its own source, and `invalidation.atr@1` covers every
+  family. The ATR must be ready even when b = 0, so a buffer sweep
+  compares the same decisions.
+- *Strict resolution.* Each of these is its own error, and all are listed
+  in line order (the ADR-040 D1 style): an unknown id, version or
+  parameter; a missing parameter; a wrong type; an out-of-range value; a
+  feature parameter of the wrong family; `beyond_extreme` on an id
+  without an extreme; `latency` ≥ `max_hold_ms`; any `state-filter` rule.
+
+### D3. Side mapping per trigger family
+
+Each family reads its evidence side, *up* or *down*, from the evidence's
+own sided fact. `with` maps up to long and down to short; `against` does
+the reverse.
+
+| Trigger ids | Evidence (`TriggerEvent.evidence`) | Field | up | down |
+|---|---|---|---|---|
+| `failed_auction`, `failed_reclaim`, `breakout_acceptance` | `Auction(status)` | `status.side` | `Some(Above)` | `Some(Below)` (`Some(In)` or `None`: skipped `no_side`) |
+| `sfp.*` | `Sfp(sweep)` | `sweep.level.side` | `High` | `Low` |
+| `cvd_divergence.*` | `Candidate(CvdDivergence(e))` | `e.comparison.pair.side` | `High` | `Low` |
+| `effort_result.*` | `Candidate(EffortVsResult(e))` | `e.value.aggressor` | `Buy` | `Sell` |
+| `exhaustion` | `Candidate(Exhaustion(e))` | `e.value.expansion.aggressor` | `Buy` | `Sell` |
+| `absorption.*` | `Candidate(Absorption(e))` | `e.value.effort.aggressor` | `Buy` | `Sell` |
+| `oi_expansion_rejection.*` | `OiExpansion(x)` | as for `x.rejection` (the `Sfp` or `Auction` row) | | |
+
+- *Why relative to the evidence:* trigger facts carry no side (ADR-053
+  D1), but every piece of evidence carries a sided fact (ADR-053 D1's
+  list: `structure::Side`, `location::Region`, `event::Aggressor`). An
+  absolute long/short would put mirror-image setups, a swept high and a
+  swept low, into one spec.
+- *Why the expansion's aggressor for exhaustion:* the exhaustion extreme
+  is the highest high after net buying or the lowest low after net selling
+  (`Exhaustion::extreme`, `crates/mie-domain/src/candidate/effort.rs`).
+- Direction belongs to the hypothesis (ADR-055 D7). It lives in the spec
+  and in `mie_domain::backtest` only. No trigger, candidate, record or
+  label type gains a side, so the ADR-053 D1 naming rule stands.
+- *Rejected:* absolute `long|short` (above); a hand mapping per family
+  ("an SFP of a high is short"), which is an interpretation no accepted
+  ADR makes.
+
+### D4. Decision event, reference, filters
+
+- A **decision** is each emission of the rule's trigger id in
+  `MarketStateEngine::trigger_events()` after an accepted sample event
+  (ADR-053 D2). It reads the state after that event. Prefix events
+  (ADR-052 D10) are driven but never evaluated.
+- *Order within an event:* the simulator first applies the event to the
+  open position (fill, touch, funding, gap), and only then takes that
+  event's decisions, in emission order. Why: a decision then can never
+  fill on its own event, ADR-055 D2's strictly-after rule.
+- *Reference:* `trade.last_price@1` at the decision, ADR-055 D2's
+  reference. A decision is skipped as `stale_reference` when no trade came
+  before it, or when a trades gap was delivered after the last trade and
+  at or before the decision (ADR-055 D6's condition).
+- *Filters:* `location.any@1` admits every decision. Regime filters apply
+  ADR-040 D1 to the label at the decision; an unready label fails because
+  it is no listed label. Decisions removed here count as `filtered`, not
+  as skipped.
+- *Conservation:* `triggers` = `filtered` + Σ`skipped` + the number of
+  `trade` lines (D12).
+
+### D5. Levels and the R unit
+
+- *Risk:* R = |reference − stop| in price units. This is planned risk
+  (STOP 1 decision 2), so cost assumptions never change the unit.
+- *Validity:* the stop needs σ · (reference − stop) > 0.
+  - With `invalidation.atr@1`, an unready ATR, an offset that rounds to 0,
+    or a level outside the price range skips the decision as `no_risk`
+    (ADR-055 D4's `Unavailable` causes).
+  - With `invalidation.beyond_extreme@1`, a stop on the wrong side skips
+    it as `stop_side`.
+- *Offset rule:* the offset is ATR × m, rounded half to even once, the
+  rule of `barrier_offset` (`crates/mie-domain/src/conditional/label.rs`).
+  At m = `0.31333000` it equals the labels' 1h offset exactly, since
+  31 333 000 / 10⁸ = 31 333 / 10⁵ (ADR-056 D4′).
+- *All levels are fixed at the decision, from the reference, not from the
+  fill.* Latency and slippage then move fills but never levels, so the
+  direction of every cost assumption can be proved (S2), and the levels
+  equal ADR-056's barriers (the S6 check). *Rejected:* levels from the
+  entry fill, which would let R move with every cost assumption.
+
+### D6. Fills, slippage, fees
+
+- **Entry:** the first trade whose canonical key (ADR-028) is after the
+  decision event and whose time is ≥ decision time + `latency`. It must
+  come before the **deadline**, decision time + `max_hold_ms`; otherwise
+  the decision ends `unfilled` and holds the position slot until the
+  deadline (D8).
+- **Exit monitoring** covers the trades from the entry fill trade
+  (inclusive) with a time before the deadline.
+  - A **touch** is a trade at or beyond a level (ADR-055 D5): for a long,
+    a price ≤ stop or ≥ target; for a short, mirrored. The first touch in
+    canonical order decides between stop and target. One trade cannot
+    touch both levels, since the stop and the target lie on opposite sides
+    of the reference.
+  - The exit fills at the **first trade after the touching trade**, with
+    no latency: stop and target are resting exchange-side orders placed
+    with the entry, and a triggered order fills on the next print.
+  - **Time exit:** with no touch before the deadline, the exit fills at
+    the first trade with a time ≥ the deadline.
+- *Why the fill trade is monitored:* a resting order placed at the fill is
+  immediately marketable when the fill is already beyond it. With latency
+  0 this also makes the monitored trades exactly ADR-055 D2's window.
+- *Why the deadline counts from the decision:* it is the hypothesis's
+  horizon, like the label window. Counted from the fill, latency would
+  move the horizon too.
+- *Latency applies to the entry only:* it is the alert-to-order delay of
+  an informational system (ADR-010). Weak spot: the time exit is treated
+  as pre-scheduled.
+- **Slippage** is adverse: fill = ⟨trade price × (1 + σs)⟩ at entry and
+  ⟨trade price × (1 − σs)⟩ at exit.
+- **Fees:** taker on both legs (STOP 1 decision 5; the `docs/direction.md`
+  fee tier), fee = ⟨taker × slipped fill⟩ per leg. `maker` is parsed and
+  unused by registry v1.
+- *Rejected:*
+  - filling at the touching trade's own price: that print happened before
+    any order could react to it;
+  - filling at the level price: it ignores gaps through a level and is
+    optimistic for stops;
+  - latency on every leg: a resting order has no human delay.
+
+### D7. Funding
+
+- `funding.recorded@1` books every `FundingSettlement` ordered after the
+  entry fill trade and before the exit fill trade. The cost per unit of
+  base is ⟨σ × rate × p⟩, where p is the last trade price before the
+  settlement (a settlement ranks after the trades of its millisecond,
+  `crates/mie-domain/src/order.rs`). Positive means paid; the sign
+  convention is the venue's (a positive rate makes longs pay).
+- *Why the last trade price, not the mark price:* the archive imports no
+  mark price (ADR-034 D2; `docs/data-availability.md`). The amount then
+  errs by the basis as a fraction of itself: by 1 % of the funding amount
+  at a 1 % basis.
+- **Funding is never zero by omission:**
+  - `funding.recorded@1` requires the sample to end at or before the
+    chain's cutover, because live delivers no settlement event
+    (`docs/data-availability.md`). This is checked before any drive
+    (`FundingNotDelivered`, D13).
+  - A `FeedGap` on `Stream::Funding` that overlaps an open position
+    censors the trade (`funding_gap`).
+- `funding.none@1` books no funding, and says so in the text.
+
+### D8. Overlap
+
+One position per spec (STOP 1 decision 3). It is busy from the decision
+until the exit fill, the `unfilled` deadline or the censor. Every decision
+in that time is skipped as `overlap`. When one event emits the id more
+than once, the first emission is taken.
+
+### D9. Censoring: ADR-055 D6's rules applied to the position
+
+- **Censor time c**, as for a label opened at the decision:
+  - a trades `FeedGap`: max(gap start, decision time);
+  - a rejected trades-stream event: ADR-055 D6's min rule;
+  - end of data: the last accepted trades-stream event's time;
+  - a chain restart (ADR-052 D4): the last accepted trades-stream event
+    before it;
+  - `funding_gap` (D7).
+- **When an outcome stands:** it is fixed by the trades **strictly before
+  c**. A stop or target exit stands when its touch is before c. A time
+  exit stands when its deadline is ≤ c, because the window
+  `[entry, deadline)` is then complete. Everything else is censored at c:
+  open positions, pending entries, and exits decided at or after c. Every
+  exit that stands has an observed fill: the provider opens a gap at the
+  last delivered trade (ADR-055 D6, *Emission*).
+- **Finality:** a trade is final once a trades-stream event is observed
+  in a later millisecond than its touch, or at or after its deadline. This
+  is ADR-055 D6's emission rule. A later gap reaching back into a final
+  trade does not reopen it; it is counted in `reach-backs`.
+- At the sample end the driver passes the trades-stream trailing gaps,
+  then finishes (the ADR-055 D6 contract). Nothing runs past the sample,
+  so a result depends only on `[origin, sample end)`.
+- Censored trades keep their fields up to c and are counted, but they are
+  excluded from every metric, because their outcome is unknown.
+- *Why these rules:* they are what the trades stream can prove about
+  coverage, and copying them makes the S6 check exact.
+
+### D10. Per-trade values
+
+Values are per unit of base, so no position size enters a result (the
+capital and the risk per trade stay out of this repository,
+`docs/direction.md`). Symbols: e and x are the prices of the entry and
+exit fill trades, E′ and X′ the slipped fills (D6), fees the sum of both
+legs' fees, funding the D7 sum.
+
+- gross R = σ(x − e) / R, on trade prices;
+- net R = (σ(X′ − E′) − fees − funding) / R;
+- displacement = σ(e − reference) / R; positive means adverse;
+- MFE and MAE: the largest favourable and adverse excursion from e, over
+  the trades from the entry fill trade through the exit fill trade. Both
+  are ≥ 0.
+- Each R value is (price units × 10⁸) / R units, rounded half to even
+  once, to 8 decimals: the ADR-027 decimal form that result text v1
+  already uses.
+- Arithmetic is i128 integer, with no float. Overflow is checked and
+  censors the trade as `overflow`; it never wraps.
+- *Rejected: floats*, which ADR-027 allows for derived statistics. The
+  result text is the identity used for reproduction, and fixed point
+  renders in the existing form without a float-formatting rule.
+
+### D11. Metrics and the regime split
+
+- **Counts:** `trades` (target, stop and time exits), `censored`,
+  `unfilled`.
+- **Over `trades`:**
+  - expectancy (mean net R) and mean gross R;
+  - profit factor = Σ positive net R ÷ |Σ negative net R|, `-` with no
+    losing trade or no trade;
+  - win rate = the share of trades with net R > 0;
+  - max drawdown = the largest fall of cumulative net R from its running
+    peak, which starts at 0, in exit order (equal to decision order under
+    D8);
+  - time to target = the mean of (touch − decision) in ms over target
+    exits;
+  - mean MFE, MAE and displacement.
+- Sums are exact over the per-trade values, with one half-to-even rounding
+  at each final division (`div_half_even`, which S2 moves to `num.rs`).
+  Why: anyone can re-derive every metric from the stored trade lines with
+  integer arithmetic.
+- *Means only, no quantiles:* the trade lines hold every value, so any
+  other statistic can be derived from the stored result, and a quantile
+  choice would be a number without a source.
+- **Regime split:** one metrics line per regime feature of the spec's set
+  and per label, `LOW` … `EXTREME` and then `-` (unready). Every line is
+  rendered even when its bucket is empty, so the set of lines does not
+  depend on the data. A bucket's drawdown runs over that bucket's trades
+  only.
+
+### D12. Outcome kind `backtest`
+
+A result text v1 outcome kind (ADR-040 D6), with a new `PIPELINE_KINDS`
+entry `("research.backtest", 1, "backtest")`
+(`crates/mie-domain/src/research/result.rs`). After `outcome backtest`, in
+order:
+
+1. the twelve provenance lines of `history-replay-summary`, with
+   unchanged grammar (ADR-052 D10); `engine-features` and `state-encoding`
+   give the result key's engine;
+2. `triggers <n>`, `filtered <n>`,
+   `skipped overlap=<n> stale_reference=<n> no_side=<n> no_risk=<n> stop_side=<n>`,
+   `reach-backs <n>`;
+3. one `trade` line per taken decision, in decision order;
+4. the `metrics` lines (D11): `all` first, then the buckets.
+
+The `trade` fields, in order:
+
+- the decision's time in ms, event kind and sequence id (the snake_case
+  names ADR-057 D2 pins in `event_kind_name`);
+- `side`;
+- the regime label of each regime feature;
+- `reference`, `stop`, `target`, `risk`;
+- `entry=<ms>:<price>|-`;
+- `exit=target|stop|time|unfilled|censored`;
+- `exit-at=<ms>` (the touch, the deadline or c);
+- `fill=<ms>:<price>|-`;
+- `funding`;
+- `gross`, `net`, `displacement`, `mfe`, `mae`;
+- `censor=<reason>|-`.
+
+`-` marks an undefined value. Parsing is strict and canonical-only
+(ADR-040 D6). *Why the event key:* it is ADR-055 D1's join key
+(`decision_time`, `event_kind`, `event_seq` on ADR-057's `contexts`), so
+S6 joins without any mapping.
+
+### D13. Pipeline `research.backtest@1`
+
+- **Source:** the history chain only (STOP 1 decision 7; ADR-052 D10:
+  every pipeline that reads Market State runs on the chain).
+- **Key:** (experiment id, `research.backtest@1`, engine key), for
+  ADR-052 D10's reason: keyed without the engine, the store would block
+  the experiment for good at the next catalog change or encoding bump.
+- **CLI:** `mie experiment run <spec> --config <ingest config with
+  [history]> --results <dir> --source history --pipeline backtest`.
+  `--pipeline backtest` with any other source fails. `mie experiment
+  validate` gains a second stage that prints resolution errors, without
+  changing which texts parse.
+- **Run order:**
+  1. Before any drive, with nothing stored on failure: open the sample,
+     check `data` (ADR-040 D5) and the feature set (ADR-040 D4), resolve
+     the rules (D2), and check funding coverage (D7).
+  2. Then ADR-052 D10's order: the prefix drive (not evaluated), then the
+     sample drive through `drive_chain_with`, so restarts reach the
+     simulator; then the trailing trades gaps and finish.
+  3. Compute the metrics and store the result as `Recorded`, `Reproduced`
+     or `Diverged` (ADR-040 D7).
+- **New `ResearchError` variants:** `Unresolved` (every resolution error)
+  and `FundingNotDelivered` (the sample end and the cutover).
+
+### D14. `BacktestEngine` port
+
+- `mie_ports::outbound::BacktestEngine` has one method. It runs a
+  resolved plan over the spec's sample and returns the domain's run
+  output, before metrics: the chain provenance values, the trade records
+  and the counts. Its errors are the provider, data, feature and sample
+  variants of `ResearchError`.
+- `mie_app::backtest` implements it on the chain, driving the domain
+  `Simulator` and rule evaluator through `drive_chain_with`.
+  `ExperimentService` holds it and keeps resolution, the funding check,
+  metrics, rendering and the store. `mie-cli` wires it.
+- *Why:* the Research Lab brief ("Concrete engines can be replaced
+  without changing the research-domain rules"), and ADR-018 lists the
+  port. Every engine is judged by the same metric code and store rules,
+  and each takes a resolved plan, so no engine reinterprets spec text.
+- *Rejected:*
+  - no port, with the service calling the simulator directly: this fixes
+    the service to one engine and leaves ADR-018's port unrealized;
+  - an observer port (`observe`/`reject`/`restart`/`finish`): this makes
+    the drive loop part of the port surface and ties every engine to it.
+
+### D15. Leakage guard
+
+- The simulator reads trades after the decision, the same path ADR-055
+  D11 closes for labels. So no file under `crates/mie-domain/src`,
+  `crates/mie-ports/src` or `crates/mie-app/src` may name `backtest::` on
+  any line, or a `backtest` path segment in a `use` item (joined across
+  lines), with the label guard's scan and self-probes in
+  `tools/check-architecture.sh`.
+- Exceptions:
+  - `crates/mie-domain/src/backtest.rs` and `crates/mie-domain/src/backtest/`;
+  - `crates/mie-domain/src/research/result.rs` (the outcome kind);
+  - `crates/mie-ports/src/outbound.rs` (the port) and
+    `crates/mie-ports/src/inbound.rs` (`Unresolved`);
+  - `crates/mie-app/src/backtest.rs` and `crates/mie-app/src/research.rs`.
+- `evidence_prices` moves from `conditional/label.rs` to `trigger.rs`
+  (S4), so the backtest never names `label::`.
+
+### D16. Source, and what #33 inherits
+
+- The chain's origin is 2025-10-01 (ADR-052 D1), so a chain backtest
+  cannot reach the calibration slice (2024-10-01 … 2024-12-31) or the
+  hold-out (2025-01-01 … 2025-09-30, `docs/direction.md`).
+- Reaching them needs an ADR that moves the origin (ADR-052 D1), and
+  either a `fundingRate` import for that year (today `aggTrades` and
+  `metrics` only, `docs/data-availability.md`) or `funding.none@1` with
+  the bias stated.
+- The live segment has no settlement events, so a forward test on live
+  data needs a settlement source in the chain before `funding.recorded@1`
+  can run there.
+
+### D17. Where each number comes from
+
+| Number | Source | What breaks at another value |
+|---|---|---|
+| 8 decimals for R and metrics | ADR-027's unit, the 8-place form of result text v1 (ADR-040 D2) | fewer: a rounding that a hand re-derivation must also reproduce; more: no text form |
+| One position per spec | STOP 1 decision 3 | independent trades: overlapping trades share one path, so the drawdown counts one move several times |
+| Range bounds in D2 | the domain of definition (D2) | the boundary value is undefined (D2) |
+| Taker on both legs | STOP 1 decision 5, the `docs/direction.md` fee tier | — |
+| Fee and latency ranges | unchanged, ADR-040 D1 (grammar in the `mie_domain::research` module docs) | — (no new number) |
+| S6 sample `1759276800000 1790812800000` | the #12 year: the only window with an accepted `conditional.labels@2` dataset (ADR-057 *Acceptance*) | any other window has no independent labels |
+| S6 trigger `trigger.effort_result.5m@1` | the most fires of any id, 12 952 (ADR-053 *Acceptance*; next: `effort_result.15m` with 7 496), counted from trigger events only | fewer comparisons; a hand pick would be a choice made after #28 |
+| S6 `side=text:with` | the identity mapping. The check is side-symmetric, and the evidence has both sides, so both mappings run | — |
+| S6 `multiple=rate:0.31333000` | ADR-056 D4′: b = 31 333 / 10⁵ | the levels are no longer the barriers, and the check breaks |
+| S6 `r=rate:1.00000000` | the symmetric barrier pair (ADR-055 D4, ADR-056 D4′) | the target is not the opposite barrier |
+| S6 `max_hold_ms=int:3600000` | the 1h horizon, ADR-056's 1h identity (v1 = v2 = the engine's ATR(1h)) | other horizons depend on the per-horizon ATR |
+| S6 `taker=0.00050000` | `docs/direction.md`: VIP 0, 10 bps round trip | — |
+| S6 `maker=0.00020000` | `docs/direction.md`: one maker leg moves the round trip by about 3 bps (5 bps taker − 2 bps maker) | unused by registry v1, but part of the id |
+| S6 slippage 0, latency 0 | #30 decision 6: nothing is calibrated or measured, so explicit zeros | latency > 0 breaks the window alignment (D6) |
+| 604 001 515 events, 0 rejections | ADR-040 *Acceptance* (nine streams) = ADR-055's 603 323 345 (`aggTrades` + `metrics`) + 677 075 klines (365 days × 1 855 bars of the six intervals, 0 missing) + 1 095 settlements (365 days × 3); the fold changes quantities, not the count (ADR-050 *Acceptance*: 0 unattributed) | any other count: a day, a stream or a fold differs |
+| 0 expected mismatches | the derivation in *Accept when* | — (a single mismatch is a bug) |
+| ≈ 25 min, < 0.4 GB per run | the nearest measured analog, ADR-040 *Acceptance* (26.1 and 24.9 min, 361 MB, nine streams) | — (a forecast, not a criterion) |
+
+There is no other number.
+
+### Out of scope
+
+- Any code (S2–S5).
+- Edits to existing ADRs; ADR-052 stays as it is.
+- State-filter rules and `target.level@1` (#31).
+- Spread and depth-walk slippage, maker legs and slippage calibration
+  (#172).
+- Walk-forward, the hold-out and an origin move (#33).
+- Limit or maker entries, scale-outs, trailing stops and absolute sides.
+- Reading any metric.
+- The S6 check tool (#171).
+
+## Consequences
+
+- **What S2–S5 must pin**, as test obligations:
+  - S2: D6, D7 and D9, including a touch by the fill trade, `unfilled`,
+    finality and every censor reason;
+  - S3: the D12 golden and the D10/D11 arithmetic;
+  - S4: the D2 errors, the D3 table and the golden spec not resolving;
+  - S5: the D13 order and errors.
+- **The weak spots of spec text v1** (D1): exactly-once slots, the closed
+  `fees` line and resolution after parsing. The first consumer that needs
+  a repeated slot writes the v2 ADR.
+- **The latency and time-exit weak spots** (D6): latency delays the entry
+  only, and the time exit is treated as pre-scheduled, so a latency
+  sensitivity understates the cost of a manual time exit.
+- **The funding error bound** (D7): without a mark price, the funding
+  amount errs by the basis as a fraction of itself.
+- **S6 proves the engine, not a strategy.** Its check compares exits,
+  times, levels and censors with independent labels; it reads no R value
+  and no metric (#30 decision 6).
+- **#33 inherits D16:** an origin-moving ADR and a `fundingRate` import
+  (or `funding.none@1` with its bias) before any backtest reaches the
+  calibration slice or the hold-out, and a settlement source before
+  `funding.recorded@1` runs on live data.
+- **The chain cutover dependency:** S6 needs #106's production cutover.
+  ADR-052 is proposed, and the chain's dataset version includes the
+  cutover (ADR-052 D5), so a run on a provisional cutover records a result
+  tied to that chain.
+- **Stream assumption of the S6 check:** the chain replays nine streams,
+  the dataset was built from `aggTrades` + `metrics`. They are expected to
+  yield the same trigger events: klines are a cross-check only and never a
+  bar source (ADR-031, `docs/data-availability.md`), and no trigger rule
+  reads a funding input (ADR-053 D2, D5–D7). The asserted 12 952 and the
+  join catch a difference, and a fallback is a decision for the issue, not
+  a tolerance.
+
+## Alternatives considered
+
+- **Spec text v2 first.** Orphans every stored result and fills no slot
+  the backtest lacks (Approach, D1).
+- **Levels from the entry fill.** R would move with every cost
+  assumption, and the levels would no longer equal the barriers (D5).
+- **Absolute sides** (`long|short`). Mirror-image setups would share one
+  spec (D3).
+- **A hand side mapping per family.** An interpretation no accepted ADR
+  makes (D3).
+- **Fill at the touching trade or at the level price.** The touching
+  print happened before any order could react; the level price ignores
+  gaps through a level and is optimistic for stops (D6).
+- **Latency on every leg.** A resting order has no human delay (D6).
+- **No port, or an observer port.** The first fixes the service to one
+  engine and leaves ADR-018's port unrealized; the second makes the drive
+  loop part of the port surface (D14).
+- **Floats.** The result text is the reproduction identity, and fixed
+  point renders without a float-formatting rule (D10).
+- **Quantile metrics.** Derivable from the stored trade lines, and a
+  quantile choice would be a number without a source (D11).
+- **A fresh labels build for the check.** A rebuild either reproduces the
+  accepted content hash, and is then the same dataset at about 70 min
+  more (ADR-057 *Acceptance*: 1:08:26 and 1:10:11), or does not, and then
+  the check would compare against labels no accepted ADR measured. The
+  accepted dataset is used, and a rebuild only stands in for it when it
+  reproduces the hash (*Accept when*, item 4).
+
+## Accept when
+
+S6 (#171). The main session runs it under the repo's 8 GB memory and
+400 % CPU cap.
+
+1. **The spec:**
+   - `sample 1759276800000 1790812800000`, with `data` as
+     `mie replay --source history` prints it for that window;
+   - `features`: the closure of `trigger.effort_result.5m@1`,
+     `trade.last_price@1`, `volatility.atr.1h@1` and
+     `volatility.regime.1h@1`;
+   - `state-filter none`, `regime-filter none`,
+     `location location.any@1`;
+   - `trigger trigger.fires@1 feature=feature:trigger.effort_result.5m@1`;
+   - `entry entry.next_trade@1 side=text:with`;
+   - `invalidation invalidation.atr@1 atr=feature:volatility.atr.1h@1 multiple=rate:0.31333000`;
+   - `target target.r_multiple@1 max_hold_ms=int:3600000 r=rate:1.00000000`;
+   - `fees maker=0.00020000 taker=0.00050000`,
+     `slippage slippage.fixed@1 rate=rate:0.00000000`,
+     `funding funding.recorded@1`, `latency 0`.
+2. **Reproduction:** the first run prints `recorded <key>` and the second
+   `reproduced <key>`. The result file's SHA-256 is the same before and
+   after the second run.
+3. **Provenance (asserted):** `stream 604001515:<hex>`, `rejections 0`,
+   `prefix-data -`, `effective-origin -`, `triggers 12952`.
+4. **Independent check** against the year dataset of ADR-057's
+   *Acceptance*, content hash
+   `47d9cb621aff5d1c361308c9935d183a66ea91594102d269b437c8fce549a683`.
+   `mie conditional verify` must PASS on it first, or a rebuild with
+   ADR-057's recorded command must reproduce that hash.
+   - (a) **Join:** every decision joins the dataset's trigger records of
+     the id at the same `decision_time`, `event_kind` and `event_seq`.
+     Their count is 12 952.
+   - (b) **Outcomes:** each decision except an `overlap` skip is compared
+     with its 1h `outcomes` row:
+     - target ↔ `upper` for a long and `lower` for a short, stop the
+       reverse, with `exit-at` = `race_at`;
+     - time ↔ `neither`;
+     - `unfilled` ↔ `neither` with `last` NULL;
+     - censored ↔ `censored` with the same reason and
+       `race_censor_at` = c;
+     - `stale_reference` ↔ censored `stale_reference`;
+     - `no_risk` ↔ `unavailable`;
+     - `no_side` must be 0, because the aggressor is always set.
+   - (c) **Levels:** (stop, target) = (`lower`, `upper`) for a long or
+     (`upper`, `lower`) for a short, and `reference` =
+     `contexts.reference`, exactly to the price unit.
+   - **Expected mismatches: 0, derived and not tolerated:**
+     - latency 0 makes the entry fill trade the first trade of ADR-055
+       D2's window, and the monitored trades the window's (D6);
+     - the offset rule is identical (D5), and ATR_1h = `state.atr`
+       (ADR-056 *Measurement*: 0 scale mismatches at 560 796 records), so
+       with k = 1 the levels are the barriers;
+     - touch and tie follow ADR-055 D5;
+     - the censor times and the strictly-before rule follow ADR-055 D6
+       (D9).
+   - The difference between entry and reference moves only fill prices,
+     which the label does not hold, so it cannot cause a mismatch.
+     Fill-to-fill gross R is not in the label. It is pinned by S2's
+     hand-computed fixture and S5's end-to-end test.
+5. **Blindness:** the check prints only the join count, the mismatches
+   per class and the non-outcome counts (filtered, skipped by reason,
+   censored, unfilled). It prints no exit-kind counts, no R values and no
+   `metrics` line (#30 decision 6).
+6. **Reachability, flagged now:**
+   - The chain needs #106's production cutover (*Consequences*).
+   - The dataset must exist, or must be rebuilt (about 70 min, ADR-057
+     *Acceptance*).
+   - The check is a tool written from this text that shares no backtest
+     code. It belongs to #171.
+
+Anything else fails: a `FAIL: …` line, a `Diverged` result, another count
+or provenance value, a single mismatch, or a changed file.
