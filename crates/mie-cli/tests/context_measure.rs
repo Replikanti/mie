@@ -2114,3 +2114,11 @@ fn geyer_ess_of_a_two_state_markov_chain() {
     let expected = n as f64 / 9.0;
     assert!((result.ess - expected).abs() < 0.1 * expected, "{result:?}");
 }
+
+#[test]
+fn geyer_ess_clamps_the_lag_to_a_quarter_of_the_series() {
+    // K = min(max_lag, ⌊n/4⌋): on a short series the quarter binds.
+    let series: Vec<Option<f64>> = (0..100_u32).map(|i| Some(f64::from(i * 37 % 11))).collect();
+    let result = ess(&series, MAX_LAG).unwrap();
+    assert_eq!(result.max_lag, 25, "{result:?}");
+}
