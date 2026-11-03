@@ -175,15 +175,49 @@ the reverse.
 - *Order within an event:* the simulator first applies the event to the
   open position (fill, touch, funding, gap), and only then takes that
   event's decisions, in emission order. Why: a decision then can never
-  fill on its own event, ADR-055 D2's strictly-after rule.
+  fill on its own event, ADR-055 D2's strictly-after rule, and a position
+  that this event's trade closes frees the slot (D8) for this event's
+  decisions. *Rejected:* decisions first. A decision would then see the
+  position as it was before the event, and a decision on the trade that
+  fills the exit would be skipped as `overlap` although no position is
+  open after that trade.
 - *Reference:* `trade.last_price@1` at the decision, ADR-055 D2's
   reference. A decision is skipped as `stale_reference` when no trade came
   before it, or when a trades gap was delivered after the last trade and
-  at or before the decision (ADR-055 D6's condition).
+  at or before the decision (ADR-055 D6's condition). *Rejected:* a
+  reference from another stream, since the archive imports no mark price
+  and no book price as a domain event (ADR-034 D2); and a stale last
+  price used anyway, whose path to the decision is unknown (ADR-055 D6).
 - *Filters:* `location.any@1` admits every decision. Regime filters apply
   ADR-040 D1 to the label at the decision; an unready label fails because
   it is no listed label. Decisions removed here count as `filtered`, not
-  as skipped.
+  as skipped. *Why:* a filtered decision lies outside the hypothesis,
+  while a skipped one lies inside it and could not trade. *Rejected:* one
+  count for both, which would hide how much of the hypothesis could not
+  trade.
+- **Order of the checks.** Each decision goes through these checks in
+  this order, and the first one that removes it names its count:
+  1. `filtered` (the filters above);
+  2. `no_side` (D3);
+  3. `stale_reference` (above);
+  4. `no_risk` (D5);
+  5. `stop_side` (D5);
+  6. `overlap` (D8).
+
+  A decision that passes all six opens the position. *Why this order:*
+  checks 1–5 read only the spec and the state and prices at the decision,
+  and `overlap` alone depends on earlier trades. With `overlap` last,
+  every count except `overlap` is a function of the spec and the data,
+  whatever the exit path, so a cost or latency sweep moves decisions only
+  between `overlap` and `trade` lines. `overlap` then counts exactly the
+  decisions that would have traded. Checks 2–5 follow their dependencies:
+  the levels need σ and the reference (D5), and `no_risk` comes before
+  `stop_side` (D5). σ and the reference do not depend on each other, so
+  their order changes no trade, only the split of the counts, and this
+  ADR fixes it in the order D3 and D4 define them. *Rejected:* an
+  unordered set of reasons, under which two implementations that both
+  follow the text render different `skipped` lines; and `overlap` first,
+  under which every other count would depend on the exit path.
 - *Conservation:* `triggers` = `filtered` + Σ`skipped` + the number of
   `trade` lines (D12).
 
@@ -287,8 +321,18 @@ the reverse.
 
 One position per spec (STOP 1 decision 3). It is busy from the decision
 until the exit fill, the `unfilled` deadline or the censor. Every decision
-in that time is skipped as `overlap`. When one event emits the id more
-than once, the first emission is taken.
+in that time that passes checks 1–5 of D4 is skipped as `overlap`. When
+one event emits the id more than once, its emissions go through D4's
+checks in emission order. The first one that passes all of them opens the
+position, and every later one is then an `overlap`. A skipped emission
+does not take the slot.
+
+*Why one position:* overlapping trades share one price path, so their
+outcomes are not independent. A drawdown over them would count one move
+several times, and the trade sequence would not be one equity path per
+unit of base (D10). *Rejected:* independent overlapping trades, every
+decision its own trade, for that reason. Their outcomes per decision are
+what the labels already measure (ADR-055).
 
 ### D9. Censoring: ADR-055 D6's rules applied to the position
 
@@ -350,6 +394,11 @@ than once, the first emission is taken.
   excluded from every metric, because their outcome is unknown.
 - *Why these rules:* they are what the trades stream can prove about
   coverage, and copying them makes the S6 check exact.
+- *Rejected:* dropping censored trades from the result, which would hide
+  the censor rate and leave S6 nothing to compare with the labels'
+  censors; and closing a censored position as a time exit at c, which
+  would book an outcome from trades the data did not show (ADR-055 D6
+  keeps only what is resolved strictly before c).
 
 ### D10. Per-trade values
 
@@ -401,9 +450,11 @@ legs' fees, funding the D7 sum.
   - mean MFE, MAE and displacement.
 - Sums are exact over the per-trade values, with one half-to-even rounding
   at each final division (`div_half_even`, which S2 moves to `num.rs`).
-  Every metric except time to target is one rounding of an exact sum
-  divided by a count (or by |Σ negative net R| for profit factor), scaled
-  by 10⁸ for the 8-place values. Why: anyone can re-derive every metric
+  Every mean and the win rate are one rounding of an exact sum divided by
+  a count, and profit factor is one rounding of Σ positive net R divided
+  by |Σ negative net R|, each scaled by 10⁸ for the 8-place values. Max
+  drawdown takes no rounding: it is a difference of two exact cumulative
+  sums of the trades' net R values. Why: anyone can re-derive every metric
   from the stored trade lines with integer arithmetic.
 - *Why integer ms for time to target:* the ms is the resolution of event
   time (ADR-028) and the unit of every time in result text v1 (`origin`,
@@ -461,7 +512,13 @@ trade <decision ms> <event_kind> <seq> side=<long|short> regime=<labels> referen
   v1's `none` for an empty list.
 - `reference`, `stop`, `target`, `risk` (R, in price units) and `funding`
   use the 8-place price form. `funding` is per unit of base, with
-  positive meaning paid (D7), and is `0.00000000` under `funding.none@1`.
+  positive meaning paid (D7). Under `funding.none@1` it is `0.00000000`
+  on target, stop and time lines, and `-` on `unfilled` and `censored`
+  lines as under `funding.recorded@1` (the `-` cases below). *Why:* the
+  set of `-` fields then depends on the exit kind only, never on the
+  funding rule, so a parser checks one shape per exit kind. *Rejected:*
+  `0.00000000` on every line under `funding.none@1`, which would make the
+  line shape depend on the rule.
 - `entry` and `fill` hold the time and price of the fill **trades** (e,
   x), not the slipped fills. E′, X′ and both fees follow from e and x,
   the spec's `slippage` and `taker`, by D6, so every value on the line
@@ -498,7 +555,7 @@ trade <decision ms> <event_kind> <seq> side=<long|short> regime=<labels> referen
 ```
 metrics all <fields>
 metrics <regime feature id@N> <LOW|MEDIUM|HIGH|EXTREME|-> <fields>
-<fields> = trades=<n> censored=<n> unfilled=<n> expectancy=<R|-> mean_gross=<R|-> profit_factor=<x|-> win_rate=<x|-> max_drawdown=<R> time_to_target=<ms|-> mean_mfe=<R|-> mean_mae=<R|-> mean_displacement=<R|->
+<fields> = trades=<n> censored=<n> unfilled=<n> expectancy=<R|-> mean_gross=<R|-> profit_factor=<x|-> win_rate=<x|-> max_drawdown=<R|-> time_to_target=<ms|-> mean_mfe=<R|-> mean_mae=<R|-> mean_displacement=<R|->
 ```
 
 - The bucket form copies spec text v1's `regime-filter <id@N> <LABEL,…>`:
@@ -522,13 +579,22 @@ metrics <regime feature id@N> <LOW|MEDIUM|HIGH|EXTREME|-> <fields>
 - `-` appears in these cases: every mean and `win_rate` when `trades=0`;
   `time_to_target` with no target exit; `profit_factor` with no losing
   trade or no trade (D11); and any metric whose value leaves the i64 unit
-  range (D10), which only an unbounded ratio can reach. `max_drawdown` is
+  range (D10). Two metrics can leave it: `profit_factor`, an unbounded
+  ratio, and `max_drawdown`, a sum over trades whose values are each in
+  range. A mean of in-range values lies between their extremes, and
+  `win_rate` lies in [0, 1], so neither can. `max_drawdown` is
   `0.00000000` with no trade, because the running peak starts at 0 (D11).
 
 ### D13. Pipeline `research.backtest@1`
 
 - **Source:** the history chain only (STOP 1 decision 7; ADR-052 D10:
-  every pipeline that reads Market State runs on the chain).
+  every pipeline that reads Market State runs on the chain). *Rejected:*
+  `--source archive` or `live`. Their engine starts at the window's first
+  event, so the state at a decision would depend on where the sample
+  begins, and it would differ from the state live holds at the same
+  instant: the research/live skew that ADR-052 removes by driving both
+  from one fixed origin (ADR-052 *Context*). Live also delivers no
+  settlement event (D7).
 - **Key:** (experiment id, `research.backtest@1`, engine key), for
   ADR-052 D10's reason: keyed without the engine, the store would block
   the experiment for good at the next catalog change or encoding bump.
@@ -626,8 +692,17 @@ metrics <regime feature id@N> <LOW|MEDIUM|HIGH|EXTREME|-> <fields>
 | 1 097 rounding units in the precondition's B | 2 fee roundings + 1 095 settlement roundings (this table's 1 095) | fewer: B misses a rounding unit |
 | 0 expected mismatches | the derivation in *Accept when* | — (a single mismatch is a bug) |
 | ≈ 25 min, < 0.4 GB per run | the nearest measured analog, ADR-040 *Acceptance* (26.1 and 24.9 min, 361 MB, nine streams) | — (a forecast, not a criterion) |
+| 8 GB memory and 400 % CPU cap for the S6 run | the caps of the label runs it is checked against: ADR-055 *Measurement* (8 GB, 400 %) and ADR-057 *Acceptance* (8 GB) | none on the result, which depends only on the events (ADR-040 D7); a memory cap below the run's peak (the row above) aborts the run |
+| About 70 min per labels rebuild | ADR-057 *Acceptance*: 1:08:26 and 1:10:11 | — (a cost, not a criterion) |
+| 560 796 records with 0 scale mismatches | ADR-056 *Measurement* | any mismatch: ATR_1h is not `state.atr` on that record, and the levels are not the barriers there |
+| 12 monthly `fundingRate` files, 0 missing | `docs/data-availability.md`, the #12 year | fewer: the year's funding is incomplete, and the expected 0 `funding_gap` censors in 4(b) no longer follow |
+| 1 % in D7's funding error example | an illustration of the stated relation (error = basis as a fraction of the amount) | — (an example, not a parameter) |
+| 2025-10-01 origin; 2024-10-01 … 2024-12-31 and 2025-01-01 … 2025-09-30 (D16) | ADR-052 D1; `docs/direction.md` | — (cited facts, not choices of this ADR) |
 
-There is no other number.
+Every other figure in the text is an identifier (an ADR, issue, id or
+hash), a constant that follows from a row above (2⁶³ − 1 from the i64
+range, 10⁸ from the 8 decimals, 1 095 settlements from the event count),
+or a 0 or 1 that a rule defines.
 
 ### Out of scope
 
@@ -701,6 +776,16 @@ There is no other number.
   print happened before any order could react; the level price ignores
   gaps through a level and is optimistic for stops (D6).
 - **Latency on every leg.** A resting order has no human delay (D6).
+- **Unordered skip reasons, or `overlap` first.** The first lets two
+  implementations of the text render different counts; the second makes
+  every count depend on the exit path (D4).
+- **Independent overlapping trades.** One price path counted several
+  times in the drawdown (D8).
+- **Dropping censored trades, or closing them as time exits at c.** The
+  first hides the censor rate; the second books outcomes the data did not
+  show (D9).
+- **Archive or live as the source.** The research/live skew of ADR-052,
+  and no settlements on live (D13).
 - **No port, or an observer port.** The first fixes the service to one
   engine and leaves ADR-018's port unrealized; the second makes the drive
   loop part of the port surface (D14).
@@ -717,8 +802,8 @@ There is no other number.
 
 ## Accept when
 
-S6 (#171). The main session runs it under the repo's 8 GB memory and
-400 % CPU cap.
+S6 (#171). It runs under an 8 GB memory cap and a 400 % CPU cap, the caps
+of the label runs it is checked against (D17).
 
 1. **The spec:**
    - `sample 1759276800000 1790812800000`, with `data` as
@@ -795,8 +880,22 @@ S6 (#171). The main session runs it under the repo's 8 GB memory and
      - `unfilled` ↔ `neither` with `last` NULL;
      - censored ↔ `censored` with the same reason
        (`race_censor_reason`) and `race_censor_at` = c;
-     - `stale_reference` ↔ censored `stale_reference`;
-     - `no_risk` ↔ `unavailable`;
+     - `stale_reference` ↔ a row whose window censor (`censor_reason`,
+       `censor_at`) is `stale_reference` at the decision time, with race
+       `censored` or `unavailable`. The labeler censors a label with a
+       stale reference as a whole at the decision. The race is `censored`
+       with `race_censor_reason` `stale_reference` when the label has
+       barriers, and it stays `unavailable` when it has none (no
+       reference, an unready ATR, an offset that rounds to 0 or a barrier
+       outside the range), because an unavailable race stays unavailable
+       under every censor (ADR-055 D6;
+       `crates/mie-domain/src/conditional/label.rs`, pinned by the test
+       `a_gap_since_the_last_trade_makes_the_reference_stale`). D4's order
+       puts `stale_reference` before `no_risk`, so a stale decision
+       without barriers is a `stale_reference` skip, never a `no_risk`
+       one;
+     - `no_risk` ↔ race `unavailable` with no `stale_reference` window
+       censor at the decision;
      - `no_side` must be 0, because the aggressor is always set;
      - `chain_restart`, `funding_gap` and `overflow` have no label
        counterpart, so each counts as a mismatch. Expected count: 0.
@@ -815,6 +914,9 @@ S6 (#171). The main session runs it under the repo's 8 GB memory and
        (ADR-056 *Measurement*: 0 scale mismatches at 560 796 records), so
        with k = 1 the levels are the barriers;
      - touch and tie follow ADR-055 D5;
+     - the stale condition is ADR-055 D6's (D4), and D4's order splits
+       stale decisions from decisions without barriers exactly as the
+       labeler's window censor and race do (above);
      - the censor times and the strictly-before rule follow ADR-055 D6
        (D9).
    - The difference between entry and reference moves only fill prices,
