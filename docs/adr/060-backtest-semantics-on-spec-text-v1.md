@@ -198,8 +198,18 @@ the reverse.
     range skips it as `no_risk` (ADR-055 D4: either barrier outside the
     range makes the race `Unavailable`). The levels are fixed at the
     decision, so no overflow comes before the entry fill (D10).
-  - With `invalidation.beyond_extreme@1`, a stop on the wrong side skips
-    it as `stop_side`.
+  - With `invalidation.beyond_extreme@1`, an unready ATR skips the
+    decision as `no_risk`, checked before `stop_side`, because the stop
+    needs ⟨b·ATR⟩ (D2 requires a ready ATR even at b = 0). *Why:* ADR-055
+    D4 names an ATR that is not `Ready` as an `Unavailable` cause, and the
+    `invalidation.atr@1` case above maps that cause to `no_risk`. One cause
+    keeps one token whatever the rule, and D12's `skipped` line keeps its
+    five reasons. *Rejected:* a new `atr_unready` token, which would split
+    one cause by rule; a resolution error, since readiness depends on the
+    data and not on the text.
+  - With `invalidation.beyond_extreme@1`, a stop with
+    σ · (reference − stop) ≤ 0 skips the decision as `stop_side`,
+    equality included, since the stop needs > 0.
 - *Offset rule:* the offset is ATR × m, rounded half to even once, the
   rule of `barrier_offset` (`crates/mie-domain/src/conditional/label.rs`).
   At m = `0.31333000` it equals the labels' 1h offset exactly, since
@@ -612,6 +622,8 @@ metrics <regime feature id@N> <LOW|MEDIUM|HIGH|EXTREME|-> <fields>
 | 604 001 515 events, 0 rejections | ADR-040 *Acceptance* (nine streams) = ADR-055's 603 323 345 (`aggTrades` + `metrics`) + 677 075 klines (365 days × 1 855 bars of the six intervals, 0 missing) + 1 095 settlements (365 days × 3); the fold changes quantities, not the count (ADR-050 *Acceptance*: 0 unattributed) | any other count: a day, a stream or a fold differs |
 | Integer ms for time to target | ADR-028's event-time resolution; the time unit of result text v1 | 8 decimals: a second time form in one text |
 | i64 range of 10⁻⁸ units for every rendered value | ADR-027 `Price`/`Rate` (`num.rs`): the range the existing decimal parser reads | wider: the text no longer parses with the existing parser |
+| Year price range 57 758.6 … 126 208.5 USDT (the overflow precondition, *Accept when* 4) | ADR-036 *Measurements behind the numbers*, every trade of the S6 window; ADR-050 D3 keeps prices under the fold | a recorded range narrower than the true one would make the bound unsound |
+| 1 097 rounding units in the precondition's B | 2 fee roundings + 1 095 settlement roundings (this table's 1 095) | fewer: B misses a rounding unit |
 | 0 expected mismatches | the derivation in *Accept when* | — (a single mismatch is a bug) |
 | ≈ 25 min, < 0.4 GB per run | the nearest measured analog, ADR-040 *Acceptance* (26.1 and 24.9 min, 361 MB, nine streams) | — (a forecast, not a criterion) |
 
@@ -642,7 +654,12 @@ There is no other number.
     outside the range; tests pin the censor-token and event-kind name
     tables;
   - S4: the D2 errors, the D3 table and the golden spec not resolving;
-  - S5: the D13 order and errors.
+    the `no_risk` skip of an unready ATR under
+    `invalidation.beyond_extreme@1` and its order before `stop_side`
+    (D5);
+  - S5: the D13 order and errors;
+  - #171: the check computes and asserts the overflow precondition
+    (*Accept when* 4) before it compares anything.
 - **The weak spots of spec text v1** (D1): exactly-once slots, the closed
   `fees` line and resolution after parsing. The first consumer that needs
   a repeated slot writes the v2 ADR.
@@ -728,6 +745,45 @@ S6 (#171). The main session runs it under the repo's 8 GB memory and
    `47d9cb621aff5d1c361308c9935d183a66ea91594102d269b437c8fce549a683`.
    `mie conditional verify` must PASS on it first, or a rebuild with
    ADR-057's recorded command must reproduce that hash.
+   - **Overflow precondition, asserted before any comparison.** No record
+     bounds R from below, so the text alone cannot derive the expected 0
+     for `overflow` in (b). The check computes a sufficient condition
+     instead. A FAIL is a decision for the issue, not a tolerance.
+     - *Inputs:*
+       - R_min is the smallest `upper` − `contexts.reference` over the
+         compared decisions' 1h `outcomes` rows that are not
+         `unavailable`, read from the ADR-057 dataset. By (c) and D5 this
+         is exactly the smallest `risk` the backtest uses.
+       - The year's trade-price range [P_lo, P_hi] =
+         [57 758.6, 126 208.5] USDT was measured over every trade of the
+         same window (ADR-036, *Measurements behind the numbers*). The
+         later fold changes quantities only: the aggregate "keeps its id,
+         price, `transact_time` and side" (ADR-050 D3), so the range
+         still holds.
+       - S = Σ|rate| over the sample's 1 095 settlements (D17), read from
+         the year's 12 monthly `fundingRate` files.
+     - *Bound:* the numerator of every R value (D10) is at most
+       B = (P_hi − P_lo) + (2 · taker + S) · P_hi + 1 097 units:
+       - every price the backtest reads is a trade price (reference, e,
+         x, the monitored trades, the funding price p), so the price
+         differences behind gross, displacement, MFE and MAE are at most
+         P_hi − P_lo;
+       - with slippage 0, E′ = e and X′ = x;
+       - the two fees add at most 2 · taker · P_hi;
+       - funding adds at most S · P_hi, because a trade books a subset of
+         the sample's settlements;
+       - the 1 097 units are one rounding unit per fee (2) and per
+         settlement term (1 095).
+     - *Assert:* B ≤ 2⁶³ − 1 units, so fees and funding stay in the i64
+       range (D10); and B · 10⁸ < (2⁶³ − 1) · R_min, so every R value
+       stays in range after its single rounding (D10). Together these rule
+       out every `overflow` censor on the year, which derives (b)'s
+       expected 0 from recorded and computed inputs. The check prints PASS
+       or FAIL together with R_min and S; neither is an outcome value, so
+       the blindness of item 5 holds.
+     - *Rejected:* a lower bound on ATR_1h or on R that no record gives (a
+       number without a source); excluding overflow-censored trades from
+       the comparison, which would hide a wrongly flagged overflow.
    - (a) **Join:** every decision joins the dataset's trigger records of
      the id at the same `decision_time`, `event_kind` and `event_seq`.
      Their count is 12 952.
@@ -746,7 +802,9 @@ S6 (#171). The main session runs it under the repo's 8 GB memory and
        counterpart, so each counts as a mismatch. Expected count: 0.
        `effective-origin -` is asserted (item 3), so there is no restart,
        and the year has 0 missing `fundingRate` months
-       (`docs/data-availability.md`), so there is no funding gap.
+       (`docs/data-availability.md`), so there is no funding gap. The
+       expected 0 for `overflow` comes from the overflow precondition
+       below.
    - (c) **Levels:** (stop, target) = (`lower`, `upper`) for a long or
      (`upper`, `lower`) for a short, and `reference` =
      `contexts.reference`, exactly to the price unit.
@@ -764,8 +822,9 @@ S6 (#171). The main session runs it under the repo's 8 GB memory and
      Fill-to-fill gross R is not in the label. It is pinned by S2's
      hand-computed fixture and S5's end-to-end test.
 5. **Blindness:** the check prints only the join count, the mismatches
-   per class and the non-outcome counts (filtered, skipped by reason,
-   censored, unfilled). It prints no exit-kind counts, no R values and no
+   per class, the non-outcome counts (filtered, skipped by reason,
+   censored, unfilled) and the overflow precondition (PASS or FAIL, R_min
+   and S). It prints no exit-kind counts, no R values and no
    `metrics` line (#30 decision 6).
 6. **Reachability, flagged now:**
    - The chain needs #106's production cutover (*Consequences*).
