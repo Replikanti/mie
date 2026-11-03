@@ -12,6 +12,20 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
 
 ### Added
 
+- **Time of day and effective sample size in the context measurement
+  (#147 M1).** The ignored tool `crates/mie-cli/tests/context_measure.rs`
+  now also reports the baseline and trigger samples per UTC hour of the
+  event time and per session (`asia` 00–08, `europe` 08–13, `us` 13–21,
+  `late` 21–24 UTC), with shares, the trigger-to-baseline share ratio and
+  per-family columns, and the effective sample size of the 1m log return
+  and the four location-bin indicators on the baseline's minute grid
+  (sample ACF with divisor n, Geyer's initial positive sequence, K =
+  min(10 080, n/4), checkpoints up to one week). The hour and session
+  counts are reconciled with the existing totals and asserted in both
+  ignored runs and the CI twin; known-answer tests cover the session
+  partition, the grid, the ACF and the ESS. Report-only: the engine, the
+  sampler and the records are unchanged. The runs and the ADR-054
+  addendum follow in M2.
 - **Informational alerts: decision path, dry-run and measurement tool
   (#38 M1, ADR-059, proposed).** `mie_domain::alert` decides alerts after
   each accepted event under `alert.policy@1` (fingerprint pinned): zone
