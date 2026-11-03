@@ -2,6 +2,7 @@
 
 - Status: accepted
 - Date: 2026-10-19
+- Amended: 2026-11-03 (#147)
 
 ## Context
 
@@ -627,3 +628,163 @@ sampling adds no memory (records stream, D6). The live run took a process
 wall time of 1:13.90 (the tool reports 40.9 s of replay) at a peak RSS of
 6 248 084 kB: the 6.1 GB that ADR-053's Acceptance records for
 `LiveReplay::run_replay` collecting a whole run (#140), not the sampler.
+
+## Justification addendum (2026-11-03)
+
+Added for #147. It gives the measured number behind the *Consequences*
+statement that the baseline's effective count is "far lower" than its
+nominal one, and it records the time-of-day composition of the samples,
+which D3's grid argument does not cover: D3 equalizes instants (1m
+closes), not hours of the day. It changes no value, threshold, criterion
+or decision.
+
+### Runs
+
+Both runs used the `context_measure` ignored tests (`measure_contexts`,
+`measure_contexts_live`) of main `df98bdc` (#147 M1), release build, under
+an 8 GB memory cap and a 400 % CPU quota, with the commands in the tool's
+module docs (`MIE_MEASURE_RAW_ROOT=<raw root>`,
+`MIE_MEASURE_JOURNAL=<journal>`; the year with `MIE_MEASURE_FROM=2025-10-01
+MIE_MEASURE_TO=2026-09-30 MIE_MEASURE_EVENTS=603323345`). The provenance
+and totals equal *Acceptance* above:
+
+- Year: data `5d9e27f862ac54dd93cff904458e9ee92767d5105a9d13a144351cba069f224d`,
+  policy `conditional.sampling@1` fingerprint `2c71fff23e8b0415`, engine
+  key `4c844593779da2e3-1`; 603 323 345 events, 561 695 records (525 599
+  baseline + 36 096 trigger), 0 rejections, 0 mismatches, 0 grid
+  violations. Wall time 1:01:33, peak RSS 431 136 kB.
+- Live (R0 store, run `20261016T225606Z`): data
+  `9348410a56c0d05d469f3f7e78c1c405d80db333d9d34df694b45ce256caca2d`, same
+  policy and engine; 2 042 225 events, 2 185 records (2 067 + 118), 0
+  rejections, 0 mismatches, 0 grid violations. Wall time 1:00.71, peak RSS
+  6 252 604 kB (#140).
+- Both runs printed `reconciliation: hours, sessions and the minute grid
+  add up`: the hour and session tables sum to the baseline total and to
+  each id's sample count, and the year's minute grid holds 525 599 present
+  minutes with 0 repeats.
+
+### Method
+
+| Item | Value | Why | At another value |
+|---|---|---|---|
+| Hour of a sample | UTC hour of the record's event time, for both kinds | Every trigger instant is a baseline instant (D3, asserted), so both kinds share one key. ADR-051 R1b also counts by emission time. | `minute_end` exists only on baseline records; trigger records would need a second clock. |
+| Clock | UTC | A session has to be a union of the 24 UTC rows, or its totals cannot reconcile with the hour table. | ADR-058 D4's New York clock does not compose from UTC hours. |
+| Sessions, `[start, end)` UTC hours | `asia` 00–08, `europe` 08–13, `us` 13–21, `late` 21–24 | Tokyo and Hong Kong cash trade 00:00–08:00 UTC, with no DST. NYSE 09:30–16:00 ET is 13:30–20:00 UTC (EDT) or 14:30–21:00 UTC (EST); [13, 21) holds it in both. London is 07:00–15:30 UTC (BST) or 08:00–16:30 UTC (GMT); [08, 13) lies inside it in both and before the US open. `late` is after the US close and before Tokyo. | Starting `us` at 14 puts the EDT open in `europe`; ending it at 20 puts the last EST cash hour in `late`. An EU/US overlap bucket would move by an hour at each DST switch, and the US and UK switch on different dates. Hours 07 (London open in BST, counted `asia`), 13 (pre-open in EST) and 20 (post-close in EDT) change meaning with DST; the year has 126 US standard-time and 239 daylight-time days. |
+| ACF | Sample ACF with divisor n (present minutes), centred on the mean of the present values; a lag-k product counts only when both minutes are present | The standard biased estimator: positive semi-definite, and the one Geyer's rule is defined on. | Divisor n − k inflates the noise at long lags, and the ESS sum accumulates it. |
+| ESS | Geyer (1992) initial positive sequence: Γ_m = ρ_{2m} + ρ_{2m+1}, summed up to the last Γ_m > 0; τ = −1 + 2 Σ Γ_m; ESS = n / τ, not capped at n | The issue's formula n / (1 + 2 Σ ρ_k) with a data-driven truncation and no tuning constant. | Sokal's window brings its own constant; the monotone variant lowers later Γ_m and raises the ESS, the opposite side from the one the *Consequences* warning is about. |
+| Max lag K | min(10 080, ⌊n/4⌋) | One week is the longest regular cycle measured on this data (#155, ADR-058's 168-hour strata); ⌊n/4⌋ is Box and Jenkins' limit for reading a sample ACF. It binds on the live store (K = 515–516). | If the rule has not fired by K, the ESS prints `capped` and is an upper bound. No series was capped in either run. |
+| Series | The 1m log return between consecutive present minutes, and the indicators of the four location bins (`value_edge`, `structural_extreme`, `neither`, `levels_not_ready`) | The issue's two series: the return as the outcome scale, the bins as the context a baseline share describes. | A constant series has no ACF and prints `-` (`levels_not_ready`, 0 in both runs). |
+
+The ESS is the effective count for the *mean of each series*, for example a
+bin's share of the baseline. It is not the number of independent forward
+outcomes at a horizon; that number comes from ADR-055 D9 thinning or
+ADR-058 D6 `units`.
+
+### Effective sample size
+
+Year (n = 525 599 minutes, K = 10 080):
+
+| Series | ρ1 | ρ15 | ρ60 | ρ240 | ρ1440 | ρ10080 | Truncation lag | τ | ESS |
+|---|---|---|---|---|---|---|---|---|---|
+| return_1m (n 525 598) | −0.0213 | 0.0029 | 0.0061 | 0.0022 | 0.0010 | 0.0032 | 1 | 0.957 | 548 930 |
+| value_edge | 0.7567 | 0.3680 | 0.2020 | 0.0952 | 0.0249 | 0.0166 | 2 629 | 243.4 | 2 160 |
+| structural_extreme | 0.6356 | 0.2021 | 0.0972 | 0.0750 | 0.0293 | 0.0451 | 2 673 | 197.5 | 2 662 |
+| neither | 0.7242 | 0.3343 | 0.1868 | 0.1016 | 0.0424 | 0.0327 | 5 097 | 362.8 | 1 449 |
+
+Live (n = 2 067 minutes, K = 516; return n 2 062, K 515):
+
+| Series | ρ1 | ρ15 | ρ60 | ρ240 | Truncation lag | τ | ESS |
+|---|---|---|---|---|---|---|---|
+| return_1m | −0.0158 | 0.0202 | −0.0124 | 0.0180 | 1 | 0.968 | 2 129 |
+| value_edge | 0.8566 | 0.4743 | 0.1299 | −0.0341 | 113 | 53.2 | 38.9 |
+| structural_extreme | 0.7484 | 0.2908 | 0.0867 | 0.0304 | 111 | 31.9 | 64.9 |
+| neither | 0.8282 | 0.4734 | 0.1463 | −0.0396 | 121 | 56.1 | 36.8 |
+
+Reading:
+
+- A bin share over the year rests on about 1 450–2 660 effective
+  observations, not 525 599: the nominal count overstates it by a factor
+  τ of 197–363. The dependence lasts for days (truncation at lags of
+  2 629–5 097 minutes, 1.8–3.5 days). ρ at 1 440 and 10 080 stays small and
+  positive (0.017–0.045), so the rule did not stop early on a daily or
+  weekly cycle; the positive ρ left beyond the truncation lag makes these
+  ESS values upper bounds, which only strengthens the *Consequences*
+  statement.
+- The 1m return is close to uncorrelated (ρ1 ≈ −0.02, τ ≈ 0.96): the mean
+  of minute returns does not suffer the same overstatement. The overlap
+  *Consequences* names is in forward outcomes over horizons longer than a
+  minute, which this ESS does not measure (caveat above).
+- On the live store the same bins have τ of 32–56 over 34 hours; the
+  shorter truncation lags (about 2 hours) reflect the length of the run,
+  and the numbers are not comparable with the year's.
+
+### Time of day
+
+Year, per UTC hour (baseline 21 899 in hour 00 and 21 900 in every other
+hour, 4.17 % each: no sample falls in the window's first minute, because a
+minute's sample is decided by the first event of the next minute):
+
+| UTC hour | Triggers | Share | Ratio to baseline |
+|---|---|---|---|
+| 00 | 1 439 | 3.99 % | 0.96 |
+| 01 | 1 354 | 3.75 % | 0.90 |
+| 02 | 1 271 | 3.52 % | 0.85 |
+| 03 | 1 281 | 3.55 % | 0.85 |
+| 04 | 1 267 | 3.51 % | 0.84 |
+| 05 | 1 169 | 3.24 % | 0.78 |
+| 06 | 1 354 | 3.75 % | 0.90 |
+| 07 | 1 379 | 3.82 % | 0.92 |
+| 08 | 1 497 | 4.15 % | 1.00 |
+| 09 | 1 342 | 3.72 % | 0.89 |
+| 10 | 1 272 | 3.52 % | 0.85 |
+| 11 | 1 262 | 3.50 % | 0.84 |
+| 12 | 1 668 | 4.62 % | 1.11 |
+| 13 | 2 151 | 5.96 % | 1.43 |
+| 14 | 2 665 | 7.38 % | 1.77 |
+| 15 | 2 598 | 7.20 % | 1.73 |
+| 16 | 2 261 | 6.26 % | 1.50 |
+| 17 | 1 703 | 4.72 % | 1.13 |
+| 18 | 1 508 | 4.18 % | 1.00 |
+| 19 | 1 298 | 3.60 % | 0.86 |
+| 20 | 1 174 | 3.25 % | 0.78 |
+| 21 | 1 020 | 2.83 % | 0.68 |
+| 22 | 1 084 | 3.00 % | 0.72 |
+| 23 | 1 079 | 2.99 % | 0.72 |
+
+Year, per session (share of all triggers, then each family's share of its
+own total; absorption has 0 samples in the archive, see *Acceptance*):
+
+| Session | Baseline | Triggers | Ratio | failed_auction | sfp | exhaustion | effort_vs_result | cvd_divergence | oi_expansion_rejection | failed_reclaim | breakout_acceptance |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| asia 00–08 | 175 199 (33.33 %) | 10 514 (29.13 %) | 0.87 | 35.29 % | 30.71 % | 31.26 % | 27.92 % | 33.26 % | 31.78 % | 30.00 % | 35.69 % |
+| europe 08–13 | 109 500 (20.83 %) | 7 041 (19.51 %) | 0.94 | 17.79 % | 18.70 % | 22.09 % | 19.55 % | 20.15 % | 19.92 % | 16.98 % | 20.44 % |
+| us 13–21 | 175 200 (33.33 %) | 15 358 (42.55 %) | 1.28 | 38.31 % | 39.89 % | 37.55 % | 44.31 % | 33.26 % | 39.87 % | 43.26 % | 35.69 % |
+| late 21–24 | 65 700 (12.50 %) | 3 183 (8.82 %) | 0.71 | 8.61 % | 10.71 % | 9.10 % | 8.22 % | 13.33 % | 8.43 % | 9.77 % | 8.17 % |
+
+Live store, per session (one 34-hour run; the hour table is in the run
+output and is not representative of a time of day):
+
+| Session | Baseline | Triggers | Ratio |
+|---|---|---|---|
+| asia 00–08 | 954 (46.15 %) | 88 (74.58 %) | 1.62 |
+| europe 08–13 | 390 (18.87 %) | 19 (16.10 %) | 0.85 |
+| us 13–21 | 480 (23.22 %) | 6 (5.08 %) | 0.22 |
+| late 21–24 | 243 (11.76 %) | 5 (4.24 %) | 0.36 |
+
+Reading:
+
+- The baseline is uniform over the hours of the year by construction (one
+  sample per minute), so a time-of-day effect in the triggers shows up
+  directly as the share ratio.
+- Triggers concentrate in 13–16 UTC (ratio 1.43–1.77), the US cash open,
+  the same concentration #124 measured; they are sparsest in 21–23 UTC
+  (0.68–0.72). The `us` session holds 42.55 % of the triggers against
+  33.33 % of the baseline. Every family leans the same way;
+  `effort_vs_result` most (44.31 % in `us`), `cvd_divergence` least (equal
+  `asia` and `us` shares).
+- A comparison of trigger outcomes against the baseline that does not
+  stratify by time of day therefore compares a US-session-weighted sample
+  with a uniform one. ADR-058 D4 stratifies by New York hour of week for
+  this reason; these tables record the size of the imbalance.
+- The live run's skew to `asia` is a property of that single run, not of
+  the time of day.
