@@ -7,8 +7,11 @@
 //! position (ADR-060 D4–D10). [`metrics`] computes ADR-060 D11's metrics
 //! and the regime split from the records, and the `text` submodule renders
 //! and parses the lines of the `backtest` outcome kind (D12) that
-//! `research::result` embeds (#168). Rule resolution and the pipeline are
-//! separate steps (#169, #170).
+//! `research::result` embeds (#168). [`rules`] holds the rule registry v1
+//! (D2): [`resolve`] turns a spec's rule references into a [`Plan`], and
+//! [`Plan::intents`] decides D4's checks 1, 2, 4 and 5 for each emission of
+//! the plan's trigger id (D3–D5). The pipeline that drives them is a
+//! separate step (#170).
 //!
 //! - *Simulation only.* The MVP has no execution path (ADR-010): nothing
 //!   here is an order or a fill report, only the prices a resting order
@@ -28,10 +31,12 @@
 #![deny(clippy::float_arithmetic)]
 
 pub mod metrics;
+pub mod rules;
 pub mod simulator;
 pub(crate) mod text;
 
 pub use metrics::{BacktestMetrics, Metrics, REGIME_BUCKETS};
+pub use rules::{Plan, ResolutionError, resolve};
 pub use simulator::Simulator;
 pub use text::{event_kind_from_name, event_kind_name};
 
@@ -257,8 +262,8 @@ impl Levels {
 }
 
 /// The outcome of ADR-060 D4's checks 1, 2, 4 and 5 for one decision, which
-/// the rule evaluator (#169) decides from the spec and the state at the
-/// decision. The simulator adds check 3 (`stale_reference`) and check 6
+/// the rule evaluator ([`Plan::intents`]) decides from the spec and the
+/// state at the decision. The simulator adds check 3 (`stale_reference`) and check 6
 /// (`overlap`), so it enforces D4's order in one place.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Admission {

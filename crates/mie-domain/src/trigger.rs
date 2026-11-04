@@ -55,7 +55,7 @@ use crate::candidate::{CandidateEvent, Candidates, LocationContext};
 use crate::derivatives::{Derivatives, OiGridPoint};
 use crate::feature::{FeatureKey, FeatureValue, Input, catalog};
 use crate::fingerprint::Fingerprinter;
-use crate::location::{AuctionStatus, LocationEvent, LocationState};
+use crate::location::{AuctionStatus, LocationEvent, LocationState, Region};
 use crate::num::Price;
 use crate::regime::Regime;
 use crate::state_hash::StateEncode;
@@ -644,6 +644,74 @@ impl fmt::Display for TriggerEvent {
             "{} evidence=[{}] {} {} {}",
             self.family, self.evidence, self.feature, self.context, self.bias
         )
+    }
+}
+
+/// The evidence prices of a trigger (ADR-055 D8), known at decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct EvidencePrices {
+    /// The level the evidence is about.
+    pub level: Option<Price>,
+    /// The farthest price the evidence reached.
+    pub extreme: Option<Price>,
+}
+
+/// The prices of an SFP: the swept level's price and the sweep's extreme.
+fn sweep_prices(sweep: &Sweep) -> EvidencePrices {
+    EvidencePrices {
+        level: Some(sweep.level.price),
+        extreme: Some(sweep.extreme),
+    }
+}
+
+/// The prices of an auction status: the value edge on its side, no
+/// extreme.
+fn auction_prices(status: &AuctionStatus) -> EvidencePrices {
+    EvidencePrices {
+        level: match status.side {
+            Some(Region::Above) => Some(status.vah),
+            Some(Region::Below) => Some(status.val),
+            Some(Region::In) | None => None,
+        },
+        extreme: None,
+    }
+}
+
+/// The evidence prices of `trigger` (ADR-055 D8): one arm per evidence
+/// variant, each reading a field of the trigger's own evidence.
+pub fn evidence_prices(trigger: &TriggerEvent) -> EvidencePrices {
+    match &trigger.evidence {
+        TriggerEvidence::Sfp(sweep) => sweep_prices(sweep),
+        TriggerEvidence::Auction(status) => auction_prices(status),
+        TriggerEvidence::Candidate(fact) => match fact.as_ref() {
+            CandidateEvent::CvdDivergence(event) => {
+                let price = event.comparison.pair.current.price;
+                EvidencePrices {
+                    level: Some(price),
+                    extreme: Some(price),
+                }
+            }
+            // No trigger family is built on an OI divergence (ADR-053 D7);
+            // the arm keeps the function total, with the CVD rule.
+            CandidateEvent::OiDivergence(event) => {
+                let price = event.comparison.pair.current.price;
+                EvidencePrices {
+                    level: Some(price),
+                    extreme: Some(price),
+                }
+            }
+            CandidateEvent::Exhaustion(event) => EvidencePrices {
+                level: None,
+                extreme: Some(event.value.extreme),
+            },
+            CandidateEvent::EffortVsResult(_) | CandidateEvent::Absorption(_) => {
+                EvidencePrices::default()
+            }
+        },
+        TriggerEvidence::OiExpansion(expansion) => match &expansion.rejection {
+            OiRejection::Sfp(sweep) => sweep_prices(sweep),
+            OiRejection::FailedAuction(status) => auction_prices(status),
+        },
     }
 }
 

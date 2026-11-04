@@ -134,6 +134,34 @@ the side's sign σ (long +1, short −1).
   parameter; a missing parameter; a wrong type; an out-of-range value; a
   feature parameter of the wrong family; `beyond_extreme` on an id
   without an extreme; `latency` ≥ `max_hold_ms`; any `state-filter` rule.
+  - *Line order* is the canonical text's: the fields in canonical order,
+    the `state-filter` lines sorted as the text sorts them. Within one
+    line the given parameters come first, in name order, then the missing
+    ones, in name order, then the line's cross-rule error. An unknown id
+    or version skips that rule's parameter checks, since there is no row
+    to check them against. *Why:* a parsed spec keeps no source line
+    numbers, because its equality is canonical-text equality (ADR-040),
+    and `validate` prints the canonical text, so the canonical lines are
+    the only lines the errors can point at. *Rejected:* source line
+    numbers, which would make two specs with the same identity report
+    differently.
+  - *The two cross-rule errors:* `beyond_extreme` without an extreme is
+    reported on the `invalidation` line, and only when the `trigger` line
+    resolved, since without a resolved trigger there is no id to classify.
+    `latency` ≥ `max_hold_ms` is reported on the `target` line, and only
+    when `max_hold_ms` passed its own checks, since an out-of-range hold
+    is already its own error. *Why:* each error then names the line whose
+    change fixes it, and one mistake gives one error.
+  - The family of `atr=` is the set of ATR features the backtest can read
+    (`volatility.atr.1h@1` today), and an id with an extreme is one this
+    section lists. A feature registered later is refused by both until it
+    is classified, so no id gains a meaning by default.
+  - A `volatility.regime.*` feature of the spec's set that the backtest
+    cannot read is its own error, on the `features` line. *Why:* a spec
+    parsed under another registry than the catalog's can list one, and
+    without a reader no decision could record or filter on its label
+    (D11, D12); refusing it keeps resolution total.
+  (Refined by S4, #169.)
 
 ### D3. Side mapping per trigger family
 
@@ -244,6 +272,18 @@ the reverse.
   - With `invalidation.beyond_extreme@1`, a stop with
     σ · (reference − stop) ≤ 0 skips the decision as `stop_side`,
     equality included, since the stop needs > 0.
+  - *The target checks follow `stop_side`,* because the target needs R:
+    R outside the `i64` unit range, ⟨k·R⟩ rounding to 0, and a target
+    outside the price range each skip the decision as `no_risk`. The
+    price range is the `i64` unit range of ADR-055's barriers
+    (`Barriers::around` checks only the addition and the subtraction), so
+    a negative level is inside it. *Why:* this keeps one token per cause,
+    ADR-055 D4's mapping, where an offset that rounds to 0 and a barrier
+    outside the range both make the race `Unavailable`. *Rejected:*
+    checking the target before `stop_side`, which needs an R that a stop
+    on the wrong side does not have; and a new token, which would split
+    one cause by level.
+    (Refined by S4, #169.)
 - *Offset rule:* the offset is ATR × m, rounded half to even once, the
   rule of `barrier_offset` (`crates/mie-domain/src/conditional/label.rs`).
   At m = `0.31333000` it equals the labels' 1h offset exactly, since
