@@ -558,6 +558,15 @@ order:
   not the number of regime features in the spec's set. Parsing checks the
   structure only; re-deriving a line's values from e, x and the costs is
   the acceptance check's job (#171). (Refined by S3, #168.)
+- The outcome's fields are public, so a value can break these rules while
+  its text still renders. `ExperimentResult::validate` runs the same
+  checks on the value, with the error `parse` gives for its text, and the
+  result store refuses a value that fails them before writing
+  (`ResultStoreError::Invalid`). Stored, such a text would never read
+  back, and since the store never overwrites, every later read and append
+  of its experiment would fail. *Rejected:* a parse round trip inside the
+  store, which repeats the spec resolution and leaves the rule outside the
+  domain. (Refined by S3's review, #168.)
 
 **The `trade` line:**
 

@@ -322,8 +322,6 @@ impl ExperimentResult {
             .strip_prefix("pipeline ")
             .and_then(PipelineKey::parse)
             .ok_or_else(|| malformed(3, "expected `pipeline <id@N>`".to_owned()))?;
-        // The line of each `trade` line of a `backtest` outcome.
-        let mut trade_lines = Vec::new();
         let outcome = match lines.next("outcome <kind>")? {
             "outcome replay-summary" => {
                 let stream = lines
@@ -346,15 +344,10 @@ impl ExperimentResult {
             "outcome history-replay-summary" => {
                 Outcome::HistoryReplaySummary(HistoryReplaySummary::parse(&mut lines)?)
             }
-            "outcome backtest" => parse_backtest(&mut lines, &mut trade_lines)?,
+            "outcome backtest" => parse_backtest(&mut lines)?,
             other => return Err(malformed(4, format!("unknown outcome line {other:?}"))),
         };
-        if let Some(kind) = kind_of(&pipeline).filter(|kind| *kind != outcome.kind()) {
-            return Err(malformed(
-                4,
-                format!("expected `outcome {kind}`: the outcome of {pipeline}"),
-            ));
-        }
+        check_kind(&pipeline, &outcome)?;
         if lines.next("spec")? != "spec" {
             return Err(malformed(lines.line, "expected `spec`".to_owned()));
         }
@@ -365,31 +358,143 @@ impl ExperimentResult {
                 computed: spec.id(),
             });
         }
-        if let Outcome::Backtest { records, .. } = &outcome {
-            let features = spec.regime_features().len();
-            if let Some((&line, _)) = trade_lines
-                .iter()
-                .zip(records)
-                .find(|(_, record)| record.regime.len() != features)
-            {
-                return Err(malformed(
-                    line,
-                    format!(
-                        "expected {features} `regime=` labels, one per regime feature of the \
-                         spec (`none` for zero)"
-                    ),
-                ));
-            }
-        }
         let result = Self {
             spec,
             pipeline,
             outcome,
         };
+        // Every check but the regime arity has run on the way here; the
+        // arity needs the spec.
+        result.validate()?;
         if result.canonical_text() != text {
             return Err(ResultParseError::NotCanonical);
         }
         Ok(result)
+    }
+
+    /// Checks what result text v1 refuses beyond its grammar, with the
+    /// error [`parse`](Self::parse) gives for this value's
+    /// [`canonical_text`](Self::canonical_text), naming the same line:
+    ///
+    /// - an `outcome` kind other than its pipeline's ([`PIPELINE_KINDS`]);
+    /// - a state-hash encoding of 0;
+    /// - for a `backtest` outcome (ADR-060 D12): a record whose values are
+    ///   not its exit kind's shape, records whose decision keys decrease,
+    ///   counts that break D4's conservation, and a regime list whose
+    ///   length is not the spec's number of regime features.
+    ///
+    /// Every other value renders text that parses back to it, so `Ok`
+    /// means [`parse`](Self::parse) returns this value for its canonical
+    /// text. A store calls this before it writes: the fields are public,
+    /// so a value no pipeline produces can be built, and its stored text
+    /// would never read back.
+    ///
+    /// # Errors
+    ///
+    /// The first [`ResultParseError::Malformed`] in line order, as `parse`
+    /// reports it.
+    pub fn validate(&self) -> Result<(), ResultParseError> {
+        let summary = match &self.outcome {
+            Outcome::ReplaySummary { .. } => None,
+            Outcome::HistoryReplaySummary(summary) | Outcome::Backtest { summary, .. } => {
+                Some(summary)
+            }
+        };
+        if summary.is_some_and(|summary| summary.engine.state_encoding == 0) {
+            return Err(ResultParseError::Malformed {
+                line: ENCODING_LINE,
+                reason: format!("expected `{ENCODING_FORM}`"),
+            });
+        }
+        if let Outcome::Backtest { stats, records, .. } = &self.outcome {
+            let mut previous = None;
+            for (index, record) in records.iter().enumerate() {
+                check_trade(FIRST_TRADE_LINE + index, record, previous)?;
+                previous = Some(record);
+            }
+            check_conservation(TRIGGERS_LINE, stats, records.len())?;
+        }
+        check_kind(&self.pipeline, &self.outcome)?;
+        if let Outcome::Backtest { records, .. } = &self.outcome {
+            let features = self.spec.regime_features().len();
+            if let Some(index) = records
+                .iter()
+                .position(|record| record.regime.len() != features)
+            {
+                return Err(ResultParseError::Malformed {
+                    line: FIRST_TRADE_LINE + index,
+                    reason: format!(
+                        "expected {features} `regime=` labels, one per regime feature of the \
+                         spec (`none` for zero)"
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The line of `state-encoding` in a kind with the chain provenance: the
+/// four opening lines, then the eighth provenance line.
+const ENCODING_LINE: usize = 12;
+
+/// The form of the `state-encoding` line.
+const ENCODING_FORM: &str = "state-encoding <n from 1>";
+
+/// The line of `triggers` in a `backtest` outcome: after the four opening
+/// lines and the twelve provenance lines.
+const TRIGGERS_LINE: usize = 17;
+
+/// The line of the first `trade` line, after the four count lines.
+const FIRST_TRADE_LINE: usize = 21;
+
+/// An `outcome` kind other than the one `pipeline` produces is malformed,
+/// at the `outcome` line.
+fn check_kind(pipeline: &PipelineKey, outcome: &Outcome) -> Result<(), ResultParseError> {
+    match kind_of(pipeline).filter(|kind| *kind != outcome.kind()) {
+        Some(kind) => Err(ResultParseError::Malformed {
+            line: 4,
+            reason: format!("expected `outcome {kind}`: the outcome of {pipeline}"),
+        }),
+        None => Ok(()),
+    }
+}
+
+/// The checks of one `trade` line at `line` beyond its grammar (ADR-060
+/// D12): the shape of its exit kind, and a decision key not below the
+/// `previous` line's.
+fn check_trade(
+    line: usize,
+    record: &TradeRecord,
+    previous: Option<&TradeRecord>,
+) -> Result<(), ResultParseError> {
+    let malformed = |reason: String| ResultParseError::Malformed { line, reason };
+    text::check_shape(record).map_err(malformed)?;
+    if previous.is_some_and(|previous| record.decision < previous.decision) {
+        return Err(malformed(
+            "the decision key is below the previous trade line's: trade lines come in \
+             decision order"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// ADR-060 D4's conservation, reported on the `triggers` line.
+fn check_conservation(
+    line: usize,
+    stats: &SimulationStats,
+    trades: usize,
+) -> Result<(), ResultParseError> {
+    if text::conserves(stats, trades) {
+        Ok(())
+    } else {
+        Err(ResultParseError::Malformed {
+            line,
+            reason: format!(
+                "triggers is not filtered + skipped + the {trades} trade lines (ADR-060 D4)"
+            ),
+        })
     }
 }
 
@@ -541,6 +646,7 @@ impl HistoryReplaySummary {
             parse_hex16(text).map(|v| FeatureSetVersion::from_fingerprint(Fingerprint::from_raw(v)))
         })?;
         let state_encoding = lines.field("state-encoding", "<n from 1>", parse_encoding)?;
+        debug_assert_eq!(lines.line, ENCODING_LINE);
         let state_start = lines.field("state-start", "<16 hex>", state_hash)?;
         let stream = lines.field("stream", "<events>:<16 hex>", parse_stream_hash)?;
         let rejections = lines.field("rejections", "<n>", |n| n.parse().ok())?;
@@ -566,12 +672,9 @@ impl HistoryReplaySummary {
 
 /// The lines of a `backtest` outcome after its `outcome` line, up to
 /// `spec` (ADR-060 D12): the provenance, the counts, the `trade` lines and
-/// the `metrics` lines. Pushes the line number of each `trade` line onto
-/// `trade_lines`, for the regime check once the spec has parsed.
-fn parse_backtest(
-    lines: &mut Lines<'_>,
-    trade_lines: &mut Vec<usize>,
-) -> Result<Outcome, ResultParseError> {
+/// the `metrics` lines. The regime arity is checked once the spec has
+/// parsed ([`ExperimentResult::validate`]).
+fn parse_backtest(lines: &mut Lines<'_>) -> Result<Outcome, ResultParseError> {
     let malformed = |line: usize, reason: String| ResultParseError::Malformed { line, reason };
     let summary = HistoryReplaySummary::parse(lines)?;
     let triggers = lines.with("triggers <n>", |t| text::parse_count(t, "triggers"))?;
@@ -588,29 +691,10 @@ fn parse_backtest(
     let mut records: Vec<TradeRecord> = Vec::new();
     while lines.peek().is_some_and(|line| line.starts_with("trade ")) {
         let record = lines.with("trade <fields>", text::parse_trade)?;
-        if records
-            .last()
-            .is_some_and(|last| record.decision < last.decision)
-        {
-            return Err(malformed(
-                lines.line,
-                "the decision key is below the previous trade line's: trade lines come in \
-                 decision order"
-                    .to_owned(),
-            ));
-        }
-        trade_lines.push(lines.line);
+        check_trade(lines.line, &record, records.last())?;
         records.push(record);
     }
-    if !text::conserves(&stats, records.len()) {
-        return Err(malformed(
-            triggers_line,
-            format!(
-                "triggers is not filtered + skipped + the {} trade lines (ADR-060 D4)",
-                records.len()
-            ),
-        ));
-    }
+    check_conservation(triggers_line, &stats, records.len())?;
     let (scope, _) = lines.with("metrics all <fields>", text::parse_metrics)?;
     if scope != MetricsScope::All {
         return Err(malformed(

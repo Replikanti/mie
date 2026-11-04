@@ -210,6 +210,10 @@ impl ResearchResultReader for FsResultStore {
 
 impl ResearchResultStore for FsResultStore {
     fn append(&mut self, result: &ExperimentResult) -> Result<ResultKey, ResultStoreError> {
+        // A result whose text cannot read back would poison its experiment
+        // for good: the store never overwrites, and every append reads the
+        // experiment's stored results.
+        result.validate().map_err(ResultStoreError::Invalid)?;
         let key = result.key();
         let dir = self.root.join(key.experiment.to_string());
         // Its entry in the root becomes durable with the sync after the

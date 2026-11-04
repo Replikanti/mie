@@ -931,3 +931,71 @@ fn lines_round_trip_on_their_own() {
         assert!(parse_metrics(bad).is_err(), "{bad}");
     }
 }
+
+/// G1 with its backtest parts changed by `change`.
+fn g1_with(
+    change: impl FnOnce(&mut HistoryReplaySummary, &mut SimulationStats, &mut Vec<TradeRecord>),
+) -> ExperimentResult {
+    let mut result = g1();
+    let Outcome::Backtest {
+        summary,
+        stats,
+        records,
+    } = &mut result.outcome
+    else {
+        unreachable!("G1 is a backtest result");
+    };
+    change(summary, stats, records);
+    result
+}
+
+/// A value no pipeline produces is refused by `validate` with the error
+/// `parse` gives for its canonical text (PR #177 review): a store calls
+/// `validate` before it writes, so such a text never reaches it.
+#[test]
+fn invalid_values_are_refused_as_their_text_is() {
+    let mut other_pipeline = g1();
+    other_pipeline.pipeline = PipelineKey::new("research.replay_summary", 2);
+    let cases = [
+        // D4's conservation broken: one trigger too few.
+        (g1_with(|_, stats, _| stats.triggers -= 1), 17),
+        // A regime list of two labels against one regime feature.
+        (g1_with(|_, _, records| records[2].regime.push(None)), 23),
+        // Decision keys that decrease.
+        (g1_with(|_, _, records| records.swap(0, 1)), 22),
+        // A closed trade without its MAE, which `Metrics::over` would
+        // leave out of every count.
+        (g1_with(|_, _, records| records[0].mae = None), 21),
+        // The pipeline fixes the kind.
+        (other_pipeline, 4),
+        // A state-hash encoding of 0.
+        (
+            g1_with(|summary, _, _| summary.engine.state_encoding = 0),
+            12,
+        ),
+    ];
+    for (result, line) in cases {
+        let refused = result.validate();
+        assert!(
+            matches!(&refused, Err(ResultParseError::Malformed { line: found, .. }) if *found == line),
+            "{refused:?}"
+        );
+        assert_eq!(
+            parse(&result.canonical_text()).map(|_| ()),
+            refused,
+            "{result:?}"
+        );
+    }
+
+    let (records, stats) = fixture(costs(10, 1_000, "0.001", "0.0005", FundingRule::Recorded));
+    let records = records
+        .into_iter()
+        .map(|record| TradeRecord {
+            regime: vec![None],
+            ..record
+        })
+        .collect();
+    for valid in [g1(), result_on(&golden(), stats, records)] {
+        assert_eq!(valid.validate(), Ok(()));
+    }
+}

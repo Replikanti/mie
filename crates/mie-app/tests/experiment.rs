@@ -93,6 +93,8 @@ impl ResearchResultReader for MemoryStore {
 
 impl ResearchResultStore for MemoryStore {
     fn append(&mut self, result: &ExperimentResult) -> Result<ResultKey, ResultStoreError> {
+        // The port contract: an invalid result is refused before writing.
+        result.validate().map_err(ResultStoreError::Invalid)?;
         let key = result.key();
         let text = result.canonical_text();
         if let Some(stored) = self.results.get(&key) {

@@ -324,7 +324,8 @@ pub(crate) fn render_trade(record: &TradeRecord, out: &mut String) {
     ));
 }
 
-/// One `trade` line, checked against the shape of its exit kind.
+/// One `trade` line, grammar only: the caller checks it against the shape
+/// of its exit kind ([`check_shape`]).
 pub(crate) fn parse_trade(text: &str) -> Result<TradeRecord, String> {
     let tokens: Vec<&str> = text.split(' ').collect();
     let [keyword, time, kind, seq, fields @ ..] = tokens.as_slice() else {
@@ -396,7 +397,7 @@ pub(crate) fn parse_trade(text: &str) -> Result<TradeRecord, String> {
             ));
         }
     };
-    let record = TradeRecord {
+    Ok(TradeRecord {
         decision,
         side,
         regime: parse_regime(regime)?,
@@ -414,9 +415,7 @@ pub(crate) fn parse_trade(text: &str) -> Result<TradeRecord, String> {
         displacement: r_value("displacement", displacement)?,
         mfe: r_value("mfe", mfe)?,
         mae: r_value("mae", mae)?,
-    };
-    check_shape(&record)?;
-    Ok(record)
+    })
 }
 
 /// ADR-060 D12's `-` cases, one shape per exit kind:
@@ -427,7 +426,7 @@ pub(crate) fn parse_trade(text: &str) -> Result<TradeRecord, String> {
 /// - censored: `fill`, `funding`, `gross` and `net` are `-`, and `entry`,
 ///   `displacement`, `mfe` and `mae` are either all `-` or all set with
 ///   the entry fill strictly before the censor time.
-fn check_shape(record: &TradeRecord) -> Result<(), String> {
+pub(crate) fn check_shape(record: &TradeRecord) -> Result<(), String> {
     let exit_values = [
         record.fill.is_some(),
         record.funding.is_some(),
