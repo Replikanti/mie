@@ -15,7 +15,8 @@
 # text guard keeps forward outcome labels out of every core file but the
 # labeler and its replay driver (ADR-055 D11), a fourth keeps the backtest
 # out of every core file but its allow-list (ADR-060 D15), and a fifth bans
-# the macro path splices that would name either without the text showing.
+# `macro_rules!` in the core, so that neither can be named without the
+# text showing.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -88,22 +89,39 @@ fi
 label_lines='label::|ForwardLabel'
 label_use='(^|[^[:alnum:]_])label($|[^[:alnum:]_])'
 
-# Every `use` item of the given files on one line: `<file>:<line>:<item>`,
-# with line comments dropped.
-use_items() {
-  awk '
+# Every item of the given files that starts on a line matching the ERE
+# `$1`, joined onto one line up to the `;` that ends it, the first one
+# outside brackets (`[u8; 4]` holds one): `<file>:<line>:<item>`, with
+# line comments dropped.
+joined_items() {
+  local start=$1
+  shift
+  awk -v start="$start" '
     FNR == 1 { item = "" }
-    item == "" && /^[[:space:]]*(pub(\([^)]*\))?[[:space:]]+)?use[[:space:]]/ { start = FNR; item = " " }
+    item == "" && $0 ~ start { first = FNR; item = " "; depth = 0 }
     item != "" {
       line = $0
       sub(/\/\/.*/, "", line)
       item = item " " line
-      if (line ~ /;/) {
-        print FILENAME ":" start ":" item
-        item = ""
+      for (i = 1; i <= length(line); i++) {
+        c = substr(line, i, 1)
+        if (c ~ /[([{]/) {
+          depth++
+        } else if (c ~ /[])}]/) {
+          depth--
+        } else if (c == ";" && depth <= 0) {
+          print FILENAME ":" first ":" item
+          item = ""
+          break
+        }
       }
     }
   ' "$@"
+}
+
+# Every `use` item of the given files, joined by `joined_items`.
+use_items() {
+  joined_items '^[[:space:]]*(pub([(][^)]*[)])?[[:space:]]+)?use[[:space:]]' "$@"
 }
 
 # The hits of an isolation scan in the given directories or files: every
@@ -169,55 +187,45 @@ clean=(
 )
 self_test label label_scan probes clean
 
-# Macro path splices (ADR-055 D11, ADR-060 D15): a `macro_rules!` that
-# pastes a metavariable into a path, `crate::$x::Race` with `m!(label)`,
-# names a module while no line shows `label::` and no `use` item has the
-# segment (PR #176 review). The core declares no such macro, so every
-# metavariable next to `::` and every metavariable in a `use` item is
-# banned in every core file, allow-listed ones included: a splicing macro
-# exported by the labeler would reopen the hole for its callers. `$crate`
-# is the crate root, not a splice. Comments count, like the other scans.
-# A `use` item that starts mid-line, inside a one-line macro body, is
-# checked on its line, the others joined by `use_items`.
-splice_lines='[$][[:alnum:]_]+[[:space:]]*::|::[[:space:]]*[$][[:alnum:]_]|(^|[^[:alnum:]_])use[[:space:]][^;]*[$][[:alnum:]_]'
+# Macro ban (ADR-055 D11, ADR-060 D15): a `macro_rules!` can paste its
+# arguments into a path, `crate::$x::Race` with `m!(label)` or the
+# repetition `$($seg)::*` with `m!(crate, conditional, label, Race)`, and
+# name a module while no line shows `label::` and no `use` item has the
+# segment (PR #176 review and re-review). A ban on splice shapes loses to
+# the next shape, so no core file defines a macro at all, the allow-list
+# and the labeler included: a macro exported from an allowed file would
+# reopen the hole for its callers. The core has none, and core crates take
+# no dependencies, so the only macros left are the standard library's,
+# which build no path from their arguments. A module is then named only by
+# a literal token, which the isolation scans see. The scan flags the
+# identifier on any line, comments included like the other scans, so
+# spacing (`macro_rules !`) and a raw identifier do not hide it.
+macro_lines='(^|[^[:alnum:]_])macro_rules($|[^[:alnum:]_])'
 
-# The macro-splice hits in the given directories or files.
-splice_scan() {
-  local files
-  mapfile -d '' files < <(find "$@" -name '*.rs' -print0 | sort -z)
-  [[ ${#files[@]} -gt 0 ]] || return 0
-  {
-    awk -v pattern="$splice_lines" '
-      { line = $0; gsub(/[$]crate/, "crate", line) }
-      line ~ pattern { print FILENAME ":" FNR ":" $0 }
-    ' "${files[@]}"
-    use_items "${files[@]}" | sed 's/[$]crate/crate/g' | grep -E '^[^:]+:[0-9]+:.*[$][[:alnum:]_]' || true
-  } | sort -u
+# The macro definitions in the given directories or files.
+macro_scan() {
+  grep -rnHE "$macro_lines" "$@" || true
 }
 
 # shellcheck disable=SC2034,SC2016 # read by self_test through a nameref; literal Rust `$`
-splice_probes=(
+macro_probes=(
   $'macro_rules! m { ($x:ident) => { crate::$x::Simulator }; }\nfn f(_: Option<m!(backtest)>) {}'
-  'macro_rules! m { ($x:ident) => { crate::conditional::$x::Race }; }'
-  'macro_rules! m { ($p:path) => { $p::Race }; }'
-  'macro_rules! m { ($p:path) => { $p :: Race }; }'
-  'macro_rules! m { ($x:ident) => { $crate::conditional::$x::Race }; }'
-  $'macro_rules! m {\n    ($x:ident) => {\n        use crate::conditional::{$x as outcome};\n    };\n}'
-  'macro_rules! m { ($p:path) => { use $p as outcome; }; }'
+  $'macro_rules! review_path {\n    ($($seg:ident),*) => { $($seg)::* };\n}'
+  'macro_rules ! m { () => {}; }'
+  $'#[macro_export]\nmacro_rules! m { ($p:path) => { use $p as outcome; }; }'
 )
-# shellcheck disable=SC2034,SC2016 # read by self_test through a nameref; literal Rust `$`
-splice_clean=(
-  'macro_rules! m { ($e:expr) => { $crate::num::Price::from_units($e) }; }'
-  'macro_rules! m { ($x:expr) => { $x + 1 }; }'
-  'macro_rules! m { () => { use $crate::num::Price; }; }'
+# shellcheck disable=SC2034 # read by self_test through a nameref
+macro_clean=(
+  'fn macro_rules_seen() -> bool { matches!(KIND, Kind::Macro) }'
+  'let rules = macro_count; // a macro argument'
+  'assert_eq!(rules, 0);'
 )
+self_test macro macro_scan macro_probes macro_clean
 
-self_test splice splice_scan splice_probes splice_clean
-
-splice_hits=$(splice_scan crates/mie-domain/src crates/mie-ports/src crates/mie-app/src)
-if [[ -n "$splice_hits" ]]; then
-  fail "macro path splices in a core crate (ADR-055 D11, ADR-060 D15):"
-  echo "$splice_hits"
+macro_hits=$(macro_scan crates/mie-domain/src crates/mie-ports/src crates/mie-app/src)
+if [[ -n "$macro_hits" ]]; then
+  fail "macro definitions in a core crate (ADR-055 D11, ADR-060 D15):"
+  echo "$macro_hits"
 fi
 
 label_hits=$(label_scan crates/mie-domain/src crates/mie-ports/src crates/mie-app/src \
@@ -235,12 +243,18 @@ fi
 # item for a `backtest` path segment. Unlike `label`, `backtest` is no
 # common word in the code, so a third scan flags the bare identifier on
 # any code line, with comments, string and char literals dropped and the
-# `mod backtest;` declaration exempt: a macro argument (`m!(backtest)`,
-# `m!(crate::backtest)`) is caught at the call too (PR #176 review). The
-# literal stripping is line-based, so a raw string holding a quote can
-# hide a token from it; the splice guard above still covers the macro
-# path. The allow-list names exact files, so a neighbour
-# (`backtester.rs`, `research.rs` in the domain) stays scanned.
+# `mod backtest;` declaration exempt. It came for macro arguments
+# (`m!(backtest)`, PR #176 review), which the macro ban above now rules
+# out, and stays as the backstop for a path the other two scans miss:
+# `crate::backtest ::X`, a space before `::`, which rustfmt removes except
+# in a macro call it cannot parse. Its literal stripping is line-based
+# and knows no raw strings: `r"\"` reads as an escaped quote, and a
+# string that spans lines pairs its quotes wrong, so a token later on such
+# a line can be hidden from this scan (PR #176 re-review). The other two
+# scans strip no literals and do not share that limit, so the gap left is
+# a spaced path in such a macro call on such a line. The allow-list names
+# exact files, so a neighbour (`backtester.rs`, `research.rs` in the
+# domain) stays scanned.
 backtest_lines='backtest::'
 backtest_use='(^|[^[:alnum:]_])backtest($|[^[:alnum:]_])'
 backtest_allow='^crates/mie-domain/src/backtest\.rs:|^crates/mie-domain/src/backtest/|^crates/mie-domain/src/research/result\.rs:|^crates/mie-ports/src/(outbound|inbound)\.rs:|^crates/mie-app/src/(backtest|research)\.rs:'
@@ -341,20 +355,18 @@ done
 # Re-exports from the allow-list (PR #176 review): an allowed file outside
 # the backtest module that re-exports a backtest item, `pub use` or
 # `pub type`, any visibility, would let every importer name it without a
-# `backtest` token. Its importers must name the module themselves. Takes
-# files; an allowed file that does not exist yet is skipped.
+# `backtest` token. Its importers must name the module themselves. Each
+# item is joined up to its `;` by `joined_items`, since rustfmt wraps a
+# long alias (PR #176 re-review). Takes files; an allowed file that does
+# not exist yet is skipped.
 backtest_reexport_scan() {
   local file files=()
   for file in "$@"; do
     [[ -f "$file" ]] && files+=("$file")
   done
   [[ ${#files[@]} -gt 0 ]] || return 0
-  {
-    use_items "${files[@]}" \
-      | grep -E '^[^:]+:[0-9]+:[[:space:]]*pub[[:space:]]*(\(|[[:space:]]use)' \
-      | grep -E "^[^:]+:[0-9]+:.*$backtest_use" || true
-    grep -nHE "^[[:space:]]*pub(\([^)]*\))?[[:space:]]+type[[:space:]].*$backtest_use" "${files[@]}" || true
-  } | sort -u
+  joined_items '^[[:space:]]*pub([[:space:]]*[(][^)]*[)][[:space:]]*|[[:space:]]+)(use|type)([[:space:]]|$)' "${files[@]}" \
+    | grep -E "^[^:]+:[0-9]+:.*$backtest_use" || true
 }
 
 # shellcheck disable=SC2034 # read by self_test through a nameref
@@ -363,12 +375,16 @@ backtest_reexport_probes=(
   $'pub(crate) use crate::backtest::{\n    Simulator,\n};'
   'pub(super) use crate::backtest as bt;'
   'pub type Sim = crate::backtest::Simulator;'
+  $'/// Review probe.\npub type ReviewPair = (\n    crate::backtest::Simulator,\n    crate::backtest::TradeRecord,\n    crate::backtest::SimulationStats,\n);'
+  $'pub type Window = (\n    [u8; 4],\n    crate::backtest::Simulator,\n);'
+  $'pub(crate) type Sim =\n    crate::backtest::Simulator;'
 )
 # shellcheck disable=SC2034 # read by self_test through a nameref
 backtest_reexport_clean=(
   'use crate::backtest::TradeRecord;'
   'pub use crate::research::ResultKey;'
   'pub type Records = Vec<Record>;'
+  $'pub type Window = [u8; 4];\nfn f(_: crate::backtest::Simulator) {}'
 )
 self_test backtest-reexport backtest_reexport_scan backtest_reexport_probes backtest_reexport_clean
 
@@ -388,6 +404,6 @@ if [[ -n "$backtest_hits" ]]; then
 fi
 
 if [[ $status -eq 0 ]]; then
-  echo "OK: $(wc -w <<<"$members") crates — crate graph, core purity (ADR-025), label isolation (ADR-055), backtest isolation (ADR-060) and no macro path splices hold"
+  echo "OK: $(wc -w <<<"$members") crates — crate graph, core purity (ADR-025), label isolation (ADR-055), backtest isolation (ADR-060) and the macro ban hold"
 fi
 exit $status

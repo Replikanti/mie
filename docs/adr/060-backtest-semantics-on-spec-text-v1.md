@@ -699,24 +699,36 @@ metrics <regime feature id@N> <LOW|MEDIUM|HIGH|EXTREME|-> <fields>
   lines), with the label guard's scan and self-probes in
   `tools/check-architecture.sh`.
 - The guard also flags (refined by the review of the simulator PR, #167):
+  - any `macro_rules!` in every core file, the allow-list and the
+    labeler included, for both guards. *Why:* a macro pastes its
+    arguments into a path, `m!(backtest)` into `crate::$x::Simulator` or
+    `m!(crate, conditional, label, Race)` into the repetition
+    `$($seg)::*`, and so names a module with neither the `::` token nor a
+    `use` item on any line. A macro exported from an allowed file would
+    reopen that for every caller. Without macro definitions, and with no
+    dependencies in the core, the only macros are the standard library's,
+    which build no path from their arguments, so a module is named only
+    by a literal token, which the scans see. The core defines no macro,
+    so the ban breaks nothing. *Rejected:* banning the splice shapes
+    (`$x::`, `::$x`, `$` in a `use` item), the first fix, which the
+    repetition splice passed (re-review of the simulator PR): every new
+    shape needs a new pattern;
   - the bare identifier `backtest` on any code line, comments and string
-    literals dropped, except the `mod backtest;` declaration. *Why:* a
-    macro argument, `m!(backtest)` spliced into `crate::$x::Simulator`,
-    names the module with neither `backtest::` nor a `use` item on any
-    line. Unlike `label`, the word does not occur elsewhere in the core,
-    so the scan costs no false positives today;
-  - a macro metavariable pasted into a path (`$x::`, `::$x`) or used in a
-    `use` item, `$crate` excepted, in every core file, the allow-list and
-    the labeler included. *Why:* it closes the same splice for the label
-    guard, where the identifier scan is not possible (`label` is a common
-    field and method name), and a splicing macro exported from an allowed
-    file would reopen the hole for every caller. The core has no such
-    macro, so the ban breaks nothing;
+    literals dropped, except the `mod backtest;` declaration. *Why:* it
+    came for macro arguments, which the ban above now rules out, and stays
+    as a backstop for a path written with a space before `::`, which
+    rustfmt leaves only inside a macro call it cannot parse. Unlike
+    `label`, the word does not occur elsewhere in the core, so the scan
+    costs no false positives today. Weak spot: its literal stripping is
+    line-based and knows no raw strings, so a raw string ending in a
+    backslash, or a string spanning lines, can hide a later token on the
+    line from it; the other two scans strip no literals;
   - a `pub use` or `pub type` of a backtest item, any visibility, in an
-    allowed file outside the backtest module. *Why:* a re-export lets every
-    importer reach the item without a `backtest` token. *Rejected:*
-    scanning for the re-exported names, which needs the guard to resolve
-    Rust paths.
+    allowed file outside the backtest module, each item joined up to the
+    `;` that ends it, since rustfmt wraps a long alias. *Why:* a
+    re-export lets every importer reach the item without a `backtest`
+    token. *Rejected:* scanning for the re-exported names, which needs
+    the guard to resolve Rust paths.
 - Exceptions:
   - `crates/mie-domain/src/backtest.rs` and `crates/mie-domain/src/backtest/`;
   - `crates/mie-domain/src/research/result.rs` (the outcome kind);
