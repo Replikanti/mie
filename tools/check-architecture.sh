@@ -13,7 +13,8 @@
 # The purity scan is a pattern guard over source text, not a proof — review
 # still applies. Dev-dependencies are exempt from the graph rules. A third
 # text guard keeps forward outcome labels out of every core file but the
-# labeler and its replay driver (ADR-055 D11).
+# labeler and its replay driver (ADR-055 D11), and a fourth keeps the
+# backtest out of every core file but its allow-list (ADR-060 D15).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -104,23 +105,48 @@ use_items() {
   ' "$@"
 }
 
-# The label-isolation hits in the given directories or files.
-label_scan() {
-  local files
+# The hits of an isolation scan in the given directories or files: every
+# line matching the ERE `$1`, and every `use` item with a path segment
+# matching the ERE `$2`.
+isolation_scan() {
+  local lines=$1 use=$2 files
+  shift 2
   mapfile -d '' files < <(find "$@" -name '*.rs' -print0 | sort -z)
   {
-    grep -rnHE "$label_lines" "$@" || true
+    grep -rnHE "$lines" "$@" || true
     if [[ ${#files[@]} -gt 0 ]]; then
-      use_items "${files[@]}" | grep -E "^[^:]+:[0-9]+:.*$label_use" || true
+      use_items "${files[@]}" | grep -E "^[^:]+:[0-9]+:.*$use" || true
     fi
   } | sort -u
 }
 
-# Self-test of the label scan: each probe below must hit, each clean
-# snippet must not. A guard that silently stops matching would pass every
-# tree, so its blind spots are pinned here (PR #148 review).
+# The label-isolation hits in the given directories or files.
+label_scan() {
+  isolation_scan "$label_lines" "$label_use" "$@"
+}
+
+# Self-test of an isolation scan: each probe of the array named `$3` must
+# hit, each clean snippet of the array named `$4` must not. A guard that
+# silently stops matching would pass every tree, so its blind spots are
+# pinned here (PR #148 review).
 probe_dir=$(mktemp -d)
 trap 'rm -rf "$probe_dir"' EXIT
+self_test() {
+  local guard=$1 scan=$2 index
+  local -n hit_probes=$3 clean_snippets=$4
+  for index in "${!hit_probes[@]}"; do
+    printf '%s\n' "${hit_probes[$index]}" >"$probe_dir/${guard}_probe_$index.rs"
+    [[ -n "$("$scan" "$probe_dir/${guard}_probe_$index.rs")" ]] \
+      || fail "$guard guard self-test: probe $index is not caught: ${hit_probes[$index]}"
+  done
+  for index in "${!clean_snippets[@]}"; do
+    printf '%s\n' "${clean_snippets[$index]}" >"$probe_dir/${guard}_clean_$index.rs"
+    [[ -z "$("$scan" "$probe_dir/${guard}_clean_$index.rs")" ]] \
+      || fail "$guard guard self-test: clean snippet $index is flagged: ${clean_snippets[$index]}"
+  done
+}
+
+# shellcheck disable=SC2034 # read by self_test through a nameref
 probes=(
   'use crate::conditional::label::ForwardLabel;'
   'use crate::conditional::label as outcome;'
@@ -133,22 +159,14 @@ probes=(
   $'pub(crate) use super::{\n    label as x, // the labeler\n};'
   'fn f(race: outcome::Race) -> bool { matches!(race, label::Race::Neither) }'
 )
+# shellcheck disable=SC2034 # read by self_test through a nameref
 clean=(
   'use crate::conditional::{ContextRecord, ContextSampler};'
   $'use crate::regime::{\n    RegimeLabel,\n};'
   'let label = regime.label(); // a regime label'
   'pub fn label(self) -> RegimeLabel {'
 )
-for index in "${!probes[@]}"; do
-  printf '%s\n' "${probes[$index]}" >"$probe_dir/probe_$index.rs"
-  [[ -n "$(label_scan "$probe_dir/probe_$index.rs")" ]] \
-    || fail "label guard self-test: probe $index is not caught: ${probes[$index]}"
-done
-for index in "${!clean[@]}"; do
-  printf '%s\n' "${clean[$index]}" >"$probe_dir/clean_$index.rs"
-  [[ -z "$(label_scan "$probe_dir/clean_$index.rs")" ]] \
-    || fail "label guard self-test: clean snippet $index is flagged: ${clean[$index]}"
-done
+self_test label label_scan probes clean
 
 label_hits=$(label_scan crates/mie-domain/src crates/mie-ports/src crates/mie-app/src \
   | grep -vE '^crates/mie-domain/src/conditional/label[^:]*:|^crates/mie-app/src/conditional\.rs:' || true)
@@ -157,7 +175,89 @@ if [[ -n "$label_hits" ]]; then
   echo "$label_hits"
 fi
 
+# Backtest isolation (ADR-060 D15): the simulator reads the trades after
+# the decision, the path the label guard closes, so no core file may name
+# the backtest except the module itself, the outcome kind, the port, the
+# `Unresolved` error and the app's engine and research service. The same
+# two scans as for labels: every line for `backtest::`, and every `use`
+# item for a `backtest` path segment. The allow-list names exact files, so
+# a neighbour (`backtester.rs`, `research.rs` in the domain) stays scanned.
+backtest_lines='backtest::'
+backtest_use='(^|[^[:alnum:]_])backtest($|[^[:alnum:]_])'
+backtest_allow='^crates/mie-domain/src/backtest\.rs:|^crates/mie-domain/src/backtest/|^crates/mie-domain/src/research/result\.rs:|^crates/mie-ports/src/(outbound|inbound)\.rs:|^crates/mie-app/src/(backtest|research)\.rs:'
+
+# The backtest-isolation hits in the given directories or files.
+backtest_scan() {
+  isolation_scan "$backtest_lines" "$backtest_use" "$@"
+}
+
+# The hits on stdin, `<path>:<line>:<text>`, outside the allow-list.
+backtest_disallowed() {
+  grep -vE "$backtest_allow" || true
+}
+
+# shellcheck disable=SC2034 # read by self_test through a nameref
+backtest_probes=(
+  'use crate::backtest::simulator::Simulator;'
+  'use crate::backtest as bt;'
+  'use crate::{backtest, research::ExperimentSpec};'
+  $'use crate::research::{\n    ExperimentSpec as _A, ResultKey as _B, backtest as bt,\n};'
+  $'use mie_domain::{\n    research,\n    backtest,\n};'
+  $'use crate::{\n    backtest::{Simulator as x},\n};'
+  'use super::backtest as x;'
+  'use self::backtest as x;'
+  $'pub(crate) use super::{\n    backtest as x, // the simulator\n};'
+  'fn f(record: bt::TradeRecord) -> bool { matches!(record.exit, backtest::Exit::Stop) }'
+  'pub use backtest::Simulator;'
+  '/// Renders a crate::backtest::TradeRecord as a trade line.'
+)
+# shellcheck disable=SC2034 # read by self_test through a nameref
+backtest_clean=(
+  'pub mod backtest;'
+  'const PIPELINE: &str = "pipeline research.backtest@1";'
+  '// The backtest (#30) adds its own pipeline.'
+  'use crate::research::{backtest_kind};'
+)
+self_test backtest backtest_scan backtest_probes backtest_clean
+
+# Self-test of the allow-list: every allowed path is dropped, and every
+# lookalike or neighbour is kept.
+backtest_allowed_paths=(
+  crates/mie-domain/src/backtest.rs
+  crates/mie-domain/src/backtest/simulator.rs
+  crates/mie-domain/src/backtest/simulator/tests.rs
+  crates/mie-domain/src/research/result.rs
+  crates/mie-ports/src/outbound.rs
+  crates/mie-ports/src/inbound.rs
+  crates/mie-app/src/backtest.rs
+  crates/mie-app/src/research.rs
+)
+backtest_kept_paths=(
+  crates/mie-domain/src/backtester.rs
+  crates/mie-domain/src/research.rs
+  crates/mie-domain/src/research/spec.rs
+  crates/mie-domain/src/lib.rs
+  crates/mie-app/src/backtest/extra.rs
+  crates/mie-app/src/backtester.rs
+  crates/mie-ports/src/lib.rs
+)
+for path in "${backtest_allowed_paths[@]}"; do
+  [[ -z "$(backtest_disallowed <<<"$path:1:use crate::backtest::Simulator;")" ]] \
+    || fail "backtest guard self-test: allowed path is flagged: $path"
+done
+for path in "${backtest_kept_paths[@]}"; do
+  [[ -n "$(backtest_disallowed <<<"$path:1:use crate::backtest::Simulator;")" ]] \
+    || fail "backtest guard self-test: path outside the allow-list is dropped: $path"
+done
+
+backtest_hits=$(backtest_scan crates/mie-domain/src crates/mie-ports/src crates/mie-app/src \
+  | backtest_disallowed)
+if [[ -n "$backtest_hits" ]]; then
+  fail "the backtest named outside its allow-list (ADR-060 D15):"
+  echo "$backtest_hits"
+fi
+
 if [[ $status -eq 0 ]]; then
-  echo "OK: $(wc -w <<<"$members") crates — crate graph, core purity (ADR-025) and label isolation (ADR-055) hold"
+  echo "OK: $(wc -w <<<"$members") crates — crate graph, core purity (ADR-025), label isolation (ADR-055) and backtest isolation (ADR-060) hold"
 fi
 exit $status
