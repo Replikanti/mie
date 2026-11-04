@@ -35,7 +35,7 @@
 //! is the only one of `mie-app` that may name them
 //! (`tools/check-architecture.sh`).
 
-use crate::drive_tolerant_observed;
+use crate::{check_trailing_trades_gap, drive_tolerant_observed};
 use mie_domain::conditional::label::{
     ForwardLabel, ForwardLabeler, LabelProvenance, LabelStats, Labeling,
 };
@@ -295,38 +295,7 @@ pub fn finish_labels(
     // moves the known time to its end.
     let mut known = labeler.trades_known_until();
     for gap in entries {
-        let broken = if gap.start > gap.end {
-            Some(
-                StateError::InvalidGap {
-                    start: gap.start,
-                    end: gap.end,
-                }
-                .to_string(),
-            )
-        } else {
-            known.and_then(|known| {
-                if gap.start > known {
-                    Some(format!(
-                        "it starts at {}, after the trades known up to {known}",
-                        gap.start
-                    ))
-                } else if gap.end < known {
-                    Some(format!(
-                        "it ends at {}, before the trades known up to {known}",
-                        gap.end
-                    ))
-                } else {
-                    None
-                }
-            })
-        };
-        if let Some(detail) = broken {
-            return Err(ProviderError::Contract(format!(
-                "trailing trades gap {} to {}: {detail}",
-                gap.start, gap.end
-            )));
-        }
-        known = Some(gap.end);
+        known = Some(check_trailing_trades_gap(gap, known)?);
     }
     for gap in &gaps {
         labeler.observe(gap, &mut on_label);

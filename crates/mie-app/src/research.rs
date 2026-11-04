@@ -12,8 +12,9 @@
 //! - [`REPLAY_SUMMARY_V2`] ([`ExperimentService::on_chain`]) runs on the
 //!   history chain (ADR-052 D10): it drives `[origin, sample start)` into
 //!   the engine without evaluating it, then the sample as `@1` does, both
-//!   through [`drive_chain`], and records the prefix's provenance and the
-//!   state hashes at the sample's start and end. The engine computes all of
+//!   through [`drive_chain`](crate::drive_chain), and records the prefix's
+//!   provenance and the state hashes at the sample's start and end. The
+//!   engine computes all of
 //!   [`catalog::CURRENT`], so those hashes depend on the build's feature
 //!   set and state-hash encoding: the result is keyed by that engine too
 //!   ([`EngineKey`]), and a build with another engine records its result
@@ -21,9 +22,18 @@
 //!   different result is a determinism failure or a definition change
 //!   without a version bump (ADR-029), and the run fails.
 //!
-//! The backtest (#30) adds its own pipeline and outcome kind.
+//! [`BacktestService`] runs [`BACKTEST_V1`] (ADR-060 D13): the spec's
+//! hypothesis simulated on the history chain. It checks the feature set,
+//! resolves the spec's rules under rule registry v1 and checks the funding
+//! coverage, all before anything is opened, then hands the resolved plan
+//! and the checked engine to a `BacktestEngine` (ADR-060 D14), which
+//! drives the chain as `@2` does, through the same driver, so the result's
+//! twelve provenance lines are `@2`'s. The result is keyed by the engine
+//! like `@2`'s and recorded under the same rules.
 
-use crate::{HashingProvider, drive_chain, drive_tolerant};
+use crate::{HashingProvider, drive_chain_with, drive_tolerant};
+use mie_domain::backtest::{FundingRule, resolve};
+use mie_domain::event::MarketEvent;
 use mie_domain::event_hash::EventStreamHasher;
 use mie_domain::feature::{FeatureKey, catalog};
 use mie_domain::research::{
@@ -35,8 +45,10 @@ use mie_domain::state_hash::STATE_HASH_ENCODING;
 use mie_domain::time::EventTime;
 use mie_ports::inbound::{ExperimentRun, ResearchError, RunResearchExperiment};
 use mie_ports::outbound::{
-    HistoricalDataProvider, Replay, ReplayWindow, ResearchResultStore, ResultStoreError,
+    BacktestEngine, BacktestRun, HistoricalDataProvider, MarketDataProvider, Replay, ReplayWindow,
+    ResearchResultStore, ResultStoreError,
 };
+use std::cell::Cell;
 
 /// `research.replay_summary@1`: the provenance-only pipeline (module docs).
 pub const REPLAY_SUMMARY_V1: PipelineKey = PipelineKey::new("research.replay_summary", 1);
@@ -44,6 +56,10 @@ pub const REPLAY_SUMMARY_V1: PipelineKey = PipelineKey::new("research.replay_sum
 /// `research.replay_summary@2`: the provenance pipeline on the history
 /// chain, with the prefix's provenance and the state hashes (module docs).
 pub const REPLAY_SUMMARY_V2: PipelineKey = PipelineKey::new("research.replay_summary", 2);
+
+/// `research.backtest@1`: the spec's hypothesis simulated on the history
+/// chain (ADR-060 D13, module docs).
+pub const BACKTEST_V1: PipelineKey = PipelineKey::new("research.backtest", 1);
 
 /// The history chain's bounds (ADR-052 D1, D2), as the composition root
 /// reads them from the configuration, so the core stays pure.
@@ -53,6 +69,17 @@ pub struct ChainBounds {
     pub origin: EventTime,
     /// The cutover between the archive and the live segment.
     pub cutover: EventTime,
+}
+
+/// Which samples the history chain delivers every funding settlement of,
+/// or the gap of a missing one (ADR-060 D7), as the composition root reads
+/// it from the configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FundingCoverage {
+    /// The latest sample end the chain covers: its cutover, since live
+    /// delivers no settlement event. `None`: the chain's archive does not
+    /// replay `fundingRate`, so it covers no sample.
+    pub until: Option<EventTime>,
 }
 
 /// [`RunResearchExperiment`] over a historical data source and a result
@@ -116,34 +143,24 @@ impl<H: HistoricalDataProvider, S: ResearchResultStore> RunResearchExperiment
     ///    refused first ([`ResearchError::SampleBeforeOrigin`]), and the
     ///    sample is opened and checked before the prefix is driven;
     /// 3. on the chain, the prefix `[origin, sample start)` drives the
-    ///    engine through [`drive_chain`] (none when the sample starts at the
-    ///    origin);
+    ///    engine through [`drive_chain`](crate::drive_chain) (none when the
+    ///    sample starts at the origin);
     /// 4. the sample is driven through the domain with the live rejection
-    ///    policy ([`drive_tolerant`]; on the chain [`drive_chain`], into the
-    ///    engine the prefix left) and must deliver at least one event;
+    ///    policy ([`drive_tolerant`]; on the chain
+    ///    [`drive_chain`](crate::drive_chain), into the engine the prefix
+    ///    left) and must deliver at least one event;
     /// 5. a result already stored under the key must be identical
     ///    ([`ExperimentRun::Reproduced`]); otherwise the run
     ///    [`Diverged`](ResearchError::Diverged) and nothing is written. A
     ///    new result is appended ([`ExperimentRun::Recorded`]). A `@2` key
     ///    includes the engine, so another build's result is another key.
     fn run(&mut self, spec: &ExperimentSpec) -> Result<ExperimentRun, ResearchError> {
-        let engine = engine_for(spec)?;
-        for member in spec.features().definitions() {
-            let computed = engine
-                .feature_set()
-                .definitions()
-                .any(|d| d.key == member.key && d.fingerprint() == member.fingerprint());
-            if !computed {
-                return Err(ResearchError::FeatureUnavailable {
-                    feature: member.key,
-                });
-            }
-        }
+        let engine = checked_engine(spec)?;
         let result = match self.chain {
             None => self.replay_summary(spec, engine)?,
             Some(bounds) => self.history_replay_summary(spec, engine, bounds)?,
         };
-        self.record(result)
+        record(&mut self.store, result)
     }
 }
 
@@ -190,106 +207,300 @@ impl<H: HistoricalDataProvider, S: ResearchResultStore> ExperimentService<H, S> 
     fn history_replay_summary(
         &self,
         spec: &ExperimentSpec,
-        mut engine: MarketStateEngine,
+        engine: MarketStateEngine,
         bounds: ChainBounds,
     ) -> Result<ExperimentResult, ResearchError> {
-        let sample = ReplayWindow {
-            start: spec.sample().start(),
-            end: spec.sample().end(),
-        };
-        if sample.start < bounds.origin {
-            return Err(ResearchError::SampleBeforeOrigin {
-                start: sample.start,
-                origin: bounds.origin,
-            });
-        }
-        // The sample is opened first, so a data mismatch costs no prefix
-        // drive. Opening selects files and computes the version; the
-        // stream reads them only when driven.
-        let Replay { stream, dataset } = self.history.replay(sample)?;
-        let opened = DataVersion::from(&dataset);
-        if &opened != spec.data_version() {
-            return Err(ResearchError::DataVersionMismatch {
-                declared: spec.data_version().clone(),
-                opened,
-            });
-        }
-
-        // The adapters refuse an empty window, so a sample at the origin
-        // opens no prefix.
-        let mut prefix_rejections = 0;
-        let (prefix_data, prefix_stream, prefix_restarts) = if sample.start > bounds.origin {
-            let prefix = ReplayWindow {
-                start: bounds.origin,
-                end: sample.start,
-            };
-            let Replay {
-                stream: prefix_stream,
-                dataset: prefix_dataset,
-            } = self.history.replay(prefix)?;
-            let mut prefix_stream = HashingProvider::new(prefix_stream);
-            let drive = drive_chain(&mut prefix_stream, &mut engine, |_| {
-                prefix_rejections += 1;
-            })?;
-            (
-                Some(DataVersion::from(&prefix_dataset)),
-                prefix_stream.hash(),
-                drive.restarts,
-            )
-        } else {
-            (None, EventStreamHasher::new().finish(), Vec::new())
-        };
-        let state_start = engine.state().state_hash();
-
-        let mut stream = HashingProvider::new(stream);
-        let mut rejections = 0;
-        let drive = drive_chain(&mut stream, &mut engine, |_| rejections += 1)?;
-        let hash = stream.hash();
-        if hash.events == 0 {
-            return Err(ResearchError::EmptySample);
-        }
-
+        let (summary, _) = drive_history(&self.history, spec, engine, bounds, |_| {})?;
         Ok(ExperimentResult {
             spec: spec.clone(),
             pipeline: REPLAY_SUMMARY_V2,
-            outcome: Outcome::HistoryReplaySummary(HistoryReplaySummary {
-                origin: bounds.origin,
-                effective_origin: drive.restarts.last().or(prefix_restarts.last()).copied(),
-                cutover: bounds.cutover,
-                prefix_data,
-                prefix_stream,
-                prefix_rejections,
-                engine: EngineKey {
-                    features: engine.feature_set().version(),
-                    state_encoding: STATE_HASH_ENCODING,
-                },
-                state_start,
-                stream: hash,
-                rejections,
-                state_end: engine.state().state_hash(),
-            }),
+            outcome: Outcome::HistoryReplaySummary(summary),
         })
     }
+}
 
-    /// Step 5 of [`RunResearchExperiment::run`]: compares `result` with the
-    /// one stored under its key, or appends it.
-    fn record(&mut self, result: ExperimentResult) -> Result<ExperimentRun, ResearchError> {
-        let key = result.key();
-        if let Some(stored) = self.store.get(&key)? {
-            return compare(stored, result);
+/// [`RunResearchExperiment`] for [`BACKTEST_V1`] over a [`BacktestEngine`]
+/// and a result store (ADR-060 D13, D14).
+#[derive(Debug)]
+pub struct BacktestService<B, S> {
+    engine: B,
+    store: S,
+    funding: FundingCoverage,
+}
+
+impl<B: BacktestEngine, S: ResearchResultStore> BacktestService<B, S> {
+    /// Creates the service over `engine`, which runs on a history chain
+    /// whose settlements `funding` covers. It is the only holder of the
+    /// writable store.
+    pub fn new(engine: B, store: S, funding: FundingCoverage) -> Self {
+        Self {
+            engine,
+            store,
+            funding,
         }
-        match self.store.append(&result) {
-            Ok(_) => Ok(ExperimentRun::Recorded(result)),
-            // Another writer stored the key between `get` and `append`.
-            Err(ResultStoreError::AlreadyStored {
-                identical: true, ..
-            }) => Ok(ExperimentRun::Reproduced(result)),
-            Err(ResultStoreError::AlreadyStored {
-                key,
-                identical: false,
-            }) => Err(ResearchError::Diverged { key }),
-            Err(error) => Err(error.into()),
+    }
+
+    /// The result store, read-only.
+    pub fn store(&self) -> &S {
+        &self.store
+    }
+
+    /// Unwraps the engine and the store.
+    pub fn into_parts(self) -> (B, S) {
+        (self.engine, self.store)
+    }
+}
+
+impl<B: BacktestEngine, S: ResearchResultStore> RunResearchExperiment for BacktestService<B, S> {
+    /// Runs [`BACKTEST_V1`] (ADR-060 D13). The first three checks are pure,
+    /// so a spec that fails one opens nothing:
+    ///
+    /// 1. the feature set, as [`ExperimentService`] checks it (ADR-040 D4);
+    /// 2. the rules resolve under rule registry v1 (ADR-060 D2), else
+    ///    [`ResearchError::Unresolved`] with every error;
+    /// 3. under `funding.recorded@1`, the chain delivers the sample's
+    ///    settlements: the sample ends at or before [`FundingCoverage`]'s
+    ///    bound, else [`ResearchError::FundingNotDelivered`] (D7);
+    /// 4. the engine refuses a sample before the origin, opens the sample,
+    ///    checks its data version (ADR-040 D5) and drives the prefix and
+    ///    the sample (ADR-052 D10);
+    /// 5. the result is keyed by the engine of its provenance and recorded
+    ///    as [`ExperimentService`] records: `Recorded`, `Reproduced` or
+    ///    `Diverged` (ADR-040 D7).
+    fn run(&mut self, spec: &ExperimentSpec) -> Result<ExperimentRun, ResearchError> {
+        let engine = checked_engine(spec)?;
+        let plan = resolve(spec).map_err(ResearchError::Unresolved)?;
+        if plan.costs().funding() == FundingRule::Recorded {
+            let sample_end = spec.sample().end();
+            if !self.funding.until.is_some_and(|until| sample_end <= until) {
+                return Err(ResearchError::FundingNotDelivered {
+                    sample_end,
+                    until: self.funding.until,
+                });
+            }
         }
+        let BacktestRun {
+            summary,
+            stats,
+            records,
+        } = self.engine.run(spec, &plan, engine)?;
+        let result = ExperimentResult {
+            spec: spec.clone(),
+            pipeline: BACKTEST_V1,
+            outcome: Outcome::Backtest {
+                summary,
+                stats,
+                records,
+            },
+        };
+        record(&mut self.store, result)
+    }
+}
+
+/// One step of [`drive_history`], in delivery order: a chain restart comes
+/// before the step of the event that caused it.
+pub(crate) enum ChainStep<'a> {
+    /// The engine was replaced by a fresh one after an uncrossable hole
+    /// (ADR-052 D4).
+    Restart,
+    /// The engine accepted `event`; `engine` is its state as of the event.
+    Accepted {
+        /// The event.
+        event: &'a MarketEvent,
+        /// The engine after the event.
+        engine: &'a MarketStateEngine,
+        /// Whether the event is in the sample, not the prefix.
+        sample: bool,
+    },
+    /// The engine rejected `event`, in the prefix or the sample alike: a
+    /// rejection censors what is open, and the prefix opens nothing.
+    Rejected {
+        /// The event.
+        event: &'a MarketEvent,
+    },
+}
+
+/// Drives `spec`'s sample on the history chain within `bounds` (ADR-052
+/// D10) and returns its provenance with the sample's stream, from which
+/// a caller reads the trailing gaps: a sample that starts before the
+/// origin is refused, the sample is opened and its data version checked,
+/// the prefix `[origin, sample start)` drives `engine` (none when the
+/// sample starts at the origin), then the sample, which must deliver an
+/// event. Both drives go through the chain driver, and `step` sees every
+/// delivered event and restart ([`ChainStep`]).
+///
+/// The one implementation of the chain provenance of `@2` and the
+/// backtest (ADR-052 D10, ADR-060 D13).
+pub(crate) fn drive_history<H: HistoricalDataProvider>(
+    history: &H,
+    spec: &ExperimentSpec,
+    mut engine: MarketStateEngine,
+    bounds: ChainBounds,
+    mut step: impl FnMut(ChainStep<'_>),
+) -> Result<(HistoryReplaySummary, H::Stream), ResearchError> {
+    let sample = ReplayWindow {
+        start: spec.sample().start(),
+        end: spec.sample().end(),
+    };
+    if sample.start < bounds.origin {
+        return Err(ResearchError::SampleBeforeOrigin {
+            start: sample.start,
+            origin: bounds.origin,
+        });
+    }
+    // The sample is opened first, so a data mismatch costs no prefix
+    // drive. Opening selects files and computes the version; the stream
+    // reads them only when driven.
+    let Replay { stream, dataset } = history.replay(sample)?;
+    let opened = DataVersion::from(&dataset);
+    if &opened != spec.data_version() {
+        return Err(ResearchError::DataVersionMismatch {
+            declared: spec.data_version().clone(),
+            opened,
+        });
+    }
+
+    // The adapters refuse an empty window, so a sample at the origin
+    // opens no prefix.
+    let (prefix_data, prefix_stream, prefix_rejections, prefix_restarts) = if sample.start
+        > bounds.origin
+    {
+        let prefix = ReplayWindow {
+            start: bounds.origin,
+            end: sample.start,
+        };
+        let Replay {
+            stream: prefix_stream,
+            dataset: prefix_dataset,
+        } = history.replay(prefix)?;
+        let mut prefix_stream = HashingProvider::new(prefix_stream);
+        let (drive, rejections) = drive_stepped(&mut prefix_stream, &mut engine, false, &mut step)?;
+        (
+            Some(DataVersion::from(&prefix_dataset)),
+            prefix_stream.hash(),
+            rejections,
+            drive,
+        )
+    } else {
+        (None, EventStreamHasher::new().finish(), 0, Vec::new())
+    };
+    let state_start = engine.state().state_hash();
+
+    let mut stream = HashingProvider::new(stream);
+    let (restarts, rejections) = drive_stepped(&mut stream, &mut engine, true, &mut step)?;
+    let hash = stream.hash();
+    if hash.events == 0 {
+        return Err(ResearchError::EmptySample);
+    }
+
+    let summary = HistoryReplaySummary {
+        origin: bounds.origin,
+        effective_origin: restarts.last().or(prefix_restarts.last()).copied(),
+        cutover: bounds.cutover,
+        prefix_data,
+        prefix_stream,
+        prefix_rejections,
+        engine: EngineKey {
+            features: engine.feature_set().version(),
+            state_encoding: STATE_HASH_ENCODING,
+        },
+        state_start,
+        stream: hash,
+        rejections,
+        state_end: engine.state().state_hash(),
+    };
+    Ok((summary, stream.into_inner()))
+}
+
+/// One chain drive of [`drive_history`]: every event of `provider` into
+/// `engine`, each delivered event and restart passed to `step` with
+/// `sample`. Returns the restarts' times and the number of rejections.
+///
+/// The flags follow `drive_chain_alerts`: the rejection and the restart
+/// callbacks only set them, and the observer, which runs after both for
+/// the same event, steps the restart first, then the event.
+fn drive_stepped<P>(
+    provider: &mut P,
+    engine: &mut MarketStateEngine,
+    sample: bool,
+    step: &mut impl FnMut(ChainStep<'_>),
+) -> Result<(Vec<EventTime>, u64), ResearchError>
+where
+    P: MarketDataProvider + ?Sized,
+{
+    let rejected = Cell::new(false);
+    let restarted = Cell::new(false);
+    let mut rejections = 0;
+    let drive = drive_chain_with(
+        provider,
+        engine,
+        |_| rejected.set(true),
+        |_| restarted.set(true),
+        |event, engine| {
+            if restarted.replace(false) {
+                step(ChainStep::Restart);
+            }
+            if rejected.replace(false) {
+                rejections += 1;
+                step(ChainStep::Rejected { event });
+            } else {
+                step(ChainStep::Accepted {
+                    event,
+                    engine,
+                    sample,
+                });
+            }
+        },
+    )?;
+    Ok((drive.restarts, rejections))
+}
+
+/// The engine for `spec`, checked against its feature set (ADR-040 D4,
+/// ADR-044 D10): [`engine_for`]'s, and every member of the spec's set must
+/// be computed by it at the same key and definition — a subset check, so
+/// new features in the default set never orphan an old spec.
+///
+/// # Errors
+///
+/// [`ResearchError::FeatureUnavailable`] naming the first member the engine
+/// does not compute.
+fn checked_engine(spec: &ExperimentSpec) -> Result<MarketStateEngine, ResearchError> {
+    let engine = engine_for(spec)?;
+    for member in spec.features().definitions() {
+        let computed = engine
+            .feature_set()
+            .definitions()
+            .any(|d| d.key == member.key && d.fingerprint() == member.fingerprint());
+        if !computed {
+            return Err(ResearchError::FeatureUnavailable {
+                feature: member.key,
+            });
+        }
+    }
+    Ok(engine)
+}
+
+/// Step 5 of [`RunResearchExperiment::run`] for both services: compares
+/// `result` with the one stored under its key, or appends it.
+fn record<S: ResearchResultStore>(
+    store: &mut S,
+    result: ExperimentResult,
+) -> Result<ExperimentRun, ResearchError> {
+    let key = result.key();
+    if let Some(stored) = store.get(&key)? {
+        return compare(stored, result);
+    }
+    match store.append(&result) {
+        Ok(_) => Ok(ExperimentRun::Recorded(result)),
+        // Another writer stored the key between `get` and `append`.
+        Err(ResultStoreError::AlreadyStored {
+            identical: true, ..
+        }) => Ok(ExperimentRun::Reproduced(result)),
+        Err(ResultStoreError::AlreadyStored {
+            key,
+            identical: false,
+        }) => Err(ResearchError::Diverged { key }),
+        Err(error) => Err(error.into()),
     }
 }
 

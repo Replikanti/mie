@@ -637,7 +637,13 @@ pub const ORIGIN: i64 = D0 - 3 * DAY_MS;
 /// before the cutover; R1 right after it, whose first trade is older than
 /// the archive's last one; R2 half an hour later.
 pub fn seam_fixture(dir: &Path) -> IngestConfig {
-    let archive = history_archive_config(dir, r#""aggTrades", "metrics""#);
+    seam_fixture_with(dir, r#""aggTrades", "metrics""#)
+}
+
+/// [`seam_fixture`] with the archive replaying `streams` (the TOML list's
+/// items), the same rows imported: a stream without rows is missing data.
+pub fn seam_fixture_with(dir: &Path, streams: &str) -> IngestConfig {
+    let archive = history_archive_config(dir, streams);
     let mut rows = Vec::new();
     let mut id = 1;
     for d in 0..3 {

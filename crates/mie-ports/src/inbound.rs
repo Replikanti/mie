@@ -1,12 +1,15 @@
 //! Driving (inbound) ports: the use cases the outside world invokes.
 //!
-//! Present: [`ReplayMarket`], [`RunResearchExperiment`] (ADR-040),
+//! Present: [`ReplayMarket`], [`RunResearchExperiment`] (ADR-040; the
+//! backtest's refusals [`ResearchError::Unresolved`] and
+//! [`ResearchError::FundingNotDelivered`], ADR-060 D13),
 //! [`GenerateMarketReport`] (ADR-059, proposed). Planned, each landing with
 //! its issue: `AnalyzeMarket`, `EvaluateStrategy`, `ValidateCandidate`.
 
 use crate::outbound::{ProviderError, ReplayWindow, ResultStoreError};
 use crate::raw::DatasetVersion;
 use mie_domain::alert::MarketReport;
+use mie_domain::backtest::ResolutionError;
 use mie_domain::event_hash::EventStreamHash;
 use mie_domain::feature::FeatureKey;
 use mie_domain::research::{DataVersion, ExperimentResult, ExperimentSpec, ResultKey};
@@ -152,6 +155,21 @@ pub enum ResearchError {
         /// The chain's origin.
         origin: EventTime,
     },
+    /// The spec's rule references do not resolve under rule registry v1
+    /// (ADR-060 D2): every error, in resolution order. Checked before
+    /// anything is opened.
+    Unresolved(Vec<ResolutionError>),
+    /// `funding.recorded@1` on a sample whose settlements the history chain
+    /// does not deliver (ADR-060 D7, D13): booking it would book zero
+    /// funding by omission. Checked before anything is opened.
+    FundingNotDelivered {
+        /// The sample's end.
+        sample_end: EventTime,
+        /// `Some`: the chain delivers settlements only up to this time, its
+        /// cutover, and the sample ends later. `None`: the chain's archive
+        /// does not replay `fundingRate`, so it delivers none.
+        until: Option<EventTime>,
+    },
     /// The run produced another result than the one stored under its key:
     /// the run is not reproducible, and the stored result stays.
     Diverged {
@@ -193,6 +211,30 @@ impl fmt::Display for ResearchError {
                 start.as_millis(),
                 origin.as_millis()
             ),
+            Self::Unresolved(errors) => {
+                f.write_str("the spec does not resolve under rule registry v1 (ADR-060 D2):")?;
+                for error in errors {
+                    write!(f, "\n{error}")?;
+                }
+                Ok(())
+            }
+            Self::FundingNotDelivered {
+                sample_end,
+                until: Some(cutover),
+            } => write!(
+                f,
+                "the sample ends at {} ms, after the history cutover {} ms: settlements are \
+                 delivered only up to the cutover, so funding.recorded@1 would book zero \
+                 funding by omission (ADR-060 D7); end the sample at or before the cutover, \
+                 or state funding.none@1",
+                sample_end.as_millis(),
+                cutover.as_millis()
+            ),
+            Self::FundingNotDelivered { until: None, .. } => f.write_str(
+                "the history chain's archive does not replay fundingRate, so no settlement is \
+                 delivered: funding.recorded@1 would book zero funding by omission (ADR-060 \
+                 D7); replay fundingRate in the archive segment, or state funding.none@1",
+            ),
             Self::Diverged { key } => write!(
                 f,
                 "result {key} diverged: the run differs from the stored result, which stays"
@@ -208,6 +250,64 @@ impl std::error::Error for ResearchError {
             Self::Provider(err) => Some(err),
             Self::Store(err) => Some(err),
             _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mie_domain::research::SpecField;
+
+    #[test]
+    fn the_backtest_refusals_describe_themselves() {
+        let errors = vec![
+            ResolutionError::UnknownRule {
+                field: SpecField::Location,
+                rule: "location.at_level@1".to_owned(),
+            },
+            ResolutionError::StateFilterRule {
+                field: SpecField::StateFilter,
+                rule: "state.trend@1".to_owned(),
+            },
+        ];
+        let text = ResearchError::Unresolved(errors.clone()).to_string();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines[0],
+            "the spec does not resolve under rule registry v1 (ADR-060 D2):"
+        );
+        assert_eq!(lines[1..], [errors[0].to_string(), errors[1].to_string()]);
+
+        assert_eq!(
+            ResearchError::FundingNotDelivered {
+                sample_end: EventTime::from_millis(2_000),
+                until: Some(EventTime::from_millis(1_000)),
+            }
+            .to_string(),
+            "the sample ends at 2000 ms, after the history cutover 1000 ms: settlements are \
+             delivered only up to the cutover, so funding.recorded@1 would book zero funding \
+             by omission (ADR-060 D7); end the sample at or before the cutover, or state \
+             funding.none@1"
+        );
+        assert_eq!(
+            ResearchError::FundingNotDelivered {
+                sample_end: EventTime::from_millis(2_000),
+                until: None,
+            }
+            .to_string(),
+            "the history chain's archive does not replay fundingRate, so no settlement is \
+             delivered: funding.recorded@1 would book zero funding by omission (ADR-060 D7); \
+             replay fundingRate in the archive segment, or state funding.none@1"
+        );
+        for error in [
+            ResearchError::Unresolved(errors),
+            ResearchError::FundingNotDelivered {
+                sample_end: EventTime::from_millis(2_000),
+                until: None,
+            },
+        ] {
+            assert!(std::error::Error::source(&error).is_none());
         }
     }
 }

@@ -3,13 +3,25 @@
 //!
 //! - [`validate`] parses a spec file (spec text v1, see
 //!   [`mie_domain::research`]) and prints its experiment id and canonical
-//!   text, or every error, one per line.
+//!   text, or every error, one per line. A spec that parses goes through a
+//!   second stage, resolution under the backtest's rule registry v1
+//!   (ADR-060 D2, D13): `backtest: resolves under rule registry v1`, or one
+//!   `backtest: <error>` line per resolution error. The second stage is
+//!   informational: the verdict, and the exit code, stay the parse's, since
+//!   a spec that parses is a valid input of the replay pipelines whether it
+//!   resolves or not.
 //! - [`run`] runs a spec through [`ExperimentService`] over a replay of the
 //!   raw store and records the result in the append-only [`FsResultStore`].
 //!   `live` and `archive` (as `mie replay`) run `research.replay_summary@1`;
 //!   `history` runs `research.replay_summary@2` on the history chain of an
 //!   ingest configuration with `[history]` (ADR-052 D10), whose origin and
-//!   cutover come from the built chain. It prints `recorded <key>` for a
+//!   cutover come from the built chain. With [`ExperimentPipeline::Backtest`]
+//!   it runs `research.backtest@1` on that chain instead, through
+//!   [`BacktestService`] and the chain's [`ChainBacktest`] (ADR-060 D13,
+//!   D14), and refuses any other source before the store is opened. The
+//!   chain covers the funding of a sample that ends at or before its
+//!   cutover, when its archive replays `fundingRate` (ADR-060 D7). It
+//!   prints `recorded <key>` for a
 //!   new result and `reproduced <key>` when the stored result was
 //!   reproduced exactly; anything else is `FAIL: <reason>`. The composition
 //!   root is the only place that hands the writable store to the pipeline
@@ -20,17 +32,28 @@
 
 use crate::journal::read_runs;
 use crate::replay::{ReplaySource, archive_replay, history_chain};
-use mie_adapter_binance::LiveReplay;
+use mie_adapter_binance::archive::ArchiveStream;
 use mie_adapter_binance::archive::fold::TradeCorrection;
+use mie_adapter_binance::{HistoryChainStream, LiveReplay};
 use mie_adapter_fs::FsResultStore;
 use mie_adapter_parquet::ParquetRawStore;
-use mie_app::{ChainBounds, ExperimentService};
+use mie_app::backtest::ChainBacktest;
+use mie_app::{BacktestService, ChainBounds, ExperimentService, FundingCoverage};
+use mie_domain::backtest::resolve;
 use mie_domain::feature::catalog;
 use mie_domain::research::{ExperimentSpec, SpecError};
 use mie_ports::inbound::{ExperimentRun, ResearchError, RunResearchExperiment};
-use mie_ports::outbound::HistoricalDataProvider;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+
+/// Which pipeline `mie experiment run` runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExperimentPipeline {
+    /// `research.replay_summary@1`, or `@2` on the history chain.
+    Summary,
+    /// `research.backtest@1`, on the history chain only (ADR-060 D13).
+    Backtest,
+}
 
 /// One `mie experiment run` invocation.
 #[derive(Debug, Clone)]
@@ -41,6 +64,8 @@ pub struct ExperimentRequest {
     pub source: ReplaySource,
     /// The result store's root directory.
     pub results: PathBuf,
+    /// The pipeline.
+    pub pipeline: ExperimentPipeline,
 }
 
 /// Validates the spec at `path` and writes the outcome to `out`. Returns
@@ -55,6 +80,14 @@ pub fn validate(path: &Path, out: &mut dyn Write) -> Result<bool, String> {
         Ok(spec) => {
             line(&mut report, &format!("experiment {}", spec.id()));
             report.extend_from_slice(spec.canonical_text().as_bytes());
+            match resolve(&spec) {
+                Ok(_) => line(&mut report, "backtest: resolves under rule registry v1"),
+                Err(errors) => {
+                    for error in errors {
+                        line(&mut report, &format!("backtest: {error}"));
+                    }
+                }
+            }
             true
         }
         Err(errors) => {
@@ -87,6 +120,15 @@ pub fn run(request: &ExperimentRequest, out: &mut dyn Write) -> Result<bool, Str
             return Ok(false);
         }
     };
+    let backtest = request.pipeline == ExperimentPipeline::Backtest;
+    if backtest && !matches!(request.source, ReplaySource::History(_)) {
+        line(
+            &mut report,
+            "FAIL: --pipeline backtest runs on --source history only (ADR-060 D13)",
+        );
+        emit(out, &report)?;
+        return Ok(false);
+    }
     let verdict = match FsResultStore::open(&request.results) {
         Ok(results) => match &request.source {
             ReplaySource::Live(config) => {
@@ -125,11 +167,27 @@ pub fn run(request: &ExperimentRequest, out: &mut dyn Write) -> Result<bool, Str
                         origin: chain.origin(),
                         cutover: chain.cutover(),
                     };
-                    execute(
-                        ExperimentService::on_chain(chain, results, bounds),
-                        &spec,
-                        false,
-                    )
+                    if !backtest {
+                        return execute(
+                            ExperimentService::on_chain(chain, results, bounds),
+                            &spec,
+                            false,
+                        );
+                    }
+                    // Settlements come from the archive segment only: live
+                    // delivers none (ADR-060 D7).
+                    let funding = FundingCoverage {
+                        until: chain
+                            .archive()
+                            .streams()
+                            .contains(&ArchiveStream::FundingRate)
+                            .then_some(chain.cutover()),
+                    };
+                    let engine =
+                        ChainBacktest::new(chain, bounds, |stream: &HistoryChainStream<'_>| {
+                            stream.trailing_gaps().to_vec()
+                        });
+                    execute(BacktestService::new(engine, results, funding), &spec, false)
                 })
             }
         },
@@ -147,8 +205,8 @@ pub fn run(request: &ExperimentRequest, out: &mut dyn Write) -> Result<bool, Str
 /// Runs `spec` through `service`: the line to print, or why it failed.
 /// `folding`: an archive replay that folds `aggTrades` (ADR-050), so a data
 /// version from before the fold may be the cause of a mismatch.
-fn execute<H: HistoricalDataProvider>(
-    mut service: ExperimentService<H, FsResultStore>,
+fn execute(
+    mut service: impl RunResearchExperiment,
     spec: &ExperimentSpec,
     folding: bool,
 ) -> Result<String, String> {

@@ -1,19 +1,24 @@
 //! Driven (outbound) ports.
 //!
 //! Present: live and historical market data, the research result store
-//! ([`ResearchResultReader`], [`ResearchResultStore`], ADR-040), and the
+//! ([`ResearchResultReader`], [`ResearchResultStore`], ADR-040), the
+//! [`BacktestEngine`] that simulates a resolved plan (ADR-060 D14), and the
 //! informational egress [`AlertGateway`] (ADR-059, proposed). Planned, each
 //! landing with the issue that first needs it: `FeatureStore`,
-//! `StrategyRepository`, `BacktestEngine`. There is deliberately no
-//! `ExecutionGateway`: the MVP is informational (ADR-010).
+//! `StrategyRepository`. There is deliberately no `ExecutionGateway`: the
+//! MVP is informational (ADR-010), and the backtest is a simulation.
 
+use crate::inbound::ResearchError;
 use crate::raw::DatasetVersion;
 use mie_domain::alert::Alert;
+use mie_domain::backtest::{Plan, SimulationStats, TradeRecord};
 use mie_domain::event::MarketEvent;
 use mie_domain::order::CanonicalKey;
 use mie_domain::research::{
-    ExperimentId, ExperimentResult, HypothesisId, ResultKey, ResultParseError,
+    ExperimentId, ExperimentResult, ExperimentSpec, HistoryReplaySummary, HypothesisId, ResultKey,
+    ResultParseError,
 };
+use mie_domain::state::MarketStateEngine;
 use mie_domain::time::EventTime;
 use std::fmt;
 
@@ -242,6 +247,57 @@ impl fmt::Display for ResultStoreError {
 }
 
 impl std::error::Error for ResultStoreError {}
+
+/// Simulates a resolved plan over a spec's sample (ADR-060 D14): the
+/// domain's run output before metrics, which the research pipeline renders,
+/// judges by the same metric code and stores. Every engine takes a resolved
+/// plan, so no engine reinterprets spec text.
+///
+/// Contract:
+/// - `plan` is [`resolve`](mie_domain::backtest::resolve)'s for `spec`, and
+///   `engine` is built and checked for the spec's feature set (ADR-040 D4)
+///   by the caller, which also checked the funding coverage (ADR-060 D7);
+/// - a sample that starts before the source's origin is refused, and the
+///   sample is opened and its data version checked against the spec's
+///   (ADR-040 D5) before anything is driven;
+/// - the prefix `[origin, sample start)` drives `engine` without being
+///   evaluated, then the sample does (ADR-052 D10); the simulator is fed
+///   per its driver contract (`Simulator`), and the run ends with the
+///   trailing gaps and `finish` (ADR-060 D9);
+/// - errors are only [`ResearchError::Provider`],
+///   [`ResearchError::DataVersionMismatch`],
+///   [`ResearchError::FeatureUnavailable`], [`ResearchError::EmptySample`]
+///   and [`ResearchError::SampleBeforeOrigin`]. Nothing is stored: the
+///   store is the pipeline's (ADR-020).
+///
+/// The output is a simulation only: no order, fill report or execution type
+/// crosses the port (ADR-010).
+pub trait BacktestEngine {
+    /// Runs `plan` over `spec`'s sample, driving `engine`.
+    ///
+    /// # Errors
+    ///
+    /// The [`ResearchError`] variants of the contract.
+    fn run(
+        &mut self,
+        spec: &ExperimentSpec,
+        plan: &Plan,
+        engine: MarketStateEngine,
+    ) -> Result<BacktestRun, ResearchError>;
+}
+
+/// What a [`BacktestEngine`] run produced (ADR-060 D12, D14): the lines of
+/// the `backtest` outcome before its metrics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BacktestRun {
+    /// The chain provenance, the lines of `research.replay_summary@2`
+    /// (ADR-052 D10); its engine is the result key's (ADR-060 D13).
+    pub summary: HistoryReplaySummary,
+    /// The counts (ADR-060 D4, D9).
+    pub stats: SimulationStats,
+    /// One record per taken decision, in decision order.
+    pub records: Vec<TradeRecord>,
+}
 
 /// The informational egress (brief §17, ADR-010, ADR-059 D3): delivers one
 /// rendered message per engine event that produced at least one alert.

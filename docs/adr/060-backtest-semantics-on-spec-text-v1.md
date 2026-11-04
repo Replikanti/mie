@@ -351,6 +351,15 @@ the reverse.
     chain's cutover, because live delivers no settlement event
     (`docs/data-availability.md`). This is checked before any drive
     (`FundingNotDelivered`, D13).
+  - It also requires the chain's archive segment to replay `fundingRate`.
+    *Why:* a chain configured without it (for example `aggTrades` +
+    `metrics`) delivers neither a settlement nor a gap, so the cutover
+    check alone would book zero funding by omission. A configured stream
+    with missing months still yields `MissingData` gaps
+    (`crates/mie-adapter-binance/src/archive/replay.rs`), which D9's
+    `funding_gap` covers. Weak spot: the configuration is trusted to say
+    what is replayed. Checked with the cutover, as the second cause of
+    `FundingNotDelivered`. (Refined by S5, #170.)
   - Under `funding.recorded@1`, a `FeedGap` on `Stream::Funding` that
     meets the booking span censors the trade (`funding_gap`; the span,
     c and the trailing funding gaps are in D9).
@@ -724,9 +733,15 @@ metrics <regime feature id@N> <LOW|MEDIUM|HIGH|EXTREME|-> <fields>
   validate` gains a second stage that prints resolution errors, without
   changing which texts parse.
 - **Run order:**
-  1. Before any drive, with nothing stored on failure: open the sample,
-     check `data` (ADR-040 D5) and the feature set (ADR-040 D4), resolve
-     the rules (D2), and check funding coverage (D7).
+  1. Before any drive, with nothing stored on failure, in this order: the
+     feature set (ADR-040 D4), resolution of the rules (D2), funding
+     coverage (D7), a sample before the origin (ADR-052 D10), then open
+     the sample and check `data` (ADR-040 D5). *Why:* the first three are
+     pure, so an unresolvable spec or a spec without funding coverage
+     opens no file at all, which is stronger than "before any drive"; and
+     D14's port takes a resolved plan, so the data check, which the engine
+     makes when it opens the sample, cannot come before resolution.
+     (Refined by S5, #170.)
   2. Then ADR-052 D10's order: the prefix drive (not evaluated), then the
      sample drive through `drive_chain_with`, so restarts reach the
      simulator; then the trailing trades gaps (and, under
@@ -734,7 +749,8 @@ metrics <regime feature id@N> <LOW|MEDIUM|HIGH|EXTREME|-> <fields>
   3. Compute the metrics and store the result as `Recorded`, `Reproduced`
      or `Diverged` (ADR-040 D7).
 - **New `ResearchError` variants:** `Unresolved` (every resolution error)
-  and `FundingNotDelivered` (the sample end and the cutover).
+  and `FundingNotDelivered` (the sample end and the cutover, or no cutover
+  when the archive does not replay `fundingRate`, D7).
 
 ### D14. `BacktestEngine` port
 
@@ -745,8 +761,12 @@ metrics <regime feature id@N> <LOW|MEDIUM|HIGH|EXTREME|-> <fields>
   variants of `ResearchError`.
 - `mie_app::backtest` implements it on the chain, driving the domain
   `Simulator` and rule evaluator through `drive_chain_with`.
-  `ExperimentService` holds it and keeps resolution, the funding check,
-  metrics, rendering and the store. `mie-cli` wires it.
+  `BacktestService`, next to `ExperimentService` and sharing its feature
+  check and store logic, holds it and keeps resolution, the funding check,
+  metrics, rendering and the store, and the port takes the
+  `MarketStateEngine` the service built and checked for the spec's feature
+  set, so that check runs once and in one place (refined by S5, #170).
+  `mie-cli` wires it.
 - *Why:* the Research Lab brief ("Concrete engines can be replaced
   without changing the research-domain rules"), and ADR-018 lists the
   port. Every engine is judged by the same metric code and store rules,
@@ -888,7 +908,12 @@ or a 0 or 1 that a rule defines.
     the `no_risk` skip of an unready ATR under
     `invalidation.beyond_extreme@1` and its order before `stop_side`
     (D5);
-  - S5: the D13 order and errors;
+  - S5: the D13 order and errors, the first three checks opening
+    nothing, and both causes of `FundingNotDelivered` (D7); the
+    provenance lines equal to `research.replay_summary@2`'s; restarts,
+    rejections, the unevaluated prefix and the trailing gaps reaching the
+    simulator; and an end-to-end golden whose every value is derived by
+    hand (refined by S5, #170);
   - #171: the check computes and asserts the overflow precondition
     (*Accept when* 4) before it compares anything.
 - **The weak spots of spec text v1** (D1): exactly-once slots, the closed

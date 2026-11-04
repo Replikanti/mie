@@ -26,6 +26,15 @@
 //! of the sample, `@2` on the history chain, with the prefix driven first
 //! (ADR-052 D10).
 //!
+//! [`BacktestService`] ([`research`]) runs `research.backtest@1` (ADR-060
+//! D13): it resolves the spec's rules, checks the funding coverage and
+//! records what a `BacktestEngine` simulated. The [`backtest`] module holds
+//! the engine on the history chain (ADR-060 D14), driven by the same chain
+//! drive as `@2`, with the provider's trailing gaps checked as the label
+//! driver checks them. Under the leakage guard (ADR-060 D15) no other file
+//! of this crate names that module's items; the composition root reaches
+//! them through the module path.
+//!
 //! [`conditional`] drives the context sampler of ADR-054 through
 //! [`drive_tolerant_observed`] for accepted events only, and opens a replay
 //! window with its provenance (#25). In replay only, it labels the
@@ -41,14 +50,18 @@
 //! and [`alert::ReportService`] reports the market at a window's end.
 
 pub mod alert;
+pub mod backtest;
 pub mod conditional;
 pub mod equivalence;
 pub mod kline_check;
 pub mod research;
 
-pub use research::{ChainBounds, ExperimentService, REPLAY_SUMMARY_V1, REPLAY_SUMMARY_V2};
+pub use research::{
+    BACKTEST_V1, BacktestService, ChainBounds, ExperimentService, FundingCoverage,
+    REPLAY_SUMMARY_V1, REPLAY_SUMMARY_V2,
+};
 
-use mie_domain::event::MarketEvent;
+use mie_domain::event::{FeedGap, MarketEvent};
 use mie_domain::event_hash::{EventStreamHash, EventStreamHasher};
 use mie_domain::state::{MarketStateEngine, StateError};
 use mie_domain::time::EventTime;
@@ -240,6 +253,60 @@ where
         observe(&event, engine);
     }
     Ok(drive)
+}
+
+/// Checks one trailing gap of the trades stream that a replay driver passes
+/// to its consumer after the stream ended, against `known`, the time up to
+/// which the trades are known (ADR-055 D6, ADR-060 D9), and returns the
+/// known time after it: the gap's end.
+///
+/// The entries skip the engine, so these checks stand in for its own. A
+/// gap must not start after its end (the engine's
+/// [`StateError::InvalidGap`]), must not start after `known`, which would
+/// treat the trades between `known` and its start as delivered, and must
+/// not end before `known`, which would sort it before a trades-stream event
+/// already observed. A start at or before `known` only censors more, the
+/// case of a gap opened at the last delivered trade.
+///
+/// # Errors
+///
+/// [`ProviderError::Contract`] naming the gap and the broken rule.
+pub(crate) fn check_trailing_trades_gap(
+    gap: &FeedGap,
+    known: Option<EventTime>,
+) -> Result<EventTime, ProviderError> {
+    let broken = if gap.start > gap.end {
+        Some(
+            StateError::InvalidGap {
+                start: gap.start,
+                end: gap.end,
+            }
+            .to_string(),
+        )
+    } else {
+        known.and_then(|known| {
+            if gap.start > known {
+                Some(format!(
+                    "it starts at {}, after the trades known up to {known}",
+                    gap.start
+                ))
+            } else if gap.end < known {
+                Some(format!(
+                    "it ends at {}, before the trades known up to {known}",
+                    gap.end
+                ))
+            } else {
+                None
+            }
+        })
+    };
+    match broken {
+        Some(detail) => Err(ProviderError::Contract(format!(
+            "trailing trades gap {} to {}: {detail}",
+            gap.start, gap.end
+        ))),
+        None => Ok(gap.end),
+    }
 }
 
 /// A [`MarketDataProvider`] that hashes and counts every event it passes
