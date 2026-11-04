@@ -780,6 +780,43 @@ fn a_rejected_funding_gap_censors_by_its_interval() {
 }
 
 #[test]
+fn a_rejected_inverted_funding_gap_censors_at_its_time() {
+    // Re-review of #176: a gap with start > end (`StateError::InvalidGap`)
+    // declares no interval. Read as one, c = max(5 000, 1 000) would land
+    // after the event and free the slot early, so B would open under a
+    // live A and A would end `end_of_data` (D8). As the point at its time,
+    // 1 100, it censors A there, as a rejected settlement would (D9).
+    let mut run = Run::new(plain());
+    run.on(trade(999, 0, "100"))
+        .decide(long("100", "98", "104"))
+        .on(trade(1_000, 1, "100"))
+        .reject(gap(Stream::Funding, 5_000, 1_100))
+        .on(trade(1_200, 3, "105"))
+        .on(trade(1_300, 4, "105"))
+        .decide(long("105", "103", "109"))
+        .on(trade(1_400, 5, "105"))
+        .on(trade(1_500, 6, "110"))
+        .on(trade(1_600, 7, "110"))
+        .on(trade(1_700, 8, "110"));
+    let (records, _) = run.finish();
+    let outline: Vec<_> = records
+        .iter()
+        .map(|record| (record.decision.time, record.exit, record.exit_at))
+        .collect();
+    assert_eq!(
+        outline,
+        [
+            (t(999), Exit::Censored(CensorReason::FundingGap), t(1_100)),
+            (t(1_300), Exit::Target, t(1_500)),
+        ]
+    );
+    assert!(
+        records[0].exit_at < records[1].decision.time,
+        "one position (D8)"
+    );
+}
+
+#[test]
 fn a_funding_gap_ending_in_the_entry_fill_millisecond_censors() {
     // Review of #176: the gap ranks before the trades of its end
     // millisecond (ADR-028), so it is seen before the entry fill trade at

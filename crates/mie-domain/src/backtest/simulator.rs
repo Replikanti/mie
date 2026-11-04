@@ -378,7 +378,7 @@ impl Simulator {
     pub fn observe(&mut self, event: &MarketEvent) {
         let key = event.canonical_key();
         match event {
-            MarketEvent::FeedGap(gap) if gap.stream == Stream::Funding => {
+            MarketEvent::FeedGap(gap) if gap.stream == Stream::Funding && gap.start <= gap.end => {
                 self.funding_gap(gap.start, gap.end);
             }
             MarketEvent::FeedGap(gap) if gap.stream == Stream::Trades => {
@@ -468,7 +468,9 @@ impl Simulator {
     /// `funding.recorded@1`, a funding-stream event censors as
     /// `funding_gap`: a refused settlement every trade whose booking span
     /// holds its time, at max(its time, the entry fill time), and a refused
-    /// funding gap by its declared interval, like an accepted one. Either
+    /// funding gap by its declared interval, like an accepted one. A gap
+    /// with `start > end` (`StateError::InvalidGap`) declares no interval,
+    /// so it censors as the point at its time, like a settlement. Either
     /// would otherwise book zero funding by omission (D7). Events of other
     /// streams are ignored.
     pub fn reject(&mut self, event: &MarketEvent) {
@@ -480,7 +482,7 @@ impl Simulator {
                 }
                 self.censor_live(start, CensorReason::Rejected);
             }
-            MarketEvent::FeedGap(gap) if gap.stream == Stream::Funding => {
+            MarketEvent::FeedGap(gap) if gap.stream == Stream::Funding && gap.start <= gap.end => {
                 self.funding_gap(gap.start, gap.end);
             }
             _ if event.stream() == Stream::Funding => {

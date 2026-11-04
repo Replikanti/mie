@@ -367,7 +367,10 @@ what the labels already measure (ADR-055).
     time (or the position has no exit fill). c = max(event time, entry
     fill time). A rejected funding `FeedGap` hits by its declared interval
     `[start, end]`, with the rule and the c of an accepted funding gap
-    above. Under `funding.none@1` both are ignored, like a funding gap. *Why:* the engine
+    above. A rejected funding `FeedGap` with `start > end` (the engine's
+    `InvalidGap`) declares no interval, so it hits as the point at the
+    event's time, its `end`, with a rejected settlement's rule and c.
+    Under `funding.none@1` all of these are ignored, like a funding gap. *Why:* the engine
     can refuse a `FundingSettlement` (`OutOfOrder`, `Duplicate` or
     `Overflow`, `StateError` in `crates/mie-domain/src/state.rs`), and
     skipping it would book zero funding by omission, which D7 forbids. Its
@@ -383,8 +386,16 @@ what the labels already measure (ADR-055).
     it. The event's time is the gap's end, so checking only that point
     would let a refused gap covering the whole span book zero funding,
     the omission D7 forbids, while an accepted copy censors. *Rejected:*
-    the point at the gap's end, for that reason. (Refined by S2, #167,
-    STOP 1 decision 1; the gap case by the review of the simulator PR.)
+    the point at the gap's end, for that reason. *Why the point for an
+    inverted gap:* its bounds name no instants, and read as an interval
+    they would put c = max(start, entry fill time) after the event, so
+    the slot would be freed before c, a later decision would open beside
+    a live trade (D8), and that trade's censor would not be final in time
+    and give way to `end_of_data`. The event's time is the one instant the
+    feed gave, so censoring there keeps D7's no-omission rule. *Rejected:*
+    ignoring it, which is zero by omission. (Refined by S2, #167, STOP 1
+    decision 1; the gap cases by the review and the re-review of the
+    simulator PR.)
   - an overflow (`overflow`, D10): the time of the event whose value
     overflowed, that is the entry fill trade (E′, the entry fee,
     displacement), a monitored trade (MFE, MAE), a settlement (funding)
