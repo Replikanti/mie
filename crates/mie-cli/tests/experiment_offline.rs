@@ -942,3 +942,25 @@ fn trades_days_missing_before_the_cutover_end_the_open_position_as_a_gap() {
         "{trade}"
     );
 }
+
+#[test]
+fn with_a_live_segment_the_archive_trades_tail_is_not_added_again() {
+    // The seam fixture without archive trades on its last day: the archive
+    // segment reports that trades gap in its own trailing gaps, and the
+    // first chain run's seed gap delivers the same hole in the window. A
+    // second copy as a trailing gap would end at the cutover, before the
+    // live trades already known, and break the provider contract
+    // (`check_trailing_trades_gap`), so the run would fail.
+    let dir = TempDir::new("experiment-backtest-live-tail");
+    let config = common::seam_fixture_days(dir.path(), r#""aggTrades", "metrics""#, 2);
+    let sample = window(ORIGIN + DAY_MS, CUTOVER + DAY_MS);
+    let replayed = history_replay(&config, sample);
+    let text = backtest_spec_text(sample, replayed.dataset.unwrap().as_str(), "funding.none@1");
+    let request = backtest_request(dir.path(), &config, &text);
+    let (pass, out) = run(&request);
+    assert!(pass, "{out}");
+    assert!(out.starts_with("recorded "), "{out}");
+    let stored = files(&request.results);
+    let stored_text = String::from_utf8(stored[0].1.clone()).unwrap();
+    assert_eq!(stored_line(&stored_text, "rejections"), "0");
+}

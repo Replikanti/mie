@@ -643,10 +643,17 @@ pub fn seam_fixture(dir: &Path) -> IngestConfig {
 /// [`seam_fixture`] with the archive replaying `streams` (the TOML list's
 /// items), the same rows imported: a stream without rows is missing data.
 pub fn seam_fixture_with(dir: &Path, streams: &str) -> IngestConfig {
+    seam_fixture_days(dir, streams, 3)
+}
+
+/// [`seam_fixture_with`] with archive trades on the first `trade_days` of
+/// its three days only: the days after are missing at the archive's tail,
+/// up to the cutover.
+pub fn seam_fixture_days(dir: &Path, streams: &str, trade_days: i64) -> IngestConfig {
     let archive = history_archive_config(dir, streams);
     let mut rows = Vec::new();
     let mut id = 1;
-    for d in 0..3 {
+    for d in 0..trade_days {
         let last = (d == 2).then_some(CUTOVER - 200);
         archive_trades(&mut rows, ORIGIN / DAY_MS + d, &mut id, last);
     }

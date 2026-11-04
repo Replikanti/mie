@@ -371,9 +371,10 @@ the reverse.
     covers both cases. The trades stream has the same tail when no live
     segment is read (no chain run, or a sample that ends before the live
     segment): the backtest then adds the archive segment's trailing
-    trades gaps too, so an open position is censored `gap` and the
-    reference turns stale (D4, D9). With a live segment the first run's
-    seed gap already covers the hole, and adding them would count it
+    trades gaps too, so an open position is censored `gap` at the gap's
+    start instead of `end_of_data` (D9); they are observed after the
+    sample's drive, so no decision changes. With a live segment the first
+    run's seed gap already covers the hole, and adding them would count it
     twice. (Refined by S5's review, #170.)
   - Under `funding.recorded@1`, a `FeedGap` on `Stream::Funding` that
     meets the booking span censors the trade (`funding_gap`; the span,
