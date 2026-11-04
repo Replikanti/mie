@@ -86,7 +86,7 @@ fi
 # Two scans: every line for `label::` and `ForwardLabel` (comments count
 # too: the guard is about naming, not only about code), and every `use`
 # item, joined onto one line, for a `label` path segment.
-label_lines='label::|ForwardLabel'
+label_lines='label[[:space:]]*::|ForwardLabel'
 label_use='(^|[^[:alnum:]_])label($|[^[:alnum:]_])'
 
 # Every item of the given files that starts on a line matching the ERE
@@ -177,6 +177,7 @@ probes=(
   'use self::label as x;'
   $'pub(crate) use super::{\n    label as x, // the labeler\n};'
   'fn f(race: outcome::Race) -> bool { matches!(race, label::Race::Neither) }'
+  'fn f(m: u64) -> bool { matches!(Some(m), Some(m) if m >= crate::conditional::label ::SCALE_MULTIPLE_E5) }'
 )
 # shellcheck disable=SC2034 # read by self_test through a nameref
 clean=(
@@ -199,8 +200,11 @@ self_test label label_scan probes clean
 # which build no path from their arguments. A module is then named only by
 # a literal token, which the isolation scans see. The scan flags the
 # identifier on any line, comments included like the other scans, so
-# spacing (`macro_rules !`) and a raw identifier do not hide it.
-macro_lines='(^|[^[:alnum:]_])macro_rules($|[^[:alnum:]_])'
+# spacing (`macro_rules !`) and a raw identifier do not hide it. File
+# inclusion is banned with it for the same reason (PR #176 third review):
+# `include!` and a `#[path = ...]` module splice in a file the scans,
+# which read the `.rs` files under `src`, never see.
+macro_lines='(^|[^[:alnum:]_])macro_rules($|[^[:alnum:]_])|(^|[^[:alnum:]_])include[[:space:]]*!|#[[:space:]]*!?\[[[:space:]]*path[[:space:]]*='
 
 # The macro definitions in the given directories or files.
 macro_scan() {
@@ -213,12 +217,15 @@ macro_probes=(
   $'macro_rules! review_path {\n    ($($seg:ident),*) => { $($seg)::* };\n}'
   'macro_rules ! m { () => {}; }'
   $'#[macro_export]\nmacro_rules! m { ($p:path) => { use $p as outcome; }; }'
+  'include!("regime/review_window.in");'
+  $'#[path = "../tests/support/x.rs"]\nmod x;'
 )
 # shellcheck disable=SC2034 # read by self_test through a nameref
 macro_clean=(
   'fn macro_rules_seen() -> bool { matches!(KIND, Kind::Macro) }'
   'let rules = macro_count; // a macro argument'
   'assert_eq!(rules, 0);'
+  'let include_str_seen = included; // include it'
 )
 self_test macro macro_scan macro_probes macro_clean
 
@@ -245,17 +252,17 @@ fi
 # any code line, with comments, string and char literals dropped and the
 # `mod backtest;` declaration exempt. It came for macro arguments
 # (`m!(backtest)`, PR #176 review), which the macro ban above now rules
-# out, and stays as the backstop for a path the other two scans miss:
-# `crate::backtest ::X`, a space before `::`, which rustfmt removes except
-# in a macro call it cannot parse. Its literal stripping is line-based
-# and knows no raw strings: `r"\"` reads as an escaped quote, and a
-# string that spans lines pairs its quotes wrong, so a token later on such
-# a line can be hidden from this scan (PR #176 re-review). The other two
-# scans strip no literals and do not share that limit, so the gap left is
-# a spaced path in such a macro call on such a line. The allow-list names
+# out, and stays as a backstop. A space before `::` (`crate::backtest
+# ::X`), which rustfmt removes except in a macro call it cannot parse, is
+# matched by the line scan itself, for labels too (PR #176 third review).
+# The identifier scan's literal stripping is line-based and knows no raw
+# strings: `r"\"` reads as an escaped quote, and a string that spans lines
+# pairs its quotes wrong, so a token later on such a line can be hidden
+# from it (PR #176 re-review). The other two scans strip no literals and
+# do not share that limit. The allow-list names
 # exact files, so a neighbour (`backtester.rs`, `research.rs` in the
 # domain) stays scanned.
-backtest_lines='backtest::'
+backtest_lines='backtest[[:space:]]*::'
 backtest_use='(^|[^[:alnum:]_])backtest($|[^[:alnum:]_])'
 backtest_allow='^crates/mie-domain/src/backtest\.rs:|^crates/mie-domain/src/backtest/|^crates/mie-domain/src/research/result\.rs:|^crates/mie-ports/src/(outbound|inbound)\.rs:|^crates/mie-app/src/(backtest|research)\.rs:'
 
@@ -304,6 +311,7 @@ backtest_probes=(
   $'pub(crate) use super::{\n    backtest as x, // the simulator\n};'
   'fn f(record: bt::TradeRecord) -> bool { matches!(record.exit, backtest::Exit::Stop) }'
   'pub use backtest::Simulator;'
+  'fn f() -> bool { matches!(X, x if x == crate::backtest ::Exit::Stop) }'
   '/// Renders a crate::backtest::TradeRecord as a trade line.'
   'fn f(_: Option<m!(backtest)>) {}'
   $'fn f() -> Option<\n    m![crate::backtest]\n> { None }'

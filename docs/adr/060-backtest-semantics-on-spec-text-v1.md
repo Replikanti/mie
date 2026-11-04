@@ -709,15 +709,20 @@ metrics <regime feature id@N> <LOW|MEDIUM|HIGH|EXTREME|-> <fields>
     dependencies in the core, the only macros are the standard library's,
     which build no path from their arguments, so a module is named only
     by a literal token, which the scans see. The core defines no macro,
-    so the ban breaks nothing. *Rejected:* banning the splice shapes
+    so the ban breaks nothing. `include!` and a `#[path = ...]` module
+    attribute are banned with it: both splice in a file the scans, which
+    read the `.rs` files under `src`, never see (third review of the
+    simulator PR). The core uses neither. *Rejected:* banning the splice shapes
     (`$x::`, `::$x`, `$` in a `use` item), the first fix, which the
     repetition splice passed (re-review of the simulator PR): every new
     shape needs a new pattern;
   - the bare identifier `backtest` on any code line, comments and string
     literals dropped, except the `mod backtest;` declaration. *Why:* it
     came for macro arguments, which the ban above now rules out, and stays
-    as a backstop for a path written with a space before `::`, which
-    rustfmt leaves only inside a macro call it cannot parse. Unlike
+    as a backstop. A path written with a space before `::`, which rustfmt
+    leaves only inside a macro call it cannot parse, is matched by the
+    line scan itself (`backtest[[:space:]]*::`, and the same for
+    `label`). Unlike
     `label`, the word does not occur elsewhere in the core, so the scan
     costs no false positives today. Weak spot: its literal stripping is
     line-based and knows no raw strings, so a raw string ending in a
