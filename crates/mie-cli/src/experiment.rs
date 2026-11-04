@@ -22,7 +22,8 @@
 //!   chain covers the funding of a sample that ends at or before its
 //!   cutover, when its archive replays `fundingRate` (ADR-060 D7), and the
 //!   backtest's trailing gaps add the archive segment's trailing funding
-//!   gaps, which the chain does not carry over the seam. It
+//!   gaps, and its trades gaps when no live segment is read, which the
+//!   chain does not carry over the seam. It
 //!   prints `recorded <key>` for a
 //!   new result and `reproduced <key>` when the stored result was
 //!   reproduced exactly; anything else is `FAIL: <reason>`. The composition
@@ -224,18 +225,23 @@ fn execute(
 }
 
 /// The trailing gaps of a backtest's chain stream once it has ended: the
-/// chain's own ([`HistoryChainStream::trailing_gaps`]), plus the archive
-/// segment's trailing funding gaps that start before the window's end.
+/// chain's own ([`HistoryChainStream::trailing_gaps`]), plus those of the
+/// archive segment's own trailing gaps that start before the window's end
+/// and that no chain run carries over the seam: its funding gaps always,
+/// and its trades gaps when no live segment was read.
 ///
-/// *Why:* funding days missing at the archive's tail, with no later
-/// settlement before the cutover, are reported only in the archive
-/// segment's own trailing gaps, and the chain carries a series over the
-/// seam only into a live stream, which funding has none of. Without them
-/// `funding.recorded@1` would book zero funding by omission over those
-/// days (ADR-060 D7, D9). The chain's list never holds them, so nothing is
-/// listed twice.
+/// *Why:* days missing at the archive's tail, with no later event of the
+/// series before the cutover, are reported only in the archive segment's
+/// own trailing gaps. A read live segment carries a series over the seam
+/// with the first chain run's seed gap, which then covers the hole, so
+/// adding the archive's trades gap there would count it twice; funding has
+/// no live stream to carry it, and without a live segment nothing carries
+/// either. Dropped, they would book zero funding by omission and end an
+/// open position as `end_of_data` instead of `gap` (ADR-060 D7, D9). The
+/// chain's list never holds them, so nothing is listed twice.
 fn backtest_trailing_gaps(stream: &HistoryChainStream<'_>) -> Vec<FeedGap> {
     let end = stream.window().end;
+    let carried_over = stream.live().is_some();
     let mut gaps = stream.trailing_gaps().to_vec();
     gaps.extend(
         stream
@@ -243,7 +249,12 @@ fn backtest_trailing_gaps(stream: &HistoryChainStream<'_>) -> Vec<FeedGap> {
             .stream()
             .trailing_gaps()
             .iter()
-            .filter(|gap| gap.stream == Stream::Funding && gap.start < end),
+            .filter(|gap| gap.start < end)
+            .filter(|gap| match gap.stream {
+                Stream::Funding => true,
+                Stream::Trades => !carried_over,
+                _ => false,
+            }),
     );
     gaps
 }

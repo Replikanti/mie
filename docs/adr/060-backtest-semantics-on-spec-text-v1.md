@@ -368,7 +368,13 @@ the reverse.
     none, so the chain's trailing gaps never hold it. The backtest's
     trailing gaps therefore add the archive segment's trailing funding
     gaps that start before the window's end, and D9's `funding_gap`
-    covers both cases. (Refined by S5's review, #170.)
+    covers both cases. The trades stream has the same tail when no live
+    segment is read (no chain run, or a sample that ends before the live
+    segment): the backtest then adds the archive segment's trailing
+    trades gaps too, so an open position is censored `gap` and the
+    reference turns stale (D4, D9). With a live segment the first run's
+    seed gap already covers the hole, and adding them would count it
+    twice. (Refined by S5's review, #170.)
   - Under `funding.recorded@1`, a `FeedGap` on `Stream::Funding` that
     meets the booking span censors the trade (`funding_gap`; the span,
     c and the trailing funding gaps are in D9).
@@ -837,6 +843,12 @@ metrics <regime feature id@N> <LOW|MEDIUM|HIGH|EXTREME|-> <fields>
     re-export lets every importer reach the item without a `backtest`
     token. *Rejected:* scanning for the re-exported names, which needs
     the guard to resolve Rust paths.
+- *Known gap (S5's review, #170; open since S3, #168):* the guard sees
+  tokens, not data. `ExperimentResult::canonical_text()` of a stored or
+  returned backtest result renders every `trade` line, so a file outside
+  the allow-list can read the records as text without naming any guarded
+  identifier. No token pattern closes that path. It is kept closed by
+  review, not by the script.
 - Exceptions:
   - `crates/mie-domain/src/backtest.rs` and `crates/mie-domain/src/backtest/`;
   - `crates/mie-domain/src/research/result.rs` (the outcome kind);

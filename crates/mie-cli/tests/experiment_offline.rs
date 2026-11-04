@@ -805,13 +805,15 @@ fn validate_resolves_a_backtest_spec_and_keeps_the_parse_verdict() {
 /// A chain of two archive days from `ORIGIN`, cut over at `ORIGIN` + 2 d,
 /// with no chain run: `aggTrades` on both days and `fundingRate` on the
 /// first only, so its missing second day has no later settlement before
-/// the cutover. The trades are the SFP tape of the app's backtest test
+/// the cutover. With `open_tail`, the tape stops two trades after the entry
+/// fill, so the position is still open, and the second day has no
+/// `aggTrades` either. The trades are the SFP tape of the app's backtest test
 /// (`crates/mie-app/tests/backtest.rs`): 16 prefix hours that make ATR(1h)
 /// 50, the 15m SFP pattern whose decision at `ORIGIN` + 19 h + 1 s opens a
 /// long with a stop at 59 921 and a target at 60 107, its entry fill at
 /// 60 016, the touch at 60 107 and the exit fill at 60 110, then one trade
 /// an hour at 60 050 through the second day.
-fn funding_tail_fixture(dir: &Path) -> IngestConfig {
+fn tail_fixture(dir: &Path, open_tail: bool) -> IngestConfig {
     let archive = common::history_archive_config(dir, r#""aggTrades", "fundingRate""#);
     let a = ORIGIN;
     let mut prices: Vec<(i64, i64)> = Vec::new();
@@ -844,10 +846,11 @@ fn funding_tail_fixture(dir: &Path) -> IngestConfig {
         (decision + 1_000, 60_016),
         (decision + 1_500, 60_020),
         (decision + 2_000, 59_990),
-        (decision + 3_000, 60_107),
-        (decision + 4_000, 60_110),
     ]);
-    prices.extend((21..48).map(|hour| (a + hour * HOUR + 7, 60_050)));
+    if !open_tail {
+        prices.extend([(decision + 3_000, 60_107), (decision + 4_000, 60_110)]);
+        prices.extend((21..48).map(|hour| (a + hour * HOUR + 7, 60_050)));
+    }
     let mut rows: Vec<(ArchiveStream, String)> = (1..)
         .zip(&prices)
         .map(|(id, (time, whole))| {
@@ -872,7 +875,7 @@ fn funding_tail_fixture(dir: &Path) -> IngestConfig {
 #[test]
 fn a_funding_day_missing_before_the_cutover_censors_instead_of_booking_zero() {
     let dir = TempDir::new("experiment-backtest-funding-tail");
-    let config = funding_tail_fixture(dir.path());
+    let config = tail_fixture(dir.path(), false);
     let cutover = ORIGIN + 2 * DAY_MS;
     let sample = window(ORIGIN + 16 * HOUR, cutover);
     let data = history_replay(&config, sample).dataset.unwrap();
@@ -909,5 +912,33 @@ fn a_funding_day_missing_before_the_cutover_censors_instead_of_booking_zero() {
     assert!(
         recorded.contains(&format!(" exit_at={} ", ORIGIN + 19 * HOUR + 2_000)),
         "{recorded}"
+    );
+}
+
+#[test]
+fn trades_days_missing_before_the_cutover_end_the_open_position_as_a_gap() {
+    // No chain run, so no live segment carries the archive's missing last
+    // day over the seam: only the archive segment reports that trades gap.
+    let dir = TempDir::new("experiment-backtest-trades-tail");
+    let config = tail_fixture(dir.path(), true);
+    let sample = window(ORIGIN + 16 * HOUR, ORIGIN + 2 * DAY_MS);
+    let data = history_replay(&config, sample).dataset.unwrap();
+    let text = backtest_spec_text(sample, data.as_str(), "funding.none@1");
+    let request = backtest_request(dir.path(), &config, &text);
+    let (pass, out) = run(&request);
+    assert!(pass, "{out}");
+    let stored = files(&request.results);
+    let text = String::from_utf8(stored[0].1.clone()).unwrap();
+    let trade = text
+        .lines()
+        .find(|line| line.starts_with("trade "))
+        .unwrap_or_else(|| panic!("no trade line in\n{text}"));
+    // Censored by the gap at its start, the last trade, not by the end of
+    // the data.
+    let last = ORIGIN + 19 * HOUR + 3_000;
+    assert!(
+        trade.contains(&format!(" exit=censored exit_at={last} "))
+            && trade.ends_with(" censor=gap"),
+        "{trade}"
     );
 }
