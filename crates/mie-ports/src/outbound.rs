@@ -11,7 +11,9 @@ use crate::raw::DatasetVersion;
 use mie_domain::alert::Alert;
 use mie_domain::event::MarketEvent;
 use mie_domain::order::CanonicalKey;
-use mie_domain::research::{ExperimentId, ExperimentResult, HypothesisId, ResultKey};
+use mie_domain::research::{
+    ExperimentId, ExperimentResult, HypothesisId, ResultKey, ResultParseError,
+};
 use mie_domain::time::EventTime;
 use std::fmt;
 
@@ -152,8 +154,11 @@ pub trait ResearchResultReader {
 /// append under a stored key fails with [`ResultStoreError::AlreadyStored`]
 /// and leaves the stored result untouched; so does an append whose spec
 /// differs from a stored spec with the same experiment id
-/// ([`ResultStoreError::Collision`]). `Ok` means the result is stored and
-/// durable: it survives a crash or power loss.
+/// ([`ResultStoreError::Collision`]). A result that fails
+/// [`ExperimentResult::validate`] is refused before anything is written
+/// ([`ResultStoreError::Invalid`]): its text would never read back, and
+/// every later read of its experiment would fail. `Ok` means the result is
+/// stored and durable: it survives a crash or power loss.
 pub trait ResearchResultStore: ResearchResultReader {
     /// Stores `result` under [`ExperimentResult::key`] and returns the key.
     ///
@@ -196,6 +201,10 @@ pub enum ResultStoreError {
         /// What failed.
         detail: String,
     },
+    /// The offered result fails [`ExperimentResult::validate`]: no
+    /// pipeline produces it, and its text would not parse back. Nothing is
+    /// written.
+    Invalid(ResultParseError),
     /// The store cannot be read or written.
     Io(String),
 }
@@ -226,6 +235,7 @@ impl fmt::Display for ResultStoreError {
                 f,
                 "result {key} is stored, but it may not survive a crash: {detail}"
             ),
+            Self::Invalid(error) => write!(f, "result refused before storing: {error}"),
             Self::Io(detail) => write!(f, "result store I/O failed: {detail}"),
         }
     }

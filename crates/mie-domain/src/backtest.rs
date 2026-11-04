@@ -4,8 +4,11 @@
 //! records: entry at the first trade after the decision and its latency,
 //! fixed slippage and the taker fee on both legs, recorded funding, stop,
 //! target and time exits, and censoring by ADR-055 D6's rules applied to the
-//! position (ADR-060 D4–D10). Metrics, the outcome text, rule resolution and
-//! the pipeline are separate steps (#168–#170).
+//! position (ADR-060 D4–D10). [`metrics`] computes ADR-060 D11's metrics
+//! and the regime split from the records, and the `text` submodule renders
+//! and parses the lines of the `backtest` outcome kind (D12) that
+//! `research::result` embeds (#168). Rule resolution and the pipeline are
+//! separate steps (#169, #170).
 //!
 //! - *Simulation only.* The MVP has no execution path (ADR-010): nothing
 //!   here is an order or a fill report, only the prices a resting order
@@ -24,9 +27,13 @@
 
 #![deny(clippy::float_arithmetic)]
 
+pub mod metrics;
 pub mod simulator;
+pub(crate) mod text;
 
+pub use metrics::{BacktestMetrics, Metrics, REGIME_BUCKETS};
 pub use simulator::Simulator;
+pub use text::{event_kind_from_name, event_kind_name};
 
 use crate::num::{Price, Rate, SCALE};
 use crate::order::CanonicalKey;
@@ -333,6 +340,20 @@ pub enum Exit {
     Unfilled,
     /// The outcome is unknown from the censor time on (D9).
     Censored(CensorReason),
+}
+
+impl Exit {
+    /// The `exit=` value of the trade line (ADR-060 D12). A censored exit
+    /// carries its reason on the `censor=` field.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Target => "target",
+            Self::Stop => "stop",
+            Self::Time => "time",
+            Self::Unfilled => "unfilled",
+            Self::Censored(_) => "censored",
+        }
+    }
 }
 
 /// A fill **trade**: the time and price of the recorded trade a leg fills

@@ -2,13 +2,16 @@
 //! read-only files, no overwrite, concurrent writers, verified reads.
 
 use mie_adapter_fs::FsResultStore;
+use mie_domain::backtest::{Exit, Fill, PositionSide, SimulationStats, SkipCounts, TradeRecord};
 use mie_domain::event_hash::EventStreamHash;
 use mie_domain::feature::FeatureSetVersion;
 use mie_domain::feature::{FeatureSet, catalog};
 use mie_domain::fingerprint::Fingerprint;
+use mie_domain::num::{Price, Rate};
+use mie_domain::order::{CanonicalKey, EventKind};
 use mie_domain::research::{
     DataVersion, EngineKey, ExperimentResult, ExperimentSpec, HistoryReplaySummary, HypothesisId,
-    Outcome, PipelineKey, ResultKey,
+    Outcome, PipelineKey, ResultKey, ResultParseError,
 };
 use mie_domain::state_hash::StateHash;
 use mie_domain::time::EventTime;
@@ -350,14 +353,14 @@ fn another_pipeline_stores_alongside() {
     let first = store.append(&result(4)).unwrap();
     let next = result_of(
         spec("vah.failed_auction.short", 250),
-        PipelineKey::new("research.backtest", 1),
+        PipelineKey::new("research.example", 1),
         4,
     );
     let second = store.append(&next).unwrap();
     assert_eq!(first.experiment, second.experiment);
     assert_ne!(first, second);
     assert_eq!(store.get(&second), Ok(Some(next)));
-    // Sorted: `research.backtest@1` before `research.replay_summary@1`.
+    // Sorted: `research.example@1` before `research.replay_summary@1`.
     assert_eq!(
         store
             .by_hypothesis(&HypothesisId::new("vah.failed_auction.short").unwrap())
@@ -472,4 +475,116 @@ fn listing_by_hypothesis_is_sorted_and_filtered() {
 fn replace(path: &Path, bytes: &[u8]) {
     fs::remove_file(path).unwrap();
     fs::write(path, bytes).unwrap();
+}
+
+/// A closed long trade decided at `decision` ms, every value set; the spec
+/// of [`spec`] has no regime feature, so its regime list is empty.
+fn closed_trade(decision: i64) -> TradeRecord {
+    let fill = |at: i64, units: i64| {
+        Some(Fill {
+            at: EventTime::from_millis(at),
+            price: Price::from_units(units),
+        })
+    };
+    let r = |units: i64| Some(Rate::from_units(units));
+    TradeRecord {
+        decision: CanonicalKey {
+            time: EventTime::from_millis(decision),
+            kind: EventKind::Trade,
+            seq: 1,
+        },
+        side: PositionSide::Long,
+        regime: Vec::new(),
+        reference: Price::from_units(10_000_000_000),
+        stop: Price::from_units(9_800_000_000),
+        target: Price::from_units(10_400_000_000),
+        risk: Price::from_units(200_000_000),
+        entry: fill(decision + 250, 10_000_000_000),
+        exit: Exit::Target,
+        exit_at: EventTime::from_millis(decision + 500),
+        fill: fill(decision + 501, 10_400_000_000),
+        funding: Some(Price::from_units(0)),
+        gross: r(200_000_000),
+        net: r(190_000_000),
+        displacement: r(0),
+        mfe: r(200_000_000),
+        mae: r(0),
+    }
+}
+
+/// A `research.backtest@1` result on [`spec`], with the provenance of
+/// [`history_result`].
+fn backtest_result(stats: SimulationStats, records: Vec<TradeRecord>) -> ExperimentResult {
+    let Outcome::HistoryReplaySummary(summary) = history_result(engine(0x0123, 1)).outcome else {
+        unreachable!("a history result");
+    };
+    ExperimentResult {
+        spec: spec("vah.failed_auction.short", 250),
+        pipeline: PipelineKey::new("research.backtest", 1),
+        outcome: Outcome::Backtest {
+            summary,
+            stats,
+            records,
+        },
+    }
+}
+
+fn triggers(n: u64) -> SimulationStats {
+    SimulationStats {
+        triggers: n,
+        filtered: 0,
+        skipped: SkipCounts::default(),
+        reach_backs: 0,
+    }
+}
+
+/// A result whose text would not read back is refused before anything is
+/// written (PR #177 review): stored, it would make every later read and
+/// append of its experiment fail as corrupt, and the store never
+/// overwrites. The four backtest shapes that render but do not parse.
+#[test]
+fn a_result_whose_text_would_not_read_back_is_never_stored() {
+    let dir = TempDir::new("invalid");
+    let mut store = FsResultStore::open(dir.path()).unwrap();
+    let mut unready = closed_trade(1_000);
+    unready.regime = vec![None];
+    let mut partial = closed_trade(1_000);
+    partial.net = None;
+    let invalid = [
+        // D4's conservation: one filtered trigger and no record.
+        backtest_result(
+            SimulationStats {
+                filtered: 1,
+                ..triggers(0)
+            },
+            Vec::new(),
+        ),
+        // A regime label although the spec has no regime feature.
+        backtest_result(triggers(1), vec![unready]),
+        // Decision keys that decrease.
+        backtest_result(triggers(2), vec![closed_trade(2_000), closed_trade(1_000)]),
+        // A target exit without its net R.
+        backtest_result(triggers(1), vec![partial]),
+    ];
+    for result in &invalid {
+        let refused = result.validate().unwrap_err();
+        assert!(
+            matches!(refused, ResultParseError::Malformed { .. }),
+            "{refused:?}"
+        );
+        assert_eq!(
+            store.append(result),
+            Err(ResultStoreError::Invalid(refused)),
+            "{result:?}"
+        );
+        assert_eq!(store.get(&result.key()), Ok(None));
+    }
+    // The experiment stays usable: other pipelines and a valid backtest
+    // store and read back.
+    let first = store.append(&result(4)).unwrap();
+    let valid = backtest_result(triggers(2), vec![closed_trade(1_000), closed_trade(2_000)]);
+    let key = store.append(&valid).unwrap();
+    assert_eq!(key.experiment, first.experiment);
+    assert_eq!(store.get(&key), Ok(Some(valid)));
+    assert_eq!(store.get(&first), Ok(Some(result(4))));
 }

@@ -115,7 +115,8 @@
 //! does not parse, and neither does any text that is not canonical. A
 //! pipeline version with a kind of its own fixes the `outcome` line:
 //! `research.replay_summary@1` records `replay-summary`, `@2`
-//! `history-replay-summary`, and any other pairing does not parse.
+//! `history-replay-summary`, `research.backtest@1` records `backtest`, and
+//! any other pairing does not parse.
 //!
 //! `history-replay-summary` (`research.replay_summary@2`, ADR-052 D10)
 //! replaces the two `replay-summary` lines with these, in this order:
@@ -142,6 +143,33 @@
 //! still a function of the text: its name is
 //! `<pipeline id>@<N>-<feature-set 16 hex>-<state encoding>`
 //! ([`ResultKey::name`]).
+//!
+//! `backtest` (`research.backtest@1`, ADR-060 D12) keeps the twelve
+//! provenance lines of `history-replay-summary`, with the same grammar and
+//! the same engine in its key, and follows them with these, in this order:
+//!
+//! ```text
+//! outcome backtest
+//! <the twelve history-replay-summary lines>
+//! triggers <n>
+//! filtered <n>
+//! skipped overlap=<n> stale_reference=<n> no_side=<n> no_risk=<n> stop_side=<n>
+//! reach-backs <n>
+//! trade <decision ms> <event_kind> <seq> side=<long|short> regime=<labels> ...
+//! metrics all <fields>
+//! metrics <regime feature id@N> <LOW|MEDIUM|HIGH|EXTREME|-> <fields>
+//! ```
+//!
+//! One `trade` line per taken decision, in decision order, then
+//! `metrics all` and one line per regime feature of the spec's set and per
+//! label. ADR-060 D12 fixes every field of both lines and when it is `-`.
+//! The metric lines are derived from the trade lines and the spec's regime
+//! features, never stored apart from them: a text whose metric lines
+//! differ from what its trade lines give is not canonical. A `trade` line
+//! whose shape is not its exit kind's, trade lines out of decision order,
+//! counts that break the conservation (`triggers` is `filtered` plus
+//! Σ`skipped` plus the number of trade lines), and a `regime=` list whose
+//! length is not the spec's number of regime features are malformed.
 
 pub mod result;
 pub mod spec;

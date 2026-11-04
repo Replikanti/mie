@@ -456,6 +456,17 @@ impl ExperimentSpec {
         &self.features
     }
 
+    /// The `volatility.regime.*` members of the feature set, in id order:
+    /// the regime features whose labels a backtest records and splits its
+    /// metrics by (ADR-060 D11, D12).
+    pub fn regime_features(&self) -> Vec<FeatureKey> {
+        self.features
+            .definitions()
+            .map(|definition| definition.key)
+            .filter(|&key| is_regime_feature(key))
+            .collect()
+    }
+
     /// The Market State filters, sorted by canonical line; empty means
     /// explicitly unfiltered.
     pub fn state_filters(&self) -> &[RuleRef] {
@@ -731,7 +742,7 @@ impl Draft {
                             return Err(format!("label {name} is listed twice"));
                         }
                     }
-                    if feature.id.as_str().starts_with("volatility.regime.") {
+                    if is_regime_feature(feature) {
                         self.regime_filters.push((
                             line,
                             RegimeFilter {
@@ -1042,6 +1053,12 @@ fn parse_value(kind: &str, value: &str, registry: &FeatureRegistry) -> Result<Sp
             ));
         }
     })
+}
+
+/// Whether `key` is a regime feature: a `volatility.regime.*` id, the one
+/// test for regime filters and the backtest's regime split (ADR-060 D11).
+fn is_regime_feature(key: FeatureKey) -> bool {
+    key.id.as_str().starts_with("volatility.regime.")
 }
 
 #[cfg(test)]

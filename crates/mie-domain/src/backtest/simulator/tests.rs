@@ -33,7 +33,7 @@ fn gap(stream: Stream, start: i64, end: i64) -> MarketEvent {
     })
 }
 
-fn costs(
+pub(in crate::backtest) fn costs(
     latency_ms: u32,
     max_hold_ms: i64,
     slippage: &str,
@@ -241,7 +241,7 @@ fn record(
 /// #22 at c itself.
 ///
 /// Counts: 10 triggers = 1 filtered + 5 skipped + 4 trades.
-fn fixture(costs: Costs) -> (Vec<TradeRecord>, SimulationStats) {
+pub(in crate::backtest) fn fixture(costs: Costs) -> (Vec<TradeRecord>, SimulationStats) {
     let mut run = Run::new(costs);
     run.on(trade(1_000, 1, "100"))
         .decide_in(vec![Some(RegimeLabel::High)], long("100", "98", "104"))
