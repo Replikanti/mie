@@ -788,6 +788,9 @@ mod tests {
         ];
         for (kind, name) in kinds {
             assert_eq!(event_kind_name(kind), name);
+            // The backtest's trade line keys decisions with the same
+            // strings, so S6 joins them to `contexts` (ADR-060 D12).
+            assert_eq!(mie_domain::backtest::event_kind_name(kind), name);
         }
         let regimes = [
             (RegimeLabel::Low, "low"),
@@ -827,6 +830,25 @@ mod tests {
             reasons,
             ["gap", "stale_reference", "rejected", "end_of_data"]
         );
+        // The first three backtest censor tokens are these
+        // `race_censor_reason` strings (ADR-060 D12).
+        let backtest: Vec<&str> = [
+            mie_domain::backtest::CensorReason::Gap,
+            mie_domain::backtest::CensorReason::Rejected,
+            mie_domain::backtest::CensorReason::EndOfData,
+        ]
+        .into_iter()
+        .map(mie_domain::backtest::CensorReason::as_str)
+        .collect();
+        let labels: Vec<&str> = [
+            CensorReason::Gap,
+            CensorReason::Rejected,
+            CensorReason::EndOfData,
+        ]
+        .into_iter()
+        .map(CensorReason::as_str)
+        .collect();
+        assert_eq!(backtest, labels);
         let censor = Censor {
             at: mie_domain::time::EventTime::from_millis(1),
             reason: CensorReason::Gap,

@@ -11,7 +11,7 @@ use crate::regime::RegimeLabel;
 use crate::time::EventTime;
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;
 
 /// Simulates one spec's positions over the event stream (ADR-060 D4–D10).
 ///

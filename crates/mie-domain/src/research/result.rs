@@ -2,6 +2,8 @@
 //! [`research`](super) module docs).
 
 use super::{DataVersion, ExperimentId, ExperimentSpec, SpecError, parse_hex16};
+use crate::backtest::text::{self, MetricsScope};
+use crate::backtest::{BacktestMetrics, SimulationStats, TradeRecord};
 use crate::event_hash::EventStreamHash;
 use crate::feature::{FeatureRegistry, FeatureSetVersion, is_valid_id, parse_versioned_id};
 use crate::fingerprint::Fingerprint;
@@ -153,6 +155,20 @@ pub enum Outcome {
     /// `history-replay-summary`: the sample replayed on the history chain,
     /// after the chain's prefix drove the same engine (ADR-052 D10).
     HistoryReplaySummary(HistoryReplaySummary),
+    /// `backtest`: the trades of the spec's hypothesis, simulated on the
+    /// history chain (ADR-060 D12, D13). The metric lines are not stored:
+    /// they are rendered from `records` and the spec's regime features, so
+    /// a text whose metric lines differ from its trade lines is not
+    /// canonical.
+    Backtest {
+        /// The chain provenance, with the lines of
+        /// `history-replay-summary`.
+        summary: HistoryReplaySummary,
+        /// The counts (ADR-060 D4, D9).
+        stats: SimulationStats,
+        /// One record per taken decision, in decision order.
+        records: Vec<TradeRecord>,
+    },
 }
 
 impl Outcome {
@@ -161,6 +177,7 @@ impl Outcome {
         match self {
             Self::ReplaySummary { .. } => "replay-summary",
             Self::HistoryReplaySummary(_) => "history-replay-summary",
+            Self::Backtest { .. } => "backtest",
         }
     }
 
@@ -169,7 +186,9 @@ impl Outcome {
     pub const fn engine(&self) -> Option<EngineKey> {
         match self {
             Self::ReplaySummary { .. } => None,
-            Self::HistoryReplaySummary(summary) => Some(summary.engine),
+            Self::HistoryReplaySummary(summary) | Self::Backtest { summary, .. } => {
+                Some(summary.engine)
+            }
         }
     }
 }
@@ -244,41 +263,20 @@ impl ExperimentResult {
             } => out.push_str(&format!(
                 "stream {stream}\nrejections {domain_rejections}\n"
             )),
-            Outcome::HistoryReplaySummary(summary) => {
-                let HistoryReplaySummary {
-                    origin,
-                    effective_origin,
-                    cutover,
-                    prefix_data,
-                    prefix_stream,
-                    prefix_rejections,
-                    engine,
-                    state_start,
-                    stream,
-                    rejections,
-                    state_end,
-                } = summary;
-                let effective_origin =
-                    effective_origin.map_or_else(|| "-".to_owned(), |t| t.as_millis().to_string());
-                let prefix_data = prefix_data.as_ref().map_or("-", |version| version.as_str());
-                out.push_str(&format!(
-                    "origin {}\n\
-                     effective-origin {effective_origin}\n\
-                     cutover {}\n\
-                     prefix-data {prefix_data}\n\
-                     prefix-stream {prefix_stream}\n\
-                     prefix-rejections {prefix_rejections}\n\
-                     engine-features {}\n\
-                     state-encoding {}\n\
-                     state-start {state_start}\n\
-                     stream {stream}\n\
-                     rejections {rejections}\n\
-                     state-end {state_end}\n",
-                    origin.as_millis(),
-                    cutover.as_millis(),
-                    engine.features,
-                    engine.state_encoding,
-                ));
+            Outcome::HistoryReplaySummary(summary) => summary.render(&mut out),
+            Outcome::Backtest {
+                summary,
+                stats,
+                records,
+            } => {
+                summary.render(&mut out);
+                text::render_counts(stats, &mut out);
+                for record in records {
+                    text::render_trade(record, &mut out);
+                }
+                let features = self.spec.regime_features();
+                let metrics = BacktestMetrics::compute(records, features.len());
+                text::render_metrics(&metrics, &features, &mut out);
             }
         }
         out.push_str("spec\n");
@@ -295,6 +293,14 @@ impl ExperimentResult {
     /// kind than its pipeline's is one, [`PIPELINE_KINDS`]), an invalid
     /// embedded spec, an `experiment` line that differs from the embedded
     /// spec's id, or text that is valid but not canonical.
+    ///
+    /// A `backtest` outcome is malformed, too, with a `trade` line whose
+    /// shape is not its exit kind's, trade lines out of non-decreasing
+    /// decision-key order, counts that break ADR-060 D4's conservation (on
+    /// the `triggers` line), or a `regime=` list whose length is not the
+    /// spec's number of regime features. Its metric lines are checked for
+    /// grammar only here; values that differ from what the trade lines
+    /// give make the text not canonical.
     pub fn parse(text: &str, registry: &FeatureRegistry) -> Result<Self, ResultParseError> {
         let mut lines = Lines {
             rest: text,
@@ -316,6 +322,8 @@ impl ExperimentResult {
             .strip_prefix("pipeline ")
             .and_then(PipelineKey::parse)
             .ok_or_else(|| malformed(3, "expected `pipeline <id@N>`".to_owned()))?;
+        // The line of each `trade` line of a `backtest` outcome.
+        let mut trade_lines = Vec::new();
         let outcome = match lines.next("outcome <kind>")? {
             "outcome replay-summary" => {
                 let stream = lines
@@ -338,6 +346,7 @@ impl ExperimentResult {
             "outcome history-replay-summary" => {
                 Outcome::HistoryReplaySummary(HistoryReplaySummary::parse(&mut lines)?)
             }
+            "outcome backtest" => parse_backtest(&mut lines, &mut trade_lines)?,
             other => return Err(malformed(4, format!("unknown outcome line {other:?}"))),
         };
         if let Some(kind) = kind_of(&pipeline).filter(|kind| *kind != outcome.kind()) {
@@ -356,6 +365,22 @@ impl ExperimentResult {
                 computed: spec.id(),
             });
         }
+        if let Outcome::Backtest { records, .. } = &outcome {
+            let features = spec.regime_features().len();
+            if let Some((&line, _)) = trade_lines
+                .iter()
+                .zip(records)
+                .find(|(_, record)| record.regime.len() != features)
+            {
+                return Err(malformed(
+                    line,
+                    format!(
+                        "expected {features} `regime=` labels, one per regime feature of the \
+                         spec (`none` for zero)"
+                    ),
+                ));
+            }
+        }
         let result = Self {
             spec,
             pipeline,
@@ -369,12 +394,14 @@ impl ExperimentResult {
 }
 
 /// The outcome kind of each pipeline version that has one (ADR-040,
-/// ADR-052 D10). A result pairing one of them with another kind is no
-/// pipeline's output, and its key would be impossible: `@2` without an
-/// engine, `@1` with one.
-const PIPELINE_KINDS: [(&str, u32, &str); 2] = [
+/// ADR-052 D10, ADR-060 D12). A result pairing one of them with another
+/// kind is no pipeline's output, and its key would be impossible:
+/// `research.replay_summary@2` or `research.backtest@1` without an engine,
+/// `research.replay_summary@1` with one.
+const PIPELINE_KINDS: [(&str, u32, &str); 3] = [
     ("research.replay_summary", 1, "replay-summary"),
     ("research.replay_summary", 2, "history-replay-summary"),
+    ("research.backtest", 1, "backtest"),
 ];
 
 /// The outcome kind `pipeline` produces; `None` for a pipeline version not
@@ -407,6 +434,25 @@ impl<'a> Lines<'a> {
         Ok(head)
     }
 
+    /// The next line without consuming it; `None` at the end of the text.
+    fn peek(&self) -> Option<&'a str> {
+        self.rest.split_once('\n').map(|(head, _)| head)
+    }
+
+    /// The next line, parsed by `parse`; its error is the reason of a
+    /// malformed line that names this one.
+    fn with<T>(
+        &mut self,
+        expected: &str,
+        parse: impl FnOnce(&'a str) -> Result<T, String>,
+    ) -> Result<T, ResultParseError> {
+        let text = self.next(expected)?;
+        parse(text).map_err(|reason| ResultParseError::Malformed {
+            line: self.line,
+            reason,
+        })
+    }
+
     /// The next line, `<key> <value>` with `value` in the form `form`,
     /// parsed by `parse`; a line that does not match is malformed and named.
     fn field<T>(
@@ -428,6 +474,44 @@ impl<'a> Lines<'a> {
 }
 
 impl HistoryReplaySummary {
+    /// The kind's twelve lines, which `backtest` repeats (ADR-060 D12).
+    fn render(&self, out: &mut String) {
+        let Self {
+            origin,
+            effective_origin,
+            cutover,
+            prefix_data,
+            prefix_stream,
+            prefix_rejections,
+            engine,
+            state_start,
+            stream,
+            rejections,
+            state_end,
+        } = self;
+        let effective_origin =
+            effective_origin.map_or_else(|| "-".to_owned(), |t| t.as_millis().to_string());
+        let prefix_data = prefix_data.as_ref().map_or("-", |version| version.as_str());
+        out.push_str(&format!(
+            "origin {}\n\
+             effective-origin {effective_origin}\n\
+             cutover {}\n\
+             prefix-data {prefix_data}\n\
+             prefix-stream {prefix_stream}\n\
+             prefix-rejections {prefix_rejections}\n\
+             engine-features {}\n\
+             state-encoding {}\n\
+             state-start {state_start}\n\
+             stream {stream}\n\
+             rejections {rejections}\n\
+             state-end {state_end}\n",
+            origin.as_millis(),
+            cutover.as_millis(),
+            engine.features,
+            engine.state_encoding,
+        ));
+    }
+
     /// The kind's lines, in their order (the [`research`](super) module
     /// docs).
     fn parse(lines: &mut Lines<'_>) -> Result<Self, ResultParseError> {
@@ -478,6 +562,70 @@ impl HistoryReplaySummary {
             state_end,
         })
     }
+}
+
+/// The lines of a `backtest` outcome after its `outcome` line, up to
+/// `spec` (ADR-060 D12): the provenance, the counts, the `trade` lines and
+/// the `metrics` lines. Pushes the line number of each `trade` line onto
+/// `trade_lines`, for the regime check once the spec has parsed.
+fn parse_backtest(
+    lines: &mut Lines<'_>,
+    trade_lines: &mut Vec<usize>,
+) -> Result<Outcome, ResultParseError> {
+    let malformed = |line: usize, reason: String| ResultParseError::Malformed { line, reason };
+    let summary = HistoryReplaySummary::parse(lines)?;
+    let triggers = lines.with("triggers <n>", |t| text::parse_count(t, "triggers"))?;
+    let triggers_line = lines.line;
+    let filtered = lines.with("filtered <n>", |t| text::parse_count(t, "filtered"))?;
+    let skipped = lines.with(text::SKIPPED_FORM, text::parse_skipped)?;
+    let reach_backs = lines.with("reach-backs <n>", |t| text::parse_count(t, "reach-backs"))?;
+    let stats = SimulationStats {
+        triggers,
+        filtered,
+        skipped,
+        reach_backs,
+    };
+    let mut records: Vec<TradeRecord> = Vec::new();
+    while lines.peek().is_some_and(|line| line.starts_with("trade ")) {
+        let record = lines.with("trade <fields>", text::parse_trade)?;
+        if records
+            .last()
+            .is_some_and(|last| record.decision < last.decision)
+        {
+            return Err(malformed(
+                lines.line,
+                "the decision key is below the previous trade line's: trade lines come in \
+                 decision order"
+                    .to_owned(),
+            ));
+        }
+        trade_lines.push(lines.line);
+        records.push(record);
+    }
+    if !text::conserves(&stats, records.len()) {
+        return Err(malformed(
+            triggers_line,
+            format!(
+                "triggers is not filtered + skipped + the {} trade lines (ADR-060 D4)",
+                records.len()
+            ),
+        ));
+    }
+    let (scope, _) = lines.with("metrics all <fields>", text::parse_metrics)?;
+    if scope != MetricsScope::All {
+        return Err(malformed(
+            lines.line,
+            "expected `metrics all <fields>` before the bucket lines".to_owned(),
+        ));
+    }
+    while lines.peek().is_some_and(|line| line != "spec") {
+        lines.with(text::METRICS_FORM, text::parse_metrics)?;
+    }
+    Ok(Outcome::Backtest {
+        summary,
+        stats,
+        records,
+    })
 }
 
 /// Parses the `Display` form of an [`EventStreamHash`],
@@ -645,7 +793,7 @@ mod tests {
                 3,
             ),
             (
-                text.replace("outcome replay-summary", "outcome backtest"),
+                text.replace("outcome replay-summary", "outcome walk-forward"),
                 4,
             ),
             (text.replace("stream 48:0123456789abcdef", "stream 48"), 5),
@@ -891,14 +1039,26 @@ mod tests {
                     .to_owned()
             })
         );
-        // A pipeline version without a kind of its own is not checked.
-        let other = result().canonical_text().replace(
+        let v1_backtest = result().canonical_text().replace(
             "pipeline research.replay_summary@1",
             "pipeline research.backtest@1",
         );
         assert_eq!(
+            parse(&v1_backtest),
+            Err(ResultParseError::Malformed {
+                line: 4,
+                reason: "expected `outcome backtest`: the outcome of research.backtest@1"
+                    .to_owned()
+            })
+        );
+        // A pipeline version without a kind of its own is not checked.
+        let other = result().canonical_text().replace(
+            "pipeline research.replay_summary@1",
+            "pipeline research.example@1",
+        );
+        assert_eq!(
             parse(&other).map(|result| result.pipeline),
-            Ok(PipelineKey::new("research.backtest", 1))
+            Ok(PipelineKey::new("research.example", 1))
         );
     }
 

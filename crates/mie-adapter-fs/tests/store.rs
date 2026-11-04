@@ -350,14 +350,14 @@ fn another_pipeline_stores_alongside() {
     let first = store.append(&result(4)).unwrap();
     let next = result_of(
         spec("vah.failed_auction.short", 250),
-        PipelineKey::new("research.backtest", 1),
+        PipelineKey::new("research.example", 1),
         4,
     );
     let second = store.append(&next).unwrap();
     assert_eq!(first.experiment, second.experiment);
     assert_ne!(first, second);
     assert_eq!(store.get(&second), Ok(Some(next)));
-    // Sorted: `research.backtest@1` before `research.replay_summary@1`.
+    // Sorted: `research.example@1` before `research.replay_summary@1`.
     assert_eq!(
         store
             .by_hypothesis(&HypothesisId::new("vah.failed_auction.short").unwrap())

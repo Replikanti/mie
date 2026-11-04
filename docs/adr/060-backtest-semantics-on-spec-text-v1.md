@@ -496,7 +496,9 @@ legs' fees, funding the D7 sum.
   - win rate = the share of trades with net R > 0;
   - max drawdown = the largest fall of cumulative net R from its running
     peak, which starts at 0, in exit order (equal to decision order under
-    D8);
+    D8). It is the magnitude peak − trough, so it is ≥ 0 and rendered
+    without a sign: "largest fall" alone fixes none, and a fall is the
+    quantity a reader compares across results. (Refined by S3, #168.)
   - time to target = the mean of (touch − decision) over target exits,
     in integer ms: Σ(touch − decision) ÷ the number of target exits,
     rounded half to even once;
@@ -540,6 +542,22 @@ order:
 
 `-` marks an undefined value. Parsing is strict and canonical-only
 (ADR-040 D6).
+
+- The metric lines are a function of the trade lines and the spec's
+  regime features: the result stores the trade lines, and the metric lines
+  are rendered from them. A text whose metric lines differ from what its
+  trade lines give is not canonical, so a stored result cannot carry
+  metrics that contradict its trades. *Rejected:* storing the metrics next
+  to the records, a second copy of a derived value that parsing would have
+  to cross-check. (Refined by S3, #168.)
+- Strict parsing also refuses, as a malformed line: a `trade` line whose
+  `-` fields are not its exit kind's shape (below), trade lines whose
+  decision keys decrease (equal keys are allowed, since two decision
+  events can share a `CanonicalKey`), counts that break D4's conservation
+  (reported on the `triggers` line), and a `regime=` list whose length is
+  not the number of regime features in the spec's set. Parsing checks the
+  structure only; re-deriving a line's values from e, x and the costs is
+  the acceptance check's job (#171). (Refined by S3, #168.)
 
 **The `trade` line:**
 
