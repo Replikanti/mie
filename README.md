@@ -189,6 +189,23 @@ cargo run --release -p mie-cli -- experiment run <spec> \
     --source history --config <ingest config with [history]> --results data/results
 ```
 
+`--pipeline backtest` runs `research.backtest@1` on the same chain instead
+(ADR-060 D13, proposed): the spec's rules are resolved under rule registry
+v1, its hypothesis is simulated on the recorded trades (a simulation only,
+no order is placed), and the result holds the provenance lines of `@2`, the
+counts, one `trade` line per taken decision and the metrics. A spec that
+does not resolve, or `funding.recorded@1` on a sample the chain delivers no
+settlements for (no `fundingRate` in its archive, or a sample ending after
+the cutover), fails before anything is opened. `experiment validate`
+prints the resolution as a second stage, `backtest: resolves under rule
+registry v1` or one `backtest: <error>` line per error, and keeps its exit
+code the parse verdict:
+
+```sh
+cargo run --release -p mie-cli -- experiment run <spec> --pipeline backtest \
+    --source history --config <ingest config with [history]> --results data/results
+```
+
 Dry-run the informational alerts of a window (ADR-059, proposed): the
 replay goes through the decision path live ingestion will use, and the
 messages a chat would get are written to a JSON Lines log instead — header

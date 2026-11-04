@@ -12,6 +12,22 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
 
 ### Added
 
+- **Backtest pipeline `research.backtest@1` (#170, ADR-060 D13, D14,
+  proposed).** `mie experiment run <spec> --source history --pipeline
+  backtest` simulates the spec's hypothesis on the history chain and
+  records the trades and metrics through the append-only result store,
+  keyed by experiment, pipeline and engine; a re-run prints `reproduced`.
+  Before anything is opened the spec's feature set is checked, its rules
+  are resolved under rule registry v1 (every error is printed) and
+  `funding.recorded@1` is refused when the chain delivers no settlement
+  for the sample: its archive does not replay `fundingRate`, or the sample
+  ends after the cutover. The chain drive is the one of
+  `research.replay_summary@2`, so the result's provenance lines are
+  `@2`'s. The new `BacktestEngine` port and `BacktestService` hold the
+  engine; `mie experiment validate` gains an informational second stage
+  that prints the resolution (`backtest: …` lines) without changing which
+  specs are valid or its exit code. A simulation only: there is no order
+  or execution path (ADR-010).
 - **Time of day and effective sample size in the context measurement
   (#147 M1).** The ignored tool `crates/mie-cli/tests/context_measure.rs`
   now also reports the baseline and trigger samples per UTC hour of the

@@ -12,7 +12,7 @@ use mie_cli::archive::{self, ArchiveTransports, ImportRequest};
 use mie_cli::conditional::{self, BuildRequest};
 use mie_cli::config::{ArchiveConfig, IngestConfig};
 use mie_cli::equivalence::{self, EquivalenceRequest};
-use mie_cli::experiment::{self, ExperimentRequest};
+use mie_cli::experiment::{self, ExperimentPipeline, ExperimentRequest};
 use mie_cli::ingest::{self, Transports};
 use mie_cli::replay::{self, ReplayRequest, ReplaySource};
 use mie_cli::report;
@@ -132,13 +132,17 @@ USAGE:
 
     mie experiment validate <spec>
         Validate an experiment spec (spec text v1, ADR-040). Prints the
-        experiment id and the canonical spec; exits 0. An invalid spec
+        experiment id and the canonical spec, then the second stage: the
+        spec's rules resolved under the backtest's rule registry v1
+        (ADR-060 D2), either `backtest: resolves under rule registry v1`
+        or one `backtest: <error>` line per resolution error; exits 0
+        either way, since a spec that parses is valid. An invalid spec
         prints every error, one per line, and exits 1. See
         crates/mie-cli/experiment.example.spec.
 
     mie experiment run <spec> --config <path> --results <dir>
                        [--source live|archive|history] [--streams <a,b,...>]
-                       [--trade-correction fold|none]
+                       [--trade-correction fold|none] [--pipeline backtest]
         Run the spec's sample period through the core (source options as
         mie replay) and record the result in the append-only result store
         under <dir>. live and archive record research.replay_summary@1.
@@ -150,12 +154,22 @@ USAGE:
         and end. Its key ends in the engine's feature-set version and
         state-hash encoding, so another build records next to the old
         result. --streams and --trade-correction apply to archive only.
+        --pipeline backtest (with --source history only) records
+        research.backtest@1 instead (ADR-060 D13): the spec's rules are
+        resolved, the hypothesis is simulated on the same chain drive, and
+        the result holds @2's provenance lines, the counts, one trade line
+        per taken decision and the metrics; its key ends in the engine like
+        @2's. A simulation only: no order is placed (ADR-010).
         Prints `recorded <key>` for a new result or `reproduced <key>` when
         the stored result was reproduced exactly; exits 0. A data-version
         mismatch, an empty sample, a sample before the history origin, a
         provider failure or a result that differs from the stored one
-        prints `FAIL: <reason>` and exits 1. Stored results are never
-        overwritten.
+        prints `FAIL: <reason>` and exits 1; so do, for the backtest and
+        before anything is opened, a spec that does not resolve (every
+        resolution error), funding.recorded@1 on a sample the chain
+        delivers no settlements for (its archive does not replay
+        fundingRate, or the sample ends after the cutover), and a source
+        other than history. Stored results are never overwritten.
 
     mie conditional build --config <path> --from <ms|YYYY-MM-DD> --to <ms|YYYY-MM-DD>
                           --out <dir> [--source live|archive]
@@ -419,13 +433,24 @@ fn dispatch(args: &[String]) -> Result<ExitCode, String> {
                         "--streams",
                         "--results",
                         "--trade-correction",
+                        "--pipeline",
                     ],
                     &[],
                 )?;
+                let pipeline = match options.optional("--pipeline") {
+                    None => ExperimentPipeline::Summary,
+                    Some("backtest") => ExperimentPipeline::Backtest,
+                    Some(other) => {
+                        return Err(format!(
+                            "--pipeline {other:?} is not backtest (omit it for the replay summary)"
+                        ));
+                    }
+                };
                 let request = ExperimentRequest {
                     spec: PathBuf::from(spec),
                     source: options.replay_source(&options.path("--config")?)?,
                     results: options.path("--results")?,
+                    pipeline,
                 };
                 let pass = experiment::run(&request, &mut std::io::stdout().lock())?;
                 Ok(exit(pass))

@@ -351,6 +351,31 @@ the reverse.
     chain's cutover, because live delivers no settlement event
     (`docs/data-availability.md`). This is checked before any drive
     (`FundingNotDelivered`, D13).
+  - It also requires the chain's archive segment to replay `fundingRate`.
+    *Why:* a chain configured without it (for example `aggTrades` +
+    `metrics`) delivers neither a settlement nor a gap, so the cutover
+    check alone would book zero funding by omission. Weak spot: the
+    configuration is trusted to say what is replayed. Checked with the
+    cutover, as the second cause of `FundingNotDelivered`. (Refined by S5,
+    #170.)
+  - A configured `fundingRate` with missing days yields a `MissingData`
+    gap in one of two places (`crates/mie-adapter-binance/src/archive/replay.rs`,
+    `crates/mie-adapter-binance/src/history.rs` module docs). Days followed
+    by a later settlement before the cutover give a delivered gap. Days at
+    the archive's tail, with no later settlement before the cutover, give
+    only a trailing gap of the archive segment's own stream: the chain
+    carries a series over the seam only into a live stream, and funding has
+    none, so the chain's trailing gaps never hold it. The backtest's
+    trailing gaps therefore add the archive segment's trailing funding
+    gaps that start before the window's end, and D9's `funding_gap`
+    covers both cases. The trades stream has the same tail when no live
+    segment is read (no chain run, or a sample that ends before the live
+    segment): the backtest then adds the archive segment's trailing
+    trades gaps too, so an open position is censored `gap` at the gap's
+    start instead of `end_of_data` (D9); they are observed after the
+    sample's drive, so no decision changes. With a live segment the first
+    run's seed gap already covers the hole, and adding them would count it
+    twice. (Refined by S5's review, #170.)
   - Under `funding.recorded@1`, a `FeedGap` on `Stream::Funding` that
     meets the booking span censors the trade (`funding_gap`; the span,
     c and the trailing funding gaps are in D9).
@@ -724,9 +749,15 @@ metrics <regime feature id@N> <LOW|MEDIUM|HIGH|EXTREME|-> <fields>
   validate` gains a second stage that prints resolution errors, without
   changing which texts parse.
 - **Run order:**
-  1. Before any drive, with nothing stored on failure: open the sample,
-     check `data` (ADR-040 D5) and the feature set (ADR-040 D4), resolve
-     the rules (D2), and check funding coverage (D7).
+  1. Before any drive, with nothing stored on failure, in this order: the
+     feature set (ADR-040 D4), resolution of the rules (D2), funding
+     coverage (D7), a sample before the origin (ADR-052 D10), then open
+     the sample and check `data` (ADR-040 D5). *Why:* the first three are
+     pure, so an unresolvable spec or a spec without funding coverage
+     opens no file at all, which is stronger than "before any drive"; and
+     D14's port takes a resolved plan, so the data check, which the engine
+     makes when it opens the sample, cannot come before resolution.
+     (Refined by S5, #170.)
   2. Then ADR-052 D10's order: the prefix drive (not evaluated), then the
      sample drive through `drive_chain_with`, so restarts reach the
      simulator; then the trailing trades gaps (and, under
@@ -734,7 +765,8 @@ metrics <regime feature id@N> <LOW|MEDIUM|HIGH|EXTREME|-> <fields>
   3. Compute the metrics and store the result as `Recorded`, `Reproduced`
      or `Diverged` (ADR-040 D7).
 - **New `ResearchError` variants:** `Unresolved` (every resolution error)
-  and `FundingNotDelivered` (the sample end and the cutover).
+  and `FundingNotDelivered` (the sample end and the cutover, or no cutover
+  when the archive does not replay `fundingRate`, D7).
 
 ### D14. `BacktestEngine` port
 
@@ -745,8 +777,12 @@ metrics <regime feature id@N> <LOW|MEDIUM|HIGH|EXTREME|-> <fields>
   variants of `ResearchError`.
 - `mie_app::backtest` implements it on the chain, driving the domain
   `Simulator` and rule evaluator through `drive_chain_with`.
-  `ExperimentService` holds it and keeps resolution, the funding check,
-  metrics, rendering and the store. `mie-cli` wires it.
+  `BacktestService`, next to `ExperimentService` and sharing its feature
+  check and store logic, holds it and keeps resolution, the funding check,
+  metrics, rendering and the store, and the port takes the
+  `MarketStateEngine` the service built and checked for the spec's feature
+  set, so that check runs once and in one place (refined by S5, #170).
+  `mie-cli` wires it.
 - *Why:* the Research Lab brief ("Concrete engines can be replaced
   without changing the research-domain rules"), and ADR-018 lists the
   port. Every engine is judged by the same metric code and store rules,
@@ -795,12 +831,25 @@ metrics <regime feature id@N> <LOW|MEDIUM|HIGH|EXTREME|-> <fields>
     line-based and knows no raw strings, so a raw string ending in a
     backslash, or a string spanning lines, can hide a later token on the
     line from it; the other two scans strip no literals;
-  - a `pub use` or `pub type` of a backtest item, any visibility, in an
-    allowed file outside the backtest module, each item joined up to the
+  - the port types `BacktestRun` and `BacktestEngine` and the outcome
+    variant `Backtest`, as whole-word identifiers on any code line, by the
+    same scan. *Why:* they carry the simulator's records, and a core file
+    reaches them without naming the module. The pipeline's service and
+    key (`BacktestService`, `BACKTEST_V1`) hand out no record and stay
+    free (refined by S5's review, #170);
+  - a `pub use` or `pub type` of a backtest item, or of one of those
+    three identifiers (S5's review, #170), any visibility, in an allowed
+    file outside the backtest module, each item joined up to the
     `;` that ends it, since rustfmt wraps a long alias. *Why:* a
     re-export lets every importer reach the item without a `backtest`
     token. *Rejected:* scanning for the re-exported names, which needs
     the guard to resolve Rust paths.
+- *Known gap (S5's review, #170; open since S3, #168):* the guard sees
+  tokens, not data. `ExperimentResult::canonical_text()` of a stored or
+  returned backtest result renders every `trade` line, so a file outside
+  the allow-list can read the records as text without naming any guarded
+  identifier. No token pattern closes that path. It is kept closed by
+  review, not by the script.
 - Exceptions:
   - `crates/mie-domain/src/backtest.rs` and `crates/mie-domain/src/backtest/`;
   - `crates/mie-domain/src/research/result.rs` (the outcome kind);
@@ -888,7 +937,12 @@ or a 0 or 1 that a rule defines.
     the `no_risk` skip of an unready ATR under
     `invalidation.beyond_extreme@1` and its order before `stop_side`
     (D5);
-  - S5: the D13 order and errors;
+  - S5: the D13 order and errors, the first three checks opening
+    nothing, and both causes of `FundingNotDelivered` (D7); the
+    provenance lines equal to `research.replay_summary@2`'s; restarts,
+    rejections, the unevaluated prefix and the trailing gaps reaching the
+    simulator; and an end-to-end golden whose every value is derived by
+    hand (refined by S5, #170);
   - #171: the check computes and asserts the overflow precondition
     (*Accept when* 4) before it compares anything.
 - **The weak spots of spec text v1** (D1): exactly-once slots, the closed

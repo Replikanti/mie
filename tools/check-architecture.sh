@@ -259,11 +259,19 @@ fi
 # strings: `r"\"` reads as an escaped quote, and a string that spans lines
 # pairs its quotes wrong, so a token later on such a line can be hidden
 # from it (PR #176 re-review). The other two scans strip no literals and
-# do not share that limit. The allow-list names
+# do not share that limit. The identifier scan also flags the items that
+# carry the simulator's records without the module's name: the port types
+# `BacktestRun` and `BacktestEngine` and the outcome variant `Backtest`
+# (`Outcome::Backtest`, or the bare variant after a glob import), PR #179
+# review. Case-sensitive and whole-word, so the pipeline's service and key
+# (`BacktestService`, `BACKTEST_V1`), which hand out no record, stay free
+# for `mie-app`'s re-exports. The allow-list names
 # exact files, so a neighbour (`backtester.rs`, `research.rs` in the
 # domain) stays scanned.
 backtest_lines='backtest[[:space:]]*::'
 backtest_use='(^|[^[:alnum:]_])backtest($|[^[:alnum:]_])'
+backtest_identifiers='(backtest|Backtest|BacktestRun|BacktestEngine)'
+backtest_items='(^|[^[:alnum:]_])(backtest|Backtest|BacktestRun|BacktestEngine)($|[^[:alnum:]_])'
 backtest_allow='^crates/mie-domain/src/backtest\.rs:|^crates/mie-domain/src/backtest/|^crates/mie-domain/src/research/result\.rs:|^crates/mie-ports/src/(outbound|inbound)\.rs:|^crates/mie-app/src/(backtest|research)\.rs:'
 
 # The code lines of the given files that hold the identifier `$1`:
@@ -289,7 +297,7 @@ identifier_scan() {
 backtest_scan() {
   {
     isolation_scan "$backtest_lines" "$backtest_use" "$@"
-    identifier_scan backtest "$@"
+    identifier_scan "$backtest_identifiers" "$@"
   } | sort -u
 }
 
@@ -317,6 +325,11 @@ backtest_probes=(
   $'fn f() -> Option<\n    m![crate::backtest]\n> { None }'
   $'let quote = \'"\'; m!(backtest); let s = "x";'
   'm!(backtest) // a "string" after the call'
+  'pub fn p(run: &mie_ports::outbound::BacktestRun) -> usize { run.records.len() }'
+  'fn f<B: mie_ports::outbound::BacktestEngine>(_: B) {}'
+  'fn f(o: &Outcome) -> bool { matches!(o, Outcome::Backtest { .. }) }'
+  $'use mie_domain::research::Outcome::{\n    self, Backtest,\n};'
+  'fn f(o: &Outcome) -> bool { matches!(o, Backtest { .. }) }'
 )
 # shellcheck disable=SC2034 # read by self_test through a nameref
 backtest_clean=(
@@ -327,6 +340,9 @@ backtest_clean=(
   'pub(crate) mod backtest;'
   $'let text = "a \\"backtest\\" line"; // the backtest'
   'let kind = Kind::Backtester; let run = backtests[0];'
+  'pub use research::{BACKTEST_V1, BacktestService, ChainBounds};'
+  '// A BacktestRun is the port output; see Outcome::Backtest.'
+  'let run = BacktestRunner::new(); let kind = Kind::BacktestEngines;'
 )
 self_test backtest backtest_scan backtest_probes backtest_clean
 
@@ -374,7 +390,7 @@ backtest_reexport_scan() {
   done
   [[ ${#files[@]} -gt 0 ]] || return 0
   joined_items '^[[:space:]]*pub([[:space:]]*[(][^)]*[)][[:space:]]*|[[:space:]]+)(use|type)([[:space:]]|$)' "${files[@]}" \
-    | grep -E "^[^:]+:[0-9]+:.*$backtest_use" || true
+    | grep -E "^[^:]+:[0-9]+:.*$backtest_items" || true
 }
 
 # shellcheck disable=SC2034 # read by self_test through a nameref
@@ -383,6 +399,8 @@ backtest_reexport_probes=(
   $'pub(crate) use crate::backtest::{\n    Simulator,\n};'
   'pub(super) use crate::backtest as bt;'
   'pub type Sim = crate::backtest::Simulator;'
+  'pub type Run = crate::outbound::BacktestRun;'
+  'pub use crate::outbound::BacktestEngine as Engine;'
   $'/// Review probe.\npub type ReviewPair = (\n    crate::backtest::Simulator,\n    crate::backtest::TradeRecord,\n    crate::backtest::SimulationStats,\n);'
   $'pub type Window = (\n    [u8; 4],\n    crate::backtest::Simulator,\n);'
   $'pub(crate) type Sim =\n    crate::backtest::Simulator;'
