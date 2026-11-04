@@ -16,11 +16,12 @@
 //!   text v1**. Only the pipeline writes results (ADR-020); agents may
 //!   propose specs.
 //!
-//! Slots whose semantics later issues own (location, trigger, entry,
-//! invalidation, target, slippage, funding, Market State filters) are
-//! versioned [`RuleRef`]s: `id@N` plus typed parameters, checked for syntax
-//! and feature membership only. Rule registries can join later without
-//! changing spec text v1.
+//! The rule slots (location, trigger, entry, invalidation, target,
+//! slippage, funding, Market State filters) are versioned [`RuleRef`]s:
+//! `id@N` plus typed parameters, checked for syntax and feature membership
+//! only. Parsing never resolves a rule id. The backtest's rule registry v1
+//! (ADR-060 D2) resolves them after parsing, so which texts parse is
+//! unchanged (ADR-040 D3).
 //!
 //! # Spec text v1
 //!
@@ -80,8 +81,8 @@
 //! `[a-z][a-z0-9_]*` and are unique. Types: `int` (`i64`), `bool` (`true`
 //! or `false`), `text` (`[A-Za-z0-9_.-]{1,64}`), `price`, `qty` and `rate`
 //! (exact decimals, ADR-027) and `feature` (`id@N`, registered and a member
-//! of the spec's feature set). Rule ids are not resolved: no rule registry
-//! exists yet.
+//! of the spec's feature set). Parsing does not resolve rule ids; the
+//! backtest's rule registry v1 (ADR-060 D2) does, after parsing.
 //!
 //! The **canonical text** is the header, then the keys in the order of the
 //! table above (`hypothesis` first, `latency` last), filter lines sorted
@@ -280,6 +281,22 @@ pub enum SpecValue {
     Feature(FeatureKey),
 }
 
+impl SpecValue {
+    /// The type token its text starts with: `int`, `bool`, `text`,
+    /// `price`, `qty`, `rate` or `feature`.
+    pub const fn type_name(&self) -> &'static str {
+        match self {
+            Self::Int(_) => "int",
+            Self::Bool(_) => "bool",
+            Self::Text(_) => "text",
+            Self::Price(_) => "price",
+            Self::Qty(_) => "qty",
+            Self::Rate(_) => "rate",
+            Self::Feature(_) => "feature",
+        }
+    }
+}
+
 impl fmt::Display for SpecValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -427,6 +444,7 @@ mod tests {
         ];
         for (value, text) in cases {
             assert_eq!(value.to_string(), text);
+            assert_eq!(Some(value.type_name()), text.split(':').next(), "{value:?}");
         }
     }
 }
