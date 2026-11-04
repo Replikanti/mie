@@ -354,6 +354,23 @@ what the labels already measure (ADR-055).
     unknown begins, bounded below by the start of the span the value
     reads. Funding is booked from the entry fill (D7), and a pending entry
     books nothing, so the bound is the fill and not the decision;
+  - a rejected `Stream::Funding` event (`funding_gap`), under
+    `funding.recorded@1` only: it hits a trade when D7's booking span holds
+    the event's time, that is, when the time is at or after the entry fill
+    trade's time and before the exit fill trade's time (or the position
+    has no exit fill). c = max(event time, entry fill time). Under
+    `funding.none@1` it is ignored, like a funding gap. *Why:* the engine
+    can refuse a `FundingSettlement` (`OutOfOrder`, `Duplicate` or
+    `Overflow`, `StateError` in `crates/mie-domain/src/state.rs`), and
+    skipping it would book zero funding by omission, which D7 forbids. Its
+    cause is a funding gap's, a settlement value missing from the span, so
+    it takes that token and that c rule. *Rejected:* ignoring the event,
+    which is zero by omission; the `rejected` token, which names a
+    trades-stream cause, the class *Accept when* 4(b) compares with the
+    labels; and a seventh token for one cause. Weak spot: a `Duplicate`
+    rejection loses no value and still censors the trade. S6 asserts
+    `rejections 0`, so it is unaffected. (Refined by S2, #167, STOP 1
+    decision 1.)
   - an overflow (`overflow`, D10): the time of the event whose value
     overflowed, that is the entry fill trade (E′, the entry fee,
     displacement), a monitored trade (MFE, MAE), a settlement (funding)
@@ -368,14 +385,25 @@ what the labels already measure (ADR-055).
 - **When an outcome stands:** it is fixed by the trades **strictly before
   c**. A stop or target exit stands when its touch is before c. A time
   exit stands when its deadline is ≤ c, because the window
-  `[entry, deadline)` is then complete. Everything else is censored at c:
-  open positions, pending entries, and exits decided at or after c. Every
-  exit that stands has an observed fill: the provider opens a gap at the
-  last delivered trade (ADR-055 D6, *Emission*).
+  `[entry, deadline)` is then complete. An `unfilled` decision stands
+  under the same rule, deadline ≤ c: the window `[decision, deadline)`
+  then holds every trade that could have filled the entry, so a pending
+  entry whose deadline is ≤ c ends `unfilled`, not censored. Everything
+  else is censored at c: open positions, pending entries, and exits
+  decided at or after c. Every exit that stands has an observed fill: the
+  provider opens a gap at the last delivered trade (ADR-055 D6,
+  *Emission*). (The `unfilled` case refined by S2, #167: D6 and this list
+  named the outcome and its slot, not the rule.)
 - **Finality:** a trade is final once a trades-stream event is observed
-  in a later millisecond than its touch, or at or after its deadline. This
-  is ADR-055 D6's emission rule. A later gap reaching back into a final
-  trade does not reopen it; it is counted in `reach-backs`.
+  in a later millisecond than its touch, or at or after its deadline (a
+  time exit or an `unfilled` decision). A censored trade is final once a
+  trades-stream event at or after its c is observed. This is ADR-055 D6's
+  emission rule: a label is emitted once the trades are known up to its
+  censor time or window end, and a censored label once they are known up
+  to c. A later gap reaching back into a final trade does not reopen it;
+  it is counted in `reach-backs`. (The censored case refined by S2, #167:
+  without it a censored trade would stay replaceable by every later
+  reach-back, which the labels never are.)
 - **A funding gap is never a reach-back.** It censors whenever it is
   delivered, including after the trade has closed, for two reasons:
   finality is trades-stream finality and does not cover funding, and the
