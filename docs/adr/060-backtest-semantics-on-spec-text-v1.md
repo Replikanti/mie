@@ -687,6 +687,25 @@ metrics <regime feature id@N> <LOW|MEDIUM|HIGH|EXTREME|-> <fields>
   any line, or a `backtest` path segment in a `use` item (joined across
   lines), with the label guard's scan and self-probes in
   `tools/check-architecture.sh`.
+- The guard also flags (refined by the review of the simulator PR, #167):
+  - the bare identifier `backtest` on any code line, comments and string
+    literals dropped, except the `mod backtest;` declaration. *Why:* a
+    macro argument, `m!(backtest)` spliced into `crate::$x::Simulator`,
+    names the module with neither `backtest::` nor a `use` item on any
+    line. Unlike `label`, the word does not occur elsewhere in the core,
+    so the scan costs no false positives today;
+  - a macro metavariable pasted into a path (`$x::`, `::$x`) or used in a
+    `use` item, `$crate` excepted, in every core file, the allow-list and
+    the labeler included. *Why:* it closes the same splice for the label
+    guard, where the identifier scan is not possible (`label` is a common
+    field and method name), and a splicing macro exported from an allowed
+    file would reopen the hole for every caller. The core has no such
+    macro, so the ban breaks nothing;
+  - a `pub use` or `pub type` of a backtest item, any visibility, in an
+    allowed file outside the backtest module. *Why:* a re-export lets every
+    importer reach the item without a `backtest` token. *Rejected:*
+    scanning for the re-exported names, which needs the guard to resolve
+    Rust paths.
 - Exceptions:
   - `crates/mie-domain/src/backtest.rs` and `crates/mie-domain/src/backtest/`;
   - `crates/mie-domain/src/research/result.rs` (the outcome kind);
