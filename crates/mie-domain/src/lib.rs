@@ -33,11 +33,13 @@
 //! | Conditional Behavior samples (ADR-054)    | [`conditional`]              |
 //! | Strategy lifecycle / edge health          | [`strategy`]                 |
 //! | Experiments and results (ADR-040)         | [`research`]                 |
+//! | Backtest simulation (ADR-060)             | [`backtest`]                 |
 //!
 //! Risk and validation rules join as modules here when their issues land —
 //! never as a dependency on a port or adapter.
 
 pub mod alert;
+pub mod backtest;
 pub mod bars;
 pub mod book;
 pub mod candidate;

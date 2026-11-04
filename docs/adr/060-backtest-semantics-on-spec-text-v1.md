@@ -350,10 +350,52 @@ what the labels already measure (ADR-055).
     `[start, end]` meets D7's booking span, that is, when `start` is
     before the exit fill trade's time (or the position is still open) and
     `end` is at or after the entry fill trade's time. c = max(gap start,
-    entry fill time). *Why:* ADR-055 D6's uniform rule puts c where the
+    entry fill time). The test is on times, not on canonical order: a gap
+    is ordered at its end, before the trades of that millisecond
+    (`crates/mie-domain/src/order.rs`), so a gap that ends in the entry
+    fill's millisecond, observed before the fill trade and even before the
+    decision, still hits. A settlement there would rank after the fill and
+    be booked (D7). (Refined by S2, #167, review of the simulator PR.)
+    *Why:* ADR-055 D6's uniform rule puts c where the
     unknown begins, bounded below by the start of the span the value
     reads. Funding is booked from the entry fill (D7), and a pending entry
     books nothing, so the bound is the fill and not the decision;
+  - a rejected `Stream::Funding` event (`funding_gap`), under
+    `funding.recorded@1` only: a rejected settlement hits a trade when
+    D7's booking span holds the event's time, that is, when the time is at
+    or after the entry fill trade's time and before the exit fill trade's
+    time (or the position has no exit fill). c = max(event time, entry
+    fill time). A rejected funding `FeedGap` hits by its declared interval
+    `[start, end]`, with the rule and the c of an accepted funding gap
+    above. A rejected funding `FeedGap` with `start > end` (the engine's
+    `InvalidGap`) declares no interval, so it hits as the point at the
+    event's time, its `end`, with a rejected settlement's rule and c.
+    Under `funding.none@1` all of these are ignored, like a funding gap. *Why:* the engine
+    can refuse a `FundingSettlement` (`OutOfOrder`, `Duplicate` or
+    `Overflow`, `StateError` in `crates/mie-domain/src/state.rs`), and
+    skipping it would book zero funding by omission, which D7 forbids. Its
+    cause is a funding gap's, a settlement value missing from the span, so
+    it takes that token and that c rule. *Rejected:* ignoring the event,
+    which is zero by omission; the `rejected` token, which names a
+    trades-stream cause, the class *Accept when* 4(b) compares with the
+    labels; and a seventh token for one cause. Weak spot: a `Duplicate`
+    rejection loses no value and still censors the trade. S6 asserts
+    `rejections 0`, so it is unaffected. *Why the interval for a rejected
+    gap:* the gap declares every instant of `[start, end]` possibly
+    missing, and it is the same statement whether or not the engine took
+    it. The event's time is the gap's end, so checking only that point
+    would let a refused gap covering the whole span book zero funding,
+    the omission D7 forbids, while an accepted copy censors. *Rejected:*
+    the point at the gap's end, for that reason. *Why the point for an
+    inverted gap:* its bounds name no instants, and read as an interval
+    they would put c = max(start, entry fill time) after the event, so
+    the slot would be freed before c, a later decision would open beside
+    a live trade (D8), and that trade's censor would not be final in time
+    and give way to `end_of_data`. The event's time is the one instant the
+    feed gave, so censoring there keeps D7's no-omission rule. *Rejected:*
+    ignoring it, which is zero by omission. (Refined by S2, #167, STOP 1
+    decision 1; the gap cases by the review and the re-review of the
+    simulator PR.)
   - an overflow (`overflow`, D10): the time of the event whose value
     overflowed, that is the entry fill trade (E′, the entry fee,
     displacement), a monitored trade (MFE, MAE), a settlement (funding)
@@ -368,14 +410,25 @@ what the labels already measure (ADR-055).
 - **When an outcome stands:** it is fixed by the trades **strictly before
   c**. A stop or target exit stands when its touch is before c. A time
   exit stands when its deadline is ≤ c, because the window
-  `[entry, deadline)` is then complete. Everything else is censored at c:
-  open positions, pending entries, and exits decided at or after c. Every
-  exit that stands has an observed fill: the provider opens a gap at the
-  last delivered trade (ADR-055 D6, *Emission*).
+  `[entry, deadline)` is then complete. An `unfilled` decision stands
+  under the same rule, deadline ≤ c: the window `[decision, deadline)`
+  then holds every trade that could have filled the entry, so a pending
+  entry whose deadline is ≤ c ends `unfilled`, not censored. Everything
+  else is censored at c: open positions, pending entries, and exits
+  decided at or after c. Every exit that stands has an observed fill: the
+  provider opens a gap at the last delivered trade (ADR-055 D6,
+  *Emission*). (The `unfilled` case refined by S2, #167: D6 and this list
+  named the outcome and its slot, not the rule.)
 - **Finality:** a trade is final once a trades-stream event is observed
-  in a later millisecond than its touch, or at or after its deadline. This
-  is ADR-055 D6's emission rule. A later gap reaching back into a final
-  trade does not reopen it; it is counted in `reach-backs`.
+  in a later millisecond than its touch, or at or after its deadline (a
+  time exit or an `unfilled` decision). A censored trade is final once a
+  trades-stream event at or after its c is observed. This is ADR-055 D6's
+  emission rule: a label is emitted once the trades are known up to its
+  censor time or window end, and a censored label once they are known up
+  to c. A later gap reaching back into a final trade does not reopen it;
+  it is counted in `reach-backs`. (The censored case refined by S2, #167:
+  without it a censored trade would stay replaceable by every later
+  reach-back, which the labels never are.)
 - **A funding gap is never a reach-back.** It censors whenever it is
   delivered, including after the trade has closed, for two reasons:
   finality is trades-stream finality and does not cover funding, and the
@@ -645,6 +698,42 @@ metrics <regime feature id@N> <LOW|MEDIUM|HIGH|EXTREME|-> <fields>
   any line, or a `backtest` path segment in a `use` item (joined across
   lines), with the label guard's scan and self-probes in
   `tools/check-architecture.sh`.
+- The guard also flags (refined by the review of the simulator PR, #167):
+  - any `macro_rules!` in every core file, the allow-list and the
+    labeler included, for both guards. *Why:* a macro pastes its
+    arguments into a path, `m!(backtest)` into `crate::$x::Simulator` or
+    `m!(crate, conditional, label, Race)` into the repetition
+    `$($seg)::*`, and so names a module with neither the `::` token nor a
+    `use` item on any line. A macro exported from an allowed file would
+    reopen that for every caller. Without macro definitions, and with no
+    dependencies in the core, the only macros are the standard library's,
+    which build no path from their arguments, so a module is named only
+    by a literal token, which the scans see. The core defines no macro,
+    so the ban breaks nothing. `include!` and a `#[path = ...]` module
+    attribute are banned with it: both splice in a file the scans, which
+    read the `.rs` files under `src`, never see (third review of the
+    simulator PR). The core uses neither. *Rejected:* banning the splice shapes
+    (`$x::`, `::$x`, `$` in a `use` item), the first fix, which the
+    repetition splice passed (re-review of the simulator PR): every new
+    shape needs a new pattern;
+  - the bare identifier `backtest` on any code line, comments and string
+    literals dropped, except the `mod backtest;` declaration. *Why:* it
+    came for macro arguments, which the ban above now rules out, and stays
+    as a backstop. A path written with a space before `::`, which rustfmt
+    leaves only inside a macro call it cannot parse, is matched by the
+    line scan itself (`backtest[[:space:]]*::`, and the same for
+    `label`). Unlike
+    `label`, the word does not occur elsewhere in the core, so the scan
+    costs no false positives today. Weak spot: its literal stripping is
+    line-based and knows no raw strings, so a raw string ending in a
+    backslash, or a string spanning lines, can hide a later token on the
+    line from it; the other two scans strip no literals;
+  - a `pub use` or `pub type` of a backtest item, any visibility, in an
+    allowed file outside the backtest module, each item joined up to the
+    `;` that ends it, since rustfmt wraps a long alias. *Why:* a
+    re-export lets every importer reach the item without a `backtest`
+    token. *Rejected:* scanning for the re-exported names, which needs
+    the guard to resolve Rust paths.
 - Exceptions:
   - `crates/mie-domain/src/backtest.rs` and `crates/mie-domain/src/backtest/`;
   - `crates/mie-domain/src/research/result.rs` (the outcome kind);

@@ -87,6 +87,23 @@ impl Rate {
     }
 }
 
+/// `numerator / denominator` rounded half to even, once (ADR-027): the one
+/// rounding of every derived fixed-point value (ATR, ADR-033; the backtest's
+/// R values and metrics, ADR-060 D10, D11).
+///
+/// Precondition: `denominator > 0`. The numerator may have either sign.
+pub(crate) fn div_half_even(numerator: i128, denominator: i128) -> i128 {
+    debug_assert!(
+        denominator > 0,
+        "div_half_even needs a positive denominator"
+    );
+    let quotient = numerator.div_euclid(denominator);
+    let twice_remainder = 2 * numerator.rem_euclid(denominator);
+    let round_up = twice_remainder > denominator
+        || (twice_remainder == denominator && quotient.rem_euclid(2) == 1);
+    quotient + i128::from(round_up)
+}
+
 impl StateEncode for Price {
     /// `write_i64` of the units (ADR-041).
     fn encode(&self, f: &mut Fingerprinter) {
@@ -500,6 +517,48 @@ mod tests {
         assert_eq!(q(i64::MIN).checked_sub(q(1)), None);
         assert_eq!(q(0).checked_sub(q(i64::MIN)), None);
         assert_eq!(q(-1).checked_sub(q(i64::MIN)), Some(q(i64::MAX)));
+    }
+
+    #[test]
+    fn division_rounds_half_to_even() {
+        for (numerator, denominator, expected) in [
+            (3, 2, 2),
+            (5, 2, 2),
+            (7, 2, 4),
+            (-3, 2, -2),
+            (-5, 2, -2),
+            (1, 3, 0),
+            (2, 3, 1),
+            (21, 14, 2),
+            (35, 14, 2),
+            (28, 14, 2),
+            // Negative ties of both parities: R values have negative
+            // numerators (ADR-060 D10).
+            (-1, 2, 0),
+            (-7, 2, -4),
+            (-2, 3, -1),
+            (-1, 3, 0),
+        ] {
+            assert_eq!(
+                div_half_even(numerator, denominator),
+                expected,
+                "{numerator}/{denominator}"
+            );
+        }
+    }
+
+    #[test]
+    fn division_is_exact_at_the_magnitude_of_an_r_numerator() {
+        // The widest price difference, 2^64 - 1 units, times 10^8 (ADR-060
+        // D10), over a risk of 2 * 10^8 units: an exact tie at
+        // +-(2^63 - 0.5), which rounds to the even neighbour.
+        let widest = (i128::from(i64::MAX) - i128::from(i64::MIN)) * i128::from(SCALE);
+        let risk = 2 * i128::from(SCALE);
+        assert_eq!(div_half_even(widest, risk), 1_i128 << 63);
+        assert_eq!(div_half_even(-widest, risk), i128::from(i64::MIN));
+        assert_eq!(div_half_even(widest + 1, risk), 1_i128 << 63);
+        assert_eq!(div_half_even(-widest - 1, risk), i128::from(i64::MIN));
+        assert_eq!(div_half_even(widest - 1, risk), i128::from(i64::MAX));
     }
 
     #[test]

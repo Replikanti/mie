@@ -34,7 +34,7 @@
 use crate::bars::{Bar, Coverage, Timeframe};
 use crate::feature::{FeatureKey, FeatureValue, Unavailability, catalog};
 use crate::fingerprint::Fingerprinter;
-use crate::num::Price;
+use crate::num::{Price, div_half_even};
 use crate::regime::{AtrPercentile, Regime};
 use crate::state_hash::StateEncode;
 use crate::time::EventTime;
@@ -116,15 +116,6 @@ fn true_range(bar: &Bar, previous_close: Option<Price>) -> Result<Price, Volatil
         range = range.max((high - close).abs()).max((low - close).abs());
     }
     to_price(range)
-}
-
-/// `numerator / denominator` rounded half to even; `denominator > 0`.
-fn div_half_even(numerator: i128, denominator: i128) -> i128 {
-    let quotient = numerator.div_euclid(denominator);
-    let twice_remainder = 2 * numerator.rem_euclid(denominator);
-    let round_up = twice_remainder > denominator
-        || (twice_remainder == denominator && quotient.rem_euclid(2) == 1);
-    quotient + i128::from(round_up)
 }
 
 /// How many of `previous` are at or below `current` (ADR-033, decision 3).
@@ -677,28 +668,6 @@ mod tests {
             true_range(&extreme, Some(p(i64::MIN))),
             Err(VolatilityError::Overflow)
         );
-    }
-
-    #[test]
-    fn division_rounds_half_to_even() {
-        for (numerator, denominator, expected) in [
-            (3, 2, 2),
-            (5, 2, 2),
-            (7, 2, 4),
-            (-3, 2, -2),
-            (-5, 2, -2),
-            (1, 3, 0),
-            (2, 3, 1),
-            (21, 14, 2),
-            (35, 14, 2),
-            (28, 14, 2),
-        ] {
-            assert_eq!(
-                div_half_even(numerator, denominator),
-                expected,
-                "{numerator}/{denominator}"
-            );
-        }
     }
 
     #[test]
