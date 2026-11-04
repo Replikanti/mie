@@ -801,3 +801,113 @@ fn validate_resolves_a_backtest_spec_and_keeps_the_parse_verdict() {
         "{text}"
     );
 }
+
+/// A chain of two archive days from `ORIGIN`, cut over at `ORIGIN` + 2 d,
+/// with no chain run: `aggTrades` on both days and `fundingRate` on the
+/// first only, so its missing second day has no later settlement before
+/// the cutover. The trades are the SFP tape of the app's backtest test
+/// (`crates/mie-app/tests/backtest.rs`): 16 prefix hours that make ATR(1h)
+/// 50, the 15m SFP pattern whose decision at `ORIGIN` + 19 h + 1 s opens a
+/// long with a stop at 59 921 and a target at 60 107, its entry fill at
+/// 60 016, the touch at 60 107 and the exit fill at 60 110, then one trade
+/// an hour at 60 050 through the second day.
+fn funding_tail_fixture(dir: &Path) -> IngestConfig {
+    let archive = common::history_archive_config(dir, r#""aggTrades", "fundingRate""#);
+    let a = ORIGIN;
+    let mut prices: Vec<(i64, i64)> = Vec::new();
+    for hour in 0..16 {
+        let open = a + hour * HOUR;
+        prices.extend([
+            (open + 1_000, 59_176),
+            (open + 2_000, 59_226),
+            (open + 3_000, 59_176),
+        ]);
+    }
+    let t0 = a + 16 * HOUR;
+    let span = 15 * 60_000;
+    for (index, high) in (0..).zip([
+        59_990, 59_992, 59_994, 59_996, 60_010, 60_011, 60_012, 60_015, 60_012, 60_011, 60_010,
+    ]) {
+        let open = t0 + index * span;
+        prices.extend([
+            (open + 1_000, high),
+            (open + 2_000, high - 5),
+            (open + 3_000, high - 2),
+        ]);
+    }
+    let decision = t0 + 12 * span + 1_000;
+    prices.extend([
+        (t0 + 11 * span + 1_000, 60_008),
+        (t0 + 11 * span + 2_000, 60_020),
+        (t0 + 11 * span + 3_000, 60_014),
+        (decision, 60_014),
+        (decision + 1_000, 60_016),
+        (decision + 1_500, 60_020),
+        (decision + 2_000, 59_990),
+        (decision + 3_000, 60_107),
+        (decision + 4_000, 60_110),
+    ]);
+    prices.extend((21..48).map(|hour| (a + hour * HOUR + 7, 60_050)));
+    let mut rows: Vec<(ArchiveStream, String)> = (1..)
+        .zip(&prices)
+        .map(|(id, (time, whole))| {
+            (
+                ArchiveStream::AggTrades,
+                format!("{id},{whole}.00,0.100,{id},{id},{time},false"),
+            )
+        })
+        .collect();
+    for hour in [0, 8, 16] {
+        rows.push((
+            ArchiveStream::FundingRate,
+            format!("{},8,0.00010000", a + hour * HOUR),
+        ));
+    }
+    import_rows(&archive, &rows);
+    let config = common::history_config(dir, "2026-10-03", "2026-10-05");
+    common::write_records(&config, &[], &[]);
+    config
+}
+
+#[test]
+fn a_funding_day_missing_before_the_cutover_censors_instead_of_booking_zero() {
+    let dir = TempDir::new("experiment-backtest-funding-tail");
+    let config = funding_tail_fixture(dir.path());
+    let cutover = ORIGIN + 2 * DAY_MS;
+    let sample = window(ORIGIN + 16 * HOUR, cutover);
+    let data = history_replay(&config, sample).dataset.unwrap();
+    let trade_line = |funding: &str, results: &str| {
+        let text = backtest_spec_text(sample, data.as_str(), funding);
+        let request = ExperimentRequest {
+            results: dir.path().join(results),
+            ..backtest_request(dir.path(), &config, &text)
+        };
+        let (pass, out) = run(&request);
+        assert!(pass, "{out}");
+        let stored = files(&request.results);
+        let text = String::from_utf8(stored[0].1.clone()).unwrap();
+        text.lines()
+            .find(|line| line.starts_with("trade "))
+            .unwrap_or_else(|| panic!("no trade line in\n{text}"))
+            .to_owned()
+    };
+    // Under `funding.none@1` the position closes at its target.
+    let none = trade_line("funding.none@1", "none");
+    assert!(
+        none.contains(" exit=target ") && none.ends_with(" censor=-"),
+        "{none}"
+    );
+    // Under `funding.recorded@1` the funding gap from the last settlement
+    // to the cutover, reported only by the archive segment, meets the
+    // booking span: the trade is censored at its entry fill, never booked
+    // with zero funding.
+    let recorded = trade_line("funding.recorded@1", "recorded");
+    assert!(
+        recorded.contains(" exit=censored ") && recorded.ends_with(" censor=funding_gap"),
+        "{recorded}"
+    );
+    assert!(
+        recorded.contains(&format!(" exit_at={} ", ORIGIN + 19 * HOUR + 2_000)),
+        "{recorded}"
+    );
+}

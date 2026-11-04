@@ -354,12 +354,21 @@ the reverse.
   - It also requires the chain's archive segment to replay `fundingRate`.
     *Why:* a chain configured without it (for example `aggTrades` +
     `metrics`) delivers neither a settlement nor a gap, so the cutover
-    check alone would book zero funding by omission. A configured stream
-    with missing months still yields `MissingData` gaps
-    (`crates/mie-adapter-binance/src/archive/replay.rs`), which D9's
-    `funding_gap` covers. Weak spot: the configuration is trusted to say
-    what is replayed. Checked with the cutover, as the second cause of
-    `FundingNotDelivered`. (Refined by S5, #170.)
+    check alone would book zero funding by omission. Weak spot: the
+    configuration is trusted to say what is replayed. Checked with the
+    cutover, as the second cause of `FundingNotDelivered`. (Refined by S5,
+    #170.)
+  - A configured `fundingRate` with missing days yields a `MissingData`
+    gap in one of two places (`crates/mie-adapter-binance/src/archive/replay.rs`,
+    `crates/mie-adapter-binance/src/history.rs` module docs). Days followed
+    by a later settlement before the cutover give a delivered gap. Days at
+    the archive's tail, with no later settlement before the cutover, give
+    only a trailing gap of the archive segment's own stream: the chain
+    carries a series over the seam only into a live stream, and funding has
+    none, so the chain's trailing gaps never hold it. The backtest's
+    trailing gaps therefore add the archive segment's trailing funding
+    gaps that start before the window's end, and D9's `funding_gap`
+    covers both cases. (Refined by S5's review, #170.)
   - Under `funding.recorded@1`, a `FeedGap` on `Stream::Funding` that
     meets the booking span censors the trade (`funding_gap`; the span,
     c and the trailing funding gaps are in D9).
@@ -815,8 +824,15 @@ metrics <regime feature id@N> <LOW|MEDIUM|HIGH|EXTREME|-> <fields>
     line-based and knows no raw strings, so a raw string ending in a
     backslash, or a string spanning lines, can hide a later token on the
     line from it; the other two scans strip no literals;
-  - a `pub use` or `pub type` of a backtest item, any visibility, in an
-    allowed file outside the backtest module, each item joined up to the
+  - the port types `BacktestRun` and `BacktestEngine` and the outcome
+    variant `Backtest`, as whole-word identifiers on any code line, by the
+    same scan. *Why:* they carry the simulator's records, and a core file
+    reaches them without naming the module. The pipeline's service and
+    key (`BacktestService`, `BACKTEST_V1`) hand out no record and stay
+    free (refined by S5's review, #170);
+  - a `pub use` or `pub type` of a backtest item, or of one of those
+    three identifiers (S5's review, #170), any visibility, in an allowed
+    file outside the backtest module, each item joined up to the
     `;` that ends it, since rustfmt wraps a long alias. *Why:* a
     re-export lets every importer reach the item without a `backtest`
     token. *Rejected:* scanning for the re-exported names, which needs

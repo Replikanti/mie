@@ -20,7 +20,9 @@
 //!   [`BacktestService`] and the chain's [`ChainBacktest`] (ADR-060 D13,
 //!   D14), and refuses any other source before the store is opened. The
 //!   chain covers the funding of a sample that ends at or before its
-//!   cutover, when its archive replays `fundingRate` (ADR-060 D7). It
+//!   cutover, when its archive replays `fundingRate` (ADR-060 D7), and the
+//!   backtest's trailing gaps add the archive segment's trailing funding
+//!   gaps, which the chain does not carry over the seam. It
 //!   prints `recorded <key>` for a
 //!   new result and `reproduced <key>` when the stored result was
 //!   reproduced exactly; anything else is `FAIL: <reason>`. The composition
@@ -40,6 +42,7 @@ use mie_adapter_parquet::ParquetRawStore;
 use mie_app::backtest::ChainBacktest;
 use mie_app::{BacktestService, ChainBounds, ExperimentService, FundingCoverage};
 use mie_domain::backtest::resolve;
+use mie_domain::event::{FeedGap, Stream};
 use mie_domain::feature::catalog;
 use mie_domain::research::{ExperimentSpec, SpecError};
 use mie_ports::inbound::{ExperimentRun, ResearchError, RunResearchExperiment};
@@ -183,10 +186,7 @@ pub fn run(request: &ExperimentRequest, out: &mut dyn Write) -> Result<bool, Str
                             .contains(&ArchiveStream::FundingRate)
                             .then_some(chain.cutover()),
                     };
-                    let engine =
-                        ChainBacktest::new(chain, bounds, |stream: &HistoryChainStream<'_>| {
-                            stream.trailing_gaps().to_vec()
-                        });
+                    let engine = ChainBacktest::new(chain, bounds, backtest_trailing_gaps);
                     execute(BacktestService::new(engine, results, funding), &spec, false)
                 })
             }
@@ -221,6 +221,31 @@ fn execute(
         ExperimentRun::Recorded(result) => Ok(format!("recorded {}", result.key())),
         ExperimentRun::Reproduced(result) => Ok(format!("reproduced {}", result.key())),
     }
+}
+
+/// The trailing gaps of a backtest's chain stream once it has ended: the
+/// chain's own ([`HistoryChainStream::trailing_gaps`]), plus the archive
+/// segment's trailing funding gaps that start before the window's end.
+///
+/// *Why:* funding days missing at the archive's tail, with no later
+/// settlement before the cutover, are reported only in the archive
+/// segment's own trailing gaps, and the chain carries a series over the
+/// seam only into a live stream, which funding has none of. Without them
+/// `funding.recorded@1` would book zero funding by omission over those
+/// days (ADR-060 D7, D9). The chain's list never holds them, so nothing is
+/// listed twice.
+fn backtest_trailing_gaps(stream: &HistoryChainStream<'_>) -> Vec<FeedGap> {
+    let end = stream.window().end;
+    let mut gaps = stream.trailing_gaps().to_vec();
+    gaps.extend(
+        stream
+            .archive()
+            .stream()
+            .trailing_gaps()
+            .iter()
+            .filter(|gap| gap.stream == Stream::Funding && gap.start < end),
+    );
+    gaps
 }
 
 /// Reads and parses the spec file.
