@@ -279,19 +279,22 @@ fn atr_reader(key: FeatureKey) -> Option<AtrReader> {
         .map(|&(_, read)| read)
 }
 
-/// The reader of a regime feature of a spec's set.
-///
-/// # Panics
-///
-/// Never: a spec lists only registered features (ADR-040 D4), and every
-/// registered `volatility.regime.*` feature has a reader, which the
-/// coverage test pins (the pattern of `StateSnapshot::read`).
-fn regime_reader(key: FeatureKey) -> RegimeReader {
+/// The reader of a regime feature; `None` for one the backtest cannot
+/// read. Every `volatility.regime.*` feature of the catalog has one (the
+/// coverage test), but a spec parsed under another registry may list one
+/// that has none, which [`resolve`] refuses.
+fn regime_reader(key: FeatureKey) -> Option<RegimeReader> {
     REGIME_READERS
         .iter()
         .find(|(feature, _)| *feature == key)
         .map(|&(_, read)| read)
-        .expect("every registered regime feature has a reader")
+}
+
+/// The label of a regime feature at `state`; `None` when it is not ready.
+/// A plan holds only readable regime features ([`resolve`]), so a missing
+/// reader never occurs; it would read as unready.
+fn regime_label(key: FeatureKey, state: &MarketState) -> Option<RegimeLabel> {
+    regime_reader(key).and_then(|read| read(state))
 }
 
 fn is_trigger(key: FeatureKey) -> bool {
@@ -411,6 +414,14 @@ pub enum ResolutionError {
         /// The hold.
         max_hold_ms: i64,
     },
+    /// A regime feature of the spec's set that the backtest cannot read,
+    /// so no decision could carry or filter on its label (D11, D12).
+    UnreadableRegime {
+        /// The line: `features`.
+        field: SpecField,
+        /// The regime feature, `id@N`.
+        rule: String,
+    },
     /// A `state-filter` rule: registry v1 has none (#31).
     StateFilterRule {
         /// The line: `state-filter`.
@@ -433,6 +444,7 @@ impl ResolutionError {
             | Self::WrongFamily { field, .. }
             | Self::NoExtreme { field, .. }
             | Self::LatencyNotBelowHold { field, .. }
+            | Self::UnreadableRegime { field, .. }
             | Self::StateFilterRule { field, .. } => *field,
         }
     }
@@ -449,6 +461,7 @@ impl ResolutionError {
             | Self::WrongFamily { rule, .. }
             | Self::NoExtreme { rule, .. }
             | Self::LatencyNotBelowHold { rule, .. }
+            | Self::UnreadableRegime { rule, .. }
             | Self::StateFilterRule { rule, .. } => rule,
         }
     }
@@ -522,6 +535,17 @@ impl fmt::Display for ResolutionError {
                 "latency {latency_ms} is not below max_hold_ms {max_hold_ms}, so no entry can \
                  fill; raise max_hold_ms or lower latency"
             ),
+            Self::UnreadableRegime { .. } => {
+                let readable: Vec<String> = REGIME_READERS
+                    .iter()
+                    .map(|(key, _)| key.to_string())
+                    .collect();
+                write!(
+                    f,
+                    "the backtest cannot read this regime feature (readable: {})",
+                    readable.join(", ")
+                )
+            }
             Self::StateFilterRule { .. } => {
                 write!(
                     f,
@@ -751,7 +775,9 @@ impl Resolver {
 /// # Errors
 ///
 /// Every [`ResolutionError`], in the canonical text's line order: the
-/// `state-filter` lines (sorted), then `location`, `trigger`, `entry`,
+/// regime features of the `features` line that the backtest cannot read
+/// (in id order), the `state-filter` lines (sorted), then `location`,
+/// `trigger`, `entry`,
 /// `invalidation`, `target`, `slippage` and `funding`. Within one line the
 /// given parameters come first, in name order, then the missing ones, in
 /// name order, then the line's cross-rule error:
@@ -765,16 +791,24 @@ impl Resolver {
 ///
 /// # Panics
 ///
-/// Never: a spec lists only registered features, each registered regime
-/// feature has a reader (the coverage test), and a rule without an error
-/// has every value, so once every range is checked [`Costs::new`] cannot
-/// refuse them.
+/// Never: a plan is built only when no error was found, a rule without an
+/// error has every value, and once every range is checked [`Costs::new`]
+/// cannot refuse them.
 pub fn resolve(spec: &ExperimentSpec) -> Result<Plan, Vec<ResolutionError>> {
     let sample = spec.sample();
     let mut resolver = Resolver {
         sample_ms: i128::from(sample.end().as_millis()) - i128::from(sample.start().as_millis()),
         errors: Vec::new(),
     };
+    let regime_features = spec.regime_features();
+    for &key in &regime_features {
+        if regime_reader(key).is_none() {
+            resolver.errors.push(ResolutionError::UnreadableRegime {
+                field: SpecField::Features,
+                rule: key.to_string(),
+            });
+        }
+    }
     for rule in spec.state_filters() {
         resolver.errors.push(ResolutionError::StateFilterRule {
             field: SpecField::StateFilter,
@@ -858,11 +892,6 @@ pub fn resolve(spec: &ExperimentSpec) -> Result<Plan, Vec<ResolutionError>> {
             _ => None,
         });
 
-    let regime_features = spec.regime_features();
-    // Fails before any drive, not at the first decision.
-    for &key in &regime_features {
-        regime_reader(key);
-    }
     if !resolver.errors.is_empty() {
         return Err(resolver.errors);
     }
@@ -1004,10 +1033,10 @@ impl Plan {
         let regime: Vec<Option<RegimeLabel>> = self
             .regime_features
             .iter()
-            .map(|&key| regime_reader(key)(state))
+            .map(|&key| regime_label(key, state))
             .collect();
         let admitted = self.regime_filters.iter().all(|filter| {
-            regime_reader(filter.feature)(state).is_some_and(|label| filter.labels.contains(&label))
+            regime_label(filter.feature, state).is_some_and(|label| filter.labels.contains(&label))
         });
         let atr = atr_reader(self.invalidation.atr()).and_then(|read| read(state));
         triggers

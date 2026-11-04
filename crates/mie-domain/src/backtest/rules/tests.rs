@@ -623,6 +623,73 @@ fn errors_follow_the_canonical_line_order_whatever_the_input_order() {
     assert_eq!(kinds, [SpecField::Trigger, SpecField::Target]);
 }
 
+/// A regime feature the backtest has no reader for, registered beside the
+/// catalog by a caller-built registry.
+static REGIME_4H: crate::feature::FeatureDefinition = crate::feature::FeatureDefinition {
+    key: FeatureKey::new("volatility.regime.4h", 1),
+    params: &[],
+    inputs: &[],
+    warm_up: crate::feature::WarmUp::None,
+};
+
+/// A spec parsed under a registry other than the catalog's may list a
+/// regime feature without a reader: `resolve` reports it on the `features`
+/// line, ahead of the other errors, and never panics (review of PR #178).
+#[test]
+fn an_unreadable_regime_feature_is_an_error_not_a_panic() {
+    let mut definitions = catalog::DEFINITIONS.to_vec();
+    definitions.push(&REGIME_4H);
+    let registry = crate::feature::FeatureRegistry::new(&definitions).unwrap();
+    let mut closure = BTreeSet::new();
+    for text in [
+        "trigger.effort_result.5m@1",
+        "trade.last_price@1",
+        "volatility.atr.1h@1",
+        "volatility.regime.1h@1",
+        "volatility.regime.4h@1",
+    ] {
+        closure.extend(
+            registry
+                .closure(registry.resolve(text).unwrap().key)
+                .unwrap(),
+        );
+    }
+    let keys: Vec<FeatureKey> = closure.into_iter().collect();
+    let set = FeatureSet::new(&registry, &keys).unwrap();
+    let text = with_lines(
+        &accept_spec(),
+        &[
+            ("features", &format!("features {} {set}", set.version())),
+            ("regime-filter", "regime-filter volatility.regime.4h@1 HIGH"),
+            ("location", "location location.at_level@1"),
+        ],
+    );
+    let spec = ExperimentSpec::parse(&text, &registry).expect("the spec parses");
+    let errors = resolve(&spec).unwrap_err();
+    assert_eq!(
+        errors,
+        [
+            ResolutionError::UnreadableRegime {
+                field: SpecField::Features,
+                rule: "volatility.regime.4h@1".into(),
+            },
+            ResolutionError::UnknownRule {
+                field: SpecField::Location,
+                rule: "location.at_level@1".into(),
+            },
+        ]
+    );
+    assert_eq!(
+        errors[0].to_string(),
+        "features: volatility.regime.4h@1: the backtest cannot read this regime feature \
+         (readable: volatility.regime.1h@1)"
+    );
+    // Alone, it is the only error.
+    let text = with_lines(&text, &[("location", "location location.any@1")]);
+    let spec = ExperimentSpec::parse(&text, &registry).unwrap();
+    assert_eq!(resolve(&spec).unwrap_err(), [errors[0].clone()]);
+}
+
 // ---------------------------------------------------------------------
 // The extreme partition and the readers
 // ---------------------------------------------------------------------

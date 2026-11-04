@@ -156,6 +156,11 @@ the side's sign σ (long +1, short −1).
     (`volatility.atr.1h@1` today), and an id with an extreme is one this
     section lists. A feature registered later is refused by both until it
     is classified, so no id gains a meaning by default.
+  - A `volatility.regime.*` feature of the spec's set that the backtest
+    cannot read is its own error, on the `features` line. *Why:* a spec
+    parsed under another registry than the catalog's can list one, and
+    without a reader no decision could record or filter on its label
+    (D11, D12); refusing it keeps resolution total.
   (Refined by S4, #169.)
 
 ### D3. Side mapping per trigger family
