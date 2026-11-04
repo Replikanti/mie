@@ -760,6 +760,102 @@ fn a_rejected_funding_event_in_the_span_censors_as_a_funding_gap() {
 }
 
 #[test]
+fn a_rejected_funding_gap_censors_by_its_interval() {
+    // Review of #176: a refused gap declares `[start, end]` missing, not
+    // its end instant, so it censors like an accepted copy (ADR-060 D9).
+    let mut run = Run::new(plain());
+    run.on(trade(999, 0, "100"))
+        .decide(long("100", "98", "104"))
+        .on(trade(1_000, 1, "100"))
+        .on(trade(1_500, 3, "105"))
+        .on(trade(1_501, 4, "105"))
+        .on(trade(2_100, 5, "105"))
+        .reject(gap(Stream::Funding, 900, 2_000));
+    let record = run.only();
+    // c = max(900, the entry fill at 1 000).
+    assert_eq!(
+        (record.exit, record.exit_at),
+        (Exit::Censored(CensorReason::FundingGap), t(1_000))
+    );
+}
+
+#[test]
+fn a_funding_gap_ending_in_the_entry_fill_millisecond_censors() {
+    // Review of #176: the gap ranks before the trades of its end
+    // millisecond (ADR-028), so it is seen before the entry fill trade at
+    // 1 001 and still meets the span: end 1 001 >= the fill, start 900
+    // before the exit fill at 1 501. c = max(900, 1 001).
+    let mut run = Run::new(plain());
+    run.on(trade(1_000, 1, "100"))
+        .decide(long("100", "98", "104"))
+        .on(gap(Stream::Funding, 900, 1_001))
+        .on(trade(1_001, 2, "100"))
+        .on(trade(1_500, 3, "105"))
+        .on(trade(1_501, 4, "105"));
+    let record = run.only();
+    assert_eq!(
+        (record.exit, record.exit_at),
+        (Exit::Censored(CensorReason::FundingGap), t(1_001))
+    );
+    assert_eq!(record.entry, None);
+}
+
+#[test]
+fn a_funding_gap_before_the_decision_in_the_fill_millisecond_censors() {
+    // Review of #176: the gap [900, 1 000] comes before the decision trade
+    // at 1 000, and with no latency the next trade at 1 000 fills the
+    // entry. The position did not exist when the gap was observed.
+    let mut run = Run::new(plain());
+    run.on(trade(999, 0, "100"))
+        .on(gap(Stream::Funding, 900, 1_000))
+        .on(trade(1_000, 1, "100"))
+        .decide(long("100", "98", "104"))
+        .on(trade(1_000, 2, "100"))
+        .on(trade(1_500, 3, "105"))
+        .on(trade(1_501, 4, "105"));
+    let record = run.only();
+    assert_eq!(
+        (record.exit, record.exit_at),
+        (Exit::Censored(CensorReason::FundingGap), t(1_000))
+    );
+}
+
+#[test]
+fn a_one_instant_funding_gap_at_the_fill_hits_unless_the_exit_fills_there() {
+    // The gap [1, 1] starts at the entry fill time, so it meets the span
+    // only when the exit fill trade is after 1 (ADR-060 D9).
+    let opened = || {
+        let mut run = Run::new(plain());
+        run.on(trade(0, 1, "100"))
+            .decide(long("100", "99", "101"))
+            .on(gap(Stream::Funding, 1, 1))
+            // The fill trade touches the target.
+            .on(trade(1, 2, "101"));
+        run
+    };
+    let mut run = opened();
+    // A later trade makes the exit final.
+    run.on(trade(1, 3, "101")).on(trade(2, 4, "101"));
+    assert_eq!(run.only().exit, Exit::Target);
+
+    let mut run = opened();
+    run.on(trade(2, 3, "101"));
+    let record = run.only();
+    assert_eq!(
+        (record.exit, record.exit_at),
+        (Exit::Censored(CensorReason::FundingGap), t(1))
+    );
+
+    // Still open at the end of the data: the funding gap is the earlier
+    // cause at the same c and stays.
+    let record = opened().only();
+    assert_eq!(
+        (record.exit, record.exit_at),
+        (Exit::Censored(CensorReason::FundingGap), t(1))
+    );
+}
+
+#[test]
 fn a_settlement_books_in_the_entry_fill_millisecond_but_not_in_the_exit_fill_one() {
     // A settlement ranks after the trades of its millisecond (ADR-028).
     let mut run = Run::new(plain());

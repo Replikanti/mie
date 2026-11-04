@@ -52,6 +52,12 @@ pub struct Simulator {
     /// The latest exclusive bound of the final trades: a cause at an
     /// earlier time reaches back into one of them (D9).
     final_until: Option<EventTime>,
+    /// The funding interval `[start, end]` with the latest end seen so far
+    /// under `funding.recorded@1`, with the earliest start among those
+    /// ending there. A funding gap is ordered at its end, before the trades
+    /// of that millisecond (ADR-028), so it can precede an entry fill
+    /// trade whose span it meets (D9).
+    funding_seen: Option<(EventTime, EventTime)>,
     /// Counts.
     stats: SimulationStats,
 }
@@ -79,6 +85,11 @@ struct Position {
     last_price: Price,
     /// Σ of the booked funding terms, in price units (D7).
     funding: i128,
+    /// The start of a funding interval seen before the entry fill trade
+    /// that starts at or after the entry fill time: it hits unless the
+    /// exit fill trade is at or before that start (D9), which only the
+    /// exit fill can tell.
+    funding_pending: Option<EventTime>,
 }
 
 /// The lifecycle of a position (ADR-060 D6–D9).
@@ -339,6 +350,7 @@ impl Simulator {
             stale: true,
             trades_until: None,
             final_until: None,
+            funding_seen: None,
             stats: SimulationStats::default(),
         }
     }
@@ -442,6 +454,7 @@ impl Simulator {
             excursion: Excursion::default(),
             last_price: levels.reference(),
             funding: 0,
+            funding_pending: None,
         });
         self.current = Some(index);
         self.live.push(index);
@@ -452,20 +465,27 @@ impl Simulator {
     /// A trades-stream event censors every trade that is not final at
     /// c = max(decision time, min(its time, the last accepted trades-stream
     /// event)), ADR-055 D6's min rule, and closes nothing. Under
-    /// `funding.recorded@1`, a funding-stream event censors the trade whose
-    /// booking span holds its time as `funding_gap`, at max(its time, the
-    /// entry fill time): a refused settlement would otherwise book zero
-    /// funding by omission (D7). Events of other streams are ignored.
+    /// `funding.recorded@1`, a funding-stream event censors as
+    /// `funding_gap`: a refused settlement every trade whose booking span
+    /// holds its time, at max(its time, the entry fill time), and a refused
+    /// funding gap by its declared interval, like an accepted one. Either
+    /// would otherwise book zero funding by omission (D7). Events of other
+    /// streams are ignored.
     pub fn reject(&mut self, event: &MarketEvent) {
-        match event.stream() {
-            Stream::Trades => {
+        match event {
+            _ if event.stream() == Stream::Trades => {
                 let start = self.trades_until.map(|until| until.min(event.time()));
                 if let Some(start) = start {
                     self.reach_back(start);
                 }
                 self.censor_live(start, CensorReason::Rejected);
             }
-            Stream::Funding => self.funding_gap(event.time(), event.time()),
+            MarketEvent::FeedGap(gap) if gap.stream == Stream::Funding => {
+                self.funding_gap(gap.start, gap.end);
+            }
+            _ if event.stream() == Stream::Funding => {
+                self.funding_gap(event.time(), event.time());
+            }
             _ => {}
         }
     }
@@ -516,6 +536,7 @@ impl Simulator {
             return;
         };
         let costs = self.costs;
+        let seen = self.funding_seen;
         let position = &mut self.positions[index];
         let fill = Fill {
             at: key.time,
@@ -532,6 +553,16 @@ impl Simulator {
             position.entry = Some(entry);
             position.excursion = Excursion::at_entry(key.time);
             position.phase = Phase::Monitoring;
+            // A funding interval seen before this trade that ends at or
+            // after it meets the span (D9). One starting before the fill
+            // starts before any exit fill, so it hits now, at the fill.
+            if let Some((start, _)) = seen.filter(|&(_, end)| end >= key.time) {
+                if start < key.time {
+                    self.censor(index, key.time, CensorReason::FundingGap);
+                    return;
+                }
+                position.funding_pending = Some(start);
+            }
         }
         // The entry fill, a monitored trade and the exit fill are all on
         // the path (D10).
@@ -550,6 +581,12 @@ impl Simulator {
             Phase::Expired => (Exit::Time, position.deadline),
             _ => return,
         };
+        if let Some(start) = position.funding_pending.take()
+            && start < key.time
+        {
+            self.censor(index, start, CensorReason::FundingGap);
+            return;
+        }
         match position.close(&costs, exit, exit_at, fill) {
             Some(closed) => {
                 position.phase = Phase::Closed(closed);
@@ -586,13 +623,19 @@ impl Simulator {
     }
 
     /// A funding interval `[start, end]` under `funding.recorded@1`: a
-    /// funding gap, or the time of a rejected funding-stream event. It
-    /// censors every trade whose booking span it meets, final or not, and
-    /// is never a reach-back (D9).
+    /// funding gap, accepted or rejected, or the time of a rejected
+    /// settlement. It censors every trade whose booking span it meets,
+    /// final or not, and is never a reach-back (D9). An entry fill trade
+    /// later in the interval's end millisecond checks it at the fill.
     fn funding_gap(&mut self, start: EventTime, end: EventTime) {
         if self.costs.funding() != FundingRule::Recorded {
             return;
         }
+        self.funding_seen = match self.funding_seen {
+            Some((earlier, until)) if until == end => Some((earlier.min(start), end)),
+            Some((_, until)) if until > end => self.funding_seen,
+            _ => Some((start, end)),
+        };
         for index in 0..self.positions.len() {
             if let Some(at) = self.positions[index].funding_hit(start, end) {
                 self.censor(index, at, CensorReason::FundingGap);
@@ -619,6 +662,11 @@ impl Simulator {
     /// censored, including an exit that would stand without an observed
     /// fill, which the provider contract rules out.
     fn censor(&mut self, index: usize, at: EventTime, reason: CensorReason) {
+        // A pending funding interval hits once the trade cannot reach an
+        // exit fill, and as the earlier cause it is applied first.
+        if let Some(start) = self.positions[index].funding_pending.take() {
+            self.censor(index, start, CensorReason::FundingGap);
+        }
         let outright = matches!(reason, CensorReason::FundingGap | CensorReason::Overflow);
         let position = &mut self.positions[index];
         match position.phase {

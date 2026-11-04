@@ -350,16 +350,24 @@ what the labels already measure (ADR-055).
     `[start, end]` meets D7's booking span, that is, when `start` is
     before the exit fill trade's time (or the position is still open) and
     `end` is at or after the entry fill trade's time. c = max(gap start,
-    entry fill time). *Why:* ADR-055 D6's uniform rule puts c where the
+    entry fill time). The test is on times, not on canonical order: a gap
+    is ordered at its end, before the trades of that millisecond
+    (`crates/mie-domain/src/order.rs`), so a gap that ends in the entry
+    fill's millisecond, observed before the fill trade and even before the
+    decision, still hits. A settlement there would rank after the fill and
+    be booked (D7). (Refined by S2, #167, review of the simulator PR.)
+    *Why:* ADR-055 D6's uniform rule puts c where the
     unknown begins, bounded below by the start of the span the value
     reads. Funding is booked from the entry fill (D7), and a pending entry
     books nothing, so the bound is the fill and not the decision;
   - a rejected `Stream::Funding` event (`funding_gap`), under
-    `funding.recorded@1` only: it hits a trade when D7's booking span holds
-    the event's time, that is, when the time is at or after the entry fill
-    trade's time and before the exit fill trade's time (or the position
-    has no exit fill). c = max(event time, entry fill time). Under
-    `funding.none@1` it is ignored, like a funding gap. *Why:* the engine
+    `funding.recorded@1` only: a rejected settlement hits a trade when
+    D7's booking span holds the event's time, that is, when the time is at
+    or after the entry fill trade's time and before the exit fill trade's
+    time (or the position has no exit fill). c = max(event time, entry
+    fill time). A rejected funding `FeedGap` hits by its declared interval
+    `[start, end]`, with the rule and the c of an accepted funding gap
+    above. Under `funding.none@1` both are ignored, like a funding gap. *Why:* the engine
     can refuse a `FundingSettlement` (`OutOfOrder`, `Duplicate` or
     `Overflow`, `StateError` in `crates/mie-domain/src/state.rs`), and
     skipping it would book zero funding by omission, which D7 forbids. Its
@@ -369,8 +377,14 @@ what the labels already measure (ADR-055).
     trades-stream cause, the class *Accept when* 4(b) compares with the
     labels; and a seventh token for one cause. Weak spot: a `Duplicate`
     rejection loses no value and still censors the trade. S6 asserts
-    `rejections 0`, so it is unaffected. (Refined by S2, #167, STOP 1
-    decision 1.)
+    `rejections 0`, so it is unaffected. *Why the interval for a rejected
+    gap:* the gap declares every instant of `[start, end]` possibly
+    missing, and it is the same statement whether or not the engine took
+    it. The event's time is the gap's end, so checking only that point
+    would let a refused gap covering the whole span book zero funding,
+    the omission D7 forbids, while an accepted copy censors. *Rejected:*
+    the point at the gap's end, for that reason. (Refined by S2, #167,
+    STOP 1 decision 1; the gap case by the review of the simulator PR.)
   - an overflow (`overflow`, D10): the time of the event whose value
     overflowed, that is the entry fill trade (E′, the entry fee,
     displacement), a monitored trade (MFE, MAE), a settlement (funding)
