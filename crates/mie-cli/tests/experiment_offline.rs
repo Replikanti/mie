@@ -223,7 +223,7 @@ fn validate_prints_the_id_and_the_canonical_spec() {
              backtest: invalidation: invalidation.beyond_extreme@1: missing parameter buffer: \
              add `buffer=rate:<decimal at or above 0>`\n\
              backtest: target: target.level@1: unknown rule (target rules: \
-             target.r_multiple@1)\n\
+             target.r_multiple@1, target.r_multiple_maker@1)\n\
              backtest: slippage: slippage.fixed@1: missing parameter rate: add \
              `rate=rate:<decimal from 0, below 1>`\n",
             "0f".repeat(32)

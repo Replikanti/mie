@@ -187,8 +187,14 @@ pub fn run(request: &ExperimentRequest, out: &mut dyn Write) -> Result<bool, Str
                             .contains(&ArchiveStream::FundingRate)
                             .then_some(chain.cutover()),
                     };
+                    // The book exists only in the live segment (ADR-061 D4).
+                    let cutover = chain.cutover();
                     let engine = ChainBacktest::new(chain, bounds, backtest_trailing_gaps);
-                    execute(BacktestService::new(engine, results, funding), &spec, false)
+                    execute(
+                        BacktestService::new(engine, results, funding, cutover),
+                        &spec,
+                        false,
+                    )
                 })
             }
         },

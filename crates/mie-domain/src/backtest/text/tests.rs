@@ -67,6 +67,7 @@ fn base(
         displacement: None,
         mfe: None,
         mae: None,
+        slipped: None,
     }
 }
 
@@ -793,6 +794,7 @@ fn extreme_values_never_panic() {
         displacement: max_rate,
         mfe: max_rate,
         mae: Some(Rate::from_units(i64::MIN)),
+        slipped: None,
     };
     let records = vec![
         extreme(key(i64::MIN, EventKind::FeedGap, 0), i64::MAX),
@@ -859,8 +861,8 @@ fn name_tables_are_pinned() {
     for unknown in ["", "Trade", "agg_trade", "trades"] {
         assert_eq!(event_kind_from_name(unknown), None, "{unknown}");
     }
-    // ADR-060 D12's censor tokens; the first three are ADR-057's
-    // `race_censor_reason` strings.
+    // ADR-060 D12's censor tokens, the first three ADR-057's
+    // `race_censor_reason` strings, then ADR-061 D5's `no_book`.
     assert_eq!(
         CENSOR_REASONS.map(CensorReason::as_str),
         [
@@ -869,9 +871,11 @@ fn name_tables_are_pinned() {
             "end_of_data",
             "chain_restart",
             "funding_gap",
-            "overflow"
+            "overflow",
+            "no_book"
         ]
     );
+    assert_eq!(SLIPPED_FIELDS, ["entry_slipped", "exit_slipped"]);
     assert_eq!(
         [
             Exit::Target,
@@ -998,4 +1002,302 @@ fn invalid_values_are_refused_as_their_text_is() {
     for valid in [g1(), result_on(&golden(), stats, records)] {
         assert_eq!(valid.validate(), Ok(()));
     }
+}
+
+// ---------------------------------------------------------------------
+// ADR-061 D5: the slipped fills of a book slippage rule
+// ---------------------------------------------------------------------
+
+/// The golden spec's set with `book.l2@1`.
+const G3_FEATURES: &str = "bars.time.1h@1,bars.time.1m@1,book.l2@1,profile.volume.utc_day@1,\
+                           volatility.atr.1h@1,volatility.regime.1h@1";
+
+/// The version of [`G3_FEATURES`], pinned by
+/// `golden_g3_is_pinned_and_round_trips`.
+const G3_FEATURES_HEX: &str = "c420c808b19453e1";
+
+/// The golden spec under `slippage.spread@1`, its set with `book.l2@1`.
+fn spec_with_book() -> String {
+    golden()
+        .replace(
+            "features 4a14739bcf46afb3 bars.time.1h@1,bars.time.1m@1,profile.volume.utc_day@1,\
+             volatility.atr.1h@1,volatility.regime.1h@1",
+            &format!("features {G3_FEATURES_HEX} {G3_FEATURES}"),
+        )
+        .replace(
+            "slippage slippage.fixed@1 rate=rate:0.00010000",
+            "slippage slippage.spread@1 book=feature:book.l2@1",
+        )
+}
+
+/// G3's records, every one in the LOW bucket: one of each slipped-fill
+/// shape (D5). Parsing never re-derives a line (#171); the closed trade's
+/// values follow ADR-060 D10 from its fills anyway:
+///
+/// - T1, long, R 2, e 100.5 with E′ 100.6 (the book's ask), x 104.2 with
+///   X′ 104.1 (its bid); fees ⟨0.0005 × 100.6⟩ = 0.0503 and ⟨0.0005 ×
+///   104.1⟩ = 0.05205; gross (104.2 − 100.5) / 2 = 1.85 on trade prices;
+///   net (104.1 − 100.6 − 0.0503 − 0.05205) / 2 = 3.39765 / 2 = 1.698825;
+/// - an unfilled line: both slipped fills `-`;
+/// - `no_book` at the entry fill trade: no entry, both `-`;
+/// - `no_book` at the exit fill trade: the entry and E′ stay, X′ is `-`.
+fn g3_records() -> Vec<TradeRecord> {
+    let low = || vec![Some(RegimeLabel::Low)];
+    let slipped = |entry: Option<&str>, exit: Option<&str>| {
+        Some(SlippedFills {
+            entry: entry.map(usd),
+            exit: exit.map(usd),
+        })
+    };
+    vec![
+        TradeRecord {
+            entry: at(1_759_280_400_250, "100.5"),
+            exit: Exit::Target,
+            fill: at(1_759_280_460_001, "104.2"),
+            funding: Some(usd("0")),
+            gross: r("1.85"),
+            net: r("1.698825"),
+            displacement: r("0.25"),
+            mfe: r("1.85"),
+            mae: r("0.5"),
+            slipped: slipped(Some("100.6"), Some("104.1")),
+            ..base(
+                key(1_759_280_400_000, EventKind::Trade, 1_001),
+                PositionSide::Long,
+                low(),
+                LONG,
+                1_759_280_460_000,
+            )
+        },
+        TradeRecord {
+            slipped: slipped(None, None),
+            ..base(
+                key(1_759_284_000_000, EventKind::Trade, 2_001),
+                PositionSide::Long,
+                low(),
+                LONG,
+                1_759_287_600_000,
+            )
+        },
+        TradeRecord {
+            exit: Exit::Censored(CensorReason::NoBook),
+            slipped: slipped(None, None),
+            ..base(
+                key(1_759_287_600_000, EventKind::Trade, 3_001),
+                PositionSide::Short,
+                low(),
+                ["100", "102", "96", "2"],
+                1_759_287_600_250,
+            )
+        },
+        TradeRecord {
+            entry: at(1_759_291_200_250, "100.1"),
+            exit: Exit::Censored(CensorReason::NoBook),
+            displacement: r("0.05"),
+            mfe: r("0.2"),
+            mae: r("0.15"),
+            slipped: slipped(Some("100.2"), None),
+            ..base(
+                key(1_759_291_200_000, EventKind::Trade, 4_001),
+                PositionSide::Long,
+                low(),
+                LONG,
+                1_759_291_300_000,
+            )
+        },
+    ]
+}
+
+fn g3_stats() -> SimulationStats {
+    SimulationStats {
+        triggers: 4,
+        ..SimulationStats::default()
+    }
+}
+
+/// Golden G3 (ADR-061 D5). Its metric lines: one trade, T1, in `all` and
+/// in LOW with T1's own values, profit factor `-` (no losing trade), win
+/// rate 1, drawdown 0, time to target 60 000 ms; the other buckets empty.
+fn g3_text() -> String {
+    format!(
+        "mie-result 1\n\
+         experiment a15c998856a221f8\n\
+         pipeline research.backtest@1\n\
+         outcome backtest\n\
+         {PROVENANCE}\
+         triggers 4\n\
+         filtered 0\n\
+         skipped overlap=0 stale_reference=0 no_side=0 no_risk=0 stop_side=0\n\
+         reach-backs 0\n\
+         trade 1759280400000 trade 1001 side=long regime=LOW reference=100.00000000 \
+         stop=98.00000000 target=104.00000000 risk=2.00000000 \
+         entry=1759280400250:100.50000000 exit=target exit_at=1759280460000 \
+         fill=1759280460001:104.20000000 funding=0.00000000 gross=1.85000000 net=1.69882500 \
+         displacement=0.25000000 mfe=1.85000000 mae=0.50000000 censor=- \
+         entry_slipped=100.60000000 exit_slipped=104.10000000\n\
+         trade 1759284000000 trade 2001 side=long regime=LOW reference=100.00000000 \
+         stop=98.00000000 target=104.00000000 risk=2.00000000 entry=- exit=unfilled \
+         exit_at=1759287600000 fill=- funding=- gross=- net=- displacement=- mfe=- mae=- \
+         censor=- entry_slipped=- exit_slipped=-\n\
+         trade 1759287600000 trade 3001 side=short regime=LOW reference=100.00000000 \
+         stop=102.00000000 target=96.00000000 risk=2.00000000 entry=- exit=censored \
+         exit_at=1759287600250 fill=- funding=- gross=- net=- displacement=- mfe=- mae=- \
+         censor=no_book entry_slipped=- exit_slipped=-\n\
+         trade 1759291200000 trade 4001 side=long regime=LOW reference=100.00000000 \
+         stop=98.00000000 target=104.00000000 risk=2.00000000 \
+         entry=1759291200250:100.10000000 exit=censored exit_at=1759291300000 fill=- \
+         funding=- gross=- net=- displacement=0.05000000 mfe=0.20000000 mae=0.15000000 \
+         censor=no_book entry_slipped=100.20000000 exit_slipped=-\n\
+         metrics all trades=1 censored=2 unfilled=1 expectancy=1.69882500 \
+         mean_gross=1.85000000 profit_factor=- win_rate=1.00000000 max_drawdown=0.00000000 \
+         time_to_target=60000 mean_mfe=1.85000000 mean_mae=0.50000000 \
+         mean_displacement=0.25000000\n\
+         metrics volatility.regime.1h@1 LOW trades=1 censored=2 unfilled=1 \
+         expectancy=1.69882500 mean_gross=1.85000000 profit_factor=- win_rate=1.00000000 \
+         max_drawdown=0.00000000 time_to_target=60000 mean_mfe=1.85000000 \
+         mean_mae=0.50000000 mean_displacement=0.25000000\n\
+         metrics volatility.regime.1h@1 MEDIUM trades=0 censored=0 unfilled=0 expectancy=- \
+         mean_gross=- profit_factor=- win_rate=- max_drawdown=0.00000000 time_to_target=- \
+         mean_mfe=- mean_mae=- mean_displacement=-\n\
+         metrics volatility.regime.1h@1 HIGH trades=0 censored=0 unfilled=0 expectancy=- \
+         mean_gross=- profit_factor=- win_rate=- max_drawdown=0.00000000 time_to_target=- \
+         mean_mfe=- mean_mae=- mean_displacement=-\n\
+         metrics volatility.regime.1h@1 EXTREME trades=0 censored=0 unfilled=0 expectancy=- \
+         mean_gross=- profit_factor=- win_rate=- max_drawdown=0.00000000 time_to_target=- \
+         mean_mfe=- mean_mae=- mean_displacement=-\n\
+         metrics volatility.regime.1h@1 - trades=0 censored=0 unfilled=0 expectancy=- \
+         mean_gross=- profit_factor=- win_rate=- max_drawdown=0.00000000 time_to_target=- \
+         mean_mfe=- mean_mae=- mean_displacement=-\n\
+         spec\n\
+         {}",
+        spec_with_book()
+    )
+}
+
+fn g3() -> ExperimentResult {
+    result_on(&spec_with_book(), g3_stats(), g3_records())
+}
+
+#[test]
+fn golden_g3_is_pinned_and_round_trips() {
+    let registry = catalog::registry();
+    let keys: Vec<_> = G3_FEATURES
+        .split(',')
+        .map(|text| registry.resolve(text).unwrap().key)
+        .collect();
+    let version = FeatureSet::new(&registry, &keys).unwrap().version();
+    assert_eq!(version.to_string(), G3_FEATURES_HEX);
+    let result = g3();
+    assert_eq!(result.canonical_text(), g3_text());
+    assert_eq!(
+        result.key().to_string(),
+        "a15c998856a221f8/research.backtest@1-0fedcba987654321-1"
+    );
+    assert_eq!(parse(&g3_text()), Ok(result));
+}
+
+/// D5's rule, tied to the spec: under `slippage.fixed@1` no line carries
+/// the slipped fills and every line stays ADR-060 D12's (G1 is pinned
+/// byte-identical above), and under a book rule every line carries them.
+/// `parse` and `validate` refuse both mismatches on the first such line.
+#[test]
+fn the_slipped_fills_follow_the_spec_rule() {
+    // A book line under the fixed rule: G1 with T1 given slipped fills.
+    let mut records = g1_records();
+    records[0].slipped = Some(SlippedFills {
+        entry: Some(usd("100.5")),
+        exit: Some(usd("104.2")),
+    });
+    let result = result_on(&golden(), g1_stats(), records);
+    let fixed_error = ResultParseError::Malformed {
+        line: 21,
+        reason: "`entry_slipped=` and `exit_slipped=` belong only on the trade lines of a book \
+                 slippage rule, not slippage.fixed@1 (ADR-061 D5)"
+            .to_owned(),
+    };
+    assert_eq!(result.validate(), Err(fixed_error.clone()));
+    assert_eq!(parse(&result.canonical_text()), Err(fixed_error));
+
+    // A line without them under the book rule: G3's second line.
+    let mut records = g3_records();
+    records[1].slipped = None;
+    let result = result_on(&spec_with_book(), g3_stats(), records);
+    let book_error = ResultParseError::Malformed {
+        line: 22,
+        reason: "under the book slippage rule slippage.spread@1 every trade line ends with \
+                 `entry_slipped=` and `exit_slipped=` (ADR-061 D5)"
+            .to_owned(),
+    };
+    assert_eq!(result.validate(), Err(book_error.clone()));
+    assert_eq!(parse(&result.canonical_text()), Err(book_error));
+}
+
+#[test]
+fn malformed_slipped_fills_name_the_line() {
+    let text = g3_text();
+    let cases = [
+        // Out of order, and an unknown name.
+        (
+            text.replace(
+                "entry_slipped=100.60000000 exit_slipped=104.10000000",
+                "exit_slipped=104.10000000 entry_slipped=100.60000000",
+            ),
+            21,
+        ),
+        (text.replace("entry_slipped=100.6", "entry_slip=100.6"), 21),
+        // A value that is no price.
+        (
+            text.replace("exit_slipped=104.10000000", "exit_slipped=x"),
+            21,
+        ),
+        // Shapes: E′ without an entry, X′ without a fill, no X′ with one.
+        (
+            text.replace(
+                "censor=no_book entry_slipped=- exit_slipped=-",
+                "censor=no_book entry_slipped=100.00000000 exit_slipped=-",
+            ),
+            23,
+        ),
+        (
+            text.replace(
+                "censor=- entry_slipped=- exit_slipped=-",
+                "censor=- entry_slipped=- exit_slipped=100.00000000",
+            ),
+            22,
+        ),
+        (
+            text.replace("exit_slipped=104.10000000", "exit_slipped=-"),
+            21,
+        ),
+        (
+            text.replace(
+                "censor=no_book entry_slipped=100.20000000",
+                "censor=no_book entry_slipped=-",
+            ),
+            24,
+        ),
+        // One of the two fields alone.
+        (text.replace(" exit_slipped=104.10000000", ""), 21),
+    ];
+    for (text, line) in cases {
+        let (found, reason) = malformed(&text);
+        assert_eq!(found, line, "{reason}\n{text}");
+    }
+    // The censor message lists the seventh token.
+    let (_, reason) = malformed(&text.replacen("censor=no_book", "censor=book", 1));
+    assert!(reason.contains("overflow or no_book"), "{reason}");
+}
+
+/// The simulator's book-rule output parses: the book fixture's records
+/// round-trip under G3's spec.
+#[test]
+fn simulator_book_output_round_trips() {
+    use crate::backtest::simulator::tests::book_fixture;
+    let (mut records, stats) = book_fixture();
+    for record in &mut records {
+        record.regime = vec![None];
+    }
+    assert!(records.iter().all(|record| record.slipped.is_some()));
+    let result = result_on(&spec_with_book(), stats, records);
+    assert_eq!(parse(&result.canonical_text()), Ok(result));
 }

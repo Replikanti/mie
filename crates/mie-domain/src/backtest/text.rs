@@ -1,6 +1,6 @@
 //! The lines of the `backtest` outcome kind of result text v1 (ADR-060
-//! D12): the counts, one `trade` line per record and the `metrics` lines,
-//! with their name tables. `research::result` frames them with the
+//! D12, ADR-061 D5): the counts, one `trade` line per record and the
+//! `metrics` lines, with their name tables. `research::result` frames them with the
 //! provenance lines and the spec, and names the line of every error these
 //! parsers return.
 //!
@@ -11,7 +11,7 @@
 
 use super::{
     BacktestMetrics, CensorReason, Exit, Fill, Metrics, PositionSide, REGIME_BUCKETS,
-    SimulationStats, SkipCounts, TradeRecord,
+    SimulationStats, SkipCounts, SlippedFills, TradeRecord,
 };
 use crate::feature::{FeatureKey, parse_versioned_id};
 use crate::num::{Price, Rate};
@@ -60,14 +60,16 @@ pub fn event_kind_from_name(name: &str) -> Option<EventKind> {
         .find(|&kind| event_kind_name(kind) == name)
 }
 
-/// Every censor reason, in the order of ADR-060 D12's token list.
-const CENSOR_REASONS: [CensorReason; 6] = [
+/// Every censor reason, in the order of ADR-060 D12's token list, then
+/// ADR-061 D5's `no_book`.
+const CENSOR_REASONS: [CensorReason; 7] = [
     CensorReason::Gap,
     CensorReason::Rejected,
     CensorReason::EndOfData,
     CensorReason::ChainRestart,
     CensorReason::FundingGap,
     CensorReason::Overflow,
+    CensorReason::NoBook,
 ];
 
 /// The `skipped` line's pair names, in their order.
@@ -99,6 +101,10 @@ const TRADE_FIELDS: [&str; 17] = [
     "mae",
     "censor",
 ];
+
+/// The two pair names a trade line carries after `censor=` under a book
+/// slippage rule, and only there (ADR-061 D5).
+const SLIPPED_FIELDS: [&str; 2] = ["entry_slipped", "exit_slipped"];
 
 /// A metrics line's pair names, in their order (ADR-060 D11, D12).
 const METRIC_FIELDS: [&str; 12] = [
@@ -292,16 +298,24 @@ fn parse_regime(text: &str) -> Result<Vec<Option<RegimeLabel>>, String> {
         .collect()
 }
 
-/// One `trade` line (ADR-060 D12).
+/// One `trade` line (ADR-060 D12), with the slipped fills after `censor=`
+/// when the record has them (ADR-061 D5).
 pub(crate) fn render_trade(record: &TradeRecord, out: &mut String) {
     let censor = match record.exit {
         Exit::Censored(reason) => reason.as_str(),
         _ => "-",
     };
+    let slipped = record.slipped.map_or_else(String::new, |slipped| {
+        format!(
+            " entry_slipped={} exit_slipped={}",
+            or_dash(slipped.entry),
+            or_dash(slipped.exit)
+        )
+    });
     out.push_str(&format!(
         "trade {} {} {} side={} regime={} reference={} stop={} target={} risk={} entry={} \
          exit={} exit_at={} fill={} funding={} gross={} net={} displacement={} mfe={} mae={} \
-         censor={censor}\n",
+         censor={censor}{slipped}\n",
         record.decision.time.as_millis(),
         event_kind_name(record.decision.kind),
         record.decision.seq,
@@ -325,7 +339,8 @@ pub(crate) fn render_trade(record: &TradeRecord, out: &mut String) {
 }
 
 /// One `trade` line, grammar only: the caller checks it against the shape
-/// of its exit kind ([`check_shape`]).
+/// of its exit kind ([`check_shape`]) and, once the spec has parsed,
+/// whether its slipped fills match the spec's slippage rule (ADR-061 D5).
 pub(crate) fn parse_trade(text: &str) -> Result<TradeRecord, String> {
     let tokens: Vec<&str> = text.split(' ').collect();
     let [keyword, time, kind, seq, fields @ ..] = tokens.as_slice() else {
@@ -340,6 +355,13 @@ pub(crate) fn parse_trade(text: &str) -> Result<TradeRecord, String> {
         seq: seq
             .parse()
             .map_err(|_| format!("the decision seq {seq:?} is not <n>"))?,
+    };
+    // Any other count is reported against the fields every line has.
+    let (fields, slipped) = if fields.len() == TRADE_FIELDS.len() + SLIPPED_FIELDS.len() {
+        let (fields, slipped) = fields.split_at(TRADE_FIELDS.len());
+        (fields, Some(pairs(slipped, SLIPPED_FIELDS)?))
+    } else {
+        (fields, None)
     };
     let [
         side,
@@ -381,7 +403,7 @@ pub(crate) fn parse_trade(text: &str) -> Result<TradeRecord, String> {
                 .ok_or_else(|| {
                     format!(
                         "`censor=` on a censored line expects gap, rejected, end_of_data, \
-                         chain_restart, funding_gap or overflow, found {reason:?}"
+                         chain_restart, funding_gap, overflow or no_book, found {reason:?}"
                     )
                 })?,
         ),
@@ -396,6 +418,15 @@ pub(crate) fn parse_trade(text: &str) -> Result<TradeRecord, String> {
                 "`exit=` expects target, stop, time, unfilled or censored, found {other:?}"
             ));
         }
+    };
+    let price_or_dash =
+        |name: &str, text: &str| value(name, "<price> or `-`", text, |t| dash_or(t, price));
+    let slipped = match slipped {
+        Some([entry, exit]) => Some(SlippedFills {
+            entry: price_or_dash("entry_slipped", entry)?,
+            exit: price_or_dash("exit_slipped", exit)?,
+        }),
+        None => None,
     };
     Ok(TradeRecord {
         decision,
@@ -415,6 +446,7 @@ pub(crate) fn parse_trade(text: &str) -> Result<TradeRecord, String> {
         displacement: r_value("displacement", displacement)?,
         mfe: r_value("mfe", mfe)?,
         mae: r_value("mae", mae)?,
+        slipped,
     })
 }
 
@@ -425,8 +457,20 @@ pub(crate) fn parse_trade(text: &str) -> Result<TradeRecord, String> {
 ///   `displacement`, `mfe` and `mae` are `-`;
 /// - censored: `fill`, `funding`, `gross` and `net` are `-`, and `entry`,
 ///   `displacement`, `mfe` and `mae` are either all `-` or all set with
-///   the entry fill strictly before the censor time.
+///   the entry fill strictly before the censor time;
+/// - on every line with slipped fills (ADR-061 D5): `entry_slipped` is `-`
+///   exactly when `entry` is, and `exit_slipped` exactly when `fill` is.
 pub(crate) fn check_shape(record: &TradeRecord) -> Result<(), String> {
+    if let Some(slipped) = record.slipped
+        && (slipped.entry.is_some() != record.entry.is_some()
+            || slipped.exit.is_some() != record.fill.is_some())
+    {
+        return Err(
+            "`entry_slipped=` is `-` exactly when `entry=` is, and `exit_slipped=` exactly \
+             when `fill=` is (ADR-061 D5)"
+                .to_owned(),
+        );
+    }
     let exit_values = [
         record.fill.is_some(),
         record.funding.is_some(),

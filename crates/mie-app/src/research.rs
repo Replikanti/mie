@@ -226,17 +226,21 @@ pub struct BacktestService<B, S> {
     engine: B,
     store: S,
     funding: FundingCoverage,
+    /// The chain's cutover: the book exists only in the live segment after
+    /// it (ADR-043 D11, ADR-061 D4).
+    cutover: EventTime,
 }
 
 impl<B: BacktestEngine, S: ResearchResultStore> BacktestService<B, S> {
     /// Creates the service over `engine`, which runs on a history chain
-    /// whose settlements `funding` covers. It is the only holder of the
-    /// writable store.
-    pub fn new(engine: B, store: S, funding: FundingCoverage) -> Self {
+    /// whose settlements `funding` covers and whose live segment starts at
+    /// `cutover`. It is the only holder of the writable store.
+    pub fn new(engine: B, store: S, funding: FundingCoverage, cutover: EventTime) -> Self {
         Self {
             engine,
             store,
             funding,
+            cutover,
         }
     }
 
@@ -261,10 +265,13 @@ impl<B: BacktestEngine, S: ResearchResultStore> RunResearchExperiment for Backte
     /// 3. under `funding.recorded@1`, the chain delivers the sample's
     ///    settlements: the sample ends at or before [`FundingCoverage`]'s
     ///    bound, else [`ResearchError::FundingNotDelivered`] (D7);
-    /// 4. the engine refuses a sample before the origin, opens the sample,
+    /// 4. under a book slippage rule, the sample reaches the book: it ends
+    ///    after the cutover, else [`ResearchError::BookNotDelivered`]
+    ///    (ADR-061 D4);
+    /// 5. the engine refuses a sample before the origin, opens the sample,
     ///    checks its data version (ADR-040 D5) and drives the prefix and
     ///    the sample (ADR-052 D10);
-    /// 5. the result is keyed by the engine of its provenance and recorded
+    /// 6. the result is keyed by the engine of its provenance and recorded
     ///    as [`ExperimentService`] records: `Recorded`, `Reproduced` or
     ///    `Diverged` (ADR-040 D7).
     fn run(&mut self, spec: &ExperimentSpec) -> Result<ExperimentRun, ResearchError> {
@@ -276,6 +283,17 @@ impl<B: BacktestEngine, S: ResearchResultStore> RunResearchExperiment for Backte
                 return Err(ResearchError::FundingNotDelivered {
                     sample_end,
                     until: self.funding.until,
+                });
+            }
+        }
+        // The archive has no book, so a sample that ends at or before the
+        // cutover would censor every fill `no_book` (ADR-061 D4).
+        if plan.costs().slippage().is_book() {
+            let sample_end = spec.sample().end();
+            if sample_end <= self.cutover {
+                return Err(ResearchError::BookNotDelivered {
+                    sample_end,
+                    cutover: self.cutover,
                 });
             }
         }

@@ -13,6 +13,7 @@ use crate::event::samples::t;
 use crate::feature::{FeatureSet, FeatureValue};
 use crate::order::EventKind;
 use crate::regime::{AtrPercentile, Regime};
+use crate::research::FeeSchedule;
 use crate::research::spec::tests::golden;
 use crate::state::MarketStateEngine;
 use crate::trigger::TriggerFamily;
@@ -106,6 +107,18 @@ fn key(text: &str) -> FeatureKey {
     catalog::registry().resolve(text).unwrap().key
 }
 
+/// `costs` with [`accept_spec`]'s maker fee, 0.0002, which only a maker
+/// target reads (ADR-061 D6).
+fn maker_fee(costs: Costs) -> Costs {
+    Costs {
+        fees: FeeSchedule {
+            maker: rate("0.0002"),
+            ..costs.fees
+        },
+        ..costs
+    }
+}
+
 // ---------------------------------------------------------------------
 // The table
 // ---------------------------------------------------------------------
@@ -153,10 +166,30 @@ fn registry_v1_is_d2s_table() {
             "target.r_multiple@1".into(),
             vec![("max_hold_ms", Hold), ("r", PositiveRate)],
         ),
+        // ADR-061 D3: three rows, each after the rows of its slot.
+        (
+            SpecField::Target,
+            "target.r_multiple_maker@1".into(),
+            vec![
+                ("fill", MakerFill),
+                ("max_hold_ms", Hold),
+                ("r", PositiveRate),
+            ],
+        ),
         (
             SpecField::Slippage,
             "slippage.fixed@1".into(),
             vec![("rate", Fraction)],
+        ),
+        (
+            SpecField::Slippage,
+            "slippage.spread@1".into(),
+            vec![("book", BookFeature)],
+        ),
+        (
+            SpecField::Slippage,
+            "slippage.depth_walk@1".into(),
+            vec![("book", BookFeature), ("qty", PositiveQty)],
         ),
         (SpecField::Funding, "funding.recorded@1".into(), vec![]),
         (SpecField::Funding, "funding.none@1".into(), vec![]),
@@ -176,12 +209,17 @@ fn registry_v1_is_d2s_table() {
         NonNegativeRate,
         Fraction,
         Hold,
+        BookFeature,
+        PositiveQty,
+        MakerFill,
     ]
     .map(ParamKind::type_name)
     .into();
     assert_eq!(
         types,
-        ["feature", "feature", "text", "rate", "rate", "rate", "int"]
+        [
+            "feature", "feature", "text", "rate", "rate", "rate", "int", "feature", "qty", "text"
+        ]
     );
 }
 
@@ -200,7 +238,8 @@ fn the_acceptance_spec_resolves() {
             multiple: rate("0.31333"),
         },
         target: rate("1"),
-        costs: costs(0, 3_600_000, "0", "0.0005", FundingRule::Recorded),
+        costs: maker_fee(costs(0, 3_600_000, "0", "0.0005", FundingRule::Recorded)),
+        book: None,
         regime_features: vec![key("volatility.regime.1h@1")],
         regime_filters: Vec::new(),
     };
@@ -234,7 +273,7 @@ fn slippage_and_funding_resolve_into_the_costs() {
         let plan = resolve(&parse(&text)).unwrap();
         assert_eq!(
             plan.costs(),
-            &costs(250, 3_600_000, slippage, "0.0005", rule),
+            &maker_fee(costs(250, 3_600_000, slippage, "0.0005", rule)),
             "{funding}"
         );
     }
@@ -523,7 +562,9 @@ fn the_golden_spec_lists_its_errors_in_line_order() {
              `atr=feature:<volatility.atr.* id@N of the features line>`",
             "invalidation: invalidation.beyond_extreme@1: missing parameter buffer: add \
              `buffer=rate:<decimal at or above 0>`",
-            "target: target.level@1: unknown rule (target rules: target.r_multiple@1)",
+            // The hint lists every target rule, ADR-061 D3's included.
+            "target: target.level@1: unknown rule (target rules: target.r_multiple@1, \
+             target.r_multiple_maker@1)",
         ]
     );
     let kinds: Vec<_> = errors.iter().map(discriminant).collect();
@@ -855,6 +896,7 @@ fn plan(side: SideRule, invalidation: Invalidation, target: &str) -> Plan {
         invalidation,
         target: rate(target),
         costs: costs(0, 3_600_000, "0", "0", FundingRule::Recorded),
+        book: None,
         regime_features: Vec::new(),
         regime_filters: Vec::new(),
     }
@@ -1400,7 +1442,7 @@ fn a_replay_runs_through_the_simulator() {
     for event in &tape {
         match engine.apply(event) {
             Ok(()) => {
-                simulator.observe(event);
+                simulator.observe(event, plan.book(engine.state()));
                 emissions += engine
                     .trigger_events()
                     .iter()
@@ -1435,4 +1477,234 @@ fn a_replay_runs_through_the_simulator() {
             record.reference.units() - record.stop.units()
         );
     }
+}
+
+// ---------------------------------------------------------------------
+// ADR-061 D3: book slippage and the maker target
+// ---------------------------------------------------------------------
+
+/// [`accept_spec`] with `book.l2@1` in its set and `lines` replaced.
+fn book_spec(lines: &[(&str, &str)]) -> String {
+    let features = features_line(&[
+        "trigger.effort_result.5m@1",
+        "trade.last_price@1",
+        "volatility.atr.1h@1",
+        "volatility.regime.1h@1",
+        "book.l2@1",
+    ]);
+    let mut all = vec![("features", features.as_str())];
+    all.extend_from_slice(lines);
+    with_lines(&accept_spec(), &all)
+}
+
+#[test]
+fn the_book_rules_and_the_maker_target_resolve() {
+    let book = key("book.l2@1");
+    for (slippage, rule) in [
+        (
+            "slippage slippage.spread@1 book=feature:book.l2@1",
+            SlippageRule::Spread,
+        ),
+        (
+            "slippage slippage.depth_walk@1 book=feature:book.l2@1 qty=qty:0.00100000",
+            SlippageRule::DepthWalk(Qty::from_units(100_000)),
+        ),
+    ] {
+        let plan = resolve(&parse(&book_spec(&[("slippage", slippage)]))).unwrap();
+        assert_eq!(plan.costs().slippage(), rule, "{slippage}");
+        assert_eq!(plan.book, Some(book), "{slippage}");
+        assert!(is_book_slippage(
+            parse(&book_spec(&[("slippage", slippage)])).slippage()
+        ));
+    }
+    for (fill, expected) in [
+        ("through", TargetFill::MakerThrough),
+        ("touch", TargetFill::MakerTouch),
+    ] {
+        let target = format!(
+            "target target.r_multiple_maker@1 fill=text:{fill} max_hold_ms=int:3600000 \
+             r=rate:1.00000000"
+        );
+        let plan = resolve(&parse(&with_lines(&accept_spec(), &[("target", &target)]))).unwrap();
+        assert_eq!(plan.costs().target_fill(), expected);
+        assert_eq!(plan.costs().maker(), rate("0.0002"));
+        assert_eq!(plan.target, rate("1"));
+        assert_eq!(plan.costs().max_hold_ms(), 3_600_000);
+        // A fixed slippage rule reads no book.
+        assert_eq!(plan.book, None);
+    }
+    // The existing rules resolve to the same plan, with the taker target.
+    let plan = resolve(&parse(&accept_spec())).unwrap();
+    assert_eq!(plan.costs().target_fill(), TargetFill::Taker);
+    assert_eq!(plan.costs().slippage(), SlippageRule::Fixed(rate("0")));
+    assert!(!is_book_slippage(parse(&accept_spec()).slippage()));
+    // `is_book_slippage` matches the id and the version of a book row.
+    let unknown = book_spec(&[(
+        "slippage",
+        "slippage slippage.spread@2 book=feature:book.l2@1",
+    )]);
+    assert!(!is_book_slippage(parse(&unknown).slippage()));
+}
+
+#[test]
+fn each_book_and_maker_error_is_its_own() {
+    let spread = "slippage.spread@1".to_owned();
+    let depth = "slippage.depth_walk@1".to_owned();
+    let maker = "target.r_multiple_maker@1".to_owned();
+    let book_param = param("book", ParamKind::BookFeature);
+    let cases: Vec<(&str, String, ResolutionError)> = vec![
+        (
+            "a missing book",
+            book_spec(&[("slippage", "slippage slippage.spread@1")]),
+            ResolutionError::MissingParam {
+                field: SpecField::Slippage,
+                rule: spread.clone(),
+                param: book_param,
+            },
+        ),
+        (
+            "a book of the wrong family",
+            book_spec(&[(
+                "slippage",
+                "slippage slippage.spread@1 book=feature:trade.last_price@1",
+            )]),
+            ResolutionError::WrongFamily {
+                field: SpecField::Slippage,
+                rule: spread.clone(),
+                param: book_param,
+                feature: key("trade.last_price@1"),
+            },
+        ),
+        (
+            "a book of the wrong type",
+            book_spec(&[("slippage", "slippage slippage.spread@1 book=rate:1")]),
+            ResolutionError::WrongType {
+                field: SpecField::Slippage,
+                rule: spread,
+                param: book_param,
+                expected: "feature",
+                found: "rate",
+            },
+        ),
+        (
+            "q = 0",
+            book_spec(&[(
+                "slippage",
+                "slippage slippage.depth_walk@1 book=feature:book.l2@1 qty=qty:0",
+            )]),
+            ResolutionError::OutOfRange {
+                field: SpecField::Slippage,
+                rule: depth.clone(),
+                param: param("qty", ParamKind::PositiveQty),
+                value: SpecValue::Qty(Qty::from_units(0)),
+            },
+        ),
+        (
+            "q of the wrong type",
+            book_spec(&[(
+                "slippage",
+                "slippage slippage.depth_walk@1 book=feature:book.l2@1 qty=rate:1",
+            )]),
+            ResolutionError::WrongType {
+                field: SpecField::Slippage,
+                rule: depth,
+                param: param("qty", ParamKind::PositiveQty),
+                expected: "qty",
+                found: "rate",
+            },
+        ),
+        (
+            "a wrong fill text",
+            with_lines(
+                &accept_spec(),
+                &[(
+                    "target",
+                    "target target.r_multiple_maker@1 fill=text:rest max_hold_ms=int:3600000 \
+                     r=rate:1.00000000",
+                )],
+            ),
+            ResolutionError::OutOfRange {
+                field: SpecField::Target,
+                rule: maker.clone(),
+                param: param("fill", ParamKind::MakerFill),
+                value: SpecValue::Text("rest".into()),
+            },
+        ),
+        (
+            "a missing fill",
+            with_lines(
+                &accept_spec(),
+                &[(
+                    "target",
+                    "target target.r_multiple_maker@1 max_hold_ms=int:3600000 r=rate:1.00000000",
+                )],
+            ),
+            ResolutionError::MissingParam {
+                field: SpecField::Target,
+                rule: maker.clone(),
+                param: param("fill", ParamKind::MakerFill),
+            },
+        ),
+        (
+            "latency not below the maker target's hold",
+            with_lines(
+                &accept_spec(),
+                &[
+                    (
+                        "target",
+                        "target target.r_multiple_maker@1 fill=text:touch max_hold_ms=int:250 \
+                         r=rate:1.00000000",
+                    ),
+                    ("latency", "latency 250"),
+                ],
+            ),
+            ResolutionError::LatencyNotBelowHold {
+                field: SpecField::Target,
+                rule: maker,
+                latency_ms: 250,
+                max_hold_ms: 250,
+            },
+        ),
+    ];
+    let mut seen = Vec::new();
+    for (name, text, expected) in cases {
+        assert_eq!(errors_of(&text), vec![expected.clone()], "{name}");
+        seen.push(expected.to_string());
+    }
+    assert_eq!(
+        seen[1],
+        "slippage: slippage.spread@1: book=feature:trade.last_price@1 is not a book.l2 \
+         feature with a reader (`book=feature:<book.l2 id@N of the features line>`)"
+    );
+    assert_eq!(
+        seen[3],
+        "slippage: slippage.depth_walk@1: qty=qty:0.00000000 is out of range \
+         (`qty=qty:<decimal above 0>`)"
+    );
+    // Every message differs: one mistake, one error.
+    let mut unique = seen.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), seen.len());
+}
+
+#[test]
+fn the_book_readers_cover_the_registered_l2_books() {
+    let registry = catalog::registry();
+    let registered: Vec<FeatureKey> = registry
+        .definitions()
+        .map(|definition| definition.key)
+        .filter(|key| key.id.as_str() == "book.l2")
+        .collect();
+    let readers: Vec<FeatureKey> = BOOK_READERS.iter().map(|(key, _)| *key).collect();
+    assert_eq!(readers, registered);
+    // The plan hands the driver the book of its rule.
+    let plan = resolve(&parse(&book_spec(&[(
+        "slippage",
+        "slippage slippage.spread@1 book=feature:book.l2@1",
+    )])))
+    .unwrap();
+    let state = MarketStateEngine::new().state().clone();
+    assert!(std::ptr::eq(plan.book(&state), &state.book.l2));
+    assert!(std::ptr::eq(book_l2(&state), &state.book.l2));
 }

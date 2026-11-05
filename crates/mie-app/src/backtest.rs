@@ -6,7 +6,9 @@
 //! feeds the domain [`Simulator`] per its driver contract:
 //!
 //! - every accepted event is observed, the prefix included, so the
-//!   staleness of the reference follows the engine (ADR-052 D10);
+//!   staleness of the reference follows the engine (ADR-052 D10), with the
+//!   plan's order book in the engine's state after the event, the book a
+//!   fill trade met (ADR-061 D1);
 //! - in the sample only, each emission of the plan's trigger id goes
 //!   through [`Plan::intents`] to [`Simulator::decide`]; prefix events are
 //!   never evaluated (ADR-060 D4);
@@ -14,8 +16,8 @@
 //!   before the restart event's own step (ADR-060 D9, ADR-052 D4);
 //! - after the drive, the provider's trailing gaps of the trades stream,
 //!   and under `funding.recorded@1` those of the funding stream, are
-//!   checked, observed in canonical order, and the simulator finishes
-//!   (ADR-060 D9).
+//!   checked, observed in canonical order with an unready book, since no
+//!   trade is priced there, and the simulator finishes (ADR-060 D9).
 //!
 //! Simulation only (ADR-010): the records are the prices a resting order
 //! would have met on the recorded trades, never an order. This file and
@@ -26,6 +28,7 @@ use crate::check_trailing_trades_gap;
 use crate::research::{ChainBounds, ChainStep, drive_history};
 use mie_domain::backtest::{FundingRule, Plan, Simulator};
 use mie_domain::event::{FeedGap, MarketEvent, Stream};
+use mie_domain::feature::FeatureValue;
 use mie_domain::research::ExperimentSpec;
 use mie_domain::state::{MarketStateEngine, StateError};
 use mie_domain::time::EventTime;
@@ -95,7 +98,7 @@ where
                         engine,
                         sample,
                     } => {
-                        simulator.observe(event);
+                        simulator.observe(event, plan.book(engine.state()));
                         if event.stream() == Stream::Trades {
                             known = known.max(Some(event.time()));
                         }
@@ -122,8 +125,13 @@ where
             plan.costs().funding() == FundingRule::Recorded,
             known,
         )?;
+        // A gap is no trade, so no fill reads this book.
+        let no_book = FeatureValue::WarmingUp {
+            observed: 0,
+            required: 1,
+        };
         for gap in &gaps {
-            simulator.observe(gap);
+            simulator.observe(gap, &no_book);
         }
         let (records, stats) = simulator.finish();
         Ok(BacktestRun {

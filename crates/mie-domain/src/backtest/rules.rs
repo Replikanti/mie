@@ -1,5 +1,5 @@
-//! The rule registry v1 (ADR-060 D2): resolution of a spec's rule
-//! references, and the evaluation of D3–D5 at each decision.
+//! The rule registry v1 (ADR-060 D2, extended by ADR-061 D3): resolution of
+//! a spec's rule references, and the evaluation of D3–D5 at each decision.
 //!
 //! - *Resolution.* [`resolve`] checks every rule reference of an
 //!   [`ExperimentSpec`] against [`REGISTRY_V1`] and either lists every
@@ -20,12 +20,16 @@
 //!
 //! [`Simulator::decide`]: super::Simulator::decide
 
-use super::{Admission, Costs, FundingRule, Levels, LevelsError, PositionSide, TradeIntent};
+use super::{
+    Admission, Costs, FundingRule, Levels, LevelsError, PositionSide, SlippageRule, TargetFill,
+    TradeIntent,
+};
+use crate::book::OrderBook;
 use crate::candidate::CandidateEvent;
 use crate::event::Aggressor;
-use crate::feature::{FeatureKey, catalog};
+use crate::feature::{FeatureKey, FeatureValue, catalog};
 use crate::location::{AuctionStatus, Region};
-use crate::num::{Price, Rate, SCALE, div_half_even};
+use crate::num::{Price, Qty, Rate, SCALE, div_half_even};
 use crate::order::CanonicalKey;
 use crate::regime::RegimeLabel;
 use crate::research::{ExperimentSpec, RegimeFilter, RuleRef, SpecField, SpecValue};
@@ -55,16 +59,24 @@ pub enum ParamKind {
     Fraction,
     /// `int:<n>` with 1 ≤ n ≤ sample end − start, in ms.
     Hold,
+    /// `feature:<id@N>`: a `book.l2` member of the spec's set that the
+    /// backtest can read (ADR-061 D3).
+    BookFeature,
+    /// `qty:<x>` with x > 0 (ADR-061 D3).
+    PositiveQty,
+    /// `text:through` or `text:touch` (ADR-061 D6).
+    MakerFill,
 }
 
 impl ParamKind {
     /// The type token the value must carry.
     pub const fn type_name(self) -> &'static str {
         match self {
-            Self::TriggerFeature | Self::AtrFeature => "feature",
-            Self::Side => "text",
+            Self::TriggerFeature | Self::AtrFeature | Self::BookFeature => "feature",
+            Self::Side | Self::MakerFill => "text",
             Self::PositiveRate | Self::NonNegativeRate | Self::Fraction => "rate",
             Self::Hold => "int",
+            Self::PositiveQty => "qty",
         }
     }
 
@@ -78,6 +90,9 @@ impl ParamKind {
             Self::NonNegativeRate => "rate:<decimal at or above 0>",
             Self::Fraction => "rate:<decimal from 0, below 1>",
             Self::Hold => "int:<ms from 1 to the sample length>",
+            Self::BookFeature => "feature:<book.l2 id@N of the features line>",
+            Self::PositiveQty => "qty:<decimal above 0>",
+            Self::MakerFill => "text:<through|touch>",
         }
     }
 
@@ -86,6 +101,7 @@ impl ParamKind {
         match self {
             Self::TriggerFeature => "trigger.*",
             Self::AtrFeature => "volatility.atr.* feature with a reader",
+            Self::BookFeature => "book.l2 feature with a reader",
             _ => "",
         }
     }
@@ -107,7 +123,14 @@ impl ParamKind {
                     .map(|_| ())
                     .ok_or(Problem::WrongFamily { feature: *key });
             }
+            (Self::BookFeature, SpecValue::Feature(key)) => {
+                return book_reader(*key)
+                    .map(|_| ())
+                    .ok_or(Problem::WrongFamily { feature: *key });
+            }
             (Self::Side, SpecValue::Text(text)) => SideRule::from_text(text).is_some(),
+            (Self::MakerFill, SpecValue::Text(text)) => TargetFill::from_text(text).is_some(),
+            (Self::PositiveQty, SpecValue::Qty(qty)) => qty.units() > 0,
             (Self::PositiveRate, SpecValue::Rate(rate)) => rate.units() > 0,
             (Self::NonNegativeRate, SpecValue::Rate(rate)) => rate.units() >= 0,
             (Self::Fraction, SpecValue::Rate(rate)) => (0..SCALE).contains(&rate.units()),
@@ -170,7 +193,8 @@ const fn param(name: &'static str, kind: ParamKind) -> ParamSchema {
     ParamSchema { name, kind }
 }
 
-/// The rule registry v1: ADR-060 D2's table, in slot order. `state-filter`
+/// The rule registry v1: ADR-060 D2's table, in slot order, with ADR-061
+/// D3's three rows after the row of their slot each extends. `state-filter`
 /// has no rule (#31), and `regime-filter` stays ADR-040 D1's line.
 pub const REGISTRY_V1: &[RuleSchema] = &[
     RuleSchema {
@@ -219,10 +243,35 @@ pub const REGISTRY_V1: &[RuleSchema] = &[
         ],
     },
     RuleSchema {
+        slot: SpecField::Target,
+        id: "target.r_multiple_maker",
+        version: 1,
+        params: &[
+            param("fill", ParamKind::MakerFill),
+            param("max_hold_ms", ParamKind::Hold),
+            param("r", ParamKind::PositiveRate),
+        ],
+    },
+    RuleSchema {
         slot: SpecField::Slippage,
         id: "slippage.fixed",
         version: 1,
         params: &[param("rate", ParamKind::Fraction)],
+    },
+    RuleSchema {
+        slot: SpecField::Slippage,
+        id: "slippage.spread",
+        version: 1,
+        params: &[param("book", ParamKind::BookFeature)],
+    },
+    RuleSchema {
+        slot: SpecField::Slippage,
+        id: "slippage.depth_walk",
+        version: 1,
+        params: &[
+            param("book", ParamKind::BookFeature),
+            param("qty", ParamKind::PositiveQty),
+        ],
     },
     RuleSchema {
         slot: SpecField::Funding,
@@ -271,6 +320,42 @@ const ATR_READERS: [(FeatureKey, AtrReader); 1] = [(catalog::VOLATILITY_ATR_1H_V
 /// The regime features the backtest reads, with the state field of each.
 const REGIME_READERS: [(FeatureKey, RegimeReader); 1] =
     [(catalog::VOLATILITY_REGIME_1H_V1.key, regime_1h)];
+
+/// Reads one order-book feature from the state (ADR-061 D1).
+type BookReader = fn(&MarketState) -> &FeatureValue<OrderBook>;
+
+fn book_l2(state: &MarketState) -> &FeatureValue<OrderBook> {
+    &state.book.l2
+}
+
+/// The order-book features a book slippage rule reads, with the state
+/// field of each (ADR-061 D3). The `book=` family check is membership
+/// here, so a book feature registered later is refused until it gets a
+/// reader.
+const BOOK_READERS: [(FeatureKey, BookReader); 1] = [(catalog::BOOK_L2_V1.key, book_l2)];
+
+fn book_reader(key: FeatureKey) -> Option<BookReader> {
+    BOOK_READERS
+        .iter()
+        .find(|(feature, _)| *feature == key)
+        .map(|&(_, read)| read)
+}
+
+/// Whether `rule`, the rule of a spec's `slippage` line, is a book
+/// slippage rule of the registry: a row with a `book=` parameter (ADR-061
+/// D3). Under one, every `trade` line of a result carries the slipped
+/// fills (D5).
+pub fn is_book_slippage(rule: &RuleRef) -> bool {
+    REGISTRY_V1.iter().any(|schema| {
+        schema.slot == SpecField::Slippage
+            && schema.id == rule.id()
+            && schema.version == rule.version()
+            && schema
+                .params
+                .iter()
+                .any(|param| param.kind == ParamKind::BookFeature)
+    })
+}
 
 fn atr_reader(key: FeatureKey) -> Option<AtrReader> {
     ATR_READERS
@@ -625,10 +710,14 @@ pub struct Plan {
     side: SideRule,
     /// The invalidation rule (D5).
     invalidation: Invalidation,
-    /// k > 0 of `target.r_multiple@1`.
+    /// k > 0 of `target.r_multiple@1` or `target.r_multiple_maker@1`.
     target: Rate,
-    /// Latency, hold, slippage, taker fee and funding (D2, D6, D7).
+    /// Latency, hold, slippage, fees, the target fill and funding (D2, D6,
+    /// D7; ADR-061 D3, D6).
     costs: Costs,
+    /// The `book=` feature of a book slippage rule (ADR-061 D3); `None`
+    /// under `slippage.fixed@1`.
+    book: Option<FeatureKey>,
     /// The regime features of the spec's set, in id order (D11, D12).
     regime_features: Vec<FeatureKey>,
     /// The spec's regime filters (ADR-040 D1).
@@ -677,6 +766,13 @@ impl<'a> Checked<'a> {
     fn text(&self, name: &str) -> Option<&'a str> {
         match self.value(name)? {
             SpecValue::Text(text) => Some(text),
+            _ => None,
+        }
+    }
+
+    fn qty(&self, name: &str) -> Option<Qty> {
+        match self.value(name)? {
+            SpecValue::Qty(qty) => Some(*qty),
             _ => None,
         }
     }
@@ -793,7 +889,7 @@ impl Resolver {
 ///
 /// Never: a plan is built only when no error was found, a rule without an
 /// error has every value, and once every range is checked [`Costs::new`]
-/// cannot refuse them.
+/// cannot refuse them (the fee range is the spec's own, ADR-040 D1).
 pub fn resolve(spec: &ExperimentSpec) -> Result<Plan, Vec<ResolutionError>> {
     let sample = spec.sample();
     let mut resolver = Resolver {
@@ -874,13 +970,28 @@ pub fn resolve(spec: &ExperimentSpec) -> Result<Plan, Vec<ResolutionError>> {
     let target = checked
         .as_ref()
         .and_then(Checked::resolved)
-        .and_then(|checked| Some((checked.rate("r")?, checked.int("max_hold_ms")?)));
+        .and_then(|checked| {
+            let fill = match checked.schema.id {
+                "target.r_multiple" => TargetFill::Taker,
+                "target.r_multiple_maker" => TargetFill::from_text(checked.text("fill")?)?,
+                _ => return None,
+            };
+            Some((checked.rate("r")?, checked.int("max_hold_ms")?, fill))
+        });
 
     let slippage = resolver.check(SpecField::Slippage, spec.slippage());
     let slippage = slippage
         .as_ref()
         .and_then(Checked::resolved)
-        .and_then(|checked| checked.rate("rate"));
+        .and_then(|checked| match checked.schema.id {
+            "slippage.fixed" => Some((SlippageRule::Fixed(checked.rate("rate")?), None)),
+            "slippage.spread" => Some((SlippageRule::Spread, Some(checked.feature("book")?))),
+            "slippage.depth_walk" => Some((
+                SlippageRule::DepthWalk(checked.qty("qty")?),
+                Some(checked.feature("book")?),
+            )),
+            _ => None,
+        });
 
     let funding = resolver.check(SpecField::Funding, spec.funding());
     let funding = funding
@@ -896,15 +1007,17 @@ pub fn resolve(spec: &ExperimentSpec) -> Result<Plan, Vec<ResolutionError>> {
         return Err(resolver.errors);
     }
     // Every rule passed its checks, so every value is present.
-    let (r, max_hold_ms) = target.expect("the target resolved");
+    let (r, max_hold_ms, fill) = target.expect("the target resolved");
+    let (slippage, book) = slippage.expect("the slippage resolved");
     let costs = Costs::new(
         latency_ms,
         max_hold_ms,
-        slippage.expect("the slippage resolved"),
-        spec.fees().taker,
+        slippage,
+        spec.fees(),
+        fill,
         funding.expect("the funding resolved"),
     )
-    .expect("resolution checked every cost range");
+    .expect("resolution and the spec's fee range checked every cost range");
     debug_assert!(location.is_some(), "the location resolved");
     Ok(Plan {
         trigger: trigger.expect("the trigger resolved"),
@@ -912,6 +1025,7 @@ pub fn resolve(spec: &ExperimentSpec) -> Result<Plan, Vec<ResolutionError>> {
         invalidation: invalidation.expect("the invalidation resolved"),
         target: r,
         costs,
+        book,
         regime_features,
         regime_filters: spec.regime_filters().to_vec(),
     })
@@ -1008,6 +1122,17 @@ impl Plan {
     /// [`TradeIntent::regime`] carries (ADR-060 D11, D12).
     pub fn regime_features(&self) -> &[FeatureKey] {
         &self.regime_features
+    }
+
+    /// The order book the plan's fills read in `state`, for
+    /// [`Simulator::observe`](super::Simulator::observe) (ADR-061 D1): the
+    /// `book=` feature of a book slippage rule. Under `slippage.fixed@1` no
+    /// fill reads a book, and this is `book.l2@1`.
+    pub fn book<'s>(&self, state: &'s MarketState) -> &'s FeatureValue<OrderBook> {
+        // A plan holds only a readable book feature (`resolve`).
+        self.book
+            .and_then(book_reader)
+            .map_or(&state.book.l2, |read| read(state))
     }
 
     /// One intent per emission of the plan's trigger id in `triggers`, in

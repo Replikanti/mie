@@ -509,6 +509,7 @@ fn closed_trade(decision: i64) -> TradeRecord {
         displacement: r(0),
         mfe: r(200_000_000),
         mae: r(0),
+        slipped: None,
     }
 }
 

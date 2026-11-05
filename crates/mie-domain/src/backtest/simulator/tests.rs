@@ -3,6 +3,7 @@ use crate::backtest::{CostsError, LevelsError, PositionSide, SkipCounts};
 use crate::event::samples::{mark, settlement, t};
 use crate::event::{Aggressor, FeedGap, GapReason, Trade};
 use crate::num::Qty;
+use crate::research::FeeSchedule;
 
 /// A decimal price in USDT.
 fn usd(text: &str) -> Price {
@@ -33,6 +34,8 @@ fn gap(stream: Stream, start: i64, end: i64) -> MarketEvent {
     })
 }
 
+/// Fixed slippage, a taker target and a maker fee of 0, which no taker leg
+/// reads.
 pub(in crate::backtest) fn costs(
     latency_ms: u32,
     max_hold_ms: i64,
@@ -43,11 +46,24 @@ pub(in crate::backtest) fn costs(
     Costs::new(
         latency_ms,
         max_hold_ms,
-        rate(slippage),
-        rate(taker),
+        SlippageRule::Fixed(rate(slippage)),
+        FeeSchedule {
+            maker: Rate::from_units(0),
+            taker: rate(taker),
+        },
+        TargetFill::Taker,
         funding,
     )
     .unwrap()
+}
+
+/// No book: what the driver passes for an event no fill reads, and what a
+/// fill under `slippage.fixed@1` never reads.
+pub(in crate::backtest) fn no_book() -> FeatureValue<OrderBook> {
+    FeatureValue::WarmingUp {
+        observed: 0,
+        required: 1,
+    }
 }
 
 /// No latency, a 1 000 ms hold, no slippage, no fee, recorded funding.
@@ -75,6 +91,8 @@ struct Run {
     simulator: Simulator,
     decision: Option<CanonicalKey>,
     last_price: Option<Price>,
+    /// The `book.l2@1` the next events see (ADR-061 D1).
+    book: FeatureValue<OrderBook>,
 }
 
 impl Run {
@@ -83,7 +101,14 @@ impl Run {
             simulator: Simulator::new(costs),
             decision: None,
             last_price: None,
+            book: no_book(),
         }
+    }
+
+    /// Sets the book the next events see.
+    fn book(&mut self, book: FeatureValue<OrderBook>) -> &mut Self {
+        self.book = book;
+        self
     }
 
     fn on(&mut self, event: MarketEvent) -> &mut Self {
@@ -91,7 +116,7 @@ impl Run {
             self.last_price = Some(trade.price);
         }
         self.decision = Some(event.canonical_key());
-        self.simulator.observe(&event);
+        self.simulator.observe(&event, &self.book);
         self
     }
 
@@ -178,6 +203,7 @@ fn record(
         displacement: None,
         mfe: None,
         mae: None,
+        slipped: None,
     }
 }
 
@@ -1052,13 +1078,26 @@ fn contract_violating_gaps_censor_without_panicking() {
 
 #[test]
 fn costs_refuse_values_outside_their_domain() {
-    let new = |latency, hold, slippage, taker| {
+    let with = |latency, hold, slippage, taker, maker| {
         Costs::new(
             latency,
             hold,
-            rate(slippage),
-            rate(taker),
+            slippage,
+            FeeSchedule {
+                maker: rate(maker),
+                taker: rate(taker),
+            },
+            TargetFill::MakerThrough,
             FundingRule::None,
+        )
+    };
+    let new = |latency, hold, slippage, taker| {
+        with(
+            latency,
+            hold,
+            SlippageRule::Fixed(rate(slippage)),
+            taker,
+            "0",
         )
     };
     assert_eq!(new(0, 1_000, "-0.00000001", "0"), Err(CostsError::Slippage));
@@ -1067,16 +1106,45 @@ fn costs_refuse_values_outside_their_domain() {
     assert_eq!(new(0, 1_000, "0", "1"), Err(CostsError::Taker));
     assert_eq!(new(0, 0, "0", "0"), Err(CostsError::MaxHold));
     assert_eq!(new(1_000, 1_000, "0", "0"), Err(CostsError::Latency));
+    let depth = |units| SlippageRule::DepthWalk(Qty::from_units(units));
+    assert_eq!(
+        with(0, 1_000, depth(0), "0", "0"),
+        Err(CostsError::DepthQty)
+    );
+    assert_eq!(
+        with(0, 1_000, depth(-1), "0", "0"),
+        Err(CostsError::DepthQty)
+    );
+    assert_eq!(with(0, 1_000, depth(1), "0", "1"), Err(CostsError::Maker));
+    assert_eq!(
+        with(0, 1_000, depth(1), "0", "-0.00000001"),
+        Err(CostsError::Maker)
+    );
+    // In argument order: the slippage before the fees.
+    assert_eq!(with(0, 0, depth(0), "1", "1"), Err(CostsError::DepthQty));
     let edge = new(0, 1, "0.99999999", "0.99999999").unwrap();
     assert_eq!(
         (edge.latency_ms(), edge.max_hold_ms(), edge.funding()),
         (0, 1, FundingRule::None)
     );
     assert_eq!(
-        (edge.slippage(), edge.taker()),
-        (rate("0.99999999"), rate("0.99999999"))
+        (edge.slippage(), edge.taker(), edge.maker()),
+        (
+            SlippageRule::Fixed(rate("0.99999999")),
+            rate("0.99999999"),
+            rate("0")
+        )
     );
+    assert_eq!(edge.target_fill(), TargetFill::MakerThrough);
     assert!(new(999, 1_000, "0", "0").is_ok());
+    let book = with(0, 1_000, depth(1), "0", "0.99999999").unwrap();
+    assert_eq!(
+        (book.slippage(), book.maker()),
+        (depth(1), rate("0.99999999"))
+    );
+    assert!(book.slippage().is_book());
+    assert!(SlippageRule::Spread.is_book());
+    assert!(!SlippageRule::Fixed(rate("0")).is_book());
 }
 
 #[test]
@@ -1134,5 +1202,466 @@ fn the_names_are_the_trade_line_tokens() {
             "funding_gap",
             "overflow"
         ]
+    );
+}
+
+// ---------------------------------------------------------------------
+// ADR-061 D4, D6: fills priced on the book, the maker target
+// ---------------------------------------------------------------------
+
+/// A ready book from one snapshot, `(price, qty)` in USDT and BTC.
+fn book_of(bids: &[(&str, &str)], asks: &[(&str, &str)]) -> FeatureValue<OrderBook> {
+    let levels = |pairs: &[(&str, &str)]| -> Vec<crate::event::Level> {
+        pairs
+            .iter()
+            .map(|&(price, qty)| crate::event::Level {
+                price: usd(price),
+                qty: qty.parse().unwrap(),
+            })
+            .collect()
+    };
+    let mut book = OrderBook::new();
+    book.apply(&MarketEvent::BookSnapshot(crate::event::BookSnapshot {
+        time: t(0),
+        last_update_id: 1,
+        bids: levels(bids),
+        asks: levels(asks),
+    }));
+    FeatureValue::Ready(book)
+}
+
+/// The book at the entry: bids 99.9 × 1, 99.8 × 2; asks 100.1 × 1,
+/// 100.2 × 2.
+fn entry_book() -> FeatureValue<OrderBook> {
+    book_of(
+        &[("99.9", "1"), ("99.8", "2")],
+        &[("100.1", "1"), ("100.2", "2")],
+    )
+}
+
+/// The book at the exit: bids 103.9 × 1, 103.8 × 2; asks 104.1 × 1,
+/// 104.2 × 2.
+fn exit_book() -> FeatureValue<OrderBook> {
+    book_of(
+        &[("103.9", "1"), ("103.8", "2")],
+        &[("104.1", "1"), ("104.2", "2")],
+    )
+}
+
+fn with_slippage(slippage: SlippageRule) -> Costs {
+    Costs {
+        slippage,
+        ..costs(0, 1_000, "0", "0.0005", FundingRule::Recorded)
+    }
+}
+
+fn depth_walk(qty: &str) -> SlippageRule {
+    SlippageRule::DepthWalk(qty.parse().unwrap())
+}
+
+/// The book tape: a long decided at #1 (0 ms, 100) with levels 98 / 104
+/// and R = 2, the entry fill trade #2 (10 ms, e = 100.0) on
+/// [`entry_book`], the touch #3 (20 ms, 104) and the exit fill trade #4
+/// (30 ms, x = 104.0) on [`exit_book`]. Taker 0.0005, no funding.
+fn book_run(
+    costs: Costs,
+    entry: FeatureValue<OrderBook>,
+    exit: FeatureValue<OrderBook>,
+) -> TradeRecord {
+    let mut run = Run::new(costs);
+    run.on(trade(0, 1, "100"))
+        .decide(long("100", "98", "104"))
+        .book(entry)
+        .on(trade(10, 2, "100.0"))
+        .book(exit)
+        .on(trade(20, 3, "104"))
+        .on(trade(30, 4, "104.0"));
+    run.only()
+}
+
+/// Three book-rule trades for the text tests: the [`book_run`] tape's
+/// spread exit, then `no_book` at an entry fill trade (50 ms) and at an exit
+/// fill trade (90 ms).
+pub(in crate::backtest) fn book_fixture() -> (Vec<TradeRecord>, SimulationStats) {
+    let mut run = Run::new(with_slippage(SlippageRule::Spread));
+    run.on(trade(0, 1, "100"))
+        .decide(long("100", "98", "104"))
+        .book(entry_book())
+        .on(trade(10, 2, "100.0"))
+        .book(exit_book())
+        .on(trade(20, 3, "104"))
+        .on(trade(30, 4, "104.0"))
+        .on(trade(40, 5, "100"))
+        .decide(long("100", "98", "104"))
+        .book(no_book())
+        .on(trade(50, 6, "100"))
+        .on(trade(60, 7, "100"))
+        .decide(long("100", "98", "104"))
+        .book(entry_book())
+        .on(trade(70, 8, "100.0"))
+        .on(trade(80, 9, "104"))
+        .book(no_book())
+        .on(trade(90, 10, "104"))
+        .on(trade(100, 11, "100"));
+    run.finish()
+}
+
+/// The book tape's record without its values, which each test sets.
+fn book_record() -> TradeRecord {
+    TradeRecord {
+        entry: fill(10, "100"),
+        exit: Exit::Target,
+        exit_at: t(20),
+        fill: fill(30, "104"),
+        funding: Some(usd("0")),
+        gross: r("2"),
+        displacement: r("0"),
+        mfe: r("2"),
+        mae: r("0"),
+        ..record(key(0, 1), PositionSide::Long, ["100", "98", "104", "2"])
+    }
+}
+
+/// **Spread** (D2): the long buys from e = 100.0 and meets the asks at or
+/// above it: E′ = 100.1, entry fee ⟨0.0005 × 100.1⟩ = 0.05005. It sells
+/// from x = 104.0 into the bids at or below it: X′ = 103.9, fee 0.05195.
+/// Gross stays on trade prices, (104 − 100) / 2 = 2; net = (103.9 − 100.1 −
+/// 0.05005 − 0.05195) / 2 = 3.698 / 2 = 1.849. MFE 4 / 2 = 2, MAE 0.
+#[test]
+fn spread_slippage_prices_both_legs_on_the_book() {
+    let record = book_run(
+        with_slippage(SlippageRule::Spread),
+        entry_book(),
+        exit_book(),
+    );
+    assert_eq!(
+        record,
+        TradeRecord {
+            net: r("1.849"),
+            slipped: Some(SlippedFills {
+                entry: Some(usd("100.1")),
+                exit: Some(usd("103.9")),
+            }),
+            ..book_record()
+        }
+    );
+}
+
+/// **Depth walk at q = 1.5** (D2), crossing a level on both legs:
+/// - E′ = (1 × 100.1 + 0.5 × 100.2) / 1.5 = 150.2 / 1.5 = 100.133333… →
+///   100.13333333; fee ⟨0.0005 × E′⟩ = 0.050066666… → 0.05006667;
+/// - X′ = (1 × 103.9 + 0.5 × 103.8) / 1.5 = 155.8 / 1.5 = 103.866666… →
+///   103.86666667; fee 0.051933333… → 0.05193333;
+/// - net = (103.86666667 − 100.13333333 − 0.05006667 − 0.05193333) / 2 =
+///   3.63133334 / 2 = 1.81566667.
+#[test]
+fn depth_walk_slippage_walks_the_levels_for_its_size() {
+    let record = book_run(with_slippage(depth_walk("1.5")), entry_book(), exit_book());
+    assert_eq!(
+        record,
+        TradeRecord {
+            net: r("1.81566667"),
+            slipped: Some(SlippedFills {
+                entry: Some(usd("100.13333333")),
+                exit: Some(usd("103.86666667")),
+            }),
+            ..book_record()
+        }
+    );
+}
+
+/// The cost direction of the book rules (#172 acceptance 2, as in S2):
+/// spread costs more than fixed 0 where the opposite best lies beyond the
+/// print; a larger size never costs less, and strictly more once it
+/// crosses a level; a size the first reachable level holds equals the
+/// spread. Only net R and the slipped fills move.
+#[test]
+fn book_costs_lower_net_r_in_the_direction_of_size() {
+    let fixed = book_run(
+        with_slippage(SlippageRule::Fixed(rate("0"))),
+        entry_book(),
+        exit_book(),
+    );
+    // Fixed 0: (104 − 100 − 0.05 − 0.052) / 2 = 1.949, and no slipped fills.
+    assert_eq!(
+        fixed,
+        TradeRecord {
+            net: r("1.949"),
+            ..book_record()
+        }
+    );
+    let spread = book_run(
+        with_slippage(SlippageRule::Spread),
+        entry_book(),
+        exit_book(),
+    );
+    assert!(spread.net < fixed.net);
+    let nets: Vec<Rate> = ["0.5", "1", "1.5", "2", "3"]
+        .into_iter()
+        .map(|q| {
+            let record = book_run(with_slippage(depth_walk(q)), entry_book(), exit_book());
+            // Costs move fills, never levels, exits or gross (ADR-060 D5).
+            assert_eq!(
+                TradeRecord {
+                    net: None,
+                    slipped: None,
+                    ..record.clone()
+                },
+                TradeRecord {
+                    net: None,
+                    ..book_record()
+                },
+                "{q}"
+            );
+            record.net.unwrap()
+        })
+        .collect();
+    assert_eq!(
+        nets,
+        ["1.849", "1.849", "1.81566667", "1.799", "1.78233333"].map(rate)
+    );
+    assert!(nets.windows(2).all(|w| w[1] <= w[0]));
+    // q = 1 is the first level's size: the spread.
+    assert_eq!(Some(nets[1]), spread.net);
+    // q = 1.5 crosses the first level: strictly dearer.
+    assert!(nets[2] < nets[1]);
+}
+
+/// D4: a fill the book cannot price censors the trade outright, `no_book`,
+/// at the fill trade. At the entry the line keeps no entry (c is the entry
+/// fill trade itself); at the exit it keeps the entry and E′.
+#[test]
+fn an_unpriced_fill_censors_no_book_at_the_fill_trade() {
+    let spread = with_slippage(SlippageRule::Spread);
+    // Entry: no book yet.
+    let at_entry = book_run(spread, no_book(), exit_book());
+    assert_eq!(
+        at_entry,
+        TradeRecord {
+            exit: Exit::Censored(CensorReason::NoBook),
+            exit_at: t(10),
+            slipped: Some(SlippedFills {
+                entry: None,
+                exit: None,
+            }),
+            ..record(key(0, 1), PositionSide::Long, ["100", "98", "104", "2"])
+        }
+    );
+    // Exit: a one-sided book (no bids), and a size beyond the window.
+    let one_sided = book_of(&[], &[("104.1", "1")]);
+    for (costs, exit) in [
+        (spread, one_sided),
+        (with_slippage(depth_walk("3.5")), exit_book()),
+    ] {
+        let entry = book_run(costs, entry_book(), exit);
+        let expected = |slipped: &str| TradeRecord {
+            exit: Exit::Censored(CensorReason::NoBook),
+            exit_at: t(30),
+            fill: None,
+            funding: None,
+            gross: None,
+            net: None,
+            mfe: r("2"),
+            slipped: Some(SlippedFills {
+                entry: Some(usd(slipped)),
+                exit: None,
+            }),
+            ..book_record()
+        };
+        if costs.slippage() == SlippageRule::Spread {
+            assert_eq!(entry, expected("100.1"));
+        } else {
+            // q = 3.5 exceeds the 3 BTC of the entry window too.
+            assert_eq!(entry.exit, Exit::Censored(CensorReason::NoBook));
+            assert_eq!(entry.exit_at, t(10));
+        }
+    }
+    // A crossed book at the entry.
+    let crossed = book_of(&[("100.2", "1")], &[("100.1", "1")]);
+    let record = book_run(spread, crossed, exit_book());
+    assert_eq!(
+        (record.exit, record.exit_at),
+        (Exit::Censored(CensorReason::NoBook), t(10))
+    );
+    // A fixed rule never reads the book, not even an unready one.
+    let fixed = book_run(
+        with_slippage(SlippageRule::Fixed(rate("0"))),
+        no_book(),
+        no_book(),
+    );
+    assert_eq!(fixed.exit, Exit::Target);
+}
+
+fn maker(fill: TargetFill) -> Costs {
+    Costs {
+        fees: FeeSchedule {
+            maker: rate("0.0002"),
+            taker: rate("0.0005"),
+        },
+        target: fill,
+        ..costs(0, 1_000, "0", "0.0005", FundingRule::Recorded)
+    }
+}
+
+/// A long decided at #1 (0 ms, 100), levels 98 / 104, R = 2, entry fill
+/// #2 (10 ms, e = 100), then `path` from 20 ms on, one trade per 10 ms.
+fn maker_run(costs: Costs, path: &[&str]) -> TradeRecord {
+    let mut run = Run::new(costs);
+    run.on(trade(0, 1, "100"))
+        .decide(long("100", "98", "104"))
+        .on(trade(10, 2, "100"));
+    for (index, price) in (3..).zip(path) {
+        run.on(trade(i64::try_from(index - 1).unwrap() * 10, index, price));
+    }
+    run.only()
+}
+
+/// A maker target exit on the maker tape: filled at T = 104 by the trade
+/// at `at`, which printed `print`. Fixed slippage 0: E′ = 100, entry fee
+/// ⟨0.0005 × 100⟩ = 0.05; X′ = T = 104, fee ⟨0.0002 × 104⟩ = 0.0208.
+/// gross = (104 − 100) / 2 = 2 on the target, not the print; net = (104 −
+/// 100 − 0.05 − 0.0208) / 2 = 3.9292 / 2 = 1.9646.
+fn maker_exit(at: i64, print: &str, mfe: &str) -> TradeRecord {
+    TradeRecord {
+        entry: fill(10, "100"),
+        exit: Exit::Target,
+        exit_at: t(at),
+        fill: fill(at, print),
+        funding: Some(usd("0")),
+        gross: r("2"),
+        net: r("1.9646"),
+        displacement: r("0"),
+        mfe: r(mfe),
+        mae: r("0"),
+        ..record(key(0, 1), PositionSide::Long, ["100", "98", "104", "2"])
+    }
+}
+
+/// D6 on one path: #3 at 20 ms prints at T = 104, #4 at 30 ms 0.1 beyond,
+/// #5 at 40 ms makes #4 final (D9: a maker exit's `exit_at` is its fill
+/// trade, and the exit stands only before the censor time, here the end
+/// of data at 40). `through` waits for the print beyond and `touch` takes
+/// the print at T, both filling at T with no slippage and the maker fee.
+/// The taker target touches at #3 and fills at #4's 104.1: gross (104.1 −
+/// 100) / 2 = 2.05, net (104.1 − 100 − 0.05 − 0.05205) / 2 = 3.99795 / 2
+/// = 1.998975.
+#[test]
+fn the_maker_target_fills_through_or_at_a_touch() {
+    let path = ["104", "104.1", "104.1"];
+    assert_eq!(
+        maker_run(maker(TargetFill::MakerThrough), &path),
+        maker_exit(30, "104.1", "2.05")
+    );
+    assert_eq!(
+        maker_run(maker(TargetFill::MakerTouch), &path),
+        maker_exit(20, "104", "2")
+    );
+    let taker = maker_run(maker(TargetFill::Taker), &path);
+    assert_eq!(
+        taker,
+        TradeRecord {
+            exit_at: t(20),
+            fill: fill(30, "104.1"),
+            gross: r("2.05"),
+            net: r("1.998975"),
+            mfe: r("2.05"),
+            ..maker_exit(20, "104", "2")
+        }
+    );
+}
+
+/// `through` fills are a subset of `touch` fills (D6): on a path that only
+/// touches T, `touch` exits at the target while `through` rides on to the
+/// stop: the touch #5 at 40 ms (97.5 ≤ 98) and the stop's taker fill #6 at
+/// 50 ms, x = 97.6.
+#[test]
+fn a_touch_that_never_trades_through_fills_only_the_touch_rule() {
+    let path = ["104", "103", "97.5", "97.6"];
+    assert_eq!(
+        maker_run(maker(TargetFill::MakerTouch), &path),
+        maker_exit(20, "104", "2")
+    );
+    let through = maker_run(maker(TargetFill::MakerThrough), &path);
+    assert_eq!((through.exit, through.exit_at), (Exit::Stop, t(40)));
+    assert_eq!(through.fill, fill(50, "97.6"));
+    // The stop is a taker leg: fee ⟨0.0005 × 97.6⟩ = 0.0488, net = (97.6 −
+    // 100 − 0.05 − 0.0488) / 2 = −2.4988 / 2 = −1.2494.
+    assert_eq!(through.net, r("-1.2494"));
+}
+
+/// A maker fill on the last trade of the data is not final: its fill trade
+/// is at the end-of-data censor time, so it is censored like a touch there
+/// (D9), under `through` and `touch` alike.
+#[test]
+fn a_maker_fill_at_the_end_of_data_is_censored() {
+    for fill in [TargetFill::MakerThrough, TargetFill::MakerTouch] {
+        let record = maker_run(maker(fill), &["104.1"]);
+        assert_eq!(
+            (record.exit, record.exit_at),
+            (Exit::Censored(CensorReason::EndOfData), t(20)),
+            "{fill:?}"
+        );
+    }
+}
+
+/// D6's maker effect: a post-touch trade at T itself. The taker target
+/// sells at x = 104 and pays ⟨0.0005 × 104⟩ = 0.052: net (4 − 0.05 −
+/// 0.052) / 2 = 1.949. The `touch` maker fill pays 0.0208: 1.9646.
+#[test]
+fn a_maker_fill_beats_the_taker_exit_at_the_same_price() {
+    let path = ["104", "104"];
+    let taker = maker_run(maker(TargetFill::Taker), &path);
+    assert_eq!(taker.net, r("1.949"));
+    let touch = maker_run(maker(TargetFill::MakerTouch), &path);
+    assert_eq!(touch, maker_exit(20, "104", "2"));
+    assert!(touch.net > taker.net);
+    // `through` never sees a print beyond T here: the trade ends unknown.
+    let through = maker_run(maker(TargetFill::MakerThrough), &path);
+    assert_eq!(through.exit, Exit::Censored(CensorReason::EndOfData));
+}
+
+/// D6: a target at or behind the entry fill price is marketable when
+/// placed, so it exits as ADR-060 D6's taker touch at the next trade, with
+/// the taker fee and slippage, under either maker rule.
+#[test]
+fn a_maker_target_behind_the_entry_fill_exits_as_a_taker() {
+    let run = |costs| {
+        let mut run = Run::new(costs);
+        run.on(trade(0, 1, "100"))
+            .decide(long("100", "98", "104"))
+            .on(trade(10, 2, "104.5"))
+            .on(trade(20, 3, "104.2"));
+        run.only()
+    };
+    let taker = run(maker(TargetFill::Taker));
+    assert_eq!((taker.exit, taker.exit_at), (Exit::Target, t(10)));
+    assert_eq!(taker.fill, fill(20, "104.2"));
+    for fill in [TargetFill::MakerThrough, TargetFill::MakerTouch] {
+        assert_eq!(run(maker(fill)), taker, "{fill:?}");
+    }
+}
+
+/// The maker exit's line under a book rule: X′ is the target, E′ the
+/// book's (D5, D6).
+#[test]
+fn a_maker_exit_under_a_book_rule_records_the_target_as_x_prime() {
+    let costs = Costs {
+        slippage: SlippageRule::Spread,
+        ..maker(TargetFill::MakerTouch)
+    };
+    let record = book_run(costs, entry_book(), exit_book());
+    // E′ = 100.1 (fee 0.05005), X′ = T = 104 (fee 0.0208) at the touch #3:
+    // net = (104 − 100.1 − 0.05005 − 0.0208) / 2 = 3.82915 / 2 = 1.914575.
+    assert_eq!(
+        record,
+        TradeRecord {
+            fill: fill(20, "104"),
+            net: r("1.914575"),
+            slipped: Some(SlippedFills {
+                entry: Some(usd("100.1")),
+                exit: Some(usd("104")),
+            }),
+            ..book_record()
+        }
     );
 }
