@@ -3,13 +3,17 @@
 - Status: proposed
 - Date: 2026-11-05
 
-Relation to earlier ADRs: this ADR supersedes nothing. It builds on
-ADR-030 (the immutable raw store and its dataset version), ADR-032 D5 and
-D10 (the seed lookback, the seal cadence), ADR-039 (replay over the raw
-store) and ADR-052 (the history chain from a fixed origin). No status line
-changes: the CLAUDE.md invariant 4, `docs/data-availability.md` and the
-accepted ADRs stay as they are until the follow-up implements D5–D7 and
-D11.
+Relation to earlier ADRs: this ADR supersedes one point of ADR-034 D4:
+an archive file's import entry can be superseded by a later one (D11,
+*Held archive parts and their resolution*), where ADR-034 D4 has exactly
+one immutable entry per archive file. ADR-034 keeps its status line until
+the follow-up PR that implements this changes the importer, as ADR-052
+does for the ADRs it supersedes. It builds on ADR-030 (the immutable raw
+store and its dataset version), ADR-032 D5 and D10 (the seed lookback,
+the seal cadence), ADR-039 (replay over the raw store) and ADR-052 (the
+history chain from a fixed origin). The CLAUDE.md invariant 4,
+`docs/data-availability.md` and the other accepted ADRs stay as they are
+until the follow-up implements D5–D7 and D11.
 
 The decisions record the #134 plan
 (<https://github.com/Replikanti/mie/issues/134#issuecomment-6660674077>)
@@ -171,8 +175,10 @@ live in more than one root (approved as written at STOP 1).
   manifest and in every dataset version (ADR-030, the `file <path> <rows>
   <sha256>` lines). Its bytes, its manifest and its relative path never
   change, and it is never removed from the union of the roots. The one
-  exception is an archive part that no import entry lists, found by the
-  hot restore: it is quarantined, never deleted (D11).
+  exception is the *replace* resolution of a held archive part (D11): the
+  part moves to a quarantine directory, is never deleted, and every
+  selection that covers it fails until the re-import's entry replaces it,
+  so no selection silently loses it.
 - **The copy protocol.** A copy writes the data and the manifest to the
   destination under hidden temp names, fsyncs them and verifies the
   SHA-256 against the manifest. It publishes the manifest last, because "a
@@ -199,7 +205,7 @@ live in more than one root (approved as written at STOP 1).
   (`recovery.rs`). A partition split across tiers could reuse a part
   number.
 - **Part numbers come from the union.** The writer's next part number is the
-  highest part that hot *or* the copy ledger (including its lost and
+  highest part that hot *or* the copy ledger (including its lost, held and
   quarantined entries, D7) knows for the partition, plus one. Why: today
   `open_part` counts only the local partition, so a hot that lost a
   partition (a hot failure, an incomplete restore, D11) would number a new
@@ -271,11 +277,15 @@ live in more than one root (approved as written at STOP 1).
 - **One multi-root store** in `mie-adapter-parquet` sits behind the
   unchanged `RawRecordSource` port.
   - `select` enumerates the hot partitions as today, plus **every file
-    the copy ledger records** (its manifest records and lost entries,
-    never a quarantined file, D11),
+    the copy ledger records** (its manifest records and lost entries),
     whatever the partition's state (on hot, removed, returned), and merges
     them by `relative_path`. A file in both is the same file (D5). It never
-    lists a cold root.
+    lists a cold root. A selection that covers a held archive file (D11),
+    or a quarantined one whose replacement entry does not exist yet, fails
+    with `Integrity` naming the file and the resolution step, like a lost
+    file; it is never answered shorter. A quarantined file whose
+    replacement entry exists is not listed: the re-import's parts replace
+    it.
   - Why every file and not only the removed partitions: a partition also
     reappears on hot gradually, file by file, in a recall (D6) and in the
     hot restore's step 3 (D11). A `select` that lists hot in the middle of
@@ -657,8 +667,8 @@ What breaks:
   import that seals several parts of one file (a large `trades` or
   `aggTrades` day, ADR-034 D5's row and byte limits) writes its entry only
   at the end. Parts that reach cold before their entry, followed by a hot
-  loss, are parts that no entry lists; the hot restore must quarantine
-  them and halt the importer (step 5). Holding parts until their entry
+  loss, are parts that no entry lists; the hot restore must hold them
+  and halt the importer (step 5). Holding parts until their entry
   exists limits that to the one file whose parts and entry a loss
   separates within a single pass. A replicated `PENDING` does not help:
   the marker is rewritten for every file and removed at the end, so a cold
@@ -714,28 +724,48 @@ What breaks:
      root listing and the cross-check with the restored journals and import
      ledger add the records lost with the ledger tail, and step 5 marks only
      the partitions that are still off hot after step 3.
-  5. **Archive findings never stop the restore.** Archive parts that no
-     restored import-ledger entry lists (under the replication rule above,
-     at most the parts of the one file whose entry copy the loss
-     interrupted), conflicting import-ledger entries, and archive paths
-     with differing bytes on two roots are not resolved here. The parts
-     concerned are quarantined (below), every finding is written to the
-     copy ledger, and the importer refuses to run until the explicit
-     resolution step has handled each. Live-source findings (a damaged
-     journal, differing copies of a live file) still stop the restore,
-     because nothing can replace live data and a wrong guess would change
-     it. The restore makes no network request.
+  5. **Archive findings never stop the restore; copy damage is repaired,
+     not quarantined.**
+     - A copy that does not match its manifest's size and SHA-256 (live or
+       archive) is a verification finding: the restore copies from a
+       matching copy and records the finding for the D11 repair. No
+       matching copy left is the lost-file rule. Neither stops the restore.
+       Why: the usual cause of two differing copies is one damaged copy,
+       which `manifest::verify` identifies, and the good copy is the
+       sealed file.
+     - Two copies of one import-ledger entry with different bytes: if
+       exactly one of them lists files whose SHA-256 match the manifests
+       on the roots, it is the entry and the other copy is repaired from
+       it. Otherwise the file's parts are **held** (below).
+     - One archive path with different manifest texts on two roots (two
+       sealed files under one path, not one damaged copy) is **held** too,
+       with both copies left in place.
+     - Holding records the finding, leaves every byte where it is and
+       refuses the importer; it moves and deletes nothing. Only the
+       *replace* resolution below ever moves a part, to quarantine.
+     - Archive parts that no restored entry lists are **held**. Under the
+       replication rule above they come from a *completed* import: its
+       parts reached cold in the last pass, its entry, written after them,
+       was still on hot only. So it is at most one file, and runs taken
+       between that import's end and the loss may cite those parts in
+       their dataset versions, a warm run's `prefix_dataset` included.
+     - What still stops the restore is live-only and undecidable: journal
+       copies that differ beyond their common prefix, or one live path
+       with different manifest texts on two roots and no copy-ledger record
+       to say which is the sealed one. Nothing can replace live data, and
+       a wrong guess would change it.
+     - The restore makes no network request.
      - Why archive findings must not stop it: `mie ingest` waits for the
        restore, so every minute it is stopped is irreplaceable live data
        lost, while the archive can be downloaded again (D1). Rejected,
        writing a `PENDING` so that ADR-034 D4's crash rule resumes the
-       interrupted file: deriving the file from the parts' partitions is
-       wrong for `metrics` (one file seals into two dates, its 23:55 row
-       filed under the next day, ADR-034 D3) and for monthly
-       `fundingRate`; it needs the published `.CHECKSUM`, a network fetch
-       whose failure would stop the restore; and if Binance republished
-       the file, the resumed import fails the orphan-prefix check
-       (ADR-034 D4) with no defined way out.
+       file: deriving the file from the parts' partitions is wrong for
+       `metrics` (one file seals into two dates, its 23:55 row filed under
+       the next day, ADR-034 D3) and for monthly `fundingRate`; it needs
+       the published `.CHECKSUM`, a network fetch whose failure would stop
+       the restore; and if Binance republished the file, the resumed
+       import fails the orphan-prefix check (ADR-034 D4) with no defined
+       way out.
   6. Only then may `mie ingest` start; the importer starts only once no
      archive finding is open. The restored
      journal still holds every replicated run, so `read_runs` sees them.
@@ -748,31 +778,49 @@ What breaks:
      outage, the restore included. Part numbers continue from the union
      (D6), so no path is reused even if step 3 missed a partition.
 
-  **Quarantine and its resolution.** A quarantined part is moved, on
-  every root that holds it, by a rename within that root to a hidden
-  directory outside the layout (`.quarantine/<restore id>/<relative
-  path>`), and the copy ledger records it as quarantined. Nothing in mie
-  ever deletes a quarantined file. `select` skips quarantined files, and
-  the union part numbering (D6) still counts them, so no later part
-  reuses their paths. The resolution is an explicit `mie` step per
-  finding, run by the operator: it records that the quarantined parts stay
-  out of the store and that their archive file is to be imported fresh;
-  the next import then fetches the file as one it has never imported and
-  writes new parts with new numbers. Which archive files to re-import
-  follows from the import-ledger entries that are missing for the days
-  the importer expects, as for any not-yet-imported file, so no part has
-  to be mapped back to its source file.
-  - Why quarantine and not the D5 rule "never removed from the union": a
-    part that no import entry lists belongs to no completed import
-    (ADR-034 D4 writes the entry last), so no completed archive dataset
-    version names it. Only a selection taken while that import was running
-    could have included it, and ADR-034 already treats such a selection as
-    provisional. Keeping the bytes in quarantine keeps the evidence, for
-    example of an upstream file that has changed since.
-  - Why the importer halts instead of re-importing on its own: the
-    finding can be the trace of a changed upstream file (ADR-034 D4's
-    `changed` conflict), which ADR-034 never resolves automatically, and
-    an automatic re-import would hide repeated losses.
+  **Held archive parts and their resolution.** A held part stays where
+  it is, with its bytes, path and manifest; the copy ledger records the
+  hold. Every selection that covers it fails with `Integrity` (D7), the
+  union part numbering counts it (D6), and the importer refuses to run
+  until every hold is resolved. The live capture is not affected: its
+  seed scan selects live streams only, and a warm-up whose archive segment
+  covers a held part fails into a cold run (ADR-052 D8). The resolution is
+  an explicit `mie` step per archive file, run by the operator, which
+  names the file; the step proposes it from the parts' stream and ordering
+  times by the catalog's period rules (ADR-034 D3: the `metrics` 23:55 row
+  belongs to the previous day's file, `fundingRate` files are monthly), and
+  a wrong choice only fails the check below. Two modes:
+  - **Re-admit**, tried first. The step downloads the file and checks
+    that the held parts equal its rows by ADR-034 D4's prefix rule (here
+    all rows). If they do, it writes the missing entry, or a superseding
+    entry when a conflicting one exists, listing the held parts, and
+    clears the hold. Bytes, paths and dataset versions stay as they were,
+    so the runs that cited the parts before the loss still reproduce. Why
+    first: it is the only outcome that keeps those runs EQUIVALENT.
+  - **Replace**, when the rows differ (the upstream file was republished)
+    or the operator decides so. The held parts move, on every root, by a
+    rename within the root to `.quarantine/<id>/<relative path>`; nothing
+    in mie ever deletes them. The step appends a supersede record for any
+    existing entry of the file and never edits the old entry. The next
+    import then reads the file as not imported (a superseded entry counts
+    as absent, which is what keeps it from reporting "the ledger lists
+    …; not re-imported", `import.rs`), imports it fresh and writes new
+    parts with new numbers. The hold stays until that new entry exists, so
+    no selection is shorter in between. The cost, stated in the step's
+    output: every dataset version that covered the held parts changes, and
+    warm runs that cited them read `DIVERGED (warm prefix)` for good.
+  - Why the importer halts instead of resolving on its own: replace
+    changes recorded dataset versions, and a hold can be the trace of a
+    changed upstream file (ADR-034 D4's `changed` conflict), which ADR-034
+    never resolves automatically. Rejected, quarantining held parts at the
+    restore and skipping them in `select`: the parts belong to a completed
+    import, so every selection covering them would be shorter with no
+    error until a re-import, an ADR-052 hole meanwhile, and the runs that
+    cited them would diverge even when the upstream file never changed.
+    Rejected, quarantining every copy of a path whose copies differ: it
+    throws away the good copy of a completed import. Rejected, editing the
+    old import entry: entries are immutable (ADR-034 D4), and the
+    superseded one is the record of what was imported.
 
   Why a restore and not "the capture continues": on an empty hot the
   writer numbers new parts from `part-00000` under paths that cold
@@ -908,18 +956,21 @@ What breaks:
   This is the price of never reusing a path or splitting the journal.
 - A late archive import into a removed day recalls the partition to hot
   first (D6), so hot briefly holds that day again.
-- After a hot loss, an archive import that the loss interrupted leaves
-  quarantined parts and halts the importer until the operator runs the
-  resolution step; the live capture is not affected (D11).
+- After a hot loss, an archive file whose entry copy the loss interrupted
+  leaves held parts: selections covering them fail with `Integrity` and
+  the importer halts until the operator's resolution step (re-admit, or
+  replace with its dataset-version cost); the live capture is not
+  affected (D11).
 - The follow-up work: the multi-root store (listing order, the
-  disappearing-partition rule), the copy ledger with its hash chain and
-  lock, the init step with adoption and markers, the replicator (root
-  markers, the device-id check, the copy order, archive parts held until
-  their import entry, tail appends), hot removal
+  disappearing-partition rule, `Integrity` on held files), the copy ledger
+  with its hash chain and lock, the init step with adoption and markers,
+  the replicator (root markers, the device-id check, the copy order,
+  archive parts held until their import entry, tail appends), hot removal
   under the source lock, the recall, union part numbering, the
-  verification, repair, rebuild and hot-restore commands, the quarantine
-  and its resolution step, the start
-  refusal on a hot without marker, the `cold_roots` keys, and tests.
+  verification, repair, rebuild and hot-restore commands, the hold with
+  its re-admit and replace resolution, superseding import entries (ADR-034
+  D4), the start refusal on a hot without marker, the `cold_roots` keys,
+  and tests.
 
 ## Alternatives considered
 
@@ -979,14 +1030,21 @@ What breaks:
 - **Replicating the importer's `PENDING` marker.** Rejected for holding
   archive parts until their entry exists: a cold copy of the marker can
   be stale or name the next file (D11).
-- **A restore that writes `PENDING` for unlisted archive parts.**
-  Rejected for quarantine: it maps parts to files by date, which is wrong
-  for `metrics` and `fundingRate`, needs a network fetch that can stop the
-  restore and so the live capture, and dead-ends when the upstream file
-  was republished (D11).
+- **A restore that writes `PENDING` for unlisted archive parts.** Rejected
+  for the hold and an explicit resolution: it maps parts to files by date,
+  which is wrong for `metrics` and `fundingRate`, needs a network fetch
+  that can stop the restore and so the live capture, and dead-ends when
+  the upstream file was republished (D11).
 - **Any archive finding that stops the hot restore.** Rejected: the live
   capture waits for the restore, and archive data can be downloaded again
   while live data cannot (D11).
+- **Quarantining held parts at the restore and skipping them in
+  `select`.** Rejected: they belong to a completed import, so selections
+  would shrink silently and cited runs would diverge (D11).
+- **Only a fresh re-import as the resolution.** Rejected for re-admit
+  first: a re-import writes new parts and turns every run that cited the
+  old ones `DIVERGED (warm prefix)`, even when the upstream file never
+  changed (D11).
 
 ## Accept when
 
@@ -1040,10 +1098,16 @@ follow-up implementation:
    reports for windows before the loss are byte-identical. With hot lost
    between a multi-part archive file's replicated parts and its entry, and
    with the network unavailable, the restore still completes and `mie
-   ingest` starts; the unlisted parts are quarantined on every root and
-   recorded, no `select` lists them, and the importer refuses, naming
-   them. After the resolution step the importer re-imports that file as
-   new parts with new numbers, and the quarantined bytes are still there;
+   ingest` starts; the unlisted parts are held, a `mie replay --source
+   archive` covering them fails with `Integrity` naming them (never a
+   shorter report), and the importer refuses. Re-admit then writes their
+   entry and the item 1 archive report is byte-identical to the pre-loss
+   one. In a variant whose held parts do not match the file, replace
+   quarantines them, supersedes the entry, the replay keeps failing until
+   the re-import's entry exists, and the quarantined bytes remain. With one
+   copy of an archive part damaged before the restore, the restore uses
+   the matching copy and reports the damaged one for repair, holding
+   nothing;
 10. an archive import into a stream-date removed from hot recalls the
     partition, appends the next part number, and the partition is removed
     again once its new part has k copies; the remover skips the archive
