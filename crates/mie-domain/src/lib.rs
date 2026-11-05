@@ -51,6 +51,8 @@ pub mod event_hash;
 pub mod feature;
 pub mod fingerprint;
 pub mod flow;
+#[cfg(test)]
+mod independent_sampling;
 pub mod liquidity;
 pub mod location;
 pub mod num;
