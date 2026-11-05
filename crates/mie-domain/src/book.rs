@@ -441,6 +441,32 @@ impl OrderBook {
         self.bids.is_empty() && self.asks.is_empty()
     }
 
+    /// Walks the levels of `side` that a marketable order reaches from the
+    /// print price `from` (ADR-061 D2), read-only (ADR-043 D1): asks at or
+    /// above `from` or bids at or below it, best first, and only inside the
+    /// trusted window, beyond which absence is unknown (ADR-038 D6).
+    ///
+    /// - Without a size: the price of the first reachable level.
+    /// - With size q > 0: the exact notional Σ pᵢ·tᵢ, with tᵢ =
+    ///   min(remaining, qtyᵢ), in units of 10⁻¹⁶ (price units times quantity
+    ///   units). It cannot overflow: |Σ pᵢ·tᵢ| ≤ max |pᵢ| · q < 2¹²⁶.
+    ///
+    /// [`Walk::Exhausted`] when no level is reachable inside the window,
+    /// when the window holds less than q, when q ≤ 0, and always on an
+    /// invalid book, whose window is empty.
+    pub fn walk(&self, side: Side, from: Price, qty: Option<Qty>) -> Walk {
+        match side {
+            Side::Ask => match self.window.highest_ask {
+                Some(highest) if from <= highest => take(self.asks.range(from..=highest), qty),
+                _ => Walk::Exhausted,
+            },
+            Side::Bid => match self.window.lowest_bid {
+                Some(lowest) if lowest <= from => take(self.bids.range(lowest..=from).rev(), qty),
+                _ => Walk::Exhausted,
+            },
+        }
+    }
+
     /// Compares every level inside both books' trusted windows, per side;
     /// `None` when either book is invalid.
     ///
@@ -487,6 +513,42 @@ impl OrderBook {
             mismatches,
         })
     }
+}
+
+/// What [`OrderBook::walk`] found on the reachable levels (ADR-061 D2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Walk {
+    /// Without a size: the price of the first reachable level.
+    First(Price),
+    /// With a size: Σ pᵢ·tᵢ over the levels taken, exact, in units of
+    /// 10⁻¹⁶ (price units times quantity units).
+    Notional(i128),
+    /// No reachable level inside the trusted window, or less than the size
+    /// there.
+    Exhausted,
+}
+
+/// The walk over `levels`, best first (see [`OrderBook::walk`]).
+fn take<'a>(mut levels: impl Iterator<Item = (&'a Price, &'a Qty)>, qty: Option<Qty>) -> Walk {
+    let Some(qty) = qty else {
+        return levels
+            .next()
+            .map_or(Walk::Exhausted, |(&price, _)| Walk::First(price));
+    };
+    let mut remaining = i128::from(qty.units());
+    if remaining <= 0 {
+        return Walk::Exhausted;
+    }
+    let mut notional = 0_i128;
+    for (price, level) in levels {
+        let taken = remaining.min(i128::from(level.units()));
+        notional += i128::from(price.units()) * taken;
+        remaining -= taken;
+        if remaining == 0 {
+            return Walk::Notional(notional);
+        }
+    }
+    Walk::Exhausted
 }
 
 /// The first negative quantity among `bids` and `asks`.
@@ -861,5 +923,151 @@ mod tests {
         moved.apply(&update(100, 101, 0, &[(50, 1)], &[(200, 1)]));
         assert!(base().compare(&moved).unwrap().is_match());
         assert_eq!(moved.window(), base().window());
+    }
+
+    /// Bids 98, 99, 100 and asks 101, 102, 103 of [`base`], with an ask at
+    /// 104 and a bid at 97 changed beyond the window after the snapshot.
+    fn walked() -> OrderBook {
+        let mut book = base();
+        book.apply(&update(100, 101, 0, &[(97, 40)], &[(104, 41)]));
+        book
+    }
+
+    #[test]
+    fn a_walk_takes_reachable_levels_best_first_with_a_partial_take() {
+        let book = walked();
+        // Asks 101 (11) and 102 (21): 25 takes 11 at 101 and 14 at 102.
+        assert_eq!(
+            book.walk(Side::Ask, Price::from_units(101), Some(Qty::from_units(25))),
+            Walk::Notional(101 * 11 + 102 * 14)
+        );
+        // Bids 100 (10) and 99 (20): 15 takes 10 at 100 and 5 at 99.
+        assert_eq!(
+            book.walk(Side::Bid, Price::from_units(100), Some(Qty::from_units(15))),
+            Walk::Notional(100 * 10 + 99 * 5)
+        );
+        // Without a size, the first reachable level.
+        assert_eq!(
+            book.walk(Side::Ask, Price::from_units(50), None),
+            Walk::First(Price::from_units(101))
+        );
+        assert_eq!(
+            book.walk(Side::Bid, Price::from_units(200), None),
+            Walk::First(Price::from_units(100))
+        );
+    }
+
+    #[test]
+    fn a_walk_starts_at_the_print_price() {
+        let book = walked();
+        // A buy printed at 102 reaches asks from 102 up, not 101.
+        assert_eq!(
+            book.walk(Side::Ask, Price::from_units(102), None),
+            Walk::First(Price::from_units(102))
+        );
+        assert_eq!(
+            book.walk(Side::Ask, Price::from_units(102), Some(Qty::from_units(30))),
+            Walk::Notional(102 * 21 + 103 * 9)
+        );
+        // Between levels: a sell printed at 99.5 units reaches 99 first.
+        let book = {
+            let mut book = OrderBook::new();
+            book.apply(&snapshot(1, &[(990, 5), (1_000, 5)], &[(1_010, 5)]));
+            book
+        };
+        assert_eq!(
+            book.walk(Side::Bid, Price::from_units(995), None),
+            Walk::First(Price::from_units(990))
+        );
+        // The level at the print is reachable on both sides.
+        assert_eq!(
+            book.walk(Side::Bid, Price::from_units(1_000), None),
+            Walk::First(Price::from_units(1_000))
+        );
+    }
+
+    #[test]
+    fn a_walk_stops_at_the_window_bound() {
+        let book = walked();
+        // The window ends at ask 103 and bid 98: 104 and 97 are known but
+        // never walked, because absence beyond the window is unknown.
+        let asks = 11 + 21 + 31;
+        assert_eq!(
+            book.walk(
+                Side::Ask,
+                Price::from_units(101),
+                Some(Qty::from_units(asks))
+            ),
+            Walk::Notional(101 * 11 + 102 * 21 + 103 * 31)
+        );
+        assert_eq!(
+            book.walk(
+                Side::Ask,
+                Price::from_units(101),
+                Some(Qty::from_units(asks + 1))
+            ),
+            Walk::Exhausted
+        );
+        assert_eq!(
+            book.walk(Side::Bid, Price::from_units(100), Some(Qty::from_units(61))),
+            Walk::Exhausted
+        );
+        // A print beyond the window reaches nothing.
+        assert_eq!(
+            book.walk(Side::Ask, Price::from_units(104), None),
+            Walk::Exhausted
+        );
+        assert_eq!(
+            book.walk(Side::Bid, Price::from_units(97), None),
+            Walk::Exhausted
+        );
+        // A size of zero or below takes nothing.
+        assert_eq!(
+            book.walk(Side::Ask, Price::from_units(101), Some(Qty::from_units(0))),
+            Walk::Exhausted
+        );
+    }
+
+    #[test]
+    fn a_side_without_a_window_is_never_walked() {
+        let mut book = OrderBook::new();
+        book.apply(&snapshot(1, &[(100, 5)], &[]));
+        // An ask changed after a snapshot without asks is known, but the
+        // side has no window.
+        book.apply(&update(1, 2, 0, &[], &[(101, 5)]));
+        assert_eq!(book.best_ask(), Some(lv(101, 5)));
+        assert_eq!(
+            book.walk(Side::Ask, Price::from_units(101), None),
+            Walk::Exhausted
+        );
+        assert_eq!(
+            book.walk(Side::Bid, Price::from_units(100), None),
+            Walk::First(Price::from_units(100))
+        );
+        // An invalid book has no window at all.
+        assert_eq!(
+            OrderBook::new().walk(Side::Bid, Price::from_units(100), None),
+            Walk::Exhausted
+        );
+    }
+
+    #[test]
+    fn the_walk_notional_is_exact_at_the_extremes() {
+        // Two levels at the largest price, each the largest quantity / 2:
+        // the notional is far beyond i64 and exact in i128.
+        let top = i64::MAX;
+        let half = i64::MAX / 2;
+        let mut book = OrderBook::new();
+        book.apply(&snapshot(1, &[(1, 1)], &[(top - 1, half), (top, half)]));
+        assert_eq!(
+            book.walk(
+                Side::Ask,
+                Price::from_units(1),
+                Some(Qty::from_units(2 * half))
+            ),
+            Walk::Notional(
+                i128::from(top - 1) * i128::from(half) + i128::from(top) * i128::from(half)
+            )
+        );
     }
 }

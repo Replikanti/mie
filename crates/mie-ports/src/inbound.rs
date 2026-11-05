@@ -1,8 +1,9 @@
 //! Driving (inbound) ports: the use cases the outside world invokes.
 //!
 //! Present: [`ReplayMarket`], [`RunResearchExperiment`] (ADR-040; the
-//! backtest's refusals [`ResearchError::Unresolved`] and
-//! [`ResearchError::FundingNotDelivered`], ADR-060 D13),
+//! backtest's refusals [`ResearchError::Unresolved`],
+//! [`ResearchError::FundingNotDelivered`], ADR-060 D13, and
+//! [`ResearchError::BookNotDelivered`], ADR-061 D4),
 //! [`GenerateMarketReport`] (ADR-059, proposed). Planned, each landing with
 //! its issue: `AnalyzeMarket`, `EvaluateStrategy`, `ValidateCandidate`.
 
@@ -170,6 +171,16 @@ pub enum ResearchError {
         /// does not replay `fundingRate`, so it delivers none.
         until: Option<EventTime>,
     },
+    /// A book slippage rule on a sample that ends at or before the history
+    /// chain's cutover (ADR-061 D4): the archive has no order book (ADR-043
+    /// D11), so every fill would be censored `no_book`. Checked before
+    /// anything is opened.
+    BookNotDelivered {
+        /// The sample's end.
+        sample_end: EventTime,
+        /// The chain's cutover, where its live segment and the book begin.
+        cutover: EventTime,
+    },
     /// The run produced another result than the one stored under its key:
     /// the run is not reproducible, and the stored result stays.
     Diverged {
@@ -234,6 +245,18 @@ impl fmt::Display for ResearchError {
                 "the history chain's archive does not replay fundingRate, so no settlement is \
                  delivered: funding.recorded@1 would book zero funding by omission (ADR-060 \
                  D7); replay fundingRate in the archive segment, or state funding.none@1",
+            ),
+            Self::BookNotDelivered {
+                sample_end,
+                cutover,
+            } => write!(
+                f,
+                "the sample ends at {} ms, at or before the history cutover {} ms: the archive \
+                 has no order book (ADR-043 D11), so a book slippage rule would censor every \
+                 fill no_book (ADR-061 D4); end the sample after the cutover, or state \
+                 slippage.fixed@1",
+                sample_end.as_millis(),
+                cutover.as_millis()
             ),
             Self::Diverged { key } => write!(
                 f,
@@ -300,11 +323,25 @@ mod tests {
              delivered: funding.recorded@1 would book zero funding by omission (ADR-060 D7); \
              replay fundingRate in the archive segment, or state funding.none@1"
         );
+        assert_eq!(
+            ResearchError::BookNotDelivered {
+                sample_end: EventTime::from_millis(1_000),
+                cutover: EventTime::from_millis(1_000),
+            }
+            .to_string(),
+            "the sample ends at 1000 ms, at or before the history cutover 1000 ms: the archive \
+             has no order book (ADR-043 D11), so a book slippage rule would censor every fill \
+             no_book (ADR-061 D4); end the sample after the cutover, or state slippage.fixed@1"
+        );
         for error in [
             ResearchError::Unresolved(errors),
             ResearchError::FundingNotDelivered {
                 sample_end: EventTime::from_millis(2_000),
                 until: None,
+            },
+            ResearchError::BookNotDelivered {
+                sample_end: EventTime::from_millis(1_000),
+                cutover: EventTime::from_millis(1_000),
             },
         ] {
             assert!(std::error::Error::source(&error).is_none());

@@ -4,7 +4,9 @@
 //! records: entry at the first trade after the decision and its latency,
 //! fixed slippage and the taker fee on both legs, recorded funding, stop,
 //! target and time exits, and censoring by ADR-055 D6's rules applied to the
-//! position (ADR-060 D4–D10). [`metrics`] computes ADR-060 D11's metrics
+//! position (ADR-060 D4–D10). Under a book slippage rule its fills are
+//! priced on `book.l2@1` instead (`crate::slippage`), and a maker target
+//! fills as a resting limit order (ADR-061 D4, D6). [`metrics`] computes ADR-060 D11's metrics
 //! and the regime split from the records, and the `text` submodule renders
 //! and parses the lines of the `backtest` outcome kind (D12) that
 //! `research::result` embeds (#168). [`rules`] holds the rule registry v1
@@ -36,13 +38,15 @@ pub mod simulator;
 pub(crate) mod text;
 
 pub use metrics::{BacktestMetrics, Metrics, REGIME_BUCKETS};
-pub use rules::{Plan, ResolutionError, resolve};
+pub use rules::{Plan, ResolutionError, is_book_slippage, resolve};
 pub use simulator::Simulator;
 pub use text::{event_kind_from_name, event_kind_name};
 
-use crate::num::{Price, Rate, SCALE};
+use crate::num::{Price, Qty, Rate, SCALE};
 use crate::order::CanonicalKey;
 use crate::regime::RegimeLabel;
+use crate::research::FeeSchedule;
+use crate::slippage::BookModel;
 use crate::time::EventTime;
 
 /// The side of a position (ADR-060 D2, D3): σ is +1 for a long and −1 for
@@ -88,15 +92,80 @@ pub enum FundingRule {
     None,
 }
 
+/// The slippage rule of a spec (ADR-060 D2, D6; ADR-061 D2–D4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlippageRule {
+    /// `slippage.fixed@1`: fill = ⟨trade price × (1 ± σs)⟩ (ADR-060 D6).
+    Fixed(Rate),
+    /// `slippage.spread@1`: the first reachable level of the book at the
+    /// fill trade (ADR-061 D2).
+    Spread,
+    /// `slippage.depth_walk@1`: the volume-weighted price of walking the
+    /// book at the fill trade for size q > 0 (ADR-061 D2).
+    DepthWalk(Qty),
+}
+
+impl SlippageRule {
+    /// The book model of a book rule; `None` for `slippage.fixed@1`.
+    pub const fn book_model(self) -> Option<BookModel> {
+        match self {
+            Self::Fixed(_) => None,
+            Self::Spread => Some(BookModel::Spread),
+            Self::DepthWalk(qty) => Some(BookModel::DepthWalk(qty)),
+        }
+    }
+
+    /// Whether fills are priced on the book (ADR-061 D4), so that every
+    /// trade line carries the slipped fills (D5).
+    pub const fn is_book(self) -> bool {
+        self.book_model().is_some()
+    }
+}
+
+/// How the target exit fills (ADR-060 D6, ADR-061 D6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetFill {
+    /// `target.r_multiple@1`: a touch triggers a taker exit at the next
+    /// trade (ADR-060 D6).
+    Taker,
+    /// `target.r_multiple_maker@1 fill=text:through`: a resting limit order
+    /// filled by the first trade σ-strictly beyond the target (ADR-061 D6).
+    MakerThrough,
+    /// `target.r_multiple_maker@1 fill=text:touch`: filled by the first
+    /// trade at or beyond the target, the optimistic bound (ADR-061 D6).
+    MakerTouch,
+}
+
+impl TargetFill {
+    /// The `fill=` text of `target.r_multiple_maker@1`; `None` for any
+    /// other text.
+    pub fn from_text(text: &str) -> Option<Self> {
+        match text {
+            "through" => Some(Self::MakerThrough),
+            "touch" => Some(Self::MakerTouch),
+            _ => None,
+        }
+    }
+
+    /// Whether the target rests as a maker order (ADR-061 D6).
+    pub const fn is_maker(self) -> bool {
+        !matches!(self, Self::Taker)
+    }
+}
+
 /// Why [`Costs::new`] refused its values: each lies outside ADR-060 D2's
-/// domain of definition or ADR-040's fee range.
+/// or ADR-061 D3's domain of definition or ADR-040's fee range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CostsError {
-    /// The slippage rate is not in `[0, 1)`: at 1 or above a fill price is
-    /// at or below 0 (D2).
+    /// The fixed slippage rate is not in `[0, 1)`: at 1 or above a fill
+    /// price is at or below 0 (D2).
     Slippage,
+    /// The depth-walk size is not above 0: no walk (ADR-061 D3).
+    DepthQty,
     /// The taker fee is not in `[0, 1)` (ADR-040 D1).
     Taker,
+    /// The maker fee is not in `[0, 1)` (ADR-040 D1).
+    Maker,
     /// `max_hold_ms` is below 1 ms (D2).
     MaxHold,
     /// The latency is not below `max_hold_ms`, so no entry can fill (D2,
@@ -104,7 +173,8 @@ pub enum CostsError {
     Latency,
 }
 
-/// The resolved cost and timing assumptions of a spec (ADR-060 D2, D6, D7).
+/// The resolved cost and timing assumptions of a spec (ADR-060 D2, D6, D7;
+/// ADR-061 D3, D6).
 ///
 /// Built only through [`new`](Self::new), which keeps the simulator's
 /// arithmetic total: every value is inside its domain of definition.
@@ -112,15 +182,19 @@ pub enum CostsError {
 pub struct Costs {
     latency_ms: u32,
     max_hold_ms: i64,
-    slippage: Rate,
-    taker: Rate,
+    slippage: SlippageRule,
+    fees: FeeSchedule,
+    target: TargetFill,
     funding: FundingRule,
 }
 
 impl Costs {
-    /// The costs, or the first value outside its range in argument order:
-    /// slippage and taker in `[0, 1)`, `max_hold_ms` ≥ 1 and
-    /// `latency_ms` < `max_hold_ms` (ADR-060 D2).
+    /// The costs, or the first value outside its range in argument order.
+    /// `fees.maker` is charged only on a maker target fill (ADR-061 D6),
+    /// `fees.taker` on every other leg (ADR-060 D6). The ranges:
+    /// a fixed slippage rate in `[0, 1)` or a depth-walk size above 0, the
+    /// taker and maker fees in `[0, 1)`, `max_hold_ms` ≥ 1 and
+    /// `latency_ms` < `max_hold_ms` (ADR-060 D2, ADR-061 D3).
     ///
     /// # Errors
     ///
@@ -128,16 +202,24 @@ impl Costs {
     pub fn new(
         latency_ms: u32,
         max_hold_ms: i64,
-        slippage: Rate,
-        taker: Rate,
+        slippage: SlippageRule,
+        fees: FeeSchedule,
+        target: TargetFill,
         funding: FundingRule,
     ) -> Result<Self, CostsError> {
         let fraction = |rate: Rate| (0..SCALE).contains(&rate.units());
-        if !fraction(slippage) {
-            return Err(CostsError::Slippage);
+        match slippage {
+            SlippageRule::Fixed(rate) if !fraction(rate) => return Err(CostsError::Slippage),
+            SlippageRule::DepthWalk(qty) if qty.units() <= 0 => {
+                return Err(CostsError::DepthQty);
+            }
+            _ => {}
         }
-        if !fraction(taker) {
+        if !fraction(fees.taker) {
             return Err(CostsError::Taker);
+        }
+        if !fraction(fees.maker) {
+            return Err(CostsError::Maker);
         }
         if max_hold_ms < 1 {
             return Err(CostsError::MaxHold);
@@ -149,7 +231,8 @@ impl Costs {
             latency_ms,
             max_hold_ms,
             slippage,
-            taker,
+            fees,
+            target,
             funding,
         })
     }
@@ -164,14 +247,24 @@ impl Costs {
         self.max_hold_ms
     }
 
-    /// The adverse slippage rate s per leg (ADR-060 D6).
-    pub const fn slippage(&self) -> Rate {
+    /// The slippage rule (ADR-060 D6, ADR-061 D4).
+    pub const fn slippage(&self) -> SlippageRule {
         self.slippage
     }
 
     /// The taker fee per leg (ADR-060 D6).
     pub const fn taker(&self) -> Rate {
-        self.taker
+        self.fees.taker
+    }
+
+    /// The maker fee of a maker target fill (ADR-061 D6).
+    pub const fn maker(&self) -> Rate {
+        self.fees.maker
+    }
+
+    /// How the target exit fills (ADR-060 D6, ADR-061 D6).
+    pub const fn target_fill(&self) -> TargetFill {
+        self.target
     }
 
     /// The funding rule (ADR-060 D7).
@@ -295,7 +388,8 @@ pub struct TradeIntent {
     pub admission: Admission,
 }
 
-/// Why a trade is censored: exactly the six tokens of ADR-060 D12.
+/// Why a trade is censored: exactly the six tokens of ADR-060 D12 and
+/// ADR-061 D5's `no_book`.
 ///
 /// Defined here, not imported: ADR-060 D15 keeps this module off the label
 /// types, and the first three share ADR-057's `race_censor_reason` strings.
@@ -314,6 +408,10 @@ pub enum CensorReason {
     FundingGap,
     /// A value left the `i64` unit range (D10).
     Overflow,
+    /// A fill a book slippage rule cannot price: the book is not ready,
+    /// one-sided or crossed, or the trusted window holds no reachable level
+    /// or less than the size (ADR-061 D2, D4).
+    NoBook,
 }
 
 impl CensorReason {
@@ -326,6 +424,7 @@ impl CensorReason {
             Self::ChainRestart => "chain_restart",
             Self::FundingGap => "funding_gap",
             Self::Overflow => "overflow",
+            Self::NoBook => "no_book",
         }
     }
 }
@@ -371,6 +470,17 @@ pub struct Fill {
     pub price: Price,
 }
 
+/// The slipped fills E′ and X′ of a trade line under a book slippage rule
+/// (ADR-061 D5): they depend on the book, so they cannot be re-derived
+/// from e, x and the spec. `None` is the line's `-`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlippedFills {
+    /// E′, `-` exactly when the line's `entry` is.
+    pub entry: Option<Price>,
+    /// X′, `-` exactly when the line's `fill` is.
+    pub exit: Option<Price>,
+}
+
 /// One taken decision: every field of ADR-060 D12's trade line. `None` is
 /// the line's `-`; R values are 8-place [`Rate`]s (D10).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -413,6 +523,10 @@ pub struct TradeRecord {
     /// Maximum adverse excursion in R, ≥ 0; a lower bound on a censored
     /// line.
     pub mae: Option<Rate>,
+    /// `entry_slipped=` and `exit_slipped=`, set exactly under a book
+    /// slippage rule (ADR-061 D5); `None` under `slippage.fixed@1`, whose
+    /// lines stay as ADR-060 D12 defines them.
+    pub slipped: Option<SlippedFills>,
 }
 
 /// The decisions that passed the filters but could not trade, by the

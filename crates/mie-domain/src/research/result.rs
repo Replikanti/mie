@@ -3,7 +3,7 @@
 
 use super::{DataVersion, ExperimentId, ExperimentSpec, SpecError, parse_hex16};
 use crate::backtest::text::{self, MetricsScope};
-use crate::backtest::{BacktestMetrics, SimulationStats, TradeRecord};
+use crate::backtest::{BacktestMetrics, SimulationStats, TradeRecord, is_book_slippage};
 use crate::event_hash::EventStreamHash;
 use crate::feature::{FeatureRegistry, FeatureSetVersion, is_valid_id, parse_versioned_id};
 use crate::fingerprint::Fingerprint;
@@ -297,8 +297,11 @@ impl ExperimentResult {
     /// A `backtest` outcome is malformed, too, with a `trade` line whose
     /// shape is not its exit kind's, trade lines out of non-decreasing
     /// decision-key order, counts that break ADR-060 D4's conservation (on
-    /// the `triggers` line), or a `regime=` list whose length is not the
-    /// spec's number of regime features. Its metric lines are checked for
+    /// the `triggers` line), a `regime=` list whose length is not the
+    /// spec's number of regime features, or a `trade` line whose slipped
+    /// fills do not match the spec's slippage rule (ADR-061 D5): present on
+    /// every line under a book rule, on none under any other. Its metric
+    /// lines are checked for
     /// grammar only here; values that differ from what the trade lines
     /// give make the text not canonical.
     pub fn parse(text: &str, registry: &FeatureRegistry) -> Result<Self, ResultParseError> {
@@ -380,8 +383,9 @@ impl ExperimentResult {
     /// - a state-hash encoding of 0;
     /// - for a `backtest` outcome (ADR-060 D12): a record whose values are
     ///   not its exit kind's shape, records whose decision keys decrease,
-    ///   counts that break D4's conservation, and a regime list whose
-    ///   length is not the spec's number of regime features.
+    ///   counts that break D4's conservation, a regime list whose length is
+    ///   not the spec's number of regime features, and slipped fills on a
+    ///   record that its spec's slippage rule does not give (ADR-061 D5).
     ///
     /// Every other value renders text that parses back to it, so `Ok`
     /// means [`parse`](Self::parse) returns this value for its canonical
@@ -427,6 +431,32 @@ impl ExperimentResult {
                         "expected {features} `regime=` labels, one per regime feature of the \
                          spec (`none` for zero)"
                     ),
+                });
+            }
+            let book = is_book_slippage(self.spec.slippage());
+            if let Some(index) = records
+                .iter()
+                .position(|record| record.slipped.is_some() != book)
+            {
+                let rule = self.spec.slippage();
+                let reason = if book {
+                    format!(
+                        "under the book slippage rule {}@{} every trade line ends with \
+                         `entry_slipped=` and `exit_slipped=` (ADR-061 D5)",
+                        rule.id(),
+                        rule.version()
+                    )
+                } else {
+                    format!(
+                        "`entry_slipped=` and `exit_slipped=` belong only on the trade lines of \
+                         a book slippage rule, not {}@{} (ADR-061 D5)",
+                        rule.id(),
+                        rule.version()
+                    )
+                };
+                return Err(ResultParseError::Malformed {
+                    line: FIRST_TRADE_LINE + index,
+                    reason,
                 });
             }
         }

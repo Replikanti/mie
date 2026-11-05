@@ -96,6 +96,11 @@ uses is in the canonical text and the id names it.
 ⟨x⟩ is x rounded half to even, once, to 1e-8 USDT. ∓ and ± are taken with
 the side's sign σ (long +1, short −1).
 
+ADR-061 D3 adds three rows to this table: `slippage.spread@1` and
+`slippage.depth_walk@1` (fills priced on `book.l2@1`) and
+`target.r_multiple_maker@1` (a resting maker target). (Extended by
+ADR-061, #172.)
+
 - *Why `trigger.fires@1 feature=…`:* one registry entry covers every
   trigger id, current and future, and the spec's `features` set pins the
   trigger's version (ADR-053 *Approach*). *Rejected:* the trigger id as
@@ -326,7 +331,8 @@ the reverse.
   ⟨trade price × (1 − σs)⟩ at exit.
 - **Fees:** taker on both legs (STOP 1 decision 5; the `docs/direction.md`
   fee tier), fee = ⟨taker × slipped fill⟩ per leg. `maker` is parsed and
-  unused by registry v1.
+  unused by registry v1, except by `target.r_multiple_maker@1`, whose
+  target fills as a maker order (ADR-061 D6). (Extended by ADR-061, #172.)
 - *Rejected:*
   - filling at the touching trade's own price: that print happened before
     any order could react to it;
@@ -680,9 +686,16 @@ trade <decision ms> <event_kind> <seq> side=<long|short> regime=<labels> referen
   - `censor` is `-` exactly when `exit` is not `censored`.
 - On a censored line, `mfe` and `mae` cover the trades strictly before c
   and are lower bounds (ADR-055 D6).
+- Under a book slippage rule only, every `trade` line ends with
+  `entry_slipped=<price|->` and `exit_slipped=<price|->` after `censor=`:
+  E′ and X′ then depend on the book and cannot be re-derived from e, x and
+  the spec. Under `slippage.fixed@1` the line is exactly as above
+  (ADR-061 D5). (Extended by ADR-061, #172.)
 
 **The censor reason tokens:** `censor=` takes exactly `gap`, `rejected`,
-`end_of_data`, `chain_restart`, `funding_gap` and `overflow` (D9).
+`end_of_data`, `chain_restart`, `funding_gap` and `overflow` (D9), and
+`no_book`, a fill a book slippage rule cannot price (ADR-061 D4).
+(Extended by ADR-061, #172.)
 
 - The first three are the strings of `CensorReason::as_str`
   (`crates/mie-domain/src/conditional/label.rs`) and therefore ADR-057's

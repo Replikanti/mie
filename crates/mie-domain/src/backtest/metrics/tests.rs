@@ -50,6 +50,7 @@ fn record(
         displacement,
         mfe,
         mae,
+        slipped: None,
     }
 }
 

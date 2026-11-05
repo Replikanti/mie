@@ -20,7 +20,8 @@ use mie_app::{
 use mie_domain::backtest::resolve;
 use mie_domain::bars::MAX_BARS_PER_EVENT;
 use mie_domain::event::{
-    Aggressor, FeedGap, FundingSettlement, GapReason, MarketEvent, Stream, Trade,
+    Aggressor, BookSnapshot, BookUpdate, FeedGap, FundingSettlement, GapReason, Level, MarketEvent,
+    Stream, Trade,
 };
 use mie_domain::feature::{
     FeatureDefinition, FeatureKey, FeatureRegistry, FeatureSet, FeatureSetError, Input, WarmUp,
@@ -245,11 +246,15 @@ fn engine<H>(history: H, trailing: Vec<FeedGap>) -> Engine<H>
 where
     H: HistoricalDataProvider<Stream = Feed>,
 {
-    ChainBacktest::new(
-        history,
-        bounds(),
-        Box::new(move |_: &Feed| trailing.clone()),
-    )
+    engine_on(history, trailing, bounds())
+}
+
+/// [`engine`] on a chain within `bounds`.
+fn engine_on<H>(history: H, trailing: Vec<FeedGap>, bounds: ChainBounds) -> Engine<H>
+where
+    H: HistoricalDataProvider<Stream = Feed>,
+{
+    ChainBacktest::new(history, bounds, Box::new(move |_: &Feed| trailing.clone()))
 }
 
 /// A backtest service over `events` with a fresh store.
@@ -258,6 +263,7 @@ fn service(events: Vec<MarketEvent>) -> BacktestService<Engine<Recorded>, Memory
         engine(Recorded(events), Vec::new()),
         MemoryStore::default(),
         covered(),
+        EventTime::from_millis(CUTOVER),
     )
 }
 
@@ -268,6 +274,7 @@ fn run_text(events: Vec<MarketEvent>, trailing: Vec<FeedGap>, spec: &ExperimentS
         engine(Recorded(events), trailing),
         MemoryStore::default(),
         covered(),
+        EventTime::from_millis(CUTOVER),
     );
     let run = service.run(spec).unwrap();
     let ExperimentRun::Recorded(result) = &run else {
@@ -280,8 +287,16 @@ fn run_text(events: Vec<MarketEvent>, trailing: Vec<FeedGap>, spec: &ExperimentS
 
 /// The `@2` summary of `spec` over `events` on the same chain.
 fn v2_summary(events: Vec<MarketEvent>, spec: &ExperimentSpec) -> (HistoryReplaySummary, String) {
-    let mut service =
-        ExperimentService::on_chain(Recorded(events), MemoryStore::default(), bounds());
+    v2_summary_on(events, spec, bounds())
+}
+
+/// [`v2_summary`] on a chain within `bounds`.
+fn v2_summary_on(
+    events: Vec<MarketEvent>,
+    spec: &ExperimentSpec,
+    bounds: ChainBounds,
+) -> (HistoryReplaySummary, String) {
+    let mut service = ExperimentService::on_chain(Recorded(events), MemoryStore::default(), bounds);
     let run = service.run(spec).unwrap();
     assert_eq!(run.result().pipeline, REPLAY_SUMMARY_V2);
     let Outcome::HistoryReplaySummary(summary) = &run.result().outcome else {
@@ -601,6 +616,7 @@ fn a_rerun_reproduces_and_another_result_under_the_key_diverges() {
         engine(Recorded(altered.events), Vec::new()),
         store,
         covered(),
+        EventTime::from_millis(CUTOVER),
     );
     assert_eq!(
         service.run(&spec),
@@ -626,6 +642,7 @@ fn unopenable(funding: FundingCoverage) -> BacktestService<Engine<Unopenable>, M
         engine(Unopenable, Vec::new()),
         MemoryStore::default(),
         funding,
+        EventTime::from_millis(CUTOVER),
     )
 }
 
@@ -829,6 +846,7 @@ fn the_trailing_gaps_end_the_open_position() {
         engine(Recorded(open.events), vec![late]),
         MemoryStore::default(),
         covered(),
+        EventTime::from_millis(CUTOVER),
     );
     let error = service.run(&spec(WITH)).unwrap_err();
     assert!(
@@ -838,4 +856,250 @@ fn the_trailing_gaps_end_the_open_position() {
     );
     assert!(service.store().results.is_empty());
     assert_eq!(service.store().appends, 0);
+}
+
+// ---------------------------------------------------------------------
+// ADR-061 D4: fills priced on the book
+// ---------------------------------------------------------------------
+
+/// The chain of the book tests: its cutover at the sample's start, so the
+/// whole sample is live segment and has a book.
+fn book_bounds() -> ChainBounds {
+    ChainBounds {
+        origin: EventTime::from_millis(ORIGIN),
+        cutover: EventTime::from_millis(T0),
+    }
+}
+
+/// `(price, qty)` pairs in USDT and BTC as levels.
+fn book_levels(pairs: &[(&str, &str)]) -> Vec<Level> {
+    pairs
+        .iter()
+        .map(|&(price, qty)| Level {
+            price: price.parse().unwrap(),
+            qty: qty.parse().unwrap(),
+        })
+        .collect()
+}
+
+/// [`tape`] with a book: a snapshot 0.5 s after the decision and an update
+/// 0.5 s after the touch, before the exit fill trade.
+///
+/// - Snapshot (last update id 100): bids 60 015 × 0.5, 60 014 × 1; asks
+///   60 017 × 0.05, 60 018 × 1. Window: bids ≥ 60 014, asks ≤ 60 018.
+/// - Update 100 … 101: asks 60 017 and 60 018 removed, an ask 60 111 × 1
+///   added beyond the window; bids 60 109 × 0.08 and 60 108 × 1 added.
+///   The best bid 60 109 stays below the best ask 60 111.
+fn book_tape() -> Vec<MarketEvent> {
+    let mut events = tape().events;
+    let at = |events: &[MarketEvent], millis: i64| {
+        events
+            .iter()
+            .position(|event| event.time().as_millis() >= millis)
+            .unwrap()
+    };
+    let snapshot = MarketEvent::BookSnapshot(BookSnapshot {
+        time: EventTime::from_millis(DECISION + 500),
+        last_update_id: 100,
+        bids: book_levels(&[("60015", "0.5"), ("60014", "1")]),
+        asks: book_levels(&[("60017", "0.05"), ("60018", "1")]),
+    });
+    let update = MarketEvent::BookUpdate(BookUpdate {
+        time: EventTime::from_millis(DECISION + 3_500),
+        first_update_id: 100,
+        last_update_id: 101,
+        prev_update_id: 99,
+        bids: book_levels(&[("60109", "0.08"), ("60108", "1")]),
+        asks: book_levels(&[("60017", "0"), ("60018", "0"), ("60111", "1")]),
+    });
+    let index = at(&events, DECISION + 500);
+    events.insert(index, snapshot);
+    let index = at(&events, DECISION + 3_500);
+    events.insert(index, update);
+    events
+}
+
+/// The `with` spec under `funding.none@1` (live delivers no settlement,
+/// ADR-060 D7) with `book.l2@1` in its set, the slippage line `slippage`
+/// and the sample `[T0, end)`.
+fn book_spec(slippage: &str, end: i64) -> ExperimentSpec {
+    let registry = catalog::registry();
+    let variant = Variant {
+        funding: "funding.none@1",
+        sample: (T0, end),
+        ..WITH
+    };
+    let keys = vec![
+        catalog::TRIGGER_SFP_15M_V1.key,
+        catalog::VOLATILITY_ATR_1H_V1.key,
+        catalog::VOLATILITY_REGIME_1H_V1.key,
+        catalog::TRADE_LAST_PRICE_V1.key,
+    ];
+    let without = feature_set(&registry, keys.clone());
+    let with = feature_set(
+        &registry,
+        keys.into_iter().chain([catalog::BOOK_L2_V1.key]).collect(),
+    );
+    let text = spec_text(variant, &registry, catalog::TRADE_LAST_PRICE_V1.key)
+        .replace(
+            &format!("features {} {without}", without.version()),
+            &format!("features {} {with}", with.version()),
+        )
+        .replace(
+            "slippage slippage.fixed@1 rate=rate:0.0001\n",
+            &format!("slippage {slippage}\n"),
+        );
+    ExperimentSpec::parse(&text, &registry).unwrap()
+}
+
+/// The trade and metrics lines of `slippage.depth_walk@1` at q = 0.1 BTC on
+/// [`book_tape`]. The decision, levels and path are [`WITH_LINES`]'s:
+/// R = 93, e = 60 016 at decision + 1 s, the touch 60 107 at + 3 s, x =
+/// 60 110 at + 4 s; funding `funding.none@1`, 0.
+///
+/// - *E′* (the snapshot): the long buys from 60 016 into asks ≥ 60 016:
+///   0.05 at 60 017 and 0.05 at 60 018, (3 000.85 + 3 000.9) / 0.1 =
+///   60 017.5; fee 0.0005 × 60 017.5 = 30.00875.
+/// - *X′* (the update): it sells from 60 110 into bids ≤ 60 110: 0.08 at
+///   60 109 and 0.02 at 60 108, (4 808.72 + 1 202.16) / 0.1 = 60 108.8;
+///   fee 0.0005 × 60 108.8 = 30.0544.
+/// - *gross* stays on trade prices: 94 / 93 → 1.01075269.
+/// - *net* = (60 108.8 − 60 017.5 − 30.00875 − 30.0544) / 93 = 31.23685 /
+///   93 = 0.3358800… → 0.33588011.
+const BOOK_LINES: &str = "\
+triggers 1
+filtered 0
+skipped overlap=0 stale_reference=0 no_side=0 no_risk=0 stop_side=0
+reach-backs 0
+trade 68401000 trade 85 side=long regime=- reference=60014.00000000 stop=59921.00000000 \
+target=60107.00000000 risk=93.00000000 entry=68402000:60016.00000000 exit=target \
+exit_at=68404000 fill=68405000:60110.00000000 funding=0.00000000 gross=1.01075269 \
+net=0.33588011 displacement=0.02150538 mfe=1.01075269 mae=0.27956989 censor=- \
+entry_slipped=60017.50000000 exit_slipped=60108.80000000
+metrics all trades=1 censored=0 unfilled=0 expectancy=0.33588011 mean_gross=1.01075269 \
+profit_factor=- win_rate=1.00000000 max_drawdown=0.00000000 time_to_target=3000 \
+mean_mfe=1.01075269 mean_mae=0.27956989 mean_displacement=0.02150538
+EMPTY_BUCKETS\
+metrics volatility.regime.1h@1 - trades=1 censored=0 unfilled=0 expectancy=0.33588011 \
+mean_gross=1.01075269 profit_factor=- win_rate=1.00000000 max_drawdown=0.00000000 \
+time_to_target=3000 mean_mfe=1.01075269 mean_mae=0.27956989 mean_displacement=0.02150538
+";
+
+/// A service on [`book_bounds`]'s chain over `events`.
+fn book_service(events: Vec<MarketEvent>) -> BacktestService<Engine<Recorded>, MemoryStore> {
+    BacktestService::new(
+        engine_on(Recorded(events), Vec::new(), book_bounds()),
+        MemoryStore::default(),
+        FundingCoverage {
+            until: Some(EventTime::from_millis(T0)),
+        },
+        EventTime::from_millis(T0),
+    )
+}
+
+#[test]
+fn a_book_rule_prices_the_fills_on_the_recorded_book() {
+    let spec = book_spec(
+        "slippage.depth_walk@1 book=feature:book.l2@1 qty=qty:0.1",
+        END,
+    );
+    let mut service = book_service(book_tape());
+    let run = service.run(&spec).unwrap();
+    let ExperimentRun::Recorded(result) = &run else {
+        panic!("{run:?}");
+    };
+    let (_, v2) = v2_summary_on(book_tape(), &spec, book_bounds());
+    assert_eq!(result.canonical_text(), expected(&v2, BOOK_LINES));
+    // Reproduced exactly on a rerun.
+    assert_eq!(
+        service.run(&spec).unwrap(),
+        ExperimentRun::Reproduced(result.clone())
+    );
+
+    // Spread: E′ = 60 017, the first ask at or above 60 016; X′ = 60 109,
+    // the first bid at or below 60 110.
+    let spread = book_spec("slippage.spread@1 book=feature:book.l2@1", END);
+    let text = book_service(book_tape())
+        .run(&spread)
+        .unwrap()
+        .result()
+        .canonical_text();
+    assert_eq!(field(&text, "entry_slipped"), "60017.00000000");
+    assert_eq!(field(&text, "exit_slipped"), "60109.00000000");
+    // A size beyond the exit window: `no_book` at the exit fill trade.
+    let deep = book_spec(
+        "slippage.depth_walk@1 book=feature:book.l2@1 qty=qty:1.1",
+        END,
+    );
+    let text = book_service(book_tape())
+        .run(&deep)
+        .unwrap()
+        .result()
+        .canonical_text();
+    // 1.1 BTC exceeds the snapshot's 1.05 asks: `no_book` at the entry.
+    assert_eq!(field(&text, "censor"), "no_book");
+    assert_eq!(field(&text, "exit_at"), (DECISION + 1_000).to_string());
+    assert_eq!(field(&text, "entry_slipped"), "-");
+    // Without a book before the entry, every fill censors `no_book`.
+    let text = book_service(tape().events)
+        .run(&spread)
+        .unwrap()
+        .result()
+        .canonical_text();
+    assert_eq!(field(&text, "censor"), "no_book");
+}
+
+#[test]
+fn a_book_rule_on_a_sample_before_the_cutover_opens_nothing() {
+    let spread = "slippage.spread@1 book=feature:book.l2@1";
+    let unopenable_at = |cutover: i64| {
+        BacktestService::new(
+            engine(Unopenable, Vec::new()),
+            MemoryStore::default(),
+            covered(),
+            EventTime::from_millis(cutover),
+        )
+    };
+    // The sample ends at or before the cutover: no book (ADR-061 D4).
+    for cutover in [END, END + 1] {
+        assert_eq!(
+            unopenable_at(cutover).run(&book_spec(spread, END)),
+            Err(ResearchError::BookNotDelivered {
+                sample_end: EventTime::from_millis(END),
+                cutover: EventTime::from_millis(cutover),
+            })
+        );
+    }
+    // A sample that ends after it reaches the engine, and a fixed rule
+    // needs no book.
+    assert_eq!(
+        unopenable_at(END - 1).run(&book_spec(spread, END)),
+        Err(not_opened())
+    );
+    assert_eq!(
+        unopenable_at(END).run(&book_spec("slippage.fixed@1 rate=rate:0", END)),
+        Err(not_opened())
+    );
+    // Funding coverage is checked first (ADR-060 D13's order, extended).
+    let recorded = ExperimentSpec::parse(
+        &book_spec(spread, END)
+            .canonical_text()
+            .replace("funding funding.none@1", "funding funding.recorded@1"),
+        &catalog::registry(),
+    )
+    .unwrap();
+    let mut service = BacktestService::new(
+        engine(Unopenable, Vec::new()),
+        MemoryStore::default(),
+        FundingCoverage { until: None },
+        EventTime::from_millis(END),
+    );
+    assert_eq!(
+        service.run(&recorded),
+        Err(ResearchError::FundingNotDelivered {
+            sample_end: EventTime::from_millis(END),
+            until: None,
+        })
+    );
+    assert!(service.store().results.is_empty());
 }

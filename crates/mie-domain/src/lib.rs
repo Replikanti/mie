@@ -34,6 +34,7 @@
 //! | Strategy lifecycle / edge health          | [`strategy`]                 |
 //! | Experiments and results (ADR-040)         | [`research`]                 |
 //! | Backtest simulation (ADR-060)             | [`backtest`]                 |
+//! | Fill prices on the book (ADR-061)         | [`slippage`]                 |
 //!
 //! Risk and validation rules join as modules here when their issues land —
 //! never as a dependency on a port or adapter.
@@ -57,6 +58,7 @@ pub mod order;
 pub mod profile;
 pub mod regime;
 pub mod research;
+pub mod slippage;
 pub mod state;
 pub mod state_hash;
 pub mod strategy;

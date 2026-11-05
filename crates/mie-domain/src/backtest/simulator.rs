@@ -1,13 +1,17 @@
-//! The event-driven fill simulator and trade lifecycle (ADR-060 D4–D10).
+//! The event-driven fill simulator and trade lifecycle (ADR-060 D4–D10),
+//! with the book-priced fills and the maker target of ADR-061 D4 and D6.
 
 use super::{
-    Admission, CensorReason, Costs, Exit, Fill, FundingRule, Levels, SimulationStats, TradeIntent,
-    TradeRecord,
+    Admission, CensorReason, Costs, Exit, Fill, FundingRule, Levels, PositionSide, SimulationStats,
+    SlippageRule, SlippedFills, TargetFill, TradeIntent, TradeRecord,
 };
+use crate::book::OrderBook;
 use crate::event::{FundingSettlement, MarketEvent, Stream};
+use crate::feature::FeatureValue;
 use crate::num::{Price, Rate, SCALE, div_half_even};
 use crate::order::CanonicalKey;
 use crate::regime::RegimeLabel;
+use crate::slippage::{BookModel, FillSide, price_fill};
 use crate::time::EventTime;
 
 #[cfg(test)]
@@ -19,7 +23,8 @@ pub(super) mod tests;
 ///
 /// 1. [`observe`](Self::observe) every **accepted** event, from the
 ///    engine's start, the prefix included (ADR-052 D10), so that the
-///    staleness of the reference follows the engine's last price;
+///    staleness of the reference follows the engine's last price, with the
+///    engine's `book.l2@1` after the event (ADR-061 D1);
 /// 2. after each event, [`decide`](Self::decide) each emission of the
 ///    spec's trigger id at that event, in emission order (D4, D8);
 /// 3. [`reject`](Self::reject) every rejected event instead of observing
@@ -116,9 +121,11 @@ enum Phase {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Closed {
     exit: Exit,
-    /// The touch or the deadline.
+    /// The touch, the deadline, or a maker target's fill trade.
     exit_at: EventTime,
     fill: Fill,
+    /// X′.
+    slipped: Price,
     funding: Price,
     gross: Rate,
     net: Rate,
@@ -128,11 +135,22 @@ struct Closed {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Entry {
     fill: Fill,
-    /// E′ in price units.
-    slipped: i128,
+    /// E′.
+    slipped: Price,
     /// The entry leg's fee in price units.
     fee: i128,
     displacement: Rate,
+}
+
+/// How an exit leg fills (ADR-060 D6, ADR-061 D6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Leg {
+    /// A taker order at the fill trade: X′ by the slippage rule, the taker
+    /// fee, gross R on the trade price.
+    Taker,
+    /// The resting maker target: X′ = the target, the maker fee, gross R
+    /// on the target.
+    Maker,
 }
 
 /// The running σ-max and σ-min of the path against the entry fill price,
@@ -178,6 +196,54 @@ fn units(value: i128) -> Option<i64> {
     i64::try_from(value).ok()
 }
 
+/// The order side of a leg: a long buys to enter and sells to exit, a short
+/// the reverse (ADR-061 D2).
+const fn fill_side(side: PositionSide, entering: bool) -> FillSide {
+    match (side, entering) {
+        (PositionSide::Long, true) | (PositionSide::Short, false) => FillSide::Buy,
+        (PositionSide::Long, false) | (PositionSide::Short, true) => FillSide::Sell,
+    }
+}
+
+/// The slipped fill of a taker leg at the trade price `price` (ADR-060 D6,
+/// ADR-061 D2, D4): ⟨price × (1 ± σs)⟩ under `slippage.fixed@1`, with +
+/// entering and − exiting, else the book's price at the fill trade.
+///
+/// # Errors
+///
+/// [`CensorReason::Overflow`] when the fixed fill leaves the `i64` unit
+/// range (D10), [`CensorReason::NoBook`] when the book rule cannot price
+/// the fill (ADR-061 D4).
+fn slip(
+    costs: &Costs,
+    side: PositionSide,
+    entering: bool,
+    price: Price,
+    book: &FeatureValue<OrderBook>,
+) -> Result<Price, CensorReason> {
+    match costs.slippage() {
+        SlippageRule::Fixed(rate) => {
+            let sigma = i128::from(side.sign()) * if entering { 1 } else { -1 };
+            let slip = i128::from(SCALE) + sigma * i128::from(rate.units());
+            times_rate(i128::from(price.units()), slip)
+                .and_then(units)
+                .map(Price::from_units)
+                .ok_or(CensorReason::Overflow)
+        }
+        SlippageRule::Spread => {
+            price_fill(book, fill_side(side, entering), price, BookModel::Spread)
+                .map_err(|_| CensorReason::NoBook)
+        }
+        SlippageRule::DepthWalk(qty) => price_fill(
+            book,
+            fill_side(side, entering),
+            price,
+            BookModel::DepthWalk(qty),
+        )
+        .map_err(|_| CensorReason::NoBook),
+    }
+}
+
 /// ⟨value × rate⟩ in price units: one half-to-even rounding (ADR-060 D6,
 /// D7).
 fn times_rate(value: i128, rate: i128) -> Option<i128> {
@@ -196,16 +262,16 @@ impl Position {
         i128::from(self.levels.side().sign())
     }
 
-    /// The entry at a fill trade (D6, D10): E′ = ⟨e(1 + σs)⟩, the fee
-    /// ⟨taker · E′⟩ and the displacement σ(e − reference) / R. `None` on
-    /// overflow.
-    fn entry(&self, costs: &Costs, fill: Fill) -> Option<Entry> {
+    /// The entry at a fill trade with its slipped fill E′ ([`slip`]; D6,
+    /// D10): the fee ⟨taker · E′⟩ and the displacement σ(e − reference) /
+    /// R. `None` on overflow.
+    fn entry(&self, costs: &Costs, fill: Fill, slipped: Price) -> Option<Entry> {
         let sigma = self.sigma();
         let e = i128::from(fill.price.units());
-        let slip = i128::from(SCALE) + sigma * i128::from(costs.slippage().units());
-        let slipped = times_rate(e, slip)?;
-        units(slipped)?;
-        let fee = times_rate(slipped, i128::from(costs.taker().units()))?;
+        let fee = times_rate(
+            i128::from(slipped.units()),
+            i128::from(costs.taker().units()),
+        )?;
         units(fee)?;
         let moved = sigma * (e - i128::from(self.levels.reference().units()));
         let displacement = r_value(moved, self.levels.risk())?;
@@ -245,6 +311,19 @@ impl Position {
         true
     }
 
+    /// Whether a maker target fills at a trade at `price` (ADR-061 D6):
+    /// σ-strictly beyond the target under `through`, at or beyond it under
+    /// `touch`.
+    fn maker_fills(&self, costs: &Costs, price: Price) -> bool {
+        let to =
+            self.sigma() * (i128::from(price.units()) - i128::from(self.levels.target().units()));
+        match costs.target_fill() {
+            TargetFill::MakerThrough => to > 0,
+            TargetFill::MakerTouch => to >= 0,
+            TargetFill::Taker => false,
+        }
+    }
+
     /// Whether a trade at `price` touches a level, and which (ADR-055 D5,
     /// ADR-060 D6). One trade cannot touch both.
     fn touch(&self, price: Price) -> Option<Exit> {
@@ -260,21 +339,33 @@ impl Position {
         }
     }
 
-    /// The exit at a fill trade (D6, D10): X′ = ⟨x(1 − σs)⟩, its fee, gross
-    /// and net R. `None` on overflow.
-    fn close(&self, costs: &Costs, exit: Exit, exit_at: EventTime, fill: Fill) -> Option<Closed> {
+    /// The exit at a fill trade (D6, D10) with its slipped fill X′: its
+    /// fee, gross and net R. A taker leg pays ⟨taker · X′⟩ and its gross R
+    /// is σ(x − e) / R; the maker target fills at X′ = the target with
+    /// ⟨maker · X′⟩ and gross R σ(target − e) / R (ADR-061 D6). `None` on
+    /// overflow.
+    fn close(
+        &self,
+        costs: &Costs,
+        exit: Exit,
+        exit_at: EventTime,
+        fill: Fill,
+        (leg, slipped): (Leg, Price),
+    ) -> Option<Closed> {
         let entry = self.entry?;
         let sigma = self.sigma();
         let risk = self.levels.risk();
-        let x = i128::from(fill.price.units());
-        let slip = i128::from(SCALE) - sigma * i128::from(costs.slippage().units());
-        let slipped = times_rate(x, slip)?;
-        units(slipped)?;
-        let fee = times_rate(slipped, i128::from(costs.taker().units()))?;
+        let (fee_rate, gross_at) = match leg {
+            Leg::Taker => (costs.taker(), fill.price),
+            Leg::Maker => (costs.maker(), slipped),
+        };
+        let exit_units = i128::from(slipped.units());
+        let fee = times_rate(exit_units, i128::from(fee_rate.units()))?;
         units(fee)?;
         let funding = Price::from_units(units(self.funding)?);
-        let gross = r_value(sigma * (x - i128::from(entry.fill.price.units())), risk)?;
-        let net = (sigma * (slipped - entry.slipped))
+        let e = i128::from(entry.fill.price.units());
+        let gross = r_value(sigma * (i128::from(gross_at.units()) - e), risk)?;
+        let net = (sigma * (exit_units - i128::from(entry.slipped.units())))
             .checked_sub(entry.fee + fee)?
             .checked_sub(self.funding)?;
         let net = r_value(net, risk)?;
@@ -282,6 +373,7 @@ impl Position {
             exit,
             exit_at,
             fill,
+            slipped,
             funding,
             gross,
             net,
@@ -301,9 +393,10 @@ impl Position {
         (before_exit && end >= entry).then_some(start.max(entry))
     }
 
-    /// The record (D12). Every position is closed, unfilled or censored
-    /// after [`Simulator::finish`].
-    fn record(&self) -> TradeRecord {
+    /// The record (D12), with the slipped fills when `book` (a book
+    /// slippage rule, ADR-061 D5). Every position is closed, unfilled or
+    /// censored after [`Simulator::finish`].
+    fn record(&self, book: bool) -> TradeRecord {
         let (exit, exit_at, closed, cut) = match self.phase {
             Phase::Closed(closed) => (closed.exit, closed.exit_at, Some(closed), None),
             Phase::Unfilled => (Exit::Unfilled, self.deadline, None, None),
@@ -335,6 +428,10 @@ impl Position {
             displacement: entry.map(|entry| entry.displacement),
             mfe: excursion(&self.excursion.favorable),
             mae: excursion(&self.excursion.adverse),
+            slipped: book.then(|| SlippedFills {
+                entry: entry.map(|entry| entry.slipped),
+                exit: closed.map(|closed| closed.slipped),
+            }),
         }
     }
 }
@@ -375,7 +472,12 @@ impl Simulator {
     /// after a deadline ends a pending entry as `unfilled` or starts the
     /// time exit; then a trade fills, is monitored or fills the exit, and a
     /// settlement is booked.
-    pub fn observe(&mut self, event: &MarketEvent) {
+    ///
+    /// `book` is the engine's `book.l2@1` after `event`: a trade never
+    /// changes the book, so for a trade it is the book the print met
+    /// (ADR-061 D1). Only a book slippage rule reads it, and only at a fill
+    /// trade, so any value will do for an event that is no trade.
+    pub fn observe(&mut self, event: &MarketEvent, book: &FeatureValue<OrderBook>) {
         let key = event.canonical_key();
         match event {
             MarketEvent::FeedGap(gap) if gap.stream == Stream::Funding && gap.start <= gap.end => {
@@ -391,7 +493,7 @@ impl Simulator {
             }
             MarketEvent::Trade(trade) => {
                 self.expire(key.time);
-                self.trade(key, trade.price);
+                self.trade(key, trade.price, book);
                 self.stale = false;
             }
             MarketEvent::FundingSettlement(settlement) => {
@@ -506,7 +608,12 @@ impl Simulator {
     /// returns the records in decision order with the counts.
     pub fn finish(mut self) -> (Vec<TradeRecord>, SimulationStats) {
         self.censor_live(self.trades_until, CensorReason::EndOfData);
-        let records = self.positions.iter().map(Position::record).collect();
+        let book = self.costs.slippage().is_book();
+        let records = self
+            .positions
+            .iter()
+            .map(|position| position.record(book))
+            .collect();
         (records, self.stats)
     }
 
@@ -532,25 +639,38 @@ impl Simulator {
     }
 
     /// A trade, after [`expire`](Self::expire): the entry fill, a monitored
-    /// trade or the exit fill of the open position (D6, D10).
-    fn trade(&mut self, key: CanonicalKey, price: Price) {
+    /// trade or the exit fill of the open position (D6, D10), priced on
+    /// `book` under a book slippage rule (ADR-061 D4). Under a maker target,
+    /// a monitored trade after the entry fill trade may fill the resting
+    /// target itself (ADR-061 D6).
+    fn trade(&mut self, key: CanonicalKey, price: Price, book: &FeatureValue<OrderBook>) {
         let Some(index) = self.current else {
             return;
         };
         let costs = self.costs;
         let seen = self.funding_seen;
         let position = &mut self.positions[index];
+        let side = position.levels.side();
         let fill = Fill {
             at: key.time,
             price,
         };
-        if position.phase == Phase::Pending {
+        let entering = position.phase == Phase::Pending;
+        if entering {
             if key <= position.decision || key.time < position.entry_after {
                 return;
             }
-            let Some(entry) = position.entry(&costs, fill) else {
-                self.censor(index, key.time, CensorReason::Overflow);
-                return;
+            let entry = slip(&costs, side, true, price, book).and_then(|slipped| {
+                position
+                    .entry(&costs, fill, slipped)
+                    .ok_or(CensorReason::Overflow)
+            });
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(reason) => {
+                    self.censor(index, key.time, reason);
+                    return;
+                }
             };
             position.entry = Some(entry);
             position.excursion = Excursion::at_entry(key.time);
@@ -572,15 +692,32 @@ impl Simulator {
             self.censor(index, key.time, CensorReason::Overflow);
             return;
         }
-        let (exit, exit_at) = match position.phase {
+        let (exit, exit_at, leg) = match position.phase {
+            // A maker target rests from the entry; the entry fill trade
+            // itself only finds it marketable, a taker touch (ADR-061 D6).
+            Phase::Monitoring if costs.target_fill().is_maker() && !entering => {
+                match position.touch(price) {
+                    Some(Exit::Stop) => {
+                        position.phase = Phase::Touched {
+                            exit: Exit::Stop,
+                            at: key.time,
+                        };
+                        return;
+                    }
+                    _ if position.maker_fills(&costs, price) => {
+                        (Exit::Target, key.time, Leg::Maker)
+                    }
+                    _ => return,
+                }
+            }
             Phase::Monitoring => {
                 if let Some(exit) = position.touch(price) {
                     position.phase = Phase::Touched { exit, at: key.time };
                 }
                 return;
             }
-            Phase::Touched { exit, at } => (exit, at),
-            Phase::Expired => (Exit::Time, position.deadline),
+            Phase::Touched { exit, at } => (exit, at, Leg::Taker),
+            Phase::Expired => (Exit::Time, position.deadline, Leg::Taker),
             _ => return,
         };
         if let Some(start) = position.funding_pending.take()
@@ -589,7 +726,18 @@ impl Simulator {
             self.censor(index, start, CensorReason::FundingGap);
             return;
         }
-        match position.close(&costs, exit, exit_at, fill) {
+        let slipped = match leg {
+            Leg::Maker => Ok(position.levels.target()),
+            Leg::Taker => slip(&costs, side, false, price, book),
+        };
+        let slipped = match slipped {
+            Ok(slipped) => slipped,
+            Err(reason) => {
+                self.censor(index, key.time, reason);
+                return;
+            }
+        };
+        match position.close(&costs, exit, exit_at, fill, (leg, slipped)) {
             Some(closed) => {
                 position.phase = Phase::Closed(closed);
                 self.current = None;
@@ -658,9 +806,10 @@ impl Simulator {
 
     /// Applies a censor at `at` to one position (D9). The earliest censor
     /// wins, and at an equal time the first one stays. A trades-stream
-    /// cause leaves an outcome that stands: a touch before `at`, or a
-    /// deadline at or before it for a time exit or an unfilled entry. A
-    /// funding gap or an overflow censors outright. Anything else is
+    /// cause leaves an outcome that stands: a touch (or a maker target's
+    /// fill trade) before `at`, or a deadline at or before it for a time
+    /// exit or an unfilled entry. A funding gap, an overflow or an unpriced
+    /// book fill (ADR-061 D4) censors outright. Anything else is
     /// censored, including an exit that would stand without an observed
     /// fill, which the provider contract rules out.
     fn censor(&mut self, index: usize, at: EventTime, reason: CensorReason) {
@@ -669,7 +818,10 @@ impl Simulator {
         if let Some(start) = self.positions[index].funding_pending.take() {
             self.censor(index, start, CensorReason::FundingGap);
         }
-        let outright = matches!(reason, CensorReason::FundingGap | CensorReason::Overflow);
+        let outright = matches!(
+            reason,
+            CensorReason::FundingGap | CensorReason::Overflow | CensorReason::NoBook
+        );
         let position = &mut self.positions[index];
         match position.phase {
             Phase::Censored { at: earlier, .. } if earlier <= at => return,
