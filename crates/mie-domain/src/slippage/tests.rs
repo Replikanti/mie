@@ -575,3 +575,24 @@ fn an_overflow_leaves_the_calibrator_unchanged() {
     full.trades = u64::MAX;
     assert_eq!(full.unpriced(), None);
 }
+
+/// Review regression (PR #181, dd51b16): an update that leaves the
+/// engine's book not ready (its chain broke, say after the domain rejected
+/// the diff before it) proves nothing, so the held fills count `book`.
+#[test]
+fn an_update_that_invalidates_the_book_settles_book() {
+    let mut calibrator = Calibrator::new();
+    calibrator
+        .observe(&trade_at(1_150, "100.0"), &fixture())
+        .unwrap();
+    let invalid = FeatureValue::Unavailable {
+        reason: Unavailability::InputInvalid,
+    };
+    calibrator
+        .observe(&update(1_400, 111, 115), &invalid)
+        .unwrap();
+    assert_eq!(
+        calibrator.finish().unwrap(),
+        one_priced().unpriced().unwrap()
+    );
+}

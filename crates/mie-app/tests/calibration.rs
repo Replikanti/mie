@@ -311,3 +311,60 @@ fn a_trade_between_a_stale_book_and_its_resync_counts_book() {
     assert_eq!(calibration.spread, row(4, 2, 0, "0.0020101"));
     assert_eq!(calibration.first_unconserved(), None);
 }
+
+/// Review regression (PR #181, dd51b16): the domain rejects a book diff
+/// (here out of order), so the engine's book misses it; the next diff
+/// chains to the rejected one, breaks the domain book's chain and leaves
+/// it not ready. The trades held since the last proving update met a book
+/// missing that diff (the 1 300 ms one still sees the removed ask 100.0),
+/// so their fills count `book`.
+#[test]
+fn a_rejected_diff_and_its_chain_break_settle_the_held_fills_book() {
+    let diff = |millis: i64, first: u64, last: u64, prev: u64, asks: &[(&str, &str)]| {
+        MarketEvent::BookUpdate(BookUpdate {
+            time: EventTime::from_millis(millis),
+            first_update_id: first,
+            last_update_id: last,
+            prev_update_id: prev,
+            bids: Vec::new(),
+            asks: levels(asks),
+        })
+    };
+    let tape = vec![
+        snapshot(
+            1_000,
+            100,
+            &[("99.9", "1"), ("99.8", "2")],
+            &[("100.0", "1"), ("100.1", "2")],
+        ),
+        update(1_100, 100),
+        trade(1_200, 2, "100.0"),
+        // Removes the 100.0 ask; rejected: it sorts before the 1 200 ms trade.
+        diff(1_150, 102, 110, 101, &[("100.0", "0")]),
+        trade(1_300, 3, "100.0"),
+        // Chains to the rejected diff: the domain book breaks its chain.
+        diff(1_400, 111, 115, 110, &[("100.1", "2")]),
+    ];
+    let spec = spec(&[catalog::BOOK_L2_V1.key]);
+    let mut service = CalibrationService::new(Recorded(tape), MemoryStore::default());
+    let run = service.run(&spec).unwrap();
+    let ExperimentRun::Recorded(recorded) = &run else {
+        panic!("{run:?}");
+    };
+    let Outcome::SlippageCalibration {
+        domain_rejections,
+        calibration,
+        ..
+    } = &recorded.outcome
+    else {
+        panic!("{:?}", recorded.outcome);
+    };
+    assert_eq!(*domain_rejections, 1);
+    assert_eq!(calibration.trades, 2);
+    assert!(
+        calibration
+            .rows()
+            .all(|(_, line)| *line == row(0, 4, 0, "0")),
+        "{calibration:?}"
+    );
+}

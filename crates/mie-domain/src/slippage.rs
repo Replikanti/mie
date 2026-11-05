@@ -32,11 +32,13 @@
 //! `Ready` with its old levels until the resync, and the `OrderBook` gap is
 //! announced only right before the snapshot that ends it (ADR-038 rule 9,
 //! ADR-028 D4). So a fill is held until the next book event proves the
-//! book it met: a `BookUpdate`, which the sequencer emits only while the
-//! diffs chain, keeps it priced; a snapshot, an `OrderBook` gap or the end
-//! of the sample counts it unpriced `book`. Every priced fill then depends
-//! only on the book since the last snapshot and the diffs that chain to it
-//! (D7).
+//! book it met: a `BookUpdate` after which the engine's book is still
+//! `Ready` keeps it priced (the sequencer emits one only while the diffs
+//! chain, and the domain book invalidates itself on a diff that does not
+//! chain to its own, such as the successor of a diff the domain rejected);
+//! any other update, a snapshot, an `OrderBook` gap or the end of the
+//! sample counts it unpriced `book`. Every priced fill then depends only on
+//! the book since the last snapshot and the diffs that chain to it (D7).
 //!
 //! Pure, integer fixed point, no float (ADR-025, ADR-027). Shared by the
 //! trade simulation and the slippage calibration (#172), so this file names
@@ -361,9 +363,13 @@ impl SlippageCalibration {
 /// A trade's fills are priced on the book of the engine's state at the
 /// trade and held until the next book event settles them:
 ///
-/// - a `BookUpdate`: the sequencer emits one only while the diffs chain, so
-///   the book was current at the held trades, and their fills count as
-///   priced;
+/// - a `BookUpdate` after which `book` is still `Ready`: the sequencer
+///   emits one only while the diffs chain, and the domain book stays ready
+///   only while they chain to its own (a diff the domain rejected leaves
+///   its successor breaking that chain), so the book was current at the
+///   held trades, and their fills count as priced;
+/// - a `BookUpdate` that leaves `book` not ready: the book missed a diff,
+///   and the held fills count `book`;
 /// - a `BookSnapshot` or a `FeedGap` on the order book: the book may have
 ///   been stale since its last event (an unsynced period is announced only
 ///   at its resync, a restarted run's book resets), so every held fill
@@ -401,7 +407,7 @@ impl Calibrator {
     ) -> Result<(), CalibrationOverflow> {
         match event {
             MarketEvent::Trade(trade) => self.held.observe(book, trade.price),
-            MarketEvent::BookUpdate(_) => self.settle(true),
+            MarketEvent::BookUpdate(_) => self.settle(book.is_ready()),
             MarketEvent::BookSnapshot(_) => self.settle(false),
             MarketEvent::FeedGap(gap) if gap.stream == Stream::OrderBook => self.settle(false),
             _ => Ok(()),
