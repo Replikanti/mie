@@ -268,26 +268,44 @@ live in more than one root (approved as written at STOP 1).
 
 - **One multi-root store** in `mie-adapter-parquet` sits behind the
   unchanged `RawRecordSource` port.
-  - `select` enumerates the hot partitions as today, plus the copy
-    ledger's entries for partitions removed from hot, and merges them by
-    `relative_path`. It never lists a cold root.
+  - `select` enumerates the hot partitions as today, plus **every file
+    the copy ledger records** (its manifest records and lost entries),
+    whatever the partition's state (on hot, removed, returned), and merges
+    them by `relative_path`. A file in both is the same file (D5). It never
+    lists a cold root.
+  - Why every file and not only the removed partitions: a partition also
+    reappears on hot gradually, file by file, in a recall (D6) and in the
+    hot restore's step 3 (D11). A `select` that lists hot in the middle of
+    that and reads the ledger after the "returned to hot" record would
+    otherwise hold only the files already copied back, a shorter selection
+    with another dataset version and no error. Every file in the ledger
+    was copied to a copy target before its record (D5), so the ledger's
+    file list never needs hot. The cost is reading the whole ledger per
+    `select` (about 1.5 MB per day of capture, Numbers table); an index is
+    an implementation detail. Rejected, staging each recall or restore in
+    a hidden directory renamed into place before its record: it closes the
+    same race, but only as long as every path that ever writes a partition
+    back obeys it, while the union over the ledger holds whatever hot
+    shows.
   - **The order is fixed: hot is listed completely first, then the copy
-    ledger is read from disk**, fresh for every `select`, never from a copy
-    cached at construction. Why: D6 makes the removal record durable before
-    the rename. A partition missing from the hot listing was therefore
-    renamed before the listing ended, so its record is in any ledger read
-    after it. The other order loses it: a ledger read before the removal
-    record, then a hot listing after the rename, holds the partition in
+    ledger is read from disk**, fresh for every `select`, never from a
+    copy cached at construction. Why: a file's records precede the
+    removal of its partition (D6, eligibility), and the removal record
+    precedes the rename. A file missing from the hot listing was
+    therefore renamed away before the listing ended, so its records are
+    in any ledger read after the listing. The other order can lose it: a
+    ledger read that ends before a file's records are appended, then a
+    hot listing after its partition was removed, holds the file in
     neither source, and the selection would be shorter, with another
-    dataset version and no error (for the archive segment, an ADR-052 hole
-    that "holes stay holes" keeps). A ledger cached in a long-lived process
-    has the same defect.
+    dataset version and no error (for the archive segment, an ADR-052
+    hole that "holes stay holes" keeps). A ledger cached in a long-lived
+    process has the same defect, over a much longer interval.
   - **A partition that disappears during the hot listing** (its `date=`
     entry was listed, its directory is gone when its files are listed) is
     never an empty partition. Today `sorted_entries` maps `NotFound` to an
     empty list (`mie-adapter-parquet` `lib.rs`); the union store instead
     takes that partition's files from the ledger read that follows, and if
-    the ledger has no removal record for it, `select` fails with
+    the ledger records none of its files, `select` fails with
     `Integrity`, naming the partition.
   - A reader ignores an incomplete trailing ledger record (no final
     newline or a chain hash that does not verify at the end of the file):
@@ -303,7 +321,8 @@ live in more than one root (approved as written at STOP 1).
     ADR-025 change. `mie-cli` wires it.
 - **The copy ledger** is an append-only file on hot, next to the journal
   and the import ledger. It records:
-  - for each sealed file, the manifest text verbatim;
+  - for each sealed file, the manifest text verbatim, written with its
+    first verified copy;
   - for each verified copy, the file, the root id and the time;
   - for each partition removed from hot, the removal (D6);
   - for each verification pass (D11), the root, the ledger prefix covered
@@ -407,8 +426,8 @@ live in more than one root (approved as written at STOP 1).
      covering a lost file then fails with `Integrity`, as in D11's
      lost-file rule.
   5. **Every partition with verified cold copies and no directory on hot
-     is recorded as removed from hot.** Why: the union `select` must list
-     it, and an append to it must recall it first (D6). On a lost hot this
+     is recorded as removed from hot.** Why: an append to it must recall
+     it first (D6), and D6 must not try to remove it again. On a lost hot this
      runs inside the hot restore (D11) after the hot-window partitions are
      back on hot, so it never marks those as removed.
   6. **The rebuilt ledger** is written under a temp name, fsynced and
@@ -522,7 +541,8 @@ Inputs:
   archive source lock for its whole duration, so D6 cannot remove any of
   its partitions before it ends (D6 *The source lock*). A daily import
   is about one day of a; a 12-month backfill like #12 is the whole year,
-  37.0 GB with `trades` on the host's archive store (M1 archive table).
+  365 × a = 15.8 GB for the default datasets, 45.5 GB with `trades`
+  (+ 365 × 81.5 MB = 29.7 GB; M1-13).
 
 Formulas (days counted from the start of production capture, t in days):
 
@@ -613,20 +633,37 @@ What breaks:
   copy targets, or a copy target and hot, report the same device id
   (`st_dev`). That catches two copies on one local disk, but not two
   exports of one NAS.
-- **Replication.** After each seal pass (300 s, ADR-032 D10), the replicator
-  copies every sealed file with fewer than k copies to the copy targets by
-  the D5 protocol and records each verified copy in the copy ledger.
-  Within a pass it copies the data files first, then the import-ledger
-  entries, then the tails of the copy ledger and the journal. Why the
-  order: a `sealed` line on a cold journal copy then always names a file
-  that is already on cold, so a hot loss drops whole files together with
-  their journal lines, and the lost tail never leaves a cold journal
+- **Replication.** After each seal pass (300 s, ADR-032 D10), the
+  replicator copies every sealed file with fewer than k copies to the copy
+  targets by the D5 protocol and records each verified copy in the copy
+  ledger. Within a pass it copies the data files first, then the
+  import-ledger entries, then the tails of the copy ledger and the journal.
+  Why the order: a `sealed` line on a cold journal copy then always names
+  a file that is already on cold, so a hot loss drops whole files together
+  with their journal lines, and the lost tail never leaves a cold journal
   naming a missing file. It writes only into a root whose marker it finds.
   Why: an unmounted mount point is a writable empty directory on the hot
   disk, and a copy written there would share hot's device and disappear
   under the mount when the mount returns. Sealed files and import-ledger
   entries, which are immutable files (ADR-034 D4), are copied once by the
   D5 protocol.
+- **Archive parts wait for their import entry.** An archive part is
+  replicated only once the `.import` entry that lists it exists on hot,
+  and per archive file the pass copies its parts, then its entry. The
+  importer's `PENDING` marker (ADR-034 D4) is not replicated. Why: an
+  import that seals several parts of one file (a large `trades` or
+  `aggTrades` day, ADR-034 D5's row and byte limits) writes its entry only
+  at the end. If its parts reached cold before the entry and hot were then
+  lost, the restored store would hold sealed parts that no entry lists and
+  no `PENDING` names, which ADR-034 D4 treats as foreign orphans that stop
+  every later import, while D5 forbids removing them. A replicated
+  `PENDING` does not close this: the marker is rewritten for every file
+  and removed at the end, so a cold copy can be stale or already name the
+  next file while the previous file's entry is still on hot only. The cost
+  is that a file's parts stay at one copy for the duration of that file's
+  import, inside the single-copy exposure below. The hot restore handles
+  the one window left, a loss between a file's parts and its entry within
+  one pass (step 2).
 - **The journal and the copy ledger** are append-only. Each pass appends
   to each copy the bytes the copy lacks, `[len(copy), len(hot))`, and
   fsyncs it, after checking that the copy's last complete record equals
@@ -650,7 +687,9 @@ What breaks:
   stream, the ADR-032 D10 crash bound. Why the seal cadence is the
   earliest point: a part can be copied only once it is sealed ("sealed iff
   the manifest exists", ADR-030). The same bound applies to the journal's
-  and the copy ledger's tail. Hot removal never runs below k (D6).
+  and the copy ledger's tail. An archive part also waits for the end of
+  its file's import (*Archive parts wait for their import entry*). Hot
+  removal never runs below k (D6).
 - **The hot restore after a hot-disk loss.** An explicit `mie` step that
   must finish before `mie ingest` or the importer may start; both refuse a
   hot without its marker (D7). It holds the copy-ledger lock (D7)
@@ -661,7 +700,18 @@ What breaks:
      are byte prefixes of it. Two copies that differ beyond their common
      prefix stop the restore (damage, explicit repair). **The import
      ledger** is restored as the union of the entries on the copy targets;
-     one entry name with different bytes on two targets stops it. **The
+     one entry name with different bytes on two targets stops it.
+     **Archive parts that no restored entry lists** can, under the
+     replication rule above, belong only to the one file whose entry copy
+     a loss interrupted. The restore writes a `PENDING` for that file
+     (archive path and period from the parts' stream and date, the SHA-256
+     from the published `.CHECKSUM`), so the next import applies ADR-034
+     D4's crash rule unchanged: the parts must equal a prefix of the
+     file's rows (here all of them), and the run writes the entry that
+     lists them without appending. A changed upstream file is ADR-034 D4's
+     conflict, reported and never re-imported automatically. Unlisted parts
+     of more than one file stop the restore, since the rule above excludes
+     that. **The
      copy ledger** is restored from the longest copy whose hash chain
      verifies, or the restore starts it empty (D7 rebuild, step 1).
   3. **Every hot-window partition (today − 7 onward), and every partition
@@ -769,7 +819,7 @@ What breaks:
 | 90 min warm-up trigger | ADR-052 D12 | — | Cold reads lengthen `ready_after_ms`; the trigger fires on the measured value, so it stays correct (Consequences) |
 | k = 2 (copies on the copy targets; hot never counts) | Operator, STOP 1 | one device failure must not lose a replicated file (D11) | k = 1: one device failure makes every run containing the file unreplayable. k = 3: +274 … +411 GB per year per added copy (D10) |
 | k_A = 2 | This ADR (D11) | a lost archive file changes the chain's prefix dataset; cost ≈ 67 GB in year 1 | k_A = 1: one device failure turns every warm run `DIVERGED (warm prefix)`. Higher: archive bytes only |
-| Z (staging), B (largest import run on hot) | ADR-034 (one zip at a time, deleted once imported); D6 *The source lock* | Z: the largest zip, read from the import log at provisioning. B: one day of a for a daily import; a whole-year backfill is 37.0 GB with `trades` (M1 archive table) | B larger than hot's headroom fills hot during the import and stops the capture (D10 *What breaks*), hence the bootstrap's adoption path for large imports |
+| Z (staging), B (largest import run on hot) | ADR-034 (one zip at a time, deleted once imported); D6 *The source lock* | Z: the largest zip, read from the import log at provisioning. B: one day of a for a daily import; a 12-month backfill is 365 × 43.2 MB = 15.8 GB for the default datasets, + 365 × 81.5 MB = 29.7 GB with `trades`, 45.5 GB (M1-13) | Z too small: the zip being fetched fills hot, the import fails, and the capture's writer can hit `ENOSPC` too (D10 *What breaks*). B larger than hot's headroom fills hot during the import with the same result, hence the bootstrap's adoption path for large imports. Larger Z or B than needed: unused hot disk only |
 | Hot restore copies 6.35–9.36 GB | D10, D11 | (Σ_s r_s + a) × H at the two rate columns | The capture's downtime after a hot loss grows with it; a smaller H shortens the restore but weakens the degraded start (D8) |
 | Initial hot sizes | D10 | week-weighted: (750.5 + 43.2) × 8 = 6.35 GB, + 0.79 GB per outage day, J (5.6 + 1.5) × 365 = 2.6 GB per year. Busiest: (1 126.3 + 43.2) × 8 = 9.36 GB, + 1.17 GB per outage day, (15.1 + 1.5) × 365 = 6.1 GB per year | See D10 *What breaks* |
 | Initial copy-device sizes | D10 | year 1, week-weighted: 273.9 + 2.6 + 51.0 + 15.8 + 3.7 = 347 GB; busiest: 411.1 + 6.1 + 51.0 + 15.8 + 3.7 = 488 GB. Later years: 273.9 + 2.6 + 15.8 = 292 GB; 411.1 + 6.1 + 15.8 = 433 GB | See D10 *What breaks* |
@@ -821,7 +871,8 @@ What breaks:
 - The follow-up work: the multi-root store (listing order, the
   disappearing-partition rule), the copy ledger with its hash chain and
   lock, the init step with adoption and markers, the replicator (root
-  markers, the device-id check, the copy order, tail appends), hot removal
+  markers, the device-id check, the copy order, archive parts held until
+  their import entry, tail appends), hot removal
   under the source lock, the recall, union part numbering, the
   verification, repair, rebuild and hot-restore commands, the start
   refusal on a hot without marker, the `cold_roots` keys, and tests.
@@ -879,6 +930,11 @@ What breaks:
   (D7, D8).
 - **Bootstrapping existing stores through hot.** Rejected for adoption:
   A is 5–8 times the hot size (D10).
+- **Union `select` over removed partitions only.** Rejected: a recall or
+  restore in progress shows a partial partition on hot (D7).
+- **Replicating the importer's `PENDING` marker.** Rejected for holding
+  archive parts until their entry exists: a cold copy of the marker can
+  be stale or name the next file (D11).
 
 ## Accept when
 
@@ -898,8 +954,11 @@ follow-up implementation:
    a removed date, which shows that the bound is the binding one;
 3. passes the copy, hot-removal, crash and race tests, including a
    removal that lands between a `select`'s hot listing and its ledger
-   read (the selection keeps every file and its dataset version) and a
-   partition renamed while its files are listed (no empty partition);
+   read (the selection keeps every file and its dataset version), a
+   partition renamed while its files are listed (no empty partition), and
+   a `select` that lists hot while a recall or the hot restore has copied
+   back only some of a partition's files (the selection still holds every
+   file and the same dataset version);
 4. with one copy target replaced by an empty directory, prints the
    byte-identical item 1 reports from the other copy. With both copy
    targets empty, `mie replay` and `mie equivalence` fail with `Integrity`
@@ -926,11 +985,15 @@ follow-up implementation:
    partition's part numbers without reusing a path, `mie replay --source
    live` lists every replicated pre-loss run, the new run's seeds equal
    those of a single-root start over the same data, and the item 1
-   reports for windows before the loss are byte-identical;
+   reports for windows before the loss are byte-identical. With hot lost
+   between a multi-part archive file's replicated parts and its entry, the
+   restore writes the `PENDING`, and the next import writes the entry
+   listing those parts without appending and imports later files;
 10. an archive import into a stream-date removed from hot recalls the
     partition, appends the next part number, and the partition is removed
     again once its new part has k copies; the remover skips the archive
-    source while an import holds its lock;
+    source while an import holds its lock; a `mie replay --source archive`
+    running during the recall prints the item 1 report byte-identical;
 11. the replicator and a verification appending to the copy ledger at the
     same time leave its hash chain valid on hot and on every copy.
 
