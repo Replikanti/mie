@@ -421,28 +421,55 @@ live in more than one root (approved as written at STOP 1).
      the rebuild stops. Why: the rebuild and the hot restore that runs
      it (D11) are the only steps that list cold roots, and the marker is
      what tells an unmounted root from an empty one.
-  3. **List every manifest on every root** and verify each data file
-     against it (`manifest::verify`). Each verified copy becomes a copy
-     record, with the manifest text verbatim. A file that the starting
-     copy already lists must carry a byte-identical manifest text, and the
-     same path with differing manifests on two roots is `Integrity` (D5).
-     The rebuild stops on either.
+  3. **List every manifest in the layout of every root** (the `.quarantine/`
+     directory is outside the layout and skipped here; step 5a reads it)
+     and verify each data file against it (`manifest::verify`). Each
+     verified copy becomes a copy record, with the manifest text verbatim.
+     A file that the starting copy already lists must carry a
+     byte-identical manifest text, and the same path with differing
+     manifests on two roots is `Integrity` (D5). On a live path the
+     rebuild stops on either; on an archive path it is a hold (step 5a,
+     D11), because the archive must never stop it (D11 hot restore,
+     step 5).
   4. **Cross-check against independent records of every seal:** the
-     starting ledger copy, every capture journal's `sealed` records and
-     `recovery` `rolled_forward` paths (live files), and every import
-     ledger entry's `file` lines (archive files, with their SHA-256). The
-     journals and the import ledger are k-copied too (D11). A path any of
-     them names that no root holds enters the rebuilt ledger as **lost**,
-     with what that record knows of it; it is never left out. Why: a
-     listing of roots alone cannot tell a missing file from one that never
-     existed, and these records were written at seal time. A `select`
-     covering a lost file then fails with `Integrity`, as in D11's
-     lost-file rule.
+     starting ledger copy, every capture journal's `sealed` records
+     and `recovery` `rolled_forward` paths (live files), and every
+     import ledger entry's `file` lines (archive files, with their
+     SHA-256). For each archive file only its **latest entry that no
+     supersede record names** counts; files listed only by a
+     superseded entry are expected in quarantine (step 5a), never
+     lost. The journals and the import ledger, entries and supersede
+     records alike, are k-copied too (D11). A path any of them names
+     that no root holds enters the rebuilt ledger as **lost**, with
+     what that record knows of it; it is never left out. Why: a
+     listing of roots alone cannot tell a missing file from one that
+     never existed, and these records were written at seal time. A
+     `select` covering a lost file then fails with `Integrity`, as in
+     D11's lost-file rule.
   5. **Every partition with verified cold copies and no directory on hot
      is recorded as removed from hot.** Why: an append to it must recall
      it first (D6), and D6 must not try to remove it again. On a lost hot this
      runs inside the hot restore (D11) after the hot-window partitions are
      back on hot, so it never marks those as removed.
+  5a. **Archive holds and quarantine are re-derived, never copied from a
+     ledger.** The rebuild reads each root's `.quarantine/` directory and
+     records every file in it as quarantined under the supersede record
+     that names it. It then runs the hot restore's archive checks (D11,
+     step 5) against the import ledger as resolved in step 4: parts that
+     no current entry lists, conflicting entry copies with no matching
+     one, and archive paths with differing manifests become holds again;
+     a supersede record with no newer entry for its file makes every
+     selection covering its quarantined paths fail, as before the rebuild.
+     Why: the durable sources of that state are the import ledger
+     (entries and supersede records, immutable, replicated) and the
+     quarantine directories (moved within each root, never deleted), while
+     hold records in the copy ledger exist only in the copy that may be
+     lost. Re-deriving gives the same holds and the same selections
+     whether the rebuild starts from a full copy, a stale one or empty.
+     Rejected, taking holds from the starting ledger copy: an empty or
+     stale start would turn held parts into ordinary files, and a
+     superseded entry would turn quarantined parts into lost files that
+     fail every selection of the day for good.
   6. **The rebuilt ledger** is written under a temp name, fsynced and
      renamed into place. The rebuild prints the starting copy's length,
      the records it added and every lost file. The next replication pass
@@ -710,7 +737,8 @@ What breaks:
   2. **The journal** is restored from the longest copy whose other copies
      are byte prefixes of it. Two copies that differ beyond their common
      prefix stop the restore (damage, explicit repair). **The import
-     ledger** is restored as the union of the entries on the copy targets;
+     ledger** is restored as the union of the entries and supersede
+     records on the copy targets;
      an entry name with different bytes on two targets is an archive
      finding (step 5), not a stop. **The copy ledger** is restored from
      the longest copy whose hash chain verifies, or the restore starts it
@@ -797,18 +825,25 @@ What breaks:
     clears the hold. Bytes, paths and dataset versions stay as they were,
     so the runs that cited the parts before the loss still reproduce. Why
     first: it is the only outcome that keeps those runs EQUIVALENT.
-  - **Replace**, when the rows differ (the upstream file was republished)
-    or the operator decides so. The held parts move, on every root, by a
-    rename within the root to `.quarantine/<id>/<relative path>`; nothing
-    in mie ever deletes them. The step appends a supersede record for any
-    existing entry of the file and never edits the old entry. The next
-    import then reads the file as not imported (a superseded entry counts
-    as absent, which is what keeps it from reporting "the ledger lists
-    …; not re-imported", `import.rs`), imports it fresh and writes new
-    parts with new numbers. The hold stays until that new entry exists, so
-    no selection is shorter in between. The cost, stated in the step's
-    output: every dataset version that covered the held parts changes, and
-    warm runs that cited them read `DIVERGED (warm prefix)` for good.
+  - **Replace**, when the rows differ (the upstream file was republished) or
+    the operator decides so. The held parts move, on every root, by a
+    rename within the root to `.quarantine/<id>/<relative path>`;
+    nothing in mie ever deletes them, and the rebuild and every listing
+    of the layout skip `.quarantine/` (D7, rebuild step 3). The step
+    first writes a supersede record: an immutable import-ledger file
+    naming the archive file, the superseded entry's SHA-256 when an
+    entry exists, the quarantine id and the paths moved, replicated like
+    the entries (it never edits the old entry). The next import then
+    reads the file as not imported (a superseded entry counts as absent,
+    which is what keeps it from reporting "the ledger lists …; not
+    re-imported", `import.rs`), imports it fresh and writes new parts
+    with new numbers. Until that new entry exists, every selection
+    covering the quarantined paths fails with `Integrity`, so no
+    selection is shorter in between. The supersede record and the
+    quarantine directories are what a rebuild re-derives this state from
+    (D7, step 5a). The cost, stated in the step's output: every dataset
+    version that covered the held parts changes, and warm runs that
+    cited them read `DIVERGED (warm prefix)` for good.
   - Why the importer halts instead of resolving on its own: replace
     changes recorded dataset versions, and a hold can be the trace of a
     changed upstream file (ADR-034 D4's `changed` conflict), which ADR-034
@@ -1114,7 +1149,15 @@ follow-up implementation:
     source while an import holds its lock; a `mie replay --source archive`
     running during the recall prints the item 1 report byte-identical;
 11. the replicator and a verification appending to the copy ledger at the
-    same time leave its hash chain valid on hot and on every copy.
+    same time leave its hash chain valid on hot and on every copy;
+12. after a *replace* resolution, the copy ledger is rebuilt three times,
+    from a full copy, from a stale copy and from empty (no copy
+    verifies). Each time a `select` of that day equals the post-replace
+    result: `Integrity` naming the quarantined paths before the
+    re-import's entry exists, and after it the new parts with the same
+    dataset version as before the rebuild, never a lost file and never
+    a quarantined part listed. The same three rebuilds with an unresolved
+    hold leave the held parts held, never ordinary files.
 
 Flagged now: the warm-up cost with a live segment on cold cannot be
 reached until #106's cutover exists (Consequences).
