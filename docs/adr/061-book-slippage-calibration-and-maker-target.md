@@ -1,6 +1,6 @@
 # ADR-061: Book slippage, live-book calibration and the maker target
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-11-05
 
 ## Context
@@ -390,3 +390,80 @@ and quantity, 10⁸ from the 8 decimals), or a 0 or 1 that a rule defines.
 
 Anything else fails: a `FAIL: …` line, a `Diverged` result, a broken
 conservation line or a changed file.
+
+## Acceptance
+
+Accepted 2026-11-05 (#172 PR 3). Binary `mie` release build at main
+`11b601e`, SHA-256
+`b28ab53e3c33932cfb27cfeadf7545de2db470e7a817658a54f596190caa0ffa`, under an
+8 GB memory cap and a 400 % CPU cap, `setsid`, one store after another.
+
+- **Runs (item 1).** One result per depth journal, all 8; no journal was
+  excluded. `--source live` also opened both #106 rehearsal journals, whose
+  configuration has a `[history]` section. Each sample is the journal's
+  window, from the first `run_start` to the last `run_end` plus 1 ms, and
+  `data` is the dataset `mie replay --source live` printed for it. The
+  spec is the template of *Accept when* item 1, with the feature set
+  `47a7abca3bbc240a` (the 24-feature closure of ADR-060 *Accept when*
+  item 1's four features plus `book.l2@1`). `mie experiment validate`
+  passes on every spec. It also prints a `backtest:` note that
+  `max_hold_ms=int:3600000` exceeds the sample on the short stores, which
+  the calibration does not read (D7).
+- **Reproduction (item 2).** Every store printed `recorded`, then
+  `reproduced`, and its result file's SHA-256 was the same after both runs.
+- **Conservation (item 3).** fills + book + window = 2 × trades on every
+  line of every result. Every result has `rejections 0`. The trade counts
+  add up to 4 903 679, the inventory of *Context*.
+- **Caps (item 5).** The largest run (#22) peaked at 7 959 112 kB RSS,
+  inside the 8 GB cap, so no store was split (item 6).
+
+| Store (journal) | Sample (ms) | Runs | Trades | Key | Result SHA-256 (both runs) | Wall (run 1 / 2) | Peak RSS kB (run 1 / 2) |
+|---|---|---|---|---|---|---|---|
+| #9 rotation test | 1791497516720 1791498009321 | 1 | 3 168 | `54c6ad3b06b1e0e9/research.slippage_calibration@1` | `198704b373acd43798ced564613460e8144161a07d48782276db70f4f553947d` | 0:00.37 / 0:00.33 | 52 536 / 53 060 |
+| #10 soak | 1791498830306 1791548084362 | 2 | 473 671 | `4843eb1b697697ec/research.slippage_calibration@1` | `fc34d60985f450c81c9fda5f87d73db0e137c8b5b3259a20dcaf1ea799d62a45` | 0:38.52 / 0:38.52 | 3 453 344 / 3 453 972 |
+| #13 | 1791585018915 1791595804605 | 2 | 45 019 | `214afc96a2c99b95/research.slippage_calibration@1` | `2355f4d62e5dd7cf61d5778926f45fa1c28071e5477afaa87a59b002bc495b96` | 0:05.26 / 0:05.26 | 417 752 / 417 880 |
+| #106 rehearsal, attempt 1 | 1791968629106 1791971303483 | 1 | 30 432 | `c88d740e867e7b29/research.slippage_calibration@1` | `25b6eeab2ff3aa113fcbdc4e21905760cb5a83c9353228d5dee62d8a6fdd4379` | 0:02.39 / 0:02.37 | 243 676 / 243 528 |
+| #106 rehearsal | 1791971436926 1791978301778 | 2 | 59 786 | `7bf093334eec9c4e/research.slippage_calibration@1` | `7ddf47d529f1dcaf42910a76c9e17cfce7f7f684ec9b4036017d138269bc21e8` | 0:05.01 / 0:05.06 | 275 092 / 274 060 |
+| #99 sessions | 1791979204286 1792527308110 | 4 | 2 360 637 | `e7f267af9ec5600e/research.slippage_calibration@1` | `87044d3e006d3277cc5a774b2d16aa5eccee209a1811651a6d6f7d78f8fc9423` | 2:15.89 / 2:03.69 | 3 704 596 / 3 705 200 |
+| #22 | 1792096216592 1792188118035 | 1 | 1 244 224 | `95db53fd9a64ea95/research.slippage_calibration@1` | `632915a029f0e13953a09fd8de697b8e0d27cd9fc12c4f1f837d0dad54adff90` | 1:33.31 / 1:35.29 | 7 959 112 / 7 958 084 |
+| #22 rerun | 1792191366185 1792315774245 | 1 | 686 742 | `138eb60caa18e490/research.slippage_calibration@1` | `841046a2aebc32eef30c45284d144b3b6da8c3c38b4091f1a180d1befdfeddd0` | 1:08.69 / 1:09.11 | 6 234 732 / 6 234 532 |
+
+**Pooled table (item 4, D9).** s*(q) = ⟨Σ sum / Σ fills⟩ over the 8
+results, half to even at 8 decimals, over 4 903 679 trades and so
+9 807 358 hypothetical fills per line. Every line has `window` > 0, so
+every row is also a lower bound for its own size (D8).
+
+| q (BTC) | Σfills | Σbook | Σwindow | Σsum | s*(q) | bps | Lower bound (D8) |
+|---|---|---|---|---|---|---|---|
+| spread | 8 535 150 | 1 147 594 | 124 614 | 215.68096111 | 0.00002527 | 0.2527 | yes |
+| 0.001 | 8 535 150 | 1 147 594 | 124 614 | 215.68096111 | 0.00002527 | 0.2527 | yes |
+| 0.002 | 8 535 039 | 1 147 594 | 124 725 | 216.87193157 | 0.00002541 | 0.2541 | yes |
+| 0.005 | 8 534 717 | 1 147 594 | 125 047 | 219.74738921 | 0.00002575 | 0.2575 | yes |
+| 0.01 | 8 534 588 | 1 147 594 | 125 176 | 223.32086466 | 0.00002617 | 0.2617 | yes |
+| 0.02 | 8 534 469 | 1 147 594 | 125 295 | 228.00799391 | 0.00002672 | 0.2672 | yes |
+| 0.05 | 8 534 250 | 1 147 594 | 125 514 | 235.82784418 | 0.00002763 | 0.2763 | yes |
+| 0.1 | 8 533 924 | 1 147 594 | 125 840 | 243.39536230 | 0.00002852 | 0.2852 | yes |
+| 0.2 | 8 533 683 | 1 147 594 | 126 081 | 253.12010179 | 0.00002966 | 0.2966 | yes |
+| 0.5 | 8 532 986 | 1 147 594 | 126 778 | 271.05729134 | 0.00003177 | 0.3177 | yes |
+| 1 | 8 532 167 | 1 147 594 | 127 597 | 292.04178143 | 0.00003423 | 0.3423 | yes |
+| 2 | 8 530 701 | 1 147 594 | 129 063 | 324.85714055 | 0.00003808 | 0.3808 | yes |
+| 5 | 8 526 277 | 1 147 594 | 133 487 | 407.95392455 | 0.00004785 | 0.4785 | yes |
+| 10 | 8 520 289 | 1 147 594 | 139 475 | 542.43066698 | 0.00006366 | 0.6366 | yes |
+| 20 | 8 509 574 | 1 147 594 | 150 190 | 793.48375635 | 0.00009325 | 0.9325 | yes |
+| 50 | 8 474 664 | 1 147 594 | 185 100 | 1409.04202146 | 0.00016627 | 1.6627 | yes |
+| 100 | 8 417 462 | 1 147 594 | 242 302 | 2228.80182731 | 0.00026478 | 2.6478 | yes |
+| 120 | 8 390 438 | 1 147 594 | 269 326 | 2518.95217886 | 0.00030022 | 3.0022 | yes |
+
+What the table shows and does not show:
+
+- **Unpriced fills.** 1 147 594 of the 9 807 358 fills (11.7 %) met no
+  valid book. 1 097 470 of them (95.6 %) are in the #99 sessions, 23.2 %
+  of that store's 4 721 274 hypothetical fills, from the frequent resyncs
+  *Context* names. The
+  table prices only the trades that met a synced book.
+- **Population.** The rate covers every recorded trade on both sides, not
+  the hypothesis's fill moments (D9 weak spot, STOP 1 decision 1). The
+  #99 sessions are US hours only, and they hold 48 % of the trades.
+- **Use.** An archive backtest at position size q′ uses
+  `slippage.fixed@1 rate=rate:s*(q)` at the smallest grid size q ≥ q′ and
+  cites this section (D8, D9).
