@@ -192,7 +192,8 @@ pub enum ResearchError {
     /// fixed-point value, such as at a print at or below 0 (ADR-027,
     /// ADR-061 D7). Nothing is stored.
     CalibrationOverflow {
-        /// The time of the trade.
+        /// The time of the event that overflowed: the trade, the book event
+        /// that settled the held fills, or the sample's end.
         at: EventTime,
     },
     /// The run produced another result than the one stored under its key:
@@ -278,7 +279,7 @@ impl fmt::Display for ResearchError {
             ),
             Self::CalibrationOverflow { at } => write!(
                 f,
-                "the slippage calibration leaves the 64-bit fixed-point range at the trade at {} \
+                "the slippage calibration leaves the 64-bit fixed-point range at the event at {} \
                  ms (ADR-027, ADR-061 D7)",
                 at.as_millis()
             ),
@@ -384,7 +385,7 @@ mod tests {
         };
         assert_eq!(
             overflow.to_string(),
-            "the slippage calibration leaves the 64-bit fixed-point range at the trade at 1250 \
+            "the slippage calibration leaves the 64-bit fixed-point range at the event at 1250 \
              ms (ADR-027, ADR-061 D7)"
         );
         for error in [ResearchError::BookNotInSet, overflow] {

@@ -8,8 +8,10 @@
 //! two hypothetical fills, a buy and a sell at the print, on the order book
 //! the engine's state holds at that trade (D1): a trade never changes the
 //! book, and it ranks before the book updates of its millisecond. Each fill
-//! is priced by the spread model and the depth walk at every grid size
-//! ([`SlippageCalibration::observe`]).
+//! is priced by the spread model and the depth walk at every grid size,
+//! and counts as priced only once the next book event proves that book
+//! current ([`Calibrator`]): fills between a depth reconnect or a run
+//! restart and the resync count unpriced `book`.
 //!
 //! The result keeps the provenance of `@1` (the stream hash and the
 //! rejections) and, like `@1`, has no engine in its key: the values depend
@@ -22,10 +24,9 @@
 
 use crate::research::{checked_engine, record};
 use crate::{HashingProvider, drive_tolerant_observed};
-use mie_domain::event::MarketEvent;
 use mie_domain::feature::catalog;
 use mie_domain::research::{DataVersion, ExperimentResult, ExperimentSpec, Outcome, PipelineKey};
-use mie_domain::slippage::SlippageCalibration;
+use mie_domain::slippage::Calibrator;
 use mie_domain::time::EventTime;
 use mie_ports::inbound::{ExperimentRun, ResearchError, RunResearchExperiment};
 use mie_ports::outbound::{HistoricalDataProvider, Replay, ReplayWindow, ResearchResultStore};
@@ -74,9 +75,10 @@ impl<H: HistoricalDataProvider, S: ResearchResultStore> RunResearchExperiment
     /// 3. the replay of the sample must open exactly the spec's data
     ///    version (ADR-040 D5);
     /// 4. the sample is driven with the live rejection policy, every
-    ///    accepted trade observed on the book of the engine's state, and
-    ///    must deliver at least one event; a calibration that leaves its
-    ///    integer range fails [`ResearchError::CalibrationOverflow`];
+    ///    accepted event observed by a [`Calibrator`] on the book of the
+    ///    engine's state, and must deliver at least one event; a
+    ///    calibration that leaves its integer range fails
+    ///    [`ResearchError::CalibrationOverflow`];
     /// 5. the result is recorded as the replay summary records it:
     ///    `Recorded`, `Reproduced` or `Diverged` (ADR-040 D7).
     fn run(&mut self, spec: &ExperimentSpec) -> Result<ExperimentRun, ResearchError> {
@@ -104,7 +106,7 @@ impl<H: HistoricalDataProvider, S: ResearchResultStore> RunResearchExperiment
         // The rejection callback runs before the observer of the same
         // event; it only sets the flag, so the observer skips that event.
         let rejected = Cell::new(false);
-        let mut calibration = SlippageCalibration::new();
+        let mut calibrator = Calibrator::new();
         let mut overflow: Option<EventTime> = None;
         drive_tolerant_observed(
             &mut stream,
@@ -117,12 +119,8 @@ impl<H: HistoricalDataProvider, S: ResearchResultStore> RunResearchExperiment
                 if rejected.replace(false) || overflow.is_some() {
                     return;
                 }
-                if let MarketEvent::Trade(trade) = event
-                    && calibration
-                        .observe(&engine.state().book.l2, trade.price)
-                        .is_err()
-                {
-                    overflow = Some(trade.time);
+                if calibrator.observe(event, &engine.state().book.l2).is_err() {
+                    overflow = Some(event.time());
                 }
             },
         )?;
@@ -130,6 +128,11 @@ impl<H: HistoricalDataProvider, S: ResearchResultStore> RunResearchExperiment
             return Err(ResearchError::CalibrationOverflow { at });
         }
         let hash = stream.hash();
+        let calibration = calibrator
+            .finish()
+            .map_err(|_| ResearchError::CalibrationOverflow {
+                at: spec.sample().end(),
+            })?;
         if hash.events == 0 {
             return Err(ResearchError::EmptySample);
         }

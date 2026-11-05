@@ -884,8 +884,9 @@ fn parse_calibration_row(text: &str) -> Option<CalibrationRow> {
 /// of rates that are each ≥ 0, is ≥ 0, and 0 without a priced fill.
 fn check_calibration(calibration: &SlippageCalibration) -> Result<(), ResultParseError> {
     let fills = 2 * u128::from(calibration.trades);
+    let unconserved = calibration.first_unconserved();
     for (index, (_, row)) in calibration.rows().enumerate() {
-        let reason = if !row.accounts_for(fills) {
+        let reason = if unconserved == Some(index) {
             format!(
                 "fills + book + window is not 2 × trades = {fills}: every trade gives a buy \
                  and a sell on every line (ADR-061 D7)"

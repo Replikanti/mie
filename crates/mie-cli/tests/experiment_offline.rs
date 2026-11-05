@@ -981,9 +981,10 @@ const RUN_START: i64 = D0 + HOUR;
 /// A live store with depth and trades, written directly: one clean run with
 /// an aggregate trade before the book syncs (at + 500 ms), a depth diff
 /// (ids 1 … 10, at + 1 000 ms) and the snapshot that syncs it (last update
-/// id 5, at + 990 ms), then two trades at + 2 000 and + 3 000 ms. Every
-/// trade prints 85 000.10 ([`agg`]). The synced book: bids 85 000.00 × 10
-/// (the diff), 84 999.90 × 2; asks 85 000.10 × 3.
+/// id 5, at + 990 ms), then two trades at + 2 000 and + 3 000 ms and the
+/// next diff (ids 11 … 20, at + 3 500 ms), which proves the book they met.
+/// Every trade prints 85 000.10 ([`agg`]). The synced book at the trades:
+/// bids 85 000.00 × 10 (the first diff), 84 999.90 × 2; asks 85 000.10 × 3.
 fn calibration_fixture(dir: &Path) -> IngestConfig {
     let config = config_with(dir, &["aggTrade", "depth", "depthSnapshot"]);
     let run = "20261006T010000Z";
@@ -1001,6 +1002,7 @@ fn calibration_fixture(dir: &Path) -> IngestConfig {
         line(2, "depthSnapshot", t + 990, depth_snapshot(5, t + 990)),
         line(3, "aggTrade", t + 2_000, agg(2, t + 2_000)),
         line(4, "aggTrade", t + 3_000, agg(3, t + 3_000)),
+        line(5, "depth", t + 3_500, depth(11, 20, 10, t + 3_500)),
     ];
     let journal = vec![
         serde_json::json!({"type": "run_start", "run_id": run, "at_ms": t,

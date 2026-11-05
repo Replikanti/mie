@@ -195,7 +195,9 @@
 //! ([`crate::slippage`]): `spread`, then the depth walk at each of the 17
 //! sizes of [`CALIBRATION_GRID`](crate::slippage::CALIBRATION_GRID), in
 //! grid order, the size in its 8-place form. `fills` are the fills the
-//! model priced; `book` and `window` the unpriced ones by cause; `sum` is
+//! model priced; `book` and `window` the unpriced ones by cause (`book`
+//! also when no later book update proved the book a fill met,
+//! [`Calibrator`](crate::slippage::Calibrator)); `sum` is
 //! the exact Σ s of the priced fills and `mean` its ⟨sum / fills⟩, `-`
 //! without a priced fill. The mean is derived, never stored apart from the
 //! sum: a text whose mean differs is not canonical. A line whose fills,

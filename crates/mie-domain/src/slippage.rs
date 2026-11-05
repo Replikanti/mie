@@ -27,6 +27,17 @@
 //! ([`SlippageCalibration::pool`]), so D9's rate s*(q) = ⟨Σ sum / Σ fills⟩
 //! over several stores is the mean of their pooled line.
 //!
+//! [`Calibrator`] feeds the calibration from the delivered events. A book
+//! that stops receiving diffs (a depth reconnect, a run restart) stays
+//! `Ready` with its old levels until the resync, and the `OrderBook` gap is
+//! announced only right before the snapshot that ends it (ADR-038 rule 9,
+//! ADR-028 D4). So a fill is held until the next book event proves the
+//! book it met: a `BookUpdate`, which the sequencer emits only while the
+//! diffs chain, keeps it priced; a snapshot, an `OrderBook` gap or the end
+//! of the sample counts it unpriced `book`. Every priced fill then depends
+//! only on the book since the last snapshot and the diffs that chain to it
+//! (D7).
+//!
 //! Pure, integer fixed point, no float (ADR-025, ADR-027). Shared by the
 //! trade simulation and the slippage calibration (#172), so this file names
 //! neither.
@@ -34,6 +45,7 @@
 #![deny(clippy::float_arithmetic)]
 
 use crate::book::{OrderBook, Side, Walk};
+use crate::event::{MarketEvent, Stream};
 use crate::feature::FeatureValue;
 use crate::num::{Price, Qty, Rate, SCALE, div_half_even};
 
@@ -228,7 +240,7 @@ impl CalibrationRow {
 ///
 /// Every trade gives two hypothetical fills, a buy and a sell at its
 /// print, so every line accounts for 2 × `trades` fills
-/// ([`conserves`](Self::conserves)).
+/// ([`first_unconserved`](Self::first_unconserved)).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SlippageCalibration {
     /// The trades observed.
@@ -319,6 +331,21 @@ impl SlippageCalibration {
         })
     }
 
+    /// The same trades with every fill unpriced `book`: the book they met
+    /// was not proven current ([`Calibrator`]). `None` when 2 × `trades`
+    /// leaves the `u64` range.
+    pub fn unpriced(&self) -> Option<Self> {
+        let row = CalibrationRow {
+            book: self.trades.checked_mul(2)?,
+            ..CalibrationRow::default()
+        };
+        Some(Self {
+            trades: self.trades,
+            spread: row,
+            depth_walk: [row; 17],
+        })
+    }
+
     /// The first line, by its position in [`rows`](Self::rows) (0 for the
     /// spread), that does not account for 2 × `trades` fills (ADR-061 D7);
     /// `None` when every line does.
@@ -326,10 +353,85 @@ impl SlippageCalibration {
         let fills = 2 * u128::from(self.trades);
         self.rows().position(|(_, row)| !row.accounts_for(fills))
     }
+}
 
-    /// Whether every line accounts for 2 × `trades` fills (ADR-061 D7).
-    pub fn conserves(&self) -> bool {
-        self.first_unconserved().is_none()
+/// Feeds a [`SlippageCalibration`] from the accepted events of a sample, in
+/// delivery order (ADR-061 D7; module docs).
+///
+/// A trade's fills are priced on the book of the engine's state at the
+/// trade and held until the next book event settles them:
+///
+/// - a `BookUpdate`: the sequencer emits one only while the diffs chain, so
+///   the book was current at the held trades, and their fills count as
+///   priced;
+/// - a `BookSnapshot` or a `FeedGap` on the order book: the book may have
+///   been stale since its last event (an unsynced period is announced only
+///   at its resync, a restarted run's book resets), so every held fill
+///   counts unpriced `book`;
+/// - the end of the sample ([`finish`](Self::finish)): nothing proves the
+///   book after its last event, so the held fills count `book`.
+///
+/// Every other event leaves the held trades held. A trade and a book update
+/// of the same millisecond: the trade ranks first (ADR-028), so the update
+/// settles it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Calibrator {
+    settled: SlippageCalibration,
+    held: SlippageCalibration,
+}
+
+impl Calibrator {
+    /// A calibrator that has seen no event.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Observes one event the engine accepted; `book` is the order book of
+    /// the engine's state after it.
+    ///
+    /// # Errors
+    ///
+    /// [`CalibrationOverflow`] as [`SlippageCalibration::observe`] and
+    /// [`SlippageCalibration::pool`] give it. The calibrator is unchanged
+    /// then.
+    pub fn observe(
+        &mut self,
+        event: &MarketEvent,
+        book: &FeatureValue<OrderBook>,
+    ) -> Result<(), CalibrationOverflow> {
+        match event {
+            MarketEvent::Trade(trade) => self.held.observe(book, trade.price),
+            MarketEvent::BookUpdate(_) => self.settle(true),
+            MarketEvent::BookSnapshot(_) => self.settle(false),
+            MarketEvent::FeedGap(gap) if gap.stream == Stream::OrderBook => self.settle(false),
+            _ => Ok(()),
+        }
+    }
+
+    /// The calibration of the sample: the held fills count `book`.
+    ///
+    /// # Errors
+    ///
+    /// [`CalibrationOverflow`] when the pooled counts leave their range.
+    pub fn finish(mut self) -> Result<SlippageCalibration, CalibrationOverflow> {
+        self.settle(false)?;
+        Ok(self.settled)
+    }
+
+    /// Moves the held fills into the settled calibration, priced as
+    /// observed or unpriced `book`.
+    fn settle(&mut self, current: bool) -> Result<(), CalibrationOverflow> {
+        if self.held.trades == 0 {
+            return Ok(());
+        }
+        let held = if current {
+            self.held.clone()
+        } else {
+            self.held.unpriced().ok_or(CalibrationOverflow)?
+        };
+        self.settled = self.settled.pool(&held).ok_or(CalibrationOverflow)?;
+        self.held = SlippageCalibration::new();
+        Ok(())
     }
 }
 

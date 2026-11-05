@@ -352,7 +352,7 @@ fn every_trade_gives_a_buy_and_a_sell_on_every_line() {
     expected.extend(["0.0008", "0.00115", "0.00182"].map(|m| Some(rate(m).to_string())));
     expected.extend([None, None, None, None, None]);
     assert_eq!(means, expected);
-    assert!(calibration.conserves());
+    assert_eq!(calibration.first_unconserved(), None);
     let models: Vec<BookModel> = calibration.rows().map(|(model, _)| model).collect();
     assert_eq!(models[0], BookModel::Spread);
     assert_eq!(models[1..], CALIBRATION_GRID.map(BookModel::DepthWalk));
@@ -378,7 +378,6 @@ fn a_line_that_breaks_the_conservation_is_found() {
     assert_eq!(calibration.first_unconserved(), None);
     calibration.depth_walk[3].window += 1;
     assert_eq!(calibration.first_unconserved(), Some(4));
-    assert!(!calibration.conserves());
     calibration.spread.fills -= 1;
     assert_eq!(calibration.first_unconserved(), Some(0));
 }
@@ -401,7 +400,7 @@ fn pooling_two_partitions_equals_one_pass() {
     assert_eq!(first.pool(&second), Some(whole.clone()));
     assert_eq!(second.pool(&first), Some(whole.clone()));
     assert_eq!(SlippageCalibration::new().pool(&whole), Some(whole.clone()));
-    assert!(whole.conserves());
+    assert_eq!(whole.first_unconserved(), None);
     // Every priced fill has s ≥ 0, so every sum does.
     assert!(whole.rows().all(|(_, line)| line.sum.units() >= 0));
     let mut full = whole.clone();
@@ -457,4 +456,122 @@ fn per_fill_the_cost_does_not_decrease_over_the_grid() {
             }
         }
     }
+}
+
+fn update(time: i64, first: u64, last: u64) -> MarketEvent {
+    MarketEvent::BookUpdate(BookUpdate {
+        time: EventTime::from_millis(time),
+        first_update_id: first,
+        last_update_id: last,
+        prev_update_id: first - 1,
+        bids: Vec::new(),
+        asks: Vec::new(),
+    })
+}
+
+fn trade_at(time: i64, price: &str) -> MarketEvent {
+    MarketEvent::Trade(crate::event::Trade {
+        time: EventTime::from_millis(time),
+        trade_id: 1,
+        price: usd(price),
+        qty: btc("0.01"),
+        aggressor: crate::event::Aggressor::Buy,
+    })
+}
+
+fn book_gap(start: i64, end: i64) -> MarketEvent {
+    MarketEvent::FeedGap(crate::event::FeedGap {
+        stream: crate::event::Stream::OrderBook,
+        start: EventTime::from_millis(start),
+        end: EventTime::from_millis(end),
+        reason: crate::event::GapReason::Disconnected,
+    })
+}
+
+/// The calibration of one trade at e = 100.0 on [`fixture`], priced.
+fn one_priced() -> SlippageCalibration {
+    let mut calibration = SlippageCalibration::new();
+    calibration.observe(&fixture(), usd("100.0")).unwrap();
+    calibration
+}
+
+/// A held trade counts as priced only when a book update follows it; a
+/// snapshot, an order-book gap or the end of the sample count its fills
+/// `book`, since the book it met may have been stale (a reconnect or a
+/// restart is announced only at the resync).
+#[test]
+fn a_fill_is_priced_only_once_a_book_update_proves_its_book() {
+    let book = fixture();
+    let unpriced = one_priced().unpriced().unwrap();
+    assert_eq!(unpriced.trades, 1);
+    assert!(unpriced.rows().all(|(_, line)| *line == row(0, 2, 0, "0")));
+    for (settling, expected) in [
+        (Some(update(1_200, 102, 102)), one_priced()),
+        (
+            Some(snapshot(&[("99.9", "1")], &[("100.0", "1")])),
+            unpriced.clone(),
+        ),
+        (Some(book_gap(1_100, 1_300)), unpriced.clone()),
+        (None, unpriced.clone()),
+    ] {
+        let mut calibrator = Calibrator::new();
+        calibrator
+            .observe(&trade_at(1_150, "100.0"), &book)
+            .unwrap();
+        // Another stream's gap settles nothing.
+        let trades_gap = MarketEvent::FeedGap(crate::event::FeedGap {
+            stream: crate::event::Stream::Trades,
+            start: EventTime::from_millis(1_150),
+            end: EventTime::from_millis(1_160),
+            reason: crate::event::GapReason::Disconnected,
+        });
+        calibrator.observe(&trades_gap, &book).unwrap();
+        if let Some(event) = &settling {
+            calibrator.observe(event, &book).unwrap();
+        }
+        assert_eq!(calibrator.finish().unwrap(), expected, "{settling:?}");
+    }
+}
+
+/// The reviewer's stale-book shape: a trade the next update proves, then a
+/// trade after the depth stream stopped, whose book is announced stale
+/// only by the resync's gap; then the new book.
+#[test]
+fn a_trade_before_a_resync_counts_book_however_the_price_moved() {
+    let mut calibrator = Calibrator::new();
+    let old = fixture();
+    calibrator.observe(&trade_at(1_150, "100.0"), &old).unwrap();
+    calibrator.observe(&update(1_200, 102, 102), &old).unwrap();
+    // The price moved to 99.0; the old book's ask 100.0 would cost s ≈ 1 %.
+    calibrator.observe(&trade_at(5_000, "99.0"), &old).unwrap();
+    calibrator.observe(&book_gap(1_200, 6_000), &old).unwrap();
+    let mut expected = one_priced();
+    expected.trades += 1;
+    for line in std::iter::once(&mut expected.spread).chain(&mut expected.depth_walk) {
+        line.book += 2;
+    }
+    assert_eq!(calibrator.finish().unwrap(), expected);
+    assert!(
+        expected
+            .rows()
+            .all(|(_, line)| line.sum.units() < 1_000_000)
+    );
+}
+
+#[test]
+fn an_overflow_leaves_the_calibrator_unchanged() {
+    let book = fixture();
+    let mut calibrator = Calibrator::new();
+    calibrator
+        .observe(&trade_at(1_150, "100.0"), &book)
+        .unwrap();
+    let before = calibrator.clone();
+    assert_eq!(
+        calibrator.observe(&trade_at(1_160, "0"), &book),
+        Err(CalibrationOverflow)
+    );
+    assert_eq!(calibrator, before);
+    let mut full = SlippageCalibration::new();
+    full.trades = u64::MAX;
+    assert_eq!(full.unpriced(), None);
 }
