@@ -1,0 +1,694 @@
+# ADR-062: Raw-data retention and storage tiers
+
+- Status: proposed
+- Date: 2026-11-05
+
+Relation to earlier ADRs: this ADR supersedes nothing. It builds on
+ADR-030 (the immutable raw store and its dataset version), ADR-032 D5 and
+D10 (the seed lookback, the seal cadence), ADR-039 (replay over the raw
+store) and ADR-052 (the history chain from a fixed origin). No status line
+changes: the CLAUDE.md invariant 4, `docs/data-availability.md` and the
+accepted ADRs stay as they are until the follow-up implements D5–D7 and
+D11.
+
+The decisions record the #134 plan
+(<https://github.com/Replikanti/mie/issues/134#issuecomment-6660674077>)
+and its STOP 1 operator decisions. Every rate and share below comes from
+the M1 measurement
+(<https://github.com/Replikanti/mie/issues/134#issuecomment-6662697818>),
+cited as M1-n.
+
+## Context
+
+Continuous live capture grows the raw store without bound, and nothing
+decides what stays on the capture host, what moves, and what is dropped.
+ADR-030 made sealed files immutable, so any move or deletion rule needs a
+decision. Production capture will run on a server that is not provisioned
+yet, so its disk is an input of this ADR, not a fact.
+
+**Measured growth (M1).** Over the 14 live runs on record (8 journals,
+October 2026), all seven default streams together grow the store by
+19.2–46.9 MB per captured hour, depending on the session (M1-8). The
+all-hours runs give 35.6 MB/h on weekdays and 20.6 MB/h on weekends
+(M1-3, M1-4), so 750.5 MB per day weighted over a week, about 274 GB per
+year (M1-5). The busiest sessions on record, #99's US-session windows,
+give 46.9 MB/h, so 1 126.3 MB per day if every hour were that busy, about
+411 GB per year (M1-6). `depth` is 87.1–89.1 % of every store (M1-1). A
+full live day seals 3 670 files, data and manifests (M1-9). The archive
+store on the host holds 51.0 GB (M1-12).
+
+**What constrains retention.**
+
+- A live replay recomputes a whole run from all of its records in
+  `receive_seq` order, because the hold-back watermark depends on every
+  stream (ADR-039 D1, D2). A clean run with a missing record, or with a
+  record count other than its `run_end` count, is an error.
+- Every warm start, every `mie equivalence` pass and every
+  `--source history` request replays the whole chain from the 2025-10-01
+  origin (ADR-052 D1, D2). The origin is fixed, and moving it needs a new
+  ADR.
+- Research reads live depth: `book.*` (ADR-043), absorption (ADR-051),
+  the slippage calibration (ADR-061 D7), the book audit (ADR-038) and #99's
+  per-diff lateness.
+- Mie does not monitor mount liveness, and an unmounted mount point is an
+  ordinary empty directory.
+
+**The issue's premise, corrected.** #134 lists `trades`/`aggTrades`,
+`klines`, open interest and `markPrice` as republished in the archive.
+Per `docs/data-availability.md` and the ADR-034 Context:
+
+- `forceOrder` has no USD-M archive dataset.
+- `markPrice@1s` (mark, index, indicative funding) has only 1m mark-price
+  klines in the archive, and mie does not import them.
+- Archive open interest is the 5-minute `metrics` sample, while live polls
+  every 10 s, which is another `resolution_ms` (ADR-042).
+- `depth` and `depthSnapshot` have only the `bookDepth` percentage bands.
+
+So only `aggTrade` and `kline_1m` have an archive counterpart at their own
+resolution, and they are 6.2–9.6 % of the bytes (M1-2).
+
+## Decision
+
+Retention is "keep every sealed file". The policy decides only *where* a
+file lives: a writable hot tier and read-only cold roots. A file's identity
+(relative path plus SHA-256) does not depend on its location, so moving
+data changes no dataset version.
+
+### D1. Retention per stream: everything is kept
+
+| Data | Archive counterpart (at its real resolution) | Consumers | M1 rate | Verdict |
+|---|---|---|---|---|
+| `aggTrade` (live) | `aggTrades`, per aggregate; the event sets differ (ADR-047, ADR-048, ADR-050) | bars, CVD, every trade feature, candidates, triggers; the run's watermark | 19.1–91.9 MB/24 h | keep |
+| `markPrice` (live) | none imported (1m mark-price klines exist, not imported) | `derivatives.mark@1` (live only); the run's watermark | 5.2–5.6 MB/24 h | keep |
+| `forceOrder` (live) | none (no USD-M dataset) | `derivatives.liq.window.*` (live only); the run's watermark | 0.3–0.6 MB/24 h | keep |
+| `kline_1m` (live) | `klines_1m` | kline cross-check (ADR-031); the run's watermark | 9.6–16.1 MB/24 h | keep |
+| `openInterest` (live) | `metrics`, 5 min instead of 10 s (ADR-042) | `derivatives.oi.*`, OI candidates and triggers; the run's watermark | 0.9–1.0 MB/24 h | keep |
+| `depth` (live) | only `bookDepth` bands | `book.*`, absorption, slippage calibration, book audit, #99; the run's watermark | 406.5–980.8 MB/24 h | keep |
+| `depthSnapshot` (live) | only `bookDepth` bands | the book sequencer (ADR-038); the run's watermark | 18.2–30.5 MB/24 h | keep |
+| `aggTrades` (archive) | — | the chain's archive segment (ADR-052 D2); archive research | 41.99 MB/day | keep |
+| `klines_1m` … `klines_1d` (archive) | — | the kline cross-check (ADR-031, ADR-045) | 0.17 MB/day together | keep |
+| `fundingRate` (archive) | — | `derivatives.funding.settled@1`, the chain | 0.7 MB/year | keep |
+| `metrics` (archive) | — | archive open interest, the chain | 0.03 MB/day | keep |
+| `bookDepth` (archive) | — | raw DuckDB research only | 0.98 MB/day | keep |
+| `trades` (archive, opt-in) | — | the `aggTrades` fold (ADR-050), the kline cross-check | 81.5 MB/day mean, when imported | keep |
+| capture journal | — | every live replay (ADR-039 D1), the chain | 5.1–5.6 MB/24 h; 15.1 for #99 (M1-11) | keep, on hot |
+| import ledger | — | the exactly-once import (ADR-034 D4) | ≈ 6 KB per imported day (M1-15) | keep, on hot |
+| copy ledger (new, D7) | — | `select` for moved partitions, D6, D11 | ≈ 1.5 MB/day, estimated (Numbers table) | keep, on hot |
+
+Rates: live ranges are across the stores with depth (M1 live table);
+archive rates are the mean per imported day (M1 archive table).
+
+- **Why the archive is kept although it can be downloaded again.** A
+  re-import under a newer `parquet` writes other bytes (ADR-030
+  Consequences). That changes the chain's prefix dataset, which turns every
+  recorded warm run into `DIVERGED (warm prefix)` (ADR-052 Consequences),
+  and it breaks the archive dataset versions that accepted ADRs cite
+  (`fa73cb88…`, ADR-030 and ADR-039 Acceptance). Upstream files can also
+  change (the `changed` conflict, ADR-034 D4).
+- **Why `bookDepth` is kept although nothing in the chain reads it.** It
+  is 1.0 % of the archive (M1 archive table). A per-dataset exception
+  would need its own deletion path, while the rule "a sealed file is never
+  removed from the union of roots" (D5) is what makes immutability
+  checkable at all.
+- **The hold-out year** (#124) is kept whole. It is a hold-out: re-creating
+  it with other bytes would make its single final measurement
+  unreproducible.
+
+### D2. Option 3 (drop archive-republished live copies) is rejected, with no exception
+
+- Dropping a stream's live records leaves `receive_seq` holes and a record
+  count other than `run_end.records`. ADR-039 D2 makes that an error for
+  every clean run, so the run becomes unreplayable as a whole, depth
+  included.
+- Archive rows cannot replace them. ADR-039 D6 and ADR-052 D2 ("holes stay
+  holes", one source per stream) forbid it, and the events would differ:
+  97 live aggregates differ from the archive in `q` and `l` (ADR-048),
+  archive aggregates omit trades that the fold restores (ADR-047,
+  ADR-050), and the `trades` id space differs (ADR-045). Live/replay
+  equivalence (ADR-041) compares a live run with its own recompute, so it
+  needs the run's own records, never archive rows.
+- **Pre-cutover runs are no exception.** They are the acceptance evidence
+  of accepted ADRs (the ADR-030 and ADR-039 dataset versions, ADR-038,
+  ADR-041, the ADR-051 R0 runs, ADR-061) and the corpus of the still-open
+  #99.
+- **The rejected saving** is the share of the streams with an archive
+  counterpart: 6.2–9.6 % (M1-2), so 47–72 MB per day at the week-weighted
+  rate (750.5 × 0.062 … 0.096). It is small because `depth` dominates
+  (M1-1), and it would cost every run it touches.
+
+### D3. Option 4 (depth as snapshots or checkpoints only) is rejected
+
+Baseline ADR-022 requires raw order-book events to be preserved. Snapshots
+alone remove the book replay that `book.*` (ADR-043), absorption (ADR-051),
+the slippage calibration (ADR-061 D7), the book audit (ADR-038) and #99's
+per-diff lateness read. They would also change a run's record set, with
+the D2 consequence.
+
+### D4. Two tiers: hot and cold
+
+- **Hot** is the writer's `raw_root` on a local filesystem. It must be
+  local because the writer lock is `flock` (ADR-030 Consequences).
+- **Cold** is an ordered list of filesystem roots with the same relative
+  layout, mounted outside mie (operator, STOP 1). Every reader and the
+  writer treat them as read-only; only the replicator (D11) writes into
+  them. Each root carries a marker file with its root id, written once when
+  the root is provisioned.
+- **Option 1 (everything on the local disk)** is the configuration with
+  no cold root, and it stays valid while the hot formula (D10) fits the
+  disk. It loses as the policy because the fast local disk would have to
+  grow with the whole history (D10: hundreds of GB per year), and because
+  one disk is one copy (D11).
+- **Option 2 (tiered storage)** is this decision. The cold medium (a disk,
+  a NAS, an object store behind a filesystem mount) is a provisioning
+  choice outside mie.
+
+### D5. Immutability under tiers
+
+This is how the raw-store immutability invariant reads once files can
+live in more than one root (approved as written at STOP 1).
+
+- A sealed file is identified by its relative path and SHA-256, as in its
+  manifest and in every dataset version (ADR-030, the `file <path> <rows>
+  <sha256>` lines). Its bytes, its manifest and its relative path never
+  change, and it is never removed from the union of the roots.
+- **The copy protocol.** A copy writes the data and the manifest to the
+  destination under hidden temp names, fsyncs them and verifies the
+  SHA-256 against the manifest. It publishes the manifest last, because "a
+  file is sealed iff its manifest exists" (ADR-030), and then records the
+  copy in the copy ledger (D7). The hot copy is removed only by D6, after k
+  verified copies exist. So at every instant each sealed file is complete
+  in at least one root.
+- The same relative path in two roots must be byte-identical, data and
+  manifest; anything else is `Integrity`.
+- A copy never recompresses, merges parts or re-encodes: any of these
+  changes the hashes and so every recorded dataset version.
+- Why this reading: the invariant exists so that every derived result
+  reproduces from versioned raw data (ADR-003, ADR-022). The dataset
+  version names paths and hashes, never a location, so a file that moves
+  but keeps its bytes, manifest and path reproduces every result that
+  cited it. Rejected, reading immutability as "never moves": it would force
+  option 1.
+
+### D6. Hot removal: the unit and when a partition may leave hot
+
+- **The unit is one whole `(source, instrument, stream, date)` partition.**
+  A part number is "highest existing + 1" within its partition
+  (`writer.rs`, `open_part`), and recovery works per partition
+  (`recovery.rs`). A partition split across tiers could reuse a part
+  number.
+- **Eligibility.** A partition may leave hot when
+  - its date is older than the hot window (D8),
+  - it holds no `.tmp` file,
+  - the copy ledger records k verified copies (D11) of every sealed file
+    in it, and
+  - the copy-ledger records of those copies lie in the prefix of the copy
+    ledger that k verified ledger copies hold (D11). Why: the surviving
+    ledger copies alone then list every removed partition after a hot
+    loss, and the rebuild's root listing (D7) is a cross-check, not the
+    only source. The cost is that removal waits for the next replication
+    pass, at most one seal interval.
+
+  Removal therefore never takes a file below k copies.
+- **The removal.** The removal is first recorded in the copy ledger. Then
+  the partition directory is renamed atomically to a hidden name outside
+  the layout (recovery and `select` read only `date=` entries) and
+  deleted.
+- **The writer refusal.** A writer refuses to open a stream-date that the
+  copy ledger records as removed from hot. So an archive re-import of a
+  removed day fails loudly and cannot reuse a part number. Presence on a
+  cold root is not the signal, because under D11 today's partition is on
+  cold too. Without a readable copy ledger the writer opens only dates
+  inside the hot window, which D6 can never have removed, so the live
+  capture never depends on the copy ledger.
+- Readers and recovery tolerate a partition that disappears between
+  listing and opening.
+
+### D7. Resolution: how replay and `mie equivalence` find moved data
+
+- **One multi-root store** in `mie-adapter-parquet` sits behind the
+  unchanged `RawRecordSource` port.
+  - `select` enumerates the hot partitions as today, plus the copy
+    ledger's entries for partitions removed from hot, and merges them by
+    `relative_path`. It never lists a cold root.
+  - `manifest::dataset_version` then sees the same sorted file list, so it
+    yields the same version as a single root holding every file.
+  - `read` resolves the path on hot, then on each cold root in order. An
+    absent copy is skipped. The first present copy is verified as today
+    (`manifest::verify`), and a mismatch is `Integrity` (D5), never a
+    fallback to the next copy.
+  - This needs no port change, no new crate, no new dependency and no
+    ADR-025 change. `mie-cli` wires it.
+- **The copy ledger** is an append-only file on hot, next to the journal
+  and the import ledger. It records:
+  - for each sealed file, the manifest text verbatim;
+  - for each verified copy, the file, the root id and the time;
+  - for each partition removed from hot, the removal (D6);
+  - for each verification pass (D11), the root, the ledger prefix covered
+    and the findings.
+
+  Each record ends with the SHA-256 of the ledger up to and including the
+  previous record (a hash chain). Why: with k = 2 a mismatch between two
+  copies of an append-only file cannot say which one is damaged, while the
+  chain shows in each copy the first record that fails, so damage is
+  located without a majority. The copy ledger is the only listing of
+  removed partitions that depends on no mount, and it is the source of
+  truth for which copies exist.
+- **Configuration.** An ordered list `cold_roots` (default empty, the read
+  order) in `[paths]` of the ingest and the archive configuration
+  (`config.rs`, `Paths` and `ArchivePaths`). Each entry is flagged when it
+  is a copy target (D11). The `[history] archive_config` check that both
+  configurations name the same `raw_root` (`config.rs`) extends to the
+  same `cold_roots`.
+- The journal, the import ledger and the copy ledger stay on hot and never
+  move. D11 copies them.
+- **A file absent from every root is a loud error** (operator, STOP 1).
+  When the hot listing or the copy ledger names a file and no root holds
+  it, `read` fails with `Integrity`, naming the file and every root it
+  tried (the existing `NotFound` → `Integrity` path in `reader.rs`). The
+  file is never treated as an empty partition, a hole or a shorter
+  selection.
+  - Why: mie does not monitor mount liveness, and an unmounted mount point
+    reads as an empty directory. A union built from cold listings could
+    not tell an outage from "no data". It would turn the outage into
+    ADR-052 holes, which "holes stay holes" then keeps, and it would
+    change the dataset version without an error, since ADR-052 prints that
+    version but never compares it.
+  - This replaces the earlier plan rule that "an unreachable cold root is
+    an error", which needed a liveness probe.
+- **A missing copy ledger is the same error.** A store with `cold_roots`
+  configured requires the copy ledger to exist; it is created by an
+  explicit init step, never implicitly. A missing one makes every union
+  `select` fail with `Integrity`. Why: read as empty, it would drop every
+  removed partition from every selection without an error, the failure
+  the previous rule exists to prevent. The capture continues (D6, the
+  writer refusal), the warm-up fails into a cold run (ADR-052 D8), and
+  the replicator and hot removal stop until the rebuild below.
+- **The copy ledger is rebuilt from manifests when it is lost** (operator,
+  STOP 1 approval). The rebuild is an explicit `mie` step that the
+  operator runs, never automatic:
+  1. **Start** from the longest copy of the copy ledger on a cold root
+     whose hash chain verifies (D11 keeps k copies). It lacks at most the
+     records since the last replication pass, plus any cold outage (O,
+     D10).
+  2. **Every configured root must present its marker** (D11), otherwise
+     the rebuild stops. Why: the rebuild is the one step that lists cold
+     roots, and the marker is what tells an unmounted root from an empty
+     one.
+  3. **List every manifest on every root** and verify each data file
+     against it (`manifest::verify`). Each verified copy becomes a copy
+     record, with the manifest text verbatim. A file that the starting
+     copy already lists must carry a byte-identical manifest text, and the
+     same path with differing manifests on two roots is `Integrity` (D5).
+     The rebuild stops on either.
+  4. **Cross-check against independent records of every seal:** the
+     starting ledger copy, every capture journal's `sealed` records and
+     `recovery` `rolled_forward` paths (live files), and every import
+     ledger entry's `file` lines (archive files, with their SHA-256). The
+     journals and the import ledger are k-copied too (D11). A path any of
+     them names that no root holds enters the rebuilt ledger as **lost**,
+     with what that record knows of it; it is never left out. Why: a
+     listing of roots alone cannot tell a missing file from one that never
+     existed, and these records were written at seal time. A `select`
+     covering a lost file then fails with `Integrity`, as in D11's
+     lost-file rule.
+  5. **Every partition with verified cold copies and no directory on hot
+     is recorded as removed from hot.** Why: after a hot loss the new hot
+     holds none of the old partitions, and the writer refusal (D6) must
+     cover all of them.
+  6. **The rebuilt ledger** is written under a temp name, fsynced and
+     renamed into place. The rebuild prints the starting copy's length,
+     the records it added and every lost file. The next replication pass
+     copies it, and hot removal resumes only after the next full
+     verification pass.
+- **Seeds.** The capture start's seed scan (`ingest.rs` `seeds`, window
+  `[now − 7 d, now + 1 d)`) reads hot only. The warm-up, replay,
+  equivalence, experiments and research read the union. A cold-tier
+  outage at a start therefore gives an `Integrity` error in the warm-up,
+  which fails into a cold run (ADR-052 D8) and never stops the capture.
+
+### D8. The hot window, derived
+
+What each consumer reads, and the bound that puts on hot:
+
+| Consumer | Reads | Bound on hot |
+|---|---|---|
+| The live writer | the current date and the next, with the 60 s date grace (ADR-030 D4) | today and tomorrow |
+| The archive import | day D-1, plus the 23:55 `metrics` row filed under D (ADR-034 D3) | yesterday and today |
+| The capture's seed scan | 7 days back, 1 day ahead (`SEED_LOOKBACK_MS`, `ingest.rs`) | **today − 7 … tomorrow: the binding bound** |
+| ADR-052 warm-up, `mie equivalence` | the whole chain from the origin, through the union | none. Cold reads lengthen `ready_after_ms`, which ADR-052 D12's 90 min trigger and D13's queue budget see |
+| Absorption (#22, ADR-051) | a run of at least 25 h from its start, through the union | none |
+| The slippage calibration (ADR-061) | the depth stores, through the union | none |
+| #99 | see below | none |
+
+- **Result: hot holds every date from today − 7 (UTC) onward.** The seed
+  window starts at `now − 7 d`, which falls on date today − 7 at any time
+  of day, so that whole date must be on hot. Its end, `now + 1 d`, covers
+  tomorrow, whose partitions are new and never eligible. In bytes, hot
+  holds 7 full dates (today − 7 … today − 1, where today − 7 is only
+  partly inside the window but a partition is the unit, D6), today's
+  partial date (at most one day) and tomorrow's open-kline records (about
+  nothing). D6 runs after each seal pass, so the cadence adds at most 300 s.
+  H = 8 days of bytes (D10).
+- **Why 7 days.** The 7 d is ADR-032's seed lookback, an "engineering
+  default, not measured" there. This ADR's own reason is the coupling:
+  hot ≥ lookback, so a capture start never reads cold.
+  - Below it, a start reads cold. A cold outage then fails `seeds`, and
+    `mie ingest` exits before capturing (the `?` on `seeds(…)` in
+    `ingest.rs`), so raw data is lost.
+  - Above it, the only cost is hot storage (D10).
+  - If a later ADR changes `SEED_LOOKBACK_MS`, the hot window follows.
+- **Rejected, a hot-only seed scan with a 2-date hot window.** A stream
+  quiet for longer than the hot window would get no seed, and its resume no
+  `Disconnected` gap. Delivered events would then depend on the tier
+  configuration, which changes ADR-032 D5's semantics.
+- **#99 contributes no number** (accepted by the operator at STOP 1), so
+  #99 still moving does not reopen this decision:
+  - its harness is pinned to main `6ff73d1` and reads one `raw_root`; its
+    store is a pre-cutover separate root and stays in one root, unmoved,
+    until #99 closes (D9);
+  - its pending FOMC session adds a run to that store and changes no rate
+    class used here (M1-6 is already its rate);
+  - a superseded hold-back (ADR-032 D6) changes no raw byte and no seed
+    window.
+
+### D9. Pre-cutover stores
+
+Each pre-cutover store (the soak and session stores, 3.7 GB together, M1
+live table) is kept whole, root and journal. If one ever moves, it moves
+as a whole store that keeps its relative layout. None is merged into the
+production root: they have their own journals and multi-day holes
+(ADR-052 D2). They are live-only data, so D11 applies: each store gets
+whole-store copies on k independent devices, verified against the store's
+own manifests and journal. Copying moves nothing, so #99's store stays
+where its harness reads it (D8).
+
+### D10. Sizing formula
+
+Inputs:
+
+- r_s: bytes per day of live stream s. Initial values from M1; on the
+  server, the trailing rate measured from manifests (Σ `bytes` of the
+  parts sealed in the last N days over N days, the M1 method).
+- a: archive bytes per imported day, 0 when imports stop. M1-13:
+  43.2 MB/day for the default datasets, plus 81.5 MB/day for opt-in
+  `trades`.
+- H: the hot window in days of bytes, 8 (D8).
+- O: the cold-outage days the hot tier must absorb (operator input at
+  provisioning, below).
+- k: copies of every live-only file, each on an independent device,
+  k ≥ 2 (D11).
+- k_A: copies of the archive bytes, 2 (D11).
+- A: the archive bytes, 51.0 GB on the host today (M1-12).
+- S: the pre-cutover stores, 3.7 GB (D9).
+- J: the daily growth of the journal, the import ledger and the copy
+  ledger: 5.1–15.1 MB (M1-11) + 0.006 MB (M1-15) + about 1.5 MB (copy
+  ledger, estimated in the Numbers table).
+- P: the verification period (D11, operator input).
+
+Formulas (days counted from the start of production capture, t in days):
+
+- hot ≥ (Σ_s r_s + a) × (H + O) + J × t + the filesystem reserve. The
+  journal and the ledgers never leave hot, so they grow with t.
+- each copy device ≥ Σ_s r_s × t + J × t + S, plus A + a × t on the k_A
+  archive copy devices. Every one of the k devices holds a full copy; a
+  device shared by live and archive copies holds both terms.
+- yearly growth over all devices = k × 365 × (Σ_s r_s + J) + k_A × 365 × a.
+- O is also the longest time a newly sealed file can sit with a single
+  copy (D11).
+
+Initial values at k = k_A = 2 (Numbers table for the arithmetic):
+
+| | Week-weighted (M1-5) | Busiest hours (M1-6) |
+|---|---|---|
+| hot, without the reserve | 6.35 GB + 0.79 GB × O + 2.6 GB per year | 9.36 GB + 1.17 GB × O + 6.1 GB per year |
+| each copy device, year 1 (live + J + S + archive) | 347 GB | 488 GB |
+| each copy device, every later year | +292 GB | +433 GB |
+
+The busiest-hours column is an upper bound by construction for the hours
+on record, not for a crash day: the archive's busiest `aggTrades` day was
+5.5 times its mean (M1-14). Provisioning sizes from the busiest column; the
+server's trailing rate replaces both once it exists.
+
+What breaks:
+
+- hot too small: `ENOSPC`, a writer error, the capture stops (ADR-032 D10)
+  and raw data is lost;
+- a copy device too small or full: copies stop, files stay below k, hot
+  removal waits (D6), hot fills, and the same failure follows.
+
+### D11. Copies of live-only data and their verification
+
+- **Scope:** every sealed live file (all seven streams, since no live
+  stream has a replacement, D1 and D2), the D9 stores, the capture
+  journal, the import ledger and the copy ledger. The archive follows k_A.
+- **k ≥ 2 on independent devices** (operator, STOP 1). Why 2: one device
+  failure destroys a single copy. Nothing can re-create a live file (D1,
+  D2), and every run and dataset version that contains it would become
+  unreplayable. Two copies survive any single device failure. Each further
+  copy adds a full copy of the live growth (D10: +274 to +411 GB per
+  year). "Independent" means a separate disk and, for network storage, a
+  separate server, because two copies on one disk or one NAS fail
+  together (operator).
+- **k_A = 2.** The operator's k covers live-only data. The archive can be
+  downloaded again, but not as the same bytes once the writer changed
+  (D1), so a lost archive file changes the chain's prefix dataset and the
+  versions accepted ADRs cite, the same harm as a lost live file for the
+  chain. It is also cheap: A + a × 365 is about 67 GB in year 1 against
+  274–411 GB of live growth. Rejected, k_A = 1 with re-download as the
+  repair: the re-download would need a new ADR under the lost-file rule
+  below, and every warm run since the loss would read `DIVERGED (warm
+  prefix)`.
+- **What mie can check.** Mie cannot see the devices behind a mount, for
+  the same reason that it does not monitor liveness, so independence is a
+  provisioning duty. The follow-up refuses a configuration in which two
+  copy targets, or a copy target and hot, report the same device id
+  (`st_dev`). That catches two copies on one local disk, but not two
+  exports of one NAS.
+- **Replication.** After each seal pass (300 s, ADR-032 D10), the
+  replicator copies every sealed file with fewer than k copies to the copy
+  targets by the D5 protocol and records each verified copy in the copy
+  ledger. It writes only into a root whose marker it finds. Why: an
+  unmounted mount point is a writable empty directory on the hot disk, and
+  a copy written there would share hot's device and disappear under the
+  mount when the mount returns. Sealed files and import-ledger entries,
+  which are immutable files (ADR-034 D4), are copied once by the D5
+  protocol.
+- **The journal and the copy ledger** are append-only. Each pass appends
+  to each copy the bytes the copy lacks, `[len(copy), len(hot))`, and
+  fsyncs it, after checking that the copy's last complete record equals
+  hot's record at that offset. A crash mid-append leaves a shorter byte
+  prefix of hot, which the next pass extends. Why not a whole-file copy
+  per pass: after one year the journal alone is 2.0–5.5 GB (M1-11 × 365),
+  and copying it every 300 s would write that 288 times a day to every
+  target.
+- **The copy ledger is covered by the same rule as data** (operator, STOP
+  1 approval). Why: it is the only listing of the partitions removed from
+  hot (D7), so losing every copy of it would hide those partitions from
+  every selection, a loss of reachability as harmful as losing the files
+  themselves, and nothing downloads it again. It is replicated with k
+  copies on the copy targets and verified every pass of the verification
+  below. If it is lost anyway, the D7 rebuild restores it from the
+  surviving copies, the manifests on every root, the journals and the
+  import ledger.
+- **Single-copy exposure.** A newly sealed file has one copy for the open
+  part's lifetime, plus the time until the next replication pass, plus any
+  cold outage (O, D10). The open part holds at most 300 s of records per
+  stream, the ADR-032 D10 crash bound. Why the seal cadence is the
+  earliest point: a part can be copied only once it is sealed ("sealed iff
+  the manifest exists", ADR-030). The same bound applies to the journal's
+  and the copy ledger's tail. Hot removal never runs below k (D6).
+- **Periodic verification** is a follow-up `mie` command; scheduling it is
+  host-ops. It covers every sealed file in the hot listing and the copy
+  ledger, on every root that holds or should hold it, and checks for each
+  copy:
+  - the copy exists;
+  - its size and SHA-256 equal the manifest (`manifest::verify`);
+  - the root's manifest text is byte-identical to the one in the copy
+    ledger;
+  - the file has at least k good copies on distinct roots (files sealed
+    within the last replication pass excepted).
+
+  For the journal and the copy ledger it checks that each copy is a byte
+  prefix of the hot file (the SHA-256 of the copy equals the SHA-256 of
+  hot's first `len(copy)` bytes), and that the copy ledger's hash chain
+  verifies on hot and on every copy. The files grow between passes, so any
+  other difference is damage, and the chain shows which copy holds it.
+  Import-ledger entries are compared byte for byte. Each pass appends its
+  result to the copy ledger, so the time of each copy's last good
+  verification is known.
+- **P, the verification period.** Every copy's last good verification
+  must be younger than P. P is an operator input at provisioning, within
+  these bounds:
+  - Lower bound: the bytes on the largest copy device (D10) divided by the
+    measured read throughput of the slowest root. Below it, a pass cannot
+    finish. It grows with t.
+  - Above any value, a silently damaged copy stays unnoticed longer. With
+    k = 2 that is a window with one good copy, in which a second failure
+    loses the file.
+  - The ADR has no device failure data to derive one value from, so it
+    states the bounds, not a number.
+- **On a finding** (a missing copy, a size or SHA-256 mismatch, a
+  differing manifest, fewer than k good copies, a broken prefix or hash
+  chain, a verification older than P): the command exits non-zero and
+  names the file, the root and the finding, so the host's scheduler
+  alerts. A bad copy is never read, because `read` raises `Integrity` on
+  it (D5).
+  - An explicit repair step replaces a missing or bad copy from a good one
+    by the D5 protocol. The restored bytes are the sealed bytes, so D5
+    holds.
+  - Repair is explicit, not automatic: several bad copies at once point at
+    a shared cause (a failing controller, a wrong mount), and automatic
+    rewrites would spread into it.
+  - **The lost-file rule.** If no good copy is left, the file is lost. It
+    stays in the copy ledger and in every dataset version, every read of
+    it is `Integrity`, and nothing re-creates it or downloads it again
+    under the same path. Recovering from that needs a new ADR, because any
+    substitute changes dataset versions that accepted ADRs cite.
+
+### Numbers and where they come from
+
+| Number | Source | Derivation | What breaks at another value |
+|---|---|---|---|
+| `depth` 87.1–89.1 % of every store with depth | M1-1 | Σ manifest `bytes` of `depth` over the store total, per store | Not chosen. It is why option 3 saves little (D2) and why option 4 would save most but is rejected on ADR-022 (D3) |
+| 6.2–9.6 % archive-counterpart share; 47–72 MB/day | M1-2 | `aggTrade` + `kline_1m` share per store; 750.5 × 0.062 … 0.096 | Not chosen. A larger share would still be rejected: the D2 argument is the run's integrity, not the size |
+| 750.5 MB per day, ≈ 274 GB/year | M1-5 | (5 × 853.4 + 2 × 493.2) / 7 from the #22 + #22 r2 weekday/weekend rates; × 365 | Below the real rate: hot and the copy devices fill early (D10). Above: unused disk. It covers 60 h of one week, so the server's trailing rate replaces it |
+| 1 126.3 MB per day, ≈ 411 GB/year | M1-6 | #99's 46.93 MB/h × 24 | An upper bound only for the hours on record. A crash day can exceed it (M1-14), which hot's O term and the 8-day average absorb |
+| 2.0× by hour of day, 2.4× by store | M1-7, M1-8 | max/min hourly rate; max/min store rate | Why no single "720 MB/day" is a sizing input: a rate taken from one store can be off by 2.4× |
+| 5.5× busiest archive day | M1-14 | 232.41 / 41.99 MB | Why the busiest column, not the mean, sizes provisioning |
+| 3 670 files per live day, ≈ 1.34 M/year | M1-9 | 1 835 data files + 1 835 manifests on 2026-10-17; × 365 | The cold listing load and the per-pass copy count. Fewer, larger files would need merging parts, which changes hashes (D5) |
+| Copy ledger ≈ 1.5 MB/day | Estimate from M1-9 and M1-10 | per file one manifest record (349 B + 65 B chain hash + framing ≈ 430 B) and k = 2 copy records (≈ 90 B path + root id + time + 65 B chain hash ≈ 190 B each): ≈ 810 B × 1 835 files | An estimate: the follow-up measures it. Higher only adds hot bytes (D10 J); it is under 0.3 % of the data rate |
+| Journal 5.1–5.6 MB/day; 15.1 MB/day for #99 | M1-11 | journal size / captured hours × 24 | The journal never leaves hot, so J × t grows hot; the busiest column uses 15.1 |
+| Import ledger ≈ 6 KB per imported day | M1-15 | 2.25 MB / 379 dates | Negligible in J |
+| A = 51.0 GB | M1-12 | 37 000.3 + 14 002.5 MB (archive + hold-out) | A one-time term of each archive copy device |
+| a = 43.2 MB per imported day (+81.5 with `trades`) | M1-13 | 41.99 + 0.98 + 0.17 + 0.03 MB; `trades` mean | 0 if the operator stops importing after the cutover; the chain does not read post-cutover archive days (ADR-052 D2) |
+| S = 3.7 GB | M1 live table | Σ of the nine live stores' sealed bytes, 3 742.5 MB | A one-time term of each copy device (D9) |
+| Hot window: today − 7 onward | `SEED_LOOKBACK_MS` = 7 d (`ingest.rs`), ADR-032 D5 | the seed window `[now − 7 d, now + 1 d)` touches date today − 7 | Below: a start reads cold and a cold outage stops `mie ingest` before it captures (D8). Above: hot bytes only. It follows the lookback, it is not chosen here |
+| +1 d look-ahead | `ingest.rs` seed window (open klines filed at their close) | — | Tomorrow's partitions are new, never eligible (D6), so it adds no bytes worth sizing |
+| H = 8 days of bytes | D8 | 7 full dates + today's partial date (≤ 1 d) + tomorrow (≈ 0); removal after each seal pass adds ≤ 300 s | Smaller H in D10 under-sizes hot; it is not a free parameter but follows the window |
+| 60 s date grace | ADR-030 D4 | — | Only places yesterday's last records in the window; inside H |
+| 300 s seal cadence | ADR-032 D10 | — | Reused, not chosen: it is the earliest a part can be copied, so it bounds single-copy exposure. A shorter cadence means more files (M1-9 scales with it) |
+| 25 h absorption run | ADR-051 | — | Read through the union, no hot bound (D8) |
+| 90 min warm-up trigger | ADR-052 D12 | — | Cold reads lengthen `ready_after_ms`; the trigger fires on the measured value, so it stays correct (Consequences) |
+| k = 2 | Operator, STOP 1 | one device failure must not lose a file (D11) | k = 1: one device failure makes every run containing the file unreplayable. k = 3: +274 … +411 GB per year per added copy (D10) |
+| k_A = 2 | This ADR (D11) | a lost archive file changes the chain's prefix dataset; cost ≈ 67 GB in year 1 | k_A = 1: one device failure turns every warm run `DIVERGED (warm prefix)`. Higher: archive bytes only |
+| Initial hot sizes | D10 | week-weighted: (750.5 + 43.2) × 8 = 6.35 GB, + 0.79 GB per outage day, J (5.6 + 1.5) × 365 = 2.6 GB per year. Busiest: (1 126.3 + 43.2) × 8 = 9.36 GB, + 1.17 GB per outage day, (15.1 + 1.5) × 365 = 6.1 GB per year | See D10 *What breaks* |
+| Initial copy-device sizes | D10 | year 1, week-weighted: 273.9 + 2.6 + 51.0 + 15.8 + 3.7 = 347 GB; busiest: 411.1 + 6.1 + 51.0 + 15.8 + 3.7 = 488 GB. Later years: 273.9 + 2.6 + 15.8 = 292 GB; 411.1 + 6.1 + 15.8 = 433 GB | See D10 *What breaks* |
+| O (cold-outage days) | Operator input at provisioning | lower bound: the longest cold outage the operator expects to repair (a NAS reboot, a disk swap); upper bound: what hot can hold, (hot − reserve − (Σ r_s + a) × H − J × t) / (Σ r_s + a) | Too small: an outage longer than O fills hot and stops the capture (D10). Larger: more hot disk, and O is also the longest single-copy window (D11) |
+| P (verification period) | Operator input at provisioning | lower bound: bytes on the largest copy device / slowest root's measured read throughput | Below the lower bound a pass cannot finish. Larger: a damaged copy stays unnoticed longer, a window with one good copy at k = 2 (D11) |
+| Origin 2025-10-01 | ADR-052 D1 | — | Why growth has no bound: nothing before the origin can be deleted while it holds (Consequences) |
+
+### Out of scope
+
+- Implementing the multi-root store, the copy ledger, the replicator,
+  hot removal, the verification, repair and rebuild commands, the
+  `cold_roots` keys and the writer refusal (the follow-up).
+- Scheduling the verification, monitoring mount liveness and choosing the
+  devices (host-ops).
+- Provisioning or choosing the server, its disks or the cold medium.
+- Changing the stream set, the depth cadence, `SEED_LOOKBACK_MS` or the
+  hold-back (#99).
+- The ADR-052 engine snapshot (D12) and #140.
+- Moving or deleting any existing store.
+
+## Consequences
+
+- Growth is linear and unbounded: nothing can be deleted while ADR-052's
+  origin holds, and moving the origin needs a new ADR. At k = 2 the copy
+  devices grow by 584–866 GB per year together (D10).
+- Each day's 3 670 files (M1-9) are copied to every copy target and
+  verified within P. Merging parts to reduce that is rejected (D5).
+  `select` lists no cold root (D7), so the listing cost falls on the
+  verification and the rebuild only.
+- The warm-up is slower when its prefix is on cold: after the cutover's
+  first week the whole archive segment is. ADR-052 D12's trigger and D13's
+  queue budget fire on measured values, so they still fire correctly. The
+  cost with a live segment on cold can be measured only once #106's
+  cutover exists; it is recorded here for #106 and production, not as an
+  acceptance criterion.
+- Verification reads compete with warm-up reads; P's lower bound states
+  the cost of a pass.
+- A cold outage or a full copy device keeps new files at one copy. O
+  bounds that window, the verification reports every file below k, and
+  hot removal waits (D6).
+- A lost copy ledger stops replication and hot removal and turns every
+  warm-up cold until the rebuild; the capture continues (D6, D7). The
+  operator's rebuild time counts against O.
+- The follow-up work: the multi-root store, the copy ledger with its hash
+  chain, the replicator (root markers, the device-id check, tail appends),
+  hot removal, the verification, repair and rebuild commands, the
+  `cold_roots` keys, the writer refusal, the race tolerance, and tests.
+
+## Alternatives considered
+
+- **Option 1, everything on the local disk.** Valid as the configuration
+  without cold roots; rejected as the policy (D4).
+- **Option 3, drop live copies of archive-republished streams.** Rejected
+  for every run (D2).
+- **Option 4, depth as snapshots only.** Rejected (D3).
+- **A per-stream deletion schedule.** Rejected: no live stream can be
+  dropped (D2), and the archive cannot be re-created as the same bytes
+  (D1).
+- **A per-file move.** Rejected: part numbers are per partition (D6).
+- **Recompressing or merging on a move.** Rejected: it changes every hash
+  and dataset version (D5); ZSTD is rejected in ADR-030 too.
+- **A native object-storage client in mie.** Rejected: new dependencies,
+  credentials and `deny.toml` changes, against a filesystem mount outside
+  mie. The operator chose the mount at STOP 1.
+- **Deletion after N years.** Rejected: it needs a new ADR-052 origin.
+- **A hot-only seed scan.** Rejected (D8).
+- **A union built from cold listings.** Rejected: an empty mount point
+  reads as no data (D7).
+- **One copy (k = 1), or two copies on one disk or NAS.** Rejected (D11).
+- **A local mirror for hot instead of early replication.** Rejected: mie
+  cannot read a mirror's halves separately, so the per-copy SHA-256 check
+  cannot reach them.
+- **A read that falls back past a bad copy.** Rejected: it would hide a
+  lost copy (D7).
+- **Automatic repair.** Rejected (D11).
+- **Copying the journal and the copy ledger whole on every pass.**
+  Rejected for tail appends: the per-pass cost would grow with the file
+  (D11).
+- **A copy ledger without a hash chain.** Rejected: with k = 2 a prefix
+  mismatch cannot say which copy is damaged (D7).
+- **Rebuilding the copy ledger from root listings alone.** Rejected: it
+  cannot tell a lost file from one that never existed, and an unmounted
+  root would read as empty; the rebuild requires markers and cross-checks
+  the journals and the import ledger (D7).
+- **An implicitly created copy ledger.** Rejected: a missing ledger would
+  read as "nothing was ever moved" (D7).
+
+## Accept when
+
+Reachable on the capture host, without the production server. The
+follow-up implementation:
+
+1. takes copies of the #22 r2 store and of the archive store, moves every
+   eligible partition to a cold root, and `mie replay --source live`,
+   `mie replay --source archive` and `mie equivalence` print byte-identical
+   reports (dataset version, event-stream hash) before and after the move;
+2. starts `mie ingest` with the cold root unreadable and journals the same
+   seeds as a single-root start, while the capture runs;
+3. passes the copy, hot-removal, crash and race tests;
+4. with one copy target replaced by an empty directory, prints the
+   byte-identical item 1 reports from the other copy. With both copy
+   targets empty, `mie replay` and `mie equivalence` fail with `Integrity`
+   naming a removed file, and never print a report with fewer files, a
+   hole or another dataset version;
+5. with one byte flipped in one data copy, the verification exits non-zero
+   and names the file, the root and the SHA-256 mismatch. The repair
+   restores the copy, the next verification passes, and the item 1 reports
+   stay byte-identical;
+6. refuses a configuration whose two copy targets are on one filesystem,
+   and the replicator refuses a copy target without its marker;
+7. with one byte flipped in one copy of the copy ledger, the verification
+   names the ledger, the root and the first record whose hash chain fails;
+8. with the hot copy ledger deleted, `mie ingest` keeps capturing, the
+   warm-up fails into a cold run naming the missing ledger, and `mie
+   replay` fails with `Integrity`. The rebuild then restores a ledger under
+   which the item 1 reports are byte-identical. With one data file also
+   deleted from every root before the rebuild, the rebuild reports it as
+   lost (named by its journal `sealed` record), and a replay covering it
+   fails with `Integrity` naming it.
+
+Flagged now: the warm-up cost with a live segment on cold cannot be
+reached until #106's cutover exists (Consequences).
