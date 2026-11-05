@@ -136,6 +136,12 @@ plan.
   class of `funding_gap` and `overflow`: a value on the line is unknown,
   the path is not. At the entry the line keeps no entry (its fill trade is
   not strictly before c); at the exit it keeps the entry and E′.
+- *Weak spot:* unlike `funding_gap` and `overflow`, `no_book` is tied to
+  the cost being measured. Under `slippage.depth_walk@1` the fills it
+  drops are the thin or fast moments, where the window holds less than q
+  or the print has drifted past the window bound since the last re-anchor
+  (ADR-043 M2). These are the expensive fills, so a depth-walk backtest's
+  net R leans optimistic as q grows, as D8 says for the calibration.
 - Before any drive, the run is refused with
   `ResearchError::BookNotDelivered` when the sample ends at or before the
   chain's cutover. The archive has no book (ADR-043 D11), so every fill

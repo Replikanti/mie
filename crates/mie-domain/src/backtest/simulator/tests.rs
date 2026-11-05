@@ -1268,14 +1268,27 @@ fn book_run(
     entry: FeatureValue<OrderBook>,
     exit: FeatureValue<OrderBook>,
 ) -> TradeRecord {
+    book_tape(costs, long("100", "98", "104"), "104", entry, exit)
+}
+
+/// The book tape for `decision`: decided at #1 (0 ms, 100), the entry fill
+/// trade #2 (10 ms, e = 100.0) on `entry`, the touch #3 (20 ms) and the
+/// exit fill trade #4 (30 ms) both at `x`, on `exit`.
+fn book_tape(
+    costs: Costs,
+    decision: Admission,
+    x: &str,
+    entry: FeatureValue<OrderBook>,
+    exit: FeatureValue<OrderBook>,
+) -> TradeRecord {
     let mut run = Run::new(costs);
     run.on(trade(0, 1, "100"))
-        .decide(long("100", "98", "104"))
+        .decide(decision)
         .book(entry)
         .on(trade(10, 2, "100.0"))
         .book(exit)
-        .on(trade(20, 3, "104"))
-        .on(trade(30, 4, "104.0"));
+        .on(trade(20, 3, x))
+        .on(trade(30, 4, x));
     run.only()
 }
 
@@ -1367,6 +1380,64 @@ fn depth_walk_slippage_walks_the_levels_for_its_size() {
             }),
             ..book_record()
         }
+    );
+}
+
+/// The book at a short's exit: bids 95.9 × 1, 95.8 × 2; asks 96.1 × 1,
+/// 96.2 × 2.
+fn short_exit_book() -> FeatureValue<OrderBook> {
+    book_of(
+        &[("95.9", "1"), ("95.8", "2")],
+        &[("96.1", "1"), ("96.2", "2")],
+    )
+}
+
+/// **A short on the book** (D2): the legs take the other sides. Levels 102
+/// / 96, R = 2, touch and exit fill trade at x = 96.0 on
+/// [`short_exit_book`].
+/// - Spread: the short sells from e = 100.0 into the bids at or below it,
+///   E′ = 99.9, fee ⟨0.0005 × 99.9⟩ = 0.04995; it buys back from x = 96.0
+///   at the asks at or above it, X′ = 96.1, fee 0.04805. net = (99.9 −
+///   96.1 − 0.04995 − 0.04805) / 2 = 3.702 / 2 = 1.851.
+/// - Depth walk at q = 1.5: E′ = (1 × 99.9 + 0.5 × 99.8) / 1.5 = 149.8 /
+///   1.5 → 99.86666667, fee → 0.04993333; X′ = (1 × 96.1 + 0.5 × 96.2) /
+///   1.5 = 144.2 / 1.5 → 96.13333333, fee → 0.04806667. net = (99.86666667
+///   − 96.13333333 − 0.04993333 − 0.04806667) / 2 = 3.63533334 / 2 =
+///   1.81766667.
+///
+/// Gross stays on trade prices, (100 − 96) / 2 = 2; MFE 2, MAE 0.
+#[test]
+fn a_short_takes_the_bids_to_enter_and_the_asks_to_exit() {
+    let run = |slippage| {
+        book_tape(
+            with_slippage(slippage),
+            short("100", "102", "96"),
+            "96",
+            entry_book(),
+            short_exit_book(),
+        )
+    };
+    let expected = |net: &str, entry: &str, exit: &str| TradeRecord {
+        entry: fill(10, "100"),
+        exit: Exit::Target,
+        exit_at: t(20),
+        fill: fill(30, "96"),
+        funding: Some(usd("0")),
+        gross: r("2"),
+        net: r(net),
+        displacement: r("0"),
+        mfe: r("2"),
+        mae: r("0"),
+        slipped: Some(SlippedFills {
+            entry: Some(usd(entry)),
+            exit: Some(usd(exit)),
+        }),
+        ..record(key(0, 1), PositionSide::Short, ["100", "102", "96", "2"])
+    };
+    assert_eq!(run(SlippageRule::Spread), expected("1.851", "99.9", "96.1"));
+    assert_eq!(
+        run(depth_walk("1.5")),
+        expected("1.81766667", "99.86666667", "96.13333333")
     );
 }
 
@@ -1506,9 +1577,15 @@ fn maker(fill: TargetFill) -> Costs {
 /// A long decided at #1 (0 ms, 100), levels 98 / 104, R = 2, entry fill
 /// #2 (10 ms, e = 100), then `path` from 20 ms on, one trade per 10 ms.
 fn maker_run(costs: Costs, path: &[&str]) -> TradeRecord {
+    maker_tape(costs, long("100", "98", "104"), path)
+}
+
+/// The maker tape for `decision`: decided at #1 (0 ms, 100), entry fill #2
+/// (10 ms, e = 100), then `path` from 20 ms on, one trade per 10 ms.
+fn maker_tape(costs: Costs, decision: Admission, path: &[&str]) -> TradeRecord {
     let mut run = Run::new(costs);
     run.on(trade(0, 1, "100"))
-        .decide(long("100", "98", "104"))
+        .decide(decision)
         .on(trade(10, 2, "100"));
     for (index, price) in (3..).zip(path) {
         run.on(trade(i64::try_from(index - 1).unwrap() * 10, index, price));
@@ -1568,6 +1645,34 @@ fn the_maker_target_fills_through_or_at_a_touch() {
             ..maker_exit(20, "104", "2")
         }
     );
+}
+
+/// D6 for a short, levels 102 / 96, R = 2: the maker target fills on
+/// prints at or *below* T. #3 at 20 ms prints 99, short of T (a print
+/// above T never fills a short's target); #4 at 30 ms prints at T = 96,
+/// #5 at 40 ms 0.1 beyond, #6 at 50 ms makes #5 final. `touch` fills at
+/// #4, `through` at #5, both at X′ = T = 96: E′ = 100, entry fee 0.05,
+/// maker fee ⟨0.0002 × 96⟩ = 0.0192, gross (100 − 96) / 2 = 2, net (100 −
+/// 96 − 0.05 − 0.0192) / 2 = 3.9308 / 2 = 1.9654.
+#[test]
+fn a_short_maker_target_fills_at_or_below_the_target() {
+    let path = ["99", "96", "95.9", "95.9"];
+    let exit = |at: i64, print: &str, mfe: &str| TradeRecord {
+        entry: fill(10, "100"),
+        exit: Exit::Target,
+        exit_at: t(at),
+        fill: fill(at, print),
+        funding: Some(usd("0")),
+        gross: r("2"),
+        net: r("1.9654"),
+        displacement: r("0"),
+        mfe: r(mfe),
+        mae: r("0"),
+        ..record(key(0, 1), PositionSide::Short, ["100", "102", "96", "2"])
+    };
+    let run = |fill| maker_tape(maker(fill), short("100", "102", "96"), &path);
+    assert_eq!(run(TargetFill::MakerThrough), exit(40, "95.9", "2.05"));
+    assert_eq!(run(TargetFill::MakerTouch), exit(30, "96", "2"));
 }
 
 /// `through` fills are a subset of `touch` fills (D6): on a path that only
