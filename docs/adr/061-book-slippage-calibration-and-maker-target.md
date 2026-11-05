@@ -229,6 +229,19 @@ A new `PIPELINE_KINDS` entry (#172 PR 2).
     `fills=<n> book=<n> window=<n> sum=<rate> mean=<rate|->`, with mean =
     ⟨sum / fills⟩.
   - Conservation: fills + book + window = 2 × trades.
+  - *Settlement:* a fill counts as priced only once the next book event
+    proves the book it met. A `BookUpdate` after which the engine's book
+    is still `Ready` does: the sequencer emits one only while the diffs
+    chain, and the domain book stays ready only while they chain to its
+    own (when the domain rejects a book event, the next diff breaks that
+    chain and invalidates the book). Any other update, a `BookSnapshot`,
+    an `OrderBook` gap or the sample's end counts the fills held since
+    the last book event `book`. *Why:* a book that stops receiving diffs (a depth reconnect,
+    a run restart) stays `Ready` with its old levels, and its gap is
+    announced only at the resync (ADR-038 rule 9), so a fill before the
+    resync would be priced on a stale book (PR #181 review: s ≈ 1 % on a
+    1 % move). The cost: the fills of at most one diff interval before
+    each checkpoint snapshot also count `book`.
 - **Provenance:** the `stream` and `rejections` lines of
   `replay-summary`. The key has no engine part (like
   `research.replay_summary@1`): the values depend only on the data and on

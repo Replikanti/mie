@@ -482,7 +482,7 @@ where
 ///
 /// [`ResearchError::FeatureUnavailable`] naming the first member the engine
 /// does not compute.
-fn checked_engine(spec: &ExperimentSpec) -> Result<MarketStateEngine, ResearchError> {
+pub(crate) fn checked_engine(spec: &ExperimentSpec) -> Result<MarketStateEngine, ResearchError> {
     let engine = engine_for(spec)?;
     for member in spec.features().definitions() {
         let computed = engine
@@ -498,9 +498,10 @@ fn checked_engine(spec: &ExperimentSpec) -> Result<MarketStateEngine, ResearchEr
     Ok(engine)
 }
 
-/// Step 5 of [`RunResearchExperiment::run`] for both services: compares
-/// `result` with the one stored under its key, or appends it.
-fn record<S: ResearchResultStore>(
+/// Step 5 of [`RunResearchExperiment::run`] for every service of the
+/// crate: compares `result` with the one stored under its key, or appends
+/// it.
+pub(crate) fn record<S: ResearchResultStore>(
     store: &mut S,
     result: ExperimentResult,
 ) -> Result<ExperimentRun, ResearchError> {

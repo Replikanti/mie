@@ -23,7 +23,12 @@
 //!   cutover, when its archive replays `fundingRate` (ADR-060 D7), and the
 //!   backtest's trailing gaps add the archive segment's trailing funding
 //!   gaps, and its trades gaps when no live segment is read, which the
-//!   chain does not carry over the seam. It
+//!   chain does not carry over the seam. With
+//!   [`ExperimentPipeline::SlippageCalibration`] it runs
+//!   `research.slippage_calibration@1` over the live replay instead,
+//!   through [`CalibrationService`] (ADR-061 D7), and refuses any other
+//!   source before the store is opened: the archive has no order book, and
+//!   the history chain has no live segment to calibrate on yet. It
 //!   prints `recorded <key>` for a
 //!   new result and `reproduced <key>` when the stored result was
 //!   reproduced exactly; anything else is `FAIL: <reason>`. The composition
@@ -41,7 +46,9 @@ use mie_adapter_binance::{HistoryChainStream, LiveReplay};
 use mie_adapter_fs::FsResultStore;
 use mie_adapter_parquet::ParquetRawStore;
 use mie_app::backtest::ChainBacktest;
-use mie_app::{BacktestService, ChainBounds, ExperimentService, FundingCoverage};
+use mie_app::{
+    BacktestService, CalibrationService, ChainBounds, ExperimentService, FundingCoverage,
+};
 use mie_domain::backtest::resolve;
 use mie_domain::event::{FeedGap, Stream};
 use mie_domain::feature::catalog;
@@ -57,6 +64,9 @@ pub enum ExperimentPipeline {
     Summary,
     /// `research.backtest@1`, on the history chain only (ADR-060 D13).
     Backtest,
+    /// `research.slippage_calibration@1`, on live captures only (ADR-061
+    /// D7).
+    SlippageCalibration,
 }
 
 /// One `mie experiment run` invocation.
@@ -133,6 +143,15 @@ pub fn run(request: &ExperimentRequest, out: &mut dyn Write) -> Result<bool, Str
         emit(out, &report)?;
         return Ok(false);
     }
+    let calibration = request.pipeline == ExperimentPipeline::SlippageCalibration;
+    if calibration && !matches!(request.source, ReplaySource::Live(_)) {
+        line(
+            &mut report,
+            "FAIL: --pipeline slippage-calibration runs on --source live only (ADR-061 D7)",
+        );
+        emit(out, &report)?;
+        return Ok(false);
+    }
     let verdict = match FsResultStore::open(&request.results) {
         Ok(results) => match &request.source {
             ReplaySource::Live(config) => {
@@ -146,7 +165,11 @@ pub fn run(request: &ExperimentRequest, out: &mut dyn Write) -> Result<bool, Str
                             &config.instrument.symbol,
                             runs,
                         );
-                        execute(ExperimentService::new(live, results), &spec, false)
+                        if calibration {
+                            execute(CalibrationService::new(live, results), &spec, false)
+                        } else {
+                            execute(ExperimentService::new(live, results), &spec, false)
+                        }
                     }
                     Err(error) => Err(error),
                 }
