@@ -142,7 +142,8 @@ USAGE:
 
     mie experiment run <spec> --config <path> --results <dir>
                        [--source live|archive|history] [--streams <a,b,...>]
-                       [--trade-correction fold|none] [--pipeline backtest]
+                       [--trade-correction fold|none]
+                       [--pipeline backtest|slippage-calibration]
         Run the spec's sample period through the core (source options as
         mie replay) and record the result in the append-only result store
         under <dir>. live and archive record research.replay_summary@1.
@@ -160,6 +161,15 @@ USAGE:
         the result holds @2's provenance lines, the counts, one trade line
         per taken decision and the metrics; its key ends in the engine like
         @2's. A simulation only: no order is placed (ADR-010).
+        --pipeline slippage-calibration (with --source live only) records
+        research.slippage_calibration@1 (ADR-061 D7): every accepted trade
+        of the sample gives a buy and a sell at its print, priced on the
+        order book of that moment by the spread model and the depth walk
+        at 17 sizes from 0.001 to 120 BTC; the result holds @1's
+        provenance lines, the trade count and per model the priced fills,
+        the unpriced ones by cause, the sum and the mean of the per-fill
+        slippage. The spec's features must contain book.l2@1; its rule
+        lines are not read. Its key has no engine, like @1's.
         Prints `recorded <key>` for a new result or `reproduced <key>` when
         the stored result was reproduced exactly; exits 0. A data-version
         mismatch, an empty sample, a sample before the history origin, a
@@ -169,7 +179,9 @@ USAGE:
         resolution error), funding.recorded@1 on a sample the chain
         delivers no settlements for (its archive does not replay
         fundingRate, or the sample ends after the cutover), and a source
-        other than history. Stored results are never overwritten.
+        other than history; for the calibration, a spec without book.l2@1
+        and a source other than live. Stored results are never
+        overwritten.
 
     mie conditional build --config <path> --from <ms|YYYY-MM-DD> --to <ms|YYYY-MM-DD>
                           --out <dir> [--source live|archive]
@@ -440,9 +452,11 @@ fn dispatch(args: &[String]) -> Result<ExitCode, String> {
                 let pipeline = match options.optional("--pipeline") {
                     None => ExperimentPipeline::Summary,
                     Some("backtest") => ExperimentPipeline::Backtest,
+                    Some("slippage-calibration") => ExperimentPipeline::SlippageCalibration,
                     Some(other) => {
                         return Err(format!(
-                            "--pipeline {other:?} is not backtest (omit it for the replay summary)"
+                            "--pipeline {other:?} is neither backtest nor slippage-calibration \
+                             (omit it for the replay summary)"
                         ));
                     }
                 };

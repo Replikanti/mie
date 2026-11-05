@@ -7,6 +7,8 @@ use crate::backtest::{BacktestMetrics, SimulationStats, TradeRecord, is_book_sli
 use crate::event_hash::EventStreamHash;
 use crate::feature::{FeatureRegistry, FeatureSetVersion, is_valid_id, parse_versioned_id};
 use crate::fingerprint::Fingerprint;
+use crate::num::{Qty, Rate};
+use crate::slippage::{BookModel, CALIBRATION_GRID, CalibrationRow, SlippageCalibration};
 use crate::state_hash::StateHash;
 use crate::time::EventTime;
 use std::borrow::Cow;
@@ -169,6 +171,19 @@ pub enum Outcome {
         /// One record per taken decision, in decision order.
         records: Vec<TradeRecord>,
     },
+    /// `slippage-calibration`: what the book models cost at every trade of
+    /// the sample, against its print (ADR-061 D7, D8), with the provenance
+    /// lines of `replay-summary`. The mean on each line is not stored: it
+    /// is rendered from the line's sum and fills.
+    SlippageCalibration {
+        /// The hash of the delivered event sequence.
+        stream: EventStreamHash,
+        /// Delivered events the domain rejected.
+        domain_rejections: u64,
+        /// The trades observed and one line per model, boxed: 18 lines
+        /// outweigh every other kind.
+        calibration: Box<SlippageCalibration>,
+    },
 }
 
 impl Outcome {
@@ -178,6 +193,7 @@ impl Outcome {
             Self::ReplaySummary { .. } => "replay-summary",
             Self::HistoryReplaySummary(_) => "history-replay-summary",
             Self::Backtest { .. } => "backtest",
+            Self::SlippageCalibration { .. } => "slippage-calibration",
         }
     }
 
@@ -185,7 +201,7 @@ impl Outcome {
     /// outcome that reads none.
     pub const fn engine(&self) -> Option<EngineKey> {
         match self {
-            Self::ReplaySummary { .. } => None,
+            Self::ReplaySummary { .. } | Self::SlippageCalibration { .. } => None,
             Self::HistoryReplaySummary(summary) | Self::Backtest { summary, .. } => {
                 Some(summary.engine)
             }
@@ -278,6 +294,18 @@ impl ExperimentResult {
                 let metrics = BacktestMetrics::compute(records, features.len());
                 text::render_metrics(&metrics, &features, &mut out);
             }
+            Outcome::SlippageCalibration {
+                stream,
+                domain_rejections,
+                calibration,
+            } => {
+                out.push_str(&format!(
+                    "stream {stream}
+rejections {domain_rejections}
+"
+                ));
+                render_calibration(calibration, &mut out);
+            }
         }
         out.push_str("spec\n");
         out.push_str(self.spec.canonical_text());
@@ -304,6 +332,12 @@ impl ExperimentResult {
     /// lines are checked for
     /// grammar only here; values that differ from what the trade lines
     /// give make the text not canonical.
+    ///
+    /// A `slippage-calibration` outcome is malformed, too, with a line
+    /// whose fills, book and window do not add up to 2 × `trades`
+    /// (ADR-061 D7), a negative sum, or a sum other than 0 without a
+    /// priced fill. Its means are checked for grammar only; a mean other
+    /// than the line's ⟨sum / fills⟩ makes the text not canonical.
     pub fn parse(text: &str, registry: &FeatureRegistry) -> Result<Self, ResultParseError> {
         let mut lines = Lines {
             rest: text,
@@ -348,6 +382,7 @@ impl ExperimentResult {
                 Outcome::HistoryReplaySummary(HistoryReplaySummary::parse(&mut lines)?)
             }
             "outcome backtest" => parse_backtest(&mut lines)?,
+            "outcome slippage-calibration" => parse_calibration(&mut lines)?,
             other => return Err(malformed(4, format!("unknown outcome line {other:?}"))),
         };
         check_kind(&pipeline, &outcome)?;
@@ -385,7 +420,10 @@ impl ExperimentResult {
     ///   not its exit kind's shape, records whose decision keys decrease,
     ///   counts that break D4's conservation, a regime list whose length is
     ///   not the spec's number of regime features, and slipped fills on a
-    ///   record that its spec's slippage rule does not give (ADR-061 D5).
+    ///   record that its spec's slippage rule does not give (ADR-061 D5);
+    /// - for a `slippage-calibration` outcome (ADR-061 D7): a line that
+    ///   breaks the conservation, a negative sum, or a sum other than 0
+    ///   without a priced fill.
     ///
     /// Every other value renders text that parses back to it, so `Ok`
     /// means [`parse`](Self::parse) returns this value for its canonical
@@ -399,7 +437,7 @@ impl ExperimentResult {
     /// reports it.
     pub fn validate(&self) -> Result<(), ResultParseError> {
         let summary = match &self.outcome {
-            Outcome::ReplaySummary { .. } => None,
+            Outcome::ReplaySummary { .. } | Outcome::SlippageCalibration { .. } => None,
             Outcome::HistoryReplaySummary(summary) | Outcome::Backtest { summary, .. } => {
                 Some(summary)
             }
@@ -417,6 +455,9 @@ impl ExperimentResult {
                 previous = Some(record);
             }
             check_conservation(TRIGGERS_LINE, stats, records.len())?;
+        }
+        if let Outcome::SlippageCalibration { calibration, .. } = &self.outcome {
+            check_calibration(calibration)?;
         }
         check_kind(&self.pipeline, &self.outcome)?;
         if let Outcome::Backtest { records, .. } = &self.outcome {
@@ -478,6 +519,14 @@ const TRIGGERS_LINE: usize = 17;
 /// The line of the first `trade` line, after the four count lines.
 const FIRST_TRADE_LINE: usize = 21;
 
+/// The line of the first calibration line, `spread`, in a
+/// `slippage-calibration` outcome: after the four opening lines, `stream`,
+/// `rejections` and `trades`. The grid's lines follow it.
+const FIRST_CALIBRATION_LINE: usize = 8;
+
+/// The fields of a calibration line, after its model.
+const CALIBRATION_FIELDS: &str = "fills=<n> book=<n> window=<n> sum=<rate> mean=<rate|->";
+
 /// An `outcome` kind other than the one `pipeline` produces is malformed,
 /// at the `outcome` line.
 fn check_kind(pipeline: &PipelineKey, outcome: &Outcome) -> Result<(), ResultParseError> {
@@ -529,14 +578,16 @@ fn check_conservation(
 }
 
 /// The outcome kind of each pipeline version that has one (ADR-040,
-/// ADR-052 D10, ADR-060 D12). A result pairing one of them with another
-/// kind is no pipeline's output, and its key would be impossible:
-/// `research.replay_summary@2` or `research.backtest@1` without an engine,
-/// `research.replay_summary@1` with one.
-const PIPELINE_KINDS: [(&str, u32, &str); 3] = [
+/// ADR-052 D10, ADR-060 D12, ADR-061 D7). A result pairing one of them
+/// with another kind is no pipeline's output, and its key would be
+/// impossible: `research.replay_summary@2` or `research.backtest@1`
+/// without an engine, `research.replay_summary@1` or
+/// `research.slippage_calibration@1` with one.
+const PIPELINE_KINDS: [(&str, u32, &str); 4] = [
     ("research.replay_summary", 1, "replay-summary"),
     ("research.replay_summary", 2, "history-replay-summary"),
     ("research.backtest", 1, "backtest"),
+    ("research.slippage_calibration", 1, "slippage-calibration"),
 ];
 
 /// The outcome kind `pipeline` produces; `None` for a pipeline version not
@@ -740,6 +791,119 @@ fn parse_backtest(lines: &mut Lines<'_>) -> Result<Outcome, ResultParseError> {
         stats,
         records,
     })
+}
+
+/// The `trades` line and one line per model of a `slippage-calibration`
+/// outcome (ADR-061 D7): `spread <fields>`, then `depth_walk <q> <fields>`
+/// for each size of the grid, in grid order, q in its 8-place form.
+fn render_calibration(calibration: &SlippageCalibration, out: &mut String) {
+    out.push_str(&format!("trades {}\n", calibration.trades));
+    for (model, row) in calibration.rows() {
+        let CalibrationRow {
+            fills,
+            book,
+            window,
+            sum,
+        } = row;
+        let mean = row
+            .mean()
+            .map_or_else(|| "-".to_owned(), |mean| mean.to_string());
+        let fields = format!("fills={fills} book={book} window={window} sum={sum} mean={mean}");
+        match model {
+            BookModel::Spread => out.push_str(&format!("spread {fields}\n")),
+            BookModel::DepthWalk(qty) => out.push_str(&format!("depth_walk {qty} {fields}\n")),
+        }
+    }
+}
+
+/// The lines of a `slippage-calibration` outcome after its `outcome` line,
+/// up to `spec` (ADR-061 D7): the provenance of `replay-summary`, the
+/// `trades` line and the model lines, each checked as
+/// [`check_calibration`] checks it.
+fn parse_calibration(lines: &mut Lines<'_>) -> Result<Outcome, ResultParseError> {
+    let stream = lines.field("stream", "<events>:<16 hex>", parse_stream_hash)?;
+    let domain_rejections = lines.field("rejections", "<n>", |n| n.parse().ok())?;
+    let trades = lines.field("trades", "<n>", |n| n.parse().ok())?;
+    let mut calibration = SlippageCalibration {
+        trades,
+        ..SlippageCalibration::new()
+    };
+    let expected = format!("spread {CALIBRATION_FIELDS}");
+    calibration.spread = lines.with(&expected, |text| {
+        text.strip_prefix("spread ")
+            .and_then(parse_calibration_row)
+            .ok_or_else(|| format!("expected `{expected}`"))
+    })?;
+    for (row, qty) in calibration.depth_walk.iter_mut().zip(CALIBRATION_GRID) {
+        let expected = format!("depth_walk {qty} {CALIBRATION_FIELDS}");
+        *row = lines.with(&expected, |text| {
+            text.strip_prefix("depth_walk ")
+                .and_then(|rest| rest.split_once(' '))
+                .filter(|(size, _)| size.parse::<Qty>() == Ok(qty))
+                .and_then(|(_, fields)| parse_calibration_row(fields))
+                .ok_or_else(|| {
+                    format!("expected `{expected}`: the grid's sizes in order (ADR-061 D8)")
+                })
+        })?;
+    }
+    check_calibration(&calibration)?;
+    Ok(Outcome::SlippageCalibration {
+        stream,
+        domain_rejections,
+        calibration: Box::new(calibration),
+    })
+}
+
+/// Parses the fields of a calibration line, [`CALIBRATION_FIELDS`]. The
+/// mean is checked for grammar only: it is rendered from the sum and the
+/// fills, so another value makes the text not canonical.
+fn parse_calibration_row(text: &str) -> Option<CalibrationRow> {
+    let mut fields = text.split(' ');
+    let mut next = |name: &str| fields.next()?.strip_prefix(name)?.strip_prefix('=');
+    let fills = next("fills")?.parse().ok()?;
+    let book = next("book")?.parse().ok()?;
+    let window = next("window")?.parse().ok()?;
+    let sum = next("sum")?.parse::<Rate>().ok()?;
+    let mean = next("mean")?;
+    if mean != "-" {
+        mean.parse::<Rate>().ok()?;
+    }
+    if fields.next().is_some() {
+        return None;
+    }
+    Some(CalibrationRow {
+        fills,
+        book,
+        window,
+        sum,
+    })
+}
+
+/// The checks of a calibration beyond its grammar, in line order (ADR-061
+/// D2, D7): every line accounts for 2 × `trades` fills, and its sum, a sum
+/// of rates that are each ≥ 0, is ≥ 0, and 0 without a priced fill.
+fn check_calibration(calibration: &SlippageCalibration) -> Result<(), ResultParseError> {
+    let fills = 2 * u128::from(calibration.trades);
+    for (index, (_, row)) in calibration.rows().enumerate() {
+        let reason = if !row.accounts_for(fills) {
+            format!(
+                "fills + book + window is not 2 × trades = {fills}: every trade gives a buy \
+                 and a sell on every line (ADR-061 D7)"
+            )
+        } else if row.sum.units() < 0 {
+            "the sum is negative: every priced fill costs at least its print (ADR-061 D2)"
+                .to_owned()
+        } else if row.fills == 0 && row.sum.units() != 0 {
+            "the sum is not 0 without a priced fill".to_owned()
+        } else {
+            continue;
+        };
+        return Err(ResultParseError::Malformed {
+            line: FIRST_CALIBRATION_LINE + index,
+            reason,
+        });
+    }
+    Ok(())
 }
 
 /// Parses the `Display` form of an [`EventStreamHash`],
@@ -1173,6 +1337,250 @@ mod tests {
         assert_eq!(
             parse(&other).map(|result| result.pipeline),
             Ok(PipelineKey::new("research.example", 1))
+        );
+    }
+
+    const CALIBRATION_V1: PipelineKey = PipelineKey::new("research.slippage_calibration", 1);
+
+    fn calibration_row(fills: u64, book: u64, window: u64, sum: i64) -> CalibrationRow {
+        CalibrationRow {
+            fills,
+            book,
+            window,
+            sum: Rate::from_units(sum),
+        }
+    }
+
+    /// A calibration of 3 trades (6 fills a line): one book-less trade, the
+    /// spread priced at every other fill, the depth walk running out of the
+    /// window from 10 BTC on and pricing nothing from 100 BTC on.
+    fn calibration_result() -> ExperimentResult {
+        let mut depth_walk = [calibration_row(4, 2, 0, 1_000); 17];
+        depth_walk[9] = calibration_row(4, 2, 0, 3_201);
+        depth_walk[12] = calibration_row(3, 2, 1, 9_999);
+        depth_walk[15] = calibration_row(0, 2, 4, 0);
+        depth_walk[16] = calibration_row(0, 2, 4, 0);
+        ExperimentResult {
+            spec: ExperimentSpec::parse(&golden(), &catalog::registry()).unwrap(),
+            pipeline: CALIBRATION_V1,
+            outcome: Outcome::SlippageCalibration {
+                stream: stream_hash(48, 0x0123_4567_89ab_cdef),
+                domain_rejections: 2,
+                calibration: Box::new(SlippageCalibration {
+                    trades: 3,
+                    spread: calibration_row(4, 2, 0, 1_000),
+                    depth_walk,
+                }),
+            },
+        }
+    }
+
+    #[test]
+    fn calibration_result_text_is_pinned() {
+        let result = calibration_result();
+        let small = "fills=4 book=2 window=0 sum=0.00001000 mean=0.00000250";
+        let mut expected = format!(
+            "mie-result 1\n\
+             experiment 3f902847001e1998\n\
+             pipeline research.slippage_calibration@1\n\
+             outcome slippage-calibration\n\
+             stream 48:0123456789abcdef\n\
+             rejections 2\n\
+             trades 3\n\
+             spread {small}\n"
+        );
+        let sizes = [
+            "0.00100000",
+            "0.00200000",
+            "0.00500000",
+            "0.01000000",
+            "0.02000000",
+            "0.05000000",
+            "0.10000000",
+            "0.20000000",
+            "0.50000000",
+            "1.00000000",
+            "2.00000000",
+            "5.00000000",
+            "10.00000000",
+            "20.00000000",
+            "50.00000000",
+            "100.00000000",
+            "120.00000000",
+        ];
+        for (index, size) in sizes.iter().enumerate() {
+            let fields = match index {
+                // 3 201 / 4 = 800.25 → 800.
+                9 => "fills=4 book=2 window=0 sum=0.00003201 mean=0.00000800",
+                // 9 999 / 3 = 3 333.
+                12 => "fills=3 book=2 window=1 sum=0.00009999 mean=0.00003333",
+                15 | 16 => "fills=0 book=2 window=4 sum=0.00000000 mean=-",
+                _ => small,
+            };
+            expected.push_str(&format!("depth_walk {size} {fields}\n"));
+        }
+        expected.push_str("spec\n");
+        expected.push_str(&golden());
+        assert_eq!(result.canonical_text(), expected);
+        assert_eq!(
+            result.key().to_string(),
+            "3f902847001e1998/research.slippage_calibration@1"
+        );
+        assert_eq!(result.key().engine, None);
+    }
+
+    #[test]
+    fn calibration_result_text_round_trips() {
+        let result = calibration_result();
+        assert_eq!(result.validate(), Ok(()));
+        assert_eq!(parse(&result.canonical_text()), Ok(result));
+    }
+
+    #[test]
+    fn only_canonical_calibration_result_text_parses() {
+        let text = calibration_result().canonical_text();
+        let non_canonical = [
+            // A mean that is not ⟨sum / fills⟩.
+            text.replace("mean=0.00000800", "mean=0.00000801"),
+            text.replace("mean=0.00003333", "mean=-"),
+            text.replace("sum=0.00000000 mean=-", "sum=0.00000000 mean=0.00000000"),
+            text.replace("trades 3", "trades 03"),
+            text.replace("spread fills=4", "spread fills=+4"),
+            text.replace("sum=0.00003201", "sum=0.000032010"),
+            // The grid's size, not in its 8-place form.
+            text.replace("depth_walk 1.00000000", "depth_walk 1"),
+        ];
+        for text in non_canonical {
+            assert_eq!(parse(&text), Err(ResultParseError::NotCanonical), "{text}");
+        }
+    }
+
+    #[test]
+    fn malformed_calibration_result_text_names_the_line() {
+        let text = calibration_result().canonical_text();
+        let cases = [
+            (text.replace("stream 48:0123456789abcdef", "stream 48"), 5),
+            (text.replace("rejections 2", "rejections -2"), 6),
+            (text.replace("trades 3", "trades three"), 7),
+            (text.replace("spread fills", "spread  fills"), 8),
+            (text.replace("spread fills=4", "spread fill=4"), 8),
+            (
+                text.replace("mean=0.00000250\ndepth_walk 0.001", "\ndepth_walk 0.001"),
+                8,
+            ),
+            (
+                text.replace("depth_walk 0.00100000", "depth_walk 0.00100001"),
+                9,
+            ),
+            // The grid's order is fixed.
+            (
+                text.replace("depth_walk 0.00200000", "depth_walk 0.00500000"),
+                10,
+            ),
+            (
+                text.replace("depth_walk 1.00000000", "depth_walk 2.00000000"),
+                18,
+            ),
+            (
+                text.replace("120.00000000 fills=0", "120.00000000 fills=0 extra=1"),
+                25,
+            ),
+            (text.replace("\nspec\n", "\nspecification\n"), 26),
+        ];
+        for (text, line) in cases {
+            match parse(&text) {
+                Err(ResultParseError::Malformed { line: found, .. }) => {
+                    assert_eq!(found, line, "{text}");
+                }
+                other => panic!("{text}: {other:?}"),
+            }
+        }
+    }
+
+    /// A change to a calibration value.
+    type Mutation = fn(&mut SlippageCalibration);
+
+    /// ADR-061 D7's conservation and the sums of rates that are each ≥ 0,
+    /// refused by `parse` and `validate` alike, on the line that breaks
+    /// them.
+    #[test]
+    fn a_calibration_that_breaks_the_conservation_or_a_sum_is_malformed() {
+        let conservation = "fills + book + window is not 2 × trades = 6: every trade gives a \
+                            buy and a sell on every line (ADR-061 D7)";
+        let cases: [(Mutation, usize, &str); 5] = [
+            (
+                |c| c.trades = 4,
+                8,
+                "fills + book + window is not 2 × trades = 8: every trade gives a buy and a \
+                 sell on every line (ADR-061 D7)",
+            ),
+            (|c| c.depth_walk[3].book = 3, 12, conservation),
+            (
+                |c| c.depth_walk[16] = calibration_row(1, 2, 4, 0),
+                25,
+                conservation,
+            ),
+            (
+                |c| c.spread.sum = Rate::from_units(-1),
+                8,
+                "the sum is negative: every priced fill costs at least its print (ADR-061 D2)",
+            ),
+            (
+                |c| c.depth_walk[15].sum = Rate::from_units(1),
+                24,
+                "the sum is not 0 without a priced fill",
+            ),
+        ];
+        for (mutate, line, reason) in cases {
+            let mut result = calibration_result();
+            let Outcome::SlippageCalibration { calibration, .. } = &mut result.outcome else {
+                unreachable!();
+            };
+            mutate(calibration);
+            let validated = result.validate();
+            let parsed = parse(&result.canonical_text());
+            assert_eq!(validated, parsed.map(|_| ()), "line {line}");
+            match validated {
+                Err(ResultParseError::Malformed {
+                    line: found,
+                    reason: text,
+                }) => {
+                    assert_eq!((found, text.as_str()), (line, reason));
+                }
+                other => panic!("line {line}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn the_calibration_pipeline_fixes_its_outcome_kind() {
+        let summary_text = result().canonical_text().replace(
+            "pipeline research.replay_summary@1",
+            "pipeline research.slippage_calibration@1",
+        );
+        assert_eq!(
+            parse(&summary_text),
+            Err(ResultParseError::Malformed {
+                line: 4,
+                reason: "expected `outcome slippage-calibration`: the outcome of \
+                         research.slippage_calibration@1"
+                    .to_owned()
+            })
+        );
+        let mut as_summary = calibration_result();
+        as_summary.pipeline = PIPELINE;
+        assert_eq!(
+            as_summary.validate(),
+            Err(ResultParseError::Malformed {
+                line: 4,
+                reason: "expected `outcome replay-summary`: the outcome of \
+                         research.replay_summary@1"
+                    .to_owned()
+            })
+        );
+        assert_eq!(
+            parse(&as_summary.canonical_text()),
+            Err(as_summary.validate().unwrap_err())
         );
     }
 

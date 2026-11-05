@@ -4,10 +4,16 @@
 //! runs `research.replay_summary@2` on the history chain of the seam
 //! fixture (ADR-052 D10), and `--pipeline backtest` runs
 //! `research.backtest@1` on the same chain (ADR-060 D13).
+//! `--pipeline slippage-calibration` runs
+//! `research.slippage_calibration@1` on a live store with depth and trades
+//! (ADR-061 D7), and refuses every other source.
 
 mod common;
 
-use common::{CUTOVER, HOUR, ORIGIN, TempDir, import_rows, seam_fixture, seam_fixture_with};
+use common::{
+    CUTOVER, D0, HOUR, ORIGIN, RawLine, TempDir, agg, config_with, depth, depth_snapshot,
+    import_rows, seam_fixture, seam_fixture_with, write_records,
+};
 use mie_adapter_binance::archive::catalog::{DAY_MS, parse_day};
 use mie_adapter_binance::archive::fold::TradeCorrection;
 use mie_adapter_binance::archive::normalize::record_time;
@@ -963,4 +969,205 @@ fn with_a_live_segment_the_archive_trades_tail_is_not_added_again() {
     let stored = files(&request.results);
     let stored_text = String::from_utf8(stored[0].1.clone()).unwrap();
     assert_eq!(stored_line(&stored_text, "rejections"), "0");
+}
+
+// ---------------------------------------------------------------------------
+// `--pipeline slippage-calibration`: `research.slippage_calibration@1` on a
+// live store (ADR-061 D7).
+
+/// The start of the calibration fixture's run.
+const RUN_START: i64 = D0 + HOUR;
+
+/// A live store with depth and trades, written directly: one clean run with
+/// an aggregate trade before the book syncs (at + 500 ms), a depth diff
+/// (ids 1 … 10, at + 1 000 ms) and the snapshot that syncs it (last update
+/// id 5, at + 990 ms), then two trades at + 2 000 and + 3 000 ms. Every
+/// trade prints 85 000.10 ([`agg`]). The synced book: bids 85 000.00 × 10
+/// (the diff), 84 999.90 × 2; asks 85 000.10 × 3.
+fn calibration_fixture(dir: &Path) -> IngestConfig {
+    let config = config_with(dir, &["aggTrade", "depth", "depthSnapshot"]);
+    let run = "20261006T010000Z";
+    let t = RUN_START;
+    let line = |seq: u64, stream: &'static str, time: i64, payload: String| RawLine {
+        stream,
+        receive_seq: seq,
+        session_id: format!("{run}/{stream}/1"),
+        event_time_ms: time,
+        payload,
+    };
+    let records = vec![
+        line(0, "aggTrade", t + 500, agg(1, t + 500)),
+        line(1, "depth", t + 1_000, depth(1, 10, 0, t + 1_000)),
+        line(2, "depthSnapshot", t + 990, depth_snapshot(5, t + 990)),
+        line(3, "aggTrade", t + 2_000, agg(2, t + 2_000)),
+        line(4, "aggTrade", t + 3_000, agg(3, t + 3_000)),
+    ];
+    let journal = vec![
+        serde_json::json!({"type": "run_start", "run_id": run, "at_ms": t,
+            "symbol": "BTCUSDT", "source": "binance-um",
+            "streams": ["aggTrade", "depth", "depthSnapshot"],
+            "hold_back_ms": 750, "oi_retime_ms": 10_000, "seeds": {}}),
+        serde_json::json!({"type": "run_end", "run_id": run, "at_ms": t + 60_000,
+            "exit_code": 0, "records": records.len()}),
+    ];
+    write_records(&config, &records, &journal);
+    config
+}
+
+/// A calibration spec on ADR-061's template over `window`: `book.l2@1` in
+/// the set, the spread rule on it and `funding.none@1`.
+fn calibration_spec_text(window: ReplayWindow, data: &str) -> String {
+    let registry = catalog::registry();
+    let set = FeatureSet::new(&registry, &[catalog::BOOK_L2_V1.key]).unwrap();
+    format!(
+        "mie-experiment 1\n\
+         hypothesis slippage.calibration\n\
+         sample {} {}\n\
+         data {data}\n\
+         features {} {set}\n\
+         state-filter none\n\
+         regime-filter none\n\
+         location location.at_level@1 level=text:vah\n\
+         trigger trigger.failed_auction@1\n\
+         entry entry.next_trade@1\n\
+         invalidation invalidation.beyond_extreme@1\n\
+         target target.level@1 level=text:poc\n\
+         fees maker=0.0002 taker=0.0005\n\
+         slippage slippage.spread@1 book=feature:book.l2@1\n\
+         funding funding.none@1\n\
+         latency 250\n",
+        window.start.as_millis(),
+        window.end.as_millis(),
+        set.version()
+    )
+}
+
+/// The dataset version `mie replay --source live` opens for `w`.
+fn live_dataset(config: &IngestConfig, w: ReplayWindow) -> String {
+    let mut out = Vec::new();
+    let outcome = replay::run(
+        &ReplayRequest {
+            source: ReplaySource::Live(config.clone()),
+            window: w,
+        },
+        &mut out,
+    )
+    .unwrap();
+    assert!(outcome.pass, "{}", String::from_utf8_lossy(&out));
+    outcome.dataset.unwrap().to_string()
+}
+
+/// The fixture by hand (s = ⟨σ_b(E′ − e) · 10⁸ / e⟩, e = 85 000.10):
+///
+/// - The trade at + 500 ms meets no book: `book` 2 on every line.
+/// - The buy takes asks ≥ 85 000.10: 85 000.10 × 3. Spread and q ≤ 2:
+///   s = 0; q ≥ 5: `window`.
+/// - The sell takes bids ≤ 85 000.10: 85 000.00 × 10, 84 999.90 × 2.
+///   Spread and q ≤ 10: E′ = 85 000.00, s = 0.1 / 85 000.10 =
+///   0.0000011764… → 0.00000118; q ≥ 20 exceeds the 12 BTC: `window`.
+///
+/// Two priced trades: spread and q ≤ 2 fills 4, sum 0.00000236; q = 5 and
+/// 10 fills 2, window 2; q ≥ 20 window 4.
+#[test]
+fn a_slippage_calibration_records_then_reproduces_on_a_live_store() {
+    let dir = TempDir::new("experiment-calibration");
+    let config = calibration_fixture(dir.path());
+    let sample = window(D0, D0 + 2 * HOUR);
+    let data = live_dataset(&config, sample);
+    let text = calibration_spec_text(sample, &data);
+    let request = ExperimentRequest {
+        spec: write_spec(dir.path(), "calibration.spec", &text),
+        source: ReplaySource::Live(config.clone()),
+        results: dir.path().join("results"),
+        pipeline: ExperimentPipeline::SlippageCalibration,
+    };
+    let experiment = ExperimentSpec::parse(&text, &catalog::registry()).unwrap();
+    let key = format!("{}/research.slippage_calibration@1", experiment.id());
+    assert_eq!(run(&request), (true, format!("recorded {key}\n")));
+    let stored = files(&request.results);
+    assert_eq!(stored.len(), 1, "{stored:?}");
+    let result = String::from_utf8(stored[0].1.clone()).unwrap();
+    assert_eq!(stored_line(&result, "outcome"), "slippage-calibration");
+    assert_eq!(stored_line(&result, "rejections"), "0");
+    assert_eq!(stored_line(&result, "trades"), "3");
+    let priced = "fills=4 book=2 window=0 sum=0.00000236 mean=0.00000059";
+    assert_eq!(stored_line(&result, "spread"), priced);
+    let lines: Vec<&str> = result
+        .lines()
+        .filter_map(|line| line.strip_prefix("depth_walk "))
+        .collect();
+    assert_eq!(lines.len(), 17);
+    assert_eq!(lines[0], format!("0.00100000 {priced}"));
+    assert_eq!(lines[10], format!("2.00000000 {priced}"));
+    assert_eq!(
+        lines[11],
+        "5.00000000 fills=2 book=2 window=2 sum=0.00000236 mean=0.00000118"
+    );
+    assert_eq!(
+        lines[12],
+        "10.00000000 fills=2 book=2 window=2 sum=0.00000236 mean=0.00000118"
+    );
+    assert_eq!(
+        lines[13],
+        "20.00000000 fills=0 book=2 window=4 sum=0.00000000 mean=-"
+    );
+
+    assert_eq!(run(&request), (true, format!("reproduced {key}\n")));
+    assert_eq!(files(&request.results), stored);
+}
+
+#[test]
+fn a_slippage_calibration_without_the_book_in_the_set_fails() {
+    let dir = TempDir::new("experiment-calibration-no-book");
+    let config = calibration_fixture(dir.path());
+    let sample = window(D0, D0 + 2 * HOUR);
+    let data = live_dataset(&config, sample);
+    let request = ExperimentRequest {
+        spec: write_spec(dir.path(), "summary.spec", &spec_text(sample, &data)),
+        source: ReplaySource::Live(config),
+        results: dir.path().join("results"),
+        pipeline: ExperimentPipeline::SlippageCalibration,
+    };
+    let (pass, text) = run(&request);
+    assert!(!pass);
+    assert!(
+        text.starts_with("FAIL: the spec's feature set does not contain book.l2@1"),
+        "{text}"
+    );
+    assert!(files(&request.results).is_empty());
+}
+
+#[test]
+fn a_slippage_calibration_on_another_source_fails_before_the_store_opens() {
+    let dir = TempDir::new("experiment-calibration-source");
+    let archive = archive_config(dir.path());
+    let day = import_day(&archive);
+    let data = dataset_of(&archive, day, TradeCorrection::Fold);
+    let history_dir = TempDir::new("experiment-calibration-history");
+    let history = seam_fixture(history_dir.path());
+    let spec = write_spec(dir.path(), "a.spec", &calibration_spec_text(day, &data));
+    for source in [
+        ReplaySource::Archive {
+            config: archive,
+            streams: None,
+            correction: TradeCorrection::Fold,
+        },
+        ReplaySource::History(history),
+    ] {
+        let request = ExperimentRequest {
+            spec: spec.clone(),
+            source,
+            results: dir.path().join("results"),
+            pipeline: ExperimentPipeline::SlippageCalibration,
+        };
+        assert_eq!(
+            run(&request),
+            (
+                false,
+                "FAIL: --pipeline slippage-calibration runs on --source live only (ADR-061 D7)\n"
+                    .to_owned()
+            )
+        );
+        assert!(!request.results.exists());
+    }
 }

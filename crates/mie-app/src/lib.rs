@@ -35,6 +35,11 @@
 //! of this crate names that module's items; the composition root reaches
 //! them through the module path.
 //!
+//! [`CalibrationService`] ([`calibration`]) runs
+//! `research.slippage_calibration@1` (ADR-061 D7): over a live replay of
+//! the sample, it prices a buy and a sell at every accepted trade on the
+//! engine's order book and records what the book models cost.
+//!
 //! [`conditional`] drives the context sampler of ADR-054 through
 //! [`drive_tolerant_observed`] for accepted events only, and opens a replay
 //! window with its provenance (#25). In replay only, it labels the
@@ -51,11 +56,13 @@
 
 pub mod alert;
 pub mod backtest;
+pub mod calibration;
 pub mod conditional;
 pub mod equivalence;
 pub mod kline_check;
 pub mod research;
 
+pub use calibration::{CalibrationService, SLIPPAGE_CALIBRATION_V1};
 pub use research::{
     BACKTEST_V1, BacktestService, ChainBounds, ExperimentService, FundingCoverage,
     REPLAY_SUMMARY_V1, REPLAY_SUMMARY_V2,

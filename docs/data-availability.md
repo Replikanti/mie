@@ -38,7 +38,7 @@ only, #124) was probed the same way: 730 of 730 files published, 0 missing
 | Liquidation snapshots | `forceOrder` | ≤ 1/s per symbol (throttled lower bound) | start of live capture | `Liquidation` |
 | Closed 1m klines | `kline_1m` | 1 min | start of live capture | `Kline` |
 | Open interest | `openInterest` | 10 s poll | start of live capture | `OpenInterest`, `resolution_ms` 10 000 |
-| Order book (diff depth + snapshots) | `depth`, `depthSnapshot` | diffs per 100 ms batch; `limit=1000` snapshots on every resync and a checkpoint every 60 s (ADR-038) | start of live depth capture (#10, first soak 2026-10-08) | `BookUpdate`, `BookSnapshot` |
+| Order book (diff depth + snapshots) | `depth`, `depthSnapshot` | diffs per 100 ms batch; `limit=1000` snapshots on every resync and a checkpoint every 60 s (ADR-038) | start of live depth capture (#10, first soak 2026-10-08); inventory 2026-11-05: 14 runs in 8 journals, 110.05 h, 4 903 679 `aggTrade` events, 2026-10-08 22:11 … 2026-10-20 20:15 UTC, no capture since, so the history chain has no live segment yet (#106). The slippage calibration (`--pipeline slippage-calibration`, ADR-061 D7) runs on these stores | `BookUpdate`, `BookSnapshot` |
 
 Live aggregates can omit trades without an id break (2026-10-08 12:50–15:43 UTC: 465 trades, 43.250 BTC, while the archive is complete), and `mie capture-report` check 7 reports such losses per block of minutes (ADR-048).
 

@@ -116,7 +116,8 @@
 //! does not parse, and neither does any text that is not canonical. A
 //! pipeline version with a kind of its own fixes the `outcome` line:
 //! `research.replay_summary@1` records `replay-summary`, `@2`
-//! `history-replay-summary`, `research.backtest@1` records `backtest`, and
+//! `history-replay-summary`, `research.backtest@1` records `backtest`,
+//! `research.slippage_calibration@1` records `slippage-calibration`, and
 //! any other pairing does not parse.
 //!
 //! `history-replay-summary` (`research.replay_summary@2`, ADR-052 D10)
@@ -171,6 +172,35 @@
 //! counts that break the conservation (`triggers` is `filtered` plus
 //! Σ`skipped` plus the number of trade lines), and a `regime=` list whose
 //! length is not the spec's number of regime features are malformed.
+//!
+//! `slippage-calibration` (`research.slippage_calibration@1`, ADR-061 D7,
+//! D8) keeps the two provenance lines of `replay-summary`, and its key has
+//! no engine, like `@1`'s: its values depend only on the data and on
+//! `book.l2@1`, which the spec's feature set pins. They follow it in this
+//! order:
+//!
+//! ```text
+//! outcome slippage-calibration
+//! stream <events>:<16 hex>
+//! rejections <n>
+//! trades <n>
+//! spread fills=<n> book=<n> window=<n> sum=<rate> mean=<rate|->
+//! depth_walk 0.00100000 fills=<n> book=<n> window=<n> sum=<rate> mean=<rate|->
+//! ...
+//! depth_walk 120.00000000 fills=<n> book=<n> window=<n> sum=<rate> mean=<rate|->
+//! ```
+//!
+//! `trades` counts the accepted trades of the sample; each gives a buy and
+//! a sell at its print, priced on every line by its model
+//! ([`crate::slippage`]): `spread`, then the depth walk at each of the 17
+//! sizes of [`CALIBRATION_GRID`](crate::slippage::CALIBRATION_GRID), in
+//! grid order, the size in its 8-place form. `fills` are the fills the
+//! model priced; `book` and `window` the unpriced ones by cause; `sum` is
+//! the exact Σ s of the priced fills and `mean` its ⟨sum / fills⟩, `-`
+//! without a priced fill. The mean is derived, never stored apart from the
+//! sum: a text whose mean differs is not canonical. A line whose fills,
+//! book and window do not add up to 2 × `trades` (D7's conservation), a
+//! negative sum, or a sum other than 0 without a priced fill is malformed.
 
 pub mod result;
 pub mod spec;

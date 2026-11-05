@@ -18,6 +18,15 @@
 //! slippage is ≥ 0. [`slippage_rate`] turns a priced fill into the
 //! per-fill rate s of D7.
 //!
+//! [`SlippageCalibration`] is the outcome value of the calibration
+//! pipeline `research.slippage_calibration@1` (D7, D8): every trade gives
+//! two hypothetical fills, a buy and a sell at its print, each priced by
+//! the spread model and at every size of [`CALIBRATION_GRID`], and each
+//! model's line counts the priced fills, the unpriced ones by cause and the
+//! exact sum of s. Sums and counts pool exactly across results
+//! ([`SlippageCalibration::pool`]), so D9's rate s*(q) = ⟨Σ sum / Σ fills⟩
+//! over several stores is the mean of their pooled line.
+//!
 //! Pure, integer fixed point, no float (ADR-025, ADR-027). Shared by the
 //! trade simulation and the slippage calibration (#172), so this file names
 //! neither.
@@ -114,6 +123,213 @@ pub fn price_fill(
             ))
         }
         _ => Err(Unpriced::Window),
+    }
+}
+
+/// The calibration's size grid (ADR-061 D8): the 1-2-5 series from
+/// 0.001 BTC, the exchange's minimum order, to 100 BTC, plus 120 BTC, the
+/// largest market order. Per fill the cost does not decrease as q grows, so
+/// the line at the smallest grid size at or above a position size bounds
+/// the cost at that size from above, overstating the size by at most 2.5×.
+pub const CALIBRATION_GRID: [Qty; 17] = [
+    Qty::from_units(100_000),
+    Qty::from_units(200_000),
+    Qty::from_units(500_000),
+    Qty::from_units(1_000_000),
+    Qty::from_units(2_000_000),
+    Qty::from_units(5_000_000),
+    Qty::from_units(10_000_000),
+    Qty::from_units(20_000_000),
+    Qty::from_units(50_000_000),
+    Qty::from_units(100_000_000),
+    Qty::from_units(200_000_000),
+    Qty::from_units(500_000_000),
+    Qty::from_units(1_000_000_000),
+    Qty::from_units(2_000_000_000),
+    Qty::from_units(5_000_000_000),
+    Qty::from_units(10_000_000_000),
+    Qty::from_units(12_000_000_000),
+];
+
+/// One model's line of a [`SlippageCalibration`] (ADR-061 D7): the fills it
+/// priced, the fills it could not price by cause, and the exact sum of
+/// their per-fill rates s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CalibrationRow {
+    /// Fills the model priced.
+    pub fills: u64,
+    /// Fills unpriced [`Unpriced::Book`].
+    pub book: u64,
+    /// Fills unpriced [`Unpriced::Window`].
+    pub window: u64,
+    /// Σ s over the priced fills, exact (no rounding: each s is already in
+    /// `Rate` units).
+    pub sum: Rate,
+}
+
+impl Default for CalibrationRow {
+    /// No fill: every count and the sum 0.
+    fn default() -> Self {
+        Self {
+            fills: 0,
+            book: 0,
+            window: 0,
+            sum: Rate::from_units(0),
+        }
+    }
+}
+
+impl CalibrationRow {
+    /// The mean ⟨sum / fills⟩, rounded half to even once (ADR-027); `None`
+    /// without a priced fill.
+    pub fn mean(&self) -> Option<Rate> {
+        (self.fills > 0).then(|| {
+            let mean = div_half_even(i128::from(self.sum.units()), i128::from(self.fills));
+            // |sum / fills| ≤ |sum|, which is an `i64`.
+            Rate::from_units(i64::try_from(mean).expect("a mean is at most its sum"))
+        })
+    }
+
+    /// Whether the line accounts for exactly `fills` hypothetical fills:
+    /// fills + book + window (ADR-061 D7's conservation).
+    pub fn accounts_for(&self, fills: u128) -> bool {
+        u128::from(self.fills) + u128::from(self.book) + u128::from(self.window) == fills
+    }
+
+    /// Counts one fill; `None` when a count or the sum leaves its range.
+    fn count(self, priced: Result<Rate, Unpriced>) -> Option<Self> {
+        let mut row = self;
+        match priced {
+            Ok(s) => {
+                row.fills = row.fills.checked_add(1)?;
+                row.sum = Rate::from_units(row.sum.units().checked_add(s.units())?);
+            }
+            Err(Unpriced::Book) => row.book = row.book.checked_add(1)?,
+            Err(Unpriced::Window) => row.window = row.window.checked_add(1)?,
+        }
+        Some(row)
+    }
+
+    /// The exact sum of two lines of the same model; `None` when a count or
+    /// the sum leaves its range.
+    fn pool(self, other: Self) -> Option<Self> {
+        Some(Self {
+            fills: self.fills.checked_add(other.fills)?,
+            book: self.book.checked_add(other.book)?,
+            window: self.window.checked_add(other.window)?,
+            sum: Rate::from_units(self.sum.units().checked_add(other.sum.units())?),
+        })
+    }
+}
+
+/// What the slippage calibration measured over a sample (ADR-061 D7, D8):
+/// the trades observed and one [`CalibrationRow`] per model, the spread
+/// model first, then the depth walk at each size of [`CALIBRATION_GRID`].
+///
+/// Every trade gives two hypothetical fills, a buy and a sell at its
+/// print, so every line accounts for 2 × `trades` fills
+/// ([`conserves`](Self::conserves)).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SlippageCalibration {
+    /// The trades observed.
+    pub trades: u64,
+    /// The line of [`BookModel::Spread`].
+    pub spread: CalibrationRow,
+    /// The lines of [`BookModel::DepthWalk`], in [`CALIBRATION_GRID`]
+    /// order.
+    pub depth_walk: [CalibrationRow; 17],
+}
+
+/// A calibration count or sum would leave its integer range (ADR-027:
+/// arithmetic is explicit about overflow), or a fill's slippage has no
+/// `Rate` value ([`slippage_rate`]: a print at or below 0, or a fraction
+/// beyond the `i64` units). No real tape comes near either; the
+/// calibration stops instead of rounding or dropping the fill.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CalibrationOverflow;
+
+impl SlippageCalibration {
+    /// An empty calibration: no trade, every line zero.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The lines with their models, in text order: the spread, then the
+    /// grid.
+    pub fn rows(&self) -> impl Iterator<Item = (BookModel, &CalibrationRow)> {
+        std::iter::once((BookModel::Spread, &self.spread)).chain(
+            CALIBRATION_GRID
+                .iter()
+                .zip(&self.depth_walk)
+                .map(|(&qty, row)| (BookModel::DepthWalk(qty), row)),
+        )
+    }
+
+    /// Observes one trade printed at `print` against `book`, the order book
+    /// of the engine's state at the trade (ADR-061 D1): a buy and a sell,
+    /// each priced by every model (D2), counted on its line. All or
+    /// nothing: on an error the value is unchanged.
+    ///
+    /// # Errors
+    ///
+    /// [`CalibrationOverflow`] when a count or a sum leaves its range or a
+    /// priced fill's slippage has no `Rate` value.
+    pub fn observe(
+        &mut self,
+        book: &FeatureValue<OrderBook>,
+        print: Price,
+    ) -> Result<(), CalibrationOverflow> {
+        let mut next = self.clone();
+        next.trades = next.trades.checked_add(1).ok_or(CalibrationOverflow)?;
+        for side in [FillSide::Buy, FillSide::Sell] {
+            let rate = |model| -> Result<Result<Rate, Unpriced>, CalibrationOverflow> {
+                match price_fill(book, side, print, model) {
+                    Ok(fill) => slippage_rate(side, print, fill)
+                        .map(Ok)
+                        .ok_or(CalibrationOverflow),
+                    Err(cause) => Ok(Err(cause)),
+                }
+            };
+            next.spread = next
+                .spread
+                .count(rate(BookModel::Spread)?)
+                .ok_or(CalibrationOverflow)?;
+            for (row, &qty) in next.depth_walk.iter_mut().zip(&CALIBRATION_GRID) {
+                *row = row
+                    .count(rate(BookModel::DepthWalk(qty))?)
+                    .ok_or(CalibrationOverflow)?;
+            }
+        }
+        *self = next;
+        Ok(())
+    }
+
+    /// The exact pooling of two calibrations (ADR-061 D9): counts and sums
+    /// add line by line, so the pooled line's mean is ⟨Σ sum / Σ fills⟩.
+    /// `None` when a count or a sum leaves its range.
+    pub fn pool(&self, other: &Self) -> Option<Self> {
+        let mut depth_walk = self.depth_walk;
+        for (row, other) in depth_walk.iter_mut().zip(&other.depth_walk) {
+            *row = row.pool(*other)?;
+        }
+        Some(Self {
+            trades: self.trades.checked_add(other.trades)?,
+            spread: self.spread.pool(other.spread)?,
+            depth_walk,
+        })
+    }
+
+    /// The first line, by its position in [`rows`](Self::rows) (0 for the
+    /// spread), that does not account for 2 × `trades` fills (ADR-061 D7);
+    /// `None` when every line does.
+    pub fn first_unconserved(&self) -> Option<usize> {
+        let fills = 2 * u128::from(self.trades);
+        self.rows().position(|(_, row)| !row.accounts_for(fills))
+    }
+
+    /// Whether every line accounts for 2 × `trades` fills (ADR-061 D7).
+    pub fn conserves(&self) -> bool {
+        self.first_unconserved().is_none()
     }
 }
 

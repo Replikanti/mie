@@ -3,7 +3,9 @@
 //! Present: [`ReplayMarket`], [`RunResearchExperiment`] (ADR-040; the
 //! backtest's refusals [`ResearchError::Unresolved`],
 //! [`ResearchError::FundingNotDelivered`], ADR-060 D13, and
-//! [`ResearchError::BookNotDelivered`], ADR-061 D4),
+//! [`ResearchError::BookNotDelivered`], ADR-061 D4; the slippage
+//! calibration's [`ResearchError::BookNotInSet`] and
+//! [`ResearchError::CalibrationOverflow`], ADR-061 D7),
 //! [`GenerateMarketReport`] (ADR-059, proposed). Planned, each landing with
 //! its issue: `AnalyzeMarket`, `EvaluateStrategy`, `ValidateCandidate`.
 
@@ -181,6 +183,18 @@ pub enum ResearchError {
         /// The chain's cutover, where its live segment and the book begin.
         cutover: EventTime,
     },
+    /// The slippage calibration on a spec whose feature set does not
+    /// contain `book.l2@1` (ADR-061 D7): the book its fills are priced on
+    /// would not be pinned by the spec. Checked before anything is opened.
+    BookNotInSet,
+    /// A count or a sum of the slippage calibration would leave its integer
+    /// range, or the slippage of a fill at the trade at `at` has no
+    /// fixed-point value, such as at a print at or below 0 (ADR-027,
+    /// ADR-061 D7). Nothing is stored.
+    CalibrationOverflow {
+        /// The time of the trade.
+        at: EventTime,
+    },
     /// The run produced another result than the one stored under its key:
     /// the run is not reproducible, and the stored result stays.
     Diverged {
@@ -257,6 +271,16 @@ impl fmt::Display for ResearchError {
                  slippage.fixed@1",
                 sample_end.as_millis(),
                 cutover.as_millis()
+            ),
+            Self::BookNotInSet => f.write_str(
+                "the spec's feature set does not contain book.l2@1: the slippage calibration \
+                 prices its fills on that book (ADR-061 D7); add book.l2@1 to the features line",
+            ),
+            Self::CalibrationOverflow { at } => write!(
+                f,
+                "the slippage calibration leaves the 64-bit fixed-point range at the trade at {} \
+                 ms (ADR-027, ADR-061 D7)",
+                at.as_millis()
             ),
             Self::Diverged { key } => write!(
                 f,
@@ -344,6 +368,26 @@ mod tests {
                 cutover: EventTime::from_millis(1_000),
             },
         ] {
+            assert!(std::error::Error::source(&error).is_none());
+        }
+    }
+
+    #[test]
+    fn the_calibration_refusals_describe_themselves() {
+        assert_eq!(
+            ResearchError::BookNotInSet.to_string(),
+            "the spec's feature set does not contain book.l2@1: the slippage calibration prices \
+             its fills on that book (ADR-061 D7); add book.l2@1 to the features line"
+        );
+        let overflow = ResearchError::CalibrationOverflow {
+            at: EventTime::from_millis(1_250),
+        };
+        assert_eq!(
+            overflow.to_string(),
+            "the slippage calibration leaves the 64-bit fixed-point range at the trade at 1250 \
+             ms (ADR-027, ADR-061 D7)"
+        );
+        for error in [ResearchError::BookNotInSet, overflow] {
             assert!(std::error::Error::source(&error).is_none());
         }
     }
