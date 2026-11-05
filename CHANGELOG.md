@@ -12,6 +12,18 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
 
 ### Added
 
+- **Independent check of the ADR-054 sampler (#146).** A test-only module
+  `mie_domain::independent_sampling` holds a second model of ADR-054 D1–D4,
+  written from the ADR text without the sampler's source, and compares it
+  record by record with `ContextSampler` on the candidate, location and
+  book golden tapes and on a seeded generated corpus (0 mismatches). The
+  generator produces each edge class at least once, checked by a coverage
+  test: episode bridges through the engine, baseline anchors on a padded
+  zone edge, out-of-order spans, events that close only empty minutes,
+  divergences confirmed across a trades gap and openers starting at the
+  first observed event. Synthetic trigger streams drive the public
+  `EpisodeTracker` against the model's episode rule. No sampler, golden or
+  ADR changes.
 - **Backtest pipeline `research.backtest@1` (#170, ADR-060 D13, D14,
   proposed).** `mie experiment run <spec> --source history --pipeline
   backtest` simulates the spec's hypothesis on the history chain and
