@@ -594,15 +594,15 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
 
 ### Changed
 
-- **Breaking: `LiveReplay::run_replay` streams (#140, ADR-063,
-  proposed).** It no longer collects and sorts a whole run before the
+- **Breaking: `LiveReplay::run_replay` streams (#140, ADR-063).** It no longer collects and sorts a whole run before the
   recompute. A first pass reads each of the run's files once and checks
   the run with one bit per record, raising every integrity error, with
   the same texts as before, before any event. The recompute then merges
   the files by `receive_seq`, opening each only when its first record can
   be next, so it holds about one seal interval of records instead of the
   whole run (6.1 GB on a 34 h run before, ADR-053). The output is
-  unchanged. `RunReplay` becomes `RunReplay<'a>`, borrowing the store;
+  unchanged. `RunReplay` becomes `RunReplay<'a>`, borrowing the store
+  through a `&dyn RawRecordSource`, so it is no longer `Send`;
   its pipeline counters in `stats()` are final once `next_event` returned
   `Ok(None)` (the record counts stay final at construction); a storage
   fault between the passes now fails `next_event` with

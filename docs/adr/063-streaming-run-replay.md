@@ -1,6 +1,6 @@
 # ADR-063: Streaming replay of one cleanly ended run
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-11-06
 
 Relation to earlier ADRs: this ADR changes how `LiveReplay::run_replay`
