@@ -93,7 +93,8 @@
 //! holds one open episode, the closed hull and the last opening per id, and
 //! count tables; the per-episode distributions hold three numbers per
 //! episode, which grows with the episode count, not with the event count.
-//! `run_replay` holds one live run in memory (#140). The minute grid holds
+//! `run_replay` holds about one seal interval of a live run's records
+//! (ADR-063; the whole run before #140). The minute grid holds
 //! 9 bytes a minute, about 5 MB for the year; the ESS reads one O(n) pass
 //! per lag summed and per checkpoint. The time-of-day and ESS sections need
 //! nothing new: the run commands above are unchanged.

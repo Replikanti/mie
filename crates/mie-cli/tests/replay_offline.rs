@@ -27,7 +27,7 @@ use mie_adapter_binance::archive::fold::TradeCorrection;
 use mie_adapter_binance::transport::{Clock, HttpGet};
 use mie_adapter_binance::{
     BinanceStream, CaptureEvent, CaptureObserver, HistoryChain, LiveConfig, LiveReplay, LiveRun,
-    start,
+    Pipeline, start,
 };
 use mie_adapter_parquet::{ParquetRawStore, RotationPolicy};
 use mie_app::{HashingProvider, drive_chain, drive_chain_observed};
@@ -41,7 +41,9 @@ use mie_domain::num::{Price, Qty, Rate};
 use mie_domain::state::MarketStateEngine;
 use mie_domain::time::EventTime;
 use mie_ports::outbound::{HistoricalDataProvider, MarketDataProvider, ReplayWindow};
-use mie_ports::raw::{RawRecord, RawRecordSource, RawSelection, RawStreamKey};
+use mie_ports::raw::{
+    Capture, RawRecord, RawRecordSink, RawRecordSource, RawSelection, RawStreamKey,
+};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1260,4 +1262,117 @@ fn the_history_source_fixes_streams_and_correction() {
         "{stderr}"
     );
     assert!(!results.exists());
+}
+
+// ---------------------------------------------------------------------------
+// The streaming run replay (ADR-063).
+
+#[test]
+fn a_run_replay_streams_a_periodically_sealed_store_across_midnight() {
+    // A run written through the real writer, sealed every K appends as
+    // `mie ingest` seals every seal interval, from 23:58 to 00:02 UTC; a
+    // mark price of the old day arrives after midnight.
+    const K: usize = 97;
+    let dir = TempDir::new("run-replay-streaming");
+    let store = ParquetRawStore::new(dir.path());
+    let mut writer = store
+        .writer("binance-um", RotationPolicy::default())
+        .unwrap();
+    let midnight = D0 + 24 * HOUR;
+    let run_id = "20261006T235800Z";
+    let mut records: Vec<(BinanceStream, RawRecord)> = Vec::new();
+    let mut push = |stream: BinanceStream, time: i64, payload: String| {
+        let receive_seq = records.len() as u64;
+        records.push((
+            stream,
+            RawRecord {
+                event_time: EventTime::from_millis(time),
+                capture: Some(Capture {
+                    receive_time_ns: time * 1_000_000,
+                    receive_seq,
+                    session_id: format!("{run_id}/{}/1", stream.raw_name()),
+                }),
+                payload: payload.into_bytes(),
+            },
+        ));
+    };
+    for i in 0..2_400_i64 {
+        let t = midnight - 120_000 + 100 * i;
+        push(
+            BinanceStream::AggTrade,
+            t,
+            trade(1 + i as u64, t, "85000.10", "0.010"),
+        );
+        if i % 10 == 0 {
+            push(BinanceStream::MarkPrice, t + 5, mark(t + 5));
+        }
+        if i == 1_230 {
+            push(
+                BinanceStream::MarkPrice,
+                midnight - 300,
+                mark(midnight - 300),
+            );
+        }
+    }
+    for (n, (stream, record)) in records.iter().enumerate() {
+        let key = RawStreamKey::new("binance-um", "BTCUSDT", stream.raw_name()).unwrap();
+        writer.append(&key, record.clone()).unwrap();
+        if (n + 1) % K == 0 {
+            writer.seal_all().unwrap();
+        }
+    }
+    writer.close().unwrap();
+
+    let run = LiveRun {
+        run_id: run_id.to_owned(),
+        symbol: "BTCUSDT".to_owned(),
+        hold_back_ms: 750,
+        oi_retime_ms: 10_000,
+        seeds: BTreeMap::new(),
+        streams: vec![BinanceStream::AggTrade, BinanceStream::MarkPrice],
+        started_at_ms: midnight - 120_000,
+        ended_at_ms: Some(midnight + 121_000),
+        clean_records: Some(records.len() as u64),
+    };
+    let mut pipeline = Pipeline::new(&run.symbol, run.hold_back_ms, run.oi_retime_ms, &run.seeds);
+    let mut expected = Vec::new();
+    for (stream, record) in &records {
+        expected.extend(pipeline.push(*stream, record).events);
+    }
+    expected.extend(pipeline.finish());
+
+    let live = LiveReplay::new(&store, "binance-um", "BTCUSDT", vec![run.clone()]);
+    let mut replay = live.run_replay(run_id).unwrap();
+    assert_eq!(replay.stats().records, records.len() as u64);
+    let events = drain(&mut replay);
+    assert_eq!(events, expected);
+    assert_eq!(replay.stats().pipeline, pipeline.stats());
+    assert!(
+        events.iter().any(|e| matches!(e, MarketEvent::FeedGap(g)
+            if g.reason == GapReason::LateEvent && g.stream == Stream::MarkPrice)),
+        "the old day's mark price is late"
+    );
+    let peak = replay.peak_buffered_records();
+    assert!(0 < peak && peak <= K as u64, "peak {peak}, K {K}");
+    // Both days and many parts: the store's granularity, not the run, sets
+    // the peak.
+    let dataset = store
+        .select(
+            &RawSelection::new(
+                [BinanceStream::AggTrade, BinanceStream::MarkPrice]
+                    .iter()
+                    .map(|s| RawStreamKey::new("binance-um", "BTCUSDT", s.raw_name()).unwrap())
+                    .collect(),
+                window(midnight - HOUR, midnight + HOUR),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let dates: BTreeSet<&str> = dataset.files.iter().map(|f| f.date.as_str()).collect();
+    assert_eq!(dates.len(), 2, "{dates:?}");
+    assert!(
+        dataset.files.len() > records.len() / K,
+        "{}",
+        dataset.files.len()
+    );
 }

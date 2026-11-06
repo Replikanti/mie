@@ -46,6 +46,7 @@ pub mod normalize;
 pub mod pipeline;
 pub mod replay;
 mod rest;
+mod run_merge;
 pub mod sequence;
 pub mod stream;
 #[cfg(test)]

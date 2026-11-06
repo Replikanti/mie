@@ -12,7 +12,7 @@ use mie_ports::raw::{
     Capture, DatasetVersion, RawDataset, RawRecord, RawRecordSource, RawSelection, RawStoreError,
     RawStreamKey, SealedFile,
 };
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 
 /// The raw source of the live fixtures.
@@ -53,6 +53,15 @@ impl MemorySource {
             sha256: "0".repeat(64),
         };
         self.files.push((file, records));
+    }
+
+    /// The manifest of the file at `path`.
+    pub(crate) fn file(&self, path: &str) -> SealedFile {
+        self.files
+            .iter()
+            .find(|(f, _)| f.relative_path == path)
+            .map(|(f, _)| f.clone())
+            .unwrap()
     }
 }
 
@@ -172,6 +181,45 @@ impl RunBuilder {
         }
     }
 
+    /// The files the writer seals when it seals every open part each
+    /// `epoch` consecutive `receive_seq`s (`RawWriter::seal_all` every seal
+    /// interval): per epoch, one file per stream and UTC date, in stored
+    /// (append) order, without the `skip`ped seqs.
+    pub(crate) fn epoch_files(
+        &self,
+        epoch: usize,
+        skip: &[u64],
+    ) -> Vec<(BinanceStream, Vec<RawRecord>)> {
+        let mut files = Vec::new();
+        for chunk in self.records.chunks(epoch) {
+            let mut parts: BTreeMap<(BinanceStream, i64), Vec<RawRecord>> = BTreeMap::new();
+            for (stream, record) in chunk {
+                if skip.contains(&record.capture.as_ref().unwrap().receive_seq) {
+                    continue;
+                }
+                let day = record.event_time.as_millis().div_euclid(DAY_MS);
+                parts
+                    .entry((*stream, day))
+                    .or_default()
+                    .push(record.clone());
+            }
+            files.extend(
+                parts
+                    .into_iter()
+                    .map(|((stream, _), records)| (stream, records)),
+            );
+        }
+        files
+    }
+
+    /// Seals [`epoch_files`](Self::epoch_files), as `seal` seals one file
+    /// per stream.
+    pub(crate) fn seal_epochs(&self, source: &mut MemorySource, epoch: usize, skip: &[u64]) {
+        for (stream, records) in self.epoch_files(epoch, skip) {
+            source.seal(SOURCE, stream.raw_name(), records);
+        }
+    }
+
     pub(crate) fn run(&self, started: i64, ended: Option<i64>, clean: Option<u64>) -> LiveRun {
         LiveRun {
             run_id: self.run_id.clone(),
@@ -200,5 +248,83 @@ impl RunBuilder {
         }
         out.extend(pipeline.finish());
         out
+    }
+}
+
+/// A [`MemorySource`] that injects faults, for the tests of the read paths.
+/// Reads are numbered from 1 across every pass.
+#[derive(Debug)]
+pub(crate) struct FaultySource {
+    pub(crate) inner: MemorySource,
+    reads: Cell<u64>,
+    /// The read that fails with an I/O error.
+    fail: Option<u64>,
+    /// The read that returns its records without the last one.
+    alter: Option<u64>,
+    /// Files `select` returns in addition to the inner source's.
+    extra: Vec<SealedFile>,
+    /// The paths read, in read order.
+    pub(crate) log: RefCell<Vec<String>>,
+}
+
+impl FaultySource {
+    pub(crate) fn new(inner: MemorySource) -> Self {
+        Self {
+            inner,
+            reads: Cell::new(0),
+            fail: None,
+            alter: None,
+            extra: Vec::new(),
+            log: RefCell::new(Vec::new()),
+        }
+    }
+
+    pub(crate) fn failing_read(mut self, read: u64) -> Self {
+        self.fail = Some(read);
+        self
+    }
+
+    pub(crate) fn altering_read(mut self, read: u64) -> Self {
+        self.alter = Some(read);
+        self
+    }
+
+    /// `select` also returns `file`, whatever the selection.
+    pub(crate) fn selecting(mut self, file: SealedFile) -> Self {
+        self.extra.push(file);
+        self
+    }
+
+    /// How often `path` was read.
+    pub(crate) fn reads_of(&self, path: &str) -> usize {
+        self.log.borrow().iter().filter(|p| *p == path).count()
+    }
+}
+
+impl RawRecordSource for FaultySource {
+    fn select(&self, selection: &RawSelection) -> Result<RawDataset, RawStoreError> {
+        let mut dataset = self.inner.select(selection)?;
+        dataset.files.extend(self.extra.iter().cloned());
+        dataset
+            .files
+            .sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+        Ok(dataset)
+    }
+
+    fn read(&self, file: &SealedFile) -> Result<Vec<RawRecord>, RawStoreError> {
+        let read = self.reads.get() + 1;
+        self.reads.set(read);
+        self.log.borrow_mut().push(file.relative_path.clone());
+        if self.fail == Some(read) {
+            return Err(RawStoreError::Io(format!(
+                "{}: simulated failure",
+                file.relative_path
+            )));
+        }
+        let mut records = self.inner.read(file)?;
+        if self.alter == Some(read) {
+            records.pop();
+        }
+        Ok(records)
     }
 }

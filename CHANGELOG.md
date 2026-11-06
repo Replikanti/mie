@@ -594,6 +594,21 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
 
 ### Changed
 
+- **Breaking: `LiveReplay::run_replay` streams (#140, ADR-063,
+  proposed).** It no longer collects and sorts a whole run before the
+  recompute. A first pass reads each of the run's files once and checks
+  the run with one bit per record, raising every integrity error, with
+  the same texts as before, before any event. The recompute then merges
+  the files by `receive_seq`, opening each only when its first record can
+  be next, so it holds about one seal interval of records instead of the
+  whole run (6.1 GB on a 34 h run before, ADR-053). The output is
+  unchanged. `RunReplay` becomes `RunReplay<'a>`, borrowing the store;
+  its pipeline counters in `stats()` are final once `next_event` returned
+  `Ok(None)` (the record counts stay final at construction); a storage
+  fault between the passes now fails `next_event` with
+  `ProviderError::Source`. New `RunReplay::peak_buffered_records()`.
+  `LiveReplay::replay` and the history chain keep holding one run
+  (ADR-052 decision 13).
 - **Breaking: conditional outcome dataset format 2 (#28 M1, ADR-058 D2).**
   A new table `effort.parquet` holds each record's three effort-vs-result
   evaluations (5m, 15m, 1h: state, aggressor, effort, `effort_high`,

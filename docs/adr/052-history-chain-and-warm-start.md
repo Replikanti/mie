@@ -721,6 +721,12 @@ deferred option D are under *Alternatives considered*.
       decision predicted. The forecast undershoots for the reason given
       in decision 11. A sample of 1 h 40 min is a sample of one, and
       #106's acceptance run replaces it.
+      The 550 MB RSS comes from that 1 h 40 min sample, whose live segment
+      held only short runs; it is not a memory bound. The live segment
+      holds one whole run in memory (decision 13), at about 2.7 KB per
+      record: 6.1 GB of anonymous memory over the 2 254 454 records of the
+      34 h run `20261016T225606Z` (ADR-053, Acceptance, measured with
+      `run_replay` before ADR-063 made it stream).
 
 11. **The startup cost per segment.**
     - **Archive.** Two full-year runs of one tool
@@ -890,7 +896,13 @@ deferred option D are under *Alternatives considered*.
       the warm-up ÷ the bytes per record. The bytes per record are
       measured as the peak memory of an offline `LiveReplay` of the
       longest journaled run on record divided by its record count; the
-      host memory is recorded at #106 with its source. Why an offline
+      host memory is recorded at #106 with its source. The replay is
+      `LiveReplay::replay` over a window that covers the run, the
+      warm-up's own path, which holds the run; not `run_replay`, which
+      streams since ADR-063 and so does not measure that buffer. The
+      6.1 GB ÷ 2 254 454 records ≈ 2.7 KB per record of ADR-053's
+      Acceptance were measured with `run_replay` before ADR-063, when it
+      held the same whole-run buffer. Why an offline
       replay: no journaled run is known to reach 24 h (#9's about 30 h
       include a restart, #10 ran 13.7 h in two runs, #13's runs were under
       3 h), so a per-day memory measurement cannot be reached, while bytes
