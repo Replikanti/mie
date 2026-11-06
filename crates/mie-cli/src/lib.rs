@@ -25,7 +25,11 @@
 //! - `mie alerts replay --config <path> --from … --to … --out <file>` and
 //!   `mie alerts report --config <path> --from … --to …` ([`alerts`]): the
 //!   alert dry-run of a replay window into a JSON Lines log, and the market
-//!   report as of a window's end (#38, ADR-059).
+//!   report as of a window's end (#38, ADR-059);
+//! - `mie store init --config <path>` and `mie store init-root --config
+//!   <path> --root <path> --id <id>` ([`store`]): set up a tiered raw store,
+//!   hot's marker and copy ledger, and each cold root's marker (#187,
+//!   ADR-062 D4, D7).
 //!
 //! The real network connectors are constructed in `main.rs` and nowhere
 //! else; tests drive [`ingest::run`] with fakes.
@@ -41,3 +45,4 @@ pub mod journal;
 mod reconcile;
 pub mod replay;
 pub mod report;
+pub mod store;

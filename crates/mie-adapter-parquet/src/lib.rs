@@ -30,22 +30,36 @@
 //! Files in progress are hidden (`.part-NNNNN.parquet.tmp`) and never match
 //! `*.parquet`.
 //!
+//! A tiered store (ADR-062) adds two on-disk formats, both under a root's
+//! `.mie/` directory, outside the layout:
+//!
+//! - [`root_marker`]: each root's id, written once when the root is
+//!   initialized, and the atomic creation of `.mie/`;
+//! - [`copy_ledger`] ([`CopyLedger`]): hot's append-only, hash-chained
+//!   record of copies, removals and verification passes, one appender at a
+//!   time under a lock file, readers lock-free.
+//!
+//! With no cold root configured neither is ever created.
+//!
 //! [`outcome`] writes the conditional outcome dataset of #27 (ADR-057): the
 //! context records and forward labels of one labeling run as three
 //! content-hashed Parquet tables, sealed with the same protocol and read
 //! back only after verification.
 
+pub mod copy_ledger;
 mod layout;
 mod manifest;
 pub mod outcome;
 mod reader;
 mod recovery;
+pub mod root_marker;
 mod schema;
 mod writer;
 
 #[cfg(test)]
 mod testutil;
 
+pub use copy_ledger::{CopyLedger, LedgerHold};
 pub use reader::ParquetRawStore;
 pub use recovery::RecoveryReport;
 pub use writer::{RawWriter, RotationPolicy};

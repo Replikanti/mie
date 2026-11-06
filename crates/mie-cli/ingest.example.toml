@@ -13,6 +13,20 @@ source = "binance-um"
 raw_root = "data/raw"
 # Capture journal, JSON Lines, appended to by every run.
 journal = "data/capture-journal.jsonl"
+# Cold roots of a tiered store (ADR-062 D4, D7), in read order; default
+# empty: a single-root store. Each root is a filesystem mounted outside mie.
+# Both keys are required. A non-empty list needs at least two copy targets
+# on independent devices (k = 2, ADR-062 D11). The archive configuration
+# must list the same roots in the same order with the same flags.
+# Set up a tiered store once: `mie store init --config <this file>` writes
+# hot's marker and copy ledger, then `mie store init-root --config <this
+# file> --root <path> --id <id>` writes each freshly mounted cold root's
+# marker. Once set, `mie ingest` refuses to start on a raw_root without its
+# marker.
+# cold_roots = [
+#   { path = "/mnt/mie-cold-a", copy_target = true },
+#   { path = "/mnt/mie-cold-b", copy_target = true },
+# ]
 
 [binance]
 # USDⓈ-M market-data streams (aggTrade, markPrice, forceOrder, kline) are

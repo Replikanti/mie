@@ -97,7 +97,7 @@ data changes no dataset version.
 | `trades` (archive, opt-in) | — | the `aggTrades` fold (ADR-050), the kline cross-check | 81.5 MB/day mean, when imported | keep |
 | capture journal | — | every live replay (ADR-039 D1), the chain | 5.1–5.6 MB/24 h; 15.1 for #99 (M1-11) | keep, on hot |
 | import ledger | — | the exactly-once import (ADR-034 D4) | ≈ 6 KB per imported day (M1-15) | keep, on hot |
-| copy ledger (new, D7) | — | `select` for moved partitions, D6, D11 | ≈ 1.5 MB/day, estimated (Numbers table) | keep, on hot |
+| copy ledger (new, D7) | — | `select` for moved partitions, D6, D11 | ≈ 1.6 MB/day, estimated (Numbers table) | keep, on hot |
 
 Rates: live ranges are across the stores with depth (M1 live table);
 archive rates are the mean per imported day (M1 archive table).
@@ -157,6 +157,45 @@ the D2 consequence.
   writer treat them as read-only; only the replicator (D11) writes into
   them. Each root carries a marker file with its root id, written once when
   the root is provisioned.
+- **Root markers.** Every root of a tiered store, hot included, carries
+  `<root>/.mie/root` (grammar in D7 *Formats and layout*). Hot's marker is
+  written by `mie store init` (D7) and always carries the reserved id
+  `hot`. A cold root's marker is written by `mie store init-root --config
+  <ingest config> --root <path> --id <id>`, once, on a freshly provisioned
+  root. It refuses, in this order:
+  1. a `--root` that is not lexically one of the configured `cold_roots`;
+  2. an id that fails `validate_segment` (1 to 64 characters from
+     `[A-Za-z0-9_-]`, the raw store's segment rule, so an id is safe as a
+     path segment) or is `hot`;
+  3. a hot without its marker: `mie store init` comes first, because the
+     device check below compares against hot, and `init`'s cold-marker
+     rule (D7) relies on this order;
+  4. a root that is missing, is not a directory, or is not empty. The root
+     is never created: a created directory lands on the parent's
+     filesystem, which is the unmounted-mount-point trap. The only entries
+     an empty root may hold are the staging directories of an earlier
+     attempt that crashed or failed (the atomic `.mie/` creation, D7);
+     the successful attempt removes them. Why: otherwise every retry after
+     such an attempt would be refused as "not empty", which names the
+     wrong cause;
+  5. a root that is not a mount point: its device id (`st_dev`) equals
+     hot's, or equals its parent directory's. Why: an unmounted mount
+     point is an ordinary empty directory on its parent's filesystem, and
+     a marker written there would make it look mounted, so the replicator
+     would fill the parent's disk and the real mount, once back, would
+     hide the marker and the copies. The parent's filesystem is hot's only
+     when the mount points lie on hot's disk, so the hot comparison alone
+     misses mount points on another disk (the system disk, say). The
+     consequence: a cold root is the mount point itself, never a
+     subdirectory of a mounted volume. Every device check goes through one
+     probe; only the production host can show distinct devices, so this
+     acceptance is verified at provisioning, where the command runs
+     against the real mounts;
+  6. an id that another configured root's marker already carries (a root
+     without a marker is skipped; any other read error refuses).
+
+  The `mie store` command group holds `init` and `init-root`; the later
+  steps of the follow-up add their verbs to it.
 - **Option 1 (everything on the local disk)** is the configuration with
   no cold root, and it stays valid while the hot formula (D10) fits the
   disk. It loses as the policy because the fast local disk would have to
@@ -294,7 +333,7 @@ live in more than one root (approved as written at STOP 1).
     with another dataset version and no error. Every file in the ledger
     was copied to a copy target before its record (D5), so the ledger's
     file list never needs hot. The cost is reading the whole ledger per
-    `select` (about 1.5 MB per day of capture, Numbers table); an index is
+    `select` (about 1.6 MB per day of capture, Numbers table); an index is
     an implementation detail. Rejected, staging each recall or restore in
     a hidden directory renamed into place before its record: it closes the
     same race, but only as long as every path that ever writes a partition
@@ -320,10 +359,10 @@ live in more than one root (approved as written at STOP 1).
     takes that partition's files from the ledger read that follows, and if
     the ledger records none of its files, `select` fails with
     `Integrity`, naming the partition.
-  - A reader ignores an incomplete trailing ledger record (no final
-    newline or a chain hash that does not verify at the end of the file):
-    it can only be a record being appended, and a removal record is
-    complete before its partition is renamed (D6).
+  - A reader ignores the one incomplete trailing ledger record (the
+    single-trailing-record rule, *Formats and layout* below): it can only
+    be a record being appended, and a removal record is complete before
+    its partition is renamed (D6).
   - `manifest::dataset_version` then sees the same sorted file list, so it
     yields the same version as a single root holding every file.
   - `read` resolves the path on hot, then on each cold root in order. An
@@ -332,27 +371,53 @@ live in more than one root (approved as written at STOP 1).
     fallback to the next copy.
   - This needs no port change, no new crate, no new dependency and no
     ADR-025 change. `mie-cli` wires it.
-- **The copy ledger** is an append-only file on hot, next to the journal
-  and the import ledger. It records:
+- **The copy ledger** is an append-only text file at
+  `<raw_root>/.mie/copy-ledger`: on hot's local filesystem (D4), next to
+  the journal and the import ledger, and outside the layout (`select` and
+  recovery walk only `source=` entries). Its first line is the header
+  `mie-copy-ledger 1`. It records:
   - for each sealed file, the manifest text verbatim, written with its
     first verified copy;
   - for each verified copy, the file, the root id and the time;
-  - for each partition removed from hot, the removal (D6);
+  - for each partition removed from hot, the removal (D6), and its return
+    (D6 recall, D11 hot restore);
+  - for each verified ledger copy, the root, the prefix length and its
+    SHA-256 (the input of D6's "inside the prefix that k verified ledger
+    copies hold");
   - for each verification pass (D11), the root, the ledger prefix covered
-    and the findings.
+    and the findings;
+  - each lost file, each hold and its clearing, each quarantined path and
+    its replacement (D11).
 
-  Each record ends with the SHA-256 of the ledger up to and including the
-  previous record (a hash chain). Why: with k = 2 a mismatch between two
-  copies of an append-only file cannot say which one is damaged, while the
-  chain shows in each copy the first record that fails, so damage is
-  located without a majority. The copy ledger is the only listing of
-  removed partitions that depends on no mount, and it is the source of
-  truth for which copies exist.
+  Each record ends with its **chain hash**: the SHA-256 of the previous
+  record's chain hash (its 64 lowercase hex characters) followed directly
+  by this record's own text (its line without the chain hash). The chain
+  before record 1 is the SHA-256 of the header line. Why a chain: with
+  k = 2 a mismatch between two copies of an append-only file cannot say
+  which one is damaged, while the chain shows in each copy the first record
+  that fails, so damage is located without a majority. Each chain hash
+  covers its predecessor, so it commits to the whole prefix before it.
+  The copy ledger is the only listing of removed partitions that depends on
+  no mount, and it is the source of truth for which copies exist.
+  - Why this form (operator, #187 STOP 1). The earlier wording, each record
+    ending with "the SHA-256 of the ledger up to and including the previous
+    record", has three defects. The last record is covered by no hash, so
+    damage in it is invisible. A byte flipped in record n fails only record
+    n + 1's hash, so damage is reported one record late, and a per-copy
+    report of "the first record that fails" names the wrong record. And
+    every append re-hashes the whole ledger: after one year about 0.58 GB
+    (1.6 MB per day × 365, Numbers table), about 6 100 times a day (1 835
+    files × 3 records, a manifest and k = 2 copies, plus 2 × 288 ledger-copy
+    records, Numbers table), about 3.5 TB hashed per day. With the chained
+    form, a byte flipped in record n fails record n's own hash, and an
+    append reads only the last three records. The intent of the approved
+    decision, locating damage per copy without a majority, is unchanged.
 - **One appender at a time.** Every process that appends to the copy
   ledger (the replicator and the remover in `mie ingest`, the recall in the
   importer, the verification, repair, rebuild and hot-restore commands)
   holds an exclusive `flock` on the copy ledger's lock file for each
-  append: read the tail record's hash, write the record, fsync, release.
+  append: read back the last records, write the record, fsync, release
+  (the append protocol in *Formats and layout* below).
   The rebuild and the hot restore hold it for their whole run, and refuse
   to start when they cannot take it. Why: two appenders that read the same
   tail hash write two records chained to it, the chain fails on hot and on
@@ -362,12 +427,123 @@ live in more than one root (approved as written at STOP 1).
   separate commands, also while no capture runs. `flock` is reliable here
   because the ledger is on hot, a local filesystem (D4). Readers take no
   lock (the incomplete-record rule above).
+- **Formats and layout.** Format v1 of every file under a root's `.mie/`:
+  - **The `.mie/` directory** of every root holds `root`, the root marker.
+    On hot it also holds `copy-ledger` and its lock file
+    `copy-ledger.lock`. On a copy target it also holds, from the
+    replicator on, `copy-ledger` (the ledger copy, D11),
+    `journal/<journal file name>` (the journal copies) and
+    `import-ledger/` (the import-ledger copies). `.mie/` is outside the
+    layout, and nothing else in mie writes there.
+  - **The root marker** is the text `mie-root 1\nid <id>\n`: a versioned
+    header and one `id` line; the id passes `validate_segment`. The parser
+    is strict: exactly that text. The id `hot` is reserved for hot's
+    marker. Why reserved: copy-ledger records only ever name copy targets
+    (D11, the hot copy never counts), so an operator-chosen hot id would
+    carry no information, and a fixed id lets every check recognize hot's
+    marker under any spelling of its path.
+  - **Records.** One line per record: `<kind> <at_ms> <fields…> <chain>`,
+    tokens separated by single spaces, no empty token, `\n` line ends.
+    `at_ms` is a canonical decimal UTC epoch millisecond in the raw
+    store's event-time range (`0 … 9999-12-31T23:59:59.999Z`, ADR-030),
+    supplied by the caller. `chain` is 64 lowercase hex characters. The
+    kinds:
+
+    | Kind | Fields after `<kind> <at_ms>` | First written by |
+    |---|---|---|
+    | `manifest` | the escaped manifest text | the first verified copy |
+    | `copy` | data path, root id | each verified copy |
+    | `removed` | partition directory | hot removal (D6) |
+    | `returned` | partition directory | the recall (D6), the hot restore (D11) |
+    | `ledger-copy` | root id, prefix length in bytes, prefix SHA-256 | the replicator (D11) |
+    | `finding` | root id, code, subject | the verification (D11) |
+    | `verify` | root id, ledger prefix length covered, finding count | the verification |
+    | `lost` | data path, origin, SHA-256 or `-` | the verification, the rebuild (D7 step 4) |
+    | `hold` | data path, reason | the hot restore, the rebuild (D11) |
+    | `hold-cleared` | data path, resolution | the hold resolution (D11) |
+    | `quarantined` | data path, quarantine id | the *replace* resolution (D11) |
+    | `replaced` | data path, import entry | the *replace* resolution |
+
+  - **Field values.** A data path is a sealed data file's relative path
+    exactly as the layout writes it, a partition directory is
+    `source=…/instrument=…/stream=…/date=YYYY-MM-DD` exactly as the
+    layout writes it, and root and quarantine ids pass `validate_segment`.
+    An import entry is `<segment>/<name>.import`, the name from
+    `[A-Za-z0-9._-]` and not starting with `.`, as the import ledger names
+    its files (ADR-034 D4). The closed sets: code `missing size sha256
+    manifest copies prefix chain stale entry` (D11 *On a finding*); subject
+    a data path, `journal`, `copy-ledger` or `entry:<entry>`; origin
+    `ledger journal recovery import verify` (rebuild step 4, the lost-file
+    rule); reason `unlisted entry-conflict manifest-conflict` (D11, hot
+    restore step 5); resolution `readmit replace`. A pass's findings come
+    before its `verify` record and carry the same root and `at_ms`.
+  - **Escaping** (the `manifest` field only): `%`, the bytes 0x00–0x20 and
+    0x7F are written as `%XX` with uppercase hex; every other byte is
+    literal, and any other spelling is refused. Why these bytes: the space
+    separates tokens and `\n` ends the record, so both must never appear
+    raw in a field, the other control bytes are escaped with them so a line
+    never holds a byte a text tool could alter (a tab, a `\r`), and `%` is
+    the escape character itself. One spelling per byte keeps the line
+    canonical, so the chain hash of a given text is unique. The unescaped
+    text must parse as a manifest (ADR-030) and is stored verbatim, never
+    re-rendered.
+  - **The parser is strict**: a line that the renderer cannot produce is
+    corrupt, never skipped. A later step adds a kind only together with an
+    edit of this ADR and a golden test, and a format change bumps the
+    header's version.
+  - **The single-trailing-record rule.** Only one append is in flight at a
+    time (the lock), so a crash leaves at most one incomplete record, the
+    last. A reader ignores exactly that record: the bytes after the last
+    `\n`, if there are any, or otherwise the last line when its chain
+    fails while the line before it verifies. Any other chain failure is
+    `Integrity` naming the ledger, the record number and its byte offset;
+    a line whose chain verifies but whose grammar fails is corrupt and is
+    never ignored, since only an appender can have written it. The rule
+    cannot tell a torn append from damage at rest in the last record; the
+    verification's prefix check against the copies (D11) finds the latter.
+  - **The lock file** `<raw_root>/.mie/copy-ledger.lock` is separate from
+    the ledger. Why: the rebuild replaces the ledger by a temp file and a
+    rename (step 6), and a lock on the ledger's inode would stay on the
+    replaced file.
+  - **The append protocol.** Refuse a missing ledger (an error, never an
+    implicit new one), take the lock, and only then open the ledger. Why
+    this order: a whole-run holder (the rebuild) may replace the ledger by
+    rename while an append waits for the lock, and a descriptor opened
+    before the lock would write the record into the replaced file, where
+    no reader ever sees it. Under the lock, read back the header and the
+    last three records, and decide before
+    writing anything. Either truncate at most the one trailing record
+    above and append, or refuse with `Integrity` and leave the file
+    byte-identical. Then write the line in one write, fsync, release. Why
+    three records: the last two are the ones whose chains the decision
+    checks (the trailing record and the line before it, which must
+    verify), and the third supplies the chain hash the second-last is
+    computed from. A complete record before the last is never truncated.
+    Every truncation is reported to the caller, which journals it: in the
+    append's outcome, or, when the write after a truncation fails (a full
+    hot), in the append's error. Damage
+    older than the last three records is not seen by an append; it stays
+    in the file for readers and the verification to report.
+  - **The whole-run hold** of the rebuild and the hot restore takes the
+    lock without waiting and refuses to start when another process holds
+    it; its appends go through the held lock.
 - **Configuration.** An ordered list `cold_roots` (default empty, the read
   order) in `[paths]` of the ingest and the archive configuration
-  (`config.rs`, `Paths` and `ArchivePaths`). Each entry is flagged when it
-  is a copy target (D11). The `[history] archive_config` check that both
-  configurations name the same `raw_root` (`config.rs`) extends to the
-  same `cold_roots`.
+  (`config.rs`, `Paths` and `ArchivePaths`):
+  `cold_roots = [{ path = "…", copy_target = true }, …]`. Unknown keys are
+  refused. Both keys are required, because either default fails silently:
+  `false` hides a forgotten copy target until a file is short of k copies,
+  `true` turns a read-only root into a write target. A non-empty list
+  needs at least 2 copy targets (k = 2, D11; Numbers table), no path twice
+  and no entry equal to `raw_root`. These comparisons are lexical, never
+  resolved through the filesystem. Why: loading the configuration must
+  never touch a cold mount, since a hung mount would block the start of
+  `mie ingest`. Two spellings of one directory are caught by the markers
+  instead: `init-root` refuses the second spelling as non-empty, and the
+  replicator refuses two roots with one id. The `[history] archive_config`
+  check that both configurations name the same `raw_root` (`config.rs`)
+  extends to the same `cold_roots`: the same entries in the same order
+  (the read order) with the same flags.
 - The journal, the import ledger and the copy ledger stay on hot and never
   move. D11 copies them.
 - **A file absent from every root is a loud error** (operator, STOP 1).
@@ -386,9 +562,30 @@ live in more than one root (approved as written at STOP 1).
     an error", which needed a liveness probe.
 - **A missing copy ledger is the same error.** A store with `cold_roots`
   configured requires the copy ledger to exist; it is created by an
-  explicit init step, never implicitly. The init step also writes hot's
-  own root marker. A missing ledger makes every union `select` fail with
-  `Integrity`. Why: read as empty, it would drop every removed partition
+  explicit init step, never implicitly. The init step, `mie store init
+  --config <ingest config>`, also writes hot's own root marker. It
+  refuses, in this order: an empty `cold_roots` (a single-root store needs
+  no `.mie/`, so a `.mie/` always means a tiered store); with `[history]`,
+  a missing `raw_root`, named with the instruction to create it (the
+  check that follows resolves both raw roots on disk), and an archive
+  configuration that fails the check above; an existing
+  `<raw_root>/.mie`; and a configured cold root that carries a marker or a
+  copy-ledger copy, where any read error other than "not found" also
+  refuses. A cold marker next to a hot without one always means a hot that
+  was initialized and then lost, because `init-root` needs hot's marker
+  (D4). `init` writes the marker and a header-only ledger into a staging
+  directory of its own (a unique name per call), fsyncs them, and renames
+  the directory to `.mie`. Why a directory rename: after a crash there is
+  either no `.mie/` or a complete one; separate file renames could leave a
+  marker without a ledger, which looks like the degraded start below, or a
+  ledger without a marker, which looks like a lost hot. Why a unique
+  staging name: two concurrent calls sharing one staging directory could
+  each delete or fill the other's files and publish an incomplete `.mie/`;
+  with separate directories the first rename wins, the second fails on the
+  existing `.mie`, and the winner removes every leftover staging
+  directory. The same creation writes a cold root's marker (D4). It prints what it found on each cold root, so an
+  operator who expected a restore sees that the mounts are absent. A
+  missing ledger makes every union `select` fail with `Integrity`. Why: read as empty, it would drop every removed partition
   from every selection without an error, the failure the previous rule
   exists to prevent. Two cases are told apart by hot's marker:
   - **Hot intact, ledger lost** (the marker is there): the degraded start.
@@ -400,7 +597,11 @@ live in more than one root (approved as written at STOP 1).
     still holds every part and the journal, so nothing it writes can
     collide with cold.
   - **Hot lost** (no marker, `cold_roots` configured): `mie ingest` and
-    the importer refuse to start and name the hot restore (D11). Why: on
+    the importer, its dry run included, refuse to start before they open
+    anything, and name `mie store init` (a new store) and the hot restore
+    (D11, a lost hot). The check reads hot's marker only; with
+    `cold_roots` empty it makes no filesystem call. A `raw_root` that
+    carries a cold root's marker is refused too. Why: on
     an empty hot the writer would number new parts from zero, the journal
     would start as a new file without the earlier runs, and the seed scan
     would find nothing (the three failures D11's hot restore prevents).
@@ -570,7 +771,7 @@ Inputs:
 - A: the archive bytes, 51.0 GB on the host today (M1-12).
 - S: the pre-cutover stores, 3.7 GB (D9).
 - J: the daily growth of the journal, the import ledger and the copy
-  ledger: 5.1–15.1 MB (M1-11) + 0.006 MB (M1-15) + about 1.5 MB (copy
+  ledger: 5.1–15.1 MB (M1-11) + 0.006 MB (M1-15) + about 1.6 MB (copy
   ledger, estimated in the Numbers table).
 - P: the verification period (D11, operator input).
 - Z: the import staging, one archive zip at a time (ADR-034: one request
@@ -927,7 +1128,10 @@ What breaks:
 | 2.0× by hour of day, 2.4× by store | M1-7, M1-8 | max/min hourly rate; max/min store rate | Why no single "720 MB/day" is a sizing input: a rate taken from one store can be off by 2.4× |
 | 5.5× busiest archive day | M1-14 | 232.41 / 41.99 MB | Why the busiest column, not the mean, sizes provisioning |
 | 3 670 files per live day, ≈ 1.34 M/year | M1-9 | 1 835 data files + 1 835 manifests on 2026-10-17; × 365 | The cold listing load and the per-pass copy count. Fewer, larger files would need merging parts, which changes hashes (D5) |
-| Copy ledger ≈ 1.5 MB/day | Estimate from M1-9 and M1-10 | per file one manifest record (349 B + 65 B chain hash + framing ≈ 430 B) and k = 2 copy records (≈ 90 B path + root id + time + 65 B chain hash ≈ 190 B each): ≈ 810 B × 1 835 files | An estimate: the follow-up measures it. Higher only adds hot bytes (D10 J); it is under 0.3 % of the data rate |
+| Copy ledger ≈ 1.6 MB/day | Estimate from M1-9 and the golden records of grammar v1 (#187) | per file one `manifest` record (479 B in the golden ledger, a `depth` file) and k = 2 `copy` records (176 B each): 831 B × 1 835 files = 1.53 MB; plus one `ledger-copy` record (168 B) per copy target per replication pass, 2 × 288 × 168 B = 0.10 MB | An estimate until the follow-up measures it: record sizes vary by a few bytes with the stream name and the digits of `rows` and `bytes`, and verification records depend on P. Higher only adds hot bytes (D10 J); it is under 0.3 % of the data rate |
+| ≥ 2 copy targets in a non-empty `cold_roots` | k = 2 (D11) | k counts copies on the copy targets, and every copy target receives every file, so k equals the number of copy targets | 1: no file ever reaches k copies, nothing ever leaves hot, and the store is the single copy D11 rejects. More than 2 is allowed: it is a larger k |
+| An append reads back the last 3 records | D7 *Formats and layout* | the trailing record and the line before it are checked; the third-last supplies the chain the second-last is computed from | Fewer: the line before the trailing record cannot be verified, so a damaged second-last record could be followed by a truncation of the last. More: only read cost, and still no full-chain check, which stays the verification's job |
+| At most 1 trailing record ignored or truncated | D7 *Formats and layout* | one append is in flight at a time under the lock, so a crash leaves at most one incomplete record | More than one: damage before the last record would be silently dropped, which is what the chain exists to report |
 | Journal 5.1–5.6 MB/day; 15.1 MB/day for #99; 1.9–5.5 GB per year | M1-11 | journal size / captured hours × 24; 5.1 × 365 = 1.86 GB, 15.1 × 365 = 5.5 GB | The journal never leaves hot, so J × t grows hot; the busiest column uses 15.1. The yearly size is why D11 appends tails instead of copying the file whole every pass |
 | Import ledger ≈ 6 KB per imported day | M1-15 | 2.25 MB / 379 dates | Negligible in J |
 | A = 51.0 GB | M1-12 | 37 000.3 + 14 002.5 MB (archive + hold-out) | A one-time term of each archive copy device |
@@ -944,7 +1148,7 @@ What breaks:
 | k_A = 2 | This ADR (D11) | a lost archive file changes the chain's prefix dataset; cost ≈ 67 GB in year 1 | k_A = 1: one device failure turns every warm run `DIVERGED (warm prefix)`. Higher: archive bytes only |
 | Z (staging), B (largest import run on hot) | ADR-034 (one zip at a time, deleted once imported); D6 *The source lock* | Z: the largest zip, read from the import log at provisioning. B: one day of a for a daily import; a 12-month backfill is 365 × 43.2 MB = 15.8 GB for the default datasets, + 365 × 81.5 MB = 29.7 GB with `trades`, 45.5 GB (M1-13) | Z too small: the zip being fetched fills hot, the import fails, and the capture's writer can hit `ENOSPC` too (D10 *What breaks*). B larger than hot's headroom fills hot during the import with the same result, hence the bootstrap's adoption path for large imports. Larger Z or B than needed: unused hot disk only |
 | Hot restore copies 6.35–9.36 GB | D10, D11 | (Σ_s r_s + a) × H at the two rate columns | The capture's downtime after a hot loss grows with it; a smaller H shortens the restore but weakens the degraded start (D8) |
-| Initial hot sizes | D10 | week-weighted: (750.5 + 43.2) × 8 = 6.35 GB, + 0.79 GB per outage day, J (5.6 + 1.5) × 365 = 2.6 GB per year. Busiest: (1 126.3 + 43.2) × 8 = 9.36 GB, + 1.17 GB per outage day, (15.1 + 1.5) × 365 = 6.1 GB per year | See D10 *What breaks* |
+| Initial hot sizes | D10 | week-weighted: (750.5 + 43.2) × 8 = 6.35 GB, + 0.79 GB per outage day, J (5.6 + 1.6) × 365 = 2.6 GB per year. Busiest: (1 126.3 + 43.2) × 8 = 9.36 GB, + 1.17 GB per outage day, (15.1 + 1.6) × 365 = 6.1 GB per year | See D10 *What breaks* |
 | Initial copy-device sizes | D10 | year 1, week-weighted: 273.9 + 2.6 + 51.0 + 15.8 + 3.7 = 347 GB; busiest: 411.1 + 6.1 + 51.0 + 15.8 + 3.7 = 488 GB. Later years: 273.9 + 2.6 + 15.8 = 292 GB; 411.1 + 6.1 + 15.8 = 433 GB | See D10 *What breaks* |
 | O (cold-outage days) | Operator input at provisioning | lower bound: the longest cold outage the operator expects to repair (a NAS reboot, a disk swap); upper bound: what hot can hold, (hot − reserve − (Σ r_s + a) × H − J × t) / (Σ r_s + a) | Too small: an outage longer than O fills hot and stops the capture (D10). Larger: more hot disk, and O is also the longest single-copy window (D11) |
 | P (verification period) | Operator input at provisioning | lower bound: bytes on the largest copy device / slowest root's measured read throughput | Below the lower bound a pass cannot finish. Larger: a damaged copy stays unnoticed longer, a window with one good copy at k = 2 (D11) |
@@ -1039,6 +1243,10 @@ What breaks:
   (D11).
 - **A copy ledger without a hash chain.** Rejected: with k = 2 a prefix
   mismatch cannot say which copy is damaged (D7).
+- **A chain hash over the whole ledger prefix.** Rejected for the chained
+  hash (operator, #187 STOP 1): it covers no hash of the last record,
+  reports damage one record late, and re-hashes the whole ledger on every
+  append (D7).
 - **Rebuilding the copy ledger from root listings alone.** Rejected: it
   cannot tell a lost file from one that never existed, and an unmounted
   root would read as empty; the rebuild requires markers and cross-checks

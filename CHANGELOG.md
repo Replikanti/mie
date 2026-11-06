@@ -12,6 +12,28 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
 
 ### Added
 
+- **Storage tiers, step 1: copy ledger, root markers and `mie store init`
+  (#187, ADR-062 D4, D7, proposed).** `mie-adapter-parquet` gains the
+  on-disk formats of a tiered raw store under each root's `.mie/`: the root
+  marker (`mie-root 1`, hot's id reserved as `hot`) with an atomic
+  `.mie/` creation, and the copy ledger (`mie-copy-ledger 1`), an
+  append-only text file with one hash-chained record per line for every
+  record kind ADR-062 names, a strict parser, a chain check that names the
+  first failing record, lock-free readers that ignore the one incomplete
+  trailing record, and appenders serialized by a lock file that truncate at
+  most that record and never a complete one before it, plus a whole-run
+  hold. `[paths] cold_roots = [{ path, copy_target }, …]` is accepted in
+  the ingest and the archive configuration (at least two copy targets, and
+  the same list in both through `[history] archive_config`).
+  `mie store init` writes hot's marker and an empty copy ledger and refuses
+  a store whose cold roots show that hot was lost; `mie store init-root`
+  writes a freshly mounted cold root's marker and refuses a non-empty root
+  or one that is not a mount point (on hot's device or on its parent
+  directory's). With `cold_roots` configured, `mie ingest` and
+  `mie archive-import` refuse to start on a hot without its marker. ADR-062
+  D7 now defines each record's chain hash as the SHA-256 of the previous
+  chain hash and the record's own text. With `cold_roots` empty nothing
+  changes and no `.mie/` is created.
 - **Independent check of the ADR-054 sampler (#146).** A test-only module
   `mie_domain::independent_sampling` holds a second model of ADR-054 D1–D4,
   written from the ADR text without the sampler's source, and compares it

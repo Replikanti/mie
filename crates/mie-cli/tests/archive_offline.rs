@@ -1423,3 +1423,99 @@ fn the_kline_check_fails_when_no_bar_was_compared() {
     );
     assert!(String::from_utf8(out).unwrap().ends_with("PASS\n"));
 }
+
+// ----------------------------------------------- tiered store start refusal
+
+/// The archive configuration under `dir` with two copy targets.
+fn tiered_config(dir: &Path) -> ArchiveConfig {
+    let mut config = config(dir, r#"["aggTrades"]"#);
+    config.paths.cold_roots = ["cold-a", "cold-b"]
+        .map(|name| mie_cli::config::ColdRoot {
+            path: dir.join(name),
+            copy_target: true,
+        })
+        .to_vec();
+    config
+}
+
+fn try_import(
+    config: &ArchiveConfig,
+    archive: &Arc<FakeArchive>,
+    dry_run: bool,
+) -> Result<ImportSummary, String> {
+    let request = ImportRequest {
+        from_day: day("2026-09-28"),
+        to_day: day("2026-09-28"),
+        streams: None,
+        dry_run,
+    };
+    archive::import(
+        config,
+        &request,
+        &transports(archive),
+        &AtomicBool::new(false),
+        &mut Vec::new(),
+    )
+}
+
+#[test]
+fn a_tiered_hot_without_its_marker_refuses_imports_and_dry_runs() {
+    let dir = TempDir::new("archive-tiered-no-marker");
+    let config = tiered_config(dir.path());
+    let archive = Arc::new(FakeArchive::default());
+    publish_all(&archive, day("2026-09-28"), day("2026-09-28"), 60_000);
+    for dry_run in [false, true] {
+        let error = try_import(&config, &archive, dry_run).expect_err("refused");
+        assert!(
+            error.contains("mie store init") && error.contains("hot restore"),
+            "{error}"
+        );
+        assert_eq!(archive.downloads(), 0);
+        for path in [
+            &config.paths.raw_root,
+            &config.paths.import_ledger,
+            &config.paths.staging,
+        ] {
+            assert!(!path.exists(), "{}", path.display());
+        }
+    }
+}
+
+#[test]
+fn a_tiered_hot_with_its_marker_imports_and_a_cold_marker_is_refused() {
+    use mie_adapter_parquet::root_marker::{self, HOT_ID};
+    let dir = TempDir::new("archive-tiered-marker");
+    let config = tiered_config(dir.path());
+    let archive = Arc::new(FakeArchive::default());
+    publish_all(&archive, day("2026-09-28"), day("2026-09-28"), 60_000);
+
+    std::fs::create_dir_all(&config.paths.raw_root).unwrap();
+    root_marker::create_meta(&config.paths.raw_root, "cold-a", false).unwrap();
+    let error = try_import(&config, &archive, false).expect_err("refused");
+    assert!(error.contains("cold root \"cold-a\""), "{error}");
+    assert!(!config.paths.import_ledger.exists());
+
+    std::fs::remove_dir_all(config.paths.raw_root.join(".mie")).unwrap();
+    root_marker::create_meta(&config.paths.raw_root, HOT_ID, true).unwrap();
+    let summary = try_import(&config, &archive, false).expect("imports");
+    assert_eq!((summary.imported, summary.exit_code()), (1, 0));
+}
+
+#[test]
+fn an_import_without_cold_roots_creates_no_meta_directory() {
+    let dir = TempDir::new("archive-single-root");
+    let config = config(dir.path(), r#"["aggTrades"]"#);
+    assert_eq!(config.paths.cold_roots, []);
+    let archive = Arc::new(FakeArchive::default());
+    publish_all(&archive, day("2026-09-28"), day("2026-09-28"), 60_000);
+    let (summary, out) = run_import(
+        &config,
+        &archive,
+        day("2026-09-28"),
+        day("2026-09-28"),
+        false,
+    );
+    assert_eq!(summary.imported, 1, "{out}");
+    assert!(config.paths.raw_root.exists());
+    assert!(!config.paths.raw_root.join(".mie").exists());
+}
