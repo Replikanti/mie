@@ -47,11 +47,15 @@
 //!   stream resumed — and is listed in
 //!   [`trailing_gaps`](LiveReplayStream::trailing_gaps) instead.
 //!
-//! - **One run as live delivered it** (#13, ADR-041).
+//! - **One run as live delivered it** (#13, ADR-041, ADR-063).
 //!   [`LiveReplay::run_replay`] recomputes one cleanly ended run with the
-//!   same read, integrity checks and recompute, but without chaining and
-//!   without a window: exactly what that run's live provider delivered to
-//!   its fresh engine, for the equivalence harness.
+//!   same integrity checks and recompute, but without chaining and without
+//!   a window: exactly what that run's live provider delivered to its fresh
+//!   engine, for the equivalence harness. It streams: a first pass over the
+//!   run's files checks the run without holding its records, and raises
+//!   every integrity error before any event; the recompute then merges the
+//!   files by `receive_seq`, opening each only when its first record can be
+//!   next (the `run_merge` module).
 //!
 //! - **History chain hooks** (ADR-052 D2, crate-private, off by default).
 //!   [`chaining_only`](LiveReplay::chaining_only) restricts the replay to
@@ -73,11 +77,16 @@
 //!   journaled seed: its sequencer takes one seed from `depth` and
 //!   `depthSnapshot` together (ADR-038).
 //!
-//! Memory: one run's records and output at a time (about 1.5 M records for
-//! a 24 h run).
+//! Memory: [`replay`](LiveReplay::replay) holds one run's records and
+//! output at a time (ADR-039; about 2.7 KB per record, ADR-053), and the
+//! history chain bounds that run with `[history] max_run_records` (ADR-052
+//! decision 13). [`run_replay`](LiveReplay::run_replay) holds the run's
+//! records of about one seal interval, one bit per record of the run and a
+//! few words per file, independently of the run's length (ADR-063 D4).
 
 use crate::holdback::HoldBack;
 use crate::pipeline::{Pipeline, PipelineStats};
+use crate::run_merge::{RunMerge, plan_clean_run};
 use crate::stream::BinanceStream;
 use mie_domain::event::{FeedGap, MarketEvent, Stream};
 use mie_domain::time::EventTime;
@@ -221,8 +230,11 @@ impl<'a> LiveReplay<'a> {
     /// runs in shared files are skipped, journaled or not, because they
     /// cannot affect this run.
     ///
-    /// The run is recomputed when this is called; the provider then holds
-    /// its events (one run in memory, as for [`replay`](Self::replay)).
+    /// The run's files are checked when this is called, without holding
+    /// its records: every integrity error comes from here, before any
+    /// event. The provider then recomputes the run lazily, merging its files
+    /// by `receive_seq`, and holds about one seal interval of its records
+    /// at a time (ADR-063).
     ///
     /// # Errors
     ///
@@ -232,7 +244,7 @@ impl<'a> LiveReplay<'a> {
     ///   without capture metadata and for a `receive_seq` stored twice;
     /// - [`ProviderError::Source`] when the store fails or the clean run is
     ///   incomplete.
-    pub fn run_replay(&self, run_id: &str) -> Result<RunReplay, ProviderError> {
+    pub fn run_replay(&self, run_id: &str) -> Result<RunReplay<'a>, ProviderError> {
         let (run, (start, end)) = self
             .runs
             .iter()
@@ -245,10 +257,7 @@ impl<'a> LiveReplay<'a> {
                 ))
             })?;
         if run.clean_records.is_none() {
-            return Err(ProviderError::Contract(format!(
-                "run {run_id} did not end cleanly: its sealed records are not what live \
-                 delivered, so it cannot be compared"
-            )));
+            return Err(not_clean(run_id));
         }
         let keys = run
             .streams
@@ -265,30 +274,28 @@ impl<'a> LiveReplay<'a> {
         )
         .map_err(source_error)?;
         let dataset = self.source.select(&selection).map_err(source_error)?;
-        let prefix = format!("{run_id}/");
-        let mut records = Vec::new();
-        for file in &dataset.files {
-            let Some(stream) = BinanceStream::from_raw_name(file.stream.stream()) else {
-                return Err(ProviderError::Contract(format!(
-                    "{}: unknown live stream {}",
-                    file.relative_path, file.stream
-                )));
-            };
-            for record in self.source.read(file).map_err(source_error)? {
-                let Some(capture) = &record.capture else {
-                    return Err(ProviderError::Contract(format!(
-                        "{}: a live record at {} has no capture metadata",
-                        file.relative_path, record.event_time
-                    )));
-                };
-                if capture.session_id.starts_with(&prefix) {
-                    records.push((capture.receive_seq, stream, record));
-                }
-            }
-        }
-        let (events, stats) = recompute(run, sorted(run, records)?, None)?;
+        let plan = plan_clean_run(self.source, &dataset.files, run)?;
+        let continuation = RunContinuation::new(
+            &run.symbol,
+            run.hold_back_ms,
+            run.oi_retime_ms,
+            &run.seeds,
+            None,
+        );
+        let stats = RunStats {
+            run_id: run.run_id.clone(),
+            records: plan.found,
+            replayed: plan.found,
+            ignored: 0,
+            clean: true,
+            pipeline: continuation.stats(),
+        };
         Ok(RunReplay {
-            events: events.into(),
+            merge: RunMerge::new(self.source, run_id, plan),
+            continuation,
+            out: VecDeque::new(),
+            finished: false,
+            failed: None,
             stats,
             dataset: dataset.version,
         })
@@ -381,18 +388,44 @@ impl RunContinuation {
 }
 
 /// One cleanly ended run as its live provider delivered it
-/// ([`LiveReplay::run_replay`]).
-#[derive(Debug)]
-pub struct RunReplay {
-    events: VecDeque<MarketEvent>,
+/// ([`LiveReplay::run_replay`]), recomputed as it is read (ADR-063).
+pub struct RunReplay<'a> {
+    merge: RunMerge<'a>,
+    continuation: RunContinuation,
+    /// The events the last record released, not yet delivered.
+    out: VecDeque<MarketEvent>,
+    finished: bool,
+    failed: Option<ProviderError>,
     stats: RunStats,
     dataset: DatasetVersion,
 }
 
-impl RunReplay {
-    /// What the recompute did with the run.
+impl fmt::Debug for RunReplay<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RunReplay")
+            .field("merge", &self.merge)
+            .field("buffered", &self.out.len())
+            .field("finished", &self.finished)
+            .field("failed", &self.failed)
+            .field("stats", &self.stats)
+            .field("dataset", &self.dataset)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RunReplay<'_> {
+    /// What the recompute did with the run. The record counts are final
+    /// when [`LiveReplay::run_replay`] returns, from the integrity pass; the
+    /// pipeline counters are final once
+    /// [`next_event`](MarketDataProvider::next_event) returned `Ok(None)`.
     pub fn stats(&self) -> &RunStats {
         &self.stats
+    }
+
+    /// The most records of the run held in memory at once so far (ADR-063
+    /// D4, D5): the records of the open files not yet recomputed.
+    pub fn peak_buffered_records(&self) -> u64 {
+        self.merge.peak_held()
     }
 
     /// The version of the files the run was read from: its streams over its
@@ -402,10 +435,72 @@ impl RunReplay {
     }
 }
 
-impl MarketDataProvider for RunReplay {
+impl MarketDataProvider for RunReplay<'_> {
+    /// # Errors
+    ///
+    /// [`ProviderError::Source`] when a file fails to read during the
+    /// recompute, or no longer holds the records the integrity pass found
+    /// (a storage fault between the passes, ADR-063 D6). The failure
+    /// sticks.
     fn next_event(&mut self) -> Result<Option<MarketEvent>, ProviderError> {
-        Ok(self.events.pop_front())
+        loop {
+            if let Some(event) = self.out.pop_front() {
+                return Ok(Some(event));
+            }
+            if let Some(failed) = &self.failed {
+                return Err(failed.clone());
+            }
+            if self.finished {
+                return Ok(None);
+            }
+            match self.merge.next() {
+                Ok(Some((stream, record))) => {
+                    self.out.extend(self.continuation.push(stream, &record));
+                }
+                Ok(None) => {
+                    self.out.extend(self.continuation.finish());
+                    self.stats.pipeline = self.continuation.stats();
+                    self.finished = true;
+                }
+                Err(failed) => {
+                    self.failed = Some(failed.clone());
+                    return Err(failed);
+                }
+            }
+        }
     }
+}
+
+/// A run that did not end cleanly is not replayed alone: its sealed records
+/// are not what live delivered.
+pub(crate) fn not_clean(run_id: &str) -> ProviderError {
+    ProviderError::Contract(format!(
+        "run {run_id} did not end cleanly: its sealed records are not what live \
+         delivered, so it cannot be compared"
+    ))
+}
+
+/// A `receive_seq` of the run stored twice (D2).
+pub(crate) fn stored_twice(run_id: &str, seq: u64) -> ProviderError {
+    ProviderError::Contract(format!("run {run_id}: receive_seq {seq} is stored twice"))
+}
+
+/// A hole in a cleanly ended run: `[missing, next)` is missing (D2).
+pub(crate) fn clean_run_hole(run_id: &str, missing: u64, next: u64) -> ProviderError {
+    ProviderError::Source(format!(
+        "run {run_id} ended cleanly but receive_seq [{missing}, {next}) is missing from \
+         the raw store"
+    ))
+}
+
+/// A cleanly ended run whose record count is not its `run_end` count (D2).
+pub(crate) fn clean_run_count(run_id: &str, found: u64, expected: u64) -> ProviderError {
+    let detail = if found < expected {
+        format!("receive_seq [{found}, {expected}) is missing from the raw store")
+    } else {
+        format!("the raw store holds {found} records, run_end says {expected}")
+    };
+    ProviderError::Source(format!("run {run_id} ended cleanly but {detail}"))
 }
 
 fn source_error(detail: impl fmt::Display) -> ProviderError {
@@ -816,18 +911,16 @@ type RunRecords = Vec<(u64, BinanceStream, RawRecord)>;
 fn sorted(run: &LiveRun, mut records: RunRecords) -> Result<RunRecords, ProviderError> {
     records.sort_by_key(|(seq, _, _)| *seq);
     if let Some(pair) = records.windows(2).find(|pair| pair[0].0 == pair[1].0) {
-        return Err(ProviderError::Contract(format!(
-            "run {}: receive_seq {} is stored twice",
-            run.run_id, pair[0].0
-        )));
+        return Err(stored_twice(&run.run_id, pair[0].0));
     }
     Ok(records)
 }
 
 /// Checks a run's sorted records and recomputes them through a
 /// [`RunContinuation`] with the run's parameters, continuing `after` when
-/// given (D3): the one recompute of [`LiveReplay::replay`] and
-/// [`LiveReplay::run_replay`] (module docs, D2). A run that ended cleanly
+/// given (D3): the one recompute of [`LiveReplay::replay`] (module docs,
+/// D2). [`LiveReplay::run_replay`] streams the same checks and recompute
+/// (ADR-063). A run that ended cleanly
 /// must be complete; a crashed run is recomputed over its contiguous
 /// `receive_seq` prefix.
 fn recompute(
@@ -843,22 +936,10 @@ fn recompute(
         .count();
     if let Some(expected) = run.clean_records {
         if let Some((next, _, _)) = records.get(prefix) {
-            return Err(ProviderError::Source(format!(
-                "run {} ended cleanly but receive_seq [{prefix}, {next}) is missing from \
-                 the raw store",
-                run.run_id
-            )));
+            return Err(clean_run_hole(&run.run_id, prefix as u64, *next));
         }
         if found as u64 != expected {
-            let detail = if (found as u64) < expected {
-                format!("receive_seq [{found}, {expected}) is missing from the raw store")
-            } else {
-                format!("the raw store holds {found} records, run_end says {expected}")
-            };
-            return Err(ProviderError::Source(format!(
-                "run {} ended cleanly but {detail}",
-                run.run_id
-            )));
+            return Err(clean_run_count(&run.run_id, found as u64, expected));
         }
     }
 
@@ -942,7 +1023,7 @@ impl MarketDataProvider for LiveReplayStream<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{MemorySource, RunBuilder, SOURCE, agg, mark, oi};
+    use crate::testing::{FaultySource, MemorySource, RunBuilder, SOURCE, agg, mark, oi};
     use mie_domain::event::{GapReason, Stream};
     use mie_domain::state::MarketStateEngine;
 
@@ -1297,7 +1378,7 @@ mod tests {
         }
     }
 
-    fn drain_run(run: RunReplay) -> Vec<MarketEvent> {
+    fn drain_run(run: RunReplay<'_>) -> Vec<MarketEvent> {
         let mut run = run;
         let mut out = Vec::new();
         while let Some(event) = run.next_event().unwrap() {
@@ -1648,5 +1729,401 @@ mod tests {
                     && !d.contains("20261006T010000Z")),
             "{err}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // The streaming `run_replay` (ADR-063).
+
+    /// The run of `b` (the busy run's span), ended cleanly with all its
+    /// records.
+    fn clean(b: &RunBuilder) -> LiveRun {
+        b.run(T0, Some(T0 + 21_000), Some(b.records.len() as u64))
+    }
+
+    /// A run whose epochs of `k` records all look alike: aggTrade, markPrice
+    /// and openInterest in turn, 100 ms apart, over `epochs` epochs.
+    fn steady(k: u64, epochs: u64) -> RunBuilder {
+        let mut b = RunBuilder::new("20261006T010000Z");
+        for i in 0..k * epochs {
+            let t = T0 + 100 * i as i64;
+            match i % 3 {
+                0 => b.push(BinanceStream::AggTrade, 1, agg(1 + i, t)),
+                1 => b.push(BinanceStream::MarkPrice, 1, mark(t)),
+                _ => b.push(BinanceStream::OpenInterest, 1, oi(t)),
+            };
+        }
+        b
+    }
+
+    /// Drains a run replay to its end.
+    fn drained(run: &mut RunReplay<'_>) -> Vec<MarketEvent> {
+        let mut out = Vec::new();
+        while let Some(event) = run.next_event().unwrap() {
+            out.push(event);
+        }
+        out
+    }
+
+    /// A small linear congruential generator: seeded, without `rand`.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((self.0 >> 33) % n as u64) as usize
+        }
+
+        fn shuffle<T>(&mut self, items: &mut [T]) {
+            for i in (1..items.len()).rev() {
+                items.swap(i, self.below(i + 1));
+            }
+        }
+    }
+
+    #[test]
+    fn a_run_replays_alike_whatever_its_seal_epochs() {
+        // (T1) The busy run, sealed every 1, 7 and 64 records and once.
+        let b = busy_run();
+        let run = clean(&b);
+        let mut single = MemorySource::default();
+        b.seal(&mut single, &[]);
+        let live = LiveReplay::new(&single, SOURCE, "BTCUSDT", vec![run.clone()]);
+        let once = drain_run(live.run_replay(&run.run_id).unwrap());
+        assert_eq!(once, b.live(&run));
+        for epoch in [1, 7, 64, b.records.len()] {
+            let mut source = MemorySource::default();
+            b.seal_epochs(&mut source, epoch, &[]);
+            let live = LiveReplay::new(&source, SOURCE, "BTCUSDT", vec![run.clone()]);
+            let mut replay = live.run_replay(&run.run_id).unwrap();
+            assert_eq!(drained(&mut replay), once, "epoch {epoch}");
+            assert!(
+                replay.peak_buffered_records() <= epoch as u64,
+                "epoch {epoch}: {replay:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_peak_is_one_epoch_whatever_the_run_length() {
+        // (T2) Runs of 4 and 16 epochs of 30 records hold the same peak,
+        // at most one epoch.
+        let peak = |epochs: u64| {
+            let b = steady(30, epochs);
+            let mut source = MemorySource::default();
+            b.seal_epochs(&mut source, 30, &[]);
+            let run = b.run(T0, Some(T0 + 100 * 30 * epochs as i64), Some(30 * epochs));
+            let live = LiveReplay::new(&source, SOURCE, "BTCUSDT", vec![run.clone()]);
+            let mut replay = live.run_replay(&run.run_id).unwrap();
+            assert_eq!(drained(&mut replay), b.live(&run));
+            replay.peak_buffered_records()
+        };
+        let (short, long) = (peak(4), peak(16));
+        assert!(short <= 30, "{short}");
+        assert_eq!(short, long);
+    }
+
+    #[test]
+    fn stored_order_and_other_runs_in_shared_files_do_not_change_the_output() {
+        // (T3) Each file's records in a seeded order, with another run's
+        // records of the same stream in the same files.
+        let b = busy_run();
+        let run = clean(&b);
+        let mut other = RunBuilder::new("20261006T005900Z");
+        for i in 0..40_u64 {
+            other.push(
+                BinanceStream::AggTrade,
+                1,
+                agg(5_000 + i, T0 + 500 * i as i64),
+            );
+            other.push(BinanceStream::MarkPrice, 1, mark(T0 + 500 * i as i64 + 3));
+        }
+        let expected = b.live(&run);
+        for seed in 1..=8_u64 {
+            let mut lcg = Lcg(seed);
+            let mut source = MemorySource::default();
+            let mut foreign = other.records.iter().cycle();
+            for (stream, mut records) in b.epoch_files(16, &[]) {
+                for _ in 0..lcg.below(4) {
+                    let (s, r) = foreign.next().unwrap();
+                    if *s == stream {
+                        records.push(r.clone());
+                    }
+                }
+                lcg.shuffle(&mut records);
+                source.seal(SOURCE, stream.raw_name(), records);
+            }
+            let live = LiveReplay::new(&source, SOURCE, "BTCUSDT", vec![run.clone()]);
+            let mut replay = live.run_replay(&run.run_id).unwrap();
+            assert_eq!(drained(&mut replay), expected, "seed {seed}");
+            assert!(replay.peak_buffered_records() <= 16, "seed {seed}");
+        }
+    }
+
+    #[test]
+    fn a_run_across_midnight_holds_both_date_partitions_at_once() {
+        // (T4) 2026-10-07T00:00:00Z; a mark price of the old day arrives
+        // after the first trades of the new one, so one epoch holds two
+        // date partitions of markPrice and of aggTrade.
+        let midnight = T0 + 23 * 3_600_000;
+        let mut b = RunBuilder::new("20261006T235950Z");
+        for i in 0..200_i64 {
+            let t = midnight - 10_000 + 100 * i;
+            b.push(BinanceStream::AggTrade, 1, agg(1 + i as u64, t));
+            if i % 10 == 0 {
+                b.push(BinanceStream::MarkPrice, 1, mark(t + 5));
+            }
+            if i == 125 {
+                b.push(BinanceStream::MarkPrice, 1, mark(midnight - 100));
+            }
+        }
+        let run = b.run(
+            midnight - 10_000,
+            Some(midnight + 11_000),
+            Some(b.records.len() as u64),
+        );
+        let files = b.epoch_files(40, &[]);
+        let dated = |stream: BinanceStream| {
+            files
+                .windows(2)
+                .filter(|w| w[0].0 == stream && w[1].0 == stream)
+                .any(|w| {
+                    w[0].1[0].event_time.as_millis().div_euclid(86_400_000)
+                        != w[1].1[0].event_time.as_millis().div_euclid(86_400_000)
+                })
+        };
+        assert!(dated(BinanceStream::MarkPrice) && dated(BinanceStream::AggTrade));
+        let mut source = MemorySource::default();
+        b.seal_epochs(&mut source, 40, &[]);
+        let live = LiveReplay::new(&source, SOURCE, "BTCUSDT", vec![run.clone()]);
+        let mut replay = live.run_replay(&run.run_id).unwrap();
+        let out = drained(&mut replay);
+        assert_eq!(out, b.live(&run));
+        assert!(
+            out.iter().any(|e| matches!(e, MarketEvent::FeedGap(g)
+                if g.reason == GapReason::LateEvent)),
+            "the old day's mark price is late: {out:?}"
+        );
+        assert!(replay.peak_buffered_records() <= 40, "{replay:?}");
+    }
+
+    /// The error of `run_replay` over `source`, which must equal the error
+    /// of the windowed replay over the run's extent (the same texts), and
+    /// which must come from the integrity pass alone: no file read twice.
+    fn up_front(source: &FaultySource, run: &LiveRun) -> ProviderError {
+        let live = LiveReplay::new(source, SOURCE, "BTCUSDT", vec![run.clone()]);
+        let err = live.run_replay(&run.run_id).unwrap_err();
+        let log = source.log.borrow().clone();
+        assert!(
+            log.iter().all(|path| source.reads_of(path) == 1),
+            "pass 2 ran: {log:?}"
+        );
+        let end = run.ended_at_ms.unwrap();
+        let mut windowed = live
+            .replay(window(
+                run.started_at_ms - RUN_MARGIN_MS,
+                end + RUN_MARGIN_MS,
+            ))
+            .unwrap()
+            .stream;
+        assert_eq!(drain_err(&mut windowed), err);
+        err
+    }
+
+    #[test]
+    fn every_integrity_error_comes_before_the_first_event() {
+        // (T5) Today's texts, from `run_replay` itself.
+        let b = busy_run();
+        let n = b.records.len() as u64;
+        let sealed = |skip: &[u64]| {
+            let mut source = MemorySource::default();
+            b.seal_epochs(&mut source, 32, skip);
+            source
+        };
+
+        // Seqs 40 and 7 stored twice: the smaller is named.
+        let mut twice = sealed(&[]);
+        let again: Vec<_> = b
+            .records
+            .iter()
+            .filter(|(_, r)| [7, 40].contains(&r.capture.as_ref().unwrap().receive_seq))
+            .map(|(_, r)| r.clone())
+            .collect();
+        assert_eq!(b.records[7].0, BinanceStream::AggTrade);
+        assert_eq!(b.records[40].0, BinanceStream::AggTrade);
+        twice.seal(SOURCE, "aggTrade", again);
+        let err = up_front(&FaultySource::new(twice), &clean(&b));
+        assert_eq!(
+            err,
+            ProviderError::Contract(format!("run {}: receive_seq 7 is stored twice", b.run_id))
+        );
+
+        // Two holes: the first is named, up to the next stored seq.
+        let err = up_front(&FaultySource::new(sealed(&[3, 4, 90])), &clean(&b));
+        assert_eq!(
+            err,
+            ProviderError::Source(format!(
+                "run {} ended cleanly but receive_seq [3, 5) is missing from the raw store",
+                b.run_id
+            ))
+        );
+
+        // A missing tail, and records beyond the run_end count.
+        let short = b.run(T0, Some(T0 + 21_000), Some(n + 2));
+        let err = up_front(&FaultySource::new(sealed(&[])), &short);
+        assert_eq!(
+            err,
+            ProviderError::Source(format!(
+                "run {} ended cleanly but receive_seq [{n}, {}) is missing from the raw store",
+                b.run_id,
+                n + 2
+            ))
+        );
+        let long = b.run(T0, Some(T0 + 21_000), Some(n - 2));
+        let err = up_front(&FaultySource::new(sealed(&[])), &long);
+        assert_eq!(
+            err,
+            ProviderError::Source(format!(
+                "run {} ended cleanly but the raw store holds {n} records, run_end says {}",
+                b.run_id,
+                n - 2
+            ))
+        );
+        // A run_end count far above the store's rows sizes nothing from it.
+        let huge = b.run(T0, Some(T0 + 21_000), Some(u64::MAX / 2));
+        let err = up_front(&FaultySource::new(sealed(&[])), &huge);
+        assert!(
+            matches!(&err, ProviderError::Source(d) if d.contains(&format!("[{n}, "))),
+            "{err}"
+        );
+
+        // A record without capture metadata.
+        let mut bare = sealed(&[]);
+        let mut record = b.of(BinanceStream::MarkPrice, &[])[0].clone();
+        record.capture = None;
+        bare.seal(SOURCE, "markPrice", vec![record.clone()]);
+        let err = up_front(&FaultySource::new(bare), &clean(&b));
+        assert!(
+            matches!(&err, ProviderError::Contract(d)
+                if d.contains(&format!("a live record at {} has no capture metadata",
+                    record.event_time))),
+            "{err}"
+        );
+
+        // A file of a stream the live capture does not know.
+        let mut unknown = sealed(&[]);
+        unknown.seal(
+            SOURCE,
+            "bookTicker",
+            b.of(BinanceStream::AggTrade, &[])[..2].to_vec(),
+        );
+        let file = unknown.file("binance-um/BTCUSDT/bookTicker/date=2026-10-06/part-00000.parquet");
+        let err = up_front(&FaultySource::new(unknown).selecting(file), &clean(&b));
+        assert!(
+            matches!(&err, ProviderError::Contract(d)
+                if d.ends_with("unknown live stream binance-um/BTCUSDT/bookTicker")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn each_file_of_the_run_is_read_twice_and_a_foreign_file_once() {
+        // (T6)
+        let b = busy_run();
+        let run = clean(&b);
+        let mut inner = sealed_epochs(&b, 50);
+        let mut other = RunBuilder::new("20261006T005900Z");
+        other.push(BinanceStream::AggTrade, 1, agg(9_000, T0 + 5_000));
+        other.seal(&mut inner, &[]);
+        let foreign = "binance-um/BTCUSDT/aggTrade/date=2026-10-06/part-00005.parquet";
+        assert_eq!(inner.file(foreign).rows, 1);
+        let source = FaultySource::new(inner);
+        let live = LiveReplay::new(&source, SOURCE, "BTCUSDT", vec![run.clone()]);
+        let mut replay = live.run_replay(&run.run_id).unwrap();
+        assert_eq!(drained(&mut replay), b.live(&run));
+        let log = source.log.borrow().clone();
+        let paths: BTreeSet<&String> = log.iter().collect();
+        assert_eq!(paths.len(), b.epoch_files(50, &[]).len() + 1, "{paths:?}");
+        for path in paths {
+            let expected = if path == foreign { 1 } else { 2 };
+            assert_eq!(source.reads_of(path), expected, "{path}");
+        }
+    }
+
+    #[test]
+    fn a_storage_fault_between_the_passes_fails_the_stream_after_a_prefix() {
+        // (T7) Pass 1 reads every file once; the fault hits the third file
+        // pass 2 opens.
+        let b = busy_run();
+        let run = clean(&b);
+        let full = b.live(&run);
+        let third = b.epoch_files(25, &[]).len() as u64 + 3;
+        for source in [
+            FaultySource::new(sealed_epochs(&b, 25)).failing_read(third),
+            FaultySource::new(sealed_epochs(&b, 25)).altering_read(third),
+        ] {
+            let live = LiveReplay::new(&source, SOURCE, "BTCUSDT", vec![run.clone()]);
+            let mut replay = live.run_replay(&run.run_id).unwrap();
+            let mut out = Vec::new();
+            let err = loop {
+                match replay.next_event() {
+                    Ok(Some(event)) => out.push(event),
+                    Ok(None) => panic!("the replay did not fail"),
+                    Err(err) => break err,
+                }
+            };
+            assert!(matches!(err, ProviderError::Source(_)), "{err}");
+            assert_eq!(replay.next_event(), Err(err.clone()));
+            assert_eq!(replay.next_event(), Err(err));
+            assert_eq!(out[..], full[..out.len()]);
+            assert!(out.len() < full.len());
+        }
+    }
+
+    fn sealed_epochs(b: &RunBuilder, epoch: usize) -> MemorySource {
+        let mut source = MemorySource::default();
+        b.seal_epochs(&mut source, epoch, &[]);
+        source
+    }
+
+    #[test]
+    fn record_stats_are_final_at_once_and_pipeline_stats_after_the_drain() {
+        // (T8)
+        let b = busy_run();
+        let run = clean(&b);
+        let n = b.records.len() as u64;
+        let source = sealed_epochs(&b, 20);
+        let live = LiveReplay::new(&source, SOURCE, "BTCUSDT", vec![run.clone()]);
+        let mut replay = live.run_replay(&run.run_id).unwrap();
+        let fresh = Pipeline::new(&run.symbol, run.hold_back_ms, run.oi_retime_ms, &run.seeds);
+        assert_eq!(
+            replay.stats(),
+            &RunStats {
+                run_id: run.run_id.clone(),
+                records: n,
+                replayed: n,
+                ignored: 0,
+                clean: true,
+                pipeline: fresh.stats(),
+            }
+        );
+        drained(&mut replay);
+        let mut pipeline =
+            Pipeline::new(&run.symbol, run.hold_back_ms, run.oi_retime_ms, &run.seeds);
+        for (stream, record) in &b.records {
+            let _ = pipeline.push(*stream, record);
+        }
+        let _ = pipeline.finish();
+        assert_eq!(replay.stats().pipeline, pipeline.stats());
+        assert_ne!(replay.stats().pipeline, fresh.stats());
+        // The windowed replay of the same run counts alike.
+        let mut windowed = live
+            .replay(window(T0 - RUN_MARGIN_MS, T0 + 21_000 + RUN_MARGIN_MS))
+            .unwrap()
+            .stream;
+        drain(&mut windowed);
+        assert_eq!(windowed.runs(), std::slice::from_ref(replay.stats()));
     }
 }
