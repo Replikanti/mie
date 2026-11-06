@@ -208,3 +208,14 @@ sides; each is one sample.
   their timer started, which is why only that line grows.
 - **Bound (D5):** the peak of 13 829 records is 0.61 % of the run, below
   its largest seal of 13 906.
+
+## Acceptance
+
+Accepted 2026-11-06 at #140's STOP 2. Every condition of "Accept when"
+holds on the measurement above: the equivalence reports are
+byte-identical, the whole-stream event hash is the same,
+`measure_triggers_live` passes T0 with 0 mismatches and 0 rejections,
+and `measure_run_replay_bound` peaks at 13 829 records, below the run's
+largest seal of 13 906. The operator approved the measurement, including
+its known limit: it rests on one store, so a busier seal interval raises
+the peak with it, still to one interval rather than the run.
