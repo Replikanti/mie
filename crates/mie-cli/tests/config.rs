@@ -377,3 +377,189 @@ staging = "data/archive-staging"
         );
     }
 }
+
+mod cold_roots {
+    use super::REQUIRED;
+    use mie_cli::config::{ArchiveConfig, ColdRoot, IngestConfig};
+    use std::path::{Path, PathBuf};
+
+    const ARCHIVE: &str = r#"
+[instrument]
+symbol = "BTCUSDT"
+[paths]
+raw_root = "data/raw"
+import_ledger = "data/archive-ledger"
+staging = "data/archive-staging"
+"#;
+
+    const TWO_TARGETS: &str = r#"cold_roots = [
+  { path = "/mnt/a", copy_target = true },
+  { path = "/mnt/b", copy_target = true },
+  { path = "/mnt/old", copy_target = false },
+]
+"#;
+
+    /// `REQUIRED` (or `ARCHIVE`) with `lines` appended to `[paths]`.
+    fn with_paths(base: &str, lines: &str) -> String {
+        let at = base.find("[paths]\n").unwrap() + "[paths]\n".len();
+        format!("{}{lines}{}", &base[..at], &base[at..])
+    }
+
+    fn root(path: &str, copy_target: bool) -> ColdRoot {
+        ColdRoot {
+            path: PathBuf::from(path),
+            copy_target,
+        }
+    }
+
+    #[test]
+    fn the_shape_parses_in_both_configurations_and_defaults_to_empty() {
+        let expected = vec![
+            root("/mnt/a", true),
+            root("/mnt/b", true),
+            root("/mnt/old", false),
+        ];
+        let ingest = IngestConfig::parse(&with_paths(REQUIRED, TWO_TARGETS)).unwrap();
+        assert_eq!(ingest.paths.cold_roots, expected);
+        let archive = ArchiveConfig::parse(&with_paths(ARCHIVE, TWO_TARGETS)).unwrap();
+        assert_eq!(archive.paths.cold_roots, expected);
+        assert_eq!(IngestConfig::parse(REQUIRED).unwrap().paths.cold_roots, []);
+        assert_eq!(ArchiveConfig::parse(ARCHIVE).unwrap().paths.cold_roots, []);
+    }
+
+    #[test]
+    fn the_examples_still_parse_without_cold_roots() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let ingest = IngestConfig::load(&dir.join("ingest.example.toml")).unwrap();
+        assert_eq!(ingest.paths.cold_roots, []);
+        let archive = ArchiveConfig::load(&dir.join("archive.example.toml")).unwrap();
+        assert_eq!(archive.paths.cold_roots, []);
+    }
+
+    #[test]
+    fn invalid_cold_roots_are_refused_in_both_configurations() {
+        for (lines, expected) in [
+            (
+                "cold_roots = [{ path = \"/mnt/a\", copy_target = true, device = 1 }]\n",
+                "unknown field",
+            ),
+            ("cold_roots = [{ path = \"/mnt/a\" }]\n", "missing field"),
+            ("cold_roots = [{ copy_target = true }]\n", "missing field"),
+            (
+                "cold_roots = [{ path = \"/mnt/a\", copy_target = \"yes\" }]\n",
+                "copy_target",
+            ),
+            (
+                "cold_roots = [{ path = \"/mnt/a\", copy_target = false }]\n",
+                "0 copy target",
+            ),
+            (
+                "cold_roots = [{ path = \"/mnt/a\", copy_target = true }]\n",
+                "1 copy target",
+            ),
+            (
+                "cold_roots = [{ path = \"/mnt/a\", copy_target = true }, \
+                 { path = \"/mnt/old\", copy_target = false }, \
+                 { path = \"/mnt/older\", copy_target = false }]\n",
+                "1 copy target",
+            ),
+            (
+                "cold_roots = [{ path = \"/mnt/a\", copy_target = true }, \
+                 { path = \"/mnt/a\", copy_target = true }]\n",
+                "twice",
+            ),
+            (
+                "cold_roots = [{ path = \"/mnt/a\", copy_target = true }, \
+                 { path = \"/mnt/b\", copy_target = true }, \
+                 { path = \"/mnt/a\", copy_target = false }]\n",
+                "twice",
+            ),
+            (
+                "cold_roots = [{ path = \"/mnt/a\", copy_target = true }, \
+                 { path = \"data/raw\", copy_target = true }]\n",
+                "is the raw_root",
+            ),
+            ("cold_roots = \"/mnt/a\"\n", "cold_roots"),
+        ] {
+            let error = IngestConfig::parse(&with_paths(REQUIRED, lines))
+                .expect_err(lines)
+                .0;
+            assert!(error.contains(expected), "ingest {lines}: {error}");
+            let error = ArchiveConfig::parse(&with_paths(ARCHIVE, lines))
+                .expect_err(lines)
+                .0;
+            assert!(error.contains(expected), "archive {lines}: {error}");
+        }
+    }
+
+    /// An ingest configuration under `dir` whose `[history]` names an
+    /// archive configuration on the same raw root; `ingest` and `archive`
+    /// are the `cold_roots` lines of each (empty: no key).
+    fn configs(dir: &Path, ingest: &str, archive: &str) -> IngestConfig {
+        std::fs::create_dir_all(dir.join("raw")).unwrap();
+        let raw = dir.join("raw").display().to_string();
+        std::fs::write(
+            dir.join("archive.toml"),
+            format!(
+                "[instrument]\nsymbol = \"BTCUSDT\"\n[paths]\nraw_root = \"{raw}\"\n\
+                 import_ledger = \"{}\"\nstaging = \"{}\"\n{archive}",
+                dir.join("ledger").display(),
+                dir.join("staging").display()
+            ),
+        )
+        .unwrap();
+        IngestConfig::parse(&format!(
+            "[instrument]\nsymbol = \"BTCUSDT\"\nsource = \"binance-um\"\n[paths]\n\
+             raw_root = \"{raw}\"\njournal = \"{}\"\n{ingest}[binance]\n\
+             ws_base_url = \"wss://fake.invalid/ws\"\nrest_base_url = \"https://fake.invalid\"\n\
+             [history]\norigin = \"2025-10-01\"\ncutover = \"2026-10-20\"\n\
+             archive_config = \"{}\"\n",
+            dir.join("journal.jsonl").display(),
+            dir.join("archive.toml").display()
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn the_history_archive_must_name_the_same_cold_roots() {
+        let dir = crate::common::TempDir::new("config-cold-roots");
+        let dir = dir.path();
+        let same = |lines: &str| configs(dir, lines, lines).history_archive();
+        assert!(same("").unwrap().is_some());
+        assert!(same(TWO_TARGETS).unwrap().is_some());
+
+        let reordered = "cold_roots = [\n  { path = \"/mnt/b\", copy_target = true },\n  \
+                         { path = \"/mnt/a\", copy_target = true },\n  \
+                         { path = \"/mnt/old\", copy_target = false },\n]\n";
+        let reflagged = TWO_TARGETS.replace(
+            "\"/mnt/old\", copy_target = false",
+            "\"/mnt/old\", copy_target = true",
+        );
+        let shorter = "cold_roots = [\n  { path = \"/mnt/a\", copy_target = true },\n  \
+                       { path = \"/mnt/b\", copy_target = true },\n]\n";
+        for (ingest, archive) in [
+            (TWO_TARGETS, reordered),
+            (TWO_TARGETS, reflagged.as_str()),
+            (TWO_TARGETS, shorter),
+            (TWO_TARGETS, ""),
+            ("", TWO_TARGETS),
+        ] {
+            let error = configs(dir, ingest, archive)
+                .history_archive()
+                .expect_err(archive)
+                .0;
+            assert!(
+                error.contains("cold_roots") && error.contains("ADR-062 D7"),
+                "{error}"
+            );
+            // The error names both lists.
+            let listed = "[/mnt/a (copy target), /mnt/b (copy target), /mnt/old (read-only)]";
+            assert!(error.contains(listed), "{error}");
+            if ingest.is_empty() || archive.is_empty() {
+                assert!(error.contains("[]"), "{error}");
+            } else {
+                assert_eq!(error.matches("/mnt/a (copy target)").count(), 2, "{error}");
+            }
+        }
+    }
+}

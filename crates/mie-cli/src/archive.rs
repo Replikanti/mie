@@ -131,8 +131,10 @@ pub fn import_options(
 ///
 /// # Errors
 ///
-/// A description when the store cannot be opened or the run stops on an
-/// integrity, store or ledger failure. Files reported before stay imported.
+/// A description when a tiered store's hot has no marker (before anything
+/// is opened, dry runs included), when the store cannot be opened, or when
+/// the run stops on an integrity, store or ledger failure. Files reported
+/// before stay imported.
 pub fn import(
     config: &ArchiveConfig,
     request: &ImportRequest,
@@ -140,6 +142,9 @@ pub fn import(
     shutdown: &AtomicBool,
     out: &mut dyn Write,
 ) -> Result<ImportSummary, String> {
+    // Dry runs too: on a lost hot every file would read as not imported
+    // (ADR-062 D7, *Hot lost*).
+    crate::store::check_hot(&config.paths.raw_root, &config.paths.cold_roots)?;
     let options = import_options(config, request)?;
     let store = ParquetRawStore::new(&config.paths.raw_root);
     let fetcher = Fetcher::new(

@@ -168,8 +168,9 @@ impl<P: MarketDataProvider> MarketDataProvider for Counting<'_, P> {
 ///
 /// # Errors
 ///
-/// A description of a failure before the capture started (configuration,
-/// journal, store lock, recovery, seeds). Failures after the start end the
+/// A description of a failure before the capture started (a tiered store's
+/// hot without its marker, configuration, journal, store lock, recovery,
+/// seeds). Failures after the start end the
 /// run and are reported in the [`IngestOutcome`].
 pub fn run(
     config: &IngestConfig,
@@ -190,6 +191,9 @@ pub fn run_with_hold(
     shutdown: Arc<AtomicBool>,
     hold: WarmUpHold,
 ) -> Result<IngestOutcome, String> {
+    // Before anything is opened: `Journal::open` creates the journal file,
+    // and a refused start leaves no new file (ADR-062 D7, *Hot lost*).
+    crate::store::check_hot(&config.paths.raw_root, &config.paths.cold_roots)?;
     let clock = Arc::clone(&transports.clock);
     let now = || clock.now_utc_ns();
     let run_id = run_id(now());

@@ -108,10 +108,75 @@ pub struct Instrument {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Paths {
-    /// Root directory of the raw store.
+    /// Root directory of the raw store (hot, ADR-062 D4).
     pub raw_root: PathBuf,
     /// The capture journal (JSON Lines, appended to).
     pub journal: PathBuf,
+    /// The cold roots of a tiered store, in read order (ADR-062 D7);
+    /// empty: a single-root store.
+    #[serde(default)]
+    pub cold_roots: Vec<ColdRoot>,
+}
+
+/// One entry of `cold_roots` (ADR-062 D4, D7, D11).
+///
+/// Both keys are required, because either default would fail silently:
+/// `copy_target = false` hides a forgotten target until a file is short of
+/// k copies, `true` turns a read-only root into a write target.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ColdRoot {
+    /// The root directory, mounted outside mie.
+    pub path: PathBuf,
+    /// Whether the replicator copies every file to it (ADR-062 D11).
+    pub copy_target: bool,
+}
+
+/// The least number of copy targets in a non-empty `cold_roots`: k = 2
+/// (ADR-062 D11). k counts copies on the copy targets and every target
+/// receives every file, so k equals the number of copy targets; with one,
+/// no file ever reaches k copies.
+pub const MIN_COPY_TARGETS: usize = 2;
+
+/// Checks `cold_roots` against `raw_root` (ADR-062 D7). An empty list
+/// passes. Otherwise it needs at least [`MIN_COPY_TARGETS`] copy targets,
+/// no duplicate path and no entry equal to `raw_root`.
+///
+/// The comparisons are lexical (`Path` equality), never `canonicalize`:
+/// loading the configuration must never touch a cold mount, since a hung
+/// mount would block the start of `mie ingest`. Two spellings of one
+/// directory are caught by the root markers instead (`mie store
+/// init-root` refuses a non-empty directory).
+fn validate_cold_roots(raw_root: &Path, cold_roots: &[ColdRoot]) -> Result<(), ConfigError> {
+    if cold_roots.is_empty() {
+        return Ok(());
+    }
+    let targets = cold_roots.iter().filter(|root| root.copy_target).count();
+    if targets < MIN_COPY_TARGETS {
+        return Err(ConfigError(format!(
+            "paths.cold_roots has {targets} copy target(s); a tiered store needs at least \
+             {MIN_COPY_TARGETS} (k = 2 copies on independent devices, ADR-062 D11)"
+        )));
+    }
+    for (i, root) in cold_roots.iter().enumerate() {
+        if root.path == raw_root {
+            return Err(ConfigError(format!(
+                "paths.cold_roots: {} is the raw_root (hot); a cold root is another \
+                 directory (ADR-062 D4)",
+                root.path.display()
+            )));
+        }
+        if cold_roots[..i]
+            .iter()
+            .any(|earlier| earlier.path == root.path)
+        {
+            return Err(ConfigError(format!(
+                "paths.cold_roots lists {} twice",
+                root.path.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// `[binance]`.
@@ -330,6 +395,7 @@ impl IngestConfig {
                  exchange's {CONNECTION_LIMIT_SECS} s connection limit"
             )));
         }
+        validate_cold_roots(&self.paths.raw_root, &self.paths.cold_roots)?;
         if let Some(history) = &self.history {
             let (origin, cutover) = (history.origin_ms()?, history.cutover_ms()?);
             if origin >= cutover {
@@ -355,9 +421,11 @@ impl IngestConfig {
     ///
     /// [`ConfigError`] when the archive configuration cannot be loaded, when
     /// its raw root and this one's cannot be resolved or differ (compared
-    /// after `canonicalize`; the error names both), or when its symbol
+    /// after `canonicalize`; the error names both), when its symbol
     /// differs: both segments of the chain are read from one store, for one
-    /// instrument (ADR-052 D6).
+    /// instrument (ADR-052 D6), or when its `cold_roots` differ from this
+    /// one's in entries, order (the read order) or flags (ADR-062 D7; the
+    /// error names both lists).
     pub fn history_archive(&self) -> Result<Option<(History, ArchiveConfig)>, ConfigError> {
         let Some(history) = &self.history else {
             return Ok(None);
@@ -395,6 +463,16 @@ impl IngestConfig {
                 path.display(),
                 archive.instrument.symbol,
                 self.instrument.symbol
+            )));
+        }
+        if archive.paths.cold_roots != self.paths.cold_roots {
+            return Err(ConfigError(format!(
+                "history.archive_config {}: its paths.cold_roots {} are not this \
+                 configuration's {}: both configurations describe one tiered store, with the \
+                 same roots in the same read order and the same copy targets (ADR-062 D7)",
+                path.display(),
+                describe_cold_roots(&archive.paths.cold_roots),
+                describe_cold_roots(&self.paths.cold_roots)
             )));
         }
         Ok(Some((history.clone(), archive)))
@@ -499,6 +577,25 @@ pub struct ArchiveInstrument {
     pub symbol: String,
 }
 
+/// `cold_roots` as `[path (copy target), …]`, for error messages.
+fn describe_cold_roots(cold_roots: &[ColdRoot]) -> String {
+    let entries: Vec<String> = cold_roots
+        .iter()
+        .map(|root| {
+            format!(
+                "{} ({})",
+                root.path.display(),
+                if root.copy_target {
+                    "copy target"
+                } else {
+                    "read-only"
+                }
+            )
+        })
+        .collect();
+    format!("[{}]", entries.join(", "))
+}
+
 /// `[paths]` of the archive configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -509,6 +606,10 @@ pub struct ArchivePaths {
     pub import_ledger: PathBuf,
     /// Download staging; each zip is removed once imported.
     pub staging: PathBuf,
+    /// The cold roots of a tiered store, in read order, as in the ingest
+    /// configuration (ADR-062 D7); empty: a single-root store.
+    #[serde(default)]
+    pub cold_roots: Vec<ColdRoot>,
 }
 
 /// `[archive]`.
@@ -589,6 +690,7 @@ impl ArchiveConfig {
         if config.streams()?.is_empty() {
             return Err(ConfigError("archive.streams is empty".to_owned()));
         }
+        validate_cold_roots(&config.paths.raw_root, &config.paths.cold_roots)?;
         Ok(config)
     }
 

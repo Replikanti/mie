@@ -16,6 +16,7 @@ use mie_cli::experiment::{self, ExperimentPipeline, ExperimentRequest};
 use mie_cli::ingest::{self, Transports};
 use mie_cli::replay::{self, ReplayRequest, ReplaySource};
 use mie_cli::report;
+use mie_cli::store;
 use mie_domain::time::EventTime;
 use mie_ports::outbound::ReplayWindow;
 use std::path::{Path, PathBuf};
@@ -254,6 +255,28 @@ USAGE:
         UTC-day VWAP, prior-day auction state, the monitored prior-day
         levels with their zones and the active monitors. PASS (exit 0), or
         FAIL: <reason> (exit 1) when the window holds no event.
+
+    mie store init --config <path>
+        Initialize a tiered raw store (ADR-062 D7): write hot's root marker
+        (.mie/root, id hot) and an empty copy ledger (.mie/copy-ledger)
+        under the ingest config's raw_root, once. Needs paths.cold_roots.
+        Refused when raw_root/.mie exists, and when a configured cold root
+        already carries a marker or a copy-ledger copy: that hot was
+        initialized before and is lost, which the hot restore repairs,
+        never a new init. Prints what it wrote and what it found on each
+        cold root and exits 0, or prints FAIL: <reason> and exits 1. See
+        crates/mie-cli/ingest.example.toml.
+
+    mie store init-root --config <path> --root <path> --id <id>
+        Write the root marker of a freshly provisioned cold root
+        (ADR-062 D4), once. <path> must be one of the ingest config's
+        paths.cold_roots, spelled as there, and an existing, empty
+        directory; it is never created. The id is 1 to 64 characters from
+        A-Z, a-z, 0-9, '_' and '-', not hot, and no other configured root
+        may carry it. Run mie store init first. Refused when the root is on
+        the same device as raw_root: an unmounted mount point is an empty
+        directory on hot's filesystem. Prints what it wrote and exits 0, or
+        prints FAIL: <reason> and exits 1.
 
     mie --help
 ";
@@ -631,6 +654,36 @@ fn dispatch(args: &[String]) -> Result<ExitCode, String> {
                 Ok(exit(pass))
             }
             _ => Err("expected `mie alerts replay …` or `mie alerts report …`".to_owned()),
+        },
+        Some("store") => match args.get(1).map(String::as_str) {
+            Some("init") => {
+                let options = Options::parse(&args[2..], &["--config"], &[])?;
+                let config =
+                    IngestConfig::load(&options.path("--config")?).map_err(|e| e.to_string())?;
+                let pass = store::init(&config, &mut std::io::stdout().lock())?;
+                Ok(exit(pass))
+            }
+            Some("init-root") => {
+                let options = Options::parse(&args[2..], &["--config", "--root", "--id"], &[])?;
+                let config =
+                    IngestConfig::load(&options.path("--config")?).map_err(|e| e.to_string())?;
+                let root = options.path("--root")?;
+                let id = options.value("--id")?;
+                let probe = store::device_probe()?;
+                let pass = store::init_root(
+                    &config,
+                    &root,
+                    id,
+                    probe.as_ref(),
+                    &mut std::io::stdout().lock(),
+                )?;
+                Ok(exit(pass))
+            }
+            _ => Err(
+                "expected `mie store init --config <path>` or `mie store init-root \
+                 --config <path> --root <path> --id <id>`"
+                    .to_owned(),
+            ),
         },
         Some(other) => Err(format!("unknown command {other:?}")),
     }

@@ -15,6 +15,14 @@ raw_root = "data/raw"
 import_ledger = "data/archive-ledger"
 # Zips are downloaded here and removed once imported.
 staging = "data/archive-staging"
+# Cold roots of a tiered store (ADR-062 D7): the same list as the ingest
+# configuration's paths.cold_roots, same order, same flags; default empty.
+# Once set, `mie archive-import` refuses to start on a raw_root without
+# the marker that `mie store init` writes.
+# cold_roots = [
+#   { path = "/mnt/mie-cold-a", copy_target = true },
+#   { path = "/mnt/mie-cold-b", copy_target = true },
+# ]
 
 # Every key below is optional; the values shown are the defaults.
 [archive]

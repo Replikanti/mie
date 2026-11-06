@@ -7,6 +7,12 @@
 //!
 //! Relative paths always use `/`, whatever the platform, because they are
 //! part of the manifest and of the dataset version.
+//!
+//! A tiered store (ADR-062 D4, D7) also keeps its own metadata in
+//! `<root>/.mie/`: the root marker ([`ROOT_MARKER`]) on every root, and on
+//! hot the copy ledger ([`COPY_LEDGER`]) with its lock file
+//! ([`COPY_LEDGER_LOCK`]). `.mie/` lies outside the layout: `select` and
+//! recovery walk only `source=` entries, so they never see it.
 
 use mie_ports::raw::{RawStoreError, RawStreamKey};
 use std::path::{Path, PathBuf};
@@ -19,6 +25,20 @@ pub(crate) const MAX_EVENT_TIME_MS: i64 = 253_402_300_799_999;
 
 /// Highest part number (`part-99999`).
 pub(crate) const MAX_PART: u32 = 99_999;
+
+/// The metadata directory of a root (ADR-062 D7), outside the layout.
+pub(crate) const META_DIR: &str = ".mie";
+
+/// The root marker in [`META_DIR`]: the root's id (ADR-062 D4).
+pub(crate) const ROOT_MARKER: &str = "root";
+
+/// The copy ledger in [`META_DIR`] (ADR-062 D7).
+pub(crate) const COPY_LEDGER: &str = "copy-ledger";
+
+/// The copy ledger's lock file in [`META_DIR`] (ADR-062 D7). A separate
+/// file because the rebuild replaces the ledger by rename, and a lock on
+/// the ledger's inode would stay on the replaced file.
+pub(crate) const COPY_LEDGER_LOCK: &str = "copy-ledger.lock";
 
 /// Days between 0000-03-01 and 1970-01-01 in the proleptic Gregorian
 /// calendar (the epoch shift of the civil-date algorithm).
@@ -173,6 +193,33 @@ pub(crate) fn partition_dir(key: &RawStreamKey, date: &str) -> String {
     format!("{}/date={date}", stream_dir(key))
 }
 
+/// Parses a partition directory back into its stream and date: the inverse
+/// of [`partition_dir`], checked by rendering it again.
+///
+/// # Errors
+///
+/// [`RawStoreError::Invalid`] for anything [`partition_dir`] cannot
+/// produce.
+pub(crate) fn parse_partition_dir(dir: &str) -> Result<(RawStreamKey, String), RawStoreError> {
+    let invalid = || RawStoreError::Invalid(format!("{dir:?} is not a raw partition directory"));
+    let segments: Vec<&str> = dir.split('/').collect();
+    let [source, instrument, stream, date] = segments[..] else {
+        return Err(invalid());
+    };
+    let key = RawStreamKey::new(
+        source.strip_prefix("source=").ok_or_else(invalid)?,
+        instrument.strip_prefix("instrument=").ok_or_else(invalid)?,
+        stream.strip_prefix("stream=").ok_or_else(invalid)?,
+    )
+    .map_err(|_| invalid())?;
+    let date = date.strip_prefix("date=").ok_or_else(invalid)?;
+    parse_date(date).ok_or_else(invalid)?;
+    if partition_dir(&key, date) != dir {
+        return Err(invalid());
+    }
+    Ok((key, date.to_owned()))
+}
+
 /// Relative path of a file of `part` in a partition.
 pub(crate) fn file_path(key: &RawStreamKey, date: &str, kind: PartFile, part: u32) -> String {
     format!("{}/{}", partition_dir(key, date), kind.name(part))
@@ -308,6 +355,36 @@ mod tests {
             "x",
         ] {
             assert_eq!(PartFile::classify(other), None, "{other:?}");
+        }
+    }
+
+    #[test]
+    fn partition_dirs_round_trip_and_reject_escapes() {
+        let key = RawStreamKey::new("binance-um", "BTCUSDT", "aggTrade").unwrap();
+        let dir = partition_dir(&key, "2026-10-06");
+        assert_eq!(
+            dir,
+            "source=binance-um/instrument=BTCUSDT/stream=aggTrade/date=2026-10-06"
+        );
+        assert_eq!(
+            parse_partition_dir(&dir).unwrap(),
+            (key, "2026-10-06".to_owned())
+        );
+        for bad in [
+            "",
+            "source=binance-um/instrument=BTCUSDT/stream=aggTrade",
+            "source=binance-um/instrument=BTCUSDT/stream=aggTrade/date=2026-10-06/",
+            "source=binance-um/instrument=BTCUSDT/stream=aggTrade/date=2026-10-32",
+            "source=binance-um/instrument=BTCUSDT/stream=aggTrade/date=2026-10-06/part-00004.parquet",
+            "source=../instrument=BTCUSDT/stream=aggTrade/date=2026-10-06",
+            "/source=binance-um/instrument=BTCUSDT/stream=aggTrade/date=2026-10-06",
+            "instrument=BTCUSDT/source=binance-um/stream=aggTrade/date=2026-10-06",
+            ".mie/instrument=BTCUSDT/stream=aggTrade/date=2026-10-06",
+        ] {
+            assert!(
+                matches!(parse_partition_dir(bad), Err(RawStoreError::Invalid(_))),
+                "{bad:?}"
+            );
         }
     }
 

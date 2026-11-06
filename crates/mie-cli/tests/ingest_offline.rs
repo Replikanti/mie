@@ -1133,3 +1133,99 @@ fn a_queue_past_its_limit_abandons_the_warm_up_and_starts_cold() {
     let (error, _) = overflow_run("queue-no-room", 3, HoldAt::AfterGuard);
     assert_eq!(error, expected(1, 0, 3));
 }
+
+mod tiered_start {
+    //! The start refusal on a tiered store's hot without its marker
+    //! (ADR-062 D7, *Hot lost*), and no `.mie/` without cold roots.
+
+    use super::common::{
+        D0, FakeClock, HOUR, NoHttp, ScriptedConnector, TempDir, agg, config, ingest,
+    };
+    use mie_adapter_parquet::root_marker::{self, HOT_ID};
+    use mie_cli::config::{ColdRoot, IngestConfig};
+    use mie_cli::ingest::Transports;
+    use std::path::Path;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    fn tiered(dir: &Path) -> IngestConfig {
+        let mut config = config(dir);
+        config.paths.cold_roots = ["cold-a", "cold-b"]
+            .map(|name| ColdRoot {
+                path: dir.join(name),
+                copy_target: true,
+            })
+            .to_vec();
+        config
+    }
+
+    fn start(config: &IngestConfig) -> Result<mie_cli::ingest::IngestOutcome, String> {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let transports = Transports {
+            connector: ScriptedConnector::new(
+                "btcusdt@aggTrade",
+                vec![vec![agg(1, D0 + HOUR + 10)]],
+                &shutdown,
+            ),
+            http: Arc::new(NoHttp),
+            clock: FakeClock::new(D0 + HOUR, "mie-aggTrade"),
+        };
+        mie_cli::ingest::run(config, transports, shutdown)
+    }
+
+    #[test]
+    fn a_hot_without_its_marker_refuses_to_start_and_writes_nothing() {
+        let dir = TempDir::new("tiered-no-marker");
+        let config = tiered(dir.path());
+        let error = start(&config).expect_err("refused");
+        assert!(
+            error.contains("mie store init") && error.contains("hot restore"),
+            "{error}"
+        );
+        assert!(!config.paths.journal.exists());
+        assert!(!config.paths.raw_root.exists());
+
+        // With an existing, empty raw root: still nothing is created in it.
+        std::fs::create_dir_all(&config.paths.raw_root).unwrap();
+        start(&config).expect_err("refused");
+        assert!(!config.paths.journal.exists());
+        assert_eq!(
+            std::fs::read_dir(&config.paths.raw_root).unwrap().count(),
+            0
+        );
+    }
+
+    #[test]
+    fn a_raw_root_carrying_a_cold_marker_is_refused() {
+        let dir = TempDir::new("tiered-cold-marker");
+        let config = tiered(dir.path());
+        std::fs::create_dir_all(&config.paths.raw_root).unwrap();
+        root_marker::create_meta(&config.paths.raw_root, "cold-a", false).unwrap();
+        let error = start(&config).expect_err("refused");
+        assert!(error.contains("cold root \"cold-a\""), "{error}");
+        assert!(!config.paths.journal.exists());
+    }
+
+    #[test]
+    fn a_hot_with_its_marker_starts_as_today() {
+        let dir = TempDir::new("tiered-marker");
+        let config = tiered(dir.path());
+        std::fs::create_dir_all(&config.paths.raw_root).unwrap();
+        root_marker::create_meta(&config.paths.raw_root, HOT_ID, true).unwrap();
+        let outcome = start(&config).expect("starts");
+        assert_eq!(outcome.exit_code(), 0, "{:?}", outcome.error);
+        assert_eq!(outcome.summary.unwrap().stats.records, 1);
+        assert!(config.paths.journal.exists());
+    }
+
+    #[test]
+    fn without_cold_roots_no_meta_directory_is_created() {
+        let dir = TempDir::new("single-root");
+        let config = config(dir.path());
+        assert_eq!(config.paths.cold_roots, []);
+        let outcome = ingest(&config, D0 + HOUR, vec![vec![agg(1, D0 + HOUR + 10)]]);
+        assert_eq!(outcome.exit_code(), 0, "{:?}", outcome.error);
+        assert!(config.paths.raw_root.exists());
+        assert!(!config.paths.raw_root.join(".mie").exists());
+    }
+}
