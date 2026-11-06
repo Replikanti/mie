@@ -44,7 +44,6 @@ use mie_adapter_binance::archive::ArchiveStream;
 use mie_adapter_binance::archive::fold::TradeCorrection;
 use mie_adapter_binance::{HistoryChainStream, LiveReplay};
 use mie_adapter_fs::FsResultStore;
-use mie_adapter_parquet::ParquetRawStore;
 use mie_app::backtest::ChainBacktest;
 use mie_app::{
     BacktestService, CalibrationService, ChainBounds, ExperimentService, FundingCoverage,
@@ -157,7 +156,10 @@ pub fn run(request: &ExperimentRequest, out: &mut dyn Write) -> Result<bool, Str
             ReplaySource::Live(config) => {
                 match read_runs(&config.paths.journal, &config.instrument.source) {
                     Ok(runs) => {
-                        let store = ParquetRawStore::new(&config.paths.raw_root);
+                        let store = crate::store::raw_store(
+                            &config.paths.raw_root,
+                            &config.paths.cold_roots,
+                        );
                         let runs = runs.iter().map(|run| run.live_run()).collect();
                         let live = LiveReplay::new(
                             &store,
@@ -179,14 +181,16 @@ pub fn run(request: &ExperimentRequest, out: &mut dyn Write) -> Result<bool, Str
                 streams,
                 correction,
             } => {
-                let store = ParquetRawStore::new(&config.paths.raw_root);
+                let store =
+                    crate::store::raw_store(&config.paths.raw_root, &config.paths.cold_roots);
                 let folding = *correction == TradeCorrection::Fold;
                 archive_replay(&store, config, streams.as_deref(), *correction).and_then(|replay| {
                     execute(ExperimentService::new(replay, results), &spec, folding)
                 })
             }
             ReplaySource::History(config) => {
-                let store = ParquetRawStore::new(&config.paths.raw_root);
+                let store =
+                    crate::store::raw_store(&config.paths.raw_root, &config.paths.cold_roots);
                 history_chain(config, &store).and_then(|chain| {
                     // The bounds come from the built chain, so they cannot
                     // disagree with the provider.

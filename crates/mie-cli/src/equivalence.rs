@@ -220,7 +220,7 @@ pub fn run(
     );
     let outcome = match read_runs(&config.paths.journal, source) {
         Ok(runs) => {
-            let store = ParquetRawStore::new(&config.paths.raw_root);
+            let store = crate::store::raw_store(&config.paths.raw_root, &config.paths.cold_roots);
             let live = LiveReplay::new(
                 &store,
                 source,

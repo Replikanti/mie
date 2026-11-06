@@ -7,6 +7,12 @@
 //! - [`check_hot`] is the start refusal of `mie ingest` and `mie
 //!   archive-import`: with `cold_roots` configured, hot must carry its
 //!   marker.
+//! - [`check_copy_ledger`] is the importer's second start refusal: with
+//!   `cold_roots` configured, hot's copy ledger must be readable.
+//! - [`raw_store`] builds the raw store of every command: the tiered store
+//!   of `raw_root` and `cold_roots`, which with no cold root is the
+//!   single-root store. No command builds a single-root store over a tiered
+//!   configuration.
 //!
 //! Every device check goes through one [`DeviceProbe`]. [`StDevProbe`]
 //! (`st_dev`) is its only production implementation. A Cargo feature
@@ -23,6 +29,7 @@
 //! place that names them: they are a test device, not a configuration key.
 
 use crate::config::{ColdRoot, IngestConfig};
+use mie_adapter_parquet::ParquetRawStore;
 use mie_adapter_parquet::copy_ledger;
 use mie_adapter_parquet::root_marker::{self, HOT_ID};
 use mie_ports::raw::validate_segment;
@@ -193,6 +200,45 @@ pub fn check_hot(raw_root: &Path, cold_roots: &[ColdRoot]) -> Result<(), String>
         Err(error) => Err(format!(
             "raw_root {}: cannot read hot's root marker: {error}",
             raw_root.display()
+        )),
+    }
+}
+
+/// The raw store of `raw_root` and `cold_roots` (ADR-062 D7): hot, then the
+/// cold roots in configuration order. Does no I/O, so it never touches a
+/// cold mount; with `cold_roots` empty it is the single-root store.
+pub fn raw_store(raw_root: &Path, cold_roots: &[ColdRoot]) -> ParquetRawStore {
+    ParquetRawStore::tiered(
+        raw_root,
+        cold_roots.iter().map(|root| root.path.clone()).collect(),
+    )
+}
+
+/// The importer's refusal on a missing or unreadable copy ledger (ADR-062
+/// D6, D7 *Hot intact, ledger lost*). With `cold_roots` empty it returns at
+/// once, without a filesystem call.
+///
+/// # Errors
+///
+/// A description naming the ledger, and the read failure if there is one:
+/// the importer refuses, since its days can lie outside the hot window, and
+/// the copy-ledger rebuild restores the ledger.
+pub fn check_copy_ledger(raw_root: &Path, cold_roots: &[ColdRoot]) -> Result<(), String> {
+    if cold_roots.is_empty() {
+        return Ok(());
+    }
+    let path = copy_ledger::ledger_path(raw_root);
+    let refusal = "the importer refuses, since its days can lie outside the hot window; the \
+                   copy-ledger rebuild restores the ledger (ADR-062 D7)";
+    match copy_ledger::read(raw_root) {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(format!(
+            "copy ledger {} does not exist although paths.cold_roots is configured: {refusal}",
+            path.display()
+        )),
+        Err(error) => Err(format!(
+            "copy ledger {} cannot be read ({error}): {refusal}",
+            path.display()
         )),
     }
 }

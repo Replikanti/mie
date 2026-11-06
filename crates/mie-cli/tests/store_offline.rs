@@ -462,3 +462,24 @@ fn usage_errors_exit_2() {
         assert_eq!(output.status.code(), Some(2), "{args:?}");
     }
 }
+
+#[test]
+fn no_command_builds_a_single_root_store() {
+    // Every command builds its store through `store::raw_store`, so a
+    // tiered configuration can never be read as hot alone (ADR-062 D7).
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut checked = 0;
+    for entry in fs::read_dir(&src).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|ext| ext == "rs") {
+            let text = fs::read_to_string(&path).unwrap();
+            assert!(
+                !text.contains("ParquetRawStore::new("),
+                "{} builds a single-root store; use crate::store::raw_store",
+                path.display()
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked >= 8, "{checked} source files");
+}

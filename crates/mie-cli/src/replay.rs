@@ -138,7 +138,8 @@ pub fn run(request: &ReplayRequest, out: &mut dyn Write) -> Result<ReplayOutcome
             );
             match read_runs(&config.paths.journal, source) {
                 Ok(runs) => {
-                    let store = ParquetRawStore::new(&config.paths.raw_root);
+                    let store =
+                        crate::store::raw_store(&config.paths.raw_root, &config.paths.cold_roots);
                     let runs = runs.iter().map(|run| run.live_run()).collect();
                     let live = LiveReplay::new(&store, source, symbol, runs);
                     drive(live.replay(window), &mut report, describe_live, false)
@@ -152,7 +153,7 @@ pub fn run(request: &ReplayRequest, out: &mut dyn Write) -> Result<ReplayOutcome
             correction,
         } => {
             let symbol = &config.instrument.symbol;
-            let store = ParquetRawStore::new(&config.paths.raw_root);
+            let store = crate::store::raw_store(&config.paths.raw_root, &config.paths.cold_roots);
             match archive_replay(&store, config, streams.as_deref(), *correction) {
                 Ok(replay) => {
                     let names: Vec<_> = replay.streams().iter().map(|s| s.raw_name()).collect();
@@ -192,7 +193,7 @@ fn history(config: &IngestConfig, window: ReplayWindow, report: &mut Vec<u8>) ->
             section.cutover
         ),
     );
-    let store = ParquetRawStore::new(&config.paths.raw_root);
+    let store = crate::store::raw_store(&config.paths.raw_root, &config.paths.cold_roots);
     let chain = match history_chain(config, &store) {
         Ok(chain) => chain,
         Err(error) => return failed(report, error),

@@ -304,8 +304,10 @@ live in more than one root (approved as written at STOP 1).
     ADR-052's question; this ADR only keeps it possible.
   - Presence on a cold root is not the signal for "removed", because under
     D11 today's partition is on cold too.
-  - Without a readable copy ledger on an intact hot (the degraded start,
-    D7) the writer opens only dates inside the hot window. On an intact hot
+  - Without a readable copy ledger (missing, or failing its hash chain
+    before the last record) on an intact hot (the degraded start, D7) the
+    writer opens only dates inside the hot window, and the importer
+    refuses to start. On an intact hot
     D6 never removed those, and the union rule is not needed because hot
     still holds every part of them.
 - **A partition that disappears while it is read** is never read as
@@ -358,7 +360,43 @@ live in more than one root (approved as written at STOP 1).
     empty list (`mie-adapter-parquet` `lib.rs`); the union store instead
     takes that partition's files from the ledger read that follows, and if
     the ledger records none of its files, `select` fails with
-    `Integrity`, naming the partition.
+    `Integrity`, naming the partition. **A manifest listed on hot but gone
+    when it is read** (the D6 rename can land between the partition's
+    listing and the read) is the same case for one file: it comes from the
+    ledger, and if the ledger has no record of its path, `select` fails
+    with `Integrity`, naming the file (#188).
+  - **The merge and its checks run over the selected partitions before the
+    event-time filter** (#188). Every file of the selected streams and
+    dates, from hot and from the ledger, is merged by path first; a path
+    whose hot manifest and ledger manifest differ by a single byte is
+    `Integrity` (D5). Why before the filter: a conflict in the event times
+    could otherwise drop the file from one side's filtered list and the
+    selection would silently follow the other. Only then are the ordinary
+    files filtered by event time.
+  - **The ledger's view of a path** is folded from its records in file
+    order: `manifest` gives the manifest (two different texts are a D5
+    conflict), `lost` marks it lost, `hold` holds it, `hold-cleared
+    readmit` clears the hold, `hold-cleared replace` clears it and marks a
+    replacement pending, `quarantined` marks the replacement pending under
+    its quarantine id, and `replaced` names the re-import's entry. `copy`,
+    `removed`, `returned`, `ledger-copy`, `finding` and `verify` do not
+    change the file list. The verdict, in this precedence: lost, a D5
+    conflict, held, replaced (not listed; a replaced path still listed on
+    hot is `Integrity`), replacement pending, otherwise an ordinary file. A
+    `hold-cleared replace` never makes a path ordinary again: a selection
+    covering it fails until the `replaced` record exists (D5).
+  - **Coverage of a path that fails.** A lost, held or pending path with a
+    manifest (from hot or the ledger) fails a selection whose window
+    overlaps its event times, as an ordinary file would be selected. A
+    path no manifest describes (a `lost` record of journal or import
+    origin, D7 rebuild step 4) fails every selection of its stream that
+    covers its date (operator, #188 STOP 1 decision 2). Why: the `lost`
+    grammar carries no event times, and adding them is a ledger format
+    change; the whole-day rule fails more selections than strictly needed,
+    loudly, and never answers one shorter.
+  - **The first error in path order.** When several paths fail, the error
+    of the lowest relative path (a partition sorts before its files) is
+    returned, so the message does not depend on the listing order.
   - A reader ignores the one incomplete trailing ledger record (the
     single-trailing-record rule, *Formats and layout* below): it can only
     be a record being appended, and a removal record is complete before
@@ -368,7 +406,8 @@ live in more than one root (approved as written at STOP 1).
   - `read` resolves the path on hot, then on each cold root in order. An
     absent copy is skipped. The first present copy is verified as today
     (`manifest::verify`), and a mismatch is `Integrity` (D5), never a
-    fallback to the next copy.
+    fallback to the next copy. Any other read error than an absent copy is
+    `Io`, naming the root, and no fallback either.
   - This needs no port change, no new crate, no new dependency and no
     ADR-025 change. `mie-cli` wires it.
 - **The copy ledger** is an append-only text file at
@@ -592,8 +631,10 @@ live in more than one root (approved as written at STOP 1).
     `mie ingest` still starts and captures: the writer opens only
     hot-window dates (D6), the seed scan reads hot alone (*Seeds* below),
     the warm-up fails into a cold run (ADR-052 D8), and the replicator and
-    hot removal stop until the rebuild below. The importer refuses, since
-    its days can lie outside the window. Why the capture may continue: hot
+    hot removal stop until the rebuild below. The importer, its dry run
+    included, refuses on a missing or unreadable ledger (a chain failure
+    before the last record included), before it opens anything, since its
+    days can lie outside the window. Why the capture may continue: hot
     still holds every part and the journal, so nothing it writes can
     collide with cold.
   - **Hot lost** (no marker, `cold_roots` configured): `mie ingest` and
@@ -687,6 +728,21 @@ live in more than one root (approved as written at STOP 1).
   through the union. A cold-tier outage at a start therefore gives an
   `Integrity` error in the warm-up, which fails into a cold run (ADR-052
   D8) and never stops the capture.
+  - **The fallback rule** (operator, #188 STOP 1 decision 1): in a tiered
+    store, any `Integrity` or `Corrupt` error of the union `select` (a
+    missing or damaged ledger, a lost file or a D5 conflict inside the
+    seed window) makes the seed scan use hot's listing alone; an `Io`
+    error still stops the start. `run_start` records which listing gave
+    the seeds: `"seed_listing": "union"` or `"hot"`, and with `"hot"`
+    `"seed_listing_error"`, the union's error. A single-root store's
+    `run_start` carries neither key. Why every such error and not only a
+    missing ledger: D8 keeps every date from today − 7 on hot, so on an
+    intact hot the hot listing gives the same seeds, and for a lost live
+    file the earlier seed only widens the resume's `Disconnected` gap over
+    data that is gone; refusing the start instead would lose raw data on
+    every `mie ingest` start until the rebuild. The cost is that such a
+    start does not stop on the problem: the journal keys record it, and
+    the warm-up, replay and equivalence fail on the same store.
 
 ### D8. The hot window, derived
 
