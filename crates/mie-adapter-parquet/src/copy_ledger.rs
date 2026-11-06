@@ -871,7 +871,10 @@ fn parse_line(line: &[u8]) -> Result<Record, String> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AppendOutcome {
     /// Bytes of an incomplete trailing record truncated before the append,
-    /// 0 if none. A caller journals every truncation.
+    /// 0 if none. A caller journals every truncation. When the truncation
+    /// succeeds and the write after it fails, the [`RawStoreError::Io`]
+    /// names the truncated bytes instead, so the caller journals them from
+    /// the error.
     pub truncated_bytes: u64,
     /// The byte offset of the appended record.
     pub offset: u64,
@@ -915,10 +918,22 @@ impl CopyLedger {
     /// bad header; [`RawStoreError::Io`] on I/O failure.
     pub fn append(&self, record: &Record) -> Result<AppendOutcome, RawStoreError> {
         let body = record.body()?;
-        let mut file = open_ledger(&self.ledger)?;
+        // A missing ledger is refused before the lock file is created, so
+        // an append to a store without a ledger creates no file.
+        match fs::symlink_metadata(&self.ledger) {
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                return Err(missing_ledger(&self.ledger));
+            }
+            Err(error) => return Err(io_error("inspect", &self.ledger)(error)),
+            Ok(_) => {}
+        }
         let lock = open_lock(&self.lock)?;
         lock.lock().map_err(io_error("lock", &self.lock))?;
-        let outcome = append_locked(&self.ledger, &mut file, &body);
+        // The ledger is opened only under the lock: a holder (the rebuild)
+        // may have replaced it by rename while this append waited, and a
+        // descriptor opened before would write into the replaced file.
+        let outcome = open_ledger(&self.ledger)
+            .and_then(|mut file| append_locked(&self.ledger, &mut file, &body));
         drop(lock);
         outcome
     }
@@ -967,7 +982,17 @@ impl LedgerHold {
     }
 }
 
-/// Opens the ledger for reading and appending; never creates it.
+/// The error for a ledger that does not exist.
+fn missing_ledger(path: &Path) -> RawStoreError {
+    RawStoreError::Integrity(format!(
+        "copy ledger {} does not exist; only the init step creates it, never an append \
+         (ADR-062 D7)",
+        path.display()
+    ))
+}
+
+/// Opens the ledger for reading and appending; never creates it. Called
+/// only under the lock.
 fn open_ledger(path: &Path) -> Result<File, RawStoreError> {
     OpenOptions::new()
         .read(true)
@@ -975,11 +1000,7 @@ fn open_ledger(path: &Path) -> Result<File, RawStoreError> {
         .open(path)
         .map_err(|error| {
             if error.kind() == ErrorKind::NotFound {
-                RawStoreError::Integrity(format!(
-                    "copy ledger {} does not exist; only the init step creates it, never an \
-                     append (ADR-062 D7)",
-                    path.display()
-                ))
+                missing_ledger(path)
             } else {
                 io_error("open", path)(error)
             }
@@ -1105,16 +1126,44 @@ fn append_locked(path: &Path, file: &mut File, body: &str) -> Result<AppendOutco
 
     let chain = chain_of(&previous, body.as_bytes());
     let line = format!("{body} {chain}\n");
-    if keep < len {
-        file.set_len(keep).map_err(io_error("truncate", path))?;
+    let truncated_bytes = len - keep;
+    if truncated_bytes > 0 {
+        file.set_len(keep)
+            .and_then(|()| file.sync_all())
+            .map_err(io_error("truncate", path))?;
     }
-    file.write_all(line.as_bytes())
-        .and_then(|()| file.sync_all())
-        .map_err(io_error("append to", path))?;
+    write_line(file, line.as_bytes()).map_err(|error| {
+        let detail = format!("append to {}: {error}", path.display());
+        // The truncation already happened: the error carries it, so the
+        // caller journals it even though the append failed.
+        RawStoreError::Io(if truncated_bytes > 0 {
+            format!(
+                "{detail}; the incomplete trailing record ({truncated_bytes} bytes at byte \
+                 {keep}) was truncated before the failed write"
+            )
+        } else {
+            detail
+        })
+    })?;
     Ok(AppendOutcome {
-        truncated_bytes: len - keep,
+        truncated_bytes,
         offset: keep,
     })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: the next [`write_line`] on this thread fails.
+    pub(crate) static FAIL_NEXT_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Writes one line with one `write_all` and fsyncs it.
+fn write_line(file: &mut File, line: &[u8]) -> std::io::Result<()> {
+    #[cfg(test)]
+    if FAIL_NEXT_WRITE.with(|fail| fail.replace(false)) {
+        return Err(std::io::Error::other("injected write failure"));
+    }
+    file.write_all(line).and_then(|()| file.sync_all())
 }
 
 #[cfg(test)]

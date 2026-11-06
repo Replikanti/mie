@@ -28,7 +28,8 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   `mie store init` writes hot's marker and an empty copy ledger and refuses
   a store whose cold roots show that hot was lost; `mie store init-root`
   writes a freshly mounted cold root's marker and refuses a non-empty root
-  or one on hot's device. With `cold_roots` configured, `mie ingest` and
+  or one that is not a mount point (on hot's device or on its parent
+  directory's). With `cold_roots` configured, `mie ingest` and
   `mie archive-import` refuse to start on a hot without its marker. ADR-062
   D7 now defines each record's chain hash as the SHA-256 of the previous
   chain hash and the record's own text. With `cold_roots` empty nothing

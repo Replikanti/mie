@@ -273,9 +273,10 @@ USAGE:
         paths.cold_roots, spelled as there, and an existing, empty
         directory; it is never created. The id is 1 to 64 characters from
         A-Z, a-z, 0-9, '_' and '-', not hot, and no other configured root
-        may carry it. Run mie store init first. Refused when the root is on
-        the same device as raw_root: an unmounted mount point is an empty
-        directory on hot's filesystem. Prints what it wrote and exits 0, or
+        may carry it. Run mie store init first. The root must be a mount
+        point: refused when it is on the same device as raw_root or as its
+        parent directory, since an unmounted mount point is an empty
+        directory on its parent's filesystem. Prints what it wrote and exits 0, or
         prints FAIL: <reason> and exits 1.
 
     mie --help

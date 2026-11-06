@@ -728,3 +728,37 @@ fn a_whole_run_hold_excludes_other_holders_in_the_same_process() {
     ledger.append(&golden_records()[2]).unwrap();
     assert_eq!(read(dir.path()).unwrap().unwrap().records.len(), 2);
 }
+
+#[test]
+fn a_write_failing_after_a_truncation_reports_the_truncation() {
+    // Review of #197, finding 5: the truncation must reach the caller even
+    // when the write after it fails (a full hot, D10).
+    let dir = store("ledger-truncate-then-fail");
+    let records = golden_records();
+    append_all(dir.path(), &records[..4]);
+    let mut bytes = fs::read(ledger_path(dir.path())).unwrap();
+    let spans = spans(&bytes);
+    let (offset, len) = spans[spans.len() - 1];
+    flip(&mut bytes, offset + len - 1);
+    fs::write(ledger_path(dir.path()), &bytes).unwrap();
+
+    FAIL_NEXT_WRITE.with(|fail| fail.set(true));
+    let error = CopyLedger::at(dir.path()).append(&records[4]).unwrap_err();
+    let RawStoreError::Io(detail) = error else {
+        panic!("{error:?}");
+    };
+    assert!(
+        detail.contains(&format!("({} bytes at byte {offset})", len + 1))
+            && detail.contains("truncated"),
+        "{detail}"
+    );
+    // The truncation is durable and the next append starts from it.
+    assert_eq!(fs::read(ledger_path(dir.path())).unwrap(), &bytes[..offset]);
+    let outcome = CopyLedger::at(dir.path()).append(&records[4]).unwrap();
+    assert_eq!(outcome.truncated_bytes, 0);
+
+    // Without a truncation the error says nothing about one.
+    FAIL_NEXT_WRITE.with(|fail| fail.set(true));
+    let error = CopyLedger::at(dir.path()).append(&records[5]).unwrap_err();
+    assert!(!error.to_string().contains("truncated"), "{error}");
+}

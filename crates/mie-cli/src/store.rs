@@ -13,8 +13,10 @@
 //! `dev-device-override`, not in `default`, compiles in a second probe for
 //! host runs that keep hot and the copy targets as plain directories on one
 //! filesystem (#184 STOP 1 decision 1): it reads `MIE_DEV_DEVICE_IDS`,
-//! `<root path>=<id>` pairs separated by `;`, paths canonicalized. A root
-//! the variable does not list is an error, never a fallback to `st_dev`,
+//! `<root path>=<id>` pairs separated by `;`, paths canonicalized. It must
+//! list hot, every cold root and each cold root's parent directory (the
+//! mount-point check of `init-root`). A root the variable does not list is
+//! an error, never a fallback to `st_dev`,
 //! and every probe selection with the variable set prints a warning on
 //! stderr naming the override. A build without the feature has no override
 //! and never reads the variable. This comment is the only operator-facing
@@ -242,6 +244,17 @@ fn run_init(config: &IngestConfig) -> Result<Vec<String>, String> {
         );
     }
     if config.history.is_some() {
+        // The [history] check resolves both raw roots on disk, so a missing
+        // raw_root would fail it with a bare "No such file or directory".
+        if !exists(raw_root)? {
+            return Err(format!(
+                "raw_root {} does not exist: create it (for example `mkdir -p {}`) and run \
+                 `mie store init` again. With [history], init first checks that the archive \
+                 configuration names the same raw root, which needs the directory to exist",
+                raw_root.display(),
+                raw_root.display()
+            ));
+        }
         config.history_archive().map_err(|e| e.to_string())?;
     }
     let meta = root_marker::meta_dir(raw_root);
@@ -363,12 +376,24 @@ fn run_init_root(
     if !metadata.is_dir() {
         return Err(format!("--root {} is not a directory", root.display()));
     }
-    let mut entries = fs::read_dir(root).map_err(|e| format!("--root {}: {e}", root.display()))?;
-    if entries.next().is_some() {
-        return Err(format!(
-            "--root {} is not empty: a marker is written only on a freshly provisioned root",
-            root.display()
-        ));
+    // Empty but for staging directories that a crashed or failed earlier
+    // attempt left behind; `create_meta` removes them once it succeeds.
+    let entries = fs::read_dir(root).map_err(|e| format!("--root {}: {e}", root.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("--root {}: {e}", root.display()))?;
+        let staging = entry
+            .file_name()
+            .to_str()
+            .is_some_and(root_marker::is_staging_name)
+            && entry.file_type().is_ok_and(|kind| kind.is_dir());
+        if !staging {
+            return Err(format!(
+                "--root {} is not empty ({:?}): a marker is written only on a freshly \
+                 provisioned root",
+                root.display(),
+                entry.file_name()
+            ));
+        }
     }
     let device = |path: &Path| {
         probe
@@ -384,6 +409,19 @@ fn run_init_root(
              D11)",
             root.display(),
             raw_root.display()
+        ));
+    }
+    // A cold root is a mount point itself: an unmounted mount point lies on
+    // its parent's filesystem, which need not be hot's.
+    let parent = root.join("..");
+    let parent_device = device(&parent)?;
+    if root_device == parent_device {
+        return Err(format!(
+            "--root {} is on device {root_device}, the device of its parent directory: it is \
+             not a mount point. An unmounted mount point is an empty directory on its \
+             parent's filesystem, and a marker written there would make it look mounted; \
+             mount the cold volume at this path (ADR-062 D4)",
+            root.display()
         ));
     }
     for cold in cold_roots.iter().filter(|cold| cold.path != root) {

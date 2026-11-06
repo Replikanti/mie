@@ -206,3 +206,30 @@ fn the_whole_run_hold_refuses_while_another_process_holds_it() {
     CopyLedger::at(root).try_hold().unwrap();
     assert_sequences(root, &["child", "parent"], 1);
 }
+
+/// Review of #197, finding 1: an append that waits behind a whole-run hold
+/// opens the ledger only once it has the lock, so a rebuild that replaced
+/// the ledger by rename meanwhile (ADR-062 D7 step 6) cannot swallow the
+/// record into the replaced file.
+#[test]
+fn an_append_waiting_behind_a_hold_writes_the_replacing_ledger() {
+    let dir = hot("ledger-replaced");
+    let root = dir.path().to_path_buf();
+    let ledger = CopyLedger::at(&root);
+    ledger.append(&nth("first", 0)).unwrap();
+    let hold = ledger.try_hold().unwrap();
+    let waiter = {
+        let root = root.clone();
+        std::thread::spawn(move || CopyLedger::at(&root).append(&nth("waiter", 0)))
+    };
+    // Give the waiter time to block on the lock.
+    std::thread::sleep(Duration::from_millis(300));
+    // The holder's rebuild: a temp file renamed over the ledger.
+    let path = copy_ledger::ledger_path(&root);
+    let tmp = path.with_extension("rebuild.tmp");
+    std::fs::copy(&path, &tmp).unwrap();
+    std::fs::rename(&tmp, &path).unwrap();
+    drop(hold);
+    waiter.join().unwrap().unwrap();
+    assert_sequences(&root, &["first", "waiter"], 1);
+}

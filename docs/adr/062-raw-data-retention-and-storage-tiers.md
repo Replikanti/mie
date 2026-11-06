@@ -172,13 +172,25 @@ the D2 consequence.
      rule (D7) relies on this order;
   4. a root that is missing, is not a directory, or is not empty. The root
      is never created: a created directory lands on the parent's
-     filesystem, which is the unmounted-mount-point trap;
-  5. a root whose device id (`st_dev`) equals hot's. Why: an unmounted
-     mount point is an empty directory on hot's filesystem, and a marker
-     written there would make it look mounted. Every device check goes
-     through one probe; only the production host can show two distinct
-     devices, so this acceptance is verified at provisioning, where the
-     command runs against the real mounts;
+     filesystem, which is the unmounted-mount-point trap. The only entries
+     an empty root may hold are the staging directories of an earlier
+     attempt that crashed or failed (the atomic `.mie/` creation, D7);
+     the successful attempt removes them. Why: otherwise every retry after
+     such an attempt would be refused as "not empty", which names the
+     wrong cause;
+  5. a root that is not a mount point: its device id (`st_dev`) equals
+     hot's, or equals its parent directory's. Why: an unmounted mount
+     point is an ordinary empty directory on its parent's filesystem, and
+     a marker written there would make it look mounted, so the replicator
+     would fill the parent's disk and the real mount, once back, would
+     hide the marker and the copies. The parent's filesystem is hot's only
+     when the mount points lie on hot's disk, so the hot comparison alone
+     misses mount points on another disk (the system disk, say). The
+     consequence: a cold root is the mount point itself, never a
+     subdirectory of a mounted volume. Every device check goes through one
+     probe; only the production host can show distinct devices, so this
+     acceptance is verified at provisioning, where the command runs
+     against the real mounts;
   6. an id that another configured root's marker already carries (a root
      without a marker is skipped; any other read error refuses).
 
@@ -493,9 +505,13 @@ live in more than one root (approved as written at STOP 1).
     the ledger. Why: the rebuild replaces the ledger by a temp file and a
     rename (step 6), and a lock on the ledger's inode would stay on the
     replaced file.
-  - **The append protocol.** Open the ledger without creating it (a
-    missing ledger is an error, never an implicit new one), take the lock,
-    read back the header and the last three records, and decide before
+  - **The append protocol.** Refuse a missing ledger (an error, never an
+    implicit new one), take the lock, and only then open the ledger. Why
+    this order: a whole-run holder (the rebuild) may replace the ledger by
+    rename while an append waits for the lock, and a descriptor opened
+    before the lock would write the record into the replaced file, where
+    no reader ever sees it. Under the lock, read back the header and the
+    last three records, and decide before
     writing anything. Either truncate at most the one trailing record
     above and append, or refuse with `Integrity` and leave the file
     byte-identical. Then write the line in one write, fsync, release. Why
@@ -503,7 +519,9 @@ live in more than one root (approved as written at STOP 1).
     checks (the trailing record and the line before it, which must
     verify), and the third supplies the chain hash the second-last is
     computed from. A complete record before the last is never truncated.
-    Every truncation is reported to the caller, which journals it. Damage
+    Every truncation is reported to the caller, which journals it: in the
+    append's outcome, or, when the write after a truncation fails (a full
+    hot), in the append's error. Damage
     older than the last three records is not seen by an append; it stays
     in the file for readers and the verification to report.
   - **The whole-run hold** of the rebuild and the hot restore takes the
@@ -547,18 +565,25 @@ live in more than one root (approved as written at STOP 1).
   explicit init step, never implicitly. The init step, `mie store init
   --config <ingest config>`, also writes hot's own root marker. It
   refuses, in this order: an empty `cold_roots` (a single-root store needs
-  no `.mie/`, so a `.mie/` always means a tiered store); a `[history]`
-  whose archive configuration fails the check above; an existing
+  no `.mie/`, so a `.mie/` always means a tiered store); with `[history]`,
+  a missing `raw_root`, named with the instruction to create it (the
+  check that follows resolves both raw roots on disk), and an archive
+  configuration that fails the check above; an existing
   `<raw_root>/.mie`; and a configured cold root that carries a marker or a
   copy-ledger copy, where any read error other than "not found" also
   refuses. A cold marker next to a hot without one always means a hot that
   was initialized and then lost, because `init-root` needs hot's marker
   (D4). `init` writes the marker and a header-only ledger into a staging
-  directory, fsyncs them, and renames the directory to `.mie`. Why a
-  directory rename: after a crash there is either no `.mie/` or a complete
-  one; separate file renames could leave a marker without a ledger, which
-  looks like the degraded start below, or a ledger without a marker, which
-  looks like a lost hot. It prints what it found on each cold root, so an
+  directory of its own (a unique name per call), fsyncs them, and renames
+  the directory to `.mie`. Why a directory rename: after a crash there is
+  either no `.mie/` or a complete one; separate file renames could leave a
+  marker without a ledger, which looks like the degraded start below, or a
+  ledger without a marker, which looks like a lost hot. Why a unique
+  staging name: two concurrent calls sharing one staging directory could
+  each delete or fill the other's files and publish an incomplete `.mie/`;
+  with separate directories the first rename wins, the second fails on the
+  existing `.mie`, and the winner removes every leftover staging
+  directory. The same creation writes a cold root's marker (D4). It prints what it found on each cold root, so an
   operator who expected a restore sees that the mounts are absent. A
   missing ledger makes every union `select` fail with `Integrity`. Why: read as empty, it would drop every removed partition
   from every selection without an error, the failure the previous rule

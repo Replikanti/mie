@@ -67,26 +67,31 @@ fn names(dir: &Path) -> Vec<String> {
     names
 }
 
-/// Device ids by path, compared lexically: distinct devices without
-/// distinct filesystems.
+/// Device ids by path, compared after resolving both sides (the mount
+/// check queries `<root>/..`): distinct devices without distinct
+/// filesystems.
 struct MapProbe(Vec<(PathBuf, u64)>);
 
 impl DeviceProbe for MapProbe {
     fn device_id(&self, root: &Path) -> io::Result<u64> {
+        let resolve = |path: &Path| fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
+        let wanted = resolve(root);
         self.0
             .iter()
-            .find(|(path, _)| path == root)
+            .find(|(path, _)| resolve(path) == wanted)
             .map(|(_, id)| *id)
             .ok_or_else(|| io::Error::other(format!("{} unknown", root.display())))
     }
 }
 
-/// hot on device 1, `cold-a` on 2, `cold-b` on 3.
+/// hot on device 1, `cold-a` on 2, `cold-b` on 3, and their parent (the
+/// test directory) on 9: both cold roots are mount points.
 fn distinct(dir: &Path) -> MapProbe {
     MapProbe(vec![
         (dir.join("raw"), 1),
         (dir.join("cold-a"), 2),
         (dir.join("cold-b"), 3),
+        (dir.to_path_buf(), 9),
     ])
 }
 
@@ -133,7 +138,10 @@ fn init_refuses_in_order() {
     assert_fail(init(&common::config(dir)), "paths.cold_roots is empty");
     assert!(!raw.join(".mie").exists());
 
-    // 2. A [history] whose archive configuration does not load.
+    // 2. A [history] whose archive configuration does not load (on an
+    //    existing raw_root; a missing one is named first, see
+    //    `init_with_history_names_a_missing_raw_root`).
+    fs::create_dir_all(&raw).unwrap();
     let history = format!(
         "[history]\norigin = \"2025-10-01\"\ncutover = \"2026-10-20\"\n\
          archive_config = \"{}\"\n",
@@ -245,6 +253,20 @@ fn init_root_refuses_in_order() {
     );
     assert!(!cold_a.join(".mie").exists());
 
+    // 5b. Review of #197, finding 4: the parent's device. A directory that
+    //     is not a mount point is refused even when its filesystem is not
+    //     hot's.
+    let not_mounted = MapProbe(vec![
+        (dir.join("raw"), 1),
+        (cold_a.clone(), 2),
+        (dir.to_path_buf(), 2),
+    ]);
+    assert_fail(
+        init_root(&config, &cold_a, "cold-a", &not_mounted),
+        "not a mount point",
+    );
+    assert!(!cold_a.join(".mie").exists());
+
     // Distinct devices pass.
     let (pass, out) = init_root(&config, &cold_a, "cold-a", &probe);
     assert!(pass, "{out}");
@@ -264,6 +286,82 @@ fn init_root_refuses_in_order() {
     assert!(pass, "{out}");
     // Once only: the root is no longer empty.
     assert_fail(init_root(&config, &cold_b, "cold-b", &probe), "not empty");
+}
+
+/// Review of #197, finding 3: a retry after a crashed or failed attempt
+/// is not refused as "not empty" because of that attempt's staging
+/// directory, which the successful retry removes. Any other entry still
+/// makes the root non-empty.
+#[test]
+fn init_root_retries_over_a_crashed_attempts_staging_directory() {
+    let dir = TempDir::new("store-init-root-retry");
+    let dir = dir.path();
+    let config = tiered(dir, "");
+    assert!(init(&config).0);
+    let cold_a = dir.join("cold-a");
+    fs::create_dir_all(cold_a.join(".mie-init-4242-0.tmp")).unwrap();
+    fs::write(
+        cold_a.join(".mie-init-4242-0.tmp").join("root"),
+        b"mie-root 1\n",
+    )
+    .unwrap();
+    fs::create_dir_all(cold_a.join(".mie-init.tmp")).unwrap();
+    let probe = distinct(dir);
+    // A file under a staging name is not ours: still not empty.
+    fs::write(cold_a.join(".mie-init-1-1.tmp"), b"").unwrap();
+    assert_fail(init_root(&config, &cold_a, "cold-a", &probe), "not empty");
+    fs::remove_file(cold_a.join(".mie-init-1-1.tmp")).unwrap();
+
+    let (pass, out) = init_root(&config, &cold_a, "cold-a", &probe);
+    assert!(pass, "{out}");
+    assert_eq!(names(&cold_a), [".mie"]);
+    assert_eq!(
+        root_marker::read(&cold_a).unwrap().as_deref(),
+        Some("cold-a")
+    );
+}
+
+/// QA of #197, Known limit: with [history], a missing raw_root is named
+/// with what to do, and nothing is created.
+#[test]
+fn init_with_history_names_a_missing_raw_root() {
+    let dir = TempDir::new("store-init-history");
+    let dir = dir.path();
+    let raw = dir.join("raw");
+    fs::write(
+        dir.join("archive.toml"),
+        format!(
+            "[instrument]\nsymbol = \"BTCUSDT\"\n[paths]\nraw_root = \"{}\"\n\
+             import_ledger = \"{}\"\nstaging = \"{}\"\ncold_roots = [\n\
+             {{ path = \"{}\", copy_target = true }},\n\
+             {{ path = \"{}\", copy_target = true }},\n]\n",
+            raw.display(),
+            dir.join("ledger").display(),
+            dir.join("staging").display(),
+            dir.join("cold-a").display(),
+            dir.join("cold-b").display(),
+        ),
+    )
+    .unwrap();
+    let history = format!(
+        "[history]\norigin = \"2025-10-01\"\ncutover = \"2026-10-20\"\n\
+         archive_config = \"{}\"\n",
+        dir.join("archive.toml").display()
+    );
+    let config = tiered(dir, &history);
+    let before = names(dir);
+    let (pass, out) = init(&config);
+    assert!(!pass, "{out}");
+    assert!(
+        out.contains(&format!("raw_root {} does not exist", raw.display()))
+            && out.contains("create it"),
+        "{out}"
+    );
+    assert_eq!(names(dir), before, "nothing is created");
+
+    fs::create_dir_all(&raw).unwrap();
+    let (pass, out) = init(&config);
+    assert!(pass, "{out}");
 }
 
 #[test]
@@ -295,7 +393,12 @@ fn binary_init_root(dir: &Path) -> std::process::Output {
         .args(["--id", "cold-a"])
         .env(
             "MIE_DEV_DEVICE_IDS",
-            format!("{}=1;{}=2", dir.join("raw").display(), cold.display()),
+            format!(
+                "{}=1;{}=2;{}=3",
+                dir.join("raw").display(),
+                cold.display(),
+                dir.display()
+            ),
         )
         .output()
         .unwrap()

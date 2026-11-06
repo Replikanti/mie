@@ -21,6 +21,7 @@ use mie_ports::raw::{RawStoreError, validate_segment};
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The id of hot's marker, reserved: no other root may carry it.
 pub const HOT_ID: &str = "hot";
@@ -28,9 +29,29 @@ pub const HOT_ID: &str = "hot";
 /// The first line of every marker: the format name and version.
 const HEADER: &str = "mie-root 1";
 
-/// The staging directory of [`create_meta`], renamed to `.mie` when
+/// The staging directories of [`create_meta`] are named
+/// `.mie-init-<pid>-<n>.tmp`, unique per call, and renamed to `.mie` when
 /// complete.
-const INIT_TMP: &str = ".mie-init.tmp";
+const STAGING_PREFIX: &str = ".mie-init";
+const STAGING_SUFFIX: &str = ".tmp";
+
+/// Whether `name` is a [`create_meta`] staging directory's name: an entry
+/// that a crashed or concurrent call can leave in a root, and that the
+/// next successful call removes.
+pub fn is_staging_name(name: &str) -> bool {
+    name.starts_with(STAGING_PREFIX) && name.ends_with(STAGING_SUFFIX)
+}
+
+/// A staging directory name no other call uses: the process id and a
+/// per-process counter.
+fn unique_staging_name() -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "{STAGING_PREFIX}-{}-{n}{STAGING_SUFFIX}",
+        std::process::id()
+    )
+}
 
 /// The `.mie/` directory of `root`.
 pub fn meta_dir(root: &Path) -> PathBuf {
@@ -104,17 +125,25 @@ pub fn read(root: &Path) -> Result<Option<String>, RawStoreError> {
 /// Creates `<root>/.mie/` holding the marker of `id` and, with
 /// `with_ledger` (hot), a copy ledger with its header only.
 ///
-/// Everything is written into `<root>/.mie-init.tmp/`, fsynced, and the
-/// directory is renamed to `.mie` and the root fsynced: after a crash there
-/// is either no `.mie/` or a complete one. Two separate file renames could
-/// leave a marker without a ledger, which looks like a degraded start, or a
-/// ledger without a marker, which looks like a lost hot. A leftover
-/// `.mie-init.tmp` of a crashed earlier attempt is removed first.
+/// Everything is written into a staging directory of this call's own
+/// (`<root>/.mie-init-<pid>-<n>.tmp/`), fsynced, and the directory is
+/// renamed to `.mie` and the root fsynced: after a crash there is either no
+/// `.mie/` or a complete one. Two separate file renames could leave a
+/// marker without a ledger, which looks like a degraded start, or a ledger
+/// without a marker, which looks like a lost hot.
+///
+/// Concurrent calls on one root never share a staging directory, so each
+/// publishes only what it wrote itself. The first rename wins; a later one
+/// fails because `.mie` then exists and is not empty, and that call removes
+/// its own staging directory and returns the error. After a successful
+/// rename the call removes every other staging directory left in the root
+/// (a crashed attempt's, or a losing concurrent call's, which then fails).
 ///
 /// # Errors
 ///
 /// [`RawStoreError::Invalid`] when `<root>/.mie` exists or the id is
-/// invalid; [`RawStoreError::Io`] on I/O failure.
+/// invalid; [`RawStoreError::Io`] on I/O failure, including losing a race
+/// to a concurrent call.
 pub fn create_meta(root: &Path, id: &str, with_ledger: bool) -> Result<(), RawStoreError> {
     let marker = render(id)?;
     let meta = meta_dir(root);
@@ -128,13 +157,33 @@ pub fn create_meta(root: &Path, id: &str, with_ledger: bool) -> Result<(), RawSt
         Err(error) if error.kind() == ErrorKind::NotFound => {}
         Err(error) => return Err(io_error("inspect", &meta)(error)),
     }
-    let staging = root.join(INIT_TMP);
-    match fs::remove_dir_all(&staging) {
-        Ok(()) => {}
-        Err(error) if error.kind() == ErrorKind::NotFound => {}
-        Err(error) => return Err(io_error("remove", &staging)(error)),
-    }
+    let staging = root.join(unique_staging_name());
     fs::create_dir(&staging).map_err(io_error("create", &staging))?;
+    let published = publish(root, &staging, &meta, marker, with_ledger);
+    if published.is_err() {
+        // Best effort: the error that matters is the one returned.
+        let _ = fs::remove_dir_all(&staging);
+        return published;
+    }
+    // Leftovers of crashed or losing calls; never `.mie` itself.
+    if let Ok(entries) = fs::read_dir(root) {
+        for entry in entries.flatten() {
+            if entry.file_name().to_str().is_some_and(is_staging_name) {
+                let _ = fs::remove_dir_all(entry.path());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Fills `staging`, fsyncs it and renames it to `meta`.
+fn publish(
+    root: &Path,
+    staging: &Path,
+    meta: &Path,
+    marker: String,
+    with_ledger: bool,
+) -> Result<(), RawStoreError> {
     let mut files = vec![(ROOT_MARKER, marker)];
     if with_ledger {
         files.push((COPY_LEDGER, copy_ledger::HEADER.to_owned()));
@@ -150,10 +199,10 @@ pub fn create_meta(root: &Path, id: &str, with_ledger: bool) -> Result<(), RawSt
             .and_then(|()| file.sync_all())
             .map_err(io_error("write", &path))?;
     }
-    sync_dir(&staging)?;
-    // A concurrent init that created a non-empty `.mie` in between makes
-    // this rename fail (the target is not empty).
-    fs::rename(&staging, &meta).map_err(io_error("rename into place", &meta))?;
+    sync_dir(staging)?;
+    // A concurrent call that published `.mie` first makes this rename
+    // fail: the target exists and is not empty.
+    fs::rename(staging, meta).map_err(io_error("rename into place", meta))?;
     sync_dir(root)
 }
 
@@ -199,10 +248,11 @@ mod tests {
         assert_eq!(read(root).unwrap(), None);
 
         // A leftover staging directory of a crashed attempt is replaced.
-        fs::create_dir(root.join(INIT_TMP)).unwrap();
-        fs::write(root.join(INIT_TMP).join("junk"), b"x").unwrap();
+        let leftover = root.join(".mie-init-1-0.tmp");
+        fs::create_dir(&leftover).unwrap();
+        fs::write(leftover.join("junk"), b"x").unwrap();
         create_meta(root, HOT_ID, true).unwrap();
-        assert!(!root.join(INIT_TMP).exists());
+        assert!(!leftover.exists());
         assert_eq!(read(root).unwrap().as_deref(), Some(HOT_ID));
         assert_eq!(
             fs::read_to_string(meta_dir(root).join(COPY_LEDGER)).unwrap(),
@@ -227,6 +277,59 @@ mod tests {
         create_meta(cold.path(), "cold-a", false).unwrap();
         assert_eq!(read(cold.path()).unwrap().as_deref(), Some("cold-a"));
         assert!(!meta_dir(cold.path()).join(COPY_LEDGER).exists());
+    }
+
+    #[test]
+    fn staging_names_are_unique_and_recognized() {
+        let (a, b) = (unique_staging_name(), unique_staging_name());
+        assert_ne!(a, b);
+        assert!(is_staging_name(&a) && is_staging_name(&b));
+        assert!(is_staging_name(".mie-init.tmp"));
+        for other in [".mie", "root", ".mie-init", "mie-init-1.tmp", "source=x"] {
+            assert!(!is_staging_name(other), "{other}");
+        }
+    }
+
+    /// Review of #197, finding 2: two concurrent calls on one root never
+    /// publish an incomplete `.mie/`, exactly one of them succeeds, and no
+    /// staging directory is left. Before the fix the shared staging name
+    /// published an incomplete `.mie/` in 110 of 3 000 races.
+    #[test]
+    fn concurrent_calls_publish_one_complete_meta_dir() {
+        for i in 0..400 {
+            let dir = TempDir::new("marker-race");
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let calls: Vec<_> = (0..2)
+                .map(|_| {
+                    let (root, barrier) = (dir.path().to_path_buf(), barrier.clone());
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        create_meta(&root, HOT_ID, true)
+                    })
+                })
+                .collect();
+            let results: Vec<_> = calls.into_iter().map(|c| c.join().unwrap()).collect();
+            assert_eq!(
+                results.iter().filter(|r| r.is_ok()).count(),
+                1,
+                "race {i}: {results:?}"
+            );
+            assert_eq!(
+                read(dir.path()).unwrap().as_deref(),
+                Some(HOT_ID),
+                "race {i}"
+            );
+            assert_eq!(
+                fs::read_to_string(meta_dir(dir.path()).join(COPY_LEDGER)).unwrap(),
+                copy_ledger::HEADER,
+                "race {i}"
+            );
+            let names: Vec<String> = fs::read_dir(dir.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .collect();
+            assert_eq!(names, [".mie"], "race {i}");
+        }
     }
 
     #[test]
