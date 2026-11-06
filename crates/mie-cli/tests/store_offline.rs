@@ -483,3 +483,90 @@ fn no_command_builds_a_single_root_store() {
     }
     assert!(checked >= 8, "{checked} source files");
 }
+
+/// Review of #198, finding 1: a configuration without `cold_roots` over a
+/// tiered hot would read hot alone; every command refuses it, the pre-T1
+/// archive configuration (no `cold_roots` key, so it defaults to empty)
+/// included. The check stats hot only.
+#[test]
+fn a_configuration_without_cold_roots_over_a_tiered_hot_is_refused() {
+    use mie_adapter_binance::archive::fold::TradeCorrection;
+    use mie_adapter_parquet::ParquetRawStore;
+    use mie_cli::config::ArchiveConfig;
+    use mie_cli::replay::{self, ReplayRequest, ReplaySource};
+    use mie_domain::time::EventTime;
+    use mie_ports::outbound::ReplayWindow;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    let dir = TempDir::new("store-single-over-tiered");
+    let dir = dir.path();
+    let raw = dir.join("raw");
+    let meta = format!("{} exists", raw.join(".mie").display());
+    let refused = |error: &str| {
+        assert!(
+            error.contains(&meta) && error.contains("no paths.cold_roots"),
+            "{error}"
+        );
+    };
+
+    // Before the store is tiered a plain raw_root is the single-root store.
+    assert_eq!(store::raw_store(&raw, &[]), Ok(ParquetRawStore::new(&raw)));
+    let config = tiered(dir, "");
+    fs::create_dir_all(&raw).unwrap();
+    root_marker::create_meta(&raw, HOT_ID, true).unwrap();
+    refused(&store::raw_store(&raw, &[]).expect_err("refused"));
+    // The cold roots are never touched: they need not exist.
+    let tiered_store = store::raw_store(&raw, &config.paths.cold_roots).unwrap();
+    assert!(tiered_store.is_tiered());
+    assert!(!dir.join("cold-a").exists());
+
+    // The pre-T1 archive configuration.
+    let archive = ArchiveConfig::parse(&format!(
+        "[instrument]\nsymbol = \"BTCUSDT\"\n[paths]\nraw_root = \"{}\"\n\
+         import_ledger = \"{}\"\nstaging = \"{}\"\n[archive]\n\
+         base_url = \"https://fake.invalid\"\nstreams = [\"aggTrades\"]\n",
+        raw.display(),
+        dir.join("ledger").display(),
+        dir.join("staging").display(),
+    ))
+    .unwrap();
+    assert_eq!(archive.paths.cold_roots, []);
+    refused(
+        &mie_cli::archive::verify(&archive, 20_000, 20_000, &mut Vec::new()).expect_err("refused"),
+    );
+    let mut out = Vec::new();
+    let outcome = replay::run(
+        &ReplayRequest {
+            source: ReplaySource::Archive {
+                config: archive.clone(),
+                streams: None,
+                correction: TradeCorrection::Fold,
+            },
+            window: ReplayWindow {
+                start: EventTime::from_millis(0),
+                end: EventTime::from_millis(common::D0),
+            },
+        },
+        &mut out,
+    )
+    .unwrap();
+    assert!(!outcome.pass);
+    refused(&String::from_utf8(out).unwrap());
+
+    // An ingest configuration without cold_roots: refused before the
+    // journal is created.
+    let plain = common::config(dir);
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let transports = mie_cli::ingest::Transports {
+        connector: common::ScriptedConnector::new(
+            "btcusdt@aggTrade",
+            vec![vec![common::agg(1, common::D0 + 10)]],
+            &shutdown,
+        ),
+        http: Arc::new(common::NoHttp),
+        clock: common::FakeClock::new(common::D0, "mie-aggTrade"),
+    };
+    refused(&mie_cli::ingest::run(&plain, transports, shutdown).expect_err("refused"));
+    assert!(!plain.paths.journal.exists());
+}

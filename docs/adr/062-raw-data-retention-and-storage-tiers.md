@@ -384,7 +384,13 @@ live in more than one root (approved as written at STOP 1).
     conflict, held, replaced (not listed; a replaced path still listed on
     hot is `Integrity`), replacement pending, otherwise an ordinary file. A
     `hold-cleared replace` never makes a path ordinary again: a selection
-    covering it fails until the `replaced` record exists (D5).
+    covering it fails until the `replaced` record exists (D5). **Write
+    order (a precondition for #194):** `replaced` is appended only after
+    the re-import's entry and every part it lists are sealed on hot. Why:
+    the fold takes `replaced` as its proof that the replacement exists and
+    drops the old path at once, so a `replaced` written first would let a
+    crash, or a `select` running in between, answer without either file,
+    a shorter selection with another dataset version and no error.
   - **Coverage of a path that fails.** A lost, held or pending path with a
     manifest (from hot or the ledger) fails a selection whose window
     overlaps its event times, as an ordinary file would be selected. A
@@ -409,7 +415,13 @@ live in more than one root (approved as written at STOP 1).
     fallback to the next copy. Any other read error than an absent copy is
     `Io`, naming the root, and no fallback either.
   - This needs no port change, no new crate, no new dependency and no
-    ADR-025 change. `mie-cli` wires it.
+    ADR-025 change. `mie-cli` wires it, every command through one
+    constructor. With `cold_roots` empty that constructor refuses a
+    `raw_root` that holds `.mie/` (a hot-only stat): only a tiered store has
+    one, and a configuration that omits its `cold_roots` (an archive
+    configuration written before the store was tiered, where the key
+    defaults to empty) would read hot alone, a shorter selection without an
+    error once partitions leave hot (#198 review).
 - **The copy ledger** is an append-only text file at
   `<raw_root>/.mie/copy-ledger`: on hot's local filesystem (D4), next to
   the journal and the import ledger, and outside the layout (`select` and

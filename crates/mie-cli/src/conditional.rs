@@ -128,7 +128,7 @@ fn run_build(request: &BuildRequest) -> Result<(OutcomeManifest, u64, u64), Stri
             let source = &config.instrument.source;
             let symbol = &config.instrument.symbol;
             let runs = read_runs(&config.paths.journal, source)?;
-            let store = crate::store::raw_store(&config.paths.raw_root, &config.paths.cold_roots);
+            let store = crate::store::raw_store(&config.paths.raw_root, &config.paths.cold_roots)?;
             let runs = runs.iter().map(|run| run.live_run()).collect();
             let live = LiveReplay::new(&store, source, symbol, runs);
             // The streams are the journaled runs' own; there is nothing to
@@ -143,7 +143,7 @@ fn run_build(request: &BuildRequest) -> Result<(OutcomeManifest, u64, u64), Stri
             streams,
             correction,
         } => {
-            let store = crate::store::raw_store(&config.paths.raw_root, &config.paths.cold_roots);
+            let store = crate::store::raw_store(&config.paths.raw_root, &config.paths.cold_roots)?;
             let archive = archive_replay(&store, config, streams.as_deref(), *correction)?;
             let mut names: Vec<&str> = archive.streams().iter().map(|s| s.raw_name()).collect();
             names.sort_unstable();

@@ -12,7 +12,8 @@
 //! - [`raw_store`] builds the raw store of every command: the tiered store
 //!   of `raw_root` and `cold_roots`, which with no cold root is the
 //!   single-root store. No command builds a single-root store over a tiered
-//!   configuration.
+//!   configuration, and a configuration without `cold_roots` over a hot
+//!   that holds `.mie/` is refused.
 //!
 //! Every device check goes through one [`DeviceProbe`]. [`StDevProbe`]
 //! (`st_dev`) is its only production implementation. A Cargo feature
@@ -205,13 +206,38 @@ pub fn check_hot(raw_root: &Path, cold_roots: &[ColdRoot]) -> Result<(), String>
 }
 
 /// The raw store of `raw_root` and `cold_roots` (ADR-062 D7): hot, then the
-/// cold roots in configuration order. Does no I/O, so it never touches a
-/// cold mount; with `cold_roots` empty it is the single-root store.
-pub fn raw_store(raw_root: &Path, cold_roots: &[ColdRoot]) -> ParquetRawStore {
-    ParquetRawStore::tiered(
+/// cold roots in configuration order. It never touches a cold mount; with
+/// `cold_roots` empty it is the single-root store.
+///
+/// With `cold_roots` empty it refuses a `raw_root` that holds a `.mie/`
+/// directory: only a tiered store has one (D7, `mie store init`), and a
+/// configuration that omits its `cold_roots` (an archive configuration
+/// written before the store was tiered, where the key defaults to empty)
+/// would read hot alone, a shorter selection without an error once
+/// partitions leave hot. That check stats hot only.
+///
+/// # Errors
+///
+/// A description naming `<raw_root>/.mie` and the missing `cold_roots`, or
+/// the failure to inspect it.
+pub fn raw_store(raw_root: &Path, cold_roots: &[ColdRoot]) -> Result<ParquetRawStore, String> {
+    if cold_roots.is_empty() {
+        let meta = root_marker::meta_dir(raw_root);
+        if exists(&meta)? {
+            return Err(format!(
+                "raw_root {} is a tiered store ({} exists) but this configuration has no \
+                 paths.cold_roots: it would read hot alone and miss every partition that left \
+                 hot. Add the store's cold_roots, the same entries in the same order as the \
+                 ingest configuration, to this configuration (ADR-062 D7)",
+                raw_root.display(),
+                meta.display()
+            ));
+        }
+    }
+    Ok(ParquetRawStore::tiered(
         raw_root,
         cold_roots.iter().map(|root| root.path.clone()).collect(),
-    )
+    ))
 }
 
 /// The importer's refusal on a missing or unreadable copy ledger (ADR-062

@@ -1365,8 +1365,9 @@ mod tiered_start {
     /// The degraded start after `damage` made the copy ledger unusable:
     /// the capture runs with the single-root seeds from hot's listing, the
     /// warm-up starts cold, the importer refuses and a live replay fails,
-    /// each naming the ledger.
-    fn assert_degraded_start(tag: &str, damage: impl FnOnce(&Path)) {
+    /// each naming the ledger. `union_error` is how the union `select`'s
+    /// error displays (its kind).
+    fn assert_degraded_start(tag: &str, union_error: &str, damage: impl FnOnce(&Path)) {
         let (dir, single) = (TempDir::new(tag), TempDir::new(&format!("{tag}-1")));
         let (config, single_config) = tiered_chain(dir.path(), single.path());
         damage(&copy_ledger::ledger_path(&config.paths.raw_root));
@@ -1387,7 +1388,10 @@ mod tiered_start {
         assert_eq!(start["seeds"], reference["seeds"]);
         assert_eq!(start["seed_listing"], "hot");
         let listing_error = start["seed_listing_error"].as_str().unwrap();
-        assert!(listing_error.contains(&ledger), "{listing_error}");
+        assert!(
+            listing_error.starts_with(union_error) && listing_error.contains(&ledger),
+            "{listing_error}"
+        );
 
         // The importer refuses before it opens anything, dry runs too.
         let archive_config = ArchiveConfig::parse(
@@ -1438,21 +1442,23 @@ mod tiered_start {
         let text = String::from_utf8(out).unwrap();
         assert!(!replayed.pass, "{text}");
         assert!(
-            text.contains("raw store integrity check failed") && text.contains(&ledger),
+            text.contains(union_error) && text.contains(&ledger),
             "{text}"
         );
     }
 
+    const INTEGRITY: &str = "raw store integrity check failed";
+
     #[test]
     fn a_missing_ledger_is_the_degraded_start() {
-        assert_degraded_start("tiered-no-ledger", |ledger| {
+        assert_degraded_start("tiered-no-ledger", INTEGRITY, |ledger| {
             std::fs::remove_file(ledger).unwrap();
         });
     }
 
     #[test]
     fn a_ledger_damaged_before_its_last_record_is_the_degraded_start() {
-        assert_degraded_start("tiered-damaged-ledger", |ledger| {
+        assert_degraded_start("tiered-damaged-ledger", INTEGRITY, |ledger| {
             let raw_root = ledger.parent().unwrap().parent().unwrap();
             for at_ms in [1, 2] {
                 CopyLedger::at(raw_root)
@@ -1470,5 +1476,21 @@ mod tiered_start {
             bytes[copy_ledger::HEADER.len() + 3] ^= 0x01;
             std::fs::write(ledger, bytes).unwrap();
         });
+    }
+
+    /// QA of #198: a `Corrupt` union `select` falls back to hot's listing
+    /// too (#188 STOP 1 decision 1). The ledger's header names an unknown
+    /// format version, which the ledger read reports as `Corrupt`. A
+    /// garbage manifest on hot cannot show this: hot's listing would fail
+    /// on it as well, and the start then fails as before.
+    #[test]
+    fn a_corrupt_union_select_is_the_degraded_start() {
+        assert_degraded_start(
+            "tiered-corrupt-ledger",
+            "raw store data is corrupt",
+            |ledger| {
+                std::fs::write(ledger, "mie-copy-ledger 9\n").unwrap();
+            },
+        );
     }
 }

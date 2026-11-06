@@ -204,7 +204,7 @@ fn run_replay(request: &ReplayRequest) -> Result<String, String> {
             let source = &config.instrument.source;
             let symbol = &config.instrument.symbol;
             let runs = read_runs(&config.paths.journal, source)?;
-            let store = crate::store::raw_store(&config.paths.raw_root, &config.paths.cold_roots);
+            let store = crate::store::raw_store(&config.paths.raw_root, &config.paths.cold_roots)?;
             let runs = runs.iter().map(|run| run.live_run()).collect();
             let live = LiveReplay::new(&store, source, symbol, runs);
             let text = format!("live {source}/{symbol}");
@@ -215,7 +215,7 @@ fn run_replay(request: &ReplayRequest) -> Result<String, String> {
             streams,
             correction,
         } => {
-            let store = crate::store::raw_store(&config.paths.raw_root, &config.paths.cold_roots);
+            let store = crate::store::raw_store(&config.paths.raw_root, &config.paths.cold_roots)?;
             let archive = archive_replay(&store, config, streams.as_deref(), *correction)?;
             let mut names: Vec<&str> = archive.streams().iter().map(|s| s.raw_name()).collect();
             names.sort_unstable();
@@ -227,7 +227,7 @@ fn run_replay(request: &ReplayRequest) -> Result<String, String> {
             (text, drive(&archive, request, false, &mut log)?)
         }
         ReplaySource::History(config) => {
-            let store = crate::store::raw_store(&config.paths.raw_root, &config.paths.cold_roots);
+            let store = crate::store::raw_store(&config.paths.raw_root, &config.paths.cold_roots)?;
             let chain = history_chain(config, &store)?;
             (
                 "history".to_owned(),
@@ -303,7 +303,7 @@ fn run_report(request: &ReportRequest) -> Result<String, String> {
         ReplaySource::Live(config) => {
             let source = &config.instrument.source;
             let runs = read_runs(&config.paths.journal, source)?;
-            let store = crate::store::raw_store(&config.paths.raw_root, &config.paths.cold_roots);
+            let store = crate::store::raw_store(&config.paths.raw_root, &config.paths.cold_roots)?;
             let runs = runs.iter().map(|run| run.live_run()).collect();
             let live = LiveReplay::new(&store, source, &config.instrument.symbol, runs);
             ReportService::new(live).report(window)
@@ -313,12 +313,12 @@ fn run_report(request: &ReportRequest) -> Result<String, String> {
             streams,
             correction,
         } => {
-            let store = crate::store::raw_store(&config.paths.raw_root, &config.paths.cold_roots);
+            let store = crate::store::raw_store(&config.paths.raw_root, &config.paths.cold_roots)?;
             let archive = archive_replay(&store, config, streams.as_deref(), *correction)?;
             ReportService::new(archive).report(window)
         }
         ReplaySource::History(config) => {
-            let store = crate::store::raw_store(&config.paths.raw_root, &config.paths.cold_roots);
+            let store = crate::store::raw_store(&config.paths.raw_root, &config.paths.cold_roots)?;
             let chain = history_chain(config, &store)?;
             ReportService::chain(chain).report(window)
         }

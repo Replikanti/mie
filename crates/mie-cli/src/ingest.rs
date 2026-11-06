@@ -196,6 +196,7 @@ pub fn run_with_hold(
     // Before anything is opened: `Journal::open` creates the journal file,
     // and a refused start leaves no new file (ADR-062 D7, *Hot lost*).
     crate::store::check_hot(&config.paths.raw_root, &config.paths.cold_roots)?;
+    let store = crate::store::raw_store(&config.paths.raw_root, &config.paths.cold_roots)?;
     let clock = Arc::clone(&transports.clock);
     let now = || clock.now_utc_ns();
     let run_id = run_id(now());
@@ -206,7 +207,6 @@ pub fn run_with_hold(
     };
     let sync = || journal.lock().unwrap_or_else(|p| p.into_inner()).sync();
 
-    let store = crate::store::raw_store(&config.paths.raw_root, &config.paths.cold_roots);
     let writer = store
         .writer(&config.instrument.source, RotationPolicy::default())
         .map_err(|e| format!("open the raw store: {e}"))?;
@@ -701,7 +701,7 @@ fn warm_up(
     queue_limit: &AtomicU64,
     max: u64,
 ) -> Result<WarmUp, String> {
-    let store = crate::store::raw_store(&config.paths.raw_root, &config.paths.cold_roots);
+    let store = crate::store::raw_store(&config.paths.raw_root, &config.paths.cold_roots)?;
     let largest = memory_guard(config, &store, run_id, max)?;
     queue_limit.store(max - largest, Ordering::SeqCst);
     let chain: HistoryChain<'_> = history_chain(config, &store)?;

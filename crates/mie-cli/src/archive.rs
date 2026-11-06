@@ -150,8 +150,8 @@ pub fn import(
     // whose removed partitions only the copy ledger lists (ADR-062 D7, *Hot
     // intact, ledger lost*).
     crate::store::check_copy_ledger(&config.paths.raw_root, &config.paths.cold_roots)?;
+    let store = crate::store::raw_store(&config.paths.raw_root, &config.paths.cold_roots)?;
     let options = import_options(config, request)?;
-    let store = crate::store::raw_store(&config.paths.raw_root, &config.paths.cold_roots);
     let fetcher = Fetcher::new(
         transports.http.as_ref(),
         transports.download.as_ref(),
@@ -258,7 +258,7 @@ pub fn verify(
     to_day: i64,
     out: &mut dyn Write,
 ) -> Result<bool, String> {
-    let store = crate::store::raw_store(&config.paths.raw_root, &config.paths.cold_roots);
+    let store = crate::store::raw_store(&config.paths.raw_root, &config.paths.cold_roots)?;
     let ledgers = LedgerDir::new(&config.paths.import_ledger);
     let configured = config.streams().map_err(|e| e.to_string())?;
     let mut pass = true;
@@ -498,7 +498,7 @@ pub fn kline_check(
             "the trades fold applies to aggTrades only: trades has nothing to correct".to_owned(),
         );
     }
-    let store = crate::store::raw_store(&config.paths.raw_root, &config.paths.cold_roots);
+    let store = crate::store::raw_store(&config.paths.raw_root, &config.paths.cold_roots)?;
     let window = day_window(from_day, to_day);
     let trades_window = ReplayWindow {
         start: EventTime::from_millis(window.start.as_millis() - TRADE_MARGIN_MS),

@@ -218,9 +218,12 @@ pub fn run(
             event_hash::ENCODING_VERSION
         ),
     );
-    let outcome = match read_runs(&config.paths.journal, source) {
-        Ok(runs) => {
-            let store = crate::store::raw_store(&config.paths.raw_root, &config.paths.cold_roots);
+    let opened = read_runs(&config.paths.journal, source).and_then(|runs| {
+        crate::store::raw_store(&config.paths.raw_root, &config.paths.cold_roots)
+            .map(|store| (runs, store))
+    });
+    let outcome = match opened {
+        Ok((runs, store)) => {
             let live = LiveReplay::new(
                 &store,
                 source,

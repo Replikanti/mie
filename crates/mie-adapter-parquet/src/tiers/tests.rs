@@ -469,6 +469,50 @@ fn read_order() {
     }
 }
 
+/// QA of #198: a hot copy that exists but cannot be read is `Io`, naming
+/// the root, and never a fallback to a good cold copy. Skipped where
+/// permissions do not stop reads (root).
+#[test]
+fn read_order_an_unreadable_hot_copy_is_io_with_no_fallback() {
+    use std::os::unix::fs::PermissionsExt;
+    let fx = TieredFixture::new("tiers-read-unreadable");
+    let partition = TieredFixture::partition(&a(), 2);
+    fx.copy(&partition);
+    let path = TieredFixture::data_paths(&fx.hot, &partition)[0].clone();
+    let file = fx
+        .reference()
+        .select(&all())
+        .unwrap()
+        .files
+        .into_iter()
+        .find(|f| f.relative_path == path)
+        .unwrap();
+    let hot_copy = layout::resolve(&fx.hot, &path);
+    fs::set_permissions(&hot_copy, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read(&hot_copy).is_ok() {
+        eprintln!("skipped: permissions do not stop reads here (running as root)");
+        return;
+    }
+    match fx.store().read(&file) {
+        Err(RawStoreError::Io(message)) => {
+            assert!(
+                message.contains(&hot_copy.display().to_string()),
+                "{message}"
+            );
+            assert!(
+                message.contains(&format!("on root {}", fx.hot.display())),
+                "{message}"
+            );
+        }
+        other => panic!("expected Io with no fallback, got {other:?}"),
+    }
+    // Both cold copies are good: a fallback would have answered.
+    for root in &fx.cold {
+        let cold_only = ParquetRawStore::new(root);
+        assert_eq!(cold_only.read(&file), fx.reference().read(&file));
+    }
+}
+
 #[test]
 fn lost_held_and_quarantined_files() {
     let partition = TieredFixture::partition(&a(), 1);
