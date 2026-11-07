@@ -30,11 +30,14 @@
 //!    PASS also asserts at the end: on hot unless its partition is
 //!    recorded removed, and recorded on every copy target), so a re-run of
 //!    a stopped adoption against another store can never pass and leave a
-//!    partition guarded for good. A file that only lacks a copy on a target
-//!    added after it left hot does not block the writes (its partition is
-//!    recorded removed, and the run never writes its path); the end of the
-//!    run fails naming it with its remedy (`mie store repair`, #192, or a
-//!    re-adoption of its original store); every archive part has the entry that lists it with its
+//!    partition guarded for good. A file that left hot with at least one
+//!    recorded copy on any root id but lacks one on a configured target
+//!    (a target added or replaced, every target replaced, or a stopped
+//!    adoption) does not block the writes (its partition is recorded
+//!    removed, and the run never writes its path); the end of the run fails
+//!    naming it with its remedy (`mie store repair`, #192, when a configured
+//!    target holds a copy, otherwise only a re-adoption of each original
+//!    store); every archive part has the entry that lists it with its
 //!    manifest's SHA-256, and every listed part is in the source or already
 //!    in the store. The **path rule** (D10, D5): each source path's
 //!    manifest is compared with the ledger's `manifest` record, hot's
@@ -835,7 +838,9 @@ impl Run<'_> {
             }
             match complete(&hot, &self.fold, path, targets, removed) {
                 Ok(None) => {}
-                Ok(Some(gap)) if gap.needs_repair() => repair.push(format!("{path} ({gap})")),
+                Ok(Some(gap)) if gap.needs_refill() => {
+                    repair.push((format!("{path} ({gap})"), gap.repairable()));
+                }
                 Ok(Some(gap)) if gap.needs_pass() => pass.push(format!("{path} ({gap})")),
                 Ok(Some(gap)) => stopped.push(format!("{path} ({gap})")),
                 Err(error) => stopped.push(format!("{path} ({error})")),
@@ -858,8 +863,8 @@ impl Run<'_> {
         // anyway), and this run never writes its path. Blocking would
         // deadlock two adopted stores that each wait for the other's files
         // on a new target; the end-of-run check names it and fails the run.
-        if !stopped.is_empty() && !repair.is_empty() {
-            problems.push(repair_problem(&repair));
+        if !stopped.is_empty() {
+            problems.extend(refill_problems(&repair));
         }
         if !pass.is_empty() {
             problems.push(format!(
@@ -1178,8 +1183,8 @@ impl Run<'_> {
             }
             let gap = match complete(&hot, &fold, path, targets, &removed) {
                 Ok(None) => continue,
-                Ok(Some(gap)) if gap.needs_repair() => {
-                    repair.push(format!("{path} ({gap})"));
+                Ok(Some(gap)) if gap.needs_refill() => {
+                    repair.push((format!("{path} ({gap})"), gap.repairable()));
                     continue;
                 }
                 Ok(Some(gap)) => gap.to_string(),
@@ -1189,23 +1194,47 @@ impl Run<'_> {
                 "after the adoption {path} is not complete ({gap}) (ADR-062 D10)"
             ));
         }
-        if !repair.is_empty() {
-            self.report.problems.push(repair_problem(&repair));
-        }
+        self.report.problems.extend(refill_problems(&repair));
     }
 }
 
-/// The problem naming the files that only need the target-to-target
-/// repair: a copy target added or replaced after they left hot.
-fn repair_problem(files: &[String]) -> String {
-    format!(
-        "the copy ledger records {}, which left hot with a copy record on another copy target \
-         but none on the target named: a target added or replaced after it was adopted, and the \
-         replication pass copies from hot only. Fill it with `mie store repair` (#192), or until \
-         then re-adopt the original store it came from; this run adopted what it read, and only \
-         these files are short (ADR-062 D10, D11)",
-        files.join(", ")
-    )
+/// The problems naming the files that left hot and lack a copy on a
+/// configured target (`Gap::needs_refill`), each with whether a configured
+/// target holds a recorded copy. Two causes, two remedies.
+fn refill_problems(files: &[(String, bool)]) -> Vec<String> {
+    let names = |repairable: bool| {
+        files
+            .iter()
+            .filter(|(_, r)| *r == repairable)
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let (repairable, readopt) = (names(true), names(false));
+    let mut problems = Vec::new();
+    if !repairable.is_empty() {
+        problems.push(format!(
+            "the copy ledger records {}, which left hot with a recorded copy on a configured copy \
+             target but none on the target named: a target was added or replaced after it was \
+             adopted, or an adoption stopped before it reached every target, and the replication \
+             pass copies from hot only. Fill it with `mie store repair` (#192), or until then \
+             re-adopt the original store it came from; this run adopted what it read, and only \
+             these files are short (ADR-062 D10, D11)",
+            repairable
+        ));
+    }
+    if !readopt.is_empty() {
+        problems.push(format!(
+            "the copy ledger records {}, which left hot, and no configured copy target holds a \
+             recorded copy: its copies are recorded only on roots that are no longer configured \
+             (every copy target replaced or lost). `mie store repair` cannot help, since no \
+             configured target has a good copy; the only remedy is to re-adopt each original \
+             store in turn, which copies its files to every configured target. This run adopted \
+             what it read, and only these files are short (ADR-062 D10, D11)",
+            readopt
+        ));
+    }
+    problems
 }
 
 /// The partitions recorded removed (the later of `removed` and `returned`
@@ -1249,16 +1278,31 @@ struct Gap {
     recorded: Vec<String>,
     /// The copy targets without one.
     missing: Vec<String>,
+    /// Root ids with a `copy` record of it that are not configured copy
+    /// targets any more (replaced or lost targets).
+    elsewhere: Vec<String>,
 }
 
 impl Gap {
-    /// Only copies on some targets are missing, and another target holds a
-    /// recorded copy while hot does not: a target added or replaced after
-    /// the file left hot. The pass copies from hot only, so only the
-    /// target-to-target repair (#192) or a re-adoption of the original
-    /// store fills it.
-    fn needs_repair(&self) -> bool {
-        !self.off_hot && !self.on_hot && !self.recorded.is_empty() && !self.missing.is_empty()
+    /// Only copies on some targets are missing, hot does not hold the file
+    /// (its partition is recorded removed), and the ledger records at least
+    /// one copy of it on any root id: it left hot after a complete or
+    /// partial adoption, and a target was added or replaced since, or the
+    /// adoption stopped before it reached every target. The pass copies
+    /// from hot only, so only the target-to-target repair (#192, when a
+    /// configured target holds a recorded copy) or a re-adoption of its
+    /// original store fills it. This class never blocks the writes.
+    fn needs_refill(&self) -> bool {
+        !self.off_hot
+            && !self.on_hot
+            && !self.missing.is_empty()
+            && !(self.recorded.is_empty() && self.elsewhere.is_empty())
+    }
+
+    /// Whether a configured copy target holds a recorded copy, so the
+    /// repair (#192) can copy from it.
+    fn repairable(&self) -> bool {
+        !self.recorded.is_empty()
     }
 
     /// Only copies are missing and hot holds the file: the pass fills them.
@@ -1274,11 +1318,17 @@ impl std::fmt::Display for Gap {
             parts.push("not on hot, and its partition is not recorded removed".to_owned());
         }
         if !self.missing.is_empty() {
-            let on = if self.recorded.is_empty() {
+            let mut on = if self.recorded.is_empty() {
                 String::new()
             } else {
                 format!(", only on {}", self.recorded.join(", "))
             };
+            if !self.elsewhere.is_empty() {
+                on.push_str(&format!(
+                    ", recorded on roots no longer configured: {}",
+                    self.elsewhere.join(", ")
+                ));
+            }
             parts.push(format!("no copy record on {}{on}", self.missing.join(", ")));
         }
         write!(f, "{}", parts.join("; "))
@@ -1309,11 +1359,20 @@ fn complete(
     let (recorded, missing): (Vec<&Target>, Vec<&Target>) = targets
         .iter()
         .partition(|target| fold.has_copy(path, &target.id));
+    let elsewhere = fold
+        .copies
+        .get(path)
+        .into_iter()
+        .flatten()
+        .filter(|id| !targets.iter().any(|target| target.id == **id))
+        .cloned()
+        .collect();
     let gap = Gap {
         off_hot: !on_hot && !removed.contains(partition_of(path)),
         on_hot,
         recorded: recorded.iter().map(|t| t.id.clone()).collect(),
         missing: missing.iter().map(|t| t.id.clone()).collect(),
+        elsewhere,
     };
     Ok((gap.off_hot || !gap.missing.is_empty()).then_some(gap))
 }

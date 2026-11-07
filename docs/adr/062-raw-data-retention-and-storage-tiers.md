@@ -1048,15 +1048,28 @@ adopted into the production store. The protocol (#190):
   a copy target added after an adoption, or a failed one replaced under a
   new id, holds no copy of the files that already left hot, and the
   replication pass copies from hot only. Those files fail the predicate.
-  Unlike the other gaps they do not block the writes: such a file lies in
-  a partition recorded removed (so the writer guard refuses it whatever
-  happens) and the run never writes its path, so no path is reused and no
-  other bytes get in. The run adopts what it reads, then fails at the end,
-  naming each such path, the targets holding its recorded copy and the
-  new target lacking one, and the remedy: `mie store repair` (#192),
-  which copies it from a good target, or until then a re-adoption of
-  each original store, which copies its own files to every target
-  without a `copy` record. Why not refuse up front: with two adopted
+  The class is: not on hot (its partition is recorded removed), short of
+  a copy on a configured target, and with at least one `copy` record in
+  the ledger on any root id, configured or not. Unlike the other gaps it
+  does not block the writes: such a file lies in a partition recorded
+  removed (so the writer guard refuses it whatever happens) and the run
+  never writes its path, so no path is reused and no other bytes get in.
+  The run adopts what it reads, then fails at the end, naming each such
+  path, the targets holding its recorded copy, the targets lacking one,
+  and the remedy:
+  - when a configured target holds a recorded copy: `mie store repair`
+    (#192), which copies it from that target, or until then a
+    re-adoption of the original store. The message names both causes,
+    a target added or replaced, or an adoption that stopped before it
+    reached every target;
+  - when its copies are recorded only on roots no longer configured
+    (every target replaced or lost, review of #200 finding 7): the
+    repair cannot help, since no configured target has a good copy, and
+    the message names the only remedy, re-adopting each original store
+    in turn, which copies its own files to every configured target.
+
+  A recorded file with no `copy` record at all is the ghost of a stopped
+  adoption and still refuses up front (finding 3). Why not refuse up front: with two adopted
   stores (the #22 store and the archive, the production shape), each
   re-adoption would be refused for the other store's files, a deadlock
   until #192. Re-adopting every earlier store in turn ends with PASS. Why

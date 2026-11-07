@@ -32,9 +32,10 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   file the source does not list that is not complete (on hot unless its
   partition is removed, and recorded on every copy target; the same
   predicate a PASS asserts at its end; a file that only lacks a copy on
-  a target added after its adoption does not block the run, which fails
-  at its end naming it with `mie store repair`, #192, or a re-adoption of
-  its original store as the remedy), a pending
+  a target added after its adoption, or only recorded on targets since
+  replaced, does not block the run, which fails at its end naming it with
+  its remedy: `mie store repair`, #192, when a configured target holds a
+  copy, otherwise a re-adoption of each original store), a pending
   import, an orphan archive part or an active writer, a
   `--from` overlapping hot or a cold root, and a copy target without its
   marker. The hot window's first date is `mie_cli::ingest::first_hot_date`

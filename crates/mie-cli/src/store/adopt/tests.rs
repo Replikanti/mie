@@ -1025,3 +1025,139 @@ fn a_target_added_after_an_adoption_is_named_with_its_remedy() {
     );
     assert_eq!(report.problems, Vec::<String>::new(), "{report:?}");
 }
+
+/// The ingest configuration, an archive configuration and a probe of the
+/// fixture's hot with the copy targets `ids`, created and marked under
+/// `dst/` when they do not exist yet.
+fn with_targets(fixture: &Fixture, ids: &[&str]) -> (IngestConfig, PathBuf, Probe) {
+    let dst = fixture.dir.0.join("dst");
+    let mut roots = String::from("cold_roots = [\n");
+    let mut probe = vec![(fixture.hot.clone(), 1)];
+    for (i, id) in ids.iter().enumerate() {
+        let root = dst.join(id);
+        if !root.exists() {
+            fs::create_dir_all(&root).unwrap();
+            root_marker::create_meta(&root, id, false).unwrap();
+        }
+        roots.push_str(&format!(
+            "{{ path = \"{}\", copy_target = true }},\n",
+            root.display()
+        ));
+        probe.push((root, 10 + i as u64));
+    }
+    roots.push_str("]\n");
+    let config = IngestConfig::parse(&format!(
+        "[instrument]\nsymbol = \"BTCUSDT\"\nsource = \"binance-um\"\n[paths]\n\
+         raw_root = \"{}\"\njournal = \"{}\"\n{roots}[binance]\n\
+         ws_base_url = \"wss://fake.invalid/ws\"\nrest_base_url = \"https://fake.invalid\"\n\
+         streams = [\"aggTrade\"]\n",
+        fixture.hot.display(),
+        dst.join("journal.jsonl").display(),
+    ))
+    .unwrap();
+    let archive = dst.join(format!("archive-{}.toml", ids.join("-")));
+    fs::write(
+        &archive,
+        format!(
+            "[instrument]\nsymbol = \"BTCUSDT\"\n[paths]\nraw_root = \"{}\"\n\
+             import_ledger = \"{}\"\nstaging = \"{}\"\n{roots}",
+            fixture.hot.display(),
+            dst.join("ledger").display(),
+            dst.join("staging").display(),
+        ),
+    )
+    .unwrap();
+    (config, archive, Probe(probe))
+}
+
+/// Review of #200, finding 7: after two adoptions every copy target is
+/// replaced under new ids, so the removed files' copies are recorded only
+/// on roots no longer configured. That gap does not block the writes
+/// either, and its message names the only remedy (re-adopting each original
+/// store; the repair has no good copy to copy from). Re-adopting A fills
+/// A's files and fails naming B's; re-adopting B passes, and so does A.
+#[test]
+fn every_target_replaced_after_two_adoptions_is_filled_by_re_adoptions() {
+    let fixture = Fixture::new("adopt-all-replaced");
+    assert_eq!(fixture.adopt().problems, Vec::<String>::new());
+    let other = Dir::new("adopt-all-replaced-other");
+    seal(&other.0, "binance-um", "aggTrade", D0 - 4 * DAY, 2);
+    let request_b = AdoptRequest {
+        from: other.0.clone(),
+        archive_config: Some(fixture.dir.0.join("dst/archive.toml")),
+        ..AdoptRequest::default()
+    };
+    let b = run(
+        &fixture.config,
+        &request_b,
+        FIRST_HOT,
+        &fixture.probe,
+        &|| D0 + 2,
+    );
+    assert_eq!(b.problems, Vec::<String>::new(), "{b:?}");
+
+    let (config, archive, probe) = with_targets(&fixture, &["cold-c", "cold-d"]);
+    let new = config
+        .paths
+        .cold_roots
+        .iter()
+        .map(|root| root.path.clone())
+        .collect::<Vec<_>>();
+    let old_of = |raw: &Path| -> Vec<String> {
+        replica::list_sealed(raw)
+            .unwrap()
+            .into_iter()
+            .filter(|p| date_of(partition_of(p)) < FIRST_HOT)
+            .collect()
+    };
+    let (old_a, old_b) = (old_of(&fixture.raw()), old_of(&other.0));
+    let mut request_a = fixture.request();
+    request_a.archive_config = Some(archive.clone());
+    let request_b = AdoptRequest {
+        archive_config: Some(archive.clone()),
+        ..request_b
+    };
+
+    let mut out = Vec::new();
+    let passed =
+        crate::store::adopt(&config, &request_a, FIRST_HOT, &probe, &|| D0 + 3, &mut out).unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(!passed && !text.contains("\nPASS\n"), "{text}");
+    for root in &new {
+        for path in &old_a {
+            assert!(root.join(path).exists(), "{path}");
+        }
+        for path in &old_b {
+            assert!(!root.join(path).exists(), "{path}");
+        }
+    }
+    let fail: Vec<&str> = text.lines().filter(|l| l.starts_with("FAIL: ")).collect();
+    assert_eq!(fail.len(), 1, "{text}");
+    for path in &old_b {
+        assert!(
+            fail[0].contains(&format!(
+                "{path} (no copy record on cold-c, cold-d, recorded on roots no longer \
+                 configured: cold-a, cold-b)"
+            )),
+            "{path}: {text}"
+        );
+    }
+    for text_part in [
+        "no configured copy target holds a recorded copy",
+        "`mie store repair` cannot help",
+        "re-adopt each original store in turn",
+    ] {
+        assert!(fail[0].contains(text_part), "{text_part:?} in {text}");
+    }
+    assert!(!fail[0].contains("an adoption that stopped"), "{text}");
+
+    let report = run(&config, &request_b, FIRST_HOT, &probe, &|| D0 + 4);
+    assert_eq!(report.problems, Vec::<String>::new(), "{report:?}");
+    let report = run(&config, &request_a, FIRST_HOT, &probe, &|| D0 + 5);
+    assert_eq!(report.problems, Vec::<String>::new(), "{report:?}");
+    for root in &new {
+        for path in old_a.iter().chain(&old_b) {
+            assert!(root.join(path).exists(), "{path}");
+        }
+    }
+}
