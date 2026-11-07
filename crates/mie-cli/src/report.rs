@@ -186,7 +186,7 @@ pub fn run(
     }
 
     let streams = config.streams().map_err(|e| e.to_string())?;
-    let store = ParquetRawStore::new(&config.paths.raw_root);
+    let store = crate::store::raw_store(&config.paths.raw_root, &config.paths.cold_roots)?;
     writeln!(
         out,
         "capture report [{from_ms}, {to_ms}) — {} run(s)",

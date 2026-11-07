@@ -692,3 +692,118 @@ pub fn seam_fixture_days(dir: &Path, streams: &str, trade_days: i64) -> IngestCo
     write_records(&config, &records, &journal);
     config
 }
+
+// ---------------------------------------------------------------------------
+// Tiered stores (ADR-062): the stand-in for the replicator and the remover
+// of later steps.
+
+/// The two cold copy targets `cold-a` and `cold-b` under `dir`.
+pub fn cold_roots(dir: &Path) -> Vec<mie_cli::config::ColdRoot> {
+    ["cold-a", "cold-b"]
+        .map(|name| mie_cli::config::ColdRoot {
+            path: dir.join(name),
+            copy_target: true,
+        })
+        .to_vec()
+}
+
+/// `cold_roots` as the TOML value of `paths.cold_roots`.
+pub fn cold_roots_toml(cold_roots: &[mie_cli::config::ColdRoot]) -> String {
+    let entries: Vec<String> = cold_roots
+        .iter()
+        .map(|root| {
+            format!(
+                "{{ path = \"{}\", copy_target = {} }}",
+                root.path.display(),
+                root.copy_target
+            )
+        })
+        .collect();
+    format!("[{}]", entries.join(", "))
+}
+
+/// Initializes the tiered store of `raw_root` and `cold_roots`: hot's
+/// marker with a header-only copy ledger, and each cold root's marker under
+/// its directory name.
+pub fn init_tiers(raw_root: &Path, cold_roots: &[mie_cli::config::ColdRoot]) {
+    use mie_adapter_parquet::root_marker::{self, HOT_ID};
+    std::fs::create_dir_all(raw_root).unwrap();
+    root_marker::create_meta(raw_root, HOT_ID, true).unwrap();
+    for root in cold_roots {
+        std::fs::create_dir_all(&root.path).unwrap();
+        let id = root.path.file_name().unwrap().to_str().unwrap();
+        root_marker::create_meta(&root.path, id, false).unwrap();
+    }
+}
+
+/// Moves every partition of the tiered store except the newest date of
+/// each stream to the cold roots in the order of ADR-062 D5 and D6: each
+/// file copied to every root and recorded (`manifest`, then one `copy` per
+/// root), then the partition's `removed` record, the rename to a hidden
+/// name and the deletion. Returns the moved partition directories.
+pub fn move_to_cold(raw_root: &Path, cold_roots: &[mie_cli::config::ColdRoot]) -> Vec<PathBuf> {
+    use mie_adapter_parquet::copy_ledger::{CopyLedger, Kind, Record};
+    let ledger = CopyLedger::at(raw_root);
+    let mut at_ms = D0;
+    let mut append = |kind: Kind| {
+        at_ms += 1;
+        ledger.append(&Record { at_ms, kind }).unwrap();
+    };
+    let sorted = |dir: &Path| -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    };
+    let mut moved = Vec::new();
+    for source in sorted(raw_root).iter().filter(|n| n.starts_with("source=")) {
+        for instrument in sorted(&raw_root.join(source)) {
+            if !instrument.starts_with("instrument=") {
+                continue;
+            }
+            for stream in sorted(&raw_root.join(source).join(&instrument)) {
+                let stream_dir = raw_root.join(source).join(&instrument).join(&stream);
+                let mut dates: Vec<String> = sorted(&stream_dir)
+                    .into_iter()
+                    .filter(|n| n.starts_with("date="))
+                    .collect();
+                dates.pop();
+                for date in dates {
+                    let partition = format!("{source}/{instrument}/{stream}/{date}");
+                    let dir = stream_dir.join(&date);
+                    for name in sorted(&dir) {
+                        let Some(base) = name.strip_suffix(".manifest") else {
+                            continue;
+                        };
+                        let data = format!("{base}.parquet");
+                        for root in cold_roots {
+                            let target = root.path.join(&partition);
+                            std::fs::create_dir_all(&target).unwrap();
+                            for file in [&name, &data] {
+                                std::fs::copy(dir.join(file), target.join(file)).unwrap();
+                            }
+                        }
+                        let text = std::fs::read_to_string(dir.join(&name)).unwrap();
+                        append(Kind::Manifest { text });
+                        for root in cold_roots {
+                            append(Kind::Copy {
+                                path: format!("{partition}/{data}"),
+                                root: root.path.file_name().unwrap().to_str().unwrap().to_owned(),
+                            });
+                        }
+                    }
+                    append(Kind::Removed {
+                        partition: partition.clone(),
+                    });
+                    let hidden = stream_dir.join(format!(".removed-{date}"));
+                    std::fs::rename(&dir, &hidden).unwrap();
+                    std::fs::remove_dir_all(&hidden).unwrap();
+                    moved.push(dir);
+                }
+            }
+        }
+    }
+    moved
+}

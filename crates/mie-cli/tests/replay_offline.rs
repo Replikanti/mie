@@ -288,6 +288,38 @@ fn a_replay_of_the_store_equals_what_the_live_capture_delivered() {
 }
 
 // ---------------------------------------------------------------------------
+// A tiered store (ADR-062 D7): the live replay reads moved partitions.
+
+#[test]
+fn a_live_replay_of_a_tiered_store_is_byte_identical_after_the_move() {
+    let dir = TempDir::new("replay-tiered");
+    let mut config = config(dir.path());
+    let (t1, t2) = (D0 + HOUR, D0 + DAY_MS + HOUR);
+    let first = ingest(
+        &config,
+        t1,
+        vec![vec![agg(100, t1 + 10), agg(101, t1 + 20)]],
+    );
+    let second = ingest(&config, t2, vec![vec![agg(300, t2 + 5), agg(301, t2 + 6)]]);
+    assert_eq!((first.exit_code(), second.exit_code()), (0, 0));
+    let request = |config: &mie_cli::config::IngestConfig| ReplayRequest {
+        source: ReplaySource::Live(config.clone()),
+        window: window(D0, D0 + 2 * DAY_MS),
+    };
+    let (single, single_text) = run_replay(&request(&config));
+    assert!(single.pass, "{single_text}");
+
+    config.paths.cold_roots = common::cold_roots(dir.path());
+    common::init_tiers(&config.paths.raw_root, &config.paths.cold_roots);
+    let moved = common::move_to_cold(&config.paths.raw_root, &config.paths.cold_roots);
+    assert!(!moved.is_empty());
+    assert!(moved.iter().all(|partition| !partition.exists()));
+    let (tiered, tiered_text) = run_replay(&request(&config));
+    assert_eq!(tiered_text, single_text);
+    assert_eq!(tiered, single);
+}
+
+// ---------------------------------------------------------------------------
 // Determinism over `mie ingest` runs.
 
 #[test]

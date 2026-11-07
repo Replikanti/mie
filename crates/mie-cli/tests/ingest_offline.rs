@@ -1136,7 +1136,10 @@ fn a_queue_past_its_limit_abandons_the_warm_up_and_starts_cold() {
 
 mod tiered_start {
     //! The start refusal on a tiered store's hot without its marker
-    //! (ADR-062 D7, *Hot lost*), and no `.mie/` without cold roots.
+    //! (ADR-062 D7, *Hot lost*), no `.mie/` without cold roots, and the
+    //! seed scan of a tiered store: the union `select` with a readable copy
+    //! ledger, the degraded start without one (D7 *Seeds*, *Hot intact,
+    //! ledger lost*).
 
     use super::common::{
         D0, FakeClock, HOUR, NoHttp, ScriptedConnector, TempDir, agg, config, ingest,
@@ -1227,5 +1230,267 @@ mod tiered_start {
         assert_eq!(outcome.exit_code(), 0, "{:?}", outcome.error);
         assert!(config.paths.raw_root.exists());
         assert!(!config.paths.raw_root.join(".mie").exists());
+    }
+
+    // ------------------------------------------------- the seed listing
+
+    use super::common::warm::import_archive;
+    use super::common::{
+        CUTOVER, cold_roots, cold_roots_toml, history_config, init_tiers, journal, journaled_run,
+        write_records,
+    };
+    use mie_adapter_binance::archive::catalog::DAY_MS;
+    use mie_adapter_binance::transport::HttpDownload;
+    use mie_adapter_parquet::copy_ledger::{self, CopyLedger, Kind, Record};
+    use mie_cli::archive::{self, ArchiveTransports, ImportRequest};
+    use mie_cli::config::ArchiveConfig;
+    use mie_cli::replay::{self, ReplayRequest, ReplaySource};
+    use mie_domain::time::EventTime;
+    use mie_ports::outbound::ReplayWindow;
+    use serde_json::Value;
+    use std::path::PathBuf;
+
+    /// The start of the runs below: an hour after the prior run.
+    const T: i64 = CUTOVER + 2 * HOUR;
+
+    /// Every path below `dir`, sorted.
+    fn tree(dir: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(path) = stack.pop() {
+            if path.is_dir() {
+                for entry in std::fs::read_dir(&path).unwrap() {
+                    stack.push(entry.unwrap().path());
+                }
+            }
+            out.push(path);
+        }
+        out.sort();
+        out
+    }
+
+    /// Copies the directory tree `from` to `to`.
+    fn copy_tree(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let target = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), &target).unwrap();
+            }
+        }
+    }
+
+    /// A tiered chain configuration under `dir`: the archive of
+    /// [`import_archive`] with the same `cold_roots` in `archive.toml`, the
+    /// memory guard, a clean prior run after the cutover, hot initialized.
+    /// Before the initialization the store and the journal are copied to
+    /// `single`, with a single-root configuration over the copy.
+    fn tiered_chain(dir: &Path, single: &Path) -> (IngestConfig, IngestConfig) {
+        import_archive(dir);
+        let cold = cold_roots(dir);
+        let archive_toml = dir.join("archive.toml");
+        let text = std::fs::read_to_string(&archive_toml).unwrap().replacen(
+            "[paths]\n",
+            &format!("[paths]\ncold_roots = {}\n", cold_roots_toml(&cold)),
+            1,
+        );
+        std::fs::write(&archive_toml, text).unwrap();
+        let mut config = history_config(dir, "2026-10-03", "2026-10-06");
+        config.history.as_mut().unwrap().max_run_records = Some(1_000);
+        config.paths.cold_roots = cold;
+        let (lines, records) = journaled_run(
+            "20261006T010000Z",
+            CUTOVER + HOUR,
+            CUTOVER + HOUR + 60_000,
+            500,
+            &[
+                CUTOVER + HOUR,
+                CUTOVER + HOUR + 1_000,
+                CUTOVER + HOUR + 2_000,
+            ],
+        );
+        write_records(&config, &records, &lines);
+
+        let single_config = super::common::config(single);
+        copy_tree(&config.paths.raw_root, &single_config.paths.raw_root);
+        std::fs::copy(&config.paths.journal, &single_config.paths.journal).unwrap();
+        init_tiers(&config.paths.raw_root, &config.paths.cold_roots);
+        (config, single_config)
+    }
+
+    fn frames() -> Vec<Vec<String>> {
+        vec![vec![agg(1, T + 10), agg(2, T + 20), agg(3, T + 30)]]
+    }
+
+    /// The `run_start` line of the last run in the journal of `config`.
+    fn last_run_start(config: &IngestConfig) -> Value {
+        journal(config)
+            .into_iter()
+            .rfind(|line| line["type"] == "run_start")
+            .unwrap()
+    }
+
+    #[test]
+    fn a_readable_ledger_gives_the_single_root_seeds() {
+        let (dir, single) = (TempDir::new("tiered-seeds"), TempDir::new("tiered-seeds-1"));
+        let (tiered, single_config) = tiered_chain(dir.path(), single.path());
+        // Without `[history]`: the seeds alone are compared here.
+        let mut plain = tiered.clone();
+        plain.history = None;
+        let outcome = ingest(&plain, T, frames());
+        assert_eq!(outcome.exit_code(), 0, "{:?}", outcome.error);
+        let reference = ingest(&single_config, T, frames());
+        assert_eq!(reference.exit_code(), 0, "{:?}", reference.error);
+
+        let (start, reference) = (last_run_start(&plain), last_run_start(&single_config));
+        assert_ne!(reference["seeds"], serde_json::json!({}));
+        assert_eq!(start["seeds"], reference["seeds"]);
+        assert_eq!(start["seed_listing"], "union");
+        assert!(start.get("seed_listing_error").is_none(), "{start}");
+        assert!(reference.get("seed_listing").is_none(), "{reference}");
+    }
+
+    /// An HTTP download that must not be called.
+    struct NoDownload;
+
+    impl HttpDownload for NoDownload {
+        fn download(&self, url: &str, _: &mut dyn std::io::Write) -> Result<u16, String> {
+            panic!("unexpected download of {url}")
+        }
+    }
+
+    /// The degraded start after `damage` made the copy ledger unusable:
+    /// the capture runs with the single-root seeds from hot's listing, the
+    /// warm-up starts cold, the importer refuses and a live replay fails,
+    /// each naming the ledger. `union_error` is how the union `select`'s
+    /// error displays (its kind).
+    fn assert_degraded_start(tag: &str, union_error: &str, damage: impl FnOnce(&Path)) {
+        let (dir, single) = (TempDir::new(tag), TempDir::new(&format!("{tag}-1")));
+        let (config, single_config) = tiered_chain(dir.path(), single.path());
+        damage(&copy_ledger::ledger_path(&config.paths.raw_root));
+        let ledger = format!(
+            "copy ledger {}",
+            copy_ledger::ledger_path(&config.paths.raw_root).display()
+        );
+
+        let outcome = ingest(&config, T, frames());
+        let cold = super::assert_cold(&config, &outcome, "warm-up-failed");
+        let error = cold["error"].as_str().unwrap();
+        assert!(error.contains(&ledger), "{error}");
+
+        let reference = ingest(&single_config, T, frames());
+        assert_eq!(reference.exit_code(), 0, "{:?}", reference.error);
+        let (start, reference) = (last_run_start(&config), last_run_start(&single_config));
+        assert_ne!(reference["seeds"], serde_json::json!({}));
+        assert_eq!(start["seeds"], reference["seeds"]);
+        assert_eq!(start["seed_listing"], "hot");
+        let listing_error = start["seed_listing_error"].as_str().unwrap();
+        assert!(
+            listing_error.starts_with(union_error) && listing_error.contains(&ledger),
+            "{listing_error}"
+        );
+
+        // The importer refuses before it opens anything, dry runs too.
+        let archive_config = ArchiveConfig::parse(
+            &std::fs::read_to_string(dir.path().join("archive.toml")).unwrap(),
+        )
+        .unwrap();
+        let transports = ArchiveTransports {
+            http: Arc::new(NoHttp),
+            download: Arc::new(NoDownload),
+            clock: FakeClock::new(T, "nobody"),
+        };
+        let before = tree(dir.path());
+        for dry_run in [true, false] {
+            let request = ImportRequest {
+                from_day: CUTOVER / DAY_MS - 1,
+                to_day: CUTOVER / DAY_MS - 1,
+                streams: None,
+                dry_run,
+            };
+            let error = archive::import(
+                &archive_config,
+                &request,
+                &transports,
+                &AtomicBool::new(false),
+                &mut Vec::new(),
+            )
+            .expect_err("refused");
+            assert!(
+                error.contains(&ledger) && error.contains("copy-ledger rebuild"),
+                "{error}"
+            );
+            assert_eq!(tree(dir.path()), before);
+        }
+
+        // A live replay fails on the same store.
+        let mut out = Vec::new();
+        let replayed = replay::run(
+            &ReplayRequest {
+                source: ReplaySource::Live(config.clone()),
+                window: ReplayWindow {
+                    start: EventTime::from_millis(CUTOVER),
+                    end: EventTime::from_millis(CUTOVER + DAY_MS),
+                },
+            },
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(!replayed.pass, "{text}");
+        assert!(
+            text.contains(union_error) && text.contains(&ledger),
+            "{text}"
+        );
+    }
+
+    const INTEGRITY: &str = "raw store integrity check failed";
+
+    #[test]
+    fn a_missing_ledger_is_the_degraded_start() {
+        assert_degraded_start("tiered-no-ledger", INTEGRITY, |ledger| {
+            std::fs::remove_file(ledger).unwrap();
+        });
+    }
+
+    #[test]
+    fn a_ledger_damaged_before_its_last_record_is_the_degraded_start() {
+        assert_degraded_start("tiered-damaged-ledger", INTEGRITY, |ledger| {
+            let raw_root = ledger.parent().unwrap().parent().unwrap();
+            for at_ms in [1, 2] {
+                CopyLedger::at(raw_root)
+                    .append(&Record {
+                        at_ms,
+                        kind: Kind::Removed {
+                            partition: "source=binance-um/instrument=BTCUSDT/stream=aggTrade/\
+                                        date=2026-09-01"
+                                .to_owned(),
+                        },
+                    })
+                    .unwrap();
+            }
+            let mut bytes = std::fs::read(ledger).unwrap();
+            bytes[copy_ledger::HEADER.len() + 3] ^= 0x01;
+            std::fs::write(ledger, bytes).unwrap();
+        });
+    }
+
+    /// QA of #198: a `Corrupt` union `select` falls back to hot's listing
+    /// too (#188 STOP 1 decision 1). The ledger's header names an unknown
+    /// format version, which the ledger read reports as `Corrupt`. A
+    /// garbage manifest on hot cannot show this: hot's listing would fail
+    /// on it as well, and the start then fails as before.
+    #[test]
+    fn a_corrupt_union_select_is_the_degraded_start() {
+        assert_degraded_start(
+            "tiered-corrupt-ledger",
+            "raw store data is corrupt",
+            |ledger| {
+                std::fs::write(ledger, "mie-copy-ledger 9\n").unwrap();
+            },
+        );
     }
 }

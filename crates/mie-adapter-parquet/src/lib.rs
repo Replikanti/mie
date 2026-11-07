@@ -9,7 +9,10 @@
 //!   changes again, and a killed writer never leaves a partial one visible.
 //! - [`ParquetRawStore`] ([`RawRecordSource`](mie_ports::raw::RawRecordSource))
 //!   resolves a replay window to its sealed files and dataset version, and
-//!   reads each file only after verifying it against its manifest.
+//!   reads each file only after verifying it against its manifest. It is a
+//!   single-root store ([`ParquetRawStore::new`]) or a tiered one
+//!   ([`ParquetRawStore::tiered`], below); with no cold root the two are the
+//!   same value and run the same code.
 //!
 //! Every message is stored verbatim: the exact payload bytes plus capture
 //! metadata in one exchange-agnostic envelope (schema v1). Parsing and
@@ -41,6 +44,24 @@
 //!
 //! With no cold root configured neither is ever created.
 //!
+//! # Tiered store
+//!
+//! A tiered store (ADR-062 D7) is hot (the writer's root) plus an ordered
+//! list of cold roots, with hot's copy ledger as the listing of everything
+//! that left hot. Its `select` lists hot completely first, then reads the
+//! copy ledger from disk, fresh for every call, merges both by relative
+//! path and checks them (D5, the lost, held and quarantined files of D11)
+//! before the event-time filter. It never lists a cold root, so a hung or
+//! unmounted cold mount cannot block it or shorten a selection. Its `read`
+//! tries hot, then each cold root in order, skips a root only when the file
+//! is absent there, and verifies the first copy it finds; a bad copy is an
+//! error, never a fallback to the next one. A file absent from every root
+//! and a missing copy ledger are both `Integrity` errors.
+//!
+//! Once partitions leave hot, an ad-hoc DuckDB query reads a copy target
+//! instead of hot, since a copy target holds every file
+//! (`<copy target>/source=…/*/*.parquet`) and hot only the recent dates.
+//!
 //! [`outcome`] writes the conditional outcome dataset of #27 (ADR-057): the
 //! context records and forward labels of one labeling run as three
 //! content-hashed Parquet tables, sealed with the same protocol and read
@@ -54,6 +75,7 @@ mod reader;
 mod recovery;
 pub mod root_marker;
 mod schema;
+mod tiers;
 mod writer;
 
 #[cfg(test)]
@@ -85,9 +107,16 @@ fn sync_dir(dir: &Path) -> Result<(), RawStoreError> {
 /// A missing directory has no entries. Names that are not UTF-8 are skipped:
 /// the store never creates them.
 fn sorted_entries(dir: &Path) -> Result<Vec<String>, RawStoreError> {
+    list_entries(dir).map(Option::unwrap_or_default)
+}
+
+/// [`sorted_entries`], but `None` for a missing directory, so a caller can
+/// tell a directory that vanished from an empty one (the tiered `select`,
+/// ADR-062 D7).
+fn list_entries(dir: &Path) -> Result<Option<Vec<String>>, RawStoreError> {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(io_error("list", dir)(error)),
     };
     let mut names = Vec::new();
@@ -98,5 +127,5 @@ fn sorted_entries(dir: &Path) -> Result<Vec<String>, RawStoreError> {
         }
     }
     names.sort();
-    Ok(names)
+    Ok(Some(names))
 }

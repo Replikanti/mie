@@ -1,10 +1,11 @@
 //! The store entry point: writers, dataset selection and verified reads
-//! (ADR-030).
+//! (ADR-030), over one root or over tiers (ADR-062 D7, the `tiers` module).
 
 use crate::layout::{self, PartFile};
 use crate::manifest;
 use crate::schema;
 use crate::sorted_entries;
+use crate::tiers;
 use crate::writer::{RawWriter, RotationPolicy};
 use bytes::Bytes;
 use mie_ports::raw::{
@@ -14,17 +15,49 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// A raw store rooted at one directory.
+/// A raw store: one root, or hot plus ordered cold roots (ADR-062 D7, the
+/// crate docs' *Tiered store*).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParquetRawStore {
     root: PathBuf,
+    tiers: Option<Tiers>,
+}
+
+/// The cold roots of a tiered store, in read order; never empty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Tiers {
+    cold_roots: Vec<PathBuf>,
 }
 
 impl ParquetRawStore {
     /// A store rooted at `root`. Does no I/O: the directory is created by the
     /// first writer.
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            tiers: None,
+        }
+    }
+
+    /// A tiered store: hot at `hot`, then `cold_roots` in read order
+    /// (ADR-062 D7). Does no I/O, so it never touches a cold mount. With an
+    /// empty `cold_roots` it is the value [`new`](Self::new) gives, and runs
+    /// the single-root code.
+    pub fn tiered(hot: impl Into<PathBuf>, cold_roots: Vec<PathBuf>) -> Self {
+        Self {
+            root: hot.into(),
+            tiers: (!cold_roots.is_empty()).then_some(Tiers { cold_roots }),
+        }
+    }
+
+    /// The cold roots in read order; empty for a single-root store.
+    pub fn cold_roots(&self) -> &[PathBuf] {
+        self.tiers.as_ref().map_or(&[], |tiers| &tiers.cold_roots)
+    }
+
+    /// Whether the store has cold roots.
+    pub fn is_tiered(&self) -> bool {
+        self.tiers.is_some()
     }
 
     /// The store's root directory.
@@ -74,8 +107,17 @@ impl ParquetRawStore {
     }
 }
 
-impl RawRecordSource for ParquetRawStore {
-    fn select(&self, selection: &RawSelection) -> Result<RawDataset, RawStoreError> {
+impl ParquetRawStore {
+    /// The selection over hot's listing alone, as a single-root store
+    /// answers it; it never reads the copy ledger. In a tiered store only
+    /// the capture start's seed scan uses it, as its fallback when the union
+    /// `select` fails (ADR-062 D7 *Seeds*): elsewhere it could answer
+    /// shorter than the union without an error.
+    ///
+    /// # Errors
+    ///
+    /// As [`RawRecordSource::select`] of a single-root store.
+    pub fn select_hot(&self, selection: &RawSelection) -> Result<RawDataset, RawStoreError> {
         let window = selection.window();
         let (start, end) = (window.start.as_millis(), window.end.as_millis());
         // Only the date partitions the window touches, clamped to the
@@ -108,6 +150,47 @@ impl RawRecordSource for ParquetRawStore {
         Ok(RawDataset { version, files })
     }
 
+    /// The tiered `read`: hot, then each cold root in order (ADR-062 D7).
+    fn read_tiered(
+        &self,
+        file: &SealedFile,
+        tiers: &Tiers,
+    ) -> Result<Vec<RawRecord>, RawStoreError> {
+        let roots = std::iter::once(&self.root).chain(&tiers.cold_roots);
+        for root in roots.clone() {
+            let path = layout::resolve(root, &file.relative_path);
+            match fs::read(&path) {
+                // Absent on this root: the next one may hold it.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(RawStoreError::Io(format!(
+                        "read {} on root {}: {e}",
+                        path.display(),
+                        root.display()
+                    )));
+                }
+                // The first present copy decides: a bad copy is an error,
+                // never a fallback to the next one (D5).
+                Ok(data) => return decode_verified(data, file),
+            }
+        }
+        let tried: Vec<String> = roots.map(|root| root.display().to_string()).collect();
+        Err(RawStoreError::Integrity(format!(
+            "{} is missing on every root: {}",
+            file.relative_path,
+            tried.join(", ")
+        )))
+    }
+}
+
+impl RawRecordSource for ParquetRawStore {
+    fn select(&self, selection: &RawSelection) -> Result<RawDataset, RawStoreError> {
+        match &self.tiers {
+            None => self.select_hot(selection),
+            Some(_) => tiers::select(&self.root, selection),
+        }
+    }
+
     fn read(&self, file: &SealedFile) -> Result<Vec<RawRecord>, RawStoreError> {
         let (stream, date, part) = layout::parse_data_path(&file.relative_path)?;
         if stream != file.stream || date != file.date || part != file.part {
@@ -116,6 +199,9 @@ impl RawRecordSource for ParquetRawStore {
                 file.relative_path
             )));
         }
+        if let Some(tiers) = &self.tiers {
+            return self.read_tiered(file, tiers);
+        }
         let path = layout::resolve(&self.root, &file.relative_path);
         let data = fs::read(&path).map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => {
@@ -123,43 +209,50 @@ impl RawRecordSource for ParquetRawStore {
             }
             _ => RawStoreError::Io(format!("read {}: {e}", path.display())),
         })?;
-        manifest::verify(&data, file)?;
+        decode_verified(data, file)
+    }
+}
 
-        // Decode the very bytes that were just verified.
-        let corrupt = |e: &dyn std::fmt::Display| {
-            RawStoreError::Corrupt(format!("decode {}: {e}", file.relative_path))
-        };
-        let builder =
-            ParquetRecordBatchReaderBuilder::try_new(Bytes::from(data)).map_err(|e| corrupt(&e))?;
-        let stored = builder.metadata().file_metadata().key_value_metadata();
-        for (key, expected) in schema::key_value_metadata(&file.stream) {
-            let found = stored
-                .and_then(|pairs| pairs.iter().find(|kv| kv.key == key))
-                .and_then(|kv| kv.value.as_deref());
-            if found != Some(expected) {
-                return Err(RawStoreError::Integrity(format!(
-                    "{}: metadata {key} is {found:?}, expected {expected:?}",
-                    file.relative_path
-                )));
-            }
-        }
-        let mut records = Vec::new();
-        for batch in builder.build().map_err(|e| corrupt(&e))? {
-            records.extend(schema::from_batch(&batch.map_err(|e| corrupt(&e))?)?);
-        }
+/// Verifies `data` against `file`'s manifest and decodes exactly those
+/// bytes, checking the schema metadata, the row count and the event-time
+/// range.
+fn decode_verified(data: Vec<u8>, file: &SealedFile) -> Result<Vec<RawRecord>, RawStoreError> {
+    manifest::verify(&data, file)?;
 
-        let times = records.iter().map(|r| r.event_time);
-        let (min, max) = (times.clone().min(), times.max());
-        if records.len() as u64 != file.rows
-            || min != Some(file.min_event_time)
-            || max != Some(file.max_event_time)
-        {
+    // Decode the very bytes that were just verified.
+    let corrupt = |e: &dyn std::fmt::Display| {
+        RawStoreError::Corrupt(format!("decode {}: {e}", file.relative_path))
+    };
+    let builder =
+        ParquetRecordBatchReaderBuilder::try_new(Bytes::from(data)).map_err(|e| corrupt(&e))?;
+    let stored = builder.metadata().file_metadata().key_value_metadata();
+    for (key, expected) in schema::key_value_metadata(&file.stream) {
+        let found = stored
+            .and_then(|pairs| pairs.iter().find(|kv| kv.key == key))
+            .and_then(|kv| kv.value.as_deref());
+        if found != Some(expected) {
             return Err(RawStoreError::Integrity(format!(
-                "{}: {} rows over [{min:?}, {max:?}] do not match the manifest",
-                file.relative_path,
-                records.len()
+                "{}: metadata {key} is {found:?}, expected {expected:?}",
+                file.relative_path
             )));
         }
-        Ok(records)
     }
+    let mut records = Vec::new();
+    for batch in builder.build().map_err(|e| corrupt(&e))? {
+        records.extend(schema::from_batch(&batch.map_err(|e| corrupt(&e))?)?);
+    }
+
+    let times = records.iter().map(|r| r.event_time);
+    let (min, max) = (times.clone().min(), times.max());
+    if records.len() as u64 != file.rows
+        || min != Some(file.min_event_time)
+        || max != Some(file.max_event_time)
+    {
+        return Err(RawStoreError::Integrity(format!(
+            "{}: {} rows over [{min:?}, {max:?}] do not match the manifest",
+            file.relative_path,
+            records.len()
+        )));
+    }
+    Ok(records)
 }

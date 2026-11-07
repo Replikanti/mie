@@ -136,9 +136,12 @@ pub fn run(request: &ReplayRequest, out: &mut dyn Write) -> Result<ReplayOutcome
                 &mut report,
                 format!("replay {} source live {source}/{symbol}", span(window)),
             );
-            match read_runs(&config.paths.journal, source) {
-                Ok(runs) => {
-                    let store = ParquetRawStore::new(&config.paths.raw_root);
+            let opened = read_runs(&config.paths.journal, source).and_then(|runs| {
+                crate::store::raw_store(&config.paths.raw_root, &config.paths.cold_roots)
+                    .map(|store| (runs, store))
+            });
+            match opened {
+                Ok((runs, store)) => {
                     let runs = runs.iter().map(|run| run.live_run()).collect();
                     let live = LiveReplay::new(&store, source, symbol, runs);
                     drive(live.replay(window), &mut report, describe_live, false)
@@ -152,8 +155,12 @@ pub fn run(request: &ReplayRequest, out: &mut dyn Write) -> Result<ReplayOutcome
             correction,
         } => {
             let symbol = &config.instrument.symbol;
-            let store = ParquetRawStore::new(&config.paths.raw_root);
-            match archive_replay(&store, config, streams.as_deref(), *correction) {
+            let store = crate::store::raw_store(&config.paths.raw_root, &config.paths.cold_roots);
+            let replay = store
+                .as_ref()
+                .map_err(String::clone)
+                .and_then(|store| archive_replay(store, config, streams.as_deref(), *correction));
+            match replay {
                 Ok(replay) => {
                     let names: Vec<_> = replay.streams().iter().map(|s| s.raw_name()).collect();
                     line(
@@ -192,7 +199,10 @@ fn history(config: &IngestConfig, window: ReplayWindow, report: &mut Vec<u8>) ->
             section.cutover
         ),
     );
-    let store = ParquetRawStore::new(&config.paths.raw_root);
+    let store = match crate::store::raw_store(&config.paths.raw_root, &config.paths.cold_roots) {
+        Ok(store) => store,
+        Err(error) => return failed(report, error),
+    };
     let chain = match history_chain(config, &store) {
         Ok(chain) => chain,
         Err(error) => return failed(report, error),

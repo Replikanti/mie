@@ -44,7 +44,6 @@ use mie_adapter_binance::archive::ArchiveStream;
 use mie_adapter_binance::archive::fold::TradeCorrection;
 use mie_adapter_binance::{HistoryChainStream, LiveReplay};
 use mie_adapter_fs::FsResultStore;
-use mie_adapter_parquet::ParquetRawStore;
 use mie_app::backtest::ChainBacktest;
 use mie_app::{
     BacktestService, CalibrationService, ChainBounds, ExperimentService, FundingCoverage,
@@ -155,9 +154,11 @@ pub fn run(request: &ExperimentRequest, out: &mut dyn Write) -> Result<bool, Str
     let verdict = match FsResultStore::open(&request.results) {
         Ok(results) => match &request.source {
             ReplaySource::Live(config) => {
-                match read_runs(&config.paths.journal, &config.instrument.source) {
-                    Ok(runs) => {
-                        let store = ParquetRawStore::new(&config.paths.raw_root);
+                match read_runs(&config.paths.journal, &config.instrument.source).and_then(|runs| {
+                    crate::store::raw_store(&config.paths.raw_root, &config.paths.cold_roots)
+                        .map(|store| (runs, store))
+                }) {
+                    Ok((runs, store)) => {
                         let runs = runs.iter().map(|run| run.live_run()).collect();
                         let live = LiveReplay::new(
                             &store,
@@ -179,45 +180,53 @@ pub fn run(request: &ExperimentRequest, out: &mut dyn Write) -> Result<bool, Str
                 streams,
                 correction,
             } => {
-                let store = ParquetRawStore::new(&config.paths.raw_root);
                 let folding = *correction == TradeCorrection::Fold;
-                archive_replay(&store, config, streams.as_deref(), *correction).and_then(|replay| {
-                    execute(ExperimentService::new(replay, results), &spec, folding)
-                })
+                crate::store::raw_store(&config.paths.raw_root, &config.paths.cold_roots).and_then(
+                    |store| {
+                        archive_replay(&store, config, streams.as_deref(), *correction).and_then(
+                            |replay| {
+                                execute(ExperimentService::new(replay, results), &spec, folding)
+                            },
+                        )
+                    },
+                )
             }
             ReplaySource::History(config) => {
-                let store = ParquetRawStore::new(&config.paths.raw_root);
-                history_chain(config, &store).and_then(|chain| {
-                    // The bounds come from the built chain, so they cannot
-                    // disagree with the provider.
-                    let bounds = ChainBounds {
-                        origin: chain.origin(),
-                        cutover: chain.cutover(),
-                    };
-                    if !backtest {
-                        return execute(
-                            ExperimentService::on_chain(chain, results, bounds),
+                let store =
+                    crate::store::raw_store(&config.paths.raw_root, &config.paths.cold_roots);
+                store.and_then(|store| {
+                    history_chain(config, &store).and_then(|chain| {
+                        // The bounds come from the built chain, so they cannot
+                        // disagree with the provider.
+                        let bounds = ChainBounds {
+                            origin: chain.origin(),
+                            cutover: chain.cutover(),
+                        };
+                        if !backtest {
+                            return execute(
+                                ExperimentService::on_chain(chain, results, bounds),
+                                &spec,
+                                false,
+                            );
+                        }
+                        // Settlements come from the archive segment only: live
+                        // delivers none (ADR-060 D7).
+                        let funding = FundingCoverage {
+                            until: chain
+                                .archive()
+                                .streams()
+                                .contains(&ArchiveStream::FundingRate)
+                                .then_some(chain.cutover()),
+                        };
+                        // The book exists only in the live segment (ADR-061 D4).
+                        let cutover = chain.cutover();
+                        let engine = ChainBacktest::new(chain, bounds, backtest_trailing_gaps);
+                        execute(
+                            BacktestService::new(engine, results, funding, cutover),
                             &spec,
                             false,
-                        );
-                    }
-                    // Settlements come from the archive segment only: live
-                    // delivers none (ADR-060 D7).
-                    let funding = FundingCoverage {
-                        until: chain
-                            .archive()
-                            .streams()
-                            .contains(&ArchiveStream::FundingRate)
-                            .then_some(chain.cutover()),
-                    };
-                    // The book exists only in the live segment (ADR-061 D4).
-                    let cutover = chain.cutover();
-                    let engine = ChainBacktest::new(chain, bounds, backtest_trailing_gaps);
-                    execute(
-                        BacktestService::new(engine, results, funding, cutover),
-                        &spec,
-                        false,
-                    )
+                        )
+                    })
                 })
             }
         },

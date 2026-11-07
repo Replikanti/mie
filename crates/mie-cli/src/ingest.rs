@@ -94,7 +94,9 @@ use mie_domain::state::{MarketState, MarketStateEngine};
 use mie_domain::state_hash::STATE_HASH_ENCODING;
 use mie_domain::time::EventTime;
 use mie_ports::outbound::{MarketDataProvider, ProviderError, Replay, ReplayWindow};
-use mie_ports::raw::{DatasetVersion, RawRecord, RawRecordSource, RawSelection, RawStreamKey};
+use mie_ports::raw::{
+    DatasetVersion, RawRecord, RawRecordSource, RawSelection, RawStoreError, RawStreamKey,
+};
 use serde_json::{Value, json};
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -194,6 +196,7 @@ pub fn run_with_hold(
     // Before anything is opened: `Journal::open` creates the journal file,
     // and a refused start leaves no new file (ADR-062 D7, *Hot lost*).
     crate::store::check_hot(&config.paths.raw_root, &config.paths.cold_roots)?;
+    let store = crate::store::raw_store(&config.paths.raw_root, &config.paths.cold_roots)?;
     let clock = Arc::clone(&transports.clock);
     let now = || clock.now_utc_ns();
     let run_id = run_id(now());
@@ -204,7 +207,6 @@ pub fn run_with_hold(
     };
     let sync = || journal.lock().unwrap_or_else(|p| p.into_inner()).sync();
 
-    let store = ParquetRawStore::new(&config.paths.raw_root);
     let writer = store
         .writer(&config.instrument.source, RotationPolicy::default())
         .map_err(|e| format!("open the raw store: {e}"))?;
@@ -237,12 +239,9 @@ pub fn run_with_hold(
     // agrees with the history chain, which reads the start from `run_start`.
     let started_ns = now();
     let started_ms = started_ns.div_euclid(1_000_000);
-    let seeds = seeds(&store, config, &streams, started_ms)?;
+    let (seeds, seed_listing) = seeds(&store, config, &streams, started_ms)?;
     let feature_set = MarketStateEngine::new().feature_set().version().to_string();
-    journal.lock().unwrap_or_else(|p| p.into_inner()).write(
-        started_ns,
-        "run_start",
-        json!({
+    let mut run_start = json!({
             "symbol": config.instrument.symbol,
             "source": config.instrument.source,
             "streams": streams.iter().map(|s| s.raw_name()).collect::<Vec<_>>(),
@@ -261,8 +260,23 @@ pub fn run_with_hold(
             "feature_set": feature_set,
             "history_origin_ms": bounds.map(|(origin, _)| origin),
             "history_cutover_ms": bounds.map(|(_, cutover)| cutover),
-        }),
-    );
+    });
+    // A single-root start carries no listing key, so its line is unchanged.
+    let listing = match seed_listing {
+        SeedListing::SingleRoot => None,
+        SeedListing::Union => Some(json!({"seed_listing": "union"})),
+        SeedListing::Hot { error } => Some(json!({
+            "seed_listing": "hot",
+            "seed_listing_error": error,
+        })),
+    };
+    if let (Some(Value::Object(listing)), Some(fields)) = (listing, run_start.as_object_mut()) {
+        fields.extend(listing);
+    }
+    journal
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .write(started_ns, "run_start", run_start);
 
     // Durable before the first record is sealed: replay needs the run's
     // parameters for every record it seals (ADR-039 D2).
@@ -545,13 +559,35 @@ pub fn run_with_hold(
     Ok(outcome)
 }
 
-/// The largest sealed event time per stream within the lookback.
+/// Which listing the seeds came from (ADR-062 D7 *Seeds*).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SeedListing {
+    /// A single-root store's `select`.
+    SingleRoot,
+    /// A tiered store's union `select`.
+    Union,
+    /// A tiered store whose union `select` failed: hot's listing alone,
+    /// with the union's error.
+    Hot { error: String },
+}
+
+/// The largest sealed event time per stream within the lookback, and the
+/// listing it came from.
+///
+/// In a tiered store an `Integrity` or `Corrupt` error of the union
+/// `select` (a missing or damaged copy ledger, a lost file or a manifest
+/// conflict inside the seed window) falls back to hot's listing alone, so
+/// a tier problem never stops the capture (ADR-062 D7 *Seeds*, #188 STOP 1
+/// decision 1). Hot holds every date of the seed window (D8), so on an
+/// intact hot that listing gives the same seeds. `run_start` records the
+/// fallback, and the warm-up, replay and equivalence still fail on the
+/// same error.
 fn seeds(
     store: &ParquetRawStore,
     config: &IngestConfig,
     streams: &[BinanceStream],
     now_ms: i64,
-) -> Result<BTreeMap<BinanceStream, EventTime>, String> {
+) -> Result<(BTreeMap<BinanceStream, EventTime>, SeedListing), String> {
     let mut keys = BTreeSet::new();
     let mut by_name = BTreeMap::new();
     for &stream in streams {
@@ -570,9 +606,19 @@ fn seeds(
         end: EventTime::from_millis(now_ms.saturating_add(DAY_MS)),
     };
     let selection = RawSelection::new(keys, window).map_err(|e| e.to_string())?;
-    let dataset = store
-        .select(&selection)
-        .map_err(|e| format!("read seeds from the raw store: {e}"))?;
+    let failed = |e: RawStoreError| format!("read seeds from the raw store: {e}");
+    let (dataset, listing) = match store.select(&selection) {
+        Ok(dataset) if store.is_tiered() => (dataset, SeedListing::Union),
+        Ok(dataset) => (dataset, SeedListing::SingleRoot),
+        Err(error @ (RawStoreError::Integrity(_) | RawStoreError::Corrupt(_)))
+            if store.is_tiered() =>
+        {
+            let dataset = store.select_hot(&selection).map_err(failed)?;
+            let error = error.to_string();
+            (dataset, SeedListing::Hot { error })
+        }
+        Err(error) => return Err(failed(error)),
+    };
     let mut seeds = BTreeMap::new();
     for file in dataset.files {
         if let Some(&stream) = by_name.get(file.stream.stream()) {
@@ -580,7 +626,7 @@ fn seeds(
             *seed = (*seed).max(file.max_event_time);
         }
     }
-    Ok(seeds)
+    Ok((seeds, listing))
 }
 
 // ---------------------------------------------------------------------------
@@ -655,7 +701,7 @@ fn warm_up(
     queue_limit: &AtomicU64,
     max: u64,
 ) -> Result<WarmUp, String> {
-    let store = ParquetRawStore::new(&config.paths.raw_root);
+    let store = crate::store::raw_store(&config.paths.raw_root, &config.paths.cold_roots)?;
     let largest = memory_guard(config, &store, run_id, max)?;
     queue_limit.store(max - largest, Ordering::SeqCst);
     let chain: HistoryChain<'_> = history_chain(config, &store)?;
