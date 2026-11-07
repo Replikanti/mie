@@ -430,9 +430,30 @@ impl IngestConfig {
         let Some(history) = &self.history else {
             return Ok(None);
         };
-        let path = &history.archive_config;
-        let archive = ArchiveConfig::load(path)
-            .map_err(|e| ConfigError(format!("history.archive_config: {}", e.0)))?;
+        let archive =
+            self.check_archive_config("history.archive_config", &history.archive_config)?;
+        Ok(Some((history.clone(), archive)))
+    }
+
+    /// The archive configuration at `path`, checked against this one as
+    /// [`history_archive`](Self::history_archive) checks `[history]
+    /// archive_config`: the same canonical `raw_root`, the same symbol, and
+    /// the same `cold_roots` in the same order with the same flags. `mie
+    /// store` commands take it from `--archive-config` (ADR-062 D11).
+    ///
+    /// # Errors
+    ///
+    /// As [`history_archive`](Self::history_archive); the errors name
+    /// `--archive-config`.
+    pub fn archive_config_at(&self, path: &Path) -> Result<ArchiveConfig, ConfigError> {
+        self.check_archive_config("--archive-config", path)
+    }
+
+    /// Loads the archive configuration at `path` and checks it against this
+    /// one; `key` names where the path came from in the errors.
+    fn check_archive_config(&self, key: &str, path: &Path) -> Result<ArchiveConfig, ConfigError> {
+        let archive =
+            ArchiveConfig::load(path).map_err(|e| ConfigError(format!("{key}: {}", e.0)))?;
         let (live_root, archive_root) = (&self.paths.raw_root, &archive.paths.raw_root);
         let resolved = std::fs::canonicalize(live_root)
             .and_then(|live| Ok((live, std::fs::canonicalize(archive_root)?)));
@@ -440,9 +461,8 @@ impl IngestConfig {
             Ok((live, archived)) if live == archived => {}
             Ok(_) => {
                 return Err(ConfigError(format!(
-                    "history.archive_config {}: its raw_root {} is not this configuration's \
-                     raw_root {}: both segments of the history chain are read from one store \
-                     (ADR-052 D6)",
+                    "{key} {}: its raw_root {} is not this configuration's raw_root {}: both \
+                     segments of the history chain are read from one store (ADR-052 D6)",
                     path.display(),
                     archive_root.display(),
                     live_root.display()
@@ -450,7 +470,7 @@ impl IngestConfig {
             }
             Err(e) => {
                 return Err(ConfigError(format!(
-                    "history.archive_config {}: cannot resolve the raw roots {} and {}: {e}",
+                    "{key} {}: cannot resolve the raw roots {} and {}: {e}",
                     path.display(),
                     live_root.display(),
                     archive_root.display()
@@ -459,7 +479,7 @@ impl IngestConfig {
         }
         if archive.instrument.symbol != self.instrument.symbol {
             return Err(ConfigError(format!(
-                "history.archive_config {}: its symbol {:?} is not this configuration's {:?}",
+                "{key} {}: its symbol {:?} is not this configuration's {:?}",
                 path.display(),
                 archive.instrument.symbol,
                 self.instrument.symbol
@@ -467,15 +487,15 @@ impl IngestConfig {
         }
         if archive.paths.cold_roots != self.paths.cold_roots {
             return Err(ConfigError(format!(
-                "history.archive_config {}: its paths.cold_roots {} are not this \
-                 configuration's {}: both configurations describe one tiered store, with the \
-                 same roots in the same read order and the same copy targets (ADR-062 D7)",
+                "{key} {}: its paths.cold_roots {} are not this configuration's {}: both \
+                 configurations describe one tiered store, with the same roots in the same read \
+                 order and the same copy targets (ADR-062 D7)",
                 path.display(),
                 describe_cold_roots(&archive.paths.cold_roots),
                 describe_cold_roots(&self.paths.cold_roots)
             )));
         }
-        Ok(Some((history.clone(), archive)))
+        Ok(archive)
     }
 
     /// The state checkpoint interval in event-time milliseconds (ADR-041).

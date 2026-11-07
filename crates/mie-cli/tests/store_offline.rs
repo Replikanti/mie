@@ -3,14 +3,13 @@
 
 mod common;
 
-use common::TempDir;
+use common::{MapProbe, TempDir};
 use mie_adapter_parquet::copy_ledger;
 use mie_adapter_parquet::root_marker::{self, HOT_ID};
 use mie_cli::config::IngestConfig;
 use mie_cli::store::{self, DeviceProbe, StDevProbe};
 use std::fs;
-use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 /// A tiered ingest configuration under `dir`: hot `dir/raw`, copy targets
@@ -65,23 +64,6 @@ fn names(dir: &Path) -> Vec<String> {
         .collect();
     names.sort();
     names
-}
-
-/// Device ids by path, compared after resolving both sides (the mount
-/// check queries `<root>/..`): distinct devices without distinct
-/// filesystems.
-struct MapProbe(Vec<(PathBuf, u64)>);
-
-impl DeviceProbe for MapProbe {
-    fn device_id(&self, root: &Path) -> io::Result<u64> {
-        let resolve = |path: &Path| fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
-        let wanted = resolve(root);
-        self.0
-            .iter()
-            .find(|(path, _)| resolve(path) == wanted)
-            .map(|(_, id)| *id)
-            .ok_or_else(|| io::Error::other(format!("{} unknown", root.display())))
-    }
 }
 
 /// hot on device 1, `cold-a` on 2, `cold-b` on 3, and their parent (the

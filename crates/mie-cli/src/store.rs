@@ -9,6 +9,13 @@
 //!   marker.
 //! - [`check_copy_ledger`] is the importer's second start refusal: with
 //!   `cold_roots` configured, hot's copy ledger must be readable.
+//! - [`replicate`] (`mie store replicate`) runs one replication pass: it
+//!   copies every sealed file, import-ledger entry and the tails of the
+//!   copy ledger and the journal to the copy targets that present their
+//!   markers, and never removes anything ([`replicate`](mod@replicate) holds
+//!   the pass, #189, ADR-062 D5, D9, D11).
+//! - [`check_devices`] refuses two roots that report one device id, before
+//!   any `mie store` command writes a byte to a copy target.
 //! - [`raw_store`] builds the raw store of every command: the tiered store
 //!   of `raw_root` and `cold_roots`, which with no cold root is the
 //!   single-root store. No command builds a single-root store over a tiered
@@ -38,6 +45,10 @@ use std::fs;
 use std::io::{self, ErrorKind, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
+
+pub mod replicate;
+
+pub use replicate::{LedgerAppend, PassObserver, PassReport, truncation_line};
 
 /// The device a root lives on.
 ///
@@ -267,6 +278,105 @@ pub fn check_copy_ledger(raw_root: &Path, cold_roots: &[ColdRoot]) -> Result<(),
             path.display()
         )),
     }
+}
+
+/// Refuses two roots that report one device id (ADR-062 D11, *What mie
+/// can check*): hot and every copy target that presented its marker must
+/// be on pairwise distinct devices. Every colliding pair is named with both
+/// roots, in a fixed order: the target pairs in configuration order, then
+/// each target against hot.
+///
+/// # Errors
+///
+/// A description of every collision, or the probe's failure.
+pub fn check_devices(hot: &Path, targets: &[&Path], probe: &dyn DeviceProbe) -> Result<(), String> {
+    let device = |path: &Path| {
+        probe
+            .device_id(path)
+            .map_err(|e| format!("device of {}: {e}", path.display()))
+    };
+    let hot_device = device(hot)?;
+    let devices = targets
+        .iter()
+        .map(|target| device(target))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut collisions = Vec::new();
+    for (i, (a, a_device)) in targets.iter().zip(&devices).enumerate() {
+        for (b, b_device) in targets.iter().zip(&devices).skip(i + 1) {
+            if a_device == b_device {
+                collisions.push(format!(
+                    "copy targets {} and {} are both on device {a_device}",
+                    a.display(),
+                    b.display()
+                ));
+            }
+        }
+    }
+    for (target, target_device) in targets.iter().zip(&devices) {
+        if *target_device == hot_device {
+            collisions.push(format!(
+                "copy target {} is on device {target_device}, the device of raw_root {}",
+                target.display(),
+                hot.display()
+            ));
+        }
+    }
+    if collisions.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "{}: copies on one device fail together, so k copies need k independent devices; an \
+         unmounted mount point is an empty directory on its parent's filesystem (ADR-062 D11)",
+        collisions.join("; ")
+    ))
+}
+
+/// `mie store replicate`: one replication pass (ADR-062 D11, the module
+/// [`replicate`](mod@replicate)) over the store of `config`, with the
+/// archive configuration `archive` (`--archive-config`), else `[history]
+/// archive_config`, else none. `now_ms` stamps the ledger records.
+///
+/// It prints what it copied and appended, then every truncation of the
+/// copy ledger's trailing record on its own line, then `PASS` (returns
+/// `true`) or one `FAIL: <problem>` line per problem (returns `false`).
+///
+/// # Errors
+///
+/// A description when the report cannot be written.
+pub fn replicate(
+    config: &IngestConfig,
+    archive: Option<&Path>,
+    probe: &dyn DeviceProbe,
+    now_ms: &dyn Fn() -> i64,
+    out: &mut dyn Write,
+) -> Result<bool, String> {
+    /// Collects every truncation as a report line.
+    struct Lines(Vec<String>);
+    impl PassObserver for Lines {
+        fn ledger_truncated(&mut self, ledger: &Path, truncation: copy_ledger::Truncation) {
+            self.0.push(truncation_line(ledger, truncation));
+        }
+    }
+    let ledger = copy_ledger::CopyLedger::at(&config.paths.raw_root);
+    let mut truncations = Lines(Vec::new());
+    let report = replicate::run(config, archive, probe, now_ms, &ledger, &mut truncations);
+    let pass = report.problems.is_empty();
+    let mut lines = report.lines;
+    lines.extend(truncations.0);
+    if pass {
+        lines.push("PASS".to_owned());
+    }
+    lines.extend(
+        report
+            .problems
+            .iter()
+            .map(|problem| format!("FAIL: {problem}")),
+    );
+    for line in lines {
+        writeln!(out, "{line}").map_err(|e| format!("write the report: {e}"))?;
+    }
+    out.flush().map_err(|e| format!("write the report: {e}"))?;
+    Ok(pass)
 }
 
 /// Writes the outcome of a `mie store` verb: its lines, or `FAIL: <reason>`.

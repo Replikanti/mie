@@ -29,7 +29,10 @@
 //! - `mie store init --config <path>` and `mie store init-root --config
 //!   <path> --root <path> --id <id>` ([`store`]): set up a tiered raw store,
 //!   hot's marker and copy ledger, and each cold root's marker (#187,
-//!   ADR-062 D4, D7).
+//!   ADR-062 D4, D7);
+//! - `mie store replicate --config <path> [--archive-config <path>]`
+//!   ([`store::replicate`]): one replication pass to the copy targets, which
+//!   copies and never removes (#189, ADR-062 D5, D11).
 //!
 //! The real network connectors are constructed in `main.rs` and nowhere
 //! else; tests drive [`ingest::run`] with fakes.
