@@ -25,7 +25,11 @@
 //!    the pass: every adopted file needs k copies); ids are distinct and not
 //!    `hot`, and the devices too; the source holds no seal debris and no
 //!    `PENDING`, and every source part's data matches its manifest (so a
-//!    damaged source is refused with nothing written); every archive part has the entry that lists it with its
+//!    damaged source is refused with nothing written); the ledger records
+//!    no manifest without a `copy` record that neither the source nor a
+//!    root holds (a stopped run re-run against another store would
+//!    otherwise pass and leave that partition guarded for good); every
+//!    archive part has the entry that lists it with its
 //!    manifest's SHA-256, and every listed part is in the source or already
 //!    in the store. The **path rule** (D10, D5): each source path's
 //!    manifest is compared with the ledger's `manifest` record, hot's
@@ -668,6 +672,7 @@ impl Run<'_> {
             });
         }
         self.check_archive(&files, &entries)?;
+        self.check_unheld(&files, &targets, &marked)?;
 
         // The path rule (D10, D5).
         for file in &files {
@@ -820,6 +825,60 @@ impl Run<'_> {
             }
         }
         Ok(())
+    }
+
+    /// Refuses a ledger that records the manifest of a file no root and not
+    /// the source holds: an earlier adoption recorded every manifest before
+    /// its first copy (write 2) and stopped, and this run reads a store
+    /// without that file (a backup, another `--from`). Passing would leave
+    /// the record behind for good, and the writer guard would refuse every
+    /// new part of its partition. Only a path without any `copy` record is
+    /// checked: a copied file is held by a copy target.
+    fn check_unheld(
+        &mut self,
+        files: &[SourceFile],
+        targets: &[Target],
+        marked: &BTreeMap<String, &'static str>,
+    ) -> Result<(), Stop> {
+        let hot = self.config.paths.raw_root.clone();
+        let source: BTreeSet<&str> = files.iter().map(|f| f.path.as_str()).collect();
+        let candidates: Vec<String> = self
+            .fold
+            .manifests
+            .keys()
+            .filter(|path| {
+                !source.contains(path.as_str())
+                    && !marked.contains_key(*path)
+                    && self.fold.copies.get(*path).is_none_or(BTreeSet::is_empty)
+            })
+            .cloned()
+            .collect();
+        let mut unheld = Vec::new();
+        for path in candidates {
+            let roots =
+                std::iter::once(hot.as_path()).chain(targets.iter().map(|t| t.path.as_path()));
+            let mut held = false;
+            for root in roots {
+                match replica::sealed_manifest(root, &path) {
+                    Ok(Some(_)) => held = true,
+                    Ok(None) => {}
+                    Err(error) => return Err(self.fail(format!("{}: {error}", root.display()))),
+                }
+            }
+            if !held {
+                unheld.push(path);
+            }
+        }
+        if unheld.is_empty() {
+            return Ok(());
+        }
+        Err(self.fail(format!(
+            "the copy ledger records the manifest of {}, but neither --from nor any root holds \
+             it: an adoption that stopped recorded it before its first copy, and --from is not \
+             the store it read. Re-run the adoption with that store; until then the writer \
+             refuses new parts in those partitions. Nothing was written (ADR-062 D6, D10)",
+            unheld.join(", ")
+        )))
     }
 
     /// The path rule for one source file (module docs).

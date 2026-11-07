@@ -259,8 +259,9 @@ impl TierGuard {
                 "partition {partition}: the copy ledger {} records part {recorded} of it, but \
                  hot's next part number is {part}, so the new part would reuse a recorded path \
                  (ADR-062 D5). Hot must first hold every recorded part: re-run the adoption that \
-                 recorded it (`mie store adopt`); union part numbering comes with #191. The \
-                 writer writes nothing",
+                 recorded it (`mie store adopt`) with the store it read; when that store no longer \
+                 holds the part, the adoption refuses and names it instead of passing. Union part \
+                 numbering comes with #191. The writer writes nothing",
                 self.ledger.display()
             ))),
             _ => Ok(()),

@@ -706,3 +706,82 @@ fn a_damaged_source_part_is_refused_before_anything_is_written() {
         );
     }
 }
+
+/// Review of #200, re-check: a run that stopped after its `manifest`
+/// records, re-run against a store without one of the recorded files (a
+/// backup, another `--from`), refuses and writes nothing instead of passing
+/// with a record no root holds, which would block every new part of that
+/// partition for good. With the store it read, the re-run completes.
+#[test]
+fn a_re_run_against_a_store_without_a_recorded_file_is_refused() {
+    let fixture = Fixture::new("adopt-shrunk-source");
+    ON_STEP.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |at| {
+            if at == AdoptStep::AfterTargetPublish {
+                CRASH_AT.with(|crash| crash.set(Some(at)));
+            }
+        }));
+    });
+    let crashed = fixture.adopt();
+    ON_STEP.with(|hook| hook.borrow_mut().take());
+    assert_eq!(crashed.problems, ["simulated crash: the adoption stopped"]);
+
+    let partition = "source=binance-um/instrument=BTCUSDT/stream=aggTrade/date=2026-10-06";
+    let aside = fixture.dir.0.join("aside");
+    fs::create_dir_all(&aside).unwrap();
+    for name in ["part-00001.parquet", "part-00001.manifest"] {
+        let path = fixture.raw().join(partition).join(name);
+        fs::copy(&path, aside.join(name)).unwrap();
+        fs::remove_file(path).unwrap();
+    }
+    let ghost = format!("{partition}/part-00001.parquet");
+    let roots = |fixture: &Fixture| {
+        [&fixture.hot, &fixture.cold[0], &fixture.cold[1]].map(|root| files_under(root))
+    };
+    let (before, ledger) = (
+        roots(&fixture),
+        fs::read(copy_ledger::ledger_path(&fixture.hot)).unwrap(),
+    );
+    let report = fixture.adopt();
+    assert_eq!(report.problems.len(), 1, "{report:?}");
+    assert!(
+        report.problems[0].contains(&ghost)
+            && report.problems[0].contains("neither --from nor any root holds it")
+            && report.problems[0].contains("Nothing was written"),
+        "{report:?}"
+    );
+    assert_eq!(roots(&fixture), before);
+    assert_eq!(
+        fs::read(copy_ledger::ledger_path(&fixture.hot)).unwrap(),
+        ledger
+    );
+    // The guard still refuses the partition and names the way out.
+    let key = RawStreamKey::new("binance-um", "BTCUSDT", "aggTrade").unwrap();
+    let mut writer = fixture
+        .tiered()
+        .writer("binance-um", RotationPolicy::default())
+        .unwrap();
+    let error = writer
+        .append(
+            &key,
+            RawRecord {
+                event_time: EventTime::from_millis(D0 + 7_200_000),
+                capture: None,
+                payload: b"live".to_vec(),
+            },
+        )
+        .unwrap_err();
+    drop(writer);
+    assert!(
+        error.to_string().contains("with the store it read"),
+        "{error}"
+    );
+
+    // With the store the stopped run read, the re-run completes.
+    for name in ["part-00001.parquet", "part-00001.manifest"] {
+        fs::copy(aside.join(name), fixture.raw().join(partition).join(name)).unwrap();
+    }
+    let report = fixture.adopt();
+    assert_eq!(report.problems, Vec::<String>::new(), "{report:?}");
+    assert_adopted(&fixture);
+}

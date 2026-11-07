@@ -1027,7 +1027,15 @@ adopted into the production store. The protocol (#190):
   because it never writes the source; every source part's data exists
   and matches its manifest (size, then SHA-256, streamed), so a damaged
   source is refused with nothing written instead of stopping the run
-  after records and copies (review of #200); its import ledger holds no
+  after records and copies (review of #200); the copy ledger records no
+  `manifest` without a `copy` record whose file neither the source nor
+  hot nor a copy target holds. Why: write (2) below records every
+  manifest before the first copy, so a run that stopped and is re-run
+  against another store (a backup lacking a file, another `--from`) would
+  otherwise pass and leave a record that no root can ever satisfy, and
+  the guard's part check would refuse every new part of that partition
+  for good while naming a re-run that already passed (review of #200);
+  the refusal names the paths. The source's import ledger holds no
   `PENDING`; every source archive part is listed by a source entry with
   its manifest's SHA-256 (D11 *Archive parts wait for their import
   entry*), every part an entry lists is in the source or already in the
@@ -1068,7 +1076,10 @@ adopted into the production store. The protocol (#190):
   targets before hot: a crash then leaves extra copies on the targets,
   never a hot file that the ledger does not list.
 - **Resuming and failure.** A re-run with the same arguments resumes,
-  because identical paths are only completed. The writes stop at the
+  because identical paths are only completed. A re-run must read the
+  store the stopped run read, or one holding at least its recorded
+  files: a store without one of them is refused (the check above), and
+  the guard's message names the re-run with the store it read. The writes stop at the
   first failure, which is named: a store cannot be half adopted on
   purpose, and going on would only copy more bytes before the same
   failure. The source data is verified twice: in the check phase, so a
