@@ -975,7 +975,10 @@ fn a_damaged_ledger_copy_is_refused_even_when_current() {
     for _ in 0..2 {
         assert!(matches!(
             extend_copy(&hot, &cold[0], "cold-a"),
-            Err(RawStoreError::Integrity(_))
+            Err(CopyError {
+                side: replica::Side::Destination,
+                error: RawStoreError::Integrity(_)
+            })
         ));
         assert_eq!(fs::read(&copy_path).unwrap(), copy, "untouched");
         // Also when hot has new records to copy.
@@ -985,7 +988,10 @@ fn a_damaged_ledger_copy_is_refused_even_when_current() {
     fs::remove_file(ledger_path(&hot)).unwrap();
     assert!(matches!(
         extend_copy(&hot, &cold[1], "cold-b"),
-        Err(RawStoreError::Integrity(_))
+        Err(CopyError {
+            side: replica::Side::Source,
+            error: RawStoreError::Integrity(_)
+        })
     ));
     assert!(!ledger_path(&cold[1]).exists());
 }

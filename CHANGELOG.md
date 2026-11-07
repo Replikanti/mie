@@ -32,7 +32,11 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   archive part only once an import entry on hot lists it with its
   manifest's SHA-256 and an entry only after its parts, never copies
   `PENDING`, names every file or entry left below k and exits 1, and never
-  removes anything. A second pass over unchanged state writes nothing.
+  removes anything. It re-reads a target's marker before every write to it
+  and every record about it, checks hot's manifest against the ledger's
+  before copying, holds a target's journal tail while a live file of the
+  pass is not on it, and treats a failure to read hot as a problem of that
+  one file, not of the target. A second pass over unchanged state writes nothing.
   Copy-ledger appends now report a truncation of the trailing record as a
   structured `Truncation` (bytes, offset) in `AppendOutcome`, and in the
   new `AppendError` when the fsync of the truncation or the write after it

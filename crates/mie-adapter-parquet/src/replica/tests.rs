@@ -6,6 +6,26 @@ use crate::recovery;
 use crate::sorted_entries;
 use crate::testutil::{TempDir, TieredFixture};
 
+/// [`super::copy_sealed`] with the error only; the side is checked where
+/// it matters.
+fn copy_sealed(
+    source_root: &Path,
+    dest_root: &Path,
+    data_path: &str,
+) -> Result<(CopyOutcome, String), RawStoreError> {
+    super::copy_sealed(source_root, dest_root, data_path).map_err(|e| e.error)
+}
+
+/// [`super::copy_immutable`] with the error only.
+fn copy_immutable(source: &Path, dest: &Path) -> Result<CopyOutcome, RawStoreError> {
+    super::copy_immutable(source, dest).map_err(|e| e.error)
+}
+
+/// [`super::extend_prefix`] with the error only.
+fn extend_prefix(source: TailSource<'_>, dest: &Path, end: u64) -> Result<u64, RawStoreError> {
+    super::extend_prefix(source, dest, end).map_err(|e| e.error)
+}
+
 /// Every file below `root` with its bytes, and every directory, sorted.
 fn snapshot(root: &Path) -> Vec<(String, Option<Vec<u8>>)> {
     fn walk(dir: &Path, prefix: &str, out: &mut Vec<(String, Option<Vec<u8>>)>) {
@@ -470,4 +490,78 @@ fn the_replication_lock_refuses_a_second_holder() {
     let again = try_replication_lock(&fixture.hot).unwrap();
     drop(again);
     assert!(replication_lock_path(&fixture.hot).exists());
+}
+
+/// Review of #199, finding 2: a failure names the side it happened on, so
+/// the pass can tell one unreadable hot file from a failing target.
+#[test]
+fn every_failure_names_its_side() {
+    use std::os::unix::fs::PermissionsExt;
+    let side = |result: Result<(), CopyError>| result.unwrap_err().side;
+
+    // The source: unreadable, failing its manifest, missing.
+    let fixture = TieredFixture::new("replica-side");
+    let (path, _) = first_part(&fixture);
+    let data = layout::resolve(&fixture.hot, &path);
+    fs::set_permissions(&data, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read(&data).is_err() {
+        assert_eq!(
+            side(super::copy_sealed(&fixture.hot, &fixture.cold[0], &path).map(|_| ())),
+            Side::Source
+        );
+    }
+    fs::set_permissions(&data, fs::Permissions::from_mode(0o444)).unwrap();
+    flip_file(&data, 10);
+    assert_eq!(
+        side(super::copy_sealed(&fixture.hot, &fixture.cold[0], &path).map(|_| ())),
+        Side::Source
+    );
+    let missing = fixture.hot.join("missing.import");
+    let dest = fixture.cold[0].join(".mie/import-ledger/a/missing.import");
+    assert_eq!(
+        side(super::copy_immutable(&missing, &dest).map(|_| ())),
+        Side::Source
+    );
+    let journal = fixture.hot.join("journal.jsonl");
+    fs::write(&journal, TAIL_SOURCE).unwrap();
+    let copy = fixture.cold[0].join(".mie/journal/journal.jsonl");
+    assert_eq!(
+        side(super::extend_prefix(TailSource::File(&journal), &copy, 10_000).map(|_| ())),
+        Side::Source
+    );
+
+    // The destination: a differing copy of a part, of an entry, of a tail.
+    let fixture = TieredFixture::new("replica-side-dest");
+    let (path, partition) = first_part(&fixture);
+    super::copy_sealed(&fixture.hot, &fixture.cold[0], &path).unwrap();
+    let (_, _, part) = layout::parse_data_path(&path).unwrap();
+    flip_file(
+        &layout::resolve(&fixture.cold[0], &partition).join(PartFile::Data.name(part)),
+        10,
+    );
+    assert_eq!(
+        side(super::copy_sealed(&fixture.hot, &fixture.cold[0], &path).map(|_| ())),
+        Side::Destination
+    );
+    let entry = fixture.hot.join("entry.import");
+    fs::write(&entry, b"a").unwrap();
+    let dest = fixture.cold[0].join("entry.import");
+    fs::write(&dest, b"b").unwrap();
+    assert_eq!(
+        side(super::copy_immutable(&entry, &dest).map(|_| ())),
+        Side::Destination
+    );
+    let copy = fixture.cold[0].join("journal.jsonl");
+    fs::write(&copy, flipped(TAIL_SOURCE, TAIL_SOURCE.len() - 2)).unwrap();
+    assert_eq!(
+        side(
+            super::extend_prefix(
+                TailSource::Bytes(TAIL_SOURCE),
+                &copy,
+                TAIL_SOURCE.len() as u64
+            )
+            .map(|_| ())
+        ),
+        Side::Destination
+    );
 }

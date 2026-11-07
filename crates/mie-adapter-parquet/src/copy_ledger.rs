@@ -64,7 +64,7 @@
 use crate::io_error;
 use crate::layout::{self, COPY_LEDGER, COPY_LEDGER_LOCK, META_DIR, PartFile};
 use crate::manifest::{self, hex, sha256_hex};
-use crate::replica::{self, TailSource};
+use crate::replica::{self, CopyError, TailSource};
 use mie_ports::raw::{RawStoreError, is_sha256_hex, validate_segment};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions, TryLockError};
@@ -925,28 +925,32 @@ pub struct LedgerCopy {
 ///
 /// # Errors
 ///
-/// [`RawStoreError::Integrity`] for a missing hot ledger, a chain failure
-/// before its last record, and a copy that is not a byte prefix of hot's at
-/// its tail or is longer than B; [`RawStoreError::Corrupt`] for a bad
-/// header or grammar; [`RawStoreError::Io`] on I/O failure.
+/// A [`CopyError`] on [`replica::Side::Source`] for hot's ledger: missing or with a
+/// chain failure before its last record ([`RawStoreError::Integrity`]), a
+/// bad header or grammar ([`RawStoreError::Corrupt`]), unreadable
+/// ([`RawStoreError::Io`]). On [`replica::Side::Destination`] for a copy that is
+/// not a byte prefix of hot's at its tail or is longer than B
+/// ([`RawStoreError::Integrity`]), and any I/O failure on the copy.
 pub fn extend_copy(
     hot_root: &Path,
     target_root: &Path,
     root_id: &str,
-) -> Result<LedgerCopy, RawStoreError> {
+) -> Result<LedgerCopy, CopyError> {
     let path = ledger_path(hot_root);
     let bytes = match fs::read(&path) {
         Ok(bytes) => bytes,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Err(missing_ledger(&path)),
-        Err(error) => return Err(io_error("read", &path)(error)),
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            return Err(CopyError::source(missing_ledger(&path)));
+        }
+        Err(error) => return Err(CopyError::source(io_error("read", &path)(error))),
     };
-    let ledger = parse(&path, &bytes)?;
+    let ledger = parse(&path, &bytes).map_err(CopyError::source)?;
     let prefix = &bytes[..bytes.len() - ledger.ignored_bytes as usize];
     let copy = ledger_path(target_root);
     let copy_len = match fs::metadata(&copy) {
         Ok(metadata) => Some(metadata.len()),
         Err(error) if error.kind() == ErrorKind::NotFound => None,
-        Err(error) => return Err(io_error("inspect", &copy)(error)),
+        Err(error) => return Err(io_error("inspect", &copy)(error).into()),
     };
     let current = copy_len.filter(|&len| is_current(prefix, &ledger.records, root_id, len));
     let end = current.unwrap_or(prefix.len() as u64);

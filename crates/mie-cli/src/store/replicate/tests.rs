@@ -436,3 +436,253 @@ fn a_failed_append_that_truncated_reaches_the_observer() {
         )
     );
 }
+
+/// Every file below `root` with its bytes, sorted by relative path.
+fn files_under(root: &Path) -> Vec<(String, Vec<u8>)> {
+    fn walk(dir: &Path, base: &Path, out: &mut Vec<(String, Vec<u8>)>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(&path, base, out);
+            } else {
+                let rel = path.strip_prefix(base).unwrap().display().to_string();
+                out.push((rel, fs::read(&path).unwrap()));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out.sort();
+    out
+}
+
+/// Makes `path` writable again, so a test can replace it.
+fn make_writable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o644)).unwrap();
+}
+
+/// Review of #199, finding 1: when hot's manifest differs from the ledger's
+/// `manifest` record, the pass copies nothing, so two targets never hold
+/// two versions of one path.
+#[test]
+fn a_hot_manifest_that_differs_from_the_ledger_is_never_copied() {
+    let fixture = Fixture::new("pass-d5-guard");
+    // Pass 1 with cold-b unmarked: only cold-a gets copies and the ledger
+    // gets the manifest records.
+    let marker_b = root_marker::marker_path(&fixture.cold[1]);
+    let saved = fs::read(&marker_b).unwrap();
+    fs::remove_file(&marker_b).unwrap();
+    fixture.pass();
+    fs::write(&marker_b, &saved).unwrap();
+    // Another valid seal of the same part number replaces hot's.
+    let other = Dir::new("pass-d5-guard-other");
+    let path = replica::list_sealed(&fixture.hot)
+        .unwrap()
+        .into_iter()
+        .find(|p| p.starts_with("source=binance-um"))
+        .unwrap();
+    let alt = seal(&other.0, "binance-um", "aggTrade", D0 + 500, 6);
+    assert!(alt.contains(&path), "{alt:?} vs {path}");
+    for file in [path.clone(), manifest_of(&path)] {
+        let dst = fixture.hot.join(&file);
+        make_writable(&dst);
+        fs::remove_file(&dst).unwrap();
+        fs::copy(other.0.join(&file), &dst).unwrap();
+    }
+    let cold_a = files_under(&fixture.cold[0]);
+    let report = fixture.pass();
+    assert!(
+        !fixture.cold[1].join(&path).exists() && !fixture.cold[1].join(manifest_of(&path)).exists(),
+        "the divergent version reached cold-b"
+    );
+    assert!(
+        report.problems.iter().any(|p| p.starts_with(&format!("{path}: 1 of 2 copies"))
+            && p.contains("hot's manifest differs from the copy ledger's manifest record; nothing is copied")),
+        "{report:?}"
+    );
+    // cold-a's copy of the path is the recorded version, untouched.
+    let after: Vec<_> = files_under(&fixture.cold[0])
+        .into_iter()
+        .filter(|(name, _)| name.starts_with("source="))
+        .collect();
+    let before: Vec<_> = cold_a
+        .into_iter()
+        .filter(|(name, _)| name.starts_with("source="))
+        .collect();
+    assert_eq!(after, before);
+}
+
+/// Review of #199, finding 2: one unreadable hot file is named, and every
+/// other file and every target goes on.
+#[test]
+fn an_unreadable_hot_file_stops_only_that_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new("pass-hot-eacces");
+    let paths = replica::list_sealed(&fixture.hot).unwrap();
+    let bad = fixture.hot.join(&paths[0]);
+    fs::set_permissions(&bad, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read(&bad).is_ok() {
+        // Root reads through any permission; the case cannot be built.
+        return;
+    }
+    let report = fixture.pass();
+    fs::set_permissions(&bad, fs::Permissions::from_mode(0o444)).unwrap();
+    assert!(
+        !report.problems.iter().any(|p| p.contains("stopped")),
+        "{report:?}"
+    );
+    assert!(
+        report.problems.iter().any(|p| p.starts_with(&paths[0])
+            && p.contains("reading it on hot failed")
+            && p.contains("Permission denied")),
+        "{report:?}"
+    );
+    let (_, copies) = counts(&fixture.records());
+    assert_eq!(copies.len(), 2 * (paths.len() - 1), "{copies:?}");
+    for root in &fixture.cold {
+        assert!(copy_ledger::ledger_path(root).exists());
+        // The unreadable file is an archive part, which never holds the
+        // journal.
+        assert!(root.join(".mie/journal/journal.jsonl").exists());
+    }
+}
+
+/// Review of #199, finding 3 (operator decision): the journal tail is held
+/// on a target while a listed live file is not on it, so a `sealed` line on
+/// a copy always names a file that copy holds.
+#[test]
+fn the_journal_tail_waits_for_every_live_file_on_its_target() {
+    let fixture = Fixture::new("pass-journal-hold");
+    let path = replica::list_sealed(&fixture.hot)
+        .unwrap()
+        .into_iter()
+        .find(|p| p.starts_with("source=binance-um"))
+        .unwrap();
+    let debris = fixture.cold[0].join(&path);
+    fs::create_dir_all(debris.parent().unwrap()).unwrap();
+    fs::write(&debris, b"not the part").unwrap();
+    let report = fixture.pass();
+    assert!(!fixture.cold[0].join(manifest_of(&path)).exists());
+    assert!(!fixture.cold[0].join(".mie/journal/journal.jsonl").exists());
+    assert!(
+        report.problems.iter().any(|p| p.starts_with(
+            "the journal copy on cold-a is held: 1 listed live file(s) are not on it"
+        ) && p.contains(&path)),
+        "{report:?}"
+    );
+    assert_eq!(
+        fs::read(fixture.cold[1].join(".mie/journal/journal.jsonl")).unwrap(),
+        fs::read(&fixture.config.paths.journal).unwrap()
+    );
+
+    // Once the file is on cold-a, the journal follows.
+    fs::remove_file(&debris).unwrap();
+    let report = fixture.pass();
+    assert_eq!(report.problems, Vec::<String>::new(), "{report:?}");
+    assert_eq!(
+        fs::read(fixture.cold[0].join(".mie/journal/journal.jsonl")).unwrap(),
+        fs::read(&fixture.config.paths.journal).unwrap()
+    );
+}
+
+/// Review of #199, finding 4 (operator decision): a target that loses its
+/// mount after step 0 gets nothing written into the bare mount point.
+#[test]
+fn nothing_is_written_into_a_target_that_lost_its_mount() {
+    let fixture = Fixture::new("pass-unmounted");
+    let a = fixture.cold[0].clone();
+    let hidden = fixture.dir.0.join("cold-a.mounted");
+    AFTER_LISTING.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            fs::rename(&a, &hidden).unwrap();
+            fs::create_dir(&a).unwrap();
+        }))
+    });
+    let report = fixture.pass();
+    assert_eq!(files_under(&fixture.cold[0]), Vec::new(), "{report:?}");
+    assert!(
+        report
+            .problems
+            .iter()
+            .any(|p| p.contains("(cold-a): stopped") && p.contains("its marker is gone")),
+        "{report:?}"
+    );
+    let (_, copies) = counts(&fixture.records());
+    assert!(
+        copies.keys().all(|(_, root)| root == "cold-b"),
+        "{copies:?}"
+    );
+    assert_eq!(
+        copies.len(),
+        replica::list_sealed(&fixture.hot).unwrap().len()
+    );
+}
+
+/// QA of #199: a target whose marker disappears or changes mid-pass (right
+/// after a copy was published on it) gets no record and no file after that
+/// point, is reported stopped, and the command exits 1.
+#[test]
+fn a_marker_lost_or_changed_mid_pass_stops_its_target() {
+    for change in ["removed", "changed"] {
+        let fixture = Fixture::new("pass-marker-mid");
+        let cold_a = fixture.cold[0].clone();
+        let at_change = std::rc::Rc::new(RefCell::new(None));
+        {
+            let at_change = at_change.clone();
+            ON_STEP.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move |step| {
+                    if step != PassStep::AfterPublish || at_change.borrow().is_some() {
+                        return;
+                    }
+                    let marker = root_marker::marker_path(&cold_a);
+                    if change == "removed" {
+                        fs::remove_file(&marker).unwrap();
+                    } else {
+                        fs::write(&marker, root_marker::render("cold-x").unwrap()).unwrap();
+                    }
+                    *at_change.borrow_mut() = Some(files_under(&cold_a));
+                }));
+            });
+        }
+        let archive = fixture.archive();
+        let mut out = Vec::new();
+        let pass = crate::store::replicate(
+            &fixture.config,
+            Some(&archive),
+            &fixture.probe,
+            &|| D0 + 1,
+            &mut out,
+        )
+        .unwrap();
+        ON_STEP.with(|hook| hook.borrow_mut().take());
+        let out = String::from_utf8(out).unwrap();
+        assert!(!pass, "{change}: exit 1: {out}");
+        let snapshot = at_change.borrow().clone().expect("the marker was changed");
+        assert_eq!(files_under(&fixture.cold[0]), snapshot, "{change}: {out}");
+        for record in fixture.records() {
+            match record.kind {
+                Kind::Copy { root, path } => assert_ne!(root, "cold-a", "{change}: {path}"),
+                Kind::LedgerCopy { root, .. } => assert_ne!(root, "cold-a", "{change}"),
+                _ => {}
+            }
+        }
+        assert!(
+            out.contains(&format!(
+                "FAIL: copy target {} (cold-a): stopped for the rest of this pass",
+                fixture.cold[0].display()
+            )),
+            "{change}: {out}"
+        );
+        // cold-b completes.
+        let (_, copies) = counts(&fixture.records());
+        assert_eq!(
+            copies.len(),
+            replica::list_sealed(&fixture.hot).unwrap().len(),
+            "{change}"
+        );
+    }
+}

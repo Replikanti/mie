@@ -247,9 +247,14 @@ live in more than one root (approved as written at STOP 1).
     between the two renames) is verified against the source manifest and
     completed by publishing the manifest; data that fails is `Integrity`
     and is never overwritten. A copy's temp debris is removed.
-  - **The marker is re-read before each copy record** (D11 *Replication*),
-    so a target that unmounts mid-pass gets no record for a copy that the
-    returning mount would hide.
+  - **The D5 guard runs before the copy** (#199 review). Hot's manifest
+    text is compared with the copy ledger's `manifest` record for the path,
+    and a path with two recorded texts is refused, before any byte is
+    written to a target. Why: checked after the copy, a hot manifest that
+    differs from the recorded one would already sit on the new target, and
+    two targets would hold two versions of one path.
+  - **The marker is re-read before every write to a target and every
+    record about it** (D11 *Replication*; operator, #199 review).
 - The same relative path in two roots must be byte-identical, data and
   manifest; anything else is `Integrity`.
 - A copy never recompresses, merges parts or re-encodes: any of these
@@ -996,10 +1001,33 @@ What breaks:
   Why the order: a `sealed` line on a cold journal copy then always names
   a file that is already on cold, so a hot loss drops whole files together
   with their journal lines, and the lost tail never leaves a cold journal
-  naming a missing file. It writes only into a root whose marker it finds.
-  Why: an unmounted mount point is a writable empty directory on the hot
-  disk, and a copy written there would share hot's device and disappear
-  under the mount when the mount returns. Sealed files and import-ledger
+  naming a missing file. To keep that true when a file fails on a target,
+  **a target's journal tail is held while a live file of the pass's
+  listing has no copy record for that target**, and the pass names the
+  held tail as a failure (operator, #199 review). Archive parts never hold
+  it: only the capture writes `sealed` lines, and an archive part waits
+  for its import entry, which would hold the journal for a whole import.
+  The cost is that the journal tail of a target stays at one copy until
+  the missing file reaches it (the single-copy exposure below). A failure
+  to read hot (one part, its manifest, an entry, the journal) is about
+  that source and is named; the other files and targets go on, so one bad
+  sector on hot cannot stop the replication of everything else. It writes
+  only into a root whose marker it finds. Why: an unmounted mount point is
+  a writable empty directory on the hot disk, and a copy written there
+  would share hot's device and disappear under the mount when the mount
+  returns. **The marker is re-read before every write to a target** (a
+  sealed file, an entry, the ledger tail, the journal tail) **and before
+  every record about it** (`copy`, `ledger-copy`); a target whose marker
+  is gone or carries another id stops for the rest of the pass (operator,
+  #199 review). The cost is a few small reads per copied file. Residual:
+  a mount lost between a re-read and the write that follows it still
+  receives that one write on the parent's filesystem, and a mount lost and
+  restored between two re-reads is not seen at all. The device check
+  (`st_dev`, *What mie can check*) runs once at the start of the pass, not
+  per write: probing the device before each write would leave the same
+  window open. Both residual cases are found by the verification (#192),
+  which compares every copy with its manifest and every recorded copy with
+  the root that should hold it. Sealed files and import-ledger
   entries, which are immutable files (ADR-034 D4), are copied once by the
   D5 protocol.
 - **Archive parts wait for their import entry.** An archive part is

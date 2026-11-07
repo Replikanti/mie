@@ -14,11 +14,12 @@
 //!    roots. Then L, the journal's length, is read. Nothing is written
 //!    before this point but the lock file.
 //! 1. **Sealed files.** Every sealed part on hot without a copy record for
-//!    a target is copied to it by the D5 protocol, the target's marker is
-//!    re-read, and the `manifest` record (with the first copy) and the
-//!    `copy` record are appended. A live part is always eligible; an
-//!    archive part only once an import entry on hot lists it with its
-//!    manifest's SHA-256 (D11 *Archive parts wait for their import entry*).
+//!    a target is copied to it by the D5 protocol, and the `manifest`
+//!    record (with the first copy) and the `copy` record are appended. Hot's
+//!    manifest is checked against the ledger's `manifest` record before
+//!    anything is copied (D5). A live part is always eligible; an archive
+//!    part only once an import entry on hot lists it with its manifest's
+//!    SHA-256 (D11 *Archive parts wait for their import entry*).
 //! 2. **Import-ledger entries.** An entry goes to a target only once every
 //!    part it lists has a copy record for that target, so per archive file
 //!    its parts precede its entry. `PENDING` is never copied.
@@ -26,12 +27,22 @@
 //!    `ledger-copy` record per target whose copy was not up to date. After
 //!    steps 1 and 2, so this pass's copy records lie inside the prefix.
 //! 4. **The journal tail** `[len(copy), L)`. L was read before step 1
-//!    listed hot, so a `sealed` line on a copy always names a file that is
-//!    already on that copy.
+//!    listed hot, and the tail is held on a target while a listed live file
+//!    has no copy record for it, so a `sealed` line on a copy always names
+//!    a file that is already on that copy.
 //!
-//! An `Integrity` error on one file or entry is named and the pass goes
-//! on; any other error on a target stops that target for the rest of the
-//! pass; a failed ledger append stops the pass. Every append hands a
+//! **The target's marker is re-read before every write to it** (a sealed
+//! copy, an entry, the ledger and journal tails) and before every record
+//! about it: a target whose marker is gone or changed stops for the rest of
+//! the pass (D11; review of #199, finding 4). The residual window is the
+//! time between a re-read and the write that follows it.
+//!
+//! A failure to read hot (a part, its manifest, an entry, the journal) is
+//! about that one source and is named, and the pass goes on with the other
+//! files and targets. An `Integrity`, `Corrupt` or `Invalid` error on a
+//! target's copy of one file or entry is named and the pass goes on; any
+//! other error on a target stops that target for the rest of the pass; a
+//! failed ledger append stops the pass. Every append hands a
 //! truncation of the ledger's trailing record to the [`PassObserver`]
 //! before anything else, a failed append included (#197 review finding 5):
 //! `mie store replicate` prints it as a report line of its own, and `mie
@@ -55,7 +66,7 @@ use mie_adapter_binance::archive::ledger::ImportLedger;
 use mie_adapter_parquet::copy_ledger::{
     self, AppendError, AppendOutcome, CopyLedger, Kind, Record, Truncation,
 };
-use mie_adapter_parquet::replica::{self, CopyOutcome, TailSource};
+use mie_adapter_parquet::replica::{self, CopyError, CopyOutcome, Side, TailSource};
 use mie_adapter_parquet::root_marker::{self, HOT_ID};
 use mie_ports::raw::{RawStoreError, validate_segment};
 use std::collections::{BTreeMap, BTreeSet};
@@ -139,6 +150,10 @@ impl PassStep {
     ];
 }
 
+/// A test hook that sees every pass step.
+#[cfg(test)]
+type StepHook = Box<dyn FnMut(PassStep)>;
+
 #[cfg(test)]
 thread_local! {
     /// Test hook: the pass stops at the first occurrence of this step.
@@ -147,6 +162,9 @@ thread_local! {
     /// Test hook: runs once between step 1's listing and the rest of the
     /// pass (the seal race of D11).
     pub(crate) static AFTER_LISTING: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+    /// Test hook: runs at every pass step, before a crash there.
+    pub(crate) static ON_STEP: std::cell::RefCell<Option<StepHook>> =
         std::cell::RefCell::new(None);
 }
 
@@ -340,8 +358,15 @@ impl Pass<'_> {
     }
 }
 
-/// Marks a step of the pass; under test, stops the pass there once.
+/// Marks a step of the pass; under test, runs the step hook and stops the
+/// pass there once.
 fn reached(step: PassStep) -> Result<(), Stop> {
+    #[cfg(test)]
+    ON_STEP.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(step);
+        }
+    });
     #[cfg(test)]
     if CRASH_AT.with(std::cell::Cell::get) == Some(step) {
         CRASH_AT.with(|crash| crash.set(None));
@@ -649,7 +674,7 @@ impl Pass<'_> {
             entries_copied += self.copy_entry(entry)?;
         }
         let ledger_bytes = self.copy_ledger_tail()?;
-        let journal_bytes = self.copy_journal_tail();
+        let journal_bytes = self.copy_journal_tail(&paths);
         self.line(format!(
             "copied {copied} file(s) and {entries_copied} import entr{}; appended {ledger_bytes} \
              copy-ledger byte(s) and {journal_bytes} journal byte(s)",
@@ -670,51 +695,69 @@ impl Pass<'_> {
         if is_archive_part(path) && !self.archive_part_eligible(path, entries) {
             return Ok(0);
         }
+        // The D5 guard runs before anything is published: a hot manifest
+        // that differs from the ledger's `manifest` record would otherwise
+        // put two versions of one path on two targets (review of #199,
+        // finding 1).
+        let hot_text = match replica::sealed_manifest(self.hot, path) {
+            Ok(Some((text, _))) => text,
+            // Gone since the listing: only the hot removal removes, and a
+            // removed partition has its copies.
+            Ok(None) => return Ok(0),
+            Err(error) => {
+                self.reason(path, format!("reading its manifest on hot failed: {error}"));
+                return Ok(0);
+            }
+        };
+        if !self.matches_ledger(path, &hot_text) {
+            return Ok(0);
+        }
         let mut copied = 0;
         for i in missing {
-            if self.targets[i].stopped {
+            if self.targets[i].stopped || !self.marker_present(i) {
                 continue;
             }
             let (outcome, text) = match replica::copy_sealed(self.hot, &self.targets[i].path, path)
             {
                 Ok(done) => done,
-                Err(error) if is_local(&error) => {
+                // A failure to read hot is about this file, not about the
+                // target: the other files and targets go on (review of #199,
+                // finding 2).
+                Err(CopyError {
+                    side: Side::Source,
+                    error,
+                }) => {
+                    self.reason(path, format!("reading it on hot failed: {error}"));
+                    return Ok(copied);
+                }
+                Err(CopyError { error, .. }) if is_local(&error) => {
                     let id = self.targets[i].id.clone();
                     self.reason(path, format!("the copy to {id} failed: {error}"));
                     continue;
                 }
-                Err(error) => {
+                Err(CopyError { error, .. }) => {
                     self.stop_target(i, format!("copying {path}: {error}"));
                     continue;
                 }
             };
             reached(PassStep::AfterPublish)?;
-            if !self.marker_present(i) {
-                continue;
-            }
-            if self.fold.conflicts.contains(path) {
+            if text != hot_text {
                 self.reason(
                     path,
-                    "the copy ledger holds two different manifest texts for it (ADR-062 D5)"
+                    "its manifest on hot changed during the pass; nothing is recorded (ADR-062 D5)"
                         .to_owned(),
                 );
                 continue;
             }
-            match self.fold.manifests.get(path) {
-                Some(known) if *known != text => {
-                    self.reason(
-                        path,
-                        "hot's manifest differs from the copy ledger's manifest record; nothing \
-                         is recorded (ADR-062 D5)"
-                            .to_owned(),
-                    );
+            if !self.marker_present(i) {
+                continue;
+            }
+            if !self.fold.manifests.contains_key(path) {
+                self.append(Kind::Manifest { text: text.clone() })?;
+                self.fold.manifests.insert(path.to_owned(), text);
+                reached(PassStep::AfterManifestRecord)?;
+                if !self.marker_present(i) {
                     continue;
-                }
-                Some(_) => {}
-                None => {
-                    self.append(Kind::Manifest { text: text.clone() })?;
-                    self.fold.manifests.insert(path.to_owned(), text);
-                    reached(PassStep::AfterManifestRecord)?;
                 }
             }
             let id = self.targets[i].id.clone();
@@ -738,6 +781,33 @@ impl Pass<'_> {
             }
         }
         Ok(copied)
+    }
+
+    /// The D5 guard: hot's manifest text must equal the ledger's `manifest`
+    /// record for the path, if there is one, and the ledger must not hold
+    /// two texts for it. Otherwise the reason is recorded.
+    fn matches_ledger(&mut self, path: &str, hot_text: &str) -> bool {
+        if self.fold.conflicts.contains(path) {
+            self.reason(
+                path,
+                "the copy ledger holds two different manifest texts for it; nothing is copied \
+                 (ADR-062 D5)"
+                    .to_owned(),
+            );
+            return false;
+        }
+        match self.fold.manifests.get(path) {
+            Some(known) if known != hot_text => {
+                self.reason(
+                    path,
+                    "hot's manifest differs from the copy ledger's manifest record; nothing is \
+                     copied (ADR-062 D5)"
+                        .to_owned(),
+                );
+                false
+            }
+            _ => true,
+        }
     }
 
     /// Whether an archive part may be copied: an import entry on hot lists
@@ -837,16 +907,26 @@ impl Pass<'_> {
                 self.reason(&entry.name, reason);
                 continue;
             }
+            if !self.marker_present(i) {
+                continue;
+            }
             match replica::copy_immutable(&entry.path, &dir.join(&entry.file_name)) {
                 Ok(_) => {
                     copied += 1;
                     self.line(format!("copied import entry {} to {id}", entry.name));
                     reached(PassStep::AfterEntryCopy)?;
                 }
-                Err(error) if is_local(&error) => {
+                Err(CopyError {
+                    side: Side::Source,
+                    error,
+                }) => {
+                    self.reason(&entry.name, format!("reading it on hot failed: {error}"));
+                    return Ok(copied);
+                }
+                Err(CopyError { error, .. }) if is_local(&error) => {
                     self.reason(&entry.name, format!("the copy to {id} failed: {error}"));
                 }
-                Err(error) => {
+                Err(CopyError { error, .. }) => {
                     self.stop_target(i, format!("copying import entry {}: {error}", entry.name));
                 }
             }
@@ -861,10 +941,22 @@ impl Pass<'_> {
             if self.targets[i].stopped {
                 continue;
             }
+            if !self.marker_present(i) {
+                continue;
+            }
             let (path, id) = (self.targets[i].path.clone(), self.targets[i].id.clone());
             let copy = match copy_ledger::extend_copy(self.hot, &path, &id) {
                 Ok(copy) => copy,
-                Err(error) if is_local(&error) => {
+                Err(CopyError {
+                    side: Side::Source,
+                    error,
+                }) => {
+                    self.problem(format!(
+                        "hot's copy ledger cannot be read for the ledger copies: {error}"
+                    ));
+                    return Ok(appended);
+                }
+                Err(CopyError { error, .. }) if is_local(&error) => {
                     self.problem(format!(
                         "the copy-ledger copy on {id} ({}) is refused: {error}; it needs the \
                          repair (ADR-062 D11)",
@@ -872,7 +964,7 @@ impl Pass<'_> {
                     ));
                     continue;
                 }
-                Err(error) => {
+                Err(CopyError { error, .. }) => {
                     self.stop_target(i, format!("extending its copy-ledger copy: {error}"));
                     continue;
                 }
@@ -899,7 +991,14 @@ impl Pass<'_> {
     }
 
     /// Step 4: returns the bytes appended to the journal copies.
-    fn copy_journal_tail(&mut self) -> u64 {
+    ///
+    /// The tail is held on a target while a live file of the listing has no
+    /// copy record for it: a `sealed` line on a copy must always name a file
+    /// that copy holds (ADR-062 D11; review of #199, finding 3). Archive
+    /// parts never hold it: only the capture writes `sealed` lines, and an
+    /// archive part waits for its import entry, which would hold the journal
+    /// for a whole import.
+    fn copy_journal_tail(&mut self, paths: &[String]) -> u64 {
         let Some(len) = self.journal_len else {
             return 0;
         };
@@ -921,6 +1020,23 @@ impl Pass<'_> {
                 .join(JOURNAL_DIR)
                 .join(&name);
             let id = self.targets[i].id.clone();
+            let short: Vec<&String> = paths
+                .iter()
+                .filter(|path| !is_archive_part(path) && !self.fold.has_copy(path, &id))
+                .collect();
+            if let Some(first) = short.first() {
+                let message = format!(
+                    "the journal copy on {id} is held: {} listed live file(s) are not on it \
+                     (first {first}), and a `sealed` line on a copy always names a file that \
+                     copy holds (ADR-062 D11)",
+                    short.len()
+                );
+                self.problem(message);
+                continue;
+            }
+            if !self.marker_present(i) {
+                continue;
+            }
             match replica::extend_prefix(TailSource::File(self.journal), &dest, len) {
                 Ok(0) => {}
                 Ok(bytes) => {
@@ -929,12 +1045,24 @@ impl Pass<'_> {
                         "journal copy on {id}: appended {bytes} byte(s), now {len} bytes"
                     ));
                 }
-                Err(error) if is_local(&error) => self.problem(format!(
+                Err(CopyError {
+                    side: Side::Source,
+                    error,
+                }) => {
+                    self.problem(format!(
+                        "the journal {} cannot be read: {error}",
+                        self.journal.display()
+                    ));
+                    return appended;
+                }
+                Err(CopyError { error, .. }) if is_local(&error) => self.problem(format!(
                     "the journal copy on {id} ({}) is refused: {error}; it needs the repair \
                      (ADR-062 D11)",
                     dest.display()
                 )),
-                Err(error) => self.stop_target(i, format!("extending its journal copy: {error}")),
+                Err(CopyError { error, .. }) => {
+                    self.stop_target(i, format!("extending its journal copy: {error}"));
+                }
             }
         }
         appended

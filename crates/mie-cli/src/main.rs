@@ -296,7 +296,9 @@ USAGE:
         archive configuration (--archive-config, else [history]
         archive_config), which must name the same raw_root, symbol and
         cold_roots. Without one, archive parts and entries are not
-        copied. Nothing is ever removed. Prints what it copied and every
+        copied. A copy target's marker is re-read before every write to
+        it, and the journal tail waits on a target until every live file
+        of the pass is on it. Nothing is ever removed. Prints what it copied and every
         copy-ledger truncation, then PASS and exits 0 when every file has
         a copy on every copy target, or one FAIL: <reason> line per file,
         entry, target or copy left short and exits 1.

@@ -60,6 +60,58 @@ pub enum CopyOutcome {
     AlreadyPresent,
 }
 
+/// The side of a copy that failed: a failure to read the source (hot) is
+/// about one file, a failure on the destination is about the target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    /// Reading the source failed, or the source does not match its own
+    /// manifest.
+    Source,
+    /// Writing, reading or checking the destination failed.
+    Destination,
+}
+
+/// A failed copy and the side it failed on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyError {
+    /// Where it failed.
+    pub side: Side,
+    /// Why.
+    pub error: RawStoreError,
+}
+
+impl CopyError {
+    /// A failure on the source side.
+    pub fn source(error: RawStoreError) -> Self {
+        Self {
+            side: Side::Source,
+            error,
+        }
+    }
+}
+
+impl From<RawStoreError> for CopyError {
+    /// A failure on the destination side.
+    fn from(error: RawStoreError) -> Self {
+        Self {
+            side: Side::Destination,
+            error,
+        }
+    }
+}
+
+impl std::fmt::Display for CopyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let side = match self.side {
+            Side::Source => "source",
+            Side::Destination => "destination",
+        };
+        write!(f, "{side}: {}", self.error)
+    }
+}
+
+impl std::error::Error for CopyError {}
+
 /// The steps of [`copy_sealed`] and [`copy_immutable`], in order. Tests
 /// stop a copy after any of them to simulate a crash.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -360,23 +412,27 @@ fn write_new(path: &Path, bytes: &[u8]) -> Result<(), RawStoreError> {
 ///
 /// # Errors
 ///
-/// [`RawStoreError::Invalid`] for a path outside the layout;
-/// [`RawStoreError::Integrity`] for a source without its manifest or not
-/// matching it, and for a destination that differs (the message names the
-/// root and the path); [`RawStoreError::Corrupt`] for a malformed or
-/// misplaced source manifest; [`RawStoreError::Io`] on I/O failure.
+/// A [`CopyError`] on [`Side::Source`] for a path outside the layout
+/// ([`RawStoreError::Invalid`]), a source without its manifest or not
+/// matching it ([`RawStoreError::Integrity`]), a malformed or misplaced
+/// source manifest ([`RawStoreError::Corrupt`]) and a source that cannot be
+/// read ([`RawStoreError::Io`]); on [`Side::Destination`] for a destination
+/// that differs ([`RawStoreError::Integrity`], naming the root and the
+/// path) and any I/O failure there.
 pub fn copy_sealed(
     source_root: &Path,
     dest_root: &Path,
     data_path: &str,
-) -> Result<(CopyOutcome, String), RawStoreError> {
-    let (key, date, part) = layout::parse_data_path(data_path)?;
-    let (text, file) = sealed_manifest(source_root, data_path)?.ok_or_else(|| {
-        RawStoreError::Integrity(format!(
-            "{data_path}: the source root {} holds no manifest for it",
-            source_root.display()
-        ))
-    })?;
+) -> Result<(CopyOutcome, String), CopyError> {
+    let (key, date, part) = layout::parse_data_path(data_path).map_err(CopyError::source)?;
+    let (text, file) = sealed_manifest(source_root, data_path)
+        .map_err(CopyError::source)?
+        .ok_or_else(|| {
+            CopyError::source(RawStoreError::Integrity(format!(
+                "{data_path}: the source root {} holds no manifest for it",
+                source_root.display()
+            )))
+        })?;
     let source_data = layout::resolve(source_root, data_path);
     let partition = layout::resolve(dest_root, &layout::partition_dir(&key, &date));
     let data_final = partition.join(PartFile::Data.name(part));
@@ -402,7 +458,7 @@ pub fn copy_sealed(
     if exists(&manifest_final)? {
         let present = fs::read(&manifest_final).map_err(io_error("read", &manifest_final))?;
         if present != text.as_bytes() {
-            return Err(differs("its manifest differs from the source's"));
+            return Err(differs("its manifest differs from the source's").into());
         }
         verify_dest_data()?;
         remove_if_present(&data_tmp)?;
@@ -442,7 +498,8 @@ pub fn copy_sealed(
             "{data_path} on {}: the copy read back does not match the source; nothing was \
              published",
             dest_root.display()
-        )));
+        ))
+        .into());
     }
     reached(CopyStep::Verify)?;
 
@@ -470,16 +527,16 @@ fn stream_copy(
     expected: &SealedFile,
     source_root: &Path,
     data_path: &str,
-) -> Result<(), RawStoreError> {
+) -> Result<(), CopyError> {
     let mut input = match File::open(source) {
         Ok(file) => file,
         Err(error) if error.kind() == ErrorKind::NotFound => {
-            return Err(RawStoreError::Integrity(format!(
+            return Err(CopyError::source(RawStoreError::Integrity(format!(
                 "{data_path}: the source root {} holds its manifest without its data",
                 source_root.display()
-            )));
+            ))));
         }
-        Err(error) => return Err(io_error("open", source)(error)),
+        Err(error) => return Err(CopyError::source(io_error("open", source)(error))),
     };
     let mut output = OpenOptions::new()
         .write(true)
@@ -490,7 +547,9 @@ fn stream_copy(
     let mut bytes = 0u64;
     let mut buffer = vec![0; CHUNK];
     loop {
-        let n = input.read(&mut buffer).map_err(io_error("read", source))?;
+        let n = input
+            .read(&mut buffer)
+            .map_err(|error| CopyError::source(io_error("read", source)(error)))?;
         if n == 0 {
             break;
         }
@@ -503,13 +562,13 @@ fn stream_copy(
     if bytes != expected.bytes || hex(&hasher.finalize()) != expected.sha256 {
         drop(output);
         remove_if_present(dest)?;
-        return Err(RawStoreError::Integrity(format!(
+        return Err(CopyError::source(RawStoreError::Integrity(format!(
             "{data_path} on the source root {}: the data does not match its manifest; nothing \
              was copied",
             source_root.display()
-        )));
+        ))));
     }
-    output.sync_all().map_err(io_error("sync", dest))
+    Ok(output.sync_all().map_err(io_error("sync", dest))?)
 }
 
 /// Publishes the manifest `text` next to data that is already in place:
@@ -561,10 +620,12 @@ fn immutable_tmp(dest: &Path) -> Result<PathBuf, RawStoreError> {
 ///
 /// # Errors
 ///
-/// [`RawStoreError::Integrity`] for a differing destination;
-/// [`RawStoreError::Io`] on I/O failure, a missing source included.
-pub fn copy_immutable(source: &Path, dest: &Path) -> Result<CopyOutcome, RawStoreError> {
-    let bytes = fs::read(source).map_err(io_error("read", source))?;
+/// A [`CopyError`] on [`Side::Source`] when the source cannot be read (a
+/// missing source included); on [`Side::Destination`] for a differing
+/// destination ([`RawStoreError::Integrity`]) and any I/O failure there.
+pub fn copy_immutable(source: &Path, dest: &Path) -> Result<CopyOutcome, CopyError> {
+    let bytes =
+        fs::read(source).map_err(|error| CopyError::source(io_error("read", source)(error)))?;
     match fs::read(dest) {
         Ok(present) if present == bytes => return Ok(CopyOutcome::AlreadyPresent),
         Ok(_) => {
@@ -573,10 +634,11 @@ pub fn copy_immutable(source: &Path, dest: &Path) -> Result<CopyOutcome, RawStor
                  (ADR-062 D5)",
                 dest.display(),
                 source.display()
-            )));
+            ))
+            .into());
         }
         Err(error) if error.kind() == ErrorKind::NotFound => {}
-        Err(error) => return Err(io_error("read", dest)(error)),
+        Err(error) => return Err(io_error("read", dest)(error).into()),
     }
     let dir = dest
         .parent()
@@ -592,7 +654,8 @@ pub fn copy_immutable(source: &Path, dest: &Path) -> Result<CopyOutcome, RawStor
             "{}: the copy read back does not match {}",
             tmp.display(),
             source.display()
-        )));
+        ))
+        .into());
     }
     reached(CopyStep::Verify)?;
     mark_read_only(&tmp)?;
@@ -624,8 +687,12 @@ impl TailSource<'_> {
         }
     }
 
-    /// The `len` bytes at `offset`.
-    fn read_at(&self, offset: u64, len: usize) -> Result<Vec<u8>, RawStoreError> {
+    /// The `len` bytes at `offset`; a failure is on the source side.
+    fn read_at(&self, offset: u64, len: usize) -> Result<Vec<u8>, CopyError> {
+        self.read_at_inner(offset, len).map_err(CopyError::source)
+    }
+
+    fn read_at_inner(&self, offset: u64, len: usize) -> Result<Vec<u8>, RawStoreError> {
         match self {
             Self::File(path) => {
                 let mut file = File::open(path).map_err(io_error("open", path))?;
@@ -701,11 +768,12 @@ fn last_line_start(file: &mut File, path: &Path, len: u64) -> Result<u64, RawSto
 ///
 /// # Errors
 ///
-/// [`RawStoreError::Integrity`] for a `dest` longer than `end` or not a
-/// prefix of the source at its tail, and for a read-back mismatch;
-/// [`RawStoreError::Io`] on I/O failure, a source shorter than `end`
-/// included.
-pub fn extend_prefix(source: TailSource<'_>, dest: &Path, end: u64) -> Result<u64, RawStoreError> {
+/// A [`CopyError`] on [`Side::Source`] when the source cannot be read (a
+/// source shorter than `end` included); on [`Side::Destination`] for a
+/// `dest` longer than `end` or not a prefix of the source at its tail and
+/// for a read-back mismatch ([`RawStoreError::Integrity`]), and any I/O
+/// failure on `dest`.
+pub fn extend_prefix(source: TailSource<'_>, dest: &Path, end: u64) -> Result<u64, CopyError> {
     if !exists(dest)? {
         let dir = dest.parent().ok_or_else(|| {
             RawStoreError::Invalid(format!("{} has no directory", dest.display()))
@@ -714,7 +782,7 @@ pub fn extend_prefix(source: TailSource<'_>, dest: &Path, end: u64) -> Result<u6
         match OpenOptions::new().write(true).create_new(true).open(dest) {
             Ok(file) => file.sync_all().map_err(io_error("sync", dest))?,
             Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(io_error("create", dest)(error)),
+            Err(error) => return Err(io_error("create", dest)(error).into()),
         }
         sync_dir(dir)?;
     }
@@ -730,7 +798,8 @@ pub fn extend_prefix(source: TailSource<'_>, dest: &Path, end: u64) -> Result<u6
              prefix of hot's file (ADR-062 D11)",
             dest.display(),
             source.describe()
-        )));
+        ))
+        .into());
     }
 
     // The copy's last record (and any partial tail) against the source.
@@ -746,7 +815,8 @@ pub fn extend_prefix(source: TailSource<'_>, dest: &Path, end: u64) -> Result<u6
                 dest.display(),
                 offset + i as u64,
                 source.describe()
-            )));
+            ))
+            .into());
         }
         offset += n as u64;
     }
@@ -771,7 +841,8 @@ pub fn extend_prefix(source: TailSource<'_>, dest: &Path, end: u64) -> Result<u6
                 "{}: the bytes appended at {offset} read back differently from {}",
                 dest.display(),
                 source.describe()
-            )));
+            ))
+            .into());
         }
         offset += n as u64;
     }
@@ -785,7 +856,7 @@ fn append_range(
     source: TailSource<'_>,
     from: u64,
     to: u64,
-) -> Result<(), RawStoreError> {
+) -> Result<(), CopyError> {
     let mut offset = from;
     while offset < to {
         let n = (to - offset).min(CHUNK as u64) as usize;
