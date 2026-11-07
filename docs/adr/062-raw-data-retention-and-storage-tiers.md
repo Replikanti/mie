@@ -194,8 +194,9 @@ the D2 consequence.
   6. an id that another configured root's marker already carries (a root
      without a marker is skipped; any other read error refuses).
 
-  The `mie store` command group holds `init` and `init-root`; the later
-  steps of the follow-up add their verbs to it.
+  The `mie store` command group holds `init`, `init-root` and
+  `replicate` (one replication pass, D11; #189); the later steps of the
+  follow-up add their verbs to it.
 - **Option 1 (everything on the local disk)** is the configuration with
   no cold root, and it stays valid while the hot formula (D10) fits the
   disk. It loses as the policy because the fast local disk would have to
@@ -225,6 +226,30 @@ live in more than one root (approved as written at STOP 1).
   copy in the copy ledger (D7). The hot copy is removed only by D6, after k
   verified copies exist. So at every instant each sealed file is complete
   in at least one root.
+  - **Temp names and steps are the seal's** (#189). The copy writes the
+    data to `.part-NNNNN.parquet.tmp` and fsyncs it, writes the manifest
+    text verbatim to `.part-NNNNN.manifest.tmp` and fsyncs it and the
+    directory, reads both back and verifies them against the manifest,
+    marks both read-only, renames the data, then the manifest, and fsyncs
+    the directory. The data is streamed through a bounded buffer. Why: a
+    crashed copy on any root then passes through exactly the intermediate
+    states of a crashed seal, which ADR-030 recovery already defines (a
+    data temp file alone is discarded, a temp file or published data with
+    its pending manifest is rolled forward). That matters once the recall
+    and the hot restore copy onto hot, where the writer's recovery runs.
+    Rejected, copy temp names of their own (`.copy.tmp`): writer recovery
+    ignores names it does not own, so a crashed copy on hot would leave
+    debris that blocks D6's "no `.tmp` file" eligibility for good, and the
+    copy's states would need a second recovery definition.
+  - **A destination that already holds the path.** Its manifest must equal
+    the source's byte for byte and its data must verify: the copy then
+    only records itself. Data without a manifest (a copy that crashed
+    between the two renames) is verified against the source manifest and
+    completed by publishing the manifest; data that fails is `Integrity`
+    and is never overwritten. A copy's temp debris is removed.
+  - **The marker is re-read before each copy record** (D11 *Replication*),
+    so a target that unmounts mid-pass gets no record for a copy that the
+    returning mount would hide.
 - The same relative path in two roots must be byte-identical, data and
   manifest; anything else is `Integrity`.
 - A copy never recompresses, merges parts or re-encodes: any of these
@@ -480,11 +505,18 @@ live in more than one root (approved as written at STOP 1).
   lock (the incomplete-record rule above).
 - **Formats and layout.** Format v1 of every file under a root's `.mie/`:
   - **The `.mie/` directory** of every root holds `root`, the root marker.
-    On hot it also holds `copy-ledger` and its lock file
-    `copy-ledger.lock`. On a copy target it also holds, from the
-    replicator on, `copy-ledger` (the ledger copy, D11),
+    On hot it also holds `copy-ledger`, its lock file `copy-ledger.lock`,
+    and `replicate.lock`, the replication pass lock (#189): a pass takes an
+    exclusive `flock` on it without waiting and holds it for the whole
+    pass. Why: two passes at once (the replicator's thread in `mie ingest`
+    and a manual `mie store replicate`) would both read a copy's length and
+    append the same tail twice, so the copy would stop being a prefix of
+    hot's file. Rejected, holding the copy-ledger lock for the pass: the
+    pass does cold I/O, and the remover appends from the seal path, so a
+    hung mount would stall the capture. On a copy target it also holds,
+    from the replicator on, `copy-ledger` (the ledger copy, D11),
     `journal/<journal file name>` (the journal copies) and
-    `import-ledger/` (the import-ledger copies). `.mie/` is outside the
+    `import-ledger/<segment>/<name>.import` (the import-ledger copies). `.mie/` is outside the
     layout, and nothing else in mie writes there.
   - **The root marker** is the text `mie-root 1\nid <id>\n`: a versioned
     header and one `id` line; the id passes `validate_segment`. The parser
@@ -570,9 +602,20 @@ live in more than one root (approved as written at STOP 1).
     checks (the trailing record and the line before it, which must
     verify), and the third supplies the chain hash the second-last is
     computed from. A complete record before the last is never truncated.
-    Every truncation is reported to the caller, which journals it: in the
-    append's outcome, or, when the write after a truncation fails (a full
-    hot), in the append's error. Damage
+    Every truncation is reported to the caller, which journals it, as
+    structured fields (the truncated bytes and the offset the ledger was
+    truncated to): in the append's outcome, or, when the fsync of the
+    truncation or the write after it fails (a full hot), in the append's
+    error, which carries the truncation next to the failure (#189, #197
+    review finding 5). The replication pass hands every truncation to its
+    observer before it acts on the append's result: `mie store replicate`
+    prints it as a report line of its own, before any `FAIL` line, and `mie
+    ingest` maps it to a capture-journal line (#191). The standalone command
+    never writes the capture journal (operator, #189 STOP 1). Why: a second
+    process appending to it while `mie ingest` writes it through a buffered
+    writer can land inside a half-flushed line, and a torn `run_start`
+    drops that run from `mie replay` (ADR-039 D2). The cost: until #191, a
+    truncation by a manual pass lives in that command's output only. Damage
     older than the last three records is not seen by an append; it stays
     in the file for readers and the verification to report.
   - **The whole-run hold** of the rebuild and the hot restore takes the
@@ -927,7 +970,10 @@ What breaks:
   year). "Independent" means a separate disk and, for network storage, a
   separate server, because two copies on one disk or one NAS fail
   together (operator).
-- **k_A = 2.** The operator's k covers live-only data. The archive can be
+- **k_A = 2.** k is the number of copy targets, and every copy target
+  receives every file, archive parts included (#189), so k_A = k; at the
+  operator's k = 2 that is the k_A = 2 decided here. The operator's k
+  covers live-only data. The archive can be
   downloaded again, but not as the same bytes once the writer changed
   (D1), so a lost archive file changes the chain's prefix dataset and the
   versions accepted ADRs cite, the same harm as a lost live file for the
@@ -958,7 +1004,16 @@ What breaks:
   D5 protocol.
 - **Archive parts wait for their import entry.** An archive part is
   replicated only once the `.import` entry that lists it exists on hot,
-  and per archive file the pass copies its parts, then its entry. The
+  and per archive file the pass copies its parts, then its entry: an entry
+  goes to a copy target only once every part it lists has a copy record
+  for that target, and an archive part only once an entry on hot lists it
+  with its manifest's SHA-256 (another SHA-256 is `Integrity`, and the
+  part is not copied). Whether an entry is already on a target is read
+  from one listing of the target's entry directory, never by re-reading
+  the entries (#189). Why: re-reading every entry would read the whole
+  import ledger (2.25 MB at M1-15, and growing) from every target on every
+  pass, 288 times a day; the byte comparison of existing entries is the
+  verification's job. The
   importer's `PENDING` marker (ADR-034 D4) is not replicated. Why: an
   import that seals several parts of one file (a large `trades` or
   `aggTrades` day, ADR-034 D5's row and byte limits) writes its entry only
@@ -979,6 +1034,27 @@ What breaks:
   per pass: after one year the journal alone is 1.9–5.5 GB (M1-11 × 365),
   and copying it every 300 s would write that 288 times a day to every
   target.
+  - **The copy-ledger copy ends at hot's verified prefix B** (#189): the
+    end of hot's last complete record whose chain verifies, by the
+    single-trailing-record rule, so a torn trailing record is never
+    copied. B, its SHA-256 and the copied bytes all come from one read of
+    hot's ledger. A `ledger-copy <root> <B> <sha256>` record then asserts
+    that the copy is B bytes long, that hot's `[0, B)` had that SHA-256,
+    and that the appended bytes and the copy's last record were read back
+    and match hot's. The comparison of the whole copy with hot's prefix
+    belongs to the verification. Why not read the whole copy back on every
+    pass: the copy ledger grows about 1.6 MB per day (Numbers table), 0.58
+    GB after a year, and reading it back on 288 passes a day for two
+    targets would read about 334 GB a day from cold in year 1, growing
+    linearly.
+  - **The up-to-date rule.** A copy gets no tail and no record when every
+    hot record from its length up to B is a `ledger-copy` record and the
+    latest `ledger-copy` record for that target has prefix length = the
+    copy's length; its last record is still compared with hot's. Why: each
+    pass ends with `ledger-copy` records that the copies cannot hold yet.
+    Copying them would add new ones on every pass, and a pass over
+    unchanged state would never be idle. A crash between a tail append and
+    its record leaves no matching record, so the next pass writes it.
 - **The copy ledger is covered by the same rule as data** (operator, STOP
   1 approval). Why: it is the only listing of the partitions removed from
   hot (D7), so losing every copy of it would hide those partitions from
@@ -1197,7 +1273,7 @@ What breaks:
 | 5.5× busiest archive day | M1-14 | 232.41 / 41.99 MB | Why the busiest column, not the mean, sizes provisioning |
 | 3 670 files per live day, ≈ 1.34 M/year | M1-9 | 1 835 data files + 1 835 manifests on 2026-10-17; × 365 | The cold listing load and the per-pass copy count. Fewer, larger files would need merging parts, which changes hashes (D5) |
 | Copy ledger ≈ 1.6 MB/day | Estimate from M1-9 and the golden records of grammar v1 (#187) | per file one `manifest` record (479 B in the golden ledger, a `depth` file) and k = 2 `copy` records (176 B each): 831 B × 1 835 files = 1.53 MB; plus one `ledger-copy` record (168 B) per copy target per replication pass, 2 × 288 × 168 B = 0.10 MB | An estimate until the follow-up measures it: record sizes vary by a few bytes with the stream name and the digits of `rows` and `bytes`, and verification records depend on P. Higher only adds hot bytes (D10 J); it is under 0.3 % of the data rate |
-| ≥ 2 copy targets in a non-empty `cold_roots` | k = 2 (D11) | k counts copies on the copy targets, and every copy target receives every file, so k equals the number of copy targets | 1: no file ever reaches k copies, nothing ever leaves hot, and the store is the single copy D11 rejects. More than 2 is allowed: it is a larger k |
+| ≥ 2 copy targets in a non-empty `cold_roots` | k = 2 (D11) | k counts copies on the copy targets, and every copy target receives every file, archive parts included, so k equals the number of copy targets and k_A = k (#189) | 1: no file ever reaches k copies, nothing ever leaves hot, and the store is the single copy D11 rejects. More than 2 is allowed: it is a larger k |
 | An append reads back the last 3 records | D7 *Formats and layout* | the trailing record and the line before it are checked; the third-last supplies the chain the second-last is computed from | Fewer: the line before the trailing record cannot be verified, so a damaged second-last record could be followed by a truncation of the last. More: only read cost, and still no full-chain check, which stays the verification's job |
 | At most 1 trailing record ignored or truncated | D7 *Formats and layout* | one append is in flight at a time under the lock, so a crash leaves at most one incomplete record | More than one: damage before the last record would be silently dropped, which is what the chain exists to report |
 | Journal 5.1–5.6 MB/day; 15.1 MB/day for #99; 1.9–5.5 GB per year | M1-11 | journal size / captured hours × 24; 5.1 × 365 = 1.86 GB, 15.1 × 365 = 5.5 GB | The journal never leaves hot, so J × t grows hot; the busiest column uses 15.1. The yearly size is why D11 appends tails instead of copying the file whole every pass |
