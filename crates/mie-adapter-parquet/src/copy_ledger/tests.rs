@@ -157,7 +157,7 @@ fn store(tag: &str) -> TempDir {
 fn append_all(root: &Path, records: &[Record]) {
     let ledger = CopyLedger::at(root);
     for record in records {
-        assert_eq!(ledger.append(record).unwrap().truncated_bytes, 0);
+        assert_eq!(ledger.append(record).unwrap().truncation, None);
     }
 }
 
@@ -354,7 +354,9 @@ fn records_outside_the_grammar_are_never_written() {
     for record in bad {
         assert!(
             matches!(
-                CopyLedger::at(dir.path()).append(&record),
+                CopyLedger::at(dir.path())
+                    .append(&record)
+                    .map_err(|e| e.error),
                 Err(RawStoreError::Invalid(_))
             ),
             "{record:?}"
@@ -544,12 +546,21 @@ fn a_flipped_byte_in_record_n_is_reported_as_record_n() {
             // still never truncated.
             let target = store("ledger-flip");
             fs::write(ledger_path(target.path()), &damaged).unwrap();
-            let result = CopyLedger::at(target.path()).append(&extra);
+            let result = CopyLedger::at(target.path())
+                .append(&extra)
+                .map_err(|e| e.error);
             let after = fs::read(ledger_path(target.path())).unwrap();
             let seen_by_appender = n == count - 1 || (in_chain && n == count - 2);
             if n == count {
                 let outcome = result.unwrap();
-                assert_eq!(outcome.truncated_bytes, len as u64 + 1, "{what}");
+                assert_eq!(
+                    outcome.truncation,
+                    Some(Truncation {
+                        bytes: len as u64 + 1,
+                        offset: offset as u64
+                    }),
+                    "{what}"
+                );
                 assert_eq!(outcome.offset, offset as u64);
                 assert_eq!(&after[..offset], &original[..offset]);
                 let check = check_chain(&after);
@@ -564,7 +575,7 @@ fn a_flipped_byte_in_record_n_is_reported_as_record_n() {
                 );
                 assert_eq!(after, damaged, "{what}: the file is untouched");
             } else {
-                assert_eq!(result.unwrap().truncated_bytes, 0, "{what}");
+                assert_eq!(result.unwrap().truncation, None, "{what}");
                 assert_eq!(&after[..damaged.len()], &damaged[..], "{what}");
                 assert_eq!(check_chain(&after).failure, check.failure, "{what}");
             }
@@ -594,7 +605,14 @@ fn an_incomplete_trailing_record_is_ignored_then_truncated() {
         let dir = store("ledger-tail");
         fs::write(ledger_path(dir.path()), &bytes).unwrap();
         let outcome = CopyLedger::at(dir.path()).append(&rest[1]).unwrap();
-        assert_eq!(outcome.truncated_bytes, tail.len() as u64, "{what}");
+        assert_eq!(
+            outcome.truncation,
+            Some(Truncation {
+                bytes: tail.len() as u64,
+                offset: base.len() as u64
+            }),
+            "{what}"
+        );
         assert_eq!(outcome.offset, base.len() as u64, "{what}");
         let after = fs::read(ledger_path(dir.path())).unwrap();
         assert_eq!(check_chain(&after).failure, None, "{what}");
@@ -621,7 +639,9 @@ fn an_incomplete_trailing_record_is_ignored_then_truncated() {
     let dir = store("ledger-tail-damaged");
     fs::write(ledger_path(dir.path()), &bytes).unwrap();
     assert!(matches!(
-        CopyLedger::at(dir.path()).append(&rest[1]),
+        CopyLedger::at(dir.path())
+            .append(&rest[1])
+            .map_err(|e| e.error),
         Err(RawStoreError::Integrity(_))
     ));
     assert_eq!(fs::read(ledger_path(dir.path())).unwrap(), bytes);
@@ -633,7 +653,13 @@ fn an_incomplete_trailing_record_is_ignored_then_truncated() {
     fs::write(ledger_path(dir.path()), &bytes).unwrap();
     assert_eq!(parsed(&bytes).unwrap().records, []);
     let outcome = CopyLedger::at(dir.path()).append(&records[0]).unwrap();
-    assert_eq!(outcome.truncated_bytes, 14);
+    assert_eq!(
+        outcome.truncation,
+        Some(Truncation {
+            bytes: 14,
+            offset: HEADER.len() as u64
+        })
+    );
     assert_eq!(read(dir.path()).unwrap().unwrap().records, records[..1]);
 }
 
@@ -657,7 +683,13 @@ fn appends_read_back_over_several_tail_steps() {
     flip(&mut bytes, offset + len - 1);
     fs::write(ledger_path(dir.path()), &bytes).unwrap();
     let outcome = CopyLedger::at(dir.path()).append(&records[0]).unwrap();
-    assert_eq!(outcome.truncated_bytes, len as u64 + 1);
+    assert_eq!(
+        outcome.truncation,
+        Some(Truncation {
+            bytes: len as u64 + 1,
+            offset: offset as u64
+        })
+    );
     let after = fs::read(ledger_path(dir.path())).unwrap();
     assert_eq!(check_chain(&after).failure, None);
 }
@@ -690,7 +722,9 @@ fn a_bad_header_is_corrupt_and_a_missing_ledger_is_never_created() {
         let dir = store("ledger-header");
         fs::write(ledger_path(dir.path()), &bytes).unwrap();
         assert!(matches!(
-            CopyLedger::at(dir.path()).append(&golden_records()[1]),
+            CopyLedger::at(dir.path())
+                .append(&golden_records()[1])
+                .map_err(|e| e.error),
             Err(RawStoreError::Corrupt(_))
         ));
         assert_eq!(fs::read(ledger_path(dir.path())).unwrap(), bytes);
@@ -700,7 +734,9 @@ fn a_bad_header_is_corrupt_and_a_missing_ledger_is_never_created() {
     assert_eq!(read(dir.path()).unwrap(), None);
     fs::create_dir(dir.path().join(META_DIR)).unwrap();
     assert_eq!(read(dir.path()).unwrap(), None);
-    let result = CopyLedger::at(dir.path()).append(&golden_records()[1]);
+    let result = CopyLedger::at(dir.path())
+        .append(&golden_records()[1])
+        .map_err(|e| e.error);
     assert!(
         matches!(result, Err(RawStoreError::Integrity(_))),
         "{result:?}"
@@ -730,35 +766,70 @@ fn a_whole_run_hold_excludes_other_holders_in_the_same_process() {
 }
 
 #[test]
-fn a_write_failing_after_a_truncation_reports_the_truncation() {
-    // Review of #197, finding 5: the truncation must reach the caller even
-    // when the write after it fails (a full hot, D10).
-    let dir = store("ledger-truncate-then-fail");
+fn a_failure_after_a_truncation_carries_the_truncation() {
+    // Review of #197, finding 5: the truncation must reach the caller as
+    // structured fields even when a step after it fails (a full hot, D10),
+    // whether the write of the record fails or the fsync of the truncation.
+    for (what, hook) in [
+        ("the write", &FAIL_NEXT_WRITE),
+        ("the fsync of the truncation", &FAIL_NEXT_TRUNCATE_SYNC),
+    ] {
+        let dir = store("ledger-truncate-then-fail");
+        let records = golden_records();
+        append_all(dir.path(), &records[..4]);
+        let mut bytes = fs::read(ledger_path(dir.path())).unwrap();
+        let spans = spans(&bytes);
+        let (offset, len) = spans[spans.len() - 1];
+        flip(&mut bytes, offset + len - 1);
+        fs::write(ledger_path(dir.path()), &bytes).unwrap();
+
+        hook.with(|fail| fail.set(true));
+        let error = CopyLedger::at(dir.path()).append(&records[4]).unwrap_err();
+        assert_eq!(
+            error.truncation,
+            Some(Truncation {
+                bytes: len as u64 + 1,
+                offset: offset as u64
+            }),
+            "{what}"
+        );
+        assert!(
+            matches!(error.error, RawStoreError::Io(_)),
+            "{what}: {error}"
+        );
+        let text = error.to_string();
+        assert!(
+            text.contains(&format!("({} bytes at byte {offset})", len + 1))
+                && text.contains("truncated"),
+            "{what}: {text}"
+        );
+        // The truncation is durable and the next append starts from it.
+        assert_eq!(
+            fs::read(ledger_path(dir.path())).unwrap(),
+            &bytes[..offset],
+            "{what}"
+        );
+        let outcome = CopyLedger::at(dir.path()).append(&records[4]).unwrap();
+        assert_eq!(outcome.truncation, None, "{what}");
+        assert_eq!(outcome.offset, offset as u64, "{what}");
+    }
+
+    // Without a truncation the error carries none and says nothing about
+    // one, and an append without a truncation never fsyncs one.
+    let dir = store("ledger-fail-without-truncation");
     let records = golden_records();
-    append_all(dir.path(), &records[..4]);
-    let mut bytes = fs::read(ledger_path(dir.path())).unwrap();
-    let spans = spans(&bytes);
-    let (offset, len) = spans[spans.len() - 1];
-    flip(&mut bytes, offset + len - 1);
-    fs::write(ledger_path(dir.path()), &bytes).unwrap();
-
+    append_all(dir.path(), &records[..2]);
     FAIL_NEXT_WRITE.with(|fail| fail.set(true));
-    let error = CopyLedger::at(dir.path()).append(&records[4]).unwrap_err();
-    let RawStoreError::Io(detail) = error else {
-        panic!("{error:?}");
-    };
-    assert!(
-        detail.contains(&format!("({} bytes at byte {offset})", len + 1))
-            && detail.contains("truncated"),
-        "{detail}"
-    );
-    // The truncation is durable and the next append starts from it.
-    assert_eq!(fs::read(ledger_path(dir.path())).unwrap(), &bytes[..offset]);
-    let outcome = CopyLedger::at(dir.path()).append(&records[4]).unwrap();
-    assert_eq!(outcome.truncated_bytes, 0);
-
-    // Without a truncation the error says nothing about one.
-    FAIL_NEXT_WRITE.with(|fail| fail.set(true));
-    let error = CopyLedger::at(dir.path()).append(&records[5]).unwrap_err();
+    let error = CopyLedger::at(dir.path()).append(&records[2]).unwrap_err();
+    assert_eq!(error.truncation, None);
     assert!(!error.to_string().contains("truncated"), "{error}");
+    FAIL_NEXT_TRUNCATE_SYNC.with(|fail| fail.set(true));
+    assert_eq!(
+        CopyLedger::at(dir.path())
+            .append(&records[2])
+            .unwrap()
+            .truncation,
+        None
+    );
+    FAIL_NEXT_TRUNCATE_SYNC.with(|fail| fail.set(false));
 }

@@ -54,7 +54,10 @@
 //! and appends, or it refuses with [`RawStoreError::Integrity`] and leaves
 //! the file byte-identical. It never truncates a complete record before the
 //! last one. The new line is written with one `write_all` and fsynced
-//! before the lock is released. The ledger is never created by an append;
+//! before the lock is released. A truncation is reported to the caller as
+//! a structured [`Truncation`], in the [`AppendOutcome`] or, when a step
+//! after it fails, in the [`AppendError`], so the caller can journal it
+//! even when the append failed. The ledger is never created by an append;
 //! only the init step creates it (ADR-062 D7,
 //! [`create_meta`](crate::root_marker::create_meta)).
 
@@ -867,18 +870,67 @@ fn parse_line(line: &[u8]) -> Result<Record, String> {
     parse_body(body)
 }
 
+/// An incomplete trailing record that an append truncated (ADR-062 D7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Truncation {
+    /// The truncated bytes.
+    pub bytes: u64,
+    /// The byte offset the ledger was truncated to, where the truncated
+    /// record started.
+    pub offset: u64,
+}
+
 /// What an append did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AppendOutcome {
-    /// Bytes of an incomplete trailing record truncated before the append,
-    /// 0 if none. A caller journals every truncation. When the truncation
-    /// succeeds and the write after it fails, the [`RawStoreError::Io`]
-    /// names the truncated bytes instead, so the caller journals them from
-    /// the error.
-    pub truncated_bytes: u64,
+    /// The incomplete trailing record truncated before the append, if any.
+    /// A caller journals every truncation.
+    pub truncation: Option<Truncation>,
     /// The byte offset of the appended record.
     pub offset: u64,
 }
+
+/// A failed append. A truncation that happened before the failure is
+/// carried as a structured field, so the caller journals it even though
+/// the append failed (review of #197, finding 5).
+///
+/// There is deliberately no `From<AppendError> for RawStoreError`: a `?`
+/// could then drop the truncation without the compiler noticing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppendError {
+    /// Why the append failed.
+    pub error: RawStoreError,
+    /// The incomplete trailing record truncated before the failure. `Some`
+    /// whenever the truncation itself succeeded, whatever failed after it
+    /// (the fsync of the truncation or the write of the record).
+    pub truncation: Option<Truncation>,
+}
+
+impl From<RawStoreError> for AppendError {
+    /// A failure before anything was truncated.
+    fn from(error: RawStoreError) -> Self {
+        Self {
+            error,
+            truncation: None,
+        }
+    }
+}
+
+impl std::fmt::Display for AppendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.error)?;
+        if let Some(Truncation { bytes, offset }) = self.truncation {
+            write!(
+                f,
+                "; the incomplete trailing record ({bytes} bytes at byte {offset}) was truncated \
+                 before the failure"
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for AppendError {}
 
 /// The appender of the copy ledger of one store.
 ///
@@ -911,20 +963,22 @@ impl CopyLedger {
     ///
     /// # Errors
     ///
-    /// [`RawStoreError::Invalid`] for a record outside the grammar (nothing
-    /// is touched); [`RawStoreError::Integrity`] when the ledger does not
-    /// exist or its last records are damaged beyond the one trailing record
-    /// (the file is left byte-identical); [`RawStoreError::Corrupt`] for a
-    /// bad header; [`RawStoreError::Io`] on I/O failure.
-    pub fn append(&self, record: &Record) -> Result<AppendOutcome, RawStoreError> {
+    /// An [`AppendError`] whose `error` is [`RawStoreError::Invalid`] for a
+    /// record outside the grammar (nothing is touched),
+    /// [`RawStoreError::Integrity`] when the ledger does not exist or its
+    /// last records are damaged beyond the one trailing record (the file is
+    /// left byte-identical), [`RawStoreError::Corrupt`] for a bad header,
+    /// and [`RawStoreError::Io`] on I/O failure. Its `truncation` names a
+    /// truncation that happened before the failure.
+    pub fn append(&self, record: &Record) -> Result<AppendOutcome, AppendError> {
         let body = record.body()?;
         // A missing ledger is refused before the lock file is created, so
         // an append to a store without a ledger creates no file.
         match fs::symlink_metadata(&self.ledger) {
             Err(error) if error.kind() == ErrorKind::NotFound => {
-                return Err(missing_ledger(&self.ledger));
+                return Err(missing_ledger(&self.ledger).into());
             }
-            Err(error) => return Err(io_error("inspect", &self.ledger)(error)),
+            Err(error) => return Err(io_error("inspect", &self.ledger)(error).into()),
             Ok(_) => {}
         }
         let lock = open_lock(&self.lock)?;
@@ -933,6 +987,7 @@ impl CopyLedger {
         // may have replaced it by rename while this append waited, and a
         // descriptor opened before would write into the replaced file.
         let outcome = open_ledger(&self.ledger)
+            .map_err(AppendError::from)
             .and_then(|mut file| append_locked(&self.ledger, &mut file, &body));
         drop(lock);
         outcome
@@ -975,7 +1030,7 @@ impl LedgerHold {
     /// # Errors
     ///
     /// As [`CopyLedger::append`].
-    pub fn append(&self, record: &Record) -> Result<AppendOutcome, RawStoreError> {
+    pub fn append(&self, record: &Record) -> Result<AppendOutcome, AppendError> {
         let body = record.body()?;
         let mut file = open_ledger(&self.ledger)?;
         append_locked(&self.ledger, &mut file, &body)
@@ -1036,7 +1091,7 @@ const TAIL_STEP: u64 = if cfg!(test) { 61 } else { 4_096 };
 
 /// The append itself, under the lock: decide, then truncate at most the
 /// trailing record and append, or refuse with the file untouched.
-fn append_locked(path: &Path, file: &mut File, body: &str) -> Result<AppendOutcome, RawStoreError> {
+fn append_locked(path: &Path, file: &mut File, body: &str) -> Result<AppendOutcome, AppendError> {
     let header = HEADER.as_bytes();
     let header_len = header.len() as u64;
     let len = file.metadata().map_err(io_error("stat", path))?.len();
@@ -1047,7 +1102,7 @@ fn append_locked(path: &Path, file: &mut File, body: &str) -> Result<AppendOutco
         ))
     };
     if len < header_len || read_at(file, path, 0, header.len())? != header {
-        return Err(corrupt());
+        return Err(corrupt().into());
     }
 
     // Read back until the buffer holds four line ends, or reaches the
@@ -1109,7 +1164,7 @@ fn append_locked(path: &Path, file: &mut File, body: &str) -> Result<AppendOutco
             // The line before the last: verified unless it is the header.
             let before_ok = last == 0 || verifies(last - 1).is_some();
             if !before_ok {
-                return Err(refuse(lines[last - 1].0));
+                return Err(refuse(lines[last - 1].0).into());
             }
             match last_chain {
                 Some(chain) => (len - partial, chain),
@@ -1119,34 +1174,32 @@ fn append_locked(path: &Path, file: &mut File, body: &str) -> Result<AppendOutco
                     lines[last].0,
                     predecessor(last).expect("the line before the last verified"),
                 ),
-                None => return Err(refuse(lines[last].0)),
+                None => return Err(refuse(lines[last].0).into()),
             }
         }
     };
 
     let chain = chain_of(&previous, body.as_bytes());
     let line = format!("{body} {chain}\n");
-    let truncated_bytes = len - keep;
-    if truncated_bytes > 0 {
-        file.set_len(keep)
-            .and_then(|()| file.sync_all())
-            .map_err(io_error("truncate", path))?;
+    let truncation = (len > keep).then_some(Truncation {
+        bytes: len - keep,
+        offset: keep,
+    });
+    if truncation.is_some() {
+        file.set_len(keep).map_err(io_error("truncate", path))?;
+        // From here on the truncation happened: every error carries it, so
+        // the caller journals it even though the append failed.
+        sync_truncation(file).map_err(|error| AppendError {
+            error: io_error("sync the truncation of", path)(error),
+            truncation,
+        })?;
     }
-    write_line(file, line.as_bytes()).map_err(|error| {
-        let detail = format!("append to {}: {error}", path.display());
-        // The truncation already happened: the error carries it, so the
-        // caller journals it even though the append failed.
-        RawStoreError::Io(if truncated_bytes > 0 {
-            format!(
-                "{detail}; the incomplete trailing record ({truncated_bytes} bytes at byte \
-                 {keep}) was truncated before the failed write"
-            )
-        } else {
-            detail
-        })
+    write_line(file, line.as_bytes()).map_err(|error| AppendError {
+        error: RawStoreError::Io(format!("append to {}: {error}", path.display())),
+        truncation,
     })?;
     Ok(AppendOutcome {
-        truncated_bytes,
+        truncation,
         offset: keep,
     })
 }
@@ -1155,6 +1208,18 @@ fn append_locked(path: &Path, file: &mut File, body: &str) -> Result<AppendOutco
 thread_local! {
     /// Test hook: the next [`write_line`] on this thread fails.
     pub(crate) static FAIL_NEXT_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Test hook: the next [`sync_truncation`] on this thread fails.
+    pub(crate) static FAIL_NEXT_TRUNCATE_SYNC: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Fsyncs the ledger after a truncation.
+fn sync_truncation(file: &File) -> std::io::Result<()> {
+    #[cfg(test)]
+    if FAIL_NEXT_TRUNCATE_SYNC.with(|fail| fail.replace(false)) {
+        return Err(std::io::Error::other("injected fsync failure"));
+    }
+    file.sync_all()
 }
 
 /// Writes one line with one `write_all` and fsyncs it.
