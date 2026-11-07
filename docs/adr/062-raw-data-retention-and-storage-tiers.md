@@ -1044,7 +1044,19 @@ adopted into the production store. The protocol (#190):
   short is refused the same way; `mie store replicate` completes it. The
   same predicate is asserted over every recorded file once the closing
   pass has run, and a gap fails the run, so a PASS always leaves the
-  guard releasing every adopted partition hot holds. The source's import
+  guard releasing every adopted partition hot holds. **Limit, until #192:**
+  a copy target added after an adoption, or a failed one replaced under a
+  new id, holds no copy of the files that already left hot, and the
+  replication pass copies from hot only. Those files fail the predicate,
+  so every later adoption is refused, with nothing written. The refusal
+  is told apart from a stopped adoption: it names each path, the targets
+  that hold its recorded copy and the new target that lacks one, and the
+  remedy, `mie store repair` (#192), which copies it from a good target,
+  or until then a re-adoption of the original store, which copies the
+  file to every target without a `copy` record. A file on hot that only
+  lacks copies is named with `mie store replicate` as its remedy. Why
+  refuse instead of passing: a PASS would then leave files below k on
+  the new target with no step that ever fills them. The source's import
   ledger holds no `PENDING`; every source archive part is listed by a source entry with
   its manifest's SHA-256 (D11 *Archive parts wait for their import
   entry*), every part an entry lists is in the source or already in the
@@ -1442,7 +1454,10 @@ What breaks:
   it (D5).
   - An explicit repair step replaces a missing or bad copy from a good one
     by the D5 protocol. The restored bytes are the sealed bytes, so D5
-    holds.
+    holds. A marked copy target without a `copy` record for a recorded
+    file counts as a missing copy, even when no verification found it: a
+    target added or replaced after the file left hot (D10 *Bootstrap*,
+    the limit until #192) is filled this way, from another target.
   - Repair is explicit, not automatic: several bad copies at once point at
     a shared cause (a failing controller, a wrong mount), and automatic
     rewrites would spread into it.

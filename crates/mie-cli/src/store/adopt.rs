@@ -30,7 +30,10 @@
 //!    PASS also asserts at the end: on hot unless its partition is
 //!    recorded removed, and recorded on every copy target), so a re-run of
 //!    a stopped adoption against another store can never pass and leave a
-//!    partition guarded for good; every archive part has the entry that lists it with its
+//!    partition guarded for good. A file that only lacks a copy on a target
+//!    added after it left hot is named with its own remedy (`mie store
+//!    repair`, #192, or a re-adoption of the original store); every archive
+//!    part has the entry that lists it with its
 //!    manifest's SHA-256, and every listed part is in the source or already
 //!    in the store. The **path rule** (D10, D5): each source path's
 //!    manifest is compared with the ledger's `manifest` record, hot's
@@ -824,29 +827,54 @@ impl Run<'_> {
     ) -> Result<(), Stop> {
         let listed: BTreeSet<&str> = files.iter().map(|f| f.path.as_str()).collect();
         let hot = self.config.paths.raw_root.clone();
-        let mut incomplete = Vec::new();
+        let (mut stopped, mut repair, mut pass) = (Vec::new(), Vec::new(), Vec::new());
         for path in self.fold.manifests.keys() {
             if listed.contains(path.as_str()) || marked.contains_key(path) {
                 continue;
             }
             match complete(&hot, &self.fold, path, targets, removed) {
                 Ok(None) => {}
-                Ok(Some(gap)) => incomplete.push(format!("{path} ({gap})")),
-                Err(error) => incomplete.push(format!("{path} ({error})")),
+                Ok(Some(gap)) if gap.needs_repair() => repair.push(format!("{path} ({gap})")),
+                Ok(Some(gap)) if gap.needs_pass() => pass.push(format!("{path} ({gap})")),
+                Ok(Some(gap)) => stopped.push(format!("{path} ({gap})")),
+                Err(error) => stopped.push(format!("{path} ({error})")),
             }
         }
-        if incomplete.is_empty() {
+        let tail = "until then the writer refuses new parts in those partitions. Nothing was \
+                    written (ADR-062 D6, D10)";
+        let mut problems = Vec::new();
+        if !stopped.is_empty() {
+            problems.push(format!(
+                "the copy ledger records {}, which --from does not list and which is not complete \
+                 (on hot unless its partition is recorded removed, and recorded on every copy \
+                 target): an adoption that stopped recorded it and --from is not the store it \
+                 read. Re-run the adoption with the store it read; {tail}",
+                stopped.join(", ")
+            ));
+        }
+        if !repair.is_empty() {
+            problems.push(format!(
+                "the copy ledger records {}, which --from does not list: it left hot with a copy \
+                 record on another copy target but none on the target named, a target added or \
+                 replaced after it was adopted, and the replication pass copies from hot only. \
+                 Fill it with `mie store repair` (#192), or until then re-adopt the original \
+                 store it came from. Nothing was written (ADR-062 D10, D11)",
+                repair.join(", ")
+            ));
+        }
+        if !pass.is_empty() {
+            problems.push(format!(
+                "the copy ledger records {}, which --from does not list and which hot holds \
+                 without a copy record on every copy target: run `mie store replicate` first. \
+                 Nothing was written (ADR-062 D10, D11)",
+                pass.join(", ")
+            ));
+        }
+        if problems.is_empty() {
             return Ok(());
         }
-        Err(self.fail(format!(
-            "the copy ledger records {}, which --from does not list and which is not complete (on \
-             hot unless its partition is recorded removed, and recorded on every copy target): \
-             an adoption that stopped recorded it and --from is not the store it read, or a \
-             replication pass has not finished it. Re-run the adoption with the store it read, \
-             or run `mie store replicate` for a file on hot; until then the writer refuses new \
-             parts in those partitions. Nothing was written (ADR-062 D6, D10)",
-            incomplete.join(", ")
-        )))
+        self.report.problems.extend(problems);
+        Err(Stop::Failed)
     }
 
     /// The path rule for one source file (module docs).
@@ -1150,7 +1178,7 @@ impl Run<'_> {
             }
             let gap = match complete(&hot, &fold, path, targets, &removed) {
                 Ok(None) => continue,
-                Ok(Some(gap)) => gap,
+                Ok(Some(gap)) => gap.to_string(),
                 Err(error) => error,
             };
             self.report.problems.push(format!(
@@ -1191,6 +1219,52 @@ fn ledger_states(records: &[Record]) -> (BTreeSet<String>, BTreeMap<String, &'st
     (removed, marked)
 }
 
+/// What a recorded file lacks of [`complete`].
+struct Gap {
+    /// Its partition is not recorded removed and hot lacks it.
+    off_hot: bool,
+    /// Hot holds it.
+    on_hot: bool,
+    /// The copy targets with a `copy` record of it.
+    recorded: Vec<String>,
+    /// The copy targets without one.
+    missing: Vec<String>,
+}
+
+impl Gap {
+    /// Only copies on some targets are missing, and another target holds a
+    /// recorded copy while hot does not: a target added or replaced after
+    /// the file left hot. The pass copies from hot only, so only the
+    /// target-to-target repair (#192) or a re-adoption of the original
+    /// store fills it.
+    fn needs_repair(&self) -> bool {
+        !self.off_hot && !self.on_hot && !self.recorded.is_empty() && !self.missing.is_empty()
+    }
+
+    /// Only copies are missing and hot holds the file: the pass fills them.
+    fn needs_pass(&self) -> bool {
+        !self.off_hot && self.on_hot && !self.missing.is_empty()
+    }
+}
+
+impl std::fmt::Display for Gap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut parts = Vec::new();
+        if self.off_hot {
+            parts.push("not on hot, and its partition is not recorded removed".to_owned());
+        }
+        if !self.missing.is_empty() {
+            let on = if self.recorded.is_empty() {
+                String::new()
+            } else {
+                format!(", only on {}", self.recorded.join(", "))
+            };
+            parts.push(format!("no copy record on {}{on}", self.missing.join(", ")));
+        }
+        write!(f, "{}", parts.join("; "))
+    }
+}
+
 /// The one completeness predicate of a recorded file (ADR-062 D10): the
 /// end state a passed adoption guarantees. It is complete when it is on
 /// hot unless its partition is recorded removed, and when the ledger
@@ -1207,24 +1281,19 @@ fn complete(
     path: &str,
     targets: &[Target],
     removed: &BTreeSet<String>,
-) -> Result<Option<String>, String> {
-    let mut gaps = Vec::new();
-    if !removed.contains(partition_of(path)) {
-        match replica::sealed_manifest(hot, path) {
-            Ok(Some(_)) => {}
-            Ok(None) => {
-                gaps.push("not on hot, and its partition is not recorded removed".to_owned())
-            }
-            Err(error) => return Err(format!("hot: {error}")),
-        }
-    }
-    let missing: Vec<&str> = targets
+) -> Result<Option<Gap>, String> {
+    let on_hot = match replica::sealed_manifest(hot, path) {
+        Ok(found) => found.is_some(),
+        Err(error) => return Err(format!("hot: {error}")),
+    };
+    let (recorded, missing): (Vec<&Target>, Vec<&Target>) = targets
         .iter()
-        .filter(|target| !fold.has_copy(path, &target.id))
-        .map(|target| target.id.as_str())
-        .collect();
-    if !missing.is_empty() {
-        gaps.push(format!("no copy record on {}", missing.join(", ")));
-    }
-    Ok((!gaps.is_empty()).then(|| gaps.join("; ")))
+        .partition(|target| fold.has_copy(path, &target.id));
+    let gap = Gap {
+        off_hot: !on_hot && !removed.contains(partition_of(path)),
+        on_hot,
+        recorded: recorded.iter().map(|t| t.id.clone()).collect(),
+        missing: missing.iter().map(|t| t.id.clone()).collect(),
+    };
+    Ok((gap.off_hot || !gap.missing.is_empty()).then_some(gap))
 }

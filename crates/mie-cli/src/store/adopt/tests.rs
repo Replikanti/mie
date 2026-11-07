@@ -851,3 +851,115 @@ fn assert_guard_releases(fixture: &Fixture) {
         writer.close().unwrap();
     }
 }
+
+/// Review of #200, finding 5: a copy target added (or a failed one replaced
+/// under a new id) after an adoption holds no copy of the files that left
+/// hot, and the pass copies from hot only. A later adoption is refused with
+/// nothing written, naming each such path, the new target and the remedy:
+/// `mie store repair` (#192), or until then a re-adoption of the original
+/// store, which this test runs to show it fills the new target.
+#[test]
+fn a_target_added_after_an_adoption_is_named_with_its_remedy() {
+    let fixture = Fixture::new("adopt-new-target");
+    let first = fixture.adopt();
+    assert_eq!(first.problems, Vec::<String>::new(), "{first:?}");
+
+    let dst = fixture.dir.0.join("dst");
+    let cold_c = dst.join("cold-c");
+    fs::create_dir_all(&cold_c).unwrap();
+    root_marker::create_meta(&cold_c, "cold-c", false).unwrap();
+    let roots = format!(
+        "cold_roots = [\n{{ path = \"{}\", copy_target = true }},\n\
+         {{ path = \"{}\", copy_target = true }},\n{{ path = \"{}\", copy_target = true }},\n]\n",
+        fixture.cold[0].display(),
+        fixture.cold[1].display(),
+        cold_c.display()
+    );
+    let config = IngestConfig::parse(&format!(
+        "[instrument]\nsymbol = \"BTCUSDT\"\nsource = \"binance-um\"\n[paths]\n\
+         raw_root = \"{}\"\njournal = \"{}\"\n{roots}[binance]\n\
+         ws_base_url = \"wss://fake.invalid/ws\"\nrest_base_url = \"https://fake.invalid\"\n\
+         streams = [\"aggTrade\"]\n",
+        fixture.hot.display(),
+        dst.join("journal.jsonl").display(),
+    ))
+    .unwrap();
+    let archive = dst.join("archive3.toml");
+    fs::write(
+        &archive,
+        format!(
+            "[instrument]\nsymbol = \"BTCUSDT\"\n[paths]\nraw_root = \"{}\"\n\
+             import_ledger = \"{}\"\nstaging = \"{}\"\n{roots}",
+            fixture.hot.display(),
+            dst.join("ledger").display(),
+            dst.join("staging").display(),
+        ),
+    )
+    .unwrap();
+    let probe = Probe(vec![
+        (fixture.hot.clone(), 1),
+        (fixture.cold[0].clone(), 2),
+        (fixture.cold[1].clone(), 3),
+        (cold_c.clone(), 4),
+    ]);
+    // A pass copies what hot holds to the new target; it cannot fill the
+    // removed partitions.
+    let mut out = Vec::new();
+    crate::store::replicate(&config, Some(&archive), &probe, &|| D0 + 2, &mut out).unwrap();
+
+    let other = Dir::new("adopt-new-target-other");
+    seal(&other.0, "binance-um", "aggTrade", D0 - 4 * DAY, 2);
+    let request = AdoptRequest {
+        from: other.0.clone(),
+        archive_config: Some(archive.clone()),
+        ..AdoptRequest::default()
+    };
+    let roots_of = || {
+        [&fixture.hot, &fixture.cold[0], &fixture.cold[1], &cold_c].map(|root| files_under(root))
+    };
+    let (before, ledger) = (
+        roots_of(),
+        fs::read(copy_ledger::ledger_path(&fixture.hot)).unwrap(),
+    );
+    let refused = run(&config, &request, FIRST_HOT, &probe, &|| D0 + 3);
+    assert_eq!(refused.problems.len(), 1, "{refused:?}");
+    let problem = &refused.problems[0];
+    let old = replica::list_sealed(&fixture.raw())
+        .unwrap()
+        .into_iter()
+        .filter(|p| date_of(partition_of(p)) < FIRST_HOT)
+        .collect::<Vec<_>>();
+    assert!(!old.is_empty());
+    for path in &old {
+        assert!(
+            problem.contains(&format!(
+                "{path} (no copy record on cold-c, only on cold-a, cold-b)"
+            )),
+            "{path}: {problem}"
+        );
+    }
+    for text in [
+        "Fill it with `mie store repair` (#192)",
+        "re-adopt the original store",
+        "Nothing was written",
+    ] {
+        assert!(problem.contains(text), "{text:?} in {problem}");
+    }
+    assert_eq!(roots_of(), before);
+    assert_eq!(
+        fs::read(copy_ledger::ledger_path(&fixture.hot)).unwrap(),
+        ledger
+    );
+
+    // The interim remedy: re-adopting the original store fills cold-c, and
+    // the other store is then adopted.
+    let mut original = fixture.request();
+    original.archive_config = Some(archive.clone());
+    let again = run(&config, &original, FIRST_HOT, &probe, &|| D0 + 4);
+    assert_eq!(again.problems, Vec::<String>::new(), "{again:?}");
+    for path in &old {
+        assert!(cold_c.join(path).exists(), "{path}");
+    }
+    let second = run(&config, &request, FIRST_HOT, &probe, &|| D0 + 5);
+    assert_eq!(second.problems, Vec::<String>::new(), "{second:?}");
+}
