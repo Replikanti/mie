@@ -127,6 +127,70 @@ fn list_sealed_lists_the_layout_only() {
 }
 
 #[test]
+fn list_unsealed_names_each_kind_of_seal_debris_and_only_those() {
+    let fixture = TieredFixture::new("replica-unsealed");
+    let hot = &fixture.hot;
+    assert_eq!(list_unsealed(hot).unwrap(), Vec::<String>::new());
+
+    let (_, partition) = first_part(&fixture);
+    let dir = layout::resolve(hot, &partition);
+    // The three kinds of debris, in two partitions.
+    fs::write(dir.join(".part-00042.parquet.tmp"), b"x").unwrap();
+    fs::write(dir.join(".part-00043.manifest.tmp"), b"x").unwrap();
+    fs::write(dir.join("part-00044.parquet"), b"x").unwrap();
+    let last = list_sealed(hot).unwrap().pop().unwrap();
+    let other = last.rsplit_once('/').unwrap().0.to_owned();
+    fs::write(
+        layout::resolve(hot, &other).join(".part-00007.parquet.tmp"),
+        b"x",
+    )
+    .unwrap();
+    // Not debris: names the store does not own, a manifest without its
+    // data (a sealed state recovery refuses; `list_sealed` lists it), and
+    // anything outside the layout.
+    fs::write(dir.join("README"), b"x").unwrap();
+    fs::write(dir.join("part-00045.manifest"), b"x").unwrap();
+    fs::create_dir_all(hot.join(".quarantine/q-1")).unwrap();
+    fs::write(hot.join(".quarantine/q-1/.part-00001.parquet.tmp"), b"x").unwrap();
+    fs::write(hot.join(".mie/.part-00001.parquet.tmp"), b"x").unwrap();
+
+    let mut expected = vec![
+        format!("{partition}/.part-00042.parquet.tmp"),
+        format!("{partition}/.part-00043.manifest.tmp"),
+        format!("{partition}/part-00044.parquet"),
+        format!("{other}/.part-00007.parquet.tmp"),
+    ];
+    expected.sort();
+    assert_eq!(list_unsealed(hot).unwrap(), expected);
+    // A root without any layout holds no debris.
+    assert_eq!(
+        list_unsealed(&fixture.cold[0]).unwrap(),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn verify_sealed_refuses_missing_or_differing_data() {
+    let fixture = TieredFixture::new("replica-verify");
+    let (path, _) = first_part(&fixture);
+    let (_, file) = sealed_manifest(&fixture.hot, &path).unwrap().unwrap();
+    verify_sealed(&fixture.hot, &file).unwrap();
+    let data = layout::resolve(&fixture.hot, &path);
+    flip_file(&data, 10);
+    let error = verify_sealed(&fixture.hot, &file).unwrap_err();
+    assert!(
+        matches!(&error, RawStoreError::Integrity(m) if m.contains("does not match its manifest")),
+        "{error:?}"
+    );
+    fs::remove_file(&data).unwrap();
+    let error = verify_sealed(&fixture.hot, &file).unwrap_err();
+    assert!(
+        matches!(&error, RawStoreError::Integrity(m) if m.contains("without its data")),
+        "{error:?}"
+    );
+}
+
+#[test]
 fn a_copy_is_byte_identical_and_a_second_copy_only_finds_it() {
     let fixture = TieredFixture::new("replica-copy");
     let (path, partition) = first_part(&fixture);

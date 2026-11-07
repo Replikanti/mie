@@ -1,10 +1,12 @@
 //! The append-only writer: open parts, rotation and the seal protocol
 //! (ADR-030).
 
+use crate::copy_ledger;
 use crate::layout::{self, PartFile};
 use crate::manifest;
 use crate::recovery::{self, RecoveryReport};
 use crate::schema;
+use crate::tiers::TierGuard;
 use crate::{io_error, sorted_entries, sync_dir};
 use mie_domain::time::EventTime;
 use mie_ports::raw::{
@@ -140,11 +142,23 @@ struct OpenPart {
 /// on [`RawWriter::close`]. Dropping the writer seals nothing; the unsealed
 /// parts are discarded by the next writer's recovery. After any I/O failure
 /// the writer is poisoned and every later call fails.
+///
+/// On a tiered store the writer also carries the interim guard of ADR-062
+/// D6 (#190, until #191's recall): it reads the copy ledger once when it
+/// opens and refuses to open a part in a partition the ledger records as
+/// removed from hot, or one where the ledger knows a part number at or
+/// above hot's next one. Both refusals are [`RawStoreError::Integrity`],
+/// happen before anything is created, and poison the writer. A missing or
+/// unreadable ledger gives no guard: that is the degraded start (D7), where
+/// the live writer writes hot-window dates only and the importer refuses to
+/// start.
 pub struct RawWriter {
     root: PathBuf,
     source: String,
     policy: RotationPolicy,
     lock: File,
+    /// The interim guard of a tiered store with a readable copy ledger.
+    guard: Option<TierGuard>,
     open: BTreeMap<(RawStreamKey, String), OpenPart>,
     sealed: Vec<SealedFile>,
     poisoned: bool,
@@ -167,11 +181,13 @@ impl std::fmt::Debug for RawWriter {
 
 impl RawWriter {
     /// Creates the source directory, takes the source lock and runs
-    /// recovery.
+    /// recovery. With `tiered`, it then reads the copy ledger once for the
+    /// interim guard (the type docs); a single-root store never reads it.
     pub(crate) fn open(
         root: &Path,
         source: &str,
         policy: RotationPolicy,
+        tiered: bool,
     ) -> Result<Self, RawStoreError> {
         validate_segment(source)?;
         if policy.max_rows == 0
@@ -204,11 +220,19 @@ impl RawWriter {
             Err(TryLockError::Error(error)) => return Err(io_error("lock", &lock_path)(error)),
         }
         let recovery = recovery::recover(root, source)?;
+        let guard = match tiered.then(|| copy_ledger::read(root)) {
+            // Once the ledger parsed, its fold cannot fail; if it does, the
+            // writer fails closed.
+            Some(Ok(Some(ledger))) => Some(TierGuard::fold(root, &ledger, source)?),
+            // Missing or unreadable: the degraded start (ADR-062 D7).
+            Some(Ok(None) | Err(_)) | None => None,
+        };
         Ok(Self {
             root: root.to_path_buf(),
             source: source.to_owned(),
             policy,
             lock,
+            guard,
             open: BTreeMap::new(),
             sealed: Vec::new(),
             poisoned: false,
@@ -312,22 +336,17 @@ impl RawWriter {
     }
 
     /// Opens the next part of a partition: number = highest existing + 1.
+    /// The number is decided, and the interim guard consulted, before
+    /// anything is created, so a refusal leaves the store untouched.
     fn open_part(
         &self,
         stream: &RawStreamKey,
         date: &str,
         first_ms: i64,
     ) -> Result<OpenPart, RawStoreError> {
-        let partition = layout::resolve(&self.root, &layout::partition_dir(stream, date));
-        fs::create_dir_all(&partition).map_err(io_error("create", &partition))?;
-        // Make the new directory entries durable up to the source directory.
-        let mut dir = partition.as_path();
-        for _ in 0..3 {
-            dir = dir
-                .parent()
-                .expect("a partition is four levels below the root");
-            sync_dir(dir)?;
-        }
+        let relative = layout::partition_dir(stream, date);
+        let partition = layout::resolve(&self.root, &relative);
+        // A missing directory lists as empty.
         let part = sorted_entries(&partition)?
             .iter()
             .filter_map(|name| PartFile::classify(name))
@@ -339,6 +358,18 @@ impl RawWriter {
                 "partition {} has no free part number",
                 partition.display()
             )));
+        }
+        if let Some(guard) = &self.guard {
+            guard.check(&relative, part)?;
+        }
+        fs::create_dir_all(&partition).map_err(io_error("create", &partition))?;
+        // Make the new directory entries durable up to the source directory.
+        let mut dir = partition.as_path();
+        for _ in 0..3 {
+            dir = dir
+                .parent()
+                .expect("a partition is four levels below the root");
+            sync_dir(dir)?;
         }
         let path = partition.join(PartFile::DataTmp.name(part));
         let file = OpenOptions::new()
@@ -898,6 +929,185 @@ mod tests {
         }
         writer.append(&key, record(D0, 0)).unwrap();
         assert_eq!(writer.close().unwrap().len(), 1);
+    }
+
+    // ------------------------------------------- the interim guard (#190)
+
+    use crate::copy_ledger::{self, Kind};
+    use crate::testutil::{FIXTURE_D0, TieredFixture};
+
+    /// Appends one record at `time` to `stream` through a fresh writer of
+    /// `store` and closes it.
+    fn write_one(
+        store: &ParquetRawStore,
+        key: &RawStreamKey,
+        time: i64,
+    ) -> Result<Vec<SealedFile>, RawStoreError> {
+        let mut writer = store.writer("binance-um", RotationPolicy::default())?;
+        writer.append(key, record(time, 99))?;
+        writer.close()
+    }
+
+    /// Every entry below `root` but the source locks, which a writer
+    /// opening touches.
+    fn tree(root: &Path) -> Vec<(String, Option<Vec<u8>>)> {
+        let mut tree = snapshot(root);
+        tree.retain(|(name, _)| !name.ends_with(".lock"));
+        tree
+    }
+
+    #[test]
+    fn the_guard_refuses_a_removed_partition_before_creating_anything() {
+        let fixture = TieredFixture::new("guard-removed");
+        let key = stream("aggTrade");
+        let partition = TieredFixture::partition(&key, 0);
+        fixture.copy(&partition);
+        fixture.remove(&partition);
+        let before = tree(&fixture.hot);
+        let mut writer = fixture
+            .store()
+            .writer("binance-um", RotationPolicy::default())
+            .unwrap();
+        let error = writer.append(&key, record(FIXTURE_D0 + 10, 0)).unwrap_err();
+        let RawStoreError::Integrity(message) = &error else {
+            panic!("{error:?}")
+        };
+        let ledger = copy_ledger::ledger_path(&fixture.hot);
+        for text in [
+            partition.as_str(),
+            "removed from hot",
+            &ledger.display().to_string(),
+            "recall (ADR-062 D6)",
+            "#191",
+        ] {
+            assert!(message.contains(text), "{text:?} in {message}");
+        }
+        // Nothing was created: no partition directory, no temp file.
+        assert!(!layout::resolve(&fixture.hot, &partition).exists());
+        assert_eq!(tree(&fixture.hot), before);
+        // The refusal poisons the writer, as any failed storage step does.
+        let other = TieredFixture::partition(&key, 1);
+        assert!(matches!(
+            writer.append(&key, record(FIXTURE_D0 + layout::DAY_MS + 10, 1)),
+            Err(RawStoreError::Io(_))
+        ));
+        drop(writer);
+        assert_eq!(
+            TieredFixture::data_paths(&fixture.hot, &other).len(),
+            3,
+            "nothing reached the other partition"
+        );
+
+        // Other partitions of the source stay writable.
+        let sealed = write_one(&fixture.store(), &key, FIXTURE_D0 + layout::DAY_MS + 10).unwrap();
+        assert_eq!(sealed[0].part, 3);
+    }
+
+    #[test]
+    fn a_returned_partition_is_writable_again() {
+        let fixture = TieredFixture::new("guard-returned");
+        let key = stream("aggTrade");
+        let partition = TieredFixture::partition(&key, 0);
+        fixture.copy(&partition);
+        fixture.remove(&partition);
+        // The whole partition comes back, then `returned`.
+        fixture.return_some(&partition, 3);
+        let sealed = write_one(&fixture.store(), &key, FIXTURE_D0 + 10).unwrap();
+        assert_eq!(
+            sealed[0].relative_path,
+            format!("{partition}/part-00003.parquet")
+        );
+        // A later `removed` refuses it again.
+        fixture.append(Kind::Removed {
+            partition: partition.clone(),
+        });
+        assert!(matches!(
+            write_one(&fixture.store(), &key, FIXTURE_D0 + 11),
+            Err(RawStoreError::Integrity(_))
+        ));
+    }
+
+    #[test]
+    fn the_guard_refuses_a_part_number_the_ledger_already_knows() {
+        let fixture = TieredFixture::new("guard-part");
+        let key = stream("aggTrade");
+        let partition = TieredFixture::partition(&key, 0);
+        // Recorded parts 0 to 2, all on hot: the next part, 3, is new.
+        fixture.copy(&partition);
+        let sealed = write_one(&fixture.store(), &key, FIXTURE_D0 + 10).unwrap();
+        assert_eq!(sealed[0].part, 3);
+
+        // Hot loses its newest recorded parts (3 is recorded now too): the
+        // next number from hot's listing would reuse a recorded path.
+        fixture.append(Kind::Copy {
+            path: sealed[0].relative_path.clone(),
+            root: "cold-a".to_owned(),
+        });
+        for part in [2, 3] {
+            for kind in [PartFile::Data, PartFile::Manifest] {
+                let path = layout::resolve(
+                    &fixture.hot,
+                    &layout::file_path(&key, &TieredFixture::date(0), kind, part),
+                );
+                fs::remove_file(path).unwrap();
+            }
+        }
+        let before = tree(&fixture.hot);
+        let error = write_one(&fixture.store(), &key, FIXTURE_D0 + 11).unwrap_err();
+        let RawStoreError::Integrity(message) = &error else {
+            panic!("{error:?}")
+        };
+        for text in [
+            partition.as_str(),
+            "records part 3 of it",
+            "hot's next part number is 2",
+            "mie store adopt",
+            "#191",
+        ] {
+            assert!(message.contains(text), "{text:?} in {message}");
+        }
+        assert_eq!(tree(&fixture.hot), before);
+
+        // The single-root store over the same root numbers as today.
+        let sealed = write_one(&ParquetRawStore::new(&fixture.hot), &key, FIXTURE_D0 + 12).unwrap();
+        assert_eq!(sealed[0].part, 2);
+    }
+
+    #[test]
+    fn without_a_readable_ledger_the_writer_writes_as_today() {
+        for damage in ["missing", "chain"] {
+            let fixture = TieredFixture::new("guard-degraded");
+            let key = stream("aggTrade");
+            let partition = TieredFixture::partition(&key, 0);
+            fixture.copy(&partition);
+            fixture.remove(&partition);
+            let ledger = copy_ledger::ledger_path(&fixture.hot);
+            if damage == "missing" {
+                fs::remove_file(&ledger).unwrap();
+            } else {
+                let mut bytes = fs::read(&ledger).unwrap();
+                bytes[copy_ledger::HEADER.len() + 3] ^= 0x01;
+                fs::write(&ledger, bytes).unwrap();
+                assert!(copy_ledger::read(&fixture.hot).is_err());
+            }
+            // The degraded start (ADR-062 D7): no guard.
+            let sealed = write_one(&fixture.store(), &key, FIXTURE_D0 + 10).unwrap();
+            assert_eq!(sealed[0].part, 0, "{damage}");
+        }
+    }
+
+    #[test]
+    fn a_single_root_store_never_reads_the_ledger() {
+        let fixture = TieredFixture::new("guard-single-root");
+        let key = stream("aggTrade");
+        let partition = TieredFixture::partition(&key, 0);
+        fixture.copy(&partition);
+        fixture.remove(&partition);
+        let sealed = write_one(&ParquetRawStore::new(&fixture.hot), &key, FIXTURE_D0 + 10).unwrap();
+        assert_eq!(
+            sealed[0].relative_path,
+            format!("{partition}/part-00000.parquet")
+        );
     }
 
     #[test]

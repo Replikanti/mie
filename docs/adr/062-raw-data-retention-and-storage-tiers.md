@@ -194,8 +194,9 @@ the D2 consequence.
   6. an id that another configured root's marker already carries (a root
      without a marker is skipped; any other read error refuses).
 
-  The `mie store` command group holds `init`, `init-root` and
-  `replicate` (one replication pass, D11; #189); the later steps of the
+  The `mie store` command group holds `init`, `init-root`,
+  `replicate` (one replication pass, D11; #189) and `adopt` (the
+  bootstrap of an existing store, D10; #190); the later steps of the
   follow-up add their verbs to it.
 - **Option 1 (everything on the local disk)** is the configuration with
   no cold root, and it stays valid while the hot formula (D10) fits the
@@ -340,6 +341,55 @@ live in more than one root (approved as written at STOP 1).
     refuses to start. On an intact hot
     D6 never removed those, and the union rule is not needed because hot
     still holds every part of them.
+- **Interim (#190 until #191): the writer refuses instead of recalling.**
+  Adoption (D10) records partitions as removed from hot before the
+  recall and the union part numbering exist, so until #191 the writer of
+  a tiered store guards both. When it opens it reads the copy ledger once
+  and folds it for its source: the partitions whose latest `removed` /
+  `returned` record is `removed`, and per partition the highest part
+  number any record names (the `manifest` texts and the `copy`, `lost`,
+  `hold`, `hold-cleared`, `quarantined` and `replaced` paths). Before it
+  creates anything for a new part it refuses, with `Integrity`:
+  - a partition recorded as removed, naming the partition, the ledger and
+    the recall that #191 adds. Why: numbered from hot's empty listing, the
+    new part would be `part-00000`, a path the copy targets already hold
+    (D5);
+  - a partition whose highest recorded part is at or above hot's next
+    number, naming both numbers and the re-run of the adoption. Why:
+    adoption appends the `manifest` record of every source file before
+    its first copy (D10), so from the first published byte on the ledger
+    knows every part of each adopted partition. Until hot holds them all,
+    hot's listing would number a new part onto a path a copy target holds
+    or will hold, with other bytes (D5). Recording the manifests first is
+    what closes the window between a target's publish and its records: a
+    crash, a failed append or a lost marker there would otherwise leave
+    the ledger knowing nothing of a part the target already holds (review
+    of #200). The same check catches a hot that lost a recorded part.
+
+  The refusal poisons the writer, as any failed storage step does. The
+  snapshot taken at writer open is enough: every writer of `removed`
+  records holds that source's writer lock (only `mie store adopt` until
+  #191), so none can run while the writer is open, and the replication
+  pass only records parts hot already holds. A missing or unreadable
+  ledger gives no guard: that is the degraded start (D7), where the live
+  writer writes only hot-window dates and the importer refuses to start.
+  A single-root store never reads the ledger. Rejected, an "adoption in
+  progress" marker under `.mie/` that `mie ingest` and the importer
+  refuse: it is a new on-disk format and a third start refusal, while the
+  part check covers the same crash with no new state. The costs, all
+  until #191:
+  - a late import into an adopted old date fails instead of recalling,
+    and its `PENDING` stays (ADR-034 D4), so every later import resumes
+    the file and is refused again. Only the host work directory holds
+    removed partitions before #191, and nothing imports into it until the
+    importer's tier step;
+  - `mie ingest` refuses a hot-window partition that a crashed adoption
+    left short on hot until the adoption is re-run. Adopted stores are
+    closed stores whose dates precede today, so a capture practically
+    never writes such a partition;
+  - every writer open on a tiered store parses the ledger and checks its
+    chain once, about 0.58 GB after one year (the Numbers table), once
+    per `mie ingest` start and per import, never per part.
 - **A partition that disappears while it is read** is never read as
   empty; D7 states the rule.
 
@@ -458,7 +508,7 @@ live in more than one root (approved as written at STOP 1).
   recovery walk only `source=` entries). Its first line is the header
   `mie-copy-ledger 1`. It records:
   - for each sealed file, the manifest text verbatim, written with its
-    first verified copy;
+    first verified copy (by the adoption, before its first copy, D10);
   - for each verified copy, the file, the root id and the time;
   - for each partition removed from hot, the removal (D6), and its return
     (D6 recall, D11 hot restore);
@@ -539,7 +589,7 @@ live in more than one root (approved as written at STOP 1).
 
     | Kind | Fields after `<kind> <at_ms>` | First written by |
     |---|---|---|
-    | `manifest` | the escaped manifest text | the first verified copy |
+    | `manifest` | the escaped manifest text | the first verified copy; the adoption before its first copy (D10) |
     | `copy` | data path, root id | each verified copy |
     | `removed` | partition directory | hot removal (D6) |
     | `returned` | partition directory | the recall (D6), the hot restore (D11) |
@@ -843,6 +893,14 @@ What each consumer reads, and the bound that puts on hot:
   - Above it, the only cost is hot storage (D10) and a longer hot restore
     (D11).
   - If a later ADR changes `SEED_LOOKBACK_MS`, the hot window follows.
+- **In code** (#190): `mie_cli::ingest::first_hot_date(now)` is the UTC
+  date of `max(now − SEED_LOOKBACK_MS, 0)`, the first day of the seed
+  window, computed by the same function that opens that window. Nothing
+  configures it. `mie store adopt` passes it, from the system clock, to
+  the adoption, whose library call takes the first hot date as a
+  parameter: that parameter is the seam of the short-window test
+  configuration of Accept-when item 2, and the only way to adopt with
+  another window.
 - **Rejected, a 2-date hot window** (the writer's and the daily import's
   own bound). With a readable ledger it would give the same seeds, but in
   the degraded start a stream quiet for longer than the window would get
@@ -934,13 +992,145 @@ server's trailing rate replaces both once it exists.
 
 **Bootstrap: existing data never passes through hot.** A (51.0 GB) is 5–8
 times the initial hot size, so copying it onto hot first would fill it.
-The explicit init step (D7) therefore *adopts* an existing store: it
-copies every sealed file from the store's current location straight to
-every copy target by the D5 protocol, verifies it, appends the manifest
-and copy records to the new copy ledger, and records every partition older
-than the hot window as removed from hot; the hot-window partitions and the
-store's import ledger are copied to hot. The production archive store is
-adopted into the production store. The hold-out store and the pre-cutover
+After `mie store init` and `mie store init-root`, `mie store adopt
+--config <ingest config> [--archive-config <archive config>] --from
+<store root> [--journal <path>] [--import-ledger <dir>]` (#190)
+therefore *adopts* an existing store: it copies every sealed file from
+the store's current location straight to every copy target by the D5
+protocol, verifies it, appends the manifest and copy records to the copy
+ledger, and records every partition older than the hot window as removed
+from hot; the hot-window partitions, the store's import ledger entries
+and its journal are copied to hot. The production archive store is
+adopted into the production store. The protocol (#190):
+
+- **The source is only read.** Its `.lock` files are opened read-only and
+  tried, never created, so an active writer is refused and the source
+  stays byte-identical.
+- **Refusals before anything is written:** no `cold_roots`; hot without
+  its marker; an archive configuration of another store; `--import-ledger`
+  without an archive configuration (it names hot's import ledger); a
+  `--from` that is missing, is not a directory, holds `.mie/` (a tiered
+  hot is partial by construction), or equals, contains or lies inside hot
+  or a cold root; a writer on the source.
+- **Locks, never waiting, held for the run:** the pass lock, then hot's
+  writer of every source the run writes. Why a writer and not a bare
+  lock: opening it runs ADR-030 recovery first, which rolls a crashed seal
+  on hot forward. Without it the copy onto hot would delete that seal's
+  pending files as copy debris and lose a file. A crashed adoption's own
+  hot copies are crashed seals by construction (D5), so the next run's
+  recovery handles them too.
+- **Checks under the locks, still writing nothing:** hot's copy ledger is
+  readable; every copy target presents its marker, which is refused, not
+  skipped as in the pass, because an adoption must leave every file with
+  k copies; ids and devices are distinct (D11); the source holds no seal
+  debris (`replica::list_unsealed`), which the adoption cannot recover
+  because it never writes the source; every source part's data exists
+  and matches its manifest (size, then SHA-256, streamed), so a damaged
+  source is refused with nothing written instead of stopping the run
+  after records and copies (review of #200); every file the copy ledger
+  records and the source does not list is *complete*. Complete is one
+  predicate, the end state a passed adoption guarantees: the file is on
+  hot unless its partition is recorded removed (counting the `removed`
+  records this run will write), and the ledger records a copy of it on
+  every copy target. A file published on a target without its `copy`
+  record does not count, since nothing would ever record it. Why: write
+  (2) below records every manifest before the first copy, so a run that
+  stopped and is re-run against another store (a backup lacking a file,
+  another `--from`) would otherwise pass and leave a record that keeps
+  the guard's part check refusing every new part of its partition for
+  good, or a removed file below k, while naming a re-run that already
+  passed (review of #200). The refusal names each path and what it
+  lacks, and writes nothing. A file on hot that a replication pass left
+  short is refused the same way; `mie store replicate` completes it. The
+  same predicate is asserted over every recorded file once the closing
+  pass has run, and a gap fails the run, so a PASS always leaves the
+  guard releasing every adopted partition hot holds. **Limit, until #192:**
+  a copy target added after an adoption, or a failed one replaced under a
+  new id, holds no copy of the files that already left hot, and the
+  replication pass copies from hot only. Those files fail the predicate.
+  The class is: not on hot (its partition is recorded removed), short of
+  a copy on a configured target, and with at least one `copy` record in
+  the ledger on any root id, configured or not. Unlike the other gaps it
+  does not block the writes: such a file lies in a partition recorded
+  removed (so the writer guard refuses it whatever happens) and the run
+  never writes its path, so no path is reused and no other bytes get in.
+  The run adopts what it reads, then fails at the end, naming each such
+  path, the targets holding its recorded copy, the targets lacking one,
+  and the remedy:
+  - when a configured target holds a recorded copy: `mie store repair`
+    (#192), which copies it from that target, or until then a
+    re-adoption of the original store. The message names both causes,
+    a target added or replaced, or an adoption that stopped before it
+    reached every target;
+  - when its copies are recorded only on roots no longer configured
+    (every target replaced or lost, review of #200 finding 7): the
+    repair cannot help, since no configured target has a good copy, and
+    the message names the only remedy, re-adopting each original store
+    in turn, which copies its own files to every configured target.
+
+  A recorded file with no `copy` record at all is the ghost of a stopped
+  adoption and still refuses up front (finding 3). Why not refuse up front: with two adopted
+  stores (the #22 store and the archive, the production shape), each
+  re-adoption would be refused for the other store's files, a deadlock
+  until #192. Re-adopting every earlier store in turn ends with PASS. Why
+  not pass: files would stay below k on the new target with no step that
+  ever fills them. A file on hot that only lacks copies still refuses up
+  front, with `mie store replicate` as its remedy. The source's import
+  ledger holds no `PENDING`; every source archive part is listed by a source entry with
+  its manifest's SHA-256 (D11 *Archive parts wait for their import
+  entry*), every part an entry lists is in the source or already in the
+  store, and an archive part without `--import-ledger` is refused.
+- **The path rule** (D5). Each source path's manifest is compared with
+  the copy ledger's `manifest` record, hot's manifest and each copy
+  target's manifest, wherever they exist; the target check catches a
+  published copy that has no record yet. Equal everywhere is an identical
+  path, resumed or skipped. Anything else, and a path the ledger records
+  as lost, held, quarantined or replaced, is `Integrity` naming the path
+  and where it differs, and the run ends with nothing written. Each source
+  entry must be absent from hot's import ledger or byte-identical to it,
+  and hot's journal absent or a byte prefix of the source journal (the
+  empty file included). Why a prefix and not only "absent or empty": a
+  re-run then resumes an interrupted journal copy.
+- **The write order:** (1) `removed` for every source partition older
+  than the hot window that has no directory on hot and is not recorded
+  removed yet; (2) the `manifest` record of every source file the ledger
+  does not know yet, before any copy; (3) per file in path order, every
+  copy target without its `copy` record (the marker re-read before and
+  after the copy, then the `copy` record), then hot when the partition is
+  on hot's side (a hot-window date, or a directory already on hot, and
+  not recorded removed); (4) the source's entries to hot's import ledger,
+  after all their parts; (5) the journal, extended as a byte prefix; (6)
+  one replication pass under the held pass lock, so the ledger, the
+  journal and the entries have k copies before the run returns. Why
+  `removed` first: from the first byte on, the writer's interim guard
+  (D6) refuses an append into those dates, so no path can be reused while
+  the adoption runs or after it crashed. A `removed` record of an adopted
+  partition asserts only that hot holds no copy; adoption deletes
+  nothing, and a run that leaves a file below k fails. Why the
+  `manifest` records before any copy: the guard's part check then refuses
+  every adopted partition from the first publish until hot holds all its
+  parts (D6 *Interim*). This is the one place where a `manifest` record
+  precedes its first verified copy. Until the re-run completes, a
+  selection that covers such a file lists it and its read fails with
+  `Integrity` (missing on every root), never a shorter selection. Why
+  targets before hot: a crash then leaves extra copies on the targets,
+  never a hot file that the ledger does not list.
+- **Resuming and failure.** A re-run with the same arguments resumes,
+  because identical paths are only completed. A re-run must read the
+  store the stopped run read, or one holding at least its recorded
+  files: a store without one of them is refused (the check above), and
+  the guard's message names the re-run with the store it read. The writes stop at the
+  first failure, which is named: a store cannot be half adopted on
+  purpose, and going on would only copy more bytes before the same
+  failure. The source data is verified twice: in the check phase, so a
+  damaged source is refused before anything is written, and again while
+  it is streamed (D5), which catches a source that changed in between.
+  The cost is reading the source twice (51.0 GB of archive plus the
+  live store, D10), once per adoption, which is a one-time bootstrap.
+- **Rejected,** writing the adoption into `mie store init` (the wording
+  before #190): adopting several stores (the #22 store, then the archive)
+  and later backfills needs a verb that runs more than once on an
+  initialized store. The hold-out store and the pre-cutover
 stores stay separate stores and get whole-store copies (D9), so they never
 enter the production hot either. A future backfill of the same size takes
 the same path: import into a scratch store elsewhere, then adopt (for days
@@ -1283,7 +1473,10 @@ What breaks:
   it (D5).
   - An explicit repair step replaces a missing or bad copy from a good one
     by the D5 protocol. The restored bytes are the sealed bytes, so D5
-    holds.
+    holds. A marked copy target without a `copy` record for a recorded
+    file counts as a missing copy, even when no verification found it: a
+    target added or replaced after the file left hot (D10 *Bootstrap*,
+    the limit until #192) is filled this way, from another target.
   - Repair is explicit, not automatic: several bad copies at once point at
     a shared cause (a failing controller, a wrong mount), and automatic
     rewrites would spread into it.

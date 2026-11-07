@@ -66,7 +66,12 @@ impl ParquetRawStore {
     }
 
     /// Opens the writer of `source`: creates its directory, takes its lock
-    /// and recovers interrupted seals ([`RawWriter::recovery`]).
+    /// and recovers interrupted seals ([`RawWriter::recovery`]). On a
+    /// tiered store it also reads the copy ledger once for the interim
+    /// writer guard (ADR-062 D6, until #191; [`RawWriter`]): a part in a
+    /// partition the ledger records as removed from hot, or below a part
+    /// number the ledger already knows, is refused with
+    /// [`RawStoreError::Integrity`] when the writer would open it.
     ///
     /// # Errors
     ///
@@ -74,7 +79,7 @@ impl ParquetRawStore {
     /// [`RawStoreError::Invalid`] for a bad source name or policy, and the
     /// recovery errors of ADR-030.
     pub fn writer(&self, source: &str, policy: RotationPolicy) -> Result<RawWriter, RawStoreError> {
-        RawWriter::open(&self.root, source, policy)
+        RawWriter::open(&self.root, source, policy, self.is_tiered())
     }
 
     /// The sealed files of `stream` on `date`, from their manifests.
