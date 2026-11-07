@@ -133,7 +133,7 @@ fn concurrent_threads_leave_a_valid_chain_and_readers_never_fail() {
                 let ledger = CopyLedger::at(&root);
                 for i in 0..APPENDS {
                     let outcome = ledger.append(&nth(who, i)).unwrap();
-                    assert_eq!(outcome.truncated_bytes, 0, "{who} {i}");
+                    assert_eq!(outcome.truncation, None, "{who} {i}");
                 }
             })
         })

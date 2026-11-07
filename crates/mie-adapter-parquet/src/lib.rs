@@ -42,6 +42,11 @@
 //!   record of copies, removals and verification passes, one appender at a
 //!   time under a lock file, readers lock-free.
 //!
+//! [`replica`] holds the copy primitives of the replication pass (ADR-062
+//! D5, D11): the D5 copy of a sealed part under the writer's own temp names
+//! and step order, the copy of an immutable file, the tail append of an
+//! append-only file and the pass lock. `mie-cli` orchestrates the pass.
+//!
 //! With no cold root configured neither is ever created.
 //!
 //! # Tiered store
@@ -73,6 +78,7 @@ mod manifest;
 pub mod outcome;
 mod reader;
 mod recovery;
+pub mod replica;
 pub mod root_marker;
 mod schema;
 mod tiers;

@@ -4,7 +4,7 @@ use mie_adapter_binance::archive::ArchiveStream;
 use mie_adapter_binance::archive::catalog::parse_day;
 use mie_adapter_binance::archive::fold::TradeCorrection;
 use mie_adapter_binance::transport::{
-    DownloadTimeouts, NetTimeouts, SystemClock, TungsteniteConnector, UreqDownload, UreqHttp,
+    Clock, DownloadTimeouts, NetTimeouts, SystemClock, TungsteniteConnector, UreqDownload, UreqHttp,
 };
 use mie_app::kline_check::KlineVerdict;
 use mie_cli::alerts;
@@ -278,6 +278,31 @@ USAGE:
         parent directory, since an unmounted mount point is an empty
         directory on its parent's filesystem. Prints what it wrote and exits 0, or
         prints FAIL: <reason> and exits 1.
+
+    mie store replicate --config <path> [--archive-config <path>]
+        Run one replication pass of a tiered raw store (ADR-062 D11): copy
+        to every copy target of paths.cold_roots what it lacks, in this
+        order: every sealed file (verified by its SHA-256, the manifest
+        published last), then the import-ledger entries, then the tail of
+        the copy ledger, then the tail of the journal, each verified after
+        the copy. A copy target without its root marker is skipped and
+        named, and nothing is written into it. Refused, before anything is
+        written, when paths.cold_roots is empty, when hot has no marker,
+        when hot's copy ledger is missing or unreadable, when another pass
+        runs, when two roots carry one id, and when hot and the copy
+        targets that carry a marker do not all report distinct devices.
+        An archive part is copied only once the import entry that lists it
+        exists on hot, and its entry only after its parts; this needs the
+        archive configuration (--archive-config, else [history]
+        archive_config), which must name the same raw_root, symbol and
+        cold_roots. Without one, archive parts and entries are not
+        copied. A copy target's marker is re-read before every write to
+        it, and a target's journal copy stops before the first line
+        that names a live file missing on that target. Nothing is ever
+        removed. Prints what it copied and every copy-ledger truncation,
+        then PASS and exits 0 when every file has a copy on every copy
+        target, or one FAIL: <reason> line per file, entry, target or copy
+        left short and exits 1.
 
     mie --help
 ";
@@ -680,9 +705,27 @@ fn dispatch(args: &[String]) -> Result<ExitCode, String> {
                 )?;
                 Ok(exit(pass))
             }
+            Some("replicate") => {
+                let options = Options::parse(&args[2..], &["--config", "--archive-config"], &[])?;
+                let config =
+                    IngestConfig::load(&options.path("--config")?).map_err(|e| e.to_string())?;
+                let archive = options.optional("--archive-config").map(PathBuf::from);
+                let probe = store::device_probe()?;
+                let clock = SystemClock::new();
+                let now_ms = || clock.now_utc_ns().div_euclid(1_000_000);
+                let pass = store::replicate(
+                    &config,
+                    archive.as_deref(),
+                    probe.as_ref(),
+                    &now_ms,
+                    &mut std::io::stdout().lock(),
+                )?;
+                Ok(exit(pass))
+            }
             _ => Err(
-                "expected `mie store init --config <path>` or `mie store init-root \
-                 --config <path> --root <path> --id <id>`"
+                "expected `mie store init --config <path>`, `mie store init-root \
+                 --config <path> --root <path> --id <id>` or `mie store replicate --config \
+                 <path> [--archive-config <path>]`"
                     .to_owned(),
             ),
         },

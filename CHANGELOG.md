@@ -12,6 +12,37 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
 
 ### Added
 
+- **Storage tiers, step 3: the copy protocol and `mie store replicate`
+  (#189, ADR-062 D5, D9, D11, proposed).** `mie-adapter-parquet` gains
+  `replica`, the copy primitives of the replication pass: the D5 copy of a
+  sealed part under the writer's own temp names and step order (streamed,
+  fsynced, read back and verified, the manifest published last), so a
+  crashed copy is a crashed seal to ADR-030 recovery; the copy of an
+  immutable import-ledger entry; the tail append of the journal and the
+  copy ledger, which first compares the copy's last record with hot's; and
+  the pass lock `.mie/replicate.lock`. `copy_ledger::extend_copy` extends a
+  ledger copy to hot's verified prefix, never past a torn trailing record,
+  and skips a copy that is up to date. `mie store replicate --config
+  <ingest config> [--archive-config <archive config>]` runs one pass:
+  sealed files, then import-ledger entries, then the copy-ledger tail with
+  one `ledger-copy` record per target, then the journal tail up to its
+  length before the listing. It writes only into copy targets that present
+  their marker (a target without one is skipped and named), refuses hot
+  and the marked targets unless they report distinct devices, copies an
+  archive part only once an import entry on hot lists it with its
+  manifest's SHA-256 and an entry only after its parts, never copies
+  `PENDING`, names every file or entry left below k and exits 1, and never
+  removes anything. It re-reads a target's marker before every write to it
+  and every record about it, checks hot's manifest against the ledger's
+  before copying, stops a target's journal copy before the first line that
+  names a live file missing on that target, and treats a failure to read hot as a problem of that
+  one file, not of the target. A second pass over unchanged state writes nothing.
+  Copy-ledger appends now report a truncation of the trailing record as a
+  structured `Truncation` (bytes, offset) in `AppendOutcome`, and in the
+  new `AppendError` when the fsync of the truncation or the write after it
+  fails; the pass prints it as a report line of its own.
+  `IngestConfig::archive_config_at` checks an `--archive-config` as
+  `[history] archive_config` is checked.
 - **Storage tiers, step 1: copy ledger, root markers and `mie store init`
   (#187, ADR-062 D4, D7, proposed).** `mie-adapter-parquet` gains the
   on-disk formats of a tiered raw store under each root's `.mie/`: the root
@@ -21,8 +52,9 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   record kind ADR-062 names, a strict parser, a chain check that names the
   first failing record, lock-free readers that ignore the one incomplete
   trailing record, and appenders serialized by a lock file that truncate at
-  most that record and never a complete one before it, plus a whole-run
-  hold. `[paths] cold_roots = [{ path, copy_target }, …]` is accepted in
+  most that record and never a complete one before it and report every
+  truncation to the caller (as structured fields since step 3), plus a
+  whole-run hold. `[paths] cold_roots = [{ path, copy_target }, …]` is accepted in
   the ingest and the archive configuration (at least two copy targets, and
   the same list in both through `[history] archive_config`).
   `mie store init` writes hot's marker and an empty copy ledger and refuses

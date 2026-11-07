@@ -722,6 +722,23 @@ pub fn cold_roots_toml(cold_roots: &[mie_cli::config::ColdRoot]) -> String {
     format!("[{}]", entries.join(", "))
 }
 
+/// Device ids by path, compared after resolving both sides (the mount
+/// check queries `<root>/..`): distinct devices without distinct
+/// filesystems.
+pub struct MapProbe(pub Vec<(PathBuf, u64)>);
+
+impl mie_cli::store::DeviceProbe for MapProbe {
+    fn device_id(&self, root: &Path) -> std::io::Result<u64> {
+        let resolve = |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
+        let wanted = resolve(root);
+        self.0
+            .iter()
+            .find(|(path, _)| resolve(path) == wanted)
+            .map(|(_, id)| *id)
+            .ok_or_else(|| std::io::Error::other(format!("{} unknown", root.display())))
+    }
+}
+
 /// Initializes the tiered store of `raw_root` and `cold_roots`: hot's
 /// marker with a header-only copy ledger, and each cold root's marker under
 /// its directory name.
