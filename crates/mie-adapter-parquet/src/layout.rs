@@ -11,7 +11,8 @@
 //! A tiered store (ADR-062 D4, D7) also keeps its own metadata in
 //! `<root>/.mie/`: the root marker ([`ROOT_MARKER`]) on every root, and on
 //! hot the copy ledger ([`COPY_LEDGER`]) with its lock file
-//! ([`COPY_LEDGER_LOCK`]). `.mie/` lies outside the layout: `select` and
+//! ([`COPY_LEDGER_LOCK`]) and the replication pass lock
+//! ([`REPLICATE_LOCK`]). `.mie/` lies outside the layout: `select` and
 //! recovery walk only `source=` entries, so they never see it.
 
 use mie_ports::raw::{RawStoreError, RawStreamKey};
@@ -39,6 +40,10 @@ pub(crate) const COPY_LEDGER: &str = "copy-ledger";
 /// file because the rebuild replaces the ledger by rename, and a lock on
 /// the ledger's inode would stay on the replaced file.
 pub(crate) const COPY_LEDGER_LOCK: &str = "copy-ledger.lock";
+
+/// The replication pass lock in hot's [`META_DIR`] (ADR-062 D7, D11): one
+/// pass at a time, since two passes would append the same tail twice.
+pub(crate) const REPLICATE_LOCK: &str = "replicate.lock";
 
 /// Days between 0000-03-01 and 1970-01-01 in the proleptic Gregorian
 /// calendar (the epoch shift of the civil-date algorithm).

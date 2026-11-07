@@ -1,0 +1,473 @@
+//! The copy primitives: the D5 copy under every crash, the destination
+//! states, the immutable copy, the tail append and the pass lock.
+
+use super::*;
+use crate::recovery;
+use crate::sorted_entries;
+use crate::testutil::{TempDir, TieredFixture};
+
+/// Every file below `root` with its bytes, and every directory, sorted.
+fn snapshot(root: &Path) -> Vec<(String, Option<Vec<u8>>)> {
+    fn walk(dir: &Path, prefix: &str, out: &mut Vec<(String, Option<Vec<u8>>)>) {
+        for name in sorted_entries(dir).unwrap() {
+            let path = dir.join(&name);
+            let rel = format!("{prefix}{name}");
+            if path.is_dir() {
+                out.push((rel.clone(), None));
+                walk(&path, &format!("{rel}/"), out);
+            } else {
+                out.push((rel, Some(fs::read(&path).unwrap())));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, "", &mut out);
+    out
+}
+
+/// The files of `partition` on `root`, with their bytes.
+fn partition_files(root: &Path, partition: &str) -> Vec<(String, Vec<u8>)> {
+    let dir = layout::resolve(root, partition);
+    sorted_entries(&dir)
+        .unwrap()
+        .into_iter()
+        .map(|name| {
+            let bytes = fs::read(dir.join(&name)).unwrap();
+            (name, bytes)
+        })
+        .collect()
+}
+
+/// The first sealed part of the fixture and its partition.
+fn first_part(fixture: &TieredFixture) -> (String, String) {
+    let path = list_sealed(&fixture.hot).unwrap().remove(0);
+    let partition = path.rsplit_once('/').unwrap().0.to_owned();
+    (path, partition)
+}
+
+/// Makes `path` writable again, so a test can damage it.
+fn writable(path: &Path) {
+    let mut permissions = fs::metadata(path).unwrap().permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    permissions.set_readonly(false);
+    fs::set_permissions(path, permissions).unwrap();
+}
+
+/// Flips one bit of the byte at `at` of the file `path`.
+fn flip_file(path: &Path, at: usize) {
+    writable(path);
+    let mut bytes = fs::read(path).unwrap();
+    bytes[at] ^= 0x01;
+    fs::write(path, bytes).unwrap();
+}
+
+/// Copies every entry of `from` into the new directory `to`.
+fn copy_dir(from: &Path, to: &Path) {
+    fs::create_dir_all(to).unwrap();
+    for name in sorted_entries(from).unwrap() {
+        fs::copy(from.join(&name), to.join(&name)).unwrap();
+    }
+}
+
+#[test]
+fn list_sealed_lists_the_layout_only() {
+    let fixture = TieredFixture::new("replica-list");
+    let paths = list_sealed(&fixture.hot).unwrap();
+    // Two streams, four dates, three parts each.
+    assert_eq!(paths.len(), 24);
+    let mut sorted = paths.clone();
+    sorted.sort();
+    assert_eq!(paths, sorted);
+    for path in &paths {
+        assert!(layout::parse_data_path(path).is_ok(), "{path}");
+    }
+
+    // Names outside the layout are skipped: metadata, quarantine, debris
+    // and unknown entries, a stream directory that is a file, and a data
+    // file without its manifest (not sealed).
+    let hot = &fixture.hot;
+    let (_, partition) = first_part(&fixture);
+    let dir = layout::resolve(hot, &partition);
+    fs::write(dir.join(".part-00042.parquet.tmp"), b"x").unwrap();
+    fs::write(dir.join("part-00043.parquet"), b"x").unwrap();
+    fs::write(dir.join("README"), b"x").unwrap();
+    fs::create_dir_all(hot.join(".quarantine/q-1/source=binance-um")).unwrap();
+    fs::create_dir_all(hot.join("source=bad source")).unwrap();
+    fs::write(
+        hot.join("source=binance-um/instrument=BTCUSDT/stream=notes"),
+        b"",
+    )
+    .unwrap();
+    fs::create_dir_all(hot.join("source=binance-um/instrument=BTCUSDT/stream=x/date=2026-13-01"))
+        .unwrap();
+    assert_eq!(list_sealed(hot).unwrap(), paths);
+
+    // A root without any layout lists nothing.
+    assert_eq!(list_sealed(&fixture.cold[0]).unwrap(), Vec::<String>::new());
+}
+
+#[test]
+fn a_copy_is_byte_identical_and_a_second_copy_only_finds_it() {
+    let fixture = TieredFixture::new("replica-copy");
+    let (path, partition) = first_part(&fixture);
+    let (outcome, text) = copy_sealed(&fixture.hot, &fixture.cold[0], &path).unwrap();
+    assert_eq!(outcome, CopyOutcome::Copied);
+    assert_eq!(
+        text,
+        fs::read_to_string(layout::resolve(
+            &fixture.hot,
+            &TieredFixture::manifest_of(&path)
+        ))
+        .unwrap()
+    );
+    let copied = partition_files(&fixture.cold[0], &partition);
+    let source: Vec<_> = partition_files(&fixture.hot, &partition)
+        .into_iter()
+        .filter(|(name, _)| copied.iter().any(|(n, _)| n == name))
+        .collect();
+    assert_eq!(copied.len(), 2, "data and manifest only: {copied:?}");
+    assert_eq!(copied, source);
+    for (name, _) in &copied {
+        let path = layout::resolve(&fixture.cold[0], &partition).join(name);
+        assert!(
+            fs::metadata(&path).unwrap().permissions().readonly(),
+            "{name}"
+        );
+    }
+
+    let before = snapshot(&fixture.cold[0]);
+    let (outcome, again) = copy_sealed(&fixture.hot, &fixture.cold[0], &path).unwrap();
+    assert_eq!((outcome, again), (CopyOutcome::AlreadyPresent, text));
+    assert_eq!(snapshot(&fixture.cold[0]), before);
+}
+
+/// The acceptance item of #189: a crash at every copy step leaves no
+/// destination with a manifest whose data does not verify, the next call
+/// completes the copy byte-identically, and writer recovery reads every
+/// crashed state as a crashed seal: no part or the sealed part, never
+/// `Integrity` (the temp names #191 and #195 rely on).
+#[test]
+fn a_crash_at_every_copy_step_is_completed_and_recovers_as_a_seal() {
+    for step in CopyStep::ALL {
+        let fixture = TieredFixture::new("replica-crash");
+        let (path, partition) = first_part(&fixture);
+        let dest = &fixture.cold[0];
+        let (_, _, part) = layout::parse_data_path(&path).unwrap();
+        let (_, file) = sealed_manifest(&fixture.hot, &path).unwrap().unwrap();
+
+        CRASH_AFTER.with(|crash| crash.set(Some(step)));
+        let crashed = copy_sealed(&fixture.hot, dest, &path);
+        assert!(
+            matches!(crashed, Err(RawStoreError::Io(_))),
+            "{step:?}: {crashed:?}"
+        );
+        assert_eq!(CRASH_AFTER.with(std::cell::Cell::get), None, "{step:?}");
+
+        // Never a manifest without data that verifies against it.
+        let dest_partition = layout::resolve(dest, &partition);
+        if dest_partition.join(PartFile::Manifest.name(part)).exists() {
+            assert!(
+                matches_manifest(&dest_partition.join(PartFile::Data.name(part)), &file).unwrap(),
+                "{step:?}"
+            );
+        }
+
+        // Writer recovery over the same crashed state.
+        let scratch = TempDir::new("replica-crash-recovery");
+        copy_dir(
+            &dest_partition,
+            &layout::resolve(scratch.path(), &partition),
+        );
+        let report = recovery::recover(scratch.path(), "binance-um").unwrap();
+        let recovered = partition_files(scratch.path(), &partition);
+        let sealed: Vec<_> = partition_files(&fixture.hot, &partition)
+            .into_iter()
+            .filter(|(name, _)| {
+                *name == PartFile::Data.name(part) || *name == PartFile::Manifest.name(part)
+            })
+            .collect();
+        match step {
+            CopyStep::WriteData => {
+                assert!(recovered.is_empty(), "{step:?}: {recovered:?}");
+                assert_eq!(report.discarded.len(), 1, "{step:?}");
+            }
+            _ => assert_eq!(recovered, sealed, "{step:?}: {report:?}"),
+        }
+
+        // The next call completes the copy.
+        let (outcome, _) = copy_sealed(&fixture.hot, dest, &path).unwrap();
+        let expected = match step {
+            CopyStep::PublishManifest | CopyStep::SyncDir => CopyOutcome::AlreadyPresent,
+            _ => CopyOutcome::Copied,
+        };
+        assert_eq!(outcome, expected, "{step:?}");
+        assert_eq!(partition_files(dest, &partition), sealed, "{step:?}");
+    }
+}
+
+/// Damage done to a destination partition.
+type Damage<'a> = dyn Fn(&Path) + 'a;
+
+#[test]
+fn a_differing_destination_is_integrity_and_stays_untouched() {
+    let fixture = TieredFixture::new("replica-differ");
+    let (path, partition) = first_part(&fixture);
+    let (_, _, part) = layout::parse_data_path(&path).unwrap();
+    let manifest_name = PartFile::Manifest.name(part);
+    let data_name = PartFile::Data.name(part);
+
+    // One differing manifest byte; differing data under the right
+    // manifest; data without a manifest that fails verification.
+    let cases: [(&str, &Damage<'_>); 3] = [
+        ("manifest", &|dir: &Path| {
+            flip_file(&dir.join(&manifest_name), 30)
+        }),
+        ("data", &|dir: &Path| flip_file(&dir.join(&data_name), 10)),
+        ("data without manifest", &|dir: &Path| {
+            fs::remove_file(dir.join(&manifest_name)).unwrap();
+            flip_file(&dir.join(&data_name), 10);
+        }),
+    ];
+    for (what, damage) in cases {
+        let dest = TempDir::new("replica-differ-dest");
+        copy_sealed(&fixture.hot, dest.path(), &path).unwrap();
+        damage(&layout::resolve(dest.path(), &partition));
+        let before = snapshot(dest.path());
+        let result = copy_sealed(&fixture.hot, dest.path(), &path);
+        let Err(RawStoreError::Integrity(detail)) = &result else {
+            panic!("{what}: {result:?}");
+        };
+        assert!(
+            detail.contains(&path) && detail.contains(&dest.path().display().to_string()),
+            "{what}: {detail}"
+        );
+        assert_eq!(snapshot(dest.path()), before, "{what}");
+    }
+
+    // A manifest without its data on the destination.
+    let dest = TempDir::new("replica-differ-no-data");
+    copy_sealed(&fixture.hot, dest.path(), &path).unwrap();
+    fs::remove_file(layout::resolve(dest.path(), &partition).join(&data_name)).unwrap();
+    assert!(matches!(
+        copy_sealed(&fixture.hot, dest.path(), &path),
+        Err(RawStoreError::Integrity(_))
+    ));
+}
+
+#[test]
+fn a_source_that_fails_its_own_manifest_is_never_published() {
+    let fixture = TieredFixture::new("replica-bad-source");
+    let (path, partition) = first_part(&fixture);
+    flip_file(&layout::resolve(&fixture.hot, &path), 10);
+    let dest = &fixture.cold[0];
+    let result = copy_sealed(&fixture.hot, dest, &path);
+    let Err(RawStoreError::Integrity(detail)) = &result else {
+        panic!("{result:?}");
+    };
+    assert!(
+        detail.contains(&fixture.hot.display().to_string()),
+        "{detail}"
+    );
+    assert_eq!(partition_files(dest, &partition), Vec::new());
+
+    // A source without its manifest or without its data.
+    let fixture = TieredFixture::new("replica-missing-source");
+    let (path, _) = first_part(&fixture);
+    fs::remove_file(layout::resolve(&fixture.hot, &path)).unwrap();
+    assert!(matches!(
+        copy_sealed(&fixture.hot, &fixture.cold[0], &path),
+        Err(RawStoreError::Integrity(_))
+    ));
+    fs::remove_file(layout::resolve(
+        &fixture.hot,
+        &TieredFixture::manifest_of(&path),
+    ))
+    .unwrap();
+    assert!(matches!(
+        copy_sealed(&fixture.hot, &fixture.cold[0], &path),
+        Err(RawStoreError::Integrity(_))
+    ));
+    // A path outside the layout.
+    assert!(matches!(
+        copy_sealed(&fixture.hot, &fixture.cold[0], ".mie/root"),
+        Err(RawStoreError::Invalid(_))
+    ));
+}
+
+#[test]
+fn the_immutable_copy_survives_a_crash_at_every_step() {
+    let dir = TempDir::new("replica-immutable");
+    let source = dir
+        .path()
+        .join("hot/aggTrades/BTCUSDT-aggTrades-2026-10-05.zip.import");
+    fs::create_dir_all(source.parent().unwrap()).unwrap();
+    fs::write(&source, b"mie-archive-import 1\narchive x\n").unwrap();
+    let steps = [
+        CopyStep::WriteData,
+        CopyStep::Verify,
+        CopyStep::MarkReadOnly,
+        CopyStep::PublishData,
+        CopyStep::SyncDir,
+    ];
+    for step in steps {
+        let dest = dir.path().join(format!(
+            "cold-{step:?}/.mie/import-ledger/aggTrades/entry.import"
+        ));
+        CRASH_AFTER.with(|crash| crash.set(Some(step)));
+        assert!(
+            matches!(copy_immutable(&source, &dest), Err(RawStoreError::Io(_))),
+            "{step:?}"
+        );
+        assert_eq!(CRASH_AFTER.with(std::cell::Cell::get), None, "{step:?}");
+        // Absent or complete, never partial.
+        if dest.exists() {
+            assert_eq!(fs::read(&dest).unwrap(), fs::read(&source).unwrap());
+        }
+        let outcome = copy_immutable(&source, &dest).unwrap();
+        let expected = if matches!(step, CopyStep::PublishData | CopyStep::SyncDir) {
+            CopyOutcome::AlreadyPresent
+        } else {
+            CopyOutcome::Copied
+        };
+        assert_eq!(outcome, expected, "{step:?}");
+        assert_eq!(fs::read(&dest).unwrap(), fs::read(&source).unwrap());
+        assert!(fs::metadata(&dest).unwrap().permissions().readonly());
+        assert_eq!(
+            sorted_entries(dest.parent().unwrap()).unwrap(),
+            ["entry.import"],
+            "{step:?}: no temp file is left"
+        );
+    }
+
+    // A differing destination is refused and left alone.
+    let dest = dir.path().join("cold-differ/entry.import");
+    fs::create_dir_all(dest.parent().unwrap()).unwrap();
+    fs::write(&dest, b"mie-archive-import 1\narchive y\n").unwrap();
+    assert!(matches!(
+        copy_immutable(&source, &dest),
+        Err(RawStoreError::Integrity(_))
+    ));
+    assert_eq!(
+        fs::read(&dest).unwrap(),
+        b"mie-archive-import 1\narchive y\n"
+    );
+}
+
+/// Three journal-like lines and a partial fourth.
+const TAIL_SOURCE: &[u8] = b"{\"type\":\"run_start\",\"run_id\":\"r1\"}\n\
+{\"type\":\"sealed\",\"path\":\"source=binance-um/a\"}\n\
+{\"type\":\"sealed\",\"path\":\"source=binance-um/b\"}\n\
+{\"type\":\"run_e";
+
+#[test]
+fn a_tail_append_extends_a_byte_prefix_across_crashes() {
+    let dir = TempDir::new("replica-tail");
+    let source = dir.path().join("journal.jsonl");
+    fs::write(&source, TAIL_SOURCE).unwrap();
+    let end = TAIL_SOURCE.len() as u64;
+
+    // A missing copy is created; a crash mid-write leaves a byte prefix,
+    // which the next call extends.
+    let dest = dir.path().join("cold/.mie/journal/journal.jsonl");
+    TAIL_CRASH_AFTER.with(|crash| crash.set(Some(TailStep::PartialWrite)));
+    assert!(matches!(
+        extend_prefix(TailSource::File(&source), &dest, end),
+        Err(RawStoreError::Io(_))
+    ));
+    let partial = fs::read(&dest).unwrap();
+    assert!(!partial.is_empty() && partial.len() < TAIL_SOURCE.len());
+    assert_eq!(partial, TAIL_SOURCE[..partial.len()]);
+    assert_eq!(
+        extend_prefix(TailSource::File(&source), &dest, end).unwrap(),
+        end - partial.len() as u64
+    );
+    assert_eq!(fs::read(&dest).unwrap(), TAIL_SOURCE);
+    // At the end it only compares.
+    assert_eq!(
+        extend_prefix(TailSource::File(&source), &dest, end).unwrap(),
+        0
+    );
+
+    // A crash after the fsync, before the read-back: complete.
+    let dest = dir.path().join("cold-sync/journal.jsonl");
+    TAIL_CRASH_AFTER.with(|crash| crash.set(Some(TailStep::Sync)));
+    assert!(extend_prefix(TailSource::File(&source), &dest, end).is_err());
+    assert_eq!(fs::read(&dest).unwrap(), TAIL_SOURCE);
+    assert_eq!(
+        extend_prefix(TailSource::File(&source), &dest, end).unwrap(),
+        0
+    );
+
+    // Bytes in memory as the source, in steps.
+    let dest = dir.path().join("cold-bytes/copy-ledger");
+    for end in [10, 40, 41, TAIL_SOURCE.len() as u64] {
+        extend_prefix(TailSource::Bytes(TAIL_SOURCE), &dest, end).unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), TAIL_SOURCE[..end as usize]);
+    }
+}
+
+#[test]
+fn a_damaged_tail_or_a_longer_copy_is_refused_untouched() {
+    let dir = TempDir::new("replica-tail-damage");
+    let lines = &TAIL_SOURCE[..TAIL_SOURCE.iter().rposition(|&b| b == b'\n').unwrap() + 1];
+    let last_start = lines[..lines.len() - 1]
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .unwrap()
+        + 1;
+    let end = TAIL_SOURCE.len() as u64;
+    // A flipped byte in the copy's last record, in its partial tail, and a
+    // copy that is longer than the prefix it copies.
+    let cases: [(&str, Vec<u8>, u64); 3] = [
+        ("last record", flipped(lines, last_start + 3), end),
+        (
+            "partial tail",
+            flipped(&TAIL_SOURCE[..lines.len() + 4], lines.len() + 2),
+            end,
+        ),
+        ("longer", TAIL_SOURCE.to_vec(), lines.len() as u64),
+    ];
+    for (what, copy, end) in cases {
+        let dest = dir.path().join(format!("{what}.jsonl"));
+        fs::write(&dest, &copy).unwrap();
+        let result = extend_prefix(TailSource::Bytes(TAIL_SOURCE), &dest, end);
+        let Err(RawStoreError::Integrity(detail)) = &result else {
+            panic!("{what}: {result:?}");
+        };
+        assert!(
+            detail.contains(&dest.display().to_string()),
+            "{what}: {detail}"
+        );
+        assert_eq!(fs::read(&dest).unwrap(), copy, "{what}: untouched");
+    }
+    // The offset of the first differing byte is named.
+    let dest = dir.path().join("last record.jsonl");
+    let detail = extend_prefix(TailSource::Bytes(TAIL_SOURCE), &dest, end)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        detail.contains(&format!("byte {}", last_start + 3)),
+        "{detail}"
+    );
+}
+
+/// `bytes` with one bit of the byte at `at` flipped.
+fn flipped(bytes: &[u8], at: usize) -> Vec<u8> {
+    let mut bytes = bytes.to_vec();
+    bytes[at] ^= 0x01;
+    bytes
+}
+
+#[test]
+fn the_replication_lock_refuses_a_second_holder() {
+    let fixture = TieredFixture::new("replica-lock");
+    let lock = try_replication_lock(&fixture.hot).unwrap();
+    assert!(matches!(
+        try_replication_lock(&fixture.hot),
+        Err(RawStoreError::Locked(_))
+    ));
+    drop(lock);
+    let again = try_replication_lock(&fixture.hot).unwrap();
+    drop(again);
+    assert!(replication_lock_path(&fixture.hot).exists());
+}
