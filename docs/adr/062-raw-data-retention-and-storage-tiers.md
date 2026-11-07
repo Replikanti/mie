@@ -1027,16 +1027,25 @@ adopted into the production store. The protocol (#190):
   because it never writes the source; every source part's data exists
   and matches its manifest (size, then SHA-256, streamed), so a damaged
   source is refused with nothing written instead of stopping the run
-  after records and copies (review of #200); the copy ledger records no
-  `manifest` without a `copy` record whose file neither the source nor
-  hot nor a copy target holds. Why: write (2) below records every
-  manifest before the first copy, so a run that stopped and is re-run
-  against another store (a backup lacking a file, another `--from`) would
-  otherwise pass and leave a record that no root can ever satisfy, and
-  the guard's part check would refuse every new part of that partition
-  for good while naming a re-run that already passed (review of #200);
-  the refusal names the paths. The source's import ledger holds no
-  `PENDING`; every source archive part is listed by a source entry with
+  after records and copies (review of #200); every file the copy ledger
+  records and the source does not list is *complete*. Complete is one
+  predicate, the end state a passed adoption guarantees: the file is on
+  hot unless its partition is recorded removed (counting the `removed`
+  records this run will write), and the ledger records a copy of it on
+  every copy target. A file published on a target without its `copy`
+  record does not count, since nothing would ever record it. Why: write
+  (2) below records every manifest before the first copy, so a run that
+  stopped and is re-run against another store (a backup lacking a file,
+  another `--from`) would otherwise pass and leave a record that keeps
+  the guard's part check refusing every new part of its partition for
+  good, or a removed file below k, while naming a re-run that already
+  passed (review of #200). The refusal names each path and what it
+  lacks, and writes nothing. A file on hot that a replication pass left
+  short is refused the same way; `mie store replicate` completes it. The
+  same predicate is asserted over every recorded file once the closing
+  pass has run, and a gap fails the run, so a PASS always leaves the
+  guard releasing every adopted partition hot holds. The source's import
+  ledger holds no `PENDING`; every source archive part is listed by a source entry with
   its manifest's SHA-256 (D11 *Archive parts wait for their import
   entry*), every part an entry lists is in the source or already in the
   store, and an archive part without `--import-ledger` is refused.

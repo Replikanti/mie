@@ -28,8 +28,10 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   bytes it is `Integrity` and nothing is written, a new path is adopted,
   so a re-run resumes a crashed adoption and a later run adopts another
   store. It refuses, before writing, a source with `.mie/`, seal debris,
-  a part whose data is missing or does not match its manifest, a re-run
-  of a stopped adoption against a store lacking a file it recorded, a pending
+  a part whose data is missing or does not match its manifest, a recorded
+  file the source does not list that is not complete (on hot unless its
+  partition is removed, and recorded on every copy target; the same
+  predicate a PASS asserts at its end), a pending
   import, an orphan archive part or an active writer, a
   `--from` overlapping hot or a cold root, and a copy target without its
   marker. The hot window's first date is `mie_cli::ingest::first_hot_date`

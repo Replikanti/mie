@@ -25,11 +25,12 @@
 //!    the pass: every adopted file needs k copies); ids are distinct and not
 //!    `hot`, and the devices too; the source holds no seal debris and no
 //!    `PENDING`, and every source part's data matches its manifest (so a
-//!    damaged source is refused with nothing written); the ledger records
-//!    no manifest without a `copy` record that neither the source nor a
-//!    root holds (a stopped run re-run against another store would
-//!    otherwise pass and leave that partition guarded for good); every
-//!    archive part has the entry that lists it with its
+//!    damaged source is refused with nothing written); every recorded file
+//!    the source does not list is already *complete* (the one predicate a
+//!    PASS also asserts at the end: on hot unless its partition is
+//!    recorded removed, and recorded on every copy target), so a re-run of
+//!    a stopped adoption against another store can never pass and leave a
+//!    partition guarded for good; every archive part has the entry that lists it with its
 //!    manifest's SHA-256, and every listed part is in the source or already
 //!    in the store. The **path rule** (D10, D5): each source path's
 //!    manifest is compared with the ledger's `manifest` record, hot's
@@ -544,31 +545,7 @@ impl Run<'_> {
         };
         self.fold = Fold::new(&records)
             .map_err(|e| self.fail(format!("copy ledger {}: {e}", ledger_path.display())))?;
-        let mut removed = BTreeSet::new();
-        let mut marked: BTreeMap<String, &'static str> = BTreeMap::new();
-        for record in &records {
-            match &record.kind {
-                Kind::Removed { partition } => {
-                    removed.insert(partition.clone());
-                }
-                Kind::Returned { partition } => {
-                    removed.remove(partition);
-                }
-                Kind::Lost { path, .. } => {
-                    marked.insert(path.clone(), "lost");
-                }
-                Kind::Hold { path, .. } => {
-                    marked.entry(path.clone()).or_insert("held");
-                }
-                Kind::Quarantined { path, .. } => {
-                    marked.insert(path.clone(), "quarantined");
-                }
-                Kind::Replaced { path, .. } => {
-                    marked.insert(path.clone(), "replaced");
-                }
-                _ => {}
-            }
-        }
+        let (removed, marked) = ledger_states(&records);
 
         // The copy targets: every one must present its marker.
         let mut targets: Vec<Target> = Vec::new();
@@ -672,7 +649,6 @@ impl Run<'_> {
             });
         }
         self.check_archive(&files, &entries)?;
-        self.check_unheld(&files, &targets, &marked)?;
 
         // The path rule (D10, D5).
         for file in &files {
@@ -693,6 +669,13 @@ impl Run<'_> {
                 to_remove.push(partition.to_owned());
             }
         }
+
+        // Every recorded file the source does not list must already be in
+        // the end state an adoption guarantees: with `removed` as this run
+        // will leave it.
+        let mut removed_after = removed.clone();
+        removed_after.extend(to_remove.iter().cloned());
+        self.check_unlisted(&files, &targets, &removed_after, &marked)?;
 
         // Hot's side: entries and the journal.
         let hot_import_ledger = match &self.request.import_ledger {
@@ -827,57 +810,42 @@ impl Run<'_> {
         Ok(())
     }
 
-    /// Refuses a ledger that records the manifest of a file no root and not
-    /// the source holds: an earlier adoption recorded every manifest before
-    /// its first copy (write 2) and stopped, and this run reads a store
-    /// without that file (a backup, another `--from`). Passing would leave
-    /// the record behind for good, and the writer guard would refuse every
-    /// new part of its partition. Only a path without any `copy` record is
-    /// checked: a copied file is held by a copy target.
-    fn check_unheld(
+    /// The refusal of a recorded file the source does not list and that is
+    /// not [`complete`]: an adoption that stopped recorded it and this run
+    /// reads another store, or a replication pass has not finished it.
+    /// Passing would leave a record that keeps its partition guarded, or
+    /// a file below k, for good. Nothing is written.
+    fn check_unlisted(
         &mut self,
         files: &[SourceFile],
         targets: &[Target],
+        removed: &BTreeSet<String>,
         marked: &BTreeMap<String, &'static str>,
     ) -> Result<(), Stop> {
+        let listed: BTreeSet<&str> = files.iter().map(|f| f.path.as_str()).collect();
         let hot = self.config.paths.raw_root.clone();
-        let source: BTreeSet<&str> = files.iter().map(|f| f.path.as_str()).collect();
-        let candidates: Vec<String> = self
-            .fold
-            .manifests
-            .keys()
-            .filter(|path| {
-                !source.contains(path.as_str())
-                    && !marked.contains_key(*path)
-                    && self.fold.copies.get(*path).is_none_or(BTreeSet::is_empty)
-            })
-            .cloned()
-            .collect();
-        let mut unheld = Vec::new();
-        for path in candidates {
-            let roots =
-                std::iter::once(hot.as_path()).chain(targets.iter().map(|t| t.path.as_path()));
-            let mut held = false;
-            for root in roots {
-                match replica::sealed_manifest(root, &path) {
-                    Ok(Some(_)) => held = true,
-                    Ok(None) => {}
-                    Err(error) => return Err(self.fail(format!("{}: {error}", root.display()))),
-                }
+        let mut incomplete = Vec::new();
+        for path in self.fold.manifests.keys() {
+            if listed.contains(path.as_str()) || marked.contains_key(path) {
+                continue;
             }
-            if !held {
-                unheld.push(path);
+            match complete(&hot, &self.fold, path, targets, removed) {
+                Ok(None) => {}
+                Ok(Some(gap)) => incomplete.push(format!("{path} ({gap})")),
+                Err(error) => incomplete.push(format!("{path} ({error})")),
             }
         }
-        if unheld.is_empty() {
+        if incomplete.is_empty() {
             return Ok(());
         }
         Err(self.fail(format!(
-            "the copy ledger records the manifest of {}, but neither --from nor any root holds \
-             it: an adoption that stopped recorded it before its first copy, and --from is not \
-             the store it read. Re-run the adoption with that store; until then the writer \
-             refuses new parts in those partitions. Nothing was written (ADR-062 D6, D10)",
-            unheld.join(", ")
+            "the copy ledger records {}, which --from does not list and which is not complete (on \
+             hot unless its partition is recorded removed, and recorded on every copy target): \
+             an adoption that stopped recorded it and --from is not the store it read, or a \
+             replication pass has not finished it. Re-run the adoption with the store it read, \
+             or run `mie store replicate` for a file on hot; until then the writer refuses new \
+             parts in those partitions. Nothing was written (ADR-062 D6, D10)",
+            incomplete.join(", ")
         )))
     }
 
@@ -1139,6 +1107,124 @@ impl Run<'_> {
         );
         self.report.lines.extend(pass.lines);
         self.report.problems.extend(pass.problems);
+        if self.report.problems.is_empty() {
+            self.assert_complete(&plan.targets);
+        }
         Ok(())
     }
+
+    /// The end of a run that is about to pass: every recorded file is
+    /// [`complete`], so a PASS always leaves the writer guard releasing
+    /// every adopted partition that hot holds (D6 interim). A gap is a
+    /// problem, and the run fails.
+    fn assert_complete(&mut self, targets: &[Target]) {
+        let hot = self.config.paths.raw_root.clone();
+        let records = match copy_ledger::read(&hot) {
+            Ok(Some(ledger)) => ledger.records,
+            Ok(None) => {
+                self.report
+                    .problems
+                    .push("the copy ledger disappeared during the adoption".to_owned());
+                return;
+            }
+            Err(error) => {
+                self.report.problems.push(format!(
+                    "the copy ledger cannot be read after the adoption: {error}"
+                ));
+                return;
+            }
+        };
+        let fold = match Fold::new(&records) {
+            Ok(fold) => fold,
+            Err(error) => {
+                self.report
+                    .problems
+                    .push(format!("the copy ledger: {error}"));
+                return;
+            }
+        };
+        let (removed, marked) = ledger_states(&records);
+        for path in fold.manifests.keys() {
+            if marked.contains_key(path) {
+                continue;
+            }
+            let gap = match complete(&hot, &fold, path, targets, &removed) {
+                Ok(None) => continue,
+                Ok(Some(gap)) => gap,
+                Err(error) => error,
+            };
+            self.report.problems.push(format!(
+                "after the adoption {path} is not complete ({gap}) (ADR-062 D10)"
+            ));
+        }
+    }
+}
+
+/// The partitions recorded removed (the later of `removed` and `returned`
+/// decides) and the paths recorded lost, held, quarantined or replaced.
+fn ledger_states(records: &[Record]) -> (BTreeSet<String>, BTreeMap<String, &'static str>) {
+    let mut removed = BTreeSet::new();
+    let mut marked: BTreeMap<String, &'static str> = BTreeMap::new();
+    for record in records {
+        match &record.kind {
+            Kind::Removed { partition } => {
+                removed.insert(partition.clone());
+            }
+            Kind::Returned { partition } => {
+                removed.remove(partition);
+            }
+            Kind::Lost { path, .. } => {
+                marked.insert(path.clone(), "lost");
+            }
+            Kind::Hold { path, .. } => {
+                marked.entry(path.clone()).or_insert("held");
+            }
+            Kind::Quarantined { path, .. } => {
+                marked.insert(path.clone(), "quarantined");
+            }
+            Kind::Replaced { path, .. } => {
+                marked.insert(path.clone(), "replaced");
+            }
+            _ => {}
+        }
+    }
+    (removed, marked)
+}
+
+/// The one completeness predicate of a recorded file (ADR-062 D10): the
+/// end state a passed adoption guarantees. It is complete when it is on
+/// hot unless its partition is recorded removed, and when the ledger
+/// records a copy of it on every copy target. `Ok(None)` when complete,
+/// otherwise what is missing.
+///
+/// Why this predicate: on hot, the writer guard's part check releases its
+/// partition (hot holds every recorded part); on every target, it has its
+/// k copies. A file on a target without a `copy` record does not count:
+/// nothing would ever record it.
+fn complete(
+    hot: &Path,
+    fold: &Fold,
+    path: &str,
+    targets: &[Target],
+    removed: &BTreeSet<String>,
+) -> Result<Option<String>, String> {
+    let mut gaps = Vec::new();
+    if !removed.contains(partition_of(path)) {
+        match replica::sealed_manifest(hot, path) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                gaps.push("not on hot, and its partition is not recorded removed".to_owned())
+            }
+            Err(error) => return Err(format!("hot: {error}")),
+        }
+    }
+    let missing: Vec<&str> = targets
+        .iter()
+        .filter(|target| !fold.has_copy(path, &target.id))
+        .map(|target| target.id.as_str())
+        .collect();
+    if !missing.is_empty() {
+        gaps.push(format!("no copy record on {}", missing.join(", ")));
+    }
+    Ok((!gaps.is_empty()).then(|| gaps.join("; ")))
 }
