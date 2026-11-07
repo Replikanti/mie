@@ -1047,16 +1047,22 @@ adopted into the production store. The protocol (#190):
   guard releasing every adopted partition hot holds. **Limit, until #192:**
   a copy target added after an adoption, or a failed one replaced under a
   new id, holds no copy of the files that already left hot, and the
-  replication pass copies from hot only. Those files fail the predicate,
-  so every later adoption is refused, with nothing written. The refusal
-  is told apart from a stopped adoption: it names each path, the targets
-  that hold its recorded copy and the new target that lacks one, and the
-  remedy, `mie store repair` (#192), which copies it from a good target,
-  or until then a re-adoption of the original store, which copies the
-  file to every target without a `copy` record. A file on hot that only
-  lacks copies is named with `mie store replicate` as its remedy. Why
-  refuse instead of passing: a PASS would then leave files below k on
-  the new target with no step that ever fills them. The source's import
+  replication pass copies from hot only. Those files fail the predicate.
+  Unlike the other gaps they do not block the writes: such a file lies in
+  a partition recorded removed (so the writer guard refuses it whatever
+  happens) and the run never writes its path, so no path is reused and no
+  other bytes get in. The run adopts what it reads, then fails at the end,
+  naming each such path, the targets holding its recorded copy and the
+  new target lacking one, and the remedy: `mie store repair` (#192),
+  which copies it from a good target, or until then a re-adoption of
+  each original store, which copies its own files to every target
+  without a `copy` record. Why not refuse up front: with two adopted
+  stores (the #22 store and the archive, the production shape), each
+  re-adoption would be refused for the other store's files, a deadlock
+  until #192. Re-adopting every earlier store in turn ends with PASS. Why
+  not pass: files would stay below k on the new target with no step that
+  ever fills them. A file on hot that only lacks copies still refuses up
+  front, with `mie store replicate` as its remedy. The source's import
   ledger holds no `PENDING`; every source archive part is listed by a source entry with
   its manifest's SHA-256 (D11 *Archive parts wait for their import
   entry*), every part an entry lists is in the source or already in the

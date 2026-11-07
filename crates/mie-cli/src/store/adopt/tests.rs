@@ -852,18 +852,37 @@ fn assert_guard_releases(fixture: &Fixture) {
     }
 }
 
-/// Review of #200, finding 5: a copy target added (or a failed one replaced
-/// under a new id) after an adoption holds no copy of the files that left
-/// hot, and the pass copies from hot only. A later adoption is refused with
-/// nothing written, naming each such path, the new target and the remedy:
-/// `mie store repair` (#192), or until then a re-adoption of the original
-/// store, which this test runs to show it fills the new target.
+/// Review of #200, findings 5 and 6: a copy target added (or a failed one
+/// replaced under a new id) after two adoptions holds no copy of the files
+/// that left hot, and the pass copies from hot only. That gap does not
+/// block the writes: re-adopting the first store fills its own files on
+/// the new target and fails naming only the second store's files with the
+/// remedy (`mie store repair`, #192, or a re-adoption); re-adopting the
+/// second store then passes, and so does a third store. A file of that
+/// class never reaches the writer: its partition stays recorded removed.
 #[test]
 fn a_target_added_after_an_adoption_is_named_with_its_remedy() {
     let fixture = Fixture::new("adopt-new-target");
     let first = fixture.adopt();
     assert_eq!(first.problems, Vec::<String>::new(), "{first:?}");
+    // A second store, adopted while there are two targets.
+    let other = Dir::new("adopt-new-target-other");
+    seal(&other.0, "binance-um", "aggTrade", D0 - 4 * DAY, 2);
+    let other_request = AdoptRequest {
+        from: other.0.clone(),
+        archive_config: Some(fixture.dir.0.join("dst/archive.toml")),
+        ..AdoptRequest::default()
+    };
+    let second = run(
+        &fixture.config,
+        &other_request,
+        FIRST_HOT,
+        &fixture.probe,
+        &|| D0 + 2,
+    );
+    assert_eq!(second.problems, Vec::<String>::new(), "{second:?}");
 
+    // The operator adds cold-c.
     let dst = fixture.dir.0.join("dst");
     let cold_c = dst.join("cold-c");
     fs::create_dir_all(&cold_c).unwrap();
@@ -902,64 +921,107 @@ fn a_target_added_after_an_adoption_is_named_with_its_remedy() {
         (fixture.cold[1].clone(), 3),
         (cold_c.clone(), 4),
     ]);
-    // A pass copies what hot holds to the new target; it cannot fill the
-    // removed partitions.
     let mut out = Vec::new();
-    crate::store::replicate(&config, Some(&archive), &probe, &|| D0 + 2, &mut out).unwrap();
-
-    let other = Dir::new("adopt-new-target-other");
-    seal(&other.0, "binance-um", "aggTrade", D0 - 4 * DAY, 2);
-    let request = AdoptRequest {
-        from: other.0.clone(),
-        archive_config: Some(archive.clone()),
-        ..AdoptRequest::default()
+    crate::store::replicate(&config, Some(&archive), &probe, &|| D0 + 3, &mut out).unwrap();
+    let old_of = |raw: &Path| -> Vec<String> {
+        replica::list_sealed(raw)
+            .unwrap()
+            .into_iter()
+            .filter(|p| date_of(partition_of(p)) < FIRST_HOT)
+            .collect()
     };
-    let roots_of = || {
-        [&fixture.hot, &fixture.cold[0], &fixture.cold[1], &cold_c].map(|root| files_under(root))
-    };
-    let (before, ledger) = (
-        roots_of(),
-        fs::read(copy_ledger::ledger_path(&fixture.hot)).unwrap(),
-    );
-    let refused = run(&config, &request, FIRST_HOT, &probe, &|| D0 + 3);
-    assert_eq!(refused.problems.len(), 1, "{refused:?}");
-    let problem = &refused.problems[0];
-    let old = replica::list_sealed(&fixture.raw())
-        .unwrap()
-        .into_iter()
-        .filter(|p| date_of(partition_of(p)) < FIRST_HOT)
-        .collect::<Vec<_>>();
-    assert!(!old.is_empty());
-    for path in &old {
-        assert!(
-            problem.contains(&format!(
-                "{path} (no copy record on cold-c, only on cold-a, cold-b)"
-            )),
-            "{path}: {problem}"
-        );
-    }
-    for text in [
-        "Fill it with `mie store repair` (#192)",
-        "re-adopt the original store",
-        "Nothing was written",
-    ] {
-        assert!(problem.contains(text), "{text:?} in {problem}");
-    }
-    assert_eq!(roots_of(), before);
-    assert_eq!(
-        fs::read(copy_ledger::ledger_path(&fixture.hot)).unwrap(),
-        ledger
-    );
+    let (old_a, old_b) = (old_of(&fixture.raw()), old_of(&other.0));
+    assert!(!old_a.is_empty() && !old_b.is_empty());
 
-    // The interim remedy: re-adopting the original store fills cold-c, and
-    // the other store is then adopted.
+    // Re-adopting the first store fills its files and names the second's.
     let mut original = fixture.request();
     original.archive_config = Some(archive.clone());
     let again = run(&config, &original, FIRST_HOT, &probe, &|| D0 + 4);
-    assert_eq!(again.problems, Vec::<String>::new(), "{again:?}");
-    for path in &old {
+    // Only the end-of-run check fails this run (the repair class does not
+    // block the writes): the run must FAIL, never PASS with files short.
+    let mut out = Vec::new();
+    let passed =
+        crate::store::adopt(&config, &original, FIRST_HOT, &probe, &|| D0 + 4, &mut out).unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(!passed && !text.contains("\nPASS\n"), "{text}");
+    assert!(text.contains("FAIL: the copy ledger records "), "{text}");
+    for path in &old_a {
         assert!(cold_c.join(path).exists(), "{path}");
     }
-    let second = run(&config, &request, FIRST_HOT, &probe, &|| D0 + 5);
-    assert_eq!(second.problems, Vec::<String>::new(), "{second:?}");
+    let repair: Vec<&String> = again
+        .problems
+        .iter()
+        .filter(|p| p.contains("Fill it with `mie store repair` (#192)"))
+        .collect();
+    assert_eq!(repair.len(), 1, "{again:?}");
+    for path in &old_b {
+        assert!(!cold_c.join(path).exists(), "{path}");
+        assert!(
+            repair[0].contains(&format!(
+                "{path} (no copy record on cold-c, only on cold-a, cold-b)"
+            )),
+            "{path}: {again:?}"
+        );
+    }
+    for path in &old_a {
+        assert!(!repair[0].contains(path.as_str()), "{path}: {again:?}");
+    }
+    assert!(
+        repair[0].contains("re-adopt the original store"),
+        "{again:?}"
+    );
+    // That class never reaches the writer: its partitions stay removed.
+    let key = RawStreamKey::new("binance-um", "BTCUSDT", "aggTrade").unwrap();
+    let mut writer = ParquetRawStore::tiered(
+        &fixture.hot,
+        config
+            .paths
+            .cold_roots
+            .iter()
+            .map(|r| r.path.clone())
+            .collect(),
+    )
+    .writer("binance-um", RotationPolicy::default())
+    .unwrap();
+    let error = writer
+        .append(
+            &key,
+            RawRecord {
+                event_time: EventTime::from_millis(D0 - 4 * DAY + 60_000),
+                capture: None,
+                payload: b"late".to_vec(),
+            },
+        )
+        .unwrap_err();
+    drop(writer);
+    assert!(
+        error
+            .to_string()
+            .contains("is recorded as removed from hot"),
+        "{error}"
+    );
+
+    // Re-adopting the second store completes cold-c, and a third store
+    // is then adopted.
+    let mut second = other_request.clone();
+    second.archive_config = Some(archive.clone());
+    let report = run(&config, &second, FIRST_HOT, &probe, &|| D0 + 5);
+    assert_eq!(report.problems, Vec::<String>::new(), "{report:?}");
+    for path in &old_b {
+        assert!(cold_c.join(path).exists(), "{path}");
+    }
+    let third = Dir::new("adopt-new-target-third");
+    seal(&third.0, "binance-um", "aggTrade", D0 - 3 * DAY, 2);
+    let report = run(
+        &config,
+        &AdoptRequest {
+            from: third.0.clone(),
+            archive_config: Some(archive.clone()),
+            ..AdoptRequest::default()
+        },
+        FIRST_HOT,
+        &probe,
+        &|| D0 + 6,
+    );
+    assert_eq!(report.problems, Vec::<String>::new(), "{report:?}");
 }

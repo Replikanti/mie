@@ -31,9 +31,10 @@
 //!    recorded removed, and recorded on every copy target), so a re-run of
 //!    a stopped adoption against another store can never pass and leave a
 //!    partition guarded for good. A file that only lacks a copy on a target
-//!    added after it left hot is named with its own remedy (`mie store
-//!    repair`, #192, or a re-adoption of the original store); every archive
-//!    part has the entry that lists it with its
+//!    added after it left hot does not block the writes (its partition is
+//!    recorded removed, and the run never writes its path); the end of the
+//!    run fails naming it with its remedy (`mie store repair`, #192, or a
+//!    re-adoption of its original store); every archive part has the entry that lists it with its
 //!    manifest's SHA-256, and every listed part is in the source or already
 //!    in the store. The **path rule** (D10, D5): each source path's
 //!    manifest is compared with the ledger's `manifest` record, hot's
@@ -852,15 +853,13 @@ impl Run<'_> {
                 stopped.join(", ")
             ));
         }
-        if !repair.is_empty() {
-            problems.push(format!(
-                "the copy ledger records {}, which --from does not list: it left hot with a copy \
-                 record on another copy target but none on the target named, a target added or \
-                 replaced after it was adopted, and the replication pass copies from hot only. \
-                 Fill it with `mie store repair` (#192), or until then re-adopt the original \
-                 store it came from. Nothing was written (ADR-062 D10, D11)",
-                repair.join(", ")
-            ));
+        // A file that only needs the repair does not block the writes: its
+        // partition is recorded removed (so the writer guard refuses it
+        // anyway), and this run never writes its path. Blocking would
+        // deadlock two adopted stores that each wait for the other's files
+        // on a new target; the end-of-run check names it and fails the run.
+        if !stopped.is_empty() && !repair.is_empty() {
+            problems.push(repair_problem(&repair));
         }
         if !pass.is_empty() {
             problems.push(format!(
@@ -1135,9 +1134,9 @@ impl Run<'_> {
         );
         self.report.lines.extend(pass.lines);
         self.report.problems.extend(pass.problems);
-        if self.report.problems.is_empty() {
-            self.assert_complete(&plan.targets);
-        }
+        // Also after a failed pass, so the repair class is named whatever
+        // else is short.
+        self.assert_complete(&plan.targets);
         Ok(())
     }
 
@@ -1172,12 +1171,17 @@ impl Run<'_> {
             }
         };
         let (removed, marked) = ledger_states(&records);
+        let mut repair = Vec::new();
         for path in fold.manifests.keys() {
             if marked.contains_key(path) {
                 continue;
             }
             let gap = match complete(&hot, &fold, path, targets, &removed) {
                 Ok(None) => continue,
+                Ok(Some(gap)) if gap.needs_repair() => {
+                    repair.push(format!("{path} ({gap})"));
+                    continue;
+                }
                 Ok(Some(gap)) => gap.to_string(),
                 Err(error) => error,
             };
@@ -1185,7 +1189,23 @@ impl Run<'_> {
                 "after the adoption {path} is not complete ({gap}) (ADR-062 D10)"
             ));
         }
+        if !repair.is_empty() {
+            self.report.problems.push(repair_problem(&repair));
+        }
     }
+}
+
+/// The problem naming the files that only need the target-to-target
+/// repair: a copy target added or replaced after they left hot.
+fn repair_problem(files: &[String]) -> String {
+    format!(
+        "the copy ledger records {}, which left hot with a copy record on another copy target \
+         but none on the target named: a target added or replaced after it was adopted, and the \
+         replication pass copies from hot only. Fill it with `mie store repair` (#192), or until \
+         then re-adopt the original store it came from; this run adopted what it read, and only \
+         these files are short (ADR-062 D10, D11)",
+        files.join(", ")
+    )
 }
 
 /// The partitions recorded removed (the later of `removed` and `returned`
