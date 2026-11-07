@@ -27,9 +27,10 @@
 //!    `ledger-copy` record per target whose copy was not up to date. After
 //!    steps 1 and 2, so this pass's copy records lie inside the prefix.
 //! 4. **The journal tail** `[len(copy), L)`. L was read before step 1
-//!    listed hot, and the tail is held on a target while a listed live file
-//!    has no copy record for it, so a `sealed` line on a copy always names
-//!    a file that is already on that copy.
+//!    listed hot, and when a listed live file has no copy record for a
+//!    target, that target's copy stops before the first line that names it,
+//!    so a `sealed` line on a copy always names a file that is already on
+//!    that copy.
 //!
 //! **The target's marker is re-read before every write to it** (a sealed
 //! copy, an entry, the ledger and journal tails) and before every record
@@ -629,6 +630,59 @@ fn hot_entries(import_ledger: &Path) -> (Vec<Entry>, Vec<String>) {
     (entries, problems)
 }
 
+/// The byte offset and the path of the first line of `journal` in
+/// `[from, end)` (from the start of the line that holds byte `from`) whose
+/// bytes contain one of `paths`, or `None`. A line cut at `end` counts with
+/// the bytes before `end`. A data path's text occurs in a journal line only
+/// where the line names that file (`sealed`, `recovery` `rolled_forward`):
+/// a temp file's name differs from it in the byte before `part-`.
+fn first_line_naming(
+    journal: &Path,
+    from: u64,
+    end: u64,
+    paths: &[&String],
+) -> std::io::Result<Option<(u64, String)>> {
+    use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+    let mut file = fs::File::open(journal)?;
+    // The start of the line that holds byte `from`.
+    let mut start = from.min(end);
+    let mut cursor = start;
+    'back: while cursor > 0 {
+        let chunk_start = cursor.saturating_sub(65_536);
+        let mut chunk = vec![0; (cursor - chunk_start) as usize];
+        file.seek(SeekFrom::Start(chunk_start))?;
+        file.read_exact(&mut chunk)?;
+        for (i, &byte) in chunk.iter().enumerate().rev() {
+            if byte == b'\n' {
+                start = chunk_start + i as u64 + 1;
+                break 'back;
+            }
+        }
+        cursor = chunk_start;
+        start = 0;
+    }
+    file.seek(SeekFrom::Start(start))?;
+    let mut reader = BufReader::new(file);
+    let mut offset = start;
+    let mut line = Vec::new();
+    while offset < end {
+        line.clear();
+        let n = reader.read_until(b'\n', &mut line)? as u64;
+        if n == 0 {
+            break;
+        }
+        let seen = &line[..n.min(end - offset) as usize];
+        if let Some(path) = paths.iter().find(|path| {
+            seen.windows(path.len())
+                .any(|window| window == path.as_bytes())
+        }) {
+            return Ok(Some((offset, (*path).clone())));
+        }
+        offset += n;
+    }
+    Ok(None)
+}
+
 /// The UTF-8 entry names of `dir`, sorted; a missing directory has none.
 fn sorted_names(dir: &Path) -> std::io::Result<Vec<String>> {
     let entries = match fs::read_dir(dir) {
@@ -992,12 +1046,12 @@ impl Pass<'_> {
 
     /// Step 4: returns the bytes appended to the journal copies.
     ///
-    /// The tail is held on a target while a live file of the listing has no
-    /// copy record for it: a `sealed` line on a copy must always name a file
-    /// that copy holds (ADR-062 D11; review of #199, finding 3). Archive
-    /// parts never hold it: only the capture writes `sealed` lines, and an
-    /// archive part waits for its import entry, which would hold the journal
-    /// for a whole import.
+    /// A `sealed` line on a copy must always name a file that copy holds
+    /// (ADR-062 D11; review of #199, finding 3). So when a live file of the
+    /// listing has no copy record for a target, that target's journal copy
+    /// advances only up to the first line that names such a file, never
+    /// through it; everything before that line is still appended. Archive
+    /// parts are never checked: only the capture writes `sealed` lines.
     fn copy_journal_tail(&mut self, paths: &[String]) -> u64 {
         let Some(len) = self.journal_len else {
             return 0;
@@ -1024,25 +1078,38 @@ impl Pass<'_> {
                 .iter()
                 .filter(|path| !is_archive_part(path) && !self.fold.has_copy(path, &id))
                 .collect();
-            if let Some(first) = short.first() {
-                let message = format!(
-                    "the journal copy on {id} is held: {} listed live file(s) are not on it \
-                     (first {first}), and a `sealed` line on a copy always names a file that \
-                     copy holds (ADR-062 D11)",
-                    short.len()
-                );
-                self.problem(message);
-                continue;
+            let mut end = len;
+            if !short.is_empty() {
+                let copy_len = fs::metadata(&dest).map_or(0, |metadata| metadata.len());
+                match first_line_naming(self.journal, copy_len, len, &short) {
+                    Ok(None) => {}
+                    Ok(Some((offset, path))) => {
+                        self.problem(format!(
+                            "the journal copy on {id} stops before byte {offset} of the journal: \
+                             the line there names {path}, which is not on {id}, and a `sealed` \
+                             line on a copy always names a file that copy holds (ADR-062 D11)"
+                        ));
+                        // A copy already past the line is only compared.
+                        end = offset.max(copy_len.min(len));
+                    }
+                    Err(error) => {
+                        self.problem(format!(
+                            "the journal {} cannot be read: {error}",
+                            self.journal.display()
+                        ));
+                        return appended;
+                    }
+                }
             }
             if !self.marker_present(i) {
                 continue;
             }
-            match replica::extend_prefix(TailSource::File(self.journal), &dest, len) {
+            match replica::extend_prefix(TailSource::File(self.journal), &dest, end) {
                 Ok(0) => {}
                 Ok(bytes) => {
                     appended += bytes;
                     self.line(format!(
-                        "journal copy on {id}: appended {bytes} byte(s), now {len} bytes"
+                        "journal copy on {id}: appended {bytes} byte(s), now {end} bytes"
                     ));
                 }
                 Err(CopyError {

@@ -1002,13 +1002,17 @@ What breaks:
   a file that is already on cold, so a hot loss drops whole files together
   with their journal lines, and the lost tail never leaves a cold journal
   naming a missing file. To keep that true when a file fails on a target,
-  **a target's journal tail is held while a live file of the pass's
-  listing has no copy record for that target**, and the pass names the
-  held tail as a failure (operator, #199 review). Archive parts never hold
-  it: only the capture writes `sealed` lines, and an archive part waits
-  for its import entry, which would hold the journal for a whole import.
-  The cost is that the journal tail of a target stays at one copy until
-  the missing file reaches it (the single-copy exposure below). A failure
+  **a target's journal copy advances only up to the first journal line
+  that names a live file of the pass's listing with no copy record for
+  that target, never through that line**; every line before it is still
+  appended, and the pass names the stop as a failure (operator, #199
+  review). Why bounded at that line and not the whole tail: one
+  unreadable live part on hot (a bad sector, a part failing its manifest)
+  would otherwise keep every later journal line at a single copy on
+  every target, with no limit. Archive parts are never checked: only the
+  capture writes `sealed` lines. The cost is that the lines from that
+  line on stay at one copy until the missing file reaches the target (the
+  single-copy exposure below). A failure
   to read hot (one part, its manifest, an entry, the journal) is about
   that source and is named; the other files and targets go on, so one bad
   sector on hot cannot stop the replication of everything else. It writes

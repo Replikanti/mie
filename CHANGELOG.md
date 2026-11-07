@@ -34,8 +34,8 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   `PENDING`, names every file or entry left below k and exits 1, and never
   removes anything. It re-reads a target's marker before every write to it
   and every record about it, checks hot's manifest against the ledger's
-  before copying, holds a target's journal tail while a live file of the
-  pass is not on it, and treats a failure to read hot as a problem of that
+  before copying, stops a target's journal copy before the first line that
+  names a live file missing on that target, and treats a failure to read hot as a problem of that
   one file, not of the target. A second pass over unchanged state writes nothing.
   Copy-ledger appends now report a truncation of the trailing record as a
   structured `Truncation` (bytes, offset) in `AppendOutcome`, and in the

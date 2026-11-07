@@ -557,21 +557,23 @@ fn an_unreadable_hot_file_stops_only_that_file() {
 #[test]
 fn the_journal_tail_waits_for_every_live_file_on_its_target() {
     let fixture = Fixture::new("pass-journal-hold");
-    let path = replica::list_sealed(&fixture.hot)
-        .unwrap()
-        .into_iter()
-        .find(|p| p.starts_with("source=binance-um"))
-        .unwrap();
+    let path = first_live(&fixture);
+    let (before, _) = journal_naming(&fixture, &path);
     let debris = fixture.cold[0].join(&path);
     fs::create_dir_all(debris.parent().unwrap()).unwrap();
     fs::write(&debris, b"not the part").unwrap();
     let report = fixture.pass();
     assert!(!fixture.cold[0].join(manifest_of(&path)).exists());
-    assert!(!fixture.cold[0].join(".mie/journal/journal.jsonl").exists());
+    assert_eq!(
+        fs::read(fixture.cold[0].join(".mie/journal/journal.jsonl")).unwrap(),
+        before,
+        "cold-a's copy stops before the line that names {path}"
+    );
     assert!(
-        report.problems.iter().any(|p| p.starts_with(
-            "the journal copy on cold-a is held: 1 listed live file(s) are not on it"
-        ) && p.contains(&path)),
+        report.problems.iter().any(|p| p.starts_with(&format!(
+            "the journal copy on cold-a stops before byte {} of the journal",
+            before.len()
+        )) && p.contains(&path)),
         "{report:?}"
     );
     assert_eq!(
@@ -587,6 +589,83 @@ fn the_journal_tail_waits_for_every_live_file_on_its_target() {
         fs::read(fixture.cold[0].join(".mie/journal/journal.jsonl")).unwrap(),
         fs::read(&fixture.config.paths.journal).unwrap()
     );
+}
+
+/// The first live part of the fixture.
+fn first_live(fixture: &Fixture) -> String {
+    replica::list_sealed(&fixture.hot)
+        .unwrap()
+        .into_iter()
+        .find(|p| p.starts_with("source=binance-um"))
+        .unwrap()
+}
+
+/// Rewrites the fixture's journal as a line, a `sealed` line naming
+/// `path`, and a line after it; returns the bytes before the `sealed` line
+/// and the whole journal.
+fn journal_naming(fixture: &Fixture, path: &str) -> (Vec<u8>, Vec<u8>) {
+    let before = b"{\"type\":\"run_start\",\"run_id\":\"r1\"}\n".to_vec();
+    let mut journal = before.clone();
+    journal.extend_from_slice(
+        format!(
+            "{{\"type\":\"sealed\",\"run_id\":\"r1\",\"files\":[{{\"path\":\"{path}\",\"rows\":2}}]}}\n"
+        )
+        .as_bytes(),
+    );
+    journal.extend_from_slice(b"{\"type\":\"run_end\",\"run_id\":\"r1\"}\n");
+    fs::write(&fixture.config.paths.journal, &journal).unwrap();
+    (before, journal)
+}
+
+/// The coordinator's bound on the hold (#199): one unreadable live part on
+/// hot stops every target's journal copy before the `sealed` line that
+/// names it, and no earlier: every line before it reaches both targets.
+#[test]
+fn an_unreadable_live_part_bounds_the_journal_copies_at_its_sealed_line() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new("pass-journal-bound");
+    let path = first_live(&fixture);
+    let (before, _) = journal_naming(&fixture, &path);
+    let bad = fixture.hot.join(&path);
+    fs::set_permissions(&bad, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read(&bad).is_ok() {
+        // Root reads through any permission; the case cannot be built.
+        return;
+    }
+    let report = fixture.pass();
+    fs::set_permissions(&bad, fs::Permissions::from_mode(0o444)).unwrap();
+    for (root, id) in fixture.cold.iter().zip(["cold-a", "cold-b"]) {
+        assert_eq!(
+            fs::read(root.join(".mie/journal/journal.jsonl")).unwrap(),
+            before,
+            "{id}: the lines before the `sealed` line, nothing from it on"
+        );
+        assert!(
+            report.problems.iter().any(|p| p.starts_with(&format!(
+                "the journal copy on {id} stops before byte {}",
+                before.len()
+            ))),
+            "{report:?}"
+        );
+    }
+    assert!(
+        !report.problems.iter().any(|p| p.contains("stopped")),
+        "{report:?}"
+    );
+    // Every other file reached both targets.
+    let (_, copies) = counts(&fixture.records());
+    let paths = replica::list_sealed(&fixture.hot).unwrap();
+    assert_eq!(copies.len(), 2 * (paths.len() - 1), "{copies:?}");
+
+    // Readable again: the next pass completes the journal copies.
+    let report = fixture.pass();
+    assert_eq!(report.problems, Vec::<String>::new(), "{report:?}");
+    for root in &fixture.cold {
+        assert_eq!(
+            fs::read(root.join(".mie/journal/journal.jsonl")).unwrap(),
+            fs::read(&fixture.config.paths.journal).unwrap()
+        );
+    }
 }
 
 /// Review of #199, finding 4 (operator decision): a target that loses its
