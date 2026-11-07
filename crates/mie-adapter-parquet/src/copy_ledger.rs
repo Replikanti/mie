@@ -64,6 +64,7 @@
 use crate::io_error;
 use crate::layout::{self, COPY_LEDGER, COPY_LEDGER_LOCK, META_DIR, PartFile};
 use crate::manifest::{self, hex, sha256_hex};
+use crate::replica::{self, TailSource};
 use mie_ports::raw::{RawStoreError, is_sha256_hex, validate_segment};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions, TryLockError};
@@ -809,14 +810,21 @@ pub struct Ledger {
 pub fn read(raw_root: &Path) -> Result<Option<Ledger>, RawStoreError> {
     let path = ledger_path(raw_root);
     match fs::read(&path) {
-        Ok(bytes) => parse_ledger(&path, &bytes).map(Some),
+        Ok(bytes) => parse(&path, &bytes).map(Some),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
         Err(error) => Err(io_error("read", &path)(error)),
     }
 }
 
-/// Parses a whole ledger file as [`read`] does.
-fn parse_ledger(path: &Path, bytes: &[u8]) -> Result<Ledger, RawStoreError> {
+/// Parses the bytes of a whole ledger file as [`read`] does; `path` names
+/// it in errors. The replication pass parses exactly the bytes it copies:
+/// its verified prefix is `bytes.len() - ignored_bytes`, so the incomplete
+/// trailing record is never inside it.
+///
+/// # Errors
+///
+/// As [`read`].
+pub fn parse(path: &Path, bytes: &[u8]) -> Result<Ledger, RawStoreError> {
     if !bytes.starts_with(HEADER.as_bytes()) {
         return Err(RawStoreError::Corrupt(format!(
             "copy ledger {}: missing header or unknown format version",
@@ -878,6 +886,108 @@ pub struct Truncation {
     /// The byte offset the ledger was truncated to, where the truncated
     /// record started.
     pub offset: u64,
+}
+
+/// What [`extend_copy`] did to one copy target's ledger copy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LedgerCopy {
+    /// The copy was up to date (the up-to-date rule of [`extend_copy`]):
+    /// nothing was appended, and the pass appends no `ledger-copy` record.
+    pub current: bool,
+    /// The bytes appended to the copy.
+    pub appended_bytes: u64,
+    /// B: the length of hot's verified prefix, from the same read the copy
+    /// was extended from.
+    pub prefix_bytes: u64,
+    /// The SHA-256 of hot's `[0, B)`, lowercase hex.
+    pub prefix_sha256: String,
+}
+
+/// Extends the ledger copy `<target_root>/.mie/copy-ledger` of the copy
+/// target `root_id` to hot's verified prefix (ADR-062 D11, *The journal
+/// and the copy ledger*).
+///
+/// One read of hot's ledger gives its bytes, its records and B, the end of
+/// its last complete, verified record: the single-trailing-record rule, so
+/// a torn trailing record (partial bytes, or a complete last line whose
+/// chain fails) is never copied. A copy is **up to date** when every hot
+/// record from its length up to B is a `ledger-copy` record and the latest
+/// `ledger-copy` record for `root_id` has prefix length = the copy's
+/// length. Why: each pass ends with `ledger-copy` records that the copies
+/// cannot hold yet; copying them would add new ones on every pass, and a
+/// pass over unchanged state would never append nothing. A crash between a
+/// tail append and its record leaves no matching record, so the next pass
+/// writes it. An up-to-date copy's last record is still compared with
+/// hot's; otherwise the copy is extended to B
+/// ([`replica::extend_prefix`]) from the bytes of that same read. Nothing
+/// is appended to hot's ledger here: the pass appends the `ledger-copy`
+/// record.
+///
+/// # Errors
+///
+/// [`RawStoreError::Integrity`] for a missing hot ledger, a chain failure
+/// before its last record, and a copy that is not a byte prefix of hot's at
+/// its tail or is longer than B; [`RawStoreError::Corrupt`] for a bad
+/// header or grammar; [`RawStoreError::Io`] on I/O failure.
+pub fn extend_copy(
+    hot_root: &Path,
+    target_root: &Path,
+    root_id: &str,
+) -> Result<LedgerCopy, RawStoreError> {
+    let path = ledger_path(hot_root);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Err(missing_ledger(&path)),
+        Err(error) => return Err(io_error("read", &path)(error)),
+    };
+    let ledger = parse(&path, &bytes)?;
+    let prefix = &bytes[..bytes.len() - ledger.ignored_bytes as usize];
+    let copy = ledger_path(target_root);
+    let copy_len = match fs::metadata(&copy) {
+        Ok(metadata) => Some(metadata.len()),
+        Err(error) if error.kind() == ErrorKind::NotFound => None,
+        Err(error) => return Err(io_error("inspect", &copy)(error)),
+    };
+    let current = copy_len.filter(|&len| is_current(prefix, &ledger.records, root_id, len));
+    let end = current.unwrap_or(prefix.len() as u64);
+    let appended_bytes = replica::extend_prefix(TailSource::Bytes(prefix), &copy, end)?;
+    Ok(LedgerCopy {
+        current: current.is_some(),
+        appended_bytes,
+        prefix_bytes: prefix.len() as u64,
+        prefix_sha256: sha256_hex(prefix),
+    })
+}
+
+/// The up-to-date rule of [`extend_copy`] for a copy of `len` bytes over
+/// hot's verified `prefix` and its `records`.
+fn is_current(prefix: &[u8], records: &[Record], root_id: &str, len: u64) -> bool {
+    if len > prefix.len() as u64 {
+        return false;
+    }
+    let mut offset = HEADER.len() as u64;
+    let mut latest = None;
+    for (record, line) in records
+        .iter()
+        .zip(prefix[HEADER.len()..].split_inclusive(|&b| b == b'\n'))
+    {
+        let is_ledger_copy = match &record.kind {
+            Kind::LedgerCopy {
+                root, prefix_bytes, ..
+            } => {
+                if root == root_id {
+                    latest = Some(*prefix_bytes);
+                }
+                true
+            }
+            _ => false,
+        };
+        if offset >= len && !is_ledger_copy {
+            return false;
+        }
+        offset += line.len() as u64;
+    }
+    latest == Some(len)
 }
 
 /// What an append did.

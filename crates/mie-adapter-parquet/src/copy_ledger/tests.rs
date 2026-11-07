@@ -192,7 +192,7 @@ fn spans(bytes: &[u8]) -> Vec<(usize, usize)> {
 }
 
 fn parsed(bytes: &[u8]) -> Result<Ledger, RawStoreError> {
-    parse_ledger(Path::new("copy-ledger"), bytes)
+    parse(Path::new("copy-ledger"), bytes)
 }
 
 #[test]
@@ -832,4 +832,160 @@ fn a_failure_after_a_truncation_carries_the_truncation() {
         None
     );
     FAIL_NEXT_TRUNCATE_SYNC.with(|fail| fail.set(false));
+}
+
+/// A hot store (`<dir>/hot`) with a ledger of `records` and two copy
+/// targets with `.mie/` (`<dir>/cold-a`, `<dir>/cold-b`).
+fn replicated(tag: &str, records: &[Record]) -> (TempDir, PathBuf, [PathBuf; 2]) {
+    let dir = TempDir::new(tag);
+    let hot = dir.path().join("hot");
+    let cold = [dir.path().join("cold-a"), dir.path().join("cold-b")];
+    for root in std::iter::once(&hot).chain(&cold) {
+        fs::create_dir_all(root.join(META_DIR)).unwrap();
+    }
+    fs::write(ledger_path(&hot), HEADER).unwrap();
+    append_all(&hot, records);
+    (dir, hot, cold)
+}
+
+/// One pass's step 3 over `targets`: extend each copy, then append its
+/// `ledger-copy` record when it was not current. Returns whether each copy
+/// was current.
+fn ledger_step(hot: &Path, targets: &[(&Path, &str)], at_ms: i64) -> Vec<bool> {
+    targets
+        .iter()
+        .map(|(root, id)| {
+            let copy = extend_copy(hot, root, id).unwrap();
+            if !copy.current {
+                CopyLedger::at(hot)
+                    .append(&Record {
+                        at_ms,
+                        kind: Kind::LedgerCopy {
+                            root: (*id).to_owned(),
+                            prefix_bytes: copy.prefix_bytes,
+                            prefix_sha256: copy.prefix_sha256,
+                        },
+                    })
+                    .unwrap();
+            }
+            copy.current
+        })
+        .collect()
+}
+
+#[test]
+fn a_ledger_copy_ends_at_hots_verified_prefix() {
+    let records = golden_records();
+    let (_dir, hot, cold) = replicated("ledger-copy-torn", &records[..4]);
+    let verified = fs::read(ledger_path(&hot)).unwrap();
+    // The next record's line, torn: partial bytes, then a complete line
+    // whose chain fails.
+    append_all(&hot, &records[4..5]);
+    let full = fs::read(ledger_path(&hot)).unwrap();
+    let line = full[verified.len()..].to_vec();
+    let mut wrong = line.clone();
+    flip(&mut wrong, line.len() - 2);
+    for (what, tail) in [("partial", &line[..20]), ("failing chain", &wrong[..])] {
+        let mut bytes = verified.clone();
+        bytes.extend_from_slice(tail);
+        fs::write(ledger_path(&hot), &bytes).unwrap();
+        let _ = fs::remove_file(ledger_path(&cold[0]));
+        let copy = extend_copy(&hot, &cold[0], "cold-a").unwrap();
+        assert!(!copy.current, "{what}");
+        assert_eq!(copy.prefix_bytes, verified.len() as u64, "{what}");
+        assert_eq!(copy.appended_bytes, verified.len() as u64, "{what}");
+        assert_eq!(
+            copy.prefix_sha256,
+            hex_of(&Sha256::digest(&verified)),
+            "{what}"
+        );
+        assert_eq!(fs::read(ledger_path(&cold[0])).unwrap(), verified, "{what}");
+    }
+}
+
+#[test]
+fn ledger_copies_converge_over_two_targets_and_two_passes() {
+    let records = golden_records();
+    let (_dir, hot, cold) = replicated("ledger-copy-converge", &records[..3]);
+    let targets = [(cold[0].as_path(), "cold-a"), (cold[1].as_path(), "cold-b")];
+    assert_eq!(ledger_step(&hot, &targets, AT), [false, false]);
+    let after_pass_1 = fs::read(ledger_path(&hot)).unwrap();
+    let copies = cold
+        .clone()
+        .map(|root| fs::read(ledger_path(&root)).unwrap());
+    // Each copy is a prefix of hot's; cold-b's holds cold-a's record.
+    for copy in &copies {
+        assert_eq!(&after_pass_1[..copy.len()], &copy[..]);
+    }
+    assert!(copies[1].len() > copies[0].len());
+
+    // A pass over unchanged state copies nothing and appends nothing.
+    assert_eq!(ledger_step(&hot, &targets, AT + 1), [true, true]);
+    assert_eq!(fs::read(ledger_path(&hot)).unwrap(), after_pass_1);
+    for (root, copy) in cold.iter().zip(&copies) {
+        assert_eq!(&fs::read(ledger_path(root)).unwrap(), copy);
+    }
+
+    // A new record: both copies are extended again, through the earlier
+    // `ledger-copy` records.
+    append_all(&hot, &records[3..4]);
+    assert_eq!(ledger_step(&hot, &targets, AT + 2), [false, false]);
+    let hot_bytes = fs::read(ledger_path(&hot)).unwrap();
+    let copy_b = fs::read(ledger_path(&cold[1])).unwrap();
+    assert_eq!(&hot_bytes[..copy_b.len()], &copy_b[..]);
+    assert_eq!(ledger_step(&hot, &targets, AT + 3), [true, true]);
+}
+
+#[test]
+fn a_crash_between_the_tail_and_its_record_is_completed_by_the_next_pass() {
+    let records = golden_records();
+    let (_dir, hot, cold) = replicated("ledger-copy-crash", &records[..3]);
+    // The tail is appended, the record never written.
+    let copy = extend_copy(&hot, &cold[0], "cold-a").unwrap();
+    assert!(!copy.current);
+    // The next pass appends nothing to the copy but writes the record.
+    let again = extend_copy(&hot, &cold[0], "cold-a").unwrap();
+    assert!(!again.current);
+    assert_eq!(again.appended_bytes, 0);
+    assert_eq!(again.prefix_bytes, copy.prefix_bytes);
+    let targets = [(cold[0].as_path(), "cold-a")];
+    assert_eq!(ledger_step(&hot, &targets, AT), [false]);
+    assert_eq!(ledger_step(&hot, &targets, AT + 1), [true]);
+
+    // A crash mid-append: a shorter byte prefix, extended by the next pass.
+    let copy_path = ledger_path(&cold[1]);
+    let hot_bytes = fs::read(ledger_path(&hot)).unwrap();
+    fs::write(&copy_path, &hot_bytes[..HEADER.len() + 30]).unwrap();
+    let copy = extend_copy(&hot, &cold[1], "cold-b").unwrap();
+    assert!(!copy.current);
+    assert_eq!(fs::read(&copy_path).unwrap(), hot_bytes);
+}
+
+#[test]
+fn a_damaged_ledger_copy_is_refused_even_when_current() {
+    let records = golden_records();
+    let (_dir, hot, cold) = replicated("ledger-copy-damage", &records[..3]);
+    let targets = [(cold[0].as_path(), "cold-a")];
+    ledger_step(&hot, &targets, AT);
+    let copy_path = ledger_path(&cold[0]);
+    let mut copy = fs::read(&copy_path).unwrap();
+    let last = copy.len() - 5;
+    flip(&mut copy, last);
+    fs::write(&copy_path, &copy).unwrap();
+    for _ in 0..2 {
+        assert!(matches!(
+            extend_copy(&hot, &cold[0], "cold-a"),
+            Err(RawStoreError::Integrity(_))
+        ));
+        assert_eq!(fs::read(&copy_path).unwrap(), copy, "untouched");
+        // Also when hot has new records to copy.
+        append_all(&hot, &records[3..4]);
+    }
+    // A hot without its ledger.
+    fs::remove_file(ledger_path(&hot)).unwrap();
+    assert!(matches!(
+        extend_copy(&hot, &cold[1], "cold-b"),
+        Err(RawStoreError::Integrity(_))
+    ));
+    assert!(!ledger_path(&cold[1]).exists());
 }
