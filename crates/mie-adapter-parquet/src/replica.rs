@@ -5,6 +5,7 @@
 //! import ledger (ADR-025).
 //!
 //! - [`list_sealed`]: the sealed parts of a root's layout;
+//! - [`list_unsealed`]: the seal debris of a root's layout;
 //! - [`copy_sealed`]: the D5 copy of one sealed part;
 //! - [`copy_immutable`]: the copy of an immutable small file (an
 //!   import-ledger entry);
@@ -203,6 +204,64 @@ fn tail_reached(step: TailStep) -> Result<(), RawStoreError> {
 /// [`RawStoreError::Io`] when a directory cannot be listed.
 pub fn list_sealed(root: &Path) -> Result<Vec<String>, RawStoreError> {
     let mut paths = Vec::new();
+    for_each_partition(root, |key, date, names| {
+        for name in names {
+            if let Some((PartFile::Manifest, part)) = PartFile::classify(name) {
+                paths.push(layout::file_path(key, date, PartFile::Data, part));
+            }
+        }
+    })?;
+    // The walk sorts each directory level, which is not the order of the
+    // whole paths (`stream=a-b/` sorts before `stream=a/`).
+    paths.sort();
+    Ok(paths)
+}
+
+/// The relative paths of the seal debris in the layout of `root`, sorted:
+/// every data temp file (`.part-NNNNN.parquet.tmp`), every pending manifest
+/// (`.part-NNNNN.manifest.tmp`) and every data file without its manifest.
+///
+/// These are the states of an interrupted seal or copy that ADR-030
+/// recovery rolls forward or discards, and that [`list_sealed`] skips
+/// silently. The adoption of another store (`mie store adopt`, ADR-062
+/// D10) refuses a source that holds any: it never writes the source, so it
+/// cannot recover it, and copying only the sealed parts would leave the
+/// rest behind without a word. The walk is [`list_sealed`]'s.
+///
+/// # Errors
+///
+/// [`RawStoreError::Io`] when a directory cannot be listed.
+pub fn list_unsealed(root: &Path) -> Result<Vec<String>, RawStoreError> {
+    let mut paths = Vec::new();
+    for_each_partition(root, |key, date, names| {
+        let sealed: Vec<u32> = names
+            .iter()
+            .filter_map(|name| match PartFile::classify(name) {
+                Some((PartFile::Manifest, part)) => Some(part),
+                _ => None,
+            })
+            .collect();
+        for name in names {
+            let debris = match PartFile::classify(name) {
+                Some((PartFile::DataTmp | PartFile::ManifestTmp, _)) => true,
+                Some((PartFile::Data, part)) => !sealed.contains(&part),
+                Some((PartFile::Manifest, _)) | None => false,
+            };
+            if debris {
+                paths.push(format!("{}/{name}", layout::partition_dir(key, date)));
+            }
+        }
+    })?;
+    paths.sort();
+    Ok(paths)
+}
+
+/// Calls `visit` with the stream, the date and the sorted entry names of
+/// every partition in the layout of `root` (the walk of [`list_sealed`]).
+fn for_each_partition(
+    root: &Path,
+    mut visit: impl FnMut(&RawStreamKey, &str, &[String]),
+) -> Result<(), RawStoreError> {
     for source in layout_values(root, "source=")? {
         let source_dir = root.join(format!("source={source}"));
         for instrument in layout_values(&source_dir, "instrument=")? {
@@ -220,19 +279,12 @@ pub fn list_sealed(root: &Path) -> Result<Vec<String>, RawStoreError> {
                     let Some(names) = list_entries(&partition)? else {
                         continue;
                     };
-                    for name in names {
-                        if let Some((PartFile::Manifest, part)) = PartFile::classify(&name) {
-                            paths.push(layout::file_path(&key, &date, PartFile::Data, part));
-                        }
-                    }
+                    visit(&key, &date, &names);
                 }
             }
         }
     }
-    // The walk sorts each directory level, which is not the order of the
-    // whole paths (`stream=a-b/` sorts before `stream=a/`).
-    paths.sort();
-    Ok(paths)
+    Ok(())
 }
 
 /// The values of the `<prefix><value>` subdirectories of `dir` whose value

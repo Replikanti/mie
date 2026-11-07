@@ -304,6 +304,36 @@ USAGE:
         target, or one FAIL: <reason> line per file, entry, target or copy
         left short and exits 1.
 
+    mie store adopt --config <path> [--archive-config <path>] --from <path>
+                    [--journal <path>] [--import-ledger <dir>]
+        Adopt an existing single-root store (ADR-062 D10) into the
+        initialized tiered store of the ingest config, without passing its
+        data through hot: every sealed file of --from is copied straight to
+        every copy target (verified, manifest published last) and recorded
+        in the copy ledger; every partition before the first date of the
+        hot window (today - 7, UTC, derived from the seed lookback, D8) is
+        recorded as removed from hot, and the later ones are copied to hot
+        too. --journal copies the store's journal to the configured one,
+        which must be absent or a byte prefix of it; --import-ledger copies
+        the store's import entries to hot's import ledger, named by the
+        archive configuration (--archive-config, else [history]
+        archive_config). Then one replication pass runs. --from is only
+        read, never written. A path the store already holds with identical
+        bytes is skipped, with other bytes it is refused (Integrity), and
+        a new path is adopted, so a re-run resumes an interrupted adoption
+        and a later run can adopt another store. Refused, before anything is
+        written, when paths.cold_roots is empty, hot has no marker or no
+        readable copy ledger, a copy target has no marker, roots share a
+        device or an id, --from is not a closed single-root store outside
+        hot and every cold root (a writer holds it, it has .mie/, seal
+        debris or a pending import), an archive part has no import entry
+        listing it, or another pass or a writer of hot runs. Until the
+        recall exists (#191), the writer refuses appends to a partition
+        recorded as removed from hot. Prints one line per adopted
+        partition, a total, the pass's lines, then PASS and exits 0, or
+        one FAIL: <reason> line per problem and exits 1; it stops at the
+        first failure.
+
     mie --help
 ";
 
@@ -722,10 +752,46 @@ fn dispatch(args: &[String]) -> Result<ExitCode, String> {
                 )?;
                 Ok(exit(pass))
             }
+            Some("adopt") => {
+                let options = Options::parse(
+                    &args[2..],
+                    &[
+                        "--config",
+                        "--archive-config",
+                        "--from",
+                        "--journal",
+                        "--import-ledger",
+                    ],
+                    &[],
+                )?;
+                let request = store::AdoptRequest {
+                    from: options.path("--from")?,
+                    journal: options.optional("--journal").map(PathBuf::from),
+                    import_ledger: options.optional("--import-ledger").map(PathBuf::from),
+                    archive_config: options.optional("--archive-config").map(PathBuf::from),
+                };
+                let config =
+                    IngestConfig::load(&options.path("--config")?).map_err(|e| e.to_string())?;
+                let probe = store::device_probe()?;
+                let clock = SystemClock::new();
+                let now_ms = || clock.now_utc_ns().div_euclid(1_000_000);
+                let first_hot_date = ingest::first_hot_date(now_ms());
+                let pass = store::adopt(
+                    &config,
+                    &request,
+                    &first_hot_date,
+                    probe.as_ref(),
+                    &now_ms,
+                    &mut std::io::stdout().lock(),
+                )?;
+                Ok(exit(pass))
+            }
             _ => Err(
                 "expected `mie store init --config <path>`, `mie store init-root \
-                 --config <path> --root <path> --id <id>` or `mie store replicate --config \
-                 <path> [--archive-config <path>]`"
+                 --config <path> --root <path> --id <id>`, `mie store replicate --config \
+                 <path> [--archive-config <path>]` or `mie store adopt --config <path> \
+                 [--archive-config <path>] --from <path> [--journal <path>] [--import-ledger \
+                 <dir>]`"
                     .to_owned(),
             ),
         },

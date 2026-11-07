@@ -14,6 +14,12 @@
 //!   copy ledger and the journal to the copy targets that present their
 //!   markers, and never removes anything ([`replicate`](mod@replicate) holds
 //!   the pass, #189, ADR-062 D5, D9, D11).
+//! - [`adopt`] (`mie store adopt`) adopts an existing single-root store:
+//!   every sealed file goes straight to every copy target, partitions older
+//!   than the hot window are recorded as removed from hot, the hot-window
+//!   partitions, the journal and the import entries go to hot, and one
+//!   replication pass follows. The source is only read
+//!   ([`adopt`](mod@adopt) holds the run, #190, ADR-062 D10, D8, D6).
 //! - [`check_devices`] refuses two roots that report one device id, before
 //!   any `mie store` command writes a byte to a copy target.
 //! - [`raw_store`] builds the raw store of every command: the tiered store
@@ -46,8 +52,10 @@ use std::io::{self, ErrorKind, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
+pub mod adopt;
 pub mod replicate;
 
+pub use adopt::{AdoptReport, AdoptRequest};
 pub use replicate::{LedgerAppend, PassObserver, PassReport, truncation_line};
 
 /// The device a root lives on.
@@ -363,6 +371,46 @@ pub fn replicate(
     let pass = report.problems.is_empty();
     let mut lines = report.lines;
     lines.extend(truncations.0);
+    if pass {
+        lines.push("PASS".to_owned());
+    }
+    lines.extend(
+        report
+            .problems
+            .iter()
+            .map(|problem| format!("FAIL: {problem}")),
+    );
+    for line in lines {
+        writeln!(out, "{line}").map_err(|e| format!("write the report: {e}"))?;
+    }
+    out.flush().map_err(|e| format!("write the report: {e}"))?;
+    Ok(pass)
+}
+
+/// `mie store adopt`: adopts the store `request.from` into the tiered store
+/// of `config` (ADR-062 D10, the module [`adopt`](mod@adopt)).
+/// `first_hot_date` is the first UTC date of the hot window,
+/// [`crate::ingest::first_hot_date`] in production; a test passes another
+/// date for a shorter window. `now_ms` stamps the ledger records.
+///
+/// It prints what it adopted, the replication pass's lines and every
+/// copy-ledger truncation, then `PASS` (returns `true`) or one `FAIL:
+/// <problem>` line per problem (returns `false`).
+///
+/// # Errors
+///
+/// A description when the report cannot be written.
+pub fn adopt(
+    config: &IngestConfig,
+    request: &AdoptRequest,
+    first_hot_date: &str,
+    probe: &dyn DeviceProbe,
+    now_ms: &dyn Fn() -> i64,
+    out: &mut dyn Write,
+) -> Result<bool, String> {
+    let report = adopt::run(config, request, first_hot_date, probe, now_ms);
+    let pass = report.problems.is_empty();
+    let mut lines = report.lines;
     if pass {
         lines.push("PASS".to_owned());
     }

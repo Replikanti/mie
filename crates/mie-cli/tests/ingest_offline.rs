@@ -1493,4 +1493,156 @@ mod tiered_start {
             },
         );
     }
+
+    // ------------------------------------- AW2 after an adoption (#190)
+
+    use super::common::MapProbe;
+    use mie_cli::store::{self, AdoptRequest};
+
+    /// A closed single-root store under `dir/src` with one clean run per
+    /// entry of `runs` (start, records' times), adopted with
+    /// `first_hot_date` into the tiered store of [`tiered`] under `dir`.
+    /// Before the adoption the source is copied to `single`, with a
+    /// single-root configuration over the copy: the reference start.
+    fn adopted(
+        dir: &Path,
+        single: &Path,
+        first_hot_date: &str,
+        runs: &[(i64, &[i64])],
+    ) -> (IngestConfig, IngestConfig) {
+        let source = config(&dir.join("src"));
+        let (mut lines, mut records) = (Vec::new(), Vec::new());
+        for (i, (start, times)) in runs.iter().enumerate() {
+            let run_id = format!("2026100{i}T000000Z");
+            let (l, r) = journaled_run(
+                &run_id,
+                *start,
+                times.last().unwrap() + 1_000,
+                500 + 100 * i as u64,
+                times,
+            );
+            lines.extend(l);
+            records.extend(r);
+        }
+        write_records(&source, &records, &lines);
+        let single_config = config(single);
+        copy_tree(&source.paths.raw_root, &single_config.paths.raw_root);
+        std::fs::copy(&source.paths.journal, &single_config.paths.journal).unwrap();
+
+        let config = tiered(dir);
+        init_tiers(&config.paths.raw_root, &config.paths.cold_roots);
+        let probe = MapProbe(vec![
+            (config.paths.raw_root.clone(), 1),
+            (dir.join("cold-a"), 2),
+            (dir.join("cold-b"), 3),
+        ]);
+        let request = AdoptRequest {
+            from: source.paths.raw_root.clone(),
+            journal: Some(source.paths.journal.clone()),
+            import_ledger: None,
+            archive_config: None,
+        };
+        let mut out = Vec::new();
+        let pass =
+            store::adopt(&config, &request, first_hot_date, &probe, &|| T, &mut out).unwrap();
+        assert!(pass, "{}", String::from_utf8_lossy(&out));
+        (config, single_config)
+    }
+
+    /// The seeds and listing of a start at T on `config`, and the seeds of
+    /// the reference start on `single`.
+    fn starts(config: &IngestConfig, single: &IngestConfig) -> (Value, Value) {
+        let outcome = ingest(config, T, frames());
+        assert_eq!(outcome.exit_code(), 0, "{:?}", outcome.error);
+        assert_eq!(
+            outcome.summary.unwrap().stats.records,
+            3,
+            "the capture runs"
+        );
+        let reference = ingest(single, T, frames());
+        assert_eq!(reference.exit_code(), 0, "{:?}", reference.error);
+        (last_run_start(config), last_run_start(single))
+    }
+
+    /// AW2 (a) and (b) offline: after an adoption, `mie ingest` starts with
+    /// both copy targets gone, and with the copy ledger deleted on the
+    /// intact hot, captures, and journals the seeds of a single-root start
+    /// over the source; the listing is `union` and `hot`.
+    #[test]
+    fn after_an_adoption_the_capture_starts_with_the_single_root_seeds() {
+        let runs: [(i64, &[i64]); 2] = [
+            (
+                T - 5 * DAY_MS,
+                &[T - 5 * DAY_MS + 1_000, T - 5 * DAY_MS + 2_000],
+            ),
+            (T - DAY_MS, &[T - DAY_MS + 1_000, T - DAY_MS + 3_000]),
+        ];
+        let first_hot = mie_cli::ingest::first_hot_date(T);
+        for case in ["targets gone", "ledger deleted"] {
+            let (dir, single) = (TempDir::new("adopted-aw2"), TempDir::new("adopted-aw2-1"));
+            let (config, single_config) = adopted(dir.path(), single.path(), &first_hot, &runs);
+            if case == "targets gone" {
+                // Both gone is stronger than one unreadable: the union
+                // `select` never lists a cold root.
+                for name in ["cold-a", "cold-b"] {
+                    let root = dir.path().join(name);
+                    std::fs::rename(&root, root.with_extension("aside")).unwrap();
+                }
+            } else {
+                std::fs::remove_file(copy_ledger::ledger_path(&config.paths.raw_root)).unwrap();
+            }
+            let (start, reference) = starts(&config, &single_config);
+            assert_ne!(reference["seeds"], serde_json::json!({}), "{case}");
+            assert_eq!(start["seeds"], reference["seeds"], "{case}");
+            if case == "targets gone" {
+                assert_eq!(start["seed_listing"], "union", "{case}: {start}");
+            } else {
+                assert_eq!(start["seed_listing"], "hot", "{case}: {start}");
+                let error = start["seed_listing_error"].as_str().unwrap();
+                assert!(error.contains("copy ledger"), "{error}");
+            }
+        }
+    }
+
+    /// AW2's short-window variant: a hot window shorter than the seed
+    /// lookback (first hot date T − 2 d) removes the partition of a stream
+    /// quiet since T − 5 d. With the ledger the union keeps its seed; the
+    /// degraded start lists hot only and misses it, which is why D8 ties
+    /// the hot window to the lookback.
+    #[test]
+    fn a_hot_window_shorter_than_the_lookback_loses_a_seed_in_the_degraded_start() {
+        let quiet = T - 5 * DAY_MS;
+        let runs: [(i64, &[i64]); 1] = [(quiet, &[quiet + 1_000, quiet + 2_000])];
+        // The date of T − 2 d; the production window starts at T − 7 d.
+        let first_hot = "2026-10-04";
+        assert_eq!(mie_cli::ingest::first_hot_date(T), "2026-09-29");
+        for ledger in ["intact", "deleted"] {
+            let (dir, single) = (
+                TempDir::new("adopted-short"),
+                TempDir::new("adopted-short-1"),
+            );
+            let (config, single_config) = adopted(dir.path(), single.path(), first_hot, &runs);
+            let raw = &config.paths.raw_root;
+            assert!(
+                !raw.join("source=binance-um/instrument=BTCUSDT/stream=aggTrade/date=2026-10-01")
+                    .exists()
+            );
+            if ledger == "deleted" {
+                std::fs::remove_file(copy_ledger::ledger_path(raw)).unwrap();
+            }
+            let (start, reference) = starts(&config, &single_config);
+            assert_eq!(
+                reference["seeds"]["aggTrade"],
+                serde_json::json!(quiet + 2_000),
+                "{reference}"
+            );
+            if ledger == "intact" {
+                assert_eq!(start["seeds"], reference["seeds"]);
+                assert_eq!(start["seed_listing"], "union");
+            } else {
+                assert_eq!(start["seeds"], serde_json::json!({}), "{start}");
+                assert_eq!(start["seed_listing"], "hot");
+            }
+        }
+    }
 }
