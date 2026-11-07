@@ -364,27 +364,36 @@ fn ledger_view(records: &[Record]) -> (BTreeSet<String>, BTreeMap<String, u32>) 
     (removed, highest)
 }
 
-/// Between a crash and the re-run, an append into a partition the ledger
-/// records as removed, or one where the ledger knows a part hot lacks, is
-/// refused by the writer guard and creates nothing. Returns how many
-/// appends of the second kind were refused.
+/// Between a crash and the re-run, an append into a source partition that
+/// the crashed adoption has *exposed* (the ledger knows one of its parts,
+/// or a copy target holds one) while hot does not hold all its source
+/// parts yet, or into one recorded as removed, is refused by the writer
+/// guard and creates nothing: otherwise the capture could seal a path a
+/// target holds, or will hold, with other bytes (D5). Exposure is read
+/// from the roots and the ledger, not from the guard's own rule. Returns
+/// how many exposed, incomplete partitions were tried.
 fn assert_guard_refuses(fixture: &Fixture) -> usize {
     let (removed, highest) = ledger_view(&fixture.records());
     let mut partly = 0;
-    let partitions: BTreeSet<String> = replica::list_sealed(&fixture.raw())
-        .unwrap()
+    let source = replica::list_sealed(&fixture.raw()).unwrap();
+    let on_hot = replica::list_sealed(&fixture.hot).unwrap();
+    let on_targets: Vec<String> = fixture
+        .cold
         .iter()
-        .map(|p| partition_of(p).to_owned())
+        .flat_map(|root| replica::list_sealed(root).unwrap())
         .collect();
+    let partitions: BTreeSet<String> = source.iter().map(|p| partition_of(p).to_owned()).collect();
     for partition in partitions {
-        let hot_next = replica::list_sealed(&fixture.hot)
-            .unwrap()
+        let in_partition = |p: &&String| partition_of(p) == partition;
+        let exposed =
+            highest.contains_key(&partition) || on_targets.iter().any(|p| in_partition(&p));
+        let complete = source
             .iter()
-            .filter(|p| partition_of(p) == partition)
-            .count() as u32;
+            .filter(in_partition)
+            .all(|p| on_hot.contains(p));
         let expected = if removed.contains(&partition) {
             "is recorded as removed from hot"
-        } else if highest.get(&partition).is_some_and(|&h| h >= hot_next) {
+        } else if exposed && !complete {
             partly += 1;
             "hot's next part number is"
         } else {
@@ -589,4 +598,111 @@ fn the_pass_lock_and_the_writers_are_held_for_the_run() {
         .tiered()
         .writer("binance-um", RotationPolicy::default())
         .unwrap();
+}
+
+/// Review of #200, finding 1: a stop right after a copy target published a
+/// hot-window part, before any `copy` record, must still leave the writer
+/// guard refusing that partition: the ledger already knows every part of
+/// it, so a restarted capture can never seal the published path with other
+/// bytes, and the re-run completes the adoption.
+#[test]
+fn a_stop_right_after_a_target_publish_keeps_the_partition_guarded() {
+    let fixture = Fixture::new("adopt-publish-window");
+    let partition = "source=binance-um/instrument=BTCUSDT/stream=aggTrade/date=2026-10-06";
+    let published = fixture.cold[0].join(partition).join("part-00000.manifest");
+    {
+        let published = published.clone();
+        ON_STEP.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |at| {
+                if at == AdoptStep::AfterTargetPublish && published.exists() {
+                    CRASH_AT.with(|crash| crash.set(Some(at)));
+                }
+            }));
+        });
+    }
+    let crashed = fixture.adopt();
+    ON_STEP.with(|hook| hook.borrow_mut().take());
+    assert_eq!(crashed.problems, ["simulated crash: the adoption stopped"]);
+    let path = format!("{partition}/part-00000.parquet");
+    assert!(fixture.cold[0].join(&path).exists());
+    assert!(!fixture.hot.join(&path).exists());
+
+    // The capture restarts before the re-run.
+    let before = files_under(&fixture.hot);
+    let key = RawStreamKey::new("binance-um", "BTCUSDT", "aggTrade").unwrap();
+    let mut writer = fixture
+        .tiered()
+        .writer("binance-um", RotationPolicy::default())
+        .unwrap();
+    let error = writer
+        .append(
+            &key,
+            RawRecord {
+                event_time: EventTime::from_millis(D0 + 7_200_000),
+                capture: None,
+                payload: b"live-after-crash".to_vec(),
+            },
+        )
+        .unwrap_err();
+    drop(writer);
+    assert!(
+        matches!(&error, RawStoreError::Integrity(m) if m.contains(partition)
+            && m.contains("hot's next part number is 0")),
+        "{error}"
+    );
+    assert_eq!(files_under(&fixture.hot), before);
+
+    let report = fixture.adopt();
+    assert_eq!(report.problems, Vec::<String>::new(), "{report:?}");
+    assert_adopted(&fixture);
+}
+
+/// Review of #200, finding 2: a source manifest without its data, or data
+/// that does not match its manifest, is refused in the check phase, before
+/// any record or copy is written.
+#[test]
+fn a_damaged_source_part_is_refused_before_anything_is_written() {
+    for damage in ["data missing", "data differs"] {
+        let fixture = Fixture::new("adopt-damaged-source");
+        let last = replica::list_sealed(&fixture.raw()).unwrap().pop().unwrap();
+        let data = fixture.raw().join(&last);
+        if damage == "data missing" {
+            fs::remove_file(&data).unwrap();
+        } else {
+            use std::os::unix::fs::PermissionsExt;
+            let mut bytes = fs::read(&data).unwrap();
+            bytes[10] ^= 0x01;
+            fs::set_permissions(&data, fs::Permissions::from_mode(0o644)).unwrap();
+            fs::write(&data, bytes).unwrap();
+        }
+        assert_eq!(
+            replica::list_unsealed(&fixture.raw()).unwrap(),
+            Vec::<String>::new()
+        );
+        let before = [&fixture.hot, &fixture.cold[0], &fixture.cold[1]].map(|r| files_under(r));
+        let ledger = fs::read(copy_ledger::ledger_path(&fixture.hot)).unwrap();
+        let report = fixture.adopt();
+        assert_eq!(report.problems.len(), 1, "{damage}: {report:?}");
+        let expected = if damage == "data missing" {
+            "the manifest is present without its data"
+        } else {
+            "the data does not match its manifest"
+        };
+        assert!(
+            report.problems[0].contains(&last)
+                && report.problems[0].contains(expected)
+                && report.problems[0].contains("nothing was written"),
+            "{damage}: {report:?}"
+        );
+        assert_eq!(
+            fs::read(copy_ledger::ledger_path(&fixture.hot)).unwrap(),
+            ledger,
+            "{damage}"
+        );
+        assert_eq!(
+            [&fixture.hot, &fixture.cold[0], &fixture.cold[1]].map(|r| files_under(r)),
+            before,
+            "{damage}"
+        );
+    }
 }

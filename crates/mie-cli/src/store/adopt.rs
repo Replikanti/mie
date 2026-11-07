@@ -24,7 +24,8 @@
 //!    every copy target presents its marker (refused, not skipped as in
 //!    the pass: every adopted file needs k copies); ids are distinct and not
 //!    `hot`, and the devices too; the source holds no seal debris and no
-//!    `PENDING`; every archive part has the entry that lists it with its
+//!    `PENDING`, and every source part's data matches its manifest (so a
+//!    damaged source is refused with nothing written); every archive part has the entry that lists it with its
 //!    manifest's SHA-256, and every listed part is in the source or already
 //!    in the store. The **path rule** (D10, D5): each source path's
 //!    manifest is compared with the ledger's `manifest` record, hot's
@@ -40,16 +41,19 @@
 //!       removed yet. First, so the interim writer guard refuses an append
 //!       to those dates from the first byte on (D6). Adoption deletes
 //!       nothing: the record only says that hot holds no copy.
-//!    2. Per file in path order: to every copy target without a `copy`
-//!       record (marker re-read before and after the copy, then the
-//!       `manifest` record with the first copy, then the `copy` record),
-//!       then to hot when its partition is on hot's side. Targets come
-//!       first, so a crash leaves the ledger knowing a part that hot may
-//!       lack, which the writer guard refuses until a re-run completes it.
-//!    3. The source's import entries to hot's import ledger, after all
+//!    2. The `manifest` record of every source file the ledger does not
+//!       know yet, before any copy. From the first published byte on, the
+//!       ledger then knows every part of every adopted partition, and the
+//!       writer guard refuses a new part there until hot holds them all,
+//!       so a capture that restarts after a crash can never seal a path a
+//!       target holds, or will hold, with other bytes (review of #200).
+//!    3. Per file in path order: to every copy target without a `copy`
+//!       record (marker re-read before and after the copy, then the `copy`
+//!       record), then to hot when its partition is on hot's side.
+//!    4. The source's import entries to hot's import ledger, after all
 //!       their parts.
-//!    4. The source journal to hot's journal, as a byte-prefix extension.
-//!    5. One replication pass under the held pass lock, so the ledger, the
+//!    5. The source journal to hot's journal, as a byte-prefix extension.
+//!    6. One replication pass under the held pass lock, so the ledger, the
 //!       journal and the entries have k copies before the run returns.
 //!
 //! A re-run with the same arguments resumes: identical paths are only
@@ -105,9 +109,9 @@ pub struct AdoptReport {
 pub(crate) enum AdoptStep {
     /// Every `removed` record was appended.
     AfterRemovedRecords,
-    /// A file was published on a copy target, before its records.
+    /// A file was published on a copy target, before its `copy` record.
     AfterTargetPublish,
-    /// The `manifest` record was appended, before the `copy` record.
+    /// A `manifest` record was appended, before any copy.
     AfterManifestRecord,
     /// A `copy` record was appended.
     AfterCopyRecord,
@@ -629,7 +633,8 @@ impl Run<'_> {
             None => Vec::new(),
         };
 
-        // The source's sealed files and their manifests.
+        // The source's sealed files, their manifests, and their data
+        // verified against them.
         let listed = replica::list_sealed(&from)
             .map_err(|e| self.fail(format!("--from {}: {e}", from.display())))?;
         let mut files = Vec::new();
@@ -646,6 +651,15 @@ impl Run<'_> {
                     return Err(self.fail(format!("--from {}: {error}", from.display())));
                 }
             };
+            // The data must match its manifest now, before any write: a
+            // damaged source found while it is copied would stop the run
+            // with records and copies already written.
+            replica::verify_sealed(&from, &file).map_err(|error| {
+                self.fail(format!(
+                    "--from {}: {error}; the store is not adopted and nothing was written",
+                    from.display()
+                ))
+            })?;
             files.push(SourceFile {
                 partition: partition_of(&path).to_owned(),
                 path,
@@ -909,12 +923,30 @@ impl Run<'_> {
         }
         reached(AdoptStep::AfterRemovedRecords)?;
 
-        // 2. Every file: the targets, then hot.
+        // 2. The `manifest` record of every file the ledger does not know,
+        // before any copy: from the first publish on, the writer guard
+        // knows every part of every adopted partition (D6 interim).
+        let mut recorded = BTreeSet::new();
+        for file in &plan.files {
+            if self.fold.manifests.contains_key(&file.path) {
+                continue;
+            }
+            self.append(Kind::Manifest {
+                text: file.text.clone(),
+            })?;
+            self.fold
+                .manifests
+                .insert(file.path.clone(), file.text.clone());
+            recorded.insert(file.path.as_str());
+            reached(AdoptStep::AfterManifestRecord)?;
+        }
+
+        // 3. Every file: the targets, then hot.
         let (mut adopted, mut bytes, mut identical, mut to_hot) = (0u64, 0u64, 0u64, 0u64);
         let mut per_partition: BTreeMap<&str, u64> = BTreeMap::new();
         for file in &plan.files {
             let path = file.path.as_str();
-            let mut wrote = false;
+            let mut wrote = recorded.contains(path);
             for target in &plan.targets {
                 if self.fold.has_copy(path, &target.id) {
                     continue;
@@ -933,15 +965,6 @@ impl Run<'_> {
                 })?;
                 reached(AdoptStep::AfterTargetPublish)?;
                 self.marker_present(target)?;
-                if !self.fold.manifests.contains_key(path) {
-                    self.append(Kind::Manifest {
-                        text: file.text.clone(),
-                    })?;
-                    self.fold
-                        .manifests
-                        .insert(path.to_owned(), file.text.clone());
-                    reached(AdoptStep::AfterManifestRecord)?;
-                }
                 self.append(Kind::Copy {
                     path: path.to_owned(),
                     root: target.id.clone(),
@@ -983,7 +1006,7 @@ impl Run<'_> {
             }
         }
 
-        // 3. The entries, after all their parts.
+        // 4. The entries, after all their parts.
         let mut entries = 0u64;
         if let Some(hot_ledger) = &plan.hot_import_ledger {
             for entry in &plan.entries {
@@ -1006,7 +1029,7 @@ impl Run<'_> {
             }
         }
 
-        // 4. The journal.
+        // 5. The journal.
         let mut journal_bytes = 0;
         if let Some((source, length)) = &plan.journal {
             let dest = config.paths.journal.clone();
@@ -1045,7 +1068,7 @@ impl Run<'_> {
             if entries == 1 { "y" } else { "ies" }
         ));
 
-        // 5. One pass under the held lock.
+        // 6. One pass under the held lock.
         let pass = replicate::run_locked(
             config,
             self.request.archive_config.as_deref(),

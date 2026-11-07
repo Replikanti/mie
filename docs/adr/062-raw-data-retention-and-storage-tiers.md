@@ -356,10 +356,15 @@ live in more than one root (approved as written at STOP 1).
     (D5);
   - a partition whose highest recorded part is at or above hot's next
     number, naming both numbers and the re-run of the adoption. Why:
-    adoption copies each file to the targets before hot (D10), so a crash
-    between the two leaves the ledger knowing a part that hot lacks, and
-    hot's listing would number the next part onto that path. The same
-    check catches a hot that lost a recorded part.
+    adoption appends the `manifest` record of every source file before
+    its first copy (D10), so from the first published byte on the ledger
+    knows every part of each adopted partition. Until hot holds them all,
+    hot's listing would number a new part onto a path a copy target holds
+    or will hold, with other bytes (D5). Recording the manifests first is
+    what closes the window between a target's publish and its records: a
+    crash, a failed append or a lost marker there would otherwise leave
+    the ledger knowing nothing of a part the target already holds (review
+    of #200). The same check catches a hot that lost a recorded part.
 
   The refusal poisons the writer, as any failed storage step does. The
   snapshot taken at writer open is enough: every writer of `removed`
@@ -503,7 +508,7 @@ live in more than one root (approved as written at STOP 1).
   recovery walk only `source=` entries). Its first line is the header
   `mie-copy-ledger 1`. It records:
   - for each sealed file, the manifest text verbatim, written with its
-    first verified copy;
+    first verified copy (by the adoption, before its first copy, D10);
   - for each verified copy, the file, the root id and the time;
   - for each partition removed from hot, the removal (D6), and its return
     (D6 recall, D11 hot restore);
@@ -584,7 +589,7 @@ live in more than one root (approved as written at STOP 1).
 
     | Kind | Fields after `<kind> <at_ms>` | First written by |
     |---|---|---|
-    | `manifest` | the escaped manifest text | the first verified copy |
+    | `manifest` | the escaped manifest text | the first verified copy; the adoption before its first copy (D10) |
     | `copy` | data path, root id | each verified copy |
     | `removed` | partition directory | hot removal (D6) |
     | `returned` | partition directory | the recall (D6), the hot restore (D11) |
@@ -1019,7 +1024,10 @@ adopted into the production store. The protocol (#190):
   skipped as in the pass, because an adoption must leave every file with
   k copies; ids and devices are distinct (D11); the source holds no seal
   debris (`replica::list_unsealed`), which the adoption cannot recover
-  because it never writes the source; its import ledger holds no
+  because it never writes the source; every source part's data exists
+  and matches its manifest (size, then SHA-256, streamed), so a damaged
+  source is refused with nothing written instead of stopping the run
+  after records and copies (review of #200); its import ledger holds no
   `PENDING`; every source archive part is listed by a source entry with
   its manifest's SHA-256 (D11 *Archive parts wait for their import
   entry*), every part an entry lists is in the source or already in the
@@ -1037,29 +1045,37 @@ adopted into the production store. The protocol (#190):
   re-run then resumes an interrupted journal copy.
 - **The write order:** (1) `removed` for every source partition older
   than the hot window that has no directory on hot and is not recorded
-  removed yet; (2) per file in path order, every copy target without its
-  `copy` record (the marker re-read before and after the copy, then the
-  `manifest` record with the first copy, then the `copy` record), then
-  hot when the partition is on hot's side (a hot-window date, or a
-  directory already on hot, and not recorded removed); (3) the source's
-  entries to hot's import ledger, after all their parts; (4) the journal,
-  extended as a byte prefix; (5) one replication pass under the held pass
-  lock, so the ledger, the journal and the entries have k copies before
-  the run returns. Why `removed` first: from the first byte on, the
-  writer's interim guard (D6) refuses an append into those dates, so no
-  path can be reused while the adoption runs or after it crashed. A
-  `removed` record of an adopted partition asserts only that hot holds no
-  copy; adoption deletes nothing, and a run that leaves a file below k
-  fails. Why targets before hot: a crash then leaves extra copies on the
-  targets, never a hot file that the ledger does not list, and the
-  guard's part check refuses the partition until a re-run completes it.
+  removed yet; (2) the `manifest` record of every source file the ledger
+  does not know yet, before any copy; (3) per file in path order, every
+  copy target without its `copy` record (the marker re-read before and
+  after the copy, then the `copy` record), then hot when the partition is
+  on hot's side (a hot-window date, or a directory already on hot, and
+  not recorded removed); (4) the source's entries to hot's import ledger,
+  after all their parts; (5) the journal, extended as a byte prefix; (6)
+  one replication pass under the held pass lock, so the ledger, the
+  journal and the entries have k copies before the run returns. Why
+  `removed` first: from the first byte on, the writer's interim guard
+  (D6) refuses an append into those dates, so no path can be reused while
+  the adoption runs or after it crashed. A `removed` record of an adopted
+  partition asserts only that hot holds no copy; adoption deletes
+  nothing, and a run that leaves a file below k fails. Why the
+  `manifest` records before any copy: the guard's part check then refuses
+  every adopted partition from the first publish until hot holds all its
+  parts (D6 *Interim*). This is the one place where a `manifest` record
+  precedes its first verified copy. Until the re-run completes, a
+  selection that covers such a file lists it and its read fails with
+  `Integrity` (missing on every root), never a shorter selection. Why
+  targets before hot: a crash then leaves extra copies on the targets,
+  never a hot file that the ledger does not list.
 - **Resuming and failure.** A re-run with the same arguments resumes,
   because identical paths are only completed. The writes stop at the
   first failure, which is named: a store cannot be half adopted on
   purpose, and going on would only copy more bytes before the same
-  failure. Source data is verified while it is streamed (D5), not in the
-  check phase, so a damaged source file ends the run there, with a
-  consistent partial state.
+  failure. The source data is verified twice: in the check phase, so a
+  damaged source is refused before anything is written, and again while
+  it is streamed (D5), which catches a source that changed in between.
+  The cost is reading the source twice (51.0 GB of archive plus the
+  live store, D10), once per adoption, which is a one-time bootstrap.
 - **Rejected,** writing the adoption into `mie store init` (the wording
   before #190): adopting several stores (the #22 store, then the archive)
   and later backfills needs a verb that runs more than once on an

@@ -363,6 +363,37 @@ pub fn parse_manifest(text: &str) -> Result<SealedFile, RawStoreError> {
     manifest::parse(text)
 }
 
+/// Verifies the data of the sealed part `file` on `root` against its
+/// manifest, size first, then SHA-256, streamed through a bounded buffer.
+///
+/// The adoption of another store (ADR-062 D10) checks every source part
+/// this way before it writes anything, so a damaged source is refused
+/// with nothing written rather than found mid-run.
+///
+/// # Errors
+///
+/// [`RawStoreError::Integrity`] when the data file is missing or does not
+/// match; [`RawStoreError::Io`] when it cannot be read.
+pub fn verify_sealed(root: &Path, file: &SealedFile) -> Result<(), RawStoreError> {
+    let path = layout::resolve(root, &file.relative_path);
+    match matches_manifest(&path, file) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(RawStoreError::Integrity(format!(
+            "{} on {}: the data does not match its manifest",
+            file.relative_path,
+            root.display()
+        ))),
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            Err(RawStoreError::Integrity(format!(
+                "{} on {}: the manifest is present without its data",
+                file.relative_path,
+                root.display()
+            )))
+        }
+        Err(error) => Err(io_error("read", &path)(error)),
+    }
+}
+
 /// The size and SHA-256 of a file, streamed through a bounded buffer.
 fn hash_file(path: &Path) -> std::io::Result<(u64, String)> {
     let mut file = File::open(path)?;

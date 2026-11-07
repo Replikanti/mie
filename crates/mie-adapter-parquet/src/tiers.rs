@@ -164,9 +164,11 @@ impl LedgerView {
 /// numbers a part from hot's listing alone. Two appends would then reuse a
 /// path that a copy target already holds (D5): an append into a partition
 /// the ledger records as removed from hot (an adopted old date), and an
-/// append into a partition whose recorded parts hot does not hold yet (a
-/// crashed adoption that published a file on the targets before hot). The
-/// guard refuses both before anything is created.
+/// append into a partition whose recorded parts hot does not hold yet (an
+/// adoption that stopped before hot held every part: it records every
+/// source file's manifest before its first copy, so the ledger knows each
+/// part a copy target holds or will hold). The guard refuses both before
+/// anything is created.
 ///
 /// The snapshot taken at writer open is enough: every writer of `removed`
 /// records holds the source's writer lock (only `mie store adopt` until

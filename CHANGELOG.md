@@ -17,9 +17,10 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   <ingest config> [--archive-config <archive config>] --from <store root>
   [--journal <path>] [--import-ledger <dir>]` adopts a closed single-root
   store into an initialized tiered store without passing its data through
-  hot: every sealed file goes straight to every copy target by the D5
-  copy and is recorded (`manifest`, then `copy`); every partition before
-  the first hot date is recorded `removed` first, before any copy; the
+  hot: every partition before the first hot date is recorded `removed`
+  first, then the `manifest` record of every source file, both before any
+  copy; then every sealed file goes straight to every copy target by the
+  D5 copy and gets its `copy` records; the
   hot-window partitions, the import entries and the journal (only into an
   absent journal or a byte prefix of the source's) go to hot; then one
   replication pass runs under the held pass lock. The source is only read.
@@ -27,7 +28,8 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   bytes it is `Integrity` and nothing is written, a new path is adopted,
   so a re-run resumes a crashed adoption and a later run adopts another
   store. It refuses, before writing, a source with `.mie/`, seal debris,
-  a pending import, an orphan archive part or an active writer, a
+  a part whose data is missing or does not match its manifest, a pending
+  import, an orphan archive part or an active writer, a
   `--from` overlapping hot or a cold root, and a copy target without its
   marker. The hot window's first date is `mie_cli::ingest::first_hot_date`
   (today − 7, derived from the seed lookback, never configured). Until the
@@ -35,7 +37,8 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   before creating anything, a part in a partition the copy ledger records
   as removed from hot or below a part number the ledger already knows; an
   import refused this way leaves its `PENDING` in place.
-  `replica::list_unsealed` lists a root's seal debris.
+  `replica::list_unsealed` lists a root's seal debris and
+  `replica::verify_sealed` checks a part's data against its manifest.
   `tools/tier-reports.sh` prints the AW1 reports (`mie replay --source
   live`, `mie replay --source archive`, `mie equivalence`) for the given
   windows with local paths stripped, so host runs diff against one

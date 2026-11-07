@@ -170,6 +170,27 @@ fn list_unsealed_names_each_kind_of_seal_debris_and_only_those() {
 }
 
 #[test]
+fn verify_sealed_refuses_missing_or_differing_data() {
+    let fixture = TieredFixture::new("replica-verify");
+    let (path, _) = first_part(&fixture);
+    let (_, file) = sealed_manifest(&fixture.hot, &path).unwrap().unwrap();
+    verify_sealed(&fixture.hot, &file).unwrap();
+    let data = layout::resolve(&fixture.hot, &path);
+    flip_file(&data, 10);
+    let error = verify_sealed(&fixture.hot, &file).unwrap_err();
+    assert!(
+        matches!(&error, RawStoreError::Integrity(m) if m.contains("does not match its manifest")),
+        "{error:?}"
+    );
+    fs::remove_file(&data).unwrap();
+    let error = verify_sealed(&fixture.hot, &file).unwrap_err();
+    assert!(
+        matches!(&error, RawStoreError::Integrity(m) if m.contains("without its data")),
+        "{error:?}"
+    );
+}
+
+#[test]
 fn a_copy_is_byte_identical_and_a_second_copy_only_finds_it() {
     let fixture = TieredFixture::new("replica-copy");
     let (path, partition) = first_part(&fixture);

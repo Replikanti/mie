@@ -894,6 +894,35 @@ fn every_refusal_writes_nothing() {
             "holds the debris of an interrupted seal",
         ),
         (
+            "a source manifest without its data",
+            Box::new(move |fixture, _, _| {
+                let path = replica::list_sealed(&fixture.src_raw())
+                    .unwrap()
+                    .pop()
+                    .unwrap();
+                std::fs::remove_file(fixture.src_raw().join(path)).unwrap();
+                none()
+            }),
+            "the manifest is present without its data",
+        ),
+        (
+            "source data that does not match its manifest",
+            Box::new(move |fixture, _, _| {
+                use std::os::unix::fs::PermissionsExt;
+                let path = replica::list_sealed(&fixture.src_raw())
+                    .unwrap()
+                    .pop()
+                    .unwrap();
+                let data = fixture.src_raw().join(path);
+                let mut bytes = std::fs::read(&data).unwrap();
+                bytes[10] ^= 0x01;
+                std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o644)).unwrap();
+                std::fs::write(&data, bytes).unwrap();
+                none()
+            }),
+            "the data does not match its manifest",
+        ),
+        (
             "a pending import in the source",
             Box::new(move |fixture, _, _| {
                 std::fs::write(fixture.src().join("ledger/PENDING"), b"x").unwrap();
