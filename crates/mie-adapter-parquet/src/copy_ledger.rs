@@ -229,7 +229,8 @@ impl Subject {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Kind {
     /// `manifest`: the manifest text of a sealed file, verbatim, written
-    /// with its first verified copy.
+    /// with its first verified copy, or by the adoption before its first
+    /// copy (ADR-062 D10).
     Manifest {
         /// The manifest text; it must parse as a manifest.
         text: String,

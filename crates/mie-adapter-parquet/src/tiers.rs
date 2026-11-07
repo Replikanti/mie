@@ -156,6 +156,119 @@ impl LedgerView {
     }
 }
 
+/// The interim writer guard of a tiered store (ADR-062 D6, #190 until
+/// #191): what the copy ledger knows of one source's partitions, read once
+/// when the writer opens.
+///
+/// Until #191 brings the recall and union part numbering, the writer
+/// numbers a part from hot's listing alone. Two appends would then reuse a
+/// path that a copy target already holds (D5): an append into a partition
+/// the ledger records as removed from hot (an adopted old date), and an
+/// append into a partition whose recorded parts hot does not hold yet (an
+/// adoption that stopped before hot held every part: it records every
+/// source file's manifest before its first copy, so the ledger knows each
+/// part a copy target holds or will hold). The guard refuses both before
+/// anything is created.
+///
+/// The snapshot taken at writer open is enough: every writer of `removed`
+/// records holds the source's writer lock (only `mie store adopt` until
+/// #191), so none runs while this writer is open. `manifest` and `copy`
+/// records that the replication pass appends meanwhile name parts hot
+/// already holds, so they never raise a partition's highest part above
+/// hot's.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct TierGuard {
+    /// The ledger, for messages.
+    ledger: std::path::PathBuf,
+    /// Partition directories whose latest `removed` / `returned` record is
+    /// `removed`.
+    removed: BTreeSet<String>,
+    /// Per partition directory, the highest part number any record names.
+    highest: BTreeMap<String, u32>,
+}
+
+impl TierGuard {
+    /// Folds `ledger` (the copy ledger of the store rooted at `hot`) for
+    /// the partitions of `source`.
+    ///
+    /// # Errors
+    ///
+    /// [`RawStoreError::Corrupt`] for a `manifest` text that does not parse
+    /// and [`RawStoreError::Invalid`] for a path outside the layout; the
+    /// ledger parser has already refused both, so either means the writer
+    /// fails closed.
+    pub(crate) fn fold(hot: &Path, ledger: &Ledger, source: &str) -> Result<Self, RawStoreError> {
+        let prefix = format!("{}/", layout::source_dir(source));
+        let mut guard = Self {
+            ledger: copy_ledger::ledger_path(hot),
+            ..Self::default()
+        };
+        for record in &ledger.records {
+            let path = match &record.kind {
+                Kind::Manifest { text } => manifest::parse(text)?.relative_path,
+                Kind::Copy { path, .. }
+                | Kind::Lost { path, .. }
+                | Kind::Hold { path, .. }
+                | Kind::HoldCleared { path, .. }
+                | Kind::Quarantined { path, .. }
+                | Kind::Replaced { path, .. } => path.clone(),
+                Kind::Removed { partition } => {
+                    if partition.starts_with(&prefix) {
+                        guard.removed.insert(partition.clone());
+                    }
+                    continue;
+                }
+                Kind::Returned { partition } => {
+                    guard.removed.remove(partition);
+                    continue;
+                }
+                Kind::LedgerCopy { .. } | Kind::Finding { .. } | Kind::Verify { .. } => continue,
+            };
+            if !path.starts_with(&prefix) {
+                continue;
+            }
+            let (stream, date, part) = layout::parse_data_path(&path)?;
+            let highest = guard
+                .highest
+                .entry(layout::partition_dir(&stream, &date))
+                .or_insert(part);
+            *highest = (*highest).max(part);
+        }
+        Ok(guard)
+    }
+
+    /// Refuses a new part `part` (hot's next number) in the partition
+    /// directory `partition`, naming the cause (the type docs).
+    ///
+    /// # Errors
+    ///
+    /// [`RawStoreError::Integrity`] for a partition the ledger records as
+    /// removed from hot, and for one whose highest recorded part is `part`
+    /// or above.
+    pub(crate) fn check(&self, partition: &str, part: u32) -> Result<(), RawStoreError> {
+        if self.removed.contains(partition) {
+            return Err(RawStoreError::Integrity(format!(
+                "partition {partition} is recorded as removed from hot in the copy ledger {}: an \
+                 append to it needs the recall (ADR-062 D6), which #191 adds; until then the \
+                 writer refuses it and writes nothing",
+                self.ledger.display()
+            )));
+        }
+        match self.highest.get(partition) {
+            Some(&recorded) if recorded >= part => Err(RawStoreError::Integrity(format!(
+                "partition {partition}: the copy ledger {} records part {recorded} of it, but \
+                 hot's next part number is {part}, so the new part would reuse a recorded path \
+                 (ADR-062 D5). Hot must first hold every recorded part: re-run the adoption that \
+                 recorded it (`mie store adopt`) with the store it read; when that store no longer \
+                 holds the part, the adoption refuses and names it instead of passing. Union part \
+                 numbering comes with #191. The writer writes nothing",
+                self.ledger.display()
+            ))),
+            _ => Ok(()),
+        }
+    }
+}
+
 /// What the hot listing found.
 #[derive(Debug, Default)]
 struct HotListing {

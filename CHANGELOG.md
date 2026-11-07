@@ -12,6 +12,41 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
 
 ### Added
 
+- **Storage tiers, step 4: adoption, `mie store adopt` (#190, ADR-062
+  D10, D8, D6 interim guard, proposed).** `mie store adopt --config
+  <ingest config> [--archive-config <archive config>] --from <store root>
+  [--journal <path>] [--import-ledger <dir>]` adopts a closed single-root
+  store into an initialized tiered store without passing its data through
+  hot: every partition before the first hot date is recorded `removed`
+  first, then the `manifest` record of every source file, both before any
+  copy; then every sealed file goes straight to every copy target by the
+  D5 copy and gets its `copy` records; the
+  hot-window partitions, the import entries and the journal (only into an
+  absent journal or a byte prefix of the source's) go to hot; then one
+  replication pass runs under the held pass lock. The source is only read.
+  The path rule: a path held with identical bytes is skipped, with other
+  bytes it is `Integrity` and nothing is written, a new path is adopted,
+  so a re-run resumes a crashed adoption and a later run adopts another
+  store. It refuses, before writing, a source with `.mie/`, seal debris,
+  a part whose data is missing or does not match its manifest, a recorded
+  file the source does not list that is not complete (on hot unless its
+  partition is removed, and recorded on every copy target; the same
+  predicate a PASS asserts at its end), a pending
+  import, an orphan archive part or an active writer, a
+  `--from` overlapping hot or a cold root, and a copy target without its
+  marker. The hot window's first date is `mie_cli::ingest::first_hot_date`
+  (today − 7, derived from the seed lookback, never configured). Until the
+  recall (#191), a tiered store's writer refuses, with `Integrity` and
+  before creating anything, a part in a partition the copy ledger records
+  as removed from hot or below a part number the ledger already knows; an
+  import refused this way leaves its `PENDING` in place.
+  `replica::list_unsealed` lists a root's seal debris and
+  `replica::verify_sealed` checks a part's data against its manifest.
+  `tools/tier-reports.sh` prints the AW1 reports (`mie replay --source
+  live`, `mie replay --source archive`, `mie equivalence`) for the given
+  windows with local paths stripped, so host runs diff against one
+  baseline. Offline tests cover AC1, AW1, AW2 (both copy targets gone, the
+  ledger deleted, a short hot window), AW4 and a crash at every step.
 - **Storage tiers, step 3: the copy protocol and `mie store replicate`
   (#189, ADR-062 D5, D9, D11, proposed).** `mie-adapter-parquet` gains
   `replica`, the copy primitives of the replication pass: the D5 copy of a

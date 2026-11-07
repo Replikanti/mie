@@ -201,14 +201,14 @@ struct Target {
 /// path, the paths with conflicting texts, and the root ids of each path's
 /// copy records.
 #[derive(Default)]
-struct Fold {
-    manifests: BTreeMap<String, String>,
-    conflicts: BTreeSet<String>,
-    copies: BTreeMap<String, BTreeSet<String>>,
+pub(super) struct Fold {
+    pub(super) manifests: BTreeMap<String, String>,
+    pub(super) conflicts: BTreeSet<String>,
+    pub(super) copies: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl Fold {
-    fn new(records: &[Record]) -> Result<Self, RawStoreError> {
+    pub(super) fn new(records: &[Record]) -> Result<Self, RawStoreError> {
         let mut fold = Self::default();
         for record in records {
             match &record.kind {
@@ -236,7 +236,7 @@ impl Fold {
         Ok(fold)
     }
 
-    fn has_copy(&self, path: &str, id: &str) -> bool {
+    pub(super) fn has_copy(&self, path: &str, id: &str) -> bool {
         self.copies.get(path).is_some_and(|ids| ids.contains(id))
     }
 
@@ -245,15 +245,16 @@ impl Fold {
     }
 }
 
-/// One import-ledger entry on hot.
-struct Entry {
+/// One import-ledger entry on hot (or, for the adoption, in the import
+/// ledger of the store it adopts).
+pub(super) struct Entry {
     /// `<segment>/<name>.import`.
-    name: String,
-    segment: String,
-    file_name: String,
-    path: PathBuf,
+    pub(super) name: String,
+    pub(super) segment: String,
+    pub(super) file_name: String,
+    pub(super) path: PathBuf,
     /// The data paths it lists, with their SHA-256.
-    files: Vec<(String, String)>,
+    pub(super) files: Vec<(String, String)>,
 }
 
 /// The pass in progress.
@@ -388,7 +389,7 @@ fn is_local(error: &RawStoreError) -> bool {
 
 /// The archive configuration of the pass: `--archive-config`, otherwise
 /// `[history] archive_config`, otherwise none.
-fn archive_config(
+pub(super) fn archive_config(
     config: &IngestConfig,
     given: Option<&Path>,
 ) -> Result<Option<ArchiveConfig>, String> {
@@ -413,6 +414,33 @@ pub fn run(
     ledger: &dyn LedgerAppend,
     observer: &mut dyn PassObserver,
 ) -> PassReport {
+    run_with(config, archive, probe, now_ms, ledger, observer, None)
+}
+
+/// [`run`] under a pass lock the caller already holds: `mie store adopt`
+/// ends with one pass and holds the lock for its whole run (ADR-062 D10).
+pub(crate) fn run_locked(
+    config: &IngestConfig,
+    archive: Option<&Path>,
+    probe: &dyn DeviceProbe,
+    now_ms: &dyn Fn() -> i64,
+    ledger: &dyn LedgerAppend,
+    observer: &mut dyn PassObserver,
+    lock: replica::ReplicationLock,
+) -> PassReport {
+    run_with(config, archive, probe, now_ms, ledger, observer, Some(lock))
+}
+
+/// The pass, taking the lock at its place in step 0 unless one is given.
+fn run_with(
+    config: &IngestConfig,
+    archive: Option<&Path>,
+    probe: &dyn DeviceProbe,
+    now_ms: &dyn Fn() -> i64,
+    ledger: &dyn LedgerAppend,
+    observer: &mut dyn PassObserver,
+    lock: Option<replica::ReplicationLock>,
+) -> PassReport {
     let mut report = PassReport::default();
     let Some(mut pass) = start(
         config,
@@ -421,6 +449,7 @@ pub fn run(
         now_ms,
         ledger,
         observer,
+        lock,
         &mut report,
     ) else {
         return report;
@@ -430,7 +459,10 @@ pub fn run(
     pass.report
 }
 
-/// Step 0. `None` with the refusal in `report`.
+/// Step 0. `None` with the refusal in `report`. A held `lock` is used
+/// as is; without one the pass lock is taken after the configuration
+/// refusals, as before.
+#[allow(clippy::too_many_arguments)]
 fn start<'a>(
     config: &'a IngestConfig,
     archive: Option<&Path>,
@@ -438,6 +470,7 @@ fn start<'a>(
     now_ms: &'a dyn Fn() -> i64,
     ledger: &'a dyn LedgerAppend,
     observer: &'a mut dyn PassObserver,
+    lock: Option<replica::ReplicationLock>,
     report: &mut PassReport,
 ) -> Option<Pass<'a>> {
     let mut refuse = |problem: String| {
@@ -459,7 +492,7 @@ fn start<'a>(
         Ok(archive) => archive,
         Err(error) => return refuse(error),
     };
-    let lock = match replica::try_replication_lock(hot) {
+    let lock = match lock.map_or_else(|| replica::try_replication_lock(hot), Ok) {
         Ok(lock) => lock,
         Err(error) => return refuse(error.to_string()),
     };
@@ -564,7 +597,7 @@ fn start<'a>(
 }
 
 /// Whether a data path belongs to the archive source.
-fn is_archive_part(path: &str) -> bool {
+pub(super) fn is_archive_part(path: &str) -> bool {
     path.strip_prefix("source=")
         .and_then(|rest| rest.split_once('/'))
         .is_some_and(|(source, _)| source == ARCHIVE_SOURCE)
@@ -573,7 +606,7 @@ fn is_archive_part(path: &str) -> bool {
 /// The import-ledger entries on hot, `<segment>/<name>.import`, sorted;
 /// `PENDING`, hidden temp files and anything else are never listed. An
 /// entry that cannot be read or parsed is returned as a problem.
-fn hot_entries(import_ledger: &Path) -> (Vec<Entry>, Vec<String>) {
+pub(super) fn hot_entries(import_ledger: &Path) -> (Vec<Entry>, Vec<String>) {
     let (mut entries, mut problems) = (Vec::new(), Vec::new());
     let segments = match sorted_names(import_ledger) {
         Ok(names) => names,
@@ -684,7 +717,7 @@ fn first_line_naming(
 }
 
 /// The UTF-8 entry names of `dir`, sorted; a missing directory has none.
-fn sorted_names(dir: &Path) -> std::io::Result<Vec<String>> {
+pub(super) fn sorted_names(dir: &Path) -> std::io::Result<Vec<String>> {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),

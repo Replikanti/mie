@@ -80,6 +80,7 @@ use crate::journal::{
     warm_start_json,
 };
 use crate::replay::history_chain;
+use mie_adapter_binance::archive::catalog::civil_from_days;
 use mie_adapter_binance::transport::{Clock, HttpGet, WsConnector};
 use mie_adapter_binance::{
     BinanceLiveProvider, BinanceStream, CaptureSummary, ChainTail, CoreFeed, HistoryChain, LiveRun,
@@ -108,6 +109,27 @@ const DAY_MS: i64 = 86_400_000;
 
 /// How far back the seeds look.
 const SEED_LOOKBACK_MS: i64 = 7 * DAY_MS;
+
+/// The first event time of the seed window at `now_ms`: `now − 7 d`,
+/// clamped at the epoch. The window ends at `now + 1 d`.
+fn seed_window_start(now_ms: i64) -> i64 {
+    now_ms.saturating_sub(SEED_LOOKBACK_MS).max(0)
+}
+
+/// The first UTC date of the hot window at `now_ms` (ADR-062 D8): the date
+/// of the seed window's start, `YYYY-MM-DD`.
+///
+/// D8 derives the hot window from the seed scan: the window `[now − 7 d,
+/// now + 1 d)` starts on this date at any time of day, so hot must hold that
+/// whole date and every later one, and the degraded start's hot-only listing
+/// then gives the same seeds as the union. It is computed from
+/// `SEED_LOOKBACK_MS` and never configured, so a later ADR that changes the
+/// lookback moves the hot window with it. `mie store adopt` records every
+/// partition before this date as removed from hot (D10).
+pub fn first_hot_date(now_ms: i64) -> String {
+    let (year, month, day) = civil_from_days(seed_window_start(now_ms).div_euclid(DAY_MS));
+    format!("{year:04}-{month:02}-{day:02}")
+}
 
 /// The I/O the run uses; real ones in `main`, fakes in tests.
 pub struct Transports {
@@ -602,7 +624,7 @@ fn seeds(
     }
     // Open klines are stored at their future close time, so look ahead too.
     let window = ReplayWindow {
-        start: EventTime::from_millis(now_ms.saturating_sub(SEED_LOOKBACK_MS).max(0)),
+        start: EventTime::from_millis(seed_window_start(now_ms)),
         end: EventTime::from_millis(now_ms.saturating_add(DAY_MS)),
     };
     let selection = RawSelection::new(keys, window).map_err(|e| e.to_string())?;
@@ -931,4 +953,29 @@ fn panic_message(payload: &(dyn Any + Send)) -> String {
         .map(|s| (*s).to_owned())
         .or_else(|| payload.downcast_ref::<String>().cloned())
         .unwrap_or_else(|| "a non-text panic".to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 2026-10-06T00:00:00Z.
+    const D0: i64 = 1_791_244_800_000;
+
+    #[test]
+    fn the_first_hot_date_is_the_seed_window_start_date() {
+        // ADR-062 D8: at any time of day the seed window starts on
+        // today − 7, so that whole date is on hot.
+        for now in [D0, D0 + DAY_MS - 1] {
+            assert_eq!(first_hot_date(now), "2026-09-29", "{now}");
+            let start = seed_window_start(now);
+            let (y, m, d) = civil_from_days(start.div_euclid(DAY_MS));
+            assert_eq!(format!("{y:04}-{m:02}-{d:02}"), first_hot_date(now));
+        }
+        assert_eq!(first_hot_date(D0 + DAY_MS), "2026-09-30");
+        // Clamped at the epoch, as the seed window is.
+        assert_eq!(first_hot_date(0), "1970-01-01");
+        assert_eq!(first_hot_date(3 * DAY_MS), "1970-01-01");
+        assert_eq!(first_hot_date(8 * DAY_MS), "1970-01-02");
+    }
 }
