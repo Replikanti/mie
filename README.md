@@ -10,8 +10,10 @@ finds out which combinations of market state, regime, location and trigger
 carry repeatable edge — and it may legitimately answer
 **NO SUITABLE STRATEGY**.
 
-> **Status:** workspace skeleton. The design is complete in
-> [`docs/design/`](docs/design/); implementation is tracked in
+> **Status:** pre-1.0, latest release
+> [v0.1.0](https://github.com/Replikanti/mie/releases/tag/v0.1.0). The design is
+> complete in [`docs/design/`](docs/design/), [`CHANGELOG.md`](CHANGELOG.md) lists
+> what each release ships, and the remaining work is tracked in
 > [issues](https://github.com/Replikanti/mie/issues).
 
 ## Principles
