@@ -47,6 +47,10 @@
 //! and step order, the copy of an immutable file, the tail append of an
 //! append-only file and the pass lock. `mie-cli` orchestrates the pass.
 //!
+//! [`verification`] folds one ledger read into the copy state that the hot
+//! removal, the replication pass, `mie store verify` and `mie store repair`
+//! all read (ADR-062 D6, D11).
+//!
 //! With no cold root configured neither is ever created.
 //!
 //! # Tiered store
@@ -96,6 +100,7 @@ pub mod replica;
 pub mod root_marker;
 mod schema;
 mod tiers;
+pub mod verification;
 mod writer;
 
 #[cfg(test)]

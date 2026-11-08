@@ -1013,6 +1013,85 @@ fn is_current(prefix: &[u8], records: &[Record], root_id: &str, len: u64) -> boo
     latest == Some(len)
 }
 
+/// What [`check_copy`] found about one copy target's ledger copy, in its
+/// precedence (ADR-062 D11, #192 V4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LedgerCopyCheck {
+    /// The target holds no ledger copy.
+    Absent,
+    /// The copy is a byte prefix of hot's verified prefix and its chain
+    /// verifies (a partial last line is no failure: a crashed tail append
+    /// leaves one).
+    Good,
+    /// The copy's hash chain fails at this record (0 is the header).
+    Chain {
+        /// The record number.
+        record: u64,
+        /// The byte offset of its line.
+        offset: u64,
+    },
+    /// The chain verifies, but the copy differs from hot's ledger at this
+    /// byte.
+    Diverged {
+        /// The first differing byte.
+        offset: u64,
+    },
+    /// The chain verifies and the copy agrees with hot's ledger, but it is
+    /// longer than hot's verified prefix.
+    Longer {
+        /// The copy's length.
+        len: u64,
+        /// Hot's verified prefix.
+        verified: u64,
+    },
+}
+
+/// Checks the ledger copy `<target_root>/.mie/copy-ledger` against hot's
+/// ledger (#192 V4). The copy is read **before** hot: a copy is always a
+/// prefix of a hot ledger that only grows, so a pass that extends both
+/// between the two reads can never make a good copy look diverged.
+///
+/// # Errors
+///
+/// [`RawStoreError::Integrity`] when hot's ledger is missing or fails its
+/// chain before its last record, [`RawStoreError::Corrupt`] for a bad
+/// header or grammar on hot, and [`RawStoreError::Io`] when either cannot
+/// be read.
+pub fn check_copy(hot_root: &Path, target_root: &Path) -> Result<LedgerCopyCheck, RawStoreError> {
+    let copy_path = ledger_path(target_root);
+    let copy = match fs::read(&copy_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(LedgerCopyCheck::Absent),
+        Err(error) => return Err(io_error("read", &copy_path)(error)),
+    };
+    let path = ledger_path(hot_root);
+    let hot = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Err(missing_ledger(&path)),
+        Err(error) => return Err(io_error("read", &path)(error)),
+    };
+    let verified = hot.len() as u64 - parse(&path, &hot)?.ignored_bytes;
+    Ok(classify_copy(&copy, &hot, verified))
+}
+
+/// The classification of [`check_copy`] over the bytes of a copy and of
+/// hot's ledger, whose verified prefix is `verified` bytes long.
+fn classify_copy(copy: &[u8], hot: &[u8], verified: u64) -> LedgerCopyCheck {
+    if let Some(ChainFailure { record, offset }) = check_chain(copy).failure {
+        return LedgerCopyCheck::Chain { record, offset };
+    }
+    if let Some(offset) = copy.iter().zip(hot).position(|(a, b)| a != b) {
+        return LedgerCopyCheck::Diverged {
+            offset: offset as u64,
+        };
+    }
+    let len = copy.len() as u64;
+    if len > verified {
+        return LedgerCopyCheck::Longer { len, verified };
+    }
+    LedgerCopyCheck::Good
+}
+
 /// What an append did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AppendOutcome {

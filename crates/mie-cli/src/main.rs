@@ -341,6 +341,53 @@ USAGE:
         one FAIL: <reason> line per problem and exits 1; it stops at the
         first failure.
 
+    mie store verify --config <path> [--archive-config <path>]
+                     --period-hours <P>
+        Verify every copy of a tiered raw store (ADR-062 D11): on hot,
+        every sealed file against the copy ledger's manifest; on every copy
+        target that carries its root marker, every recorded copy (present,
+        manifest identical to the ledger's, size and SHA-256), the copies
+        each file lacks, the import-ledger entries (byte for byte, with the
+        archive configuration: --archive-config, else [history]
+        archive_config), the copy-ledger copy (its hash chain, naming the
+        first failing record, and a byte prefix of hot's) and the journal
+        copy (a byte prefix of hot's, naming the first differing byte); on
+        a read-only cold root, the copies it holds. Every finding on a copy
+        target is appended to hot's copy ledger, then one verify record per
+        target; nothing on any root is written and nothing is repaired. A
+        copy target without its marker is named as not verified, with the
+        count of its copies whose last good verification is older than P
+        hours. P is required and has no default; it must be a whole number
+        of hours of at least 1. Runs beside mie ingest; refused when hot has
+        no marker or no readable copy ledger, paths.cold_roots is empty,
+        another verify or repair runs, two roots carry one id or share a
+        device. Prints one summary line per root, then PASS and exits 0, or
+        one FAIL: <finding> line per finding naming the file, the root and
+        the finding, and exits 1.
+
+    mie store repair --config <path> [--archive-config <path>] [--record-lost]
+        Repair the copies of a tiered raw store (ADR-062 D11) that mie store
+        verify recorded as damaged or missing, and fill the copy targets
+        that lack files which left hot (a target added or replaced). It
+        never runs on its own: run it after reading what verify found,
+        since several bad copies at once point at a shared cause. Each copy
+        is checked again first; a good one is only recorded again. A bad
+        copy is moved aside into <root>/.mie/damaged/<time>/, never deleted,
+        and replaced from the first good copy (hot, then the cold roots in
+        order), verified by its SHA-256 and recorded. Copy-ledger and
+        journal copies are rebuilt from hot where that is safe; a copy
+        ledger whose chain verifies but differs from hot's, a journal copy
+        no other copy agrees with, and an import entry hot cannot vouch for
+        are refused and named. A file with no good copy left is reported
+        lost and nothing is written; --record-lost then appends its lost
+        record, after which every replay that covers it fails, so pass it
+        only after a run without it reported the file. Replication pauses
+        while the repair runs; it ends with one replication pass. Refused
+        like mie store verify, and when a replication pass runs. Prints what
+        it repaired and the pass's lines, then PASS and exits 0, or one
+        FAIL: <reason> line per copy left unrepaired, file lost or refused,
+        and exits 1.
+
     mie --help
 ";
 
@@ -793,12 +840,59 @@ fn dispatch(args: &[String]) -> Result<ExitCode, String> {
                 )?;
                 Ok(exit(pass))
             }
+            Some("verify") => {
+                let options = Options::parse(
+                    &args[2..],
+                    &["--config", "--archive-config", "--period-hours"],
+                    &[],
+                )?;
+                let config =
+                    IngestConfig::load(&options.path("--config")?).map_err(|e| e.to_string())?;
+                let period = options.value("--period-hours")?.to_owned();
+                let archive = options.optional("--archive-config").map(PathBuf::from);
+                let probe = store::device_probe()?;
+                let clock = SystemClock::new();
+                let now_ms = || clock.now_utc_ns().div_euclid(1_000_000);
+                let pass = store::verify(
+                    &config,
+                    archive.as_deref(),
+                    &period,
+                    probe.as_ref(),
+                    &now_ms,
+                    &mut std::io::stdout().lock(),
+                )?;
+                Ok(exit(pass))
+            }
+            Some("repair") => {
+                let options = Options::parse(
+                    &args[2..],
+                    &["--config", "--archive-config"],
+                    &["--record-lost"],
+                )?;
+                let config =
+                    IngestConfig::load(&options.path("--config")?).map_err(|e| e.to_string())?;
+                let archive = options.optional("--archive-config").map(PathBuf::from);
+                let probe = store::device_probe()?;
+                let clock = SystemClock::new();
+                let now_ms = || clock.now_utc_ns().div_euclid(1_000_000);
+                let pass = store::repair(
+                    &config,
+                    archive.as_deref(),
+                    options.flag("--record-lost"),
+                    probe.as_ref(),
+                    &now_ms,
+                    &mut std::io::stdout().lock(),
+                )?;
+                Ok(exit(pass))
+            }
             _ => Err(
                 "expected `mie store init --config <path>`, `mie store init-root \
                  --config <path> --root <path> --id <id>`, `mie store replicate --config \
-                 <path> [--archive-config <path>]` or `mie store adopt --config <path> \
+                 <path> [--archive-config <path>]`, `mie store adopt --config <path> \
                  [--archive-config <path>] --from <path> [--journal <path>] [--import-ledger \
-                 <dir>]`"
+                 <dir>]`, `mie store verify --config <path> [--archive-config <path>] \
+                 --period-hours <P>` or `mie store repair --config <path> [--archive-config \
+                 <path>] [--record-lost]`"
                     .to_owned(),
             ),
         },

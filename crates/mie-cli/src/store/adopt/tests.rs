@@ -939,7 +939,7 @@ fn assert_partitions_take_new_parts(fixture: &Fixture) {
 /// that left hot, and the pass copies from hot only. That gap does not
 /// block the writes: re-adopting the first store fills its own files on
 /// the new target and fails naming only the second store's files with the
-/// remedy (`mie store repair`, #192, or a re-adoption); re-adopting the
+/// remedy (`mie store repair`, or a re-adoption); re-adopting the
 /// second store then passes, and so does a third store. A file of that
 /// class stays off hot: its partition stays recorded removed. The new
 /// target's journal copy stops before the `sealed` line that names an old
@@ -1047,7 +1047,7 @@ fn a_target_added_after_an_adoption_is_named_with_its_remedy() {
     let repair: Vec<&String> = again
         .problems
         .iter()
-        .filter(|p| p.contains("Fill it with `mie store repair` (#192)"))
+        .filter(|p| p.contains("Fill it with `mie store repair`"))
         .collect();
     assert_eq!(repair.len(), 1, "{again:?}");
     for path in &old_b {

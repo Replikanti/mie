@@ -535,3 +535,46 @@ fn conflicts_are_reported_and_a_copy_after_a_finding_counts_again() {
     let plan = plan_now(&fx, &TieredFixture::target_ids(), 2, &first_hot());
     assert_eq!(plan.candidates.len(), 1, "{plan:?}");
 }
+
+/// L1 of #192 in the plan: a copy-ledger finding on one target voids its
+/// `ledger-copy` record, so there is no prefix P and no candidate, until a
+/// later `ledger-copy` record for it.
+#[test]
+fn a_copy_ledger_finding_leaves_no_plan_until_a_later_ledger_copy() {
+    let fx = eligible("removal-l1-plan");
+    let targets = TieredFixture::target_ids();
+    assert_eq!(plan_now(&fx, &targets, 2, &first_hot()).candidates.len(), 1);
+    fx.append(Kind::Finding {
+        root: "cold-a".to_owned(),
+        code: FindingCode::Chain,
+        subject: Subject::CopyLedger,
+    });
+    let plan = plan_now(&fx, &targets, 2, &first_hot());
+    assert!(plan.candidates.is_empty(), "{plan:?}");
+    fx.ledger_copy(0);
+    assert_eq!(plan_now(&fx, &targets, 2, &first_hot()).candidates.len(), 1);
+}
+
+/// L1 of #192 in the re-check: a copy-ledger finding in the tail since
+/// the plan names every candidate, which stays on hot.
+#[test]
+fn a_copy_ledger_finding_after_the_plan_skips_every_candidate() {
+    let fx = eligible("removal-l1-recheck");
+    let plan = plan_now(&fx, &TieredFixture::target_ids(), 2, &first_hot());
+    assert_eq!(plan.candidates.len(), 1);
+    fx.append(Kind::Finding {
+        root: "cold-b".to_owned(),
+        code: FindingCode::Prefix,
+        subject: Subject::CopyLedger,
+    });
+    let report = remove(&fx, &plan);
+    assert!(report.removed.is_empty(), "{report:?}");
+    assert_eq!(report.skipped.len(), 1, "{report:?}");
+    assert!(
+        report.skipped[0]
+            .1
+            .contains("a finding record after the plan"),
+        "{report:?}"
+    );
+    assert!(layout::resolve(&fx.hot, &partition()).exists());
+}

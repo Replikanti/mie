@@ -35,7 +35,7 @@
 //!    (a target added or replaced, every target replaced, or a stopped
 //!    adoption) does not block the writes (its partition is recorded
 //!    removed, and the run never writes its path); the end of the run fails
-//!    naming it with its remedy (`mie store repair`, #192, when a configured
+//!    naming it with its remedy (`mie store repair` when a configured
 //!    target holds a copy, otherwise only a re-adoption of each original
 //!    store); every archive part has the entry that lists it with its
 //!    manifest's SHA-256, and every listed part is in the source or already
@@ -202,9 +202,9 @@ impl PassObserver for Truncations {
 }
 
 /// A copy target that presented its marker.
-struct Target {
-    path: PathBuf,
-    id: String,
+pub(super) struct Target {
+    pub(super) path: PathBuf,
+    pub(super) id: String,
 }
 
 /// One sealed file of the source, as the check phase decided it.
@@ -294,7 +294,7 @@ fn source_names(root: &Path) -> Result<Vec<String>, String> {
 }
 
 /// The partition directory of a data path.
-fn partition_of(path: &str) -> &str {
+pub(super) fn partition_of(path: &str) -> &str {
     path.rsplit_once('/')
         .map_or(path, |(partition, _)| partition)
 }
@@ -1148,6 +1148,7 @@ impl Run<'_> {
             &self.ledger,
             &mut self.truncations,
             lock,
+            &BTreeSet::new(),
         );
         self.report.lines.extend(pass.lines);
         self.report.problems.extend(pass.problems);
@@ -1229,9 +1230,9 @@ fn refill_problems(files: &[(String, bool)]) -> Vec<String> {
             "the copy ledger records {}, which left hot with a recorded copy on a configured copy \
              target but none on the target named: a target was added or replaced after it was \
              adopted, or an adoption stopped before it reached every target, and the replication \
-             pass copies from hot only. Fill it with `mie store repair` (#192), or until then \
-             re-adopt the original store it came from; this run adopted what it read, and only \
-             these files are short (ADR-062 D10, D11)",
+             pass copies from hot only. Fill it with `mie store repair`, which copies it from \
+             the target that holds it, or re-adopt the original store it came from; this run \
+             adopted what it read, and only these files are short (ADR-062 D10, D11)",
             repairable
         ));
     }
@@ -1251,7 +1252,9 @@ fn refill_problems(files: &[(String, bool)]) -> Vec<String> {
 
 /// The partitions recorded removed (the later of `removed` and `returned`
 /// decides) and the paths recorded lost, held, quarantined or replaced.
-fn ledger_states(records: &[Record]) -> (BTreeSet<String>, BTreeMap<String, &'static str>) {
+pub(super) fn ledger_states(
+    records: &[Record],
+) -> (BTreeSet<String>, BTreeMap<String, &'static str>) {
     let mut removed = BTreeSet::new();
     let mut marked: BTreeMap<String, &'static str> = BTreeMap::new();
     for record in records {
@@ -1281,18 +1284,18 @@ fn ledger_states(records: &[Record]) -> (BTreeSet<String>, BTreeMap<String, &'st
 }
 
 /// What a recorded file lacks of [`complete`].
-struct Gap {
+pub(super) struct Gap {
     /// Its partition is not recorded removed and hot lacks it.
-    off_hot: bool,
+    pub(super) off_hot: bool,
     /// Hot holds it.
-    on_hot: bool,
+    pub(super) on_hot: bool,
     /// The copy targets with a `copy` record of it.
-    recorded: Vec<String>,
+    pub(super) recorded: Vec<String>,
     /// The copy targets without one.
-    missing: Vec<String>,
+    pub(super) missing: Vec<String>,
     /// Root ids with a `copy` record of it that are not configured copy
     /// targets any more (replaced or lost targets).
-    elsewhere: Vec<String>,
+    pub(super) elsewhere: Vec<String>,
 }
 
 impl Gap {
@@ -1301,10 +1304,10 @@ impl Gap {
     /// one copy of it on any root id: it left hot after a complete or
     /// partial adoption, and a target was added or replaced since, or the
     /// adoption stopped before it reached every target. The pass copies
-    /// from hot only, so only the target-to-target repair (#192, when a
+    /// from hot only, so only the target-to-target repair (`mie store repair`, when a
     /// configured target holds a recorded copy) or a re-adoption of its
     /// original store fills it. This class never blocks the writes.
-    fn needs_refill(&self) -> bool {
+    pub(super) fn needs_refill(&self) -> bool {
         !self.off_hot
             && !self.on_hot
             && !self.missing.is_empty()
@@ -1312,8 +1315,8 @@ impl Gap {
     }
 
     /// Whether a configured copy target holds a recorded copy, so the
-    /// repair (#192) can copy from it.
-    fn repairable(&self) -> bool {
+    /// repair can copy from it.
+    pub(super) fn repairable(&self) -> bool {
         !self.recorded.is_empty()
     }
 
@@ -1357,7 +1360,7 @@ impl std::fmt::Display for Gap {
 /// partition, so a hot-window partition is whole there; on every target,
 /// it has its k copies. A file on a target without a `copy` record does not count:
 /// nothing would ever record it.
-fn complete(
+pub(super) fn complete(
     hot: &Path,
     fold: &Fold,
     path: &str,

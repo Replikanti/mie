@@ -34,7 +34,15 @@
 //!    that copy. The ledger's paths count because the hot removal (#191,
 //!    ADR-062 D6) takes files off hot: a target added after a removal never
 //!    gets them from hot, and its journal copy waits at the first removed
-//!    file's line until #192's repair fills it.
+//!    file's line until `mie store repair` fills it.
+//!
+//! **A target with an open copy-ledger finding** (a `finding R …
+//! copy-ledger` after its latest `ledger-copy R` record) gets no ledger
+//! copy extension and no `ledger-copy` record in step 3 (L2 of #192): such
+//! a record would end the finding's void without any repair. The pass
+//! names it as needing `mie store repair` and is not complete for the hot
+//! removal. Only the closing pass of a repair, which names the targets it
+//! repaired, extends them.
 //!
 //! **The target's marker is re-read before every write to it** (a sealed
 //! copy, an entry, the ledger and journal tails) and before every record
@@ -80,6 +88,7 @@ use mie_adapter_parquet::copy_ledger::{
 use mie_adapter_parquet::removal::{self, RemovalPlan};
 use mie_adapter_parquet::replica::{self, CopyError, CopyOutcome, Side, TailSource};
 use mie_adapter_parquet::root_marker::{self, HOT_ID};
+use mie_adapter_parquet::verification;
 use mie_ports::raw::{RawStoreError, validate_segment};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -87,13 +96,13 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 /// Where a copy target keeps its copies of hot's metadata (ADR-062 D7
 /// *Formats and layout*).
-const META_DIR: &str = ".mie";
-const JOURNAL_DIR: &str = "journal";
-const IMPORT_LEDGER_DIR: &str = "import-ledger";
+pub(super) const META_DIR: &str = ".mie";
+pub(super) const JOURNAL_DIR: &str = "journal";
+pub(super) const IMPORT_LEDGER_DIR: &str = "import-ledger";
 
 /// The appender the pass writes the copy ledger through: [`CopyLedger`] in
 /// production, a failing one in tests.
@@ -232,6 +241,8 @@ pub(super) struct Fold {
     pub(super) copies: BTreeMap<String, BTreeSet<String>>,
     /// The paths of `lost` records: no copy of them can reach a target.
     pub(super) lost: BTreeSet<String>,
+    /// The root ids with an open copy-ledger finding (L2 of #192).
+    pub(super) open_ledger: BTreeSet<String>,
 }
 
 impl Fold {
@@ -263,6 +274,7 @@ impl Fold {
                 _ => {}
             }
         }
+        fold.open_ledger = verification::open_ledger_findings(records);
         Ok(fold)
     }
 
@@ -310,6 +322,8 @@ struct Pass<'a> {
     /// pass is not complete for the hot removal's rule (f) (review of #202,
     /// finding 1).
     ledger_copy_failed: bool,
+    /// The root ids whose ledger copy a repair rebuilt: exempt from L2.
+    cleared: &'a BTreeSet<String>,
 }
 
 impl Pass<'_> {
@@ -450,7 +464,16 @@ pub fn run(
     observer: &mut dyn PassObserver,
 ) -> PassReport {
     let archive = archive_config(config, archive);
-    run_with(config, archive, probe, now_ms, ledger, observer, None)
+    run_with(
+        config,
+        archive,
+        probe,
+        now_ms,
+        ledger,
+        observer,
+        None,
+        &BTreeSet::new(),
+    )
 }
 
 /// The pass of `mie ingest` (module docs): [`run`] with the archive
@@ -467,7 +490,16 @@ pub fn run_planned(
     observer: &mut dyn PassObserver,
     first_hot_date: &str,
 ) -> (PassReport, Option<RemovalPlan>) {
-    let mut report = run_with(config, Ok(archive), probe, now_ms, ledger, observer, None);
+    let mut report = run_with(
+        config,
+        Ok(archive),
+        probe,
+        now_ms,
+        ledger,
+        observer,
+        None,
+        &BTreeSet::new(),
+    );
     if !report.targets_complete {
         return (report, None);
     }
@@ -504,7 +536,11 @@ pub fn run_planned(
 }
 
 /// [`run`] under a pass lock the caller already holds: `mie store adopt`
-/// ends with one pass and holds the lock for its whole run (ADR-062 D10).
+/// and `mie store repair` end with one pass and hold the lock for their
+/// whole run (ADR-062 D10, D11). `cleared` names the copy targets whose
+/// ledger copy the repair rebuilt, which L2 then lets through; the adoption
+/// passes an empty set.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_locked(
     config: &IngestConfig,
     archive: Option<&Path>,
@@ -513,12 +549,23 @@ pub(crate) fn run_locked(
     ledger: &dyn LedgerAppend,
     observer: &mut dyn PassObserver,
     lock: replica::ReplicationLock,
+    cleared: &BTreeSet<String>,
 ) -> PassReport {
     let archive = archive_config(config, archive);
-    run_with(config, archive, probe, now_ms, ledger, observer, Some(lock))
+    run_with(
+        config,
+        archive,
+        probe,
+        now_ms,
+        ledger,
+        observer,
+        Some(lock),
+        cleared,
+    )
 }
 
 /// The pass, taking the lock at its place in step 0 unless one is given.
+#[allow(clippy::too_many_arguments)]
 fn run_with(
     config: &IngestConfig,
     archive: Result<Option<ArchiveConfig>, String>,
@@ -527,6 +574,7 @@ fn run_with(
     ledger: &dyn LedgerAppend,
     observer: &mut dyn PassObserver,
     lock: Option<replica::ReplicationLock>,
+    cleared: &BTreeSet<String>,
 ) -> PassReport {
     let mut report = PassReport::default();
     let Some(mut pass) = start(
@@ -537,6 +585,7 @@ fn run_with(
         ledger,
         observer,
         lock,
+        cleared,
         &mut report,
     ) else {
         return report;
@@ -558,6 +607,7 @@ fn start<'a>(
     ledger: &'a dyn LedgerAppend,
     observer: &'a mut dyn PassObserver,
     lock: Option<replica::ReplicationLock>,
+    cleared: &'a BTreeSet<String>,
     report: &mut PassReport,
 ) -> Option<Pass<'a>> {
     let mut refuse = |problem: String| {
@@ -681,6 +731,7 @@ fn start<'a>(
         report: std::mem::take(report),
         reasons: BTreeMap::new(),
         ledger_copy_failed: false,
+        cleared,
     })
 }
 
@@ -1167,6 +1218,18 @@ impl Pass<'_> {
                 continue;
             }
             let (path, id) = (self.targets[i].path.clone(), self.targets[i].id.clone());
+            // L2 (#192): an open copy-ledger finding blocks the extension
+            // and its record until a repair rebuilt the copy.
+            if self.fold.open_ledger.contains(&id) && !self.cleared.contains(&id) {
+                self.ledger_copy_failed = true;
+                self.problem(format!(
+                    "the copy-ledger copy on {id} ({}) has an open copy-ledger finding: it is \
+                     not extended and gets no ledger-copy record until `mie store repair` \
+                     repairs it (ADR-062 D6, D11)",
+                    copy_ledger::ledger_path(&path).display()
+                ));
+                continue;
+            }
             let copy = match copy_ledger::extend_copy(self.hot, &path, &id) {
                 Ok(copy) => copy,
                 Err(CopyError {
@@ -1224,7 +1287,7 @@ impl Pass<'_> {
     /// everything before that line is still appended. The ledger's paths
     /// count because the hot removal takes files off hot, and a target added
     /// after it never gets them from hot (#199 review carry-over): its copy
-    /// waits until #192's repair fills the target. Archive parts are never
+    /// waits until `mie store repair` fills the target. Archive parts are never
     /// checked: only the capture writes `sealed` lines. Lost paths are not
     /// added: no copy of them can ever reach a target (#192, #193 decide).
     fn copy_journal_tail(&mut self, paths: &[String]) -> u64 {

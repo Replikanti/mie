@@ -379,9 +379,9 @@ live in more than one root (approved as written at STOP 1).
     STOP 1 decision 1). Why the fallback: a late import must never stop
     on a fault that a good copy already covers, and the hot restore does
     the same with the same function. The cost: the damage found by a
-    recall is not recorded in the ledger; #192's verification checks
-    every copy and finds it again. Only then is `returned` appended. Any
-    failure appends nothing and poisons the writer: the partition stays
+    recall is not recorded in the ledger; the verification (`mie store
+    verify`, #192) checks every copy and finds it again. Only then is
+    `returned` appended. Any failure appends nothing and poisons the writer: the partition stays
     recorded removed, the next recall resumes it (files already on hot
     are `AlreadyPresent`), or the remover finishes its removal again.
   - **The degraded writer.** Without a readable copy ledger (missing, or
@@ -442,6 +442,27 @@ live in more than one root (approved as written at STOP 1).
     inside that hold is refused with `Locked`, naming the holder, and a
     re-run succeeds.
   - A single-root store never reads the ledger.
+- **As implemented (#192): a damaged ledger copy holds no verified
+  prefix.**
+  - **L1.** The plan reads one copy state, folded once from its ledger
+    read (`verification.rs`), which `mie store verify` and `mie store
+    repair` read too. For each target, a `finding <root> … copy-ledger`
+    after its latest `ledger-copy` record voids that record until a later
+    one, so with it there is no P and no candidate; the re-check treats a
+    copy-ledger finding in the tail since the plan as naming every
+    candidate. Why: rule (f) requires the records to lie in the prefix
+    that k *verified* ledger copies hold, and a copy that a verification
+    found damaged holds no verified prefix, while the plan before #192
+    read every `ledger-copy` record whatever followed it. L1 only ever
+    removes candidates.
+  - **L2.** The replication pass never extends a ledger copy with an open
+    copy-ledger finding, and never appends its `ledger-copy` record; it
+    names the target as needing `mie store repair` and is not complete
+    for rule (c) to (f), so `mie ingest` plans no removal. Only the
+    targets that the repair's closing pass names as rebuilt are exempt.
+    Why: the next pass's `ledger-copy` record would otherwise end L1's
+    void with no repair at all, over a copy whose damage may lie before
+    its tail, where the pass never looks.
 - **A partition that disappears while it is read** is never read as
   empty; D7 states the rule.
 
@@ -623,8 +644,19 @@ live in more than one root (approved as written at STOP 1).
     hung mount would stall the capture. On a copy target it also holds,
     from the replicator on, `copy-ledger` (the ledger copy, D11),
     `journal/<journal file name>` (the journal copies) and
-    `import-ledger/<segment>/<name>.import` (the import-ledger copies). `.mie/` is outside the
-    layout, and nothing else in mie writes there.
+    `import-ledger/<segment>/<name>.import` (the import-ledger copies).
+    On hot it also holds `verify.lock` (#192): `mie store verify` and
+    `mie store repair` take an exclusive `flock` on it without waiting and
+    hold it for their whole run. Why: a verification records findings
+    only about copies its ledger read already records, and the repair is
+    the only writer of a second `copy` record for such a copy, so the lock
+    keeps a finding from voiding a copy the repair made after that read
+    (D11 *As implemented*, V10). Every root may also hold `damaged/<at_ms>/`
+    (#192): `mie store repair` moves each damaged copy there under its
+    relative path instead of deleting it, one directory per run. Nothing
+    in mie lists or deletes it, and it is outside the layout, so
+    `select`, recovery and every walk of the layout never see it. `.mie/`
+    is outside the layout, and nothing else in mie writes there.
   - **The hidden directory of a removal**, `.removed-date=YYYY-MM-DD`
     beside the partition on hot (D6 *As implemented*), lies outside the
     layout too: it exists only between the rename and the deletion, or
@@ -646,13 +678,13 @@ live in more than one root (approved as written at STOP 1).
     | Kind | Fields after `<kind> <at_ms>` | First written by |
     |---|---|---|
     | `manifest` | the escaped manifest text | the first verified copy; the adoption before its first copy (D10) |
-    | `copy` | data path, root id | each verified copy |
+    | `copy` | data path, root id | each verified copy; the repair, for a copy it re-verified or replaced (D11) |
     | `removed` | partition directory | hot removal (D6) |
     | `returned` | partition directory | the recall (D6), the hot restore (D11) |
     | `ledger-copy` | root id, prefix length in bytes, prefix SHA-256 | the replicator (D11) |
     | `finding` | root id, code, subject | the verification (D11) |
     | `verify` | root id, ledger prefix length covered, finding count | the verification |
-    | `lost` | data path, origin, SHA-256 or `-` | the verification, the rebuild (D7 step 4) |
+    | `lost` | data path, origin, SHA-256 or `-` | `mie store repair --record-lost` (D11, origin `verify`), the rebuild (D7 step 4) |
     | `hold` | data path, reason | the hot restore, the rebuild (D11) |
     | `hold-cleared` | data path, resolution | the hold resolution (D11) |
     | `quarantined` | data path, quarantine id | the *replace* resolution (D11) |
@@ -1104,10 +1136,11 @@ adopted into the production store. The protocol (#190):
   short is refused the same way; `mie store replicate` completes it. The
   same predicate is asserted over every recorded file once the closing
   pass has run, and a gap fails the run, so a PASS always leaves every
-  adopted partition hot holds whole there and every file at k copies. **Limit, until #192:**
-  a copy target added after an adoption, or a failed one replaced under a
-  new id, holds no copy of the files that already left hot, and the
-  replication pass copies from hot only. Those files fail the predicate.
+  adopted partition hot holds whole there and every file at k copies.
+  **A target added or replaced after files left hot** (resolved by `mie
+  store repair`, #192): a copy target added after an adoption, or a failed
+  one replaced under a new id, holds no copy of the files that already
+  left hot, and the replication pass copies from hot only. Those files fail the predicate.
   The class is: not on hot (its partition is recorded removed), short of
   a copy on a configured target, and with at least one `copy` record in
   the ledger on any root id, configured or not. Unlike the other gaps it
@@ -1118,10 +1151,10 @@ adopted into the production store. The protocol (#190):
   The run adopts what it reads, then fails at the end, naming each such
   path, the targets holding its recorded copy, the targets lacking one,
   and the remedy:
-  - when a configured target holds a recorded copy: `mie store repair`
-    (#192), which copies it from that target, or until then a
-    re-adoption of the original store. The message names both causes,
-    a target added or replaced, or an adoption that stopped before it
+  - when a configured target holds a recorded copy: `mie store repair`,
+    which copies it from that target (D11 *As implemented*, R2), after
+    which the next adoption passes. The message names both causes, a
+    target added or replaced, or an adoption that stopped before it
     reached every target;
   - when its copies are recorded only on roots no longer configured
     (every target replaced or lost, review of #200 finding 7): the
@@ -1133,7 +1166,8 @@ adopted into the production store. The protocol (#190):
   adoption and still refuses up front (finding 3). Why not refuse up front: with two adopted
   stores (the #22 store and the archive, the production shape), each
   re-adoption would be refused for the other store's files, a deadlock
-  until #192. Re-adopting every earlier store in turn ends with PASS. Why
+  that only the repair breaks. Re-adopting every earlier store in turn
+  ends with PASS, and so does one repair. Why
   not pass: files would stay below k on the new target with no step that
   ever fills them. A file on hot that only lacks copies still refuses up
   front, with `mie store replicate` as its remedy. The source's import
@@ -1268,9 +1302,10 @@ What breaks:
   because the pass copies from hot only, and a hold keyed on hot's
   listing alone would let their `sealed` lines through to that target.
   The cost: that target's journal copy stops at the first removed file's
-  line until #192's repair fills the target, and every pass names the
-  stop and fails. `lost` paths are not counted, since no copy of them can
-  ever reach a target (#192 and #193 decide). Archive parts are never
+  line until `mie store repair` fills the target, and every pass names
+  the stop and fails. `lost` paths are not counted, since no copy of them
+  can ever reach a target (the repair records them only with
+  `--record-lost`, the rebuild #193 at its step 4). Archive parts are never
   checked: only the capture writes `sealed` lines. The cost is that the
   lines from that line on stay at one copy until the missing file
   reaches the target (the single-copy exposure below). A line names a
@@ -1583,7 +1618,7 @@ What breaks:
     holds. A marked copy target without a `copy` record for a recorded
     file counts as a missing copy, even when no verification found it: a
     target added or replaced after the file left hot (D10 *Bootstrap*,
-    the limit until #192) is filled this way, from another target.
+    the class it names) is filled this way, from another target.
   - Repair is explicit, not automatic: several bad copies at once point at
     a shared cause (a failing controller, a wrong mount), and automatic
     rewrites would spread into it.
@@ -1592,6 +1627,193 @@ What breaks:
     it is `Integrity`, and nothing re-creates it or downloads it again
     under the same path. Recovering from that needs a new ADR, because any
     substitute changes dataset versions that accepted ADRs cite.
+- **As implemented (#192): `mie store verify` and `mie store repair`.**
+  The ledger grammar does not change: no new record kind and no header
+  bump. Rejected, a `cleared` record kind: it is a format change (header
+  v2) for what a fresh `copy` or `ledger-copy` record already says under
+  the remover's rule (D6). Rejected, a repair that re-verifies the whole
+  store itself: that is a second full read of every target per repair, P's
+  lower bound paid twice; the repair works from what the verification
+  recorded and re-checks only those copies.
+  - **The verification** (`mie store verify --period-hours <P>`) reads the
+    roots and appends to hot's ledger only; it takes `.mie/verify.lock`
+    (D7), never the pass lock, so it runs beside the replicator of `mie
+    ingest` (AW11).
+    - **V1 Refusals,** before any cold read: P missing (a usage error) or
+      not a whole number of at least 1 hour, or overflowing as
+      milliseconds (0 would make every copy stale at once); an empty
+      `cold_roots`; a hot without its marker; an archive configuration of
+      another store; the verification lock held; hot's ledger missing or
+      failing its chain before its last record, naming the record and its
+      byte (the hot half of "the chain verifies on hot and on every
+      copy"); a marker with hot's id or one id on two roots; two roots on
+      one device.
+    - **V2 Read order:** hot's sealed listing, then hot's ledger once (the
+      snapshot S, verified prefix Vₛ), then hot's import entries. For every
+      tail check the copy is read before hot. Why: a copy is always a
+      prefix of a hot file that only grows (ledger copies stop at hot's
+      verified prefix, and the journal is append-only), so a pass that
+      extends both between the two reads can never produce a false
+      `prefix`.
+    - **V3 Hot, report only:** each sealed file on hot against the ledger's
+      `manifest` record and its data against it, and every ordinary
+      recorded path hot lacks although its partition is not recorded
+      removed. Nothing is recorded: records name copy targets only, and
+      the hot copy never counts.
+    - **V4 Per copy target** that presents its marker, in configuration
+      order, one walk with `at_ms` = now at its start, the marker re-read
+      before every record. Data: every path with an ordinary or held
+      verdict and a `copy` record for the target in S, one finding per
+      copy in the precedence `missing`, `manifest`, `size`, `sha256`, the
+      data always checked against the ledger's text; a self-consistent
+      other file (data matching its own differing manifest) is `manifest`
+      with D5's wording, two sealed files under one path. k: an ordinary
+      path without a `copy` record for the target is `copies`, except an
+      archive part no hot entry lists yet and a file on hot whose data
+      mtime lies within G before now. Entries: each hot entry whose parts
+      all have `copy` records for the target older than G, byte for byte
+      (`missing entry:<e>`, `entry`). Copy ledger: absent while S holds a
+      `ledger-copy` record for the target is `missing`; then `chain`,
+      naming the record and its byte; then `prefix` for a copy longer
+      than hot's verified prefix or with one differing byte. Journal:
+      absent while the target has a `copy` record is `missing`; otherwise
+      the bytes are compared in bounded chunks, and a difference is
+      `prefix` naming the first differing byte. Why bytes instead of the
+      SHA-256 of `len(copy)` bytes: the comparison is equivalent and
+      locates the damage, which the repair needs. Each recorded finding is
+      appended as soon as it is found, then `verify <at_ms> <root> <Vₛ>
+      <count>`. Why at once: the remover counts a damaged copy until its
+      finding exists, and a walk takes up to P's lower bound. An I/O error
+      other than an absent file stops the target: its findings stay, it
+      gets no `verify` record, and a `FAIL` line names it.
+    - **V5 Unverified targets** (no marker, or stopped) are named, and
+      their copies whose last good verification is older than now − P are
+      `stale` (the count, the oldest time, the first path). The last good
+      verification of a copy is the later of its latest `copy` record and
+      the latest pass over its root that covered that record and recorded
+      no finding about the file. A target without its marker has no id,
+      so the ids S records copies on that no marked target carries stand
+      in for it.
+    - **V6 Read-only roots** that present a marker: the copies they hold
+      are checked as data, reported only.
+    - **V7 Not recorded: `copies`, `stale`, and findings on hot or on
+      read-only roots.** Why: they are re-derived from S on every run (an
+      absent `copy` record, an old `verify` record), so a record adds no
+      information, and their count scales with the store. A copy target
+      added after one year lacks about 670 000 `copy` records (1 835 data
+      files a day, M1-9); at about 185 bytes per `finding` record that is
+      about 124 MB per run, about 77 days of ledger growth at 1.6 MB a day
+      (Numbers table), which every later fold would read for good.
+      Recorded findings are exactly those about a copy the ledger
+      records, which is what the remover voids. The codes stay in grammar
+      v1.
+    - **V8 G = 2 × `capture.seal_interval_secs`,** 600 s at the default
+      300 s (ADR-032 D10). Why: a pass runs after every seal pass, and a
+      pass running while a part seals leaves one wake-up behind
+      (*Scheduling in `mie ingest`*), so a healthy replicator copies a
+      part within two intervals. A shorter G reports parts the next pass
+      copies anyway; a longer one leaves a stalled replicator unreported
+      longer, which is the single-copy exposure above. A future mtime is
+      never exempt, so a clock step can add a report but never hide one.
+    - **V9 Output:** one summary line per root, then the `FAIL` lines: hot;
+      each root in configuration order (data in path order, then entries,
+      the copy ledger, the journal); then `stale`; then one line per file
+      with fewer than k good copies. That last check runs only when every
+      copy target was verified in this run; otherwise the `not verified`
+      and `stale` lines stand in for it. Why: an unmounted target would
+      otherwise give one line per file of the whole store. `PASS` and exit
+      0 only without any `FAIL` line.
+    - **V10 Concurrency:** the verification records only about copies S
+      records, and the verification lock excludes the repair, the only
+      writer of a second `copy` record for such a copy, so a finding can
+      never void a copy made after S. The replicator only adds copies S
+      does not record.
+  - **The repair** (`mie store repair [--record-lost]`) works the list the
+    ledger records plus the copies a configured target lacks without a
+    record (the comment of 2026-11-07 on #192), and re-checks each item
+    first.
+    - **R0** The refusals of V1 without P; then the verification lock and
+      the pass lock, both without waiting, for the whole run. A copy
+      target without its marker is named and never written. The cost of
+      the pass lock: replication pauses while the repair runs. For the
+      refill of a target added after a year that means copying about
+      347–488 GB (D10, the year-1 copy device), while new parts stay at
+      one copy and removal waits, as during a cold outage, which D10's O
+      term sizes. Rejected, per-file locking: it races the replicator on
+      the same target. The adoption makes the same trade (D10).
+    - **R1** A data copy with an open finding (a finding after its latest
+      `copy` record, the remover's rule): good now, only a fresh `copy`
+      record; a self-consistent other file, refused and never moved (D5);
+      otherwise a good source (R3), the bad copy moved aside (R5), the D5
+      copy, its published text checked against the ledger's, the marker
+      re-read, a fresh `copy` record. Why the record: it ends the
+      finding's void, so a repaired partition becomes removable again (the
+      comment of 2026-11-08 on #192).
+    - **R2** A file that left hot with a recorded copy on a configured
+      target and none on another is copied there and recorded: the class
+      of D10's bootstrap, computed by the adoption's own predicate, so the
+      two never disagree.
+    - **R3** Sources, in order: hot, then every cold root in configuration
+      order, read-only roots included, never the destination. A source
+      counts only when its manifest text equals the ledger's byte for byte
+      and its data verifies; a source whose own manifest differs is never
+      written.
+    - **R4** A bad hot copy, or a recorded path hot lacks although its
+      partition is not recorded removed, is replaced from the first good
+      cold copy (`replica::copy_back`) after R5, under the source's writer
+      lock taken without waiting; a held lock leaves it unrepaired and
+      named. Hot copies get no record.
+    - **R5** The move-aside, into `<root>/.mie/damaged/<run at_ms>/<relative
+      path>`: the data first, then its manifest and the seal temp names,
+      each an atomic rename on the root's filesystem, the directories
+      fsynced. Why not delete: several bad copies point at a shared cause,
+      and the bytes are its evidence; the rename costs no I/O. Why not
+      overwrite: D5 never overwrites a copy that fails, and a crash in an
+      overwrite leaves neither version. Why the data first: `read` skips a
+      root without the data, so a concurrent reader falls through to a
+      good copy, and a crash after the first rename leaves a manifest
+      without data, which the verification reports as `missing`, ADR-030
+      recovery refuses on hot, and the next repair completes.
+    - **R6** A ledger copy with an open copy-ledger finding whose chain
+      fails at or before the first byte f where it differs from hot is
+      moved aside and rebuilt as hot's verified bytes up to f (a temp
+      name, fsync, read-back, rename, directory fsync); the closing pass
+      extends it. A copy whose chain verifies but differs from hot, or is
+      longer than hot's verified prefix, is refused: both chains are valid,
+      so one holds records the other lacks (a damaged last record on hot
+      that an append truncated as torn, D7, say), and overwriting it could
+      destroy the last copy of a record. The rebuild (#193) decides.
+    - **R7** A journal copy with an open journal finding is repaired only
+      when another target's copy is longer than the first differing byte d
+      and equals hot over `[0, d]`, so two of three agree; it is rebuilt
+      up to the start of the line holding d. Otherwise it is refused: the
+      journal has no chain, so one copy against hot cannot be attributed.
+      When every copy agrees against hot, hot's journal is named as the
+      suspect; the hot restore restores it, never the repair.
+    - **R8** An entry copy with an open entry finding is replaced from hot
+      only when hot's entry lists every file with the SHA-256 of the
+      ledger's `manifest` record (else hot's manifest); otherwise it is an
+      entry conflict for the hold resolution (#194). An absent copy is
+      left to the closing pass.
+    - **R9 The lost-file rule as implemented** (operator, #192 STOP 1
+      decision 1). A path with no good source, while every root the
+      ledger records a copy of it on presented its marker, is reported
+      lost; nothing is re-created and nothing is written to any root. Only
+      `--record-lost`, passed after a run without it reported the path,
+      appends `lost <at_ms> <path> verify <sha256>`. Why: a `lost` record
+      is irreversible (every selection covering the path fails for good,
+      and undoing it needs a new ADR), and a shared-cause read fault must
+      not become a permanent loss on its own; without any record, a new
+      target's journal copy would stay at the lost file's `sealed` line
+      until the rebuild. A recorded copy on a root that is absent or no
+      longer configured makes the path "not repairable in this run",
+      never lost.
+    - **R10** The closing pass runs under the held pass lock, with the
+      targets R6 rebuilt exempt from L2 (D6), so the fresh `copy` records
+      land inside the prefix k ledger copies hold (rule f) and a refilled
+      target's journal copy moves past the refilled files. The repair
+      passes only when every item was repaired or re-verified, nothing was
+      refused or lost, and the closing pass passed.
 
 ### Numbers and where they come from
 

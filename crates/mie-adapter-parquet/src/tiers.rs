@@ -201,6 +201,28 @@ impl LedgerView {
         }
     }
 
+    /// Every path the ledger records, in path order, with its verdict
+    /// (the verification of #192 walks them all).
+    pub(crate) fn all(&self) -> impl Iterator<Item = (&str, Verdict)> {
+        self.entries
+            .iter()
+            .map(|(path, entry)| (path.as_str(), Self::verdict(entry)))
+    }
+
+    /// The verdict of `path`, `None` when the ledger does not record it.
+    pub(crate) fn verdict_of(&self, path: &str) -> Option<Verdict> {
+        self.entries.get(path).map(Self::verdict)
+    }
+
+    /// The first `manifest` text the ledger records for `path`, whatever
+    /// its verdict.
+    pub(crate) fn text(&self, path: &str) -> Option<&str> {
+        self.entries
+            .get(path)
+            .and_then(|entry| entry.manifest.as_ref())
+            .map(|manifest| manifest.text.as_str())
+    }
+
     /// Every path the ledger records in the partition directory
     /// `partition`, in path order, with its verdict: the recall and the
     /// removal planner apply `select`'s own rules.

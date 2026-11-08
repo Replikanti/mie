@@ -1072,3 +1072,89 @@ fn records_after_a_plans_prefix() {
         Err(RawStoreError::Integrity(_))
     ));
 }
+
+/// Every class of [`check_copy`] (#192 V4), in its precedence: absent,
+/// good (a partial tail included), chain, diverged, longer.
+#[test]
+fn check_copy_classifies_every_ledger_copy() {
+    let records = golden_records();
+    let (_dir, hot, cold) = replicated("ledger-check-copy", &records[..6]);
+    let [a, _] = &cold;
+    assert_eq!(check_copy(&hot, a).unwrap(), LedgerCopyCheck::Absent);
+    let hot_bytes = fs::read(ledger_path(&hot)).unwrap();
+    let write = |bytes: &[u8]| fs::write(ledger_path(a), bytes).unwrap();
+
+    write(&hot_bytes);
+    assert_eq!(check_copy(&hot, a).unwrap(), LedgerCopyCheck::Good);
+    // A copy that stopped mid-record is a prefix, no chain failure.
+    write(&hot_bytes[..hot_bytes.len() - 7]);
+    assert_eq!(check_copy(&hot, a).unwrap(), LedgerCopyCheck::Good);
+
+    // A flipped byte in record 3 fails its chain there.
+    let (offset, _) = spans(&hot_bytes)[2];
+    let mut damaged = hot_bytes.clone();
+    flip(&mut damaged, offset + 4);
+    write(&damaged);
+    assert_eq!(
+        check_copy(&hot, a).unwrap(),
+        LedgerCopyCheck::Chain {
+            record: 3,
+            offset: offset as u64
+        }
+    );
+
+    // A valid chain that leaves hot's after record 4.
+    let (end4, len4) = spans(&hot_bytes)[3];
+    let prefix = &hot_bytes[..end4 + len4 + 1];
+    let other = store("ledger-check-copy-other");
+    fs::write(ledger_path(other.path()), prefix).unwrap();
+    append_all(
+        other.path(),
+        &[record(
+            50,
+            Kind::Removed {
+                partition: PARTITION.to_owned(),
+            },
+        )],
+    );
+    let diverged = fs::read(ledger_path(other.path())).unwrap();
+    write(&diverged);
+    let first = diverged
+        .iter()
+        .zip(&hot_bytes)
+        .position(|(x, y)| x != y)
+        .unwrap();
+    assert!(first > end4 + len4, "it differs after record 4");
+    assert_eq!(
+        check_copy(&hot, a).unwrap(),
+        LedgerCopyCheck::Diverged {
+            offset: first as u64
+        }
+    );
+
+    // Hot's verified prefix plus a complete record hot lacks.
+    let mut longer = hot_bytes.clone();
+    let hot_ledger = parsed(&hot_bytes).unwrap();
+    let body = format!("removed {} {PARTITION}", AT + 99);
+    longer.extend_from_slice(
+        format!(
+            "{body} {}\n",
+            chain_of(hot_ledger.last_chain.as_bytes(), body.as_bytes())
+        )
+        .as_bytes(),
+    );
+    write(&longer);
+    assert_eq!(
+        check_copy(&hot, a).unwrap(),
+        LedgerCopyCheck::Longer {
+            len: longer.len() as u64,
+            verified: hot_bytes.len() as u64
+        }
+    );
+
+    // The copy is read before hot: hot growing in between never makes a
+    // good copy look longer or diverged.
+    write(&hot_bytes);
+    append_all(&hot, &records[6..8]);
+    assert_eq!(check_copy(&hot, a).unwrap(), LedgerCopyCheck::Good);
+}
