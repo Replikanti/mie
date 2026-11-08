@@ -50,6 +50,8 @@
 //! ```
 
 mod common;
+#[path = "order_flow_study/replication.rs"]
+mod replication;
 
 use common::TempDir;
 use common::bootstrap::{SplitMix64, resample};
