@@ -126,6 +126,7 @@ fn ingest_with_reconnect(
         }),
         http: Arc::new(common::NoHttp),
         clock: common::FakeClock::new(start_ms, "mie-aggTrade"),
+        device_probe: Arc::new(mie_cli::store::StDevProbe),
     };
     mie_cli::ingest::run(config, transports, shutdown).expect("ingest starts")
 }

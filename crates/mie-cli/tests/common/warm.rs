@@ -196,6 +196,7 @@ pub fn warm_ingest(
         connector: Arc::new(Ws(Arc::clone(&script))),
         http: Arc::new(Oi(Arc::clone(&script))),
         clock,
+        device_probe: super::probe_for(config),
     };
     mie_cli::ingest::run_with_hold(config, transports, shutdown, hold).expect("ingest starts")
 }

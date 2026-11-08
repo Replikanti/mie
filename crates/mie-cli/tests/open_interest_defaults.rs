@@ -135,6 +135,7 @@ fn ingest(config: &IngestConfig, lags_ms: &[i64]) -> IngestOutcome {
             shutdown: Arc::clone(&shutdown),
         }),
         clock,
+        device_probe: Arc::new(mie_cli::store::StDevProbe),
     };
     mie_cli::ingest::run(config, transports, shutdown).expect("ingest starts")
 }

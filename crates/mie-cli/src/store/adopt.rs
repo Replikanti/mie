@@ -30,7 +30,7 @@
 //!    PASS also asserts at the end: on hot unless its partition is
 //!    recorded removed, and recorded on every copy target), so a re-run of
 //!    a stopped adoption against another store can never pass and leave a
-//!    partition guarded for good. A file that left hot with at least one
+//!    recorded file incomplete for good. A file that left hot with at least one
 //!    recorded copy on any root id but lacks one on a configured target
 //!    (a target added or replaced, every target replaced, or a stopped
 //!    adoption) does not block the writes (its partition is recorded
@@ -50,15 +50,17 @@
 //! 3. **Writes, in this order, stopping at the first failure:**
 //!    1. `removed` for every source partition older than the first hot
 //!       date (D8) that has no directory on hot and is not recorded
-//!       removed yet. First, so the interim writer guard refuses an append
-//!       to those dates from the first byte on (D6). Adoption deletes
-//!       nothing: the record only says that hot holds no copy.
+//!       removed yet. First, so an append to those dates recalls the
+//!       partition from the first byte on instead of numbering from hot's
+//!       empty listing (D6). Adoption deletes nothing: the record only says
+//!       that hot holds no copy.
 //!    2. The `manifest` record of every source file the ledger does not
 //!       know yet, before any copy. From the first published byte on, the
 //!       ledger then knows every part of every adopted partition, and the
-//!       writer guard refuses a new part there until hot holds them all,
-//!       so a capture that restarts after a crash can never seal a path a
-//!       target holds, or will hold, with other bytes (review of #200).
+//!       writer's union part numbering (D6) numbers a new part above all of
+//!       them, so a capture that restarts after a crash can never seal a
+//!       path a target holds, or will hold, with other bytes (review of
+//!       #200).
 //!    3. Per file in path order: to every copy target without a `copy`
 //!       record (marker re-read before and after the copy, then the `copy`
 //!       record), then to hot when its partition is on hot's side.
@@ -81,12 +83,13 @@ use mie_adapter_binance::archive::ledger::PENDING_FILE;
 use mie_adapter_parquet::copy_ledger::{self, AppendError, CopyLedger, Kind, Record, Truncation};
 use mie_adapter_parquet::replica::{self, CopyError, CopyOutcome, Side, TailSource};
 use mie_adapter_parquet::root_marker::{self, HOT_ID};
-use mie_adapter_parquet::{RawWriter, RotationPolicy};
+use mie_adapter_parquet::{RawWriter, RotationPolicy, TierContext};
 use mie_ports::raw::{RawStoreError, SealedFile, validate_segment};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, TryLockError};
 use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 #[cfg(test)]
 mod tests;
@@ -506,9 +509,17 @@ impl Run<'_> {
             sources.insert(ARCHIVE_SOURCE.to_owned());
         }
         let mut writers = Vec::new();
+        // They never append, so the clock is only a stand-in for a recall
+        // that never runs.
+        let opened_ms = (self.now_ms)();
         for source in sources {
+            let ctx = TierContext {
+                first_hot_date: self.first_hot_date.to_owned(),
+                now_ms: Arc::new(move || opened_ms),
+                on_recall: None,
+            };
             let writer = store
-                .writer(&source, RotationPolicy::default())
+                .tiered_writer(&source, RotationPolicy::default(), ctx)
                 .map_err(|e| {
                     self.fail(format!("open the writer of source {source} on hot: {e}"))
                 })?;
@@ -820,8 +831,8 @@ impl Run<'_> {
     /// The refusal of a recorded file the source does not list and that is
     /// not [`complete`]: an adoption that stopped recorded it and this run
     /// reads another store, or a replication pass has not finished it.
-    /// Passing would leave a record that keeps its partition guarded, or
-    /// a file below k, for good. Nothing is written.
+    /// Passing would leave a recorded file that no root completes, or a
+    /// file below k, for good. Nothing is written.
     fn check_unlisted(
         &mut self,
         files: &[SourceFile],
@@ -859,8 +870,9 @@ impl Run<'_> {
             ));
         }
         // A file that only needs the repair does not block the writes: its
-        // partition is recorded removed (so the writer guard refuses it
-        // anyway), and this run never writes its path. Blocking would
+        // partition is recorded removed (so an append recalls it, and the
+        // recall names a file no root holds), and this run never writes its
+        // path. Blocking would
         // deadlock two adopted stores that each wait for the other's files
         // on a new target; the end-of-run check names it and fails the run.
         if !stopped.is_empty() {
@@ -983,8 +995,8 @@ impl Run<'_> {
         reached(AdoptStep::AfterRemovedRecords)?;
 
         // 2. The `manifest` record of every file the ledger does not know,
-        // before any copy: from the first publish on, the writer guard
-        // knows every part of every adopted partition (D6 interim).
+        // before any copy: from the first publish on, the writer's union
+        // numbering knows every part of every adopted partition (D6).
         let mut recorded = BTreeSet::new();
         for file in &plan.files {
             if self.fold.manifests.contains_key(&file.path) {
@@ -1146,8 +1158,8 @@ impl Run<'_> {
     }
 
     /// The end of a run that is about to pass: every recorded file is
-    /// [`complete`], so a PASS always leaves the writer guard releasing
-    /// every adopted partition that hot holds (D6 interim). A gap is a
+    /// [`complete`], so a PASS always leaves every adopted partition that
+    /// hot holds complete there and every file at k copies (D6). A gap is a
     /// problem, and the run fails.
     fn assert_complete(&mut self, targets: &[Target]) {
         let hot = self.config.paths.raw_root.clone();
@@ -1341,9 +1353,9 @@ impl std::fmt::Display for Gap {
 /// records a copy of it on every copy target. `Ok(None)` when complete,
 /// otherwise what is missing.
 ///
-/// Why this predicate: on hot, the writer guard's part check releases its
-/// partition (hot holds every recorded part); on every target, it has its
-/// k copies. A file on a target without a `copy` record does not count:
+/// Why this predicate: on hot, hot holds every recorded part of its
+/// partition, so a hot-window partition is whole there; on every target,
+/// it has its k copies. A file on a target without a `copy` record does not count:
 /// nothing would ever record it.
 fn complete(
     hot: &Path,

@@ -27,10 +27,14 @@
 //!    `ledger-copy` record per target whose copy was not up to date. After
 //!    steps 1 and 2, so this pass's copy records lie inside the prefix.
 //! 4. **The journal tail** `[len(copy), L)`. L was read before step 1
-//!    listed hot, and when a listed live file has no copy record for a
+//!    listed hot, and when a live file (from hot's listing, or from the
+//!    ledger's `manifest` and `copy` records) has no copy record for a
 //!    target, that target's copy stops before the first line that names it,
 //!    so a `sealed` line on a copy always names a file that is already on
-//!    that copy.
+//!    that copy. The ledger's paths count because the hot removal (#191,
+//!    ADR-062 D6) takes files off hot: a target added after a removal never
+//!    gets them from hot, and its journal copy waits at the first removed
+//!    file's line until #192's repair fills it.
 //!
 //! **The target's marker is re-read before every write to it** (a sealed
 //! copy, an entry, the ledger and journal tails) and before every record
@@ -47,7 +51,7 @@
 //! truncation of the ledger's trailing record to the [`PassObserver`]
 //! before anything else, a failed append included (#197 review finding 5):
 //! `mie store replicate` prints it as a report line of its own, and `mie
-//! ingest` will journal it (#191). The standalone command never writes the
+//! ingest` journals it (`copy_ledger_truncated`). The standalone command never writes the
 //! capture journal: a second process appending to it while `mie ingest`
 //! writes it through a buffered writer could land inside a half-flushed
 //! line (#189 STOP 1).
@@ -59,6 +63,12 @@
 //!
 //! It is also D9's copy-only mode: a pre-cutover store initialized with its
 //! own `cold_roots` gets whole-store copies, and nothing moves.
+//!
+//! [`run_planned`] is the pass of `mie ingest` (D11, after every seal
+//! pass): when every configured copy target presented its marker and none
+//! stopped, it ends with a fresh ledger read, one walk of hot and the hot
+//! removal's plan ([`removal::plan`]), which the seal path carries out.
+//! `mie store replicate` and the adoption never plan and never remove.
 
 use super::{DeviceProbe, check_devices, check_hot};
 use crate::config::{ArchiveConfig, IngestConfig};
@@ -67,6 +77,7 @@ use mie_adapter_binance::archive::ledger::ImportLedger;
 use mie_adapter_parquet::copy_ledger::{
     self, AppendError, AppendOutcome, CopyLedger, Kind, Record, Truncation,
 };
+use mie_adapter_parquet::removal::{self, RemovalPlan};
 use mie_adapter_parquet::replica::{self, CopyError, CopyOutcome, Side, TailSource};
 use mie_adapter_parquet::root_marker::{self, HOT_ID};
 use mie_ports::raw::{RawStoreError, validate_segment};
@@ -178,6 +189,19 @@ pub struct PassReport {
     /// Every refusal, skipped or stopped target, file or entry below k and
     /// error; empty when the pass passed.
     pub problems: Vec<String>,
+    /// Sealed files copied (copies made, over every target).
+    pub files_copied: usize,
+    /// Import entries copied.
+    pub entries_copied: usize,
+    /// Bytes appended to the copy-ledger copies.
+    pub ledger_bytes: u64,
+    /// Bytes appended to the journal copies.
+    pub journal_bytes: u64,
+    /// The ids of the copy targets that presented their marker.
+    pub target_ids: BTreeSet<String>,
+    /// Every configured copy target presented its marker and none was
+    /// stopped, and the pass ran to its end.
+    pub targets_complete: bool,
 }
 
 /// Why the pass stopped early.
@@ -205,6 +229,8 @@ pub(super) struct Fold {
     pub(super) manifests: BTreeMap<String, String>,
     pub(super) conflicts: BTreeSet<String>,
     pub(super) copies: BTreeMap<String, BTreeSet<String>>,
+    /// The paths of `lost` records: no copy of them can reach a target.
+    pub(super) lost: BTreeSet<String>,
 }
 
 impl Fold {
@@ -229,6 +255,9 @@ impl Fold {
                         .entry(path.clone())
                         .or_default()
                         .insert(root.clone());
+                }
+                Kind::Lost { path, .. } => {
+                    fold.lost.insert(path.clone());
                 }
                 _ => {}
             }
@@ -389,7 +418,7 @@ fn is_local(error: &RawStoreError) -> bool {
 
 /// The archive configuration of the pass: `--archive-config`, otherwise
 /// `[history] archive_config`, otherwise none.
-pub(super) fn archive_config(
+pub fn archive_config(
     config: &IngestConfig,
     given: Option<&Path>,
 ) -> Result<Option<ArchiveConfig>, String> {
@@ -414,7 +443,54 @@ pub fn run(
     ledger: &dyn LedgerAppend,
     observer: &mut dyn PassObserver,
 ) -> PassReport {
+    let archive = archive_config(config, archive);
     run_with(config, archive, probe, now_ms, ledger, observer, None)
+}
+
+/// The pass of `mie ingest` (module docs): [`run`] with the archive
+/// configuration already resolved, then, when every configured copy target
+/// presented its marker and none stopped, the hot removal's plan from a
+/// fresh ledger read and one walk of hot, with the hot window starting on
+/// `first_hot_date`. A failed read or walk is a problem and gives no plan.
+pub fn run_planned(
+    config: &IngestConfig,
+    archive: Option<ArchiveConfig>,
+    probe: &dyn DeviceProbe,
+    now_ms: &dyn Fn() -> i64,
+    ledger: &dyn LedgerAppend,
+    observer: &mut dyn PassObserver,
+    first_hot_date: &str,
+) -> (PassReport, Option<RemovalPlan>) {
+    let mut report = run_with(config, Ok(archive), probe, now_ms, ledger, observer, None);
+    if !report.targets_complete {
+        return (report, None);
+    }
+    let hot = config.paths.raw_root.as_path();
+    let k = config
+        .paths
+        .cold_roots
+        .iter()
+        .filter(|root| root.copy_target)
+        .count();
+    let planned = match copy_ledger::read(hot) {
+        Ok(Some(read)) => removal::scan_hot(hot)
+            .and_then(|scan| removal::plan(&read, &scan, &report.target_ids, k, first_hot_date))
+            .map_err(|error| error.to_string()),
+        Ok(None) => Err(format!(
+            "copy ledger {} does not exist",
+            copy_ledger::ledger_path(hot).display()
+        )),
+        Err(error) => Err(error.to_string()),
+    };
+    match planned {
+        Ok(plan) => (report, Some(plan)),
+        Err(error) => {
+            report.problems.push(format!(
+                "the hot removal's plan failed, so nothing is removed after this pass: {error}"
+            ));
+            (report, None)
+        }
+    }
 }
 
 /// [`run`] under a pass lock the caller already holds: `mie store adopt`
@@ -428,13 +504,14 @@ pub(crate) fn run_locked(
     observer: &mut dyn PassObserver,
     lock: replica::ReplicationLock,
 ) -> PassReport {
+    let archive = archive_config(config, archive);
     run_with(config, archive, probe, now_ms, ledger, observer, Some(lock))
 }
 
 /// The pass, taking the lock at its place in step 0 unless one is given.
 fn run_with(
     config: &IngestConfig,
-    archive: Option<&Path>,
+    archive: Result<Option<ArchiveConfig>, String>,
     probe: &dyn DeviceProbe,
     now_ms: &dyn Fn() -> i64,
     ledger: &dyn LedgerAppend,
@@ -465,7 +542,7 @@ fn run_with(
 #[allow(clippy::too_many_arguments)]
 fn start<'a>(
     config: &'a IngestConfig,
-    archive: Option<&Path>,
+    archive: Result<Option<ArchiveConfig>, String>,
     probe: &dyn DeviceProbe,
     now_ms: &'a dyn Fn() -> i64,
     ledger: &'a dyn LedgerAppend,
@@ -488,7 +565,7 @@ fn start<'a>(
     if let Err(error) = check_hot(hot, cold_roots) {
         return refuse(error);
     }
-    let archive = match archive_config(config, archive) {
+    let archive = match archive {
         Ok(archive) => archive,
         Err(error) => return refuse(error),
     };
@@ -664,16 +741,21 @@ pub(super) fn hot_entries(import_ledger: &Path) -> (Vec<Entry>, Vec<String>) {
 }
 
 /// The byte offset and the path of the first line of `journal` in
-/// `[from, end)` (from the start of the line that holds byte `from`) whose
-/// bytes contain one of `paths`, or `None`. A line cut at `end` counts with
-/// the bytes before `end`. A data path's text occurs in a journal line only
+/// `[from, end)` (from the start of the line that holds byte `from`) that
+/// names one of `paths`, or `None`. A line cut at `end` counts with the
+/// bytes before `end`. A data path's text occurs in a journal line only
 /// where the line names that file (`sealed`, `recovery` `rolled_forward`):
 /// a temp file's name differs from it in the byte before `part-`.
-fn first_line_naming(
+///
+/// The match is by token ([`line_names`]), not a substring scan per path:
+/// with the ledger's paths, a new target's set holds every recorded live
+/// file (about 670 000 after a year), and a scan per path would take
+/// minutes per pass.
+pub(super) fn first_line_naming(
     journal: &Path,
     from: u64,
     end: u64,
-    paths: &[&String],
+    paths: &BTreeSet<&str>,
 ) -> std::io::Result<Option<(u64, String)>> {
     use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
     let mut file = fs::File::open(journal)?;
@@ -705,15 +787,49 @@ fn first_line_naming(
             break;
         }
         let seen = &line[..n.min(end - offset) as usize];
-        if let Some(path) = paths.iter().find(|path| {
-            seen.windows(path.len())
-                .any(|window| window == path.as_bytes())
-        }) {
-            return Ok(Some((offset, (*path).clone())));
+        if let Some(path) = line_names(seen, paths) {
+            return Ok(Some((offset, path.to_owned())));
         }
         offset += n;
     }
     Ok(None)
+}
+
+/// The first path of `paths` that `line` names, by token: for each
+/// occurrence of `source=`, the longest run of layout-path bytes
+/// (`[A-Za-z0-9._=/-]`) from there, and every prefix of that run that ends
+/// with `.parquet`, looked up in `paths`. It finds the lines today's
+/// substring rule found for every path the layout can write: a data path
+/// consists of those bytes and starts with `source=`, so each occurrence is
+/// a prefix of such a run. The cost per line is O(line length · log n)
+/// instead of O(paths × line length).
+pub(super) fn line_names<'a>(line: &[u8], paths: &BTreeSet<&'a str>) -> Option<&'a str> {
+    const START: &[u8] = b"source=";
+    const SUFFIX: &[u8] = b".parquet";
+    let layout_byte =
+        |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'=' | b'/' | b'-');
+    let mut from = 0;
+    while let Some(at) = line[from..]
+        .windows(START.len())
+        .position(|window| window == START)
+    {
+        let start = from + at;
+        let run_len = line[start..]
+            .iter()
+            .position(|&b| !layout_byte(b))
+            .unwrap_or(line.len() - start);
+        let run = &line[start..start + run_len];
+        for end in SUFFIX.len()..=run.len() {
+            if run[..end].ends_with(SUFFIX)
+                && let Ok(candidate) = std::str::from_utf8(&run[..end])
+                && let Some(path) = paths.get(candidate)
+            {
+                return Some(path);
+            }
+        }
+        from = start + 1;
+    }
+    None
 }
 
 /// The UTF-8 entry names of `dir`, sorted; a missing directory has none.
@@ -767,6 +883,13 @@ impl Pass<'_> {
              copy-ledger byte(s) and {journal_bytes} journal byte(s)",
             if entries_copied == 1 { "y" } else { "ies" }
         ));
+        self.report.files_copied = copied;
+        self.report.entries_copied = entries_copied;
+        self.report.ledger_bytes = ledger_bytes;
+        self.report.journal_bytes = journal_bytes;
+        self.report.target_ids = self.targets.iter().map(|t| t.id.clone()).collect();
+        self.report.targets_complete =
+            self.targets.len() == self.k && self.targets.iter().all(|t| !t.stopped);
         self.result(&paths, &entries);
         Ok(())
     }
@@ -1081,10 +1204,15 @@ impl Pass<'_> {
     ///
     /// A `sealed` line on a copy must always name a file that copy holds
     /// (ADR-062 D11; review of #199, finding 3). So when a live file of the
-    /// listing has no copy record for a target, that target's journal copy
-    /// advances only up to the first line that names such a file, never
-    /// through it; everything before that line is still appended. Archive
-    /// parts are never checked: only the capture writes `sealed` lines.
+    /// listing, or of the ledger's `manifest` and `copy` records, has no
+    /// copy record for a target, that target's journal copy advances only up
+    /// to the first line that names such a file, never through it;
+    /// everything before that line is still appended. The ledger's paths
+    /// count because the hot removal takes files off hot, and a target added
+    /// after it never gets them from hot (#199 review carry-over): its copy
+    /// waits until #192's repair fills the target. Archive parts are never
+    /// checked: only the capture writes `sealed` lines. Lost paths are not
+    /// added: no copy of them can ever reach a target (#192, #193 decide).
     fn copy_journal_tail(&mut self, paths: &[String]) -> u64 {
         let Some(len) = self.journal_len else {
             return 0;
@@ -1107,31 +1235,44 @@ impl Pass<'_> {
                 .join(JOURNAL_DIR)
                 .join(&name);
             let id = self.targets[i].id.clone();
-            let short: Vec<&String> = paths
-                .iter()
-                .filter(|path| !is_archive_part(path) && !self.fold.has_copy(path, &id))
-                .collect();
+            let copy_len = fs::metadata(&dest).map_or(0, |metadata| metadata.len());
+            let found = {
+                let fold = &self.fold;
+                let recorded = fold
+                    .manifests
+                    .keys()
+                    .chain(fold.copies.keys())
+                    .filter(|path| !fold.lost.contains(*path));
+                let short: BTreeSet<&str> = paths
+                    .iter()
+                    .chain(recorded)
+                    .filter(|path| !is_archive_part(path) && !fold.has_copy(path, &id))
+                    .map(String::as_str)
+                    .collect();
+                if short.is_empty() {
+                    Ok(None)
+                } else {
+                    first_line_naming(self.journal, copy_len, len, &short)
+                }
+            };
             let mut end = len;
-            if !short.is_empty() {
-                let copy_len = fs::metadata(&dest).map_or(0, |metadata| metadata.len());
-                match first_line_naming(self.journal, copy_len, len, &short) {
-                    Ok(None) => {}
-                    Ok(Some((offset, path))) => {
-                        self.problem(format!(
-                            "the journal copy on {id} stops before byte {offset} of the journal: \
-                             the line there names {path}, which is not on {id}, and a `sealed` \
-                             line on a copy always names a file that copy holds (ADR-062 D11)"
-                        ));
-                        // A copy already past the line is only compared.
-                        end = offset.max(copy_len.min(len));
-                    }
-                    Err(error) => {
-                        self.problem(format!(
-                            "the journal {} cannot be read: {error}",
-                            self.journal.display()
-                        ));
-                        return appended;
-                    }
+            match found {
+                Ok(None) => {}
+                Ok(Some((offset, path))) => {
+                    self.problem(format!(
+                        "the journal copy on {id} stops before byte {offset} of the journal: \
+                         the line there names {path}, which is not on {id}, and a `sealed` \
+                         line on a copy always names a file that copy holds (ADR-062 D11)"
+                    ));
+                    // A copy already past the line is only compared.
+                    end = offset.max(copy_len.min(len));
+                }
+                Err(error) => {
+                    self.problem(format!(
+                        "the journal {} cannot be read: {error}",
+                        self.journal.display()
+                    ));
+                    return appended;
                 }
             }
             if !self.marker_present(i) {

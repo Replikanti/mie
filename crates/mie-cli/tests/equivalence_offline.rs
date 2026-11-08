@@ -769,6 +769,7 @@ fn play(config: &IngestConfig, start_ms: i64, records: &[&Record]) {
             shutdown: Arc::clone(&shutdown),
         }),
         clock: clock as Arc<dyn Clock>,
+        device_probe: Arc::new(mie_cli::store::StDevProbe),
     };
     let outcome = mie_cli::ingest::run(config, transports, shutdown).expect("ingest starts");
     assert_eq!(outcome.exit_code(), 0, "{:?}", outcome.error);

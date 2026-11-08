@@ -22,6 +22,10 @@
 //! | `domain_rejection` | ingest | an event the engine rejected |
 //! | `state_checkpoint` | ingest | `ordinal` (events delivered so far, rejections included), `as_of` (ms or null), `event_hash` and `state_hash` (16 hex digits), `last`: a checkpoint of the core (ADR-041) |
 //! | `run_end` | ingest | totals (`events`, `domain_rejections`, `records`) and the exit code |
+//! | `replication` | ingest | one per replication pass of a tiered store (ADR-062 D11, after every seal pass, on the `mie-replicate` thread): `passed`, `files_copied`, `entries_copied`, `ledger_bytes`, `journal_bytes`, `problems` (a count), `first_problem` (text or null; `mie store replicate` prints the full list) and `candidates` (the partitions planned for removal from hot, or null without a plan). The final pass's line lands after `run_end` |
+//! | `copy_ledger_truncated` | ingest | an append truncated the copy ledger's incomplete trailing record (ADR-062 D7): `ledger` (path), `bytes`, `offset` |
+//! | `removal` | ingest | a hot-removal pass in the seal path that did something (ADR-062 D6): `source`, `removed` and `completed` (partitions), `skipped` (`[{partition, reason}]`), `locked` (the source's lock was held by an import) and `error` (text or null) |
+//! | `recall` | ingest | the live writer recalled a partition removed from hot (ADR-062 D6): `partition`, `files`, `from` (`{cold root: files}`) and `damaged` (`[{path, root, error}]`, the damaged copies passed over) |
 //!
 //! The journal is flushed on every `stats` line and at the end of a run, and
 //! synced to stable storage right after `run_start` and at the end of a run:
@@ -49,11 +53,15 @@
 //! engine, and the history chain keeps them, so it recomputes the run
 //! exactly as it was consumed.
 
+use crate::ingest::tiers::Recalled;
+use crate::store::PassReport;
 use mie_adapter_binance::live::ChannelStats;
 use mie_adapter_binance::{
     BinanceStream, BookStats, BookTransition, CaptureEvent, CaptureObserver, CheckpointResult,
     LiveRun, MIN_SIDE_LEVELS, PipelineStats, SideCoverage, SnapshotTrigger,
 };
+use mie_adapter_parquet::copy_ledger::Truncation;
+use mie_adapter_parquet::removal::{RemovalPlan, RemovalReport};
 use mie_app::equivalence::StateCheckpoint;
 use mie_domain::book::{Invalidation, Side};
 use mie_domain::event_hash::EventStreamHash;
@@ -1000,6 +1008,61 @@ fn side(side: Side) -> &'static str {
         Side::Bid => "bid",
         Side::Ask => "ask",
     }
+}
+
+/// A replication pass as its `replication` line (ADR-062 D11): counts and
+/// the first problem only, since a pass with a new target can name hundreds
+/// of thousands of files, 288 times a day.
+pub fn replication_json(report: &PassReport, plan: Option<&RemovalPlan>) -> Value {
+    json!({
+        "passed": report.problems.is_empty(),
+        "files_copied": report.files_copied,
+        "entries_copied": report.entries_copied,
+        "ledger_bytes": report.ledger_bytes,
+        "journal_bytes": report.journal_bytes,
+        "problems": report.problems.len(),
+        "first_problem": report.problems.first(),
+        "candidates": plan.map(|plan| plan.candidates.len()),
+    })
+}
+
+/// A truncation of the copy ledger's trailing record (ADR-062 D7).
+pub fn copy_ledger_truncated_json(ledger: &Path, truncation: Truncation) -> Value {
+    json!({
+        "ledger": ledger.display().to_string(),
+        "bytes": truncation.bytes,
+        "offset": truncation.offset,
+    })
+}
+
+/// A hot-removal pass of one source (ADR-062 D6).
+pub fn removal_json(report: &RemovalReport) -> Value {
+    json!({
+        "source": report.source,
+        "removed": report.removed,
+        "completed": report.completed,
+        "skipped": report
+            .skipped
+            .iter()
+            .map(|(partition, reason)| json!({"partition": partition, "reason": reason}))
+            .collect::<Vec<_>>(),
+        "locked": report.locked,
+        "error": report.error,
+    })
+}
+
+/// A recalled partition (ADR-062 D6).
+pub(crate) fn recall_json(recalled: &Recalled) -> Value {
+    json!({
+        "partition": recalled.partition,
+        "files": recalled.files,
+        "from": recalled.from,
+        "damaged": recalled
+            .damaged
+            .iter()
+            .map(|(path, root, error, _)| json!({"path": path, "root": root, "error": error}))
+            .collect::<Vec<_>>(),
+    })
 }
 
 /// Sealed files as journal JSON.

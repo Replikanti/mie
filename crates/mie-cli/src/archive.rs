@@ -17,7 +17,9 @@ use mie_adapter_binance::archive::normalize::{parse, record_time};
 use mie_adapter_binance::archive::replay::open_requests;
 use mie_adapter_binance::archive::{ARCHIVE_SOURCE, ArchiveStream};
 use mie_adapter_binance::transport::{Clock, HttpDownload, HttpGet};
-use mie_adapter_parquet::{ParquetRawStore, RotationPolicy};
+use mie_adapter_parquet::{
+    ParquetRawStore, RecallEvent, RecallObserver, RotationPolicy, TierContext,
+};
 use mie_app::kline_check::{KlineVerdict, MAX_EXPECTED_INCOMPLETE, window_bars};
 use mie_domain::bars::Timeframe;
 use mie_domain::event::MarketEvent;
@@ -30,8 +32,8 @@ use mie_ports::raw::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Longest silence inside a trade stream's day that `archive-verify`
@@ -143,6 +145,30 @@ pub fn import(
     shutdown: &AtomicBool,
     out: &mut dyn Write,
 ) -> Result<ImportSummary, String> {
+    import_with(config, request, transports, shutdown, out, None)
+}
+
+/// [`import`], with `on_recall` seeing every step of a recall (ADR-062 D6)
+/// synchronously, before the next one: a test runs a replay there.
+///
+/// On a tiered store the writer is the tiered writer: an import into a
+/// partition removed from hot first copies it back from a copy target. The
+/// recall is printed as `recall <partition>: <n> file(s) copied back to hot
+/// (<root>: <n>, …); returned`, with one line per damaged copy passed over
+/// (`recall <partition>: damaged copy of <path> on <root>: <error>; copied
+/// from <root>`) and one per copy-ledger truncation.
+///
+/// # Errors
+///
+/// As [`import`].
+pub fn import_with(
+    config: &ArchiveConfig,
+    request: &ImportRequest,
+    transports: &ArchiveTransports,
+    shutdown: &AtomicBool,
+    out: &mut dyn Write,
+    on_recall: Option<RecallObserver>,
+) -> Result<ImportSummary, String> {
     // Dry runs too: on a lost hot every file would read as not imported
     // (ADR-062 D7, *Hot lost*).
     crate::store::check_hot(&config.paths.raw_root, &config.paths.cold_roots)?;
@@ -168,9 +194,67 @@ pub fn import(
         let _ = writeln!(out, "{summary}");
         return Ok(summary);
     }
-    let mut writer = store
-        .writer(ARCHIVE_SOURCE, rotation_policy())
-        .map_err(|e| format!("open the raw store: {e}"))?;
+    let events: Arc<Mutex<Vec<RecallEvent>>> = Arc::default();
+    let mut writer = if store.is_tiered() {
+        let clock = Arc::clone(&transports.clock);
+        let buffer = Arc::clone(&events);
+        let ctx = TierContext {
+            first_hot_date: crate::ingest::first_hot_date(clock.now_utc_ns().div_euclid(1_000_000)),
+            now_ms: Arc::new(move || clock.now_utc_ns().div_euclid(1_000_000)),
+            on_recall: Some(Arc::new(move |event: &RecallEvent| {
+                buffer
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push(event.clone());
+                if let Some(on_recall) = &on_recall {
+                    on_recall(event);
+                }
+            })),
+        };
+        store.tiered_writer(ARCHIVE_SOURCE, rotation_policy(), ctx)
+    } else {
+        store.writer(ARCHIVE_SOURCE, rotation_policy())
+    }
+    .map_err(|e| format!("open the raw store: {e}"))?;
+    let ledger = mie_adapter_parquet::copy_ledger::ledger_path(&config.paths.raw_root);
+    let mut tally = crate::ingest::tiers::RecallTally::default();
+    let mut print_recalls = |out: &mut dyn Write| {
+        let drained: Vec<RecallEvent> =
+            std::mem::take(&mut *events.lock().unwrap_or_else(|p| p.into_inner()));
+        for event in drained {
+            if let RecallEvent::LedgerTruncated(truncation) = event {
+                let _ = writeln!(
+                    out,
+                    "{}",
+                    crate::store::truncation_line(&ledger, truncation)
+                );
+                continue;
+            }
+            let Some(recalled) = tally.observe(&event) else {
+                continue;
+            };
+            let from: Vec<String> = recalled
+                .from
+                .iter()
+                .map(|(root, n)| format!("{root}: {n}"))
+                .collect();
+            let _ = writeln!(
+                out,
+                "recall {}: {} file(s) copied back to hot ({}); returned",
+                recalled.partition,
+                recalled.files,
+                from.join(", ")
+            );
+            for (path, root, error, copied_from) in &recalled.damaged {
+                let _ = writeln!(
+                    out,
+                    "recall {}: damaged copy of {path} on {root}: {error}; copied from \
+                     {copied_from}",
+                    recalled.partition
+                );
+            }
+        }
+    };
     let recovery = writer.recovery().clone();
     if !recovery.is_clean() {
         let _ = writeln!(
@@ -181,9 +265,11 @@ pub fn import(
     }
     let result =
         Importer::new(&mut writer, &store, fetcher, options, shutdown).run(&mut |report| {
+            print_recalls(out);
             let _ = writeln!(out, "{report}");
         });
     let closed = writer.close();
+    print_recalls(out);
     let summary = result.map_err(|e| e.to_string())?;
     closed.map_err(|e| format!("close the raw store: {e}"))?;
     let _ = writeln!(out, "{summary}");

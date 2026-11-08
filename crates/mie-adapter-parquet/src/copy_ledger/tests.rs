@@ -995,3 +995,80 @@ fn a_damaged_ledger_copy_is_refused_even_when_current() {
     ));
     assert!(!ledger_path(&cold[1]).exists());
 }
+
+/// #191: a reader's ledger carries every record's end, its verified length
+/// and its last chain, and a hold returns the records after such a prefix,
+/// refusing a ledger that changed under it.
+#[test]
+fn records_after_a_plans_prefix() {
+    let dir = store("records-after");
+    let records = golden_records();
+    let ledger = read(dir.path()).unwrap().unwrap();
+    assert_eq!(ledger.verified_len, HEADER.len() as u64);
+    assert_eq!(ledger.last_chain, genesis());
+    assert!(ledger.ends.is_empty());
+    let hold = CopyLedger::at(dir.path()).try_hold().unwrap();
+    // From the header-only prefix.
+    assert!(
+        hold.records_after(ledger.verified_len, &ledger.last_chain)
+            .unwrap()
+            .is_empty()
+    );
+    for record in &records[..4] {
+        hold.append(record).unwrap();
+    }
+    assert_eq!(
+        hold.records_after(ledger.verified_len, &ledger.last_chain)
+            .unwrap(),
+        records[..4].to_vec()
+    );
+    drop(hold);
+
+    // From a later prefix; the ends match the file.
+    let bytes = fs::read(ledger_path(dir.path())).unwrap();
+    let ledger = read(dir.path()).unwrap().unwrap();
+    assert_eq!(ledger.verified_len, bytes.len() as u64);
+    assert_eq!(*ledger.ends.last().unwrap(), bytes.len() as u64);
+    for (i, &end) in ledger.ends.iter().enumerate() {
+        assert_eq!(bytes[end as usize - 1], b'\n', "record {i}");
+    }
+    append_all(dir.path(), &records[4..6]);
+    let hold = CopyLedger::at(dir.path()).try_hold().unwrap();
+    assert_eq!(
+        hold.records_after(ledger.verified_len, &ledger.last_chain)
+            .unwrap(),
+        records[4..6].to_vec()
+    );
+
+    // An incomplete trailing record is ignored.
+    let path = ledger_path(dir.path());
+    let mut tail = fs::read(&path).unwrap();
+    tail.extend_from_slice(b"removed 17912484");
+    fs::write(&path, &tail).unwrap();
+    assert_eq!(
+        hold.records_after(ledger.verified_len, &ledger.last_chain)
+            .unwrap()
+            .len(),
+        2
+    );
+
+    // Another chain before the offset, a shorter file, a broken tail.
+    let other = genesis();
+    for (what, chain, offset) in [
+        ("chain", other.as_str(), ledger.verified_len),
+        ("shorter", ledger.last_chain.as_str(), tail.len() as u64 + 1),
+    ] {
+        let error = hold.records_after(offset, chain).unwrap_err();
+        assert!(
+            matches!(&error, RawStoreError::Integrity(m) if m.contains("changed since the plan")),
+            "{what}: {error:?}"
+        );
+    }
+    let mut broken = fs::read(&path).unwrap();
+    flip(&mut broken, ledger.verified_len as usize + 3);
+    fs::write(&path, &broken).unwrap();
+    assert!(matches!(
+        hold.records_after(ledger.verified_len, &ledger.last_chain),
+        Err(RawStoreError::Integrity(_))
+    ));
+}

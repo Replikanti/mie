@@ -185,22 +185,36 @@ impl TieredFixture {
     /// per root (D5, the copy protocol).
     pub(crate) fn copy(&self, partition: &str) {
         for path in Self::data_paths(&self.hot, partition) {
-            let manifest = Self::manifest_of(&path);
-            for root in &self.cold {
-                for file in [&path, &manifest] {
+            self.copy_path(&path, &["cold-a", "cold-b"]);
+        }
+    }
+
+    /// Copies the sealed file `path` from hot to the cold roots with the
+    /// ids `ids` (`cold-a`, `cold-b`) and records it: its `manifest`
+    /// record, then one `copy` record per root.
+    pub(crate) fn copy_path(&self, path: &str, ids: &[&str]) {
+        let manifest = Self::manifest_of(path);
+        for (root, id) in self.cold.iter().zip(["cold-a", "cold-b"]) {
+            if ids.contains(&id) {
+                for file in [path, manifest.as_str()] {
                     copy_file(&self.hot, root, file);
                 }
             }
-            let text = std::fs::read_to_string(crate::layout::resolve(&self.hot, &manifest))
-                .expect("read a manifest");
-            self.append(crate::copy_ledger::Kind::Manifest { text });
-            for root in ["cold-a", "cold-b"] {
-                self.append(crate::copy_ledger::Kind::Copy {
-                    path: path.clone(),
-                    root: root.to_owned(),
-                });
-            }
         }
+        let text = std::fs::read_to_string(crate::layout::resolve(&self.hot, &manifest))
+            .expect("read a manifest");
+        self.append(crate::copy_ledger::Kind::Manifest { text });
+        for id in ids {
+            self.append(crate::copy_ledger::Kind::Copy {
+                path: path.to_owned(),
+                root: (*id).to_owned(),
+            });
+        }
+    }
+
+    /// The reference root.
+    pub(crate) fn reference_root(&self) -> &Path {
+        &self.reference
     }
 
     /// Removes `partition` from hot in D6's order: the `removed` record,
@@ -226,6 +240,44 @@ impl TieredFixture {
         self.append(crate::copy_ledger::Kind::Returned {
             partition: partition.to_owned(),
         });
+    }
+
+    /// Extends both cold roots' copy-ledger copies to hot's ledger and
+    /// appends their `ledger-copy` records, as the replication pass's step
+    /// 3 does (ADR-062 D11).
+    pub(crate) fn ledger_copies(&self) {
+        for i in 0..self.cold.len() {
+            self.ledger_copy(i);
+        }
+    }
+
+    /// [`ledger_copies`](Self::ledger_copies) for cold root `i` alone.
+    pub(crate) fn ledger_copy(&self, i: usize) {
+        let id = ["cold-a", "cold-b"][i];
+        let copy = crate::copy_ledger::extend_copy(&self.hot, &self.cold[i], id)
+            .expect("extend a ledger copy");
+        if !copy.current {
+            self.append(crate::copy_ledger::Kind::LedgerCopy {
+                root: id.to_owned(),
+                prefix_bytes: copy.prefix_bytes,
+                prefix_sha256: copy.prefix_sha256,
+            });
+        }
+    }
+
+    /// The writer context of a tiered writer whose hot window starts on
+    /// `first_hot_date`, with a fixed clock and no recall observer.
+    pub(crate) fn context(first_hot_date: &str) -> crate::writer::TierContext {
+        crate::writer::TierContext {
+            first_hot_date: first_hot_date.to_owned(),
+            now_ms: std::sync::Arc::new(|| FIXTURE_D0 + 30 * crate::layout::DAY_MS),
+            on_recall: None,
+        }
+    }
+
+    /// The ids of both copy targets.
+    pub(crate) fn target_ids() -> std::collections::BTreeSet<String> {
+        ["cold-a", "cold-b"].map(str::to_owned).into()
     }
 
     /// Moves every copy of `path` (data and manifest), on hot and both cold
