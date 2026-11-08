@@ -26,7 +26,7 @@
 //! finishes both without a second record. A recall that failed before its
 //! `returned` record leaves an incomplete partition too.
 
-use crate::copy_ledger::{CopyLedger, Kind, Ledger, Record, Truncation};
+use crate::copy_ledger::{CopyLedger, Kind, Ledger, Record, Subject, Truncation};
 use crate::layout::{self, PartFile};
 use crate::replica::layout_values;
 use crate::tiers::{self, LedgerView, Verdict};
@@ -48,6 +48,10 @@ pub struct PartitionScan {
     /// Whether it holds seal debris: a `.tmp` file, or data without its
     /// manifest.
     pub debris: bool,
+    /// For a partition before the hot window, hot's manifest text of each
+    /// sealed part by data path, `None` when it cannot be read; empty for
+    /// the others, which the plan never considers.
+    pub manifests: BTreeMap<String, Option<String>>,
 }
 
 /// One walk of hot's layout.
@@ -62,12 +66,15 @@ pub struct HotScan {
 
 /// Walks hot's layout once, as [`replica::list_sealed`](crate::replica::list_sealed)
 /// does: per partition its sealed data paths and whether seal debris is
-/// there, and every hidden directory of a crashed removal.
+/// there, and every hidden directory of a crashed removal. For partitions
+/// dated before `first_hot_date`, the only ones the plan considers, it also
+/// reads each sealed part's manifest text, so the plan can compare it with
+/// the ledger's `manifest` record (D5; review of #202, finding 2).
 ///
 /// # Errors
 ///
 /// [`RawStoreError::Io`] when a directory cannot be listed.
-pub fn scan_hot(hot: &Path) -> Result<HotScan, RawStoreError> {
+pub fn scan_hot(hot: &Path, first_hot_date: &str) -> Result<HotScan, RawStoreError> {
     let mut scan = HotScan::default();
     for source in layout_values(hot, "source=")? {
         let source_dir = hot.join(format!("source={source}"));
@@ -99,14 +106,42 @@ pub fn scan_hot(hot: &Path) -> Result<HotScan, RawStoreError> {
                     let Some(files) = list_entries(&stream_dir.join(&name))? else {
                         continue;
                     };
-                    scan.partitions
-                        .insert(partition.clone(), scan_partition(&partition, &files));
+                    let mut found = scan_partition(&partition, &files);
+                    if date < first_hot_date {
+                        found.manifests = read_manifests(hot, &found.sealed);
+                    }
+                    scan.partitions.insert(partition, found);
                 }
             }
         }
     }
     scan.leftovers.sort();
     Ok(scan)
+}
+
+/// Hot's manifest text of each data path in `sealed`, `None` when it
+/// cannot be read.
+fn read_manifests(hot: &Path, sealed: &[String]) -> BTreeMap<String, Option<String>> {
+    sealed
+        .iter()
+        .map(|path| (path.clone(), read_manifest(hot, path)))
+        .collect()
+}
+
+/// Hot's manifest text of the data path `path`.
+fn read_manifest(hot: &Path, path: &str) -> Option<String> {
+    let (key, date, part) = layout::parse_data_path(path).ok()?;
+    let manifest = layout::file_path(&key, &date, PartFile::Manifest, part);
+    fs::read_to_string(layout::resolve(hot, &manifest)).ok()
+}
+
+/// The D5 message for hot's manifest of `path` differing from the ledger's.
+fn differs(path: &str) -> String {
+    format!(
+        "{path}: hot's manifest differs from the copy ledger's manifest record; the same path \
+         must carry byte-identical manifests everywhere, so its partition is not removed from \
+         hot (ADR-062 D5)"
+    )
 }
 
 /// The sealed parts and the debris among the entry `names` of `partition`.
@@ -141,6 +176,9 @@ pub struct Candidate {
     /// Its file set: hot's sealed files plus every path the ledger records
     /// in it, replaced paths excluded; sorted.
     pub files: Vec<String>,
+    /// The ledger's manifest text of every file in the set: hot's manifests
+    /// must still equal them under the locks (D5).
+    pub manifests: BTreeMap<String, String>,
 }
 
 /// What [`plan`] decided, against one ledger read.
@@ -158,6 +196,10 @@ pub struct RemovalPlan {
     pub incomplete: Vec<Candidate>,
     /// The hidden directories a crashed removal left (relative).
     pub leftovers: Vec<String>,
+    /// Every path whose hot manifest differs from the ledger's `manifest`
+    /// record (D5), as a message: its partition stays on hot, and the pass
+    /// reports it.
+    pub conflicts: Vec<String>,
 }
 
 impl RemovalPlan {
@@ -186,8 +228,11 @@ impl RemovalPlan {
 /// - (d) its file set (hot's sealed files plus every path the ledger
 ///   records in it, replaced paths excluded) has no lost, held, conflicting
 ///   or replacement-pending path;
-/// - (e) every file in it has a `manifest` record and, for every id in
-///   `targets`, a `copy` record;
+/// - (e) every file in it has a `manifest` record whose text hot's
+///   manifest equals (D5; a difference is reported in
+///   [`RemovalPlan::conflicts`]) and, for every id in `targets`, a `copy`
+///   record with no `finding` about that copy on that root after it (a
+///   damaged copy never counts toward k, the re-check's own rule);
 /// - (f) that `manifest` record and those `copy` records end at or before
 ///   P, the smallest of the latest `ledger-copy` prefix lengths of the ids
 ///   in `targets`: they lie in the prefix that k verified ledger copies
@@ -214,6 +259,7 @@ pub fn plan(
         candidates: Vec::new(),
         incomplete: Vec::new(),
         leftovers: scan.leftovers.clone(),
+        conflicts: Vec::new(),
     };
     if targets.len() != k || k == 0 {
         return Ok(plan);
@@ -221,9 +267,10 @@ pub fn plan(
     let view = LedgerView::fold(ledger)?;
     let removed = tiers::removed_partitions(ledger);
     // Where each path's first `manifest` record and each id's first `copy`
-    // record end, and P.
+    // record end, and P. A `finding` about a file on a root voids that
+    // root's copy until a later `copy` record (review of #202, finding 3).
     let mut manifest_end: BTreeMap<String, u64> = BTreeMap::new();
-    let mut copy_end: BTreeMap<(String, String), u64> = BTreeMap::new();
+    let mut copy_end: BTreeMap<(String, String), Option<u64>> = BTreeMap::new();
     let mut ledger_copy: BTreeMap<&str, u64> = BTreeMap::new();
     for (record, &end) in ledger.records.iter().zip(&ledger.ends) {
         match &record.kind {
@@ -232,7 +279,17 @@ pub fn plan(
                 manifest_end.entry(path).or_insert(end);
             }
             Kind::Copy { path, root } => {
-                copy_end.entry((path.clone(), root.clone())).or_insert(end);
+                copy_end
+                    .entry((path.clone(), root.clone()))
+                    .or_insert(None)
+                    .get_or_insert(end);
+            }
+            Kind::Finding {
+                root,
+                subject: Subject::File(path),
+                ..
+            } => {
+                copy_end.insert((path.clone(), root.clone()), None);
             }
             Kind::LedgerCopy {
                 root, prefix_bytes, ..
@@ -262,14 +319,16 @@ pub fn plan(
         }
         let recorded = view.partition(partition);
         let mut files: BTreeSet<String> = on_hot.sealed.iter().cloned().collect();
+        let mut manifests: BTreeMap<String, String> = BTreeMap::new();
         let mut safe = true;
         for (path, verdict) in &recorded {
             match verdict {
                 // A replaced path still on hot is the error `select`
                 // reports; the partition stays until it is resolved.
                 Verdict::Replaced => safe &= !on_hot.sealed.contains(path),
-                Verdict::Ordinary(_) => {
+                Verdict::Ordinary(text) => {
                     files.insert(path.clone());
+                    manifests.insert(path.clone(), text.clone());
                 }
                 Verdict::NoManifest
                 | Verdict::Lost
@@ -278,11 +337,23 @@ pub fn plan(
                 | Verdict::Pending => safe = false,
             }
         }
+        // Hot's version of every path it holds is the ledger's (D5).
+        for path in &on_hot.sealed {
+            match (on_hot.manifests.get(path), manifests.get(path)) {
+                (Some(Some(hot)), Some(ledger)) if hot == ledger => {}
+                (Some(Some(_)), Some(_)) => {
+                    plan.conflicts.push(differs(path));
+                    safe = false;
+                }
+                // Unreadable, or not recorded (rule e fails anyway).
+                _ => safe = false,
+            }
+        }
         safe &= files.iter().all(|path| {
             inside(manifest_end.get(path).copied())
                 && targets
                     .iter()
-                    .all(|id| inside(copy_end.get(&(path.clone(), id.clone())).copied()))
+                    .all(|id| inside(copy_end.get(&(path.clone(), id.clone())).copied().flatten()))
         });
         if !safe || files.is_empty() {
             continue;
@@ -290,6 +361,7 @@ pub fn plan(
         let candidate = Candidate {
             partition: partition.clone(),
             files: files.into_iter().collect(),
+            manifests,
         };
         if recorded_removed {
             plan.incomplete.push(candidate);
@@ -577,7 +649,7 @@ fn recheck(
                 files.contains(path.as_str()) || path.starts_with(&format!("{partition}/"))
             }
             Kind::Finding { subject, .. } => match subject {
-                crate::copy_ledger::Subject::File(path) => {
+                Subject::File(path) => {
                     files.contains(path.as_str()) || path.starts_with(&format!("{partition}/"))
                 }
                 _ => false,
@@ -605,6 +677,12 @@ fn recheck(
         .find(|path| !files.contains(path.as_str()))
     {
         return Err(format!("{extra} was sealed after the plan"));
+    }
+    // Hot's version is still the ledger's (D5): a few small reads.
+    for path in &scan.sealed {
+        if read_manifest(hot, path).as_ref() != candidate.manifests.get(path) {
+            return Err(differs(path));
+        }
     }
     Ok(())
 }

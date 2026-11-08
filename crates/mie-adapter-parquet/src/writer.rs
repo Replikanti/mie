@@ -1265,7 +1265,7 @@ mod tests {
     fn remove_through(fixture: &TieredFixture, writer: &mut RawWriter, partition: &str) {
         fixture.ledger_copies();
         let ledger = copy_ledger::read(&fixture.hot).unwrap().unwrap();
-        let scan = removal::scan_hot(&fixture.hot).unwrap();
+        let scan = removal::scan_hot(&fixture.hot, &first_hot()).unwrap();
         let plan = removal::plan(
             &ledger,
             &scan,

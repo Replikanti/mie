@@ -661,7 +661,7 @@ fn the_first_error_in_path_order() {
 fn remove_for_real(fx: &TieredFixture) -> crate::removal::RemovalReport {
     let first = TieredFixture::date(3);
     let ledger = copy_ledger::read(&fx.hot).unwrap().unwrap();
-    let scan = crate::removal::scan_hot(&fx.hot).unwrap();
+    let scan = crate::removal::scan_hot(&fx.hot, &first).unwrap();
     let plan =
         crate::removal::plan(&ledger, &scan, &TieredFixture::target_ids(), 2, &first).unwrap();
     crate::removal::remove_with_lock(&fx.hot, "binance-um", &plan, &first, D0 + 40 * DAY_MS)

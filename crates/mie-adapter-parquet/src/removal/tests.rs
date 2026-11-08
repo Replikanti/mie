@@ -5,7 +5,9 @@
 use super::{
     CRASH_AFTER, RemovalPlan, RemovalReport, RemovalStep, plan, remove_with_lock, scan_hot,
 };
-use crate::copy_ledger::{self, CopyLedger, HoldReason, Kind, LostOrigin, Resolution};
+use crate::copy_ledger::{
+    self, CopyLedger, FindingCode, HoldReason, Kind, LostOrigin, Resolution, Subject,
+};
 use crate::layout::{self, DAY_MS, PartFile};
 use crate::reader::ParquetRawStore;
 use crate::testutil::{FIXTURE_D0 as D0, TieredFixture, record, stream};
@@ -45,7 +47,14 @@ fn partition() -> String {
 /// The plan over the fixture's current state.
 fn plan_now(fx: &TieredFixture, targets: &BTreeSet<String>, k: usize, first: &str) -> RemovalPlan {
     let ledger = copy_ledger::read(&fx.hot).unwrap().unwrap();
-    plan(&ledger, &scan_hot(&fx.hot).unwrap(), targets, k, first).unwrap()
+    plan(
+        &ledger,
+        &scan_hot(&fx.hot, first).unwrap(),
+        targets,
+        k,
+        first,
+    )
+    .unwrap()
 }
 
 fn remove(fx: &TieredFixture, plan: &RemovalPlan) -> RemovalReport {
@@ -80,6 +89,19 @@ fn seal_extra(fx: &TieredFixture, key: &RawStreamKey) {
         .unwrap();
     writer.append(key, record(D0 + 10, 1)).unwrap();
     writer.close().unwrap();
+}
+
+/// Replaces hot's manifest of `path` with another valid text (one more
+/// row): hot then holds another version of a recorded path (D5).
+fn rewrite_hot_manifest(fx: &TieredFixture, path: &str) {
+    let file = layout::resolve(&fx.hot, &TieredFixture::manifest_of(path));
+    let mut manifest = crate::manifest::parse(&fs::read_to_string(&file).unwrap()).unwrap();
+    manifest.rows += 1;
+    let mut permissions = fs::metadata(&file).unwrap().permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    permissions.set_readonly(false);
+    fs::set_permissions(&file, permissions).unwrap();
+    fs::write(&file, crate::manifest::render(&manifest)).unwrap();
 }
 
 /// Every reference file reads through the union, the ledger verifies, and
@@ -273,6 +295,41 @@ fn each_eligibility_condition_alone_blocks_removal() {
             }),
             Some("after the plan names it"),
         ),
+        // Review of #202, finding 2: hot's manifest differs from the
+        // ledger's `manifest` record (D5): never planned.
+        (
+            "hot's manifest differs from the ledger's",
+            Box::new(move |fx| {
+                rewrite_hot_manifest(fx, &path(0));
+                plan_now(fx, &TieredFixture::target_ids(), 2, &first_hot())
+            }),
+            None,
+        ),
+        // ... and when it changes after the plan, the re-check refuses it.
+        (
+            "hot's manifest changed after the plan",
+            Box::new(move |fx| {
+                let plan = plan_now(fx, &TieredFixture::target_ids(), 2, &first_hot());
+                rewrite_hot_manifest(fx, &path(0));
+                plan
+            }),
+            Some("differs from the copy ledger's manifest record"),
+        ),
+        // Review of #202, finding 3: a damaged-copy finding before the
+        // plan takes that copy out of k.
+        (
+            "a finding before the plan",
+            Box::new(move |fx| {
+                fx.append(Kind::Finding {
+                    root: "cold-b".to_owned(),
+                    code: FindingCode::Sha256,
+                    subject: Subject::File(path(1)),
+                });
+                fx.ledger_copies();
+                plan_now(fx, &TieredFixture::target_ids(), 2, &first_hot())
+            }),
+            None,
+        ),
     ];
     for (name, setup, refused) in rows {
         let fx = eligible("removal-row");
@@ -440,4 +497,41 @@ fn a_writer_removes_only_partitions_without_an_open_part() {
     );
     let sealed = writer.close().unwrap();
     assert_eq!(sealed[0].part, 3);
+}
+
+/// Review of #202: the plan names a D5 conflict, and a copy re-recorded
+/// after a finding counts again (the repair's `copy` record, #192).
+#[test]
+fn conflicts_are_reported_and_a_copy_after_a_finding_counts_again() {
+    let path = format!("{}/{}", partition(), PartFile::Data.name(0));
+    let fx = eligible("removal-conflict");
+    rewrite_hot_manifest(&fx, &path);
+    let plan = plan_now(&fx, &TieredFixture::target_ids(), 2, &first_hot());
+    assert!(plan.candidates.is_empty(), "{plan:?}");
+    assert!(
+        plan.conflicts
+            .iter()
+            .any(|c| c.contains(&path) && c.contains("ADR-062 D5")),
+        "{plan:?}"
+    );
+
+    let fx = eligible("removal-finding-then-copy");
+    fx.append(Kind::Finding {
+        root: "cold-b".to_owned(),
+        code: FindingCode::Missing,
+        subject: Subject::File(path.clone()),
+    });
+    fx.ledger_copies();
+    assert!(
+        plan_now(&fx, &TieredFixture::target_ids(), 2, &first_hot())
+            .candidates
+            .is_empty()
+    );
+    fx.append(Kind::Copy {
+        path: path.clone(),
+        root: "cold-b".to_owned(),
+    });
+    fx.ledger_copies();
+    let plan = plan_now(&fx, &TieredFixture::target_ids(), 2, &first_hot());
+    assert_eq!(plan.candidates.len(), 1, "{plan:?}");
 }

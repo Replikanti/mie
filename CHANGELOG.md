@@ -26,8 +26,9 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   the writer opens only hot-window dates. The new `removal` module plans
   the hot removal from one ledger read and one walk of hot (the date
   before the window, every configured target present, every file with a
-  `manifest` and k `copy` records inside the prefix both ledger copies
-  hold, no lost, held or pending path) and removes under the source lock
+  `manifest` record equal to hot's manifest and k `copy` records without a
+  later `finding`, inside the prefix both ledger copies hold, no lost,
+  held or pending path; a D5 conflict is reported and never removed) and removes under the source lock
   and a non-waiting ledger lock, re-checking the ledger's tail and the
   directory: the `removed` record and fsync, then the rename to
   `.removed-date=…`, then the deletion; a crash is finished by the next

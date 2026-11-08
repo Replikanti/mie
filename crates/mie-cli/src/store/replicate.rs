@@ -199,8 +199,9 @@ pub struct PassReport {
     pub journal_bytes: u64,
     /// The ids of the copy targets that presented their marker.
     pub target_ids: BTreeSet<String>,
-    /// Every configured copy target presented its marker and none was
-    /// stopped, and the pass ran to its end.
+    /// Every configured copy target presented its marker, none was stopped,
+    /// every one's ledger copy was extended or current (a refused copy holds
+    /// no verified prefix), and the pass ran to its end.
     pub targets_complete: bool,
 }
 
@@ -304,6 +305,11 @@ struct Pass<'a> {
     report: PassReport,
     /// Per file or entry, why it is short of a copy.
     reasons: BTreeMap<String, Vec<String>>,
+    /// A ledger copy was refused or hot's ledger could not be read for
+    /// them: a target without a verified ledger copy this pass, so the
+    /// pass is not complete for the hot removal's rule (f) (review of #202,
+    /// finding 1).
+    ledger_copy_failed: bool,
 }
 
 impl Pass<'_> {
@@ -473,7 +479,7 @@ pub fn run_planned(
         .filter(|root| root.copy_target)
         .count();
     let planned = match copy_ledger::read(hot) {
-        Ok(Some(read)) => removal::scan_hot(hot)
+        Ok(Some(read)) => removal::scan_hot(hot, first_hot_date)
             .and_then(|scan| removal::plan(&read, &scan, &report.target_ids, k, first_hot_date))
             .map_err(|error| error.to_string()),
         Ok(None) => Err(format!(
@@ -483,7 +489,11 @@ pub fn run_planned(
         Err(error) => Err(error.to_string()),
     };
     match planned {
-        Ok(plan) => (report, Some(plan)),
+        Ok(plan) => {
+            // A D5 conflict keeps its partition on hot and fails the pass.
+            report.problems.extend(plan.conflicts.iter().cloned());
+            (report, Some(plan))
+        }
         Err(error) => {
             report.problems.push(format!(
                 "the hot removal's plan failed, so nothing is removed after this pass: {error}"
@@ -670,6 +680,7 @@ fn start<'a>(
         fold,
         report: std::mem::take(report),
         reasons: BTreeMap::new(),
+        ledger_copy_failed: false,
     })
 }
 
@@ -888,8 +899,9 @@ impl Pass<'_> {
         self.report.ledger_bytes = ledger_bytes;
         self.report.journal_bytes = journal_bytes;
         self.report.target_ids = self.targets.iter().map(|t| t.id.clone()).collect();
-        self.report.targets_complete =
-            self.targets.len() == self.k && self.targets.iter().all(|t| !t.stopped);
+        self.report.targets_complete = self.targets.len() == self.k
+            && self.targets.iter().all(|t| !t.stopped)
+            && !self.ledger_copy_failed;
         self.result(&paths, &entries);
         Ok(())
     }
@@ -1161,12 +1173,14 @@ impl Pass<'_> {
                     side: Side::Source,
                     error,
                 }) => {
+                    self.ledger_copy_failed = true;
                     self.problem(format!(
                         "hot's copy ledger cannot be read for the ledger copies: {error}"
                     ));
                     return Ok(appended);
                 }
                 Err(CopyError { error, .. }) if is_local(&error) => {
+                    self.ledger_copy_failed = true;
                     self.problem(format!(
                         "the copy-ledger copy on {id} ({}) is refused: {error}; it needs the \
                          repair (ADR-062 D11)",

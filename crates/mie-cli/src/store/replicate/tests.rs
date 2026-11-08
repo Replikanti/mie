@@ -1028,7 +1028,7 @@ fn a_planned_pass_plans_only_complete_partitions() {
     CRASH_AT.with(|crash| crash.set(None));
     assert!(plan.is_none(), "a stopped pass gives no plan");
     let ledger = copy_ledger::read(&fixture.hot).unwrap().unwrap();
-    let scan = removal::scan_hot(&fixture.hot).unwrap();
+    let scan = removal::scan_hot(&fixture.hot, "2026-10-07").unwrap();
     let ids: BTreeSet<String> = ["cold-a", "cold-b"].map(str::to_owned).into();
     let direct = removal::plan(&ledger, &scan, &ids, 2, "2026-10-07").unwrap();
     assert!(
@@ -1051,4 +1051,73 @@ fn a_planned_pass_plans_only_complete_partitions() {
     let report = fixture.pass();
     assert_eq!(report.problems, Vec::<String>::new(), "{report:?}");
     assert!(fixture.hot.join(partition(&fixture)).exists());
+}
+
+/// Review of #202, finding 1: a target whose copy-ledger copy is refused
+/// ("needs the repair") holds no verified ledger copy, so its older
+/// `ledger-copy` record must not count for rule (f). The pass is not
+/// complete, gives no plan, and nothing leaves hot.
+#[test]
+fn a_refused_ledger_copy_gives_no_plan_and_removes_nothing() {
+    let fixture = Fixture::new("plan-refused-ledger-copy");
+    let partition = first_live(&fixture).rsplit_once('/').unwrap().0.to_owned();
+    let report = fixture.pass();
+    assert_eq!(report.problems, Vec::<String>::new(), "{report:?}");
+    // cold-b's ledger copy is damaged in its last record.
+    let copy = copy_ledger::ledger_path(&fixture.cold[1]);
+    make_writable(&copy);
+    let mut bytes = fs::read(&copy).unwrap();
+    let at = bytes.len() - 5;
+    bytes[at] ^= 0x01;
+    fs::write(&copy, &bytes).unwrap();
+
+    let (report, plan) = fixture.planned("2026-10-07");
+    assert!(
+        report
+            .problems
+            .iter()
+            .any(|p| p.contains("the copy-ledger copy on cold-b") && p.contains("refused")),
+        "{report:?}"
+    );
+    assert!(!report.targets_complete, "{report:?}");
+    assert!(plan.is_none(), "{plan:?}");
+    assert!(fixture.hot.join(&partition).exists());
+}
+
+/// Review of #202, finding 2: hot holding another version of a recorded
+/// path (a D5 breach that `select` reports) is never removed silently: the
+/// plan leaves the partition on hot and the pass names the conflict.
+#[test]
+fn a_hot_manifest_differing_from_the_ledger_is_never_removed() {
+    let fixture = Fixture::new("plan-d5-conflict");
+    let report = fixture.pass();
+    assert_eq!(report.problems, Vec::<String>::new(), "{report:?}");
+    let other = Dir::new("plan-d5-conflict-other");
+    let path = first_live(&fixture);
+    let alt = seal(&other.0, "binance-um", "aggTrade", D0 + 500, 6);
+    assert!(alt.contains(&path));
+    for file in [path.clone(), manifest_of(&path)] {
+        let dst = fixture.hot.join(&file);
+        make_writable(&dst);
+        fs::remove_file(&dst).unwrap();
+        fs::copy(other.0.join(&file), &dst).unwrap();
+    }
+    let partition = path.rsplit_once('/').unwrap().0.to_owned();
+    let (report, plan) = fixture.planned("2026-10-07");
+    let plan = plan.expect("a plan");
+    assert!(
+        plan.candidates.iter().all(|c| c.partition != partition),
+        "{plan:?}"
+    );
+    assert!(
+        report
+            .problems
+            .iter()
+            .any(|p| p.contains(&path) && p.contains("ADR-062 D5")),
+        "{report:?}"
+    );
+    let removed =
+        removal::remove_with_lock(&fixture.hot, "binance-um", &plan, "2026-10-07", D0 + 3);
+    assert!(removed.removed.is_empty(), "{removed:?}");
+    assert!(fixture.hot.join(&path).exists());
 }

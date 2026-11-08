@@ -398,24 +398,35 @@ live in more than one root (approved as written at STOP 1).
     every configured copy target presented its marker in the pass; no
     lost, held, conflicting or replacement-pending path in the partition's
     file set, which is hot's sealed files plus every path the ledger
-    records there, replaced paths excluded; a `manifest` record and a
-    `copy` record per target id for every file in it; and those records
-    inside P, the smallest latest `ledger-copy` prefix of those ids). The
+    records there, replaced paths excluded; a `manifest` record whose text
+    hot's manifest equals, and a `copy` record per target id with no
+    `finding` about that copy after it, for every file in it; and those
+    records inside P, the smallest latest `ledger-copy` prefix of those
+    ids). A hot manifest that differs from the ledger's is a D5 conflict:
+    the partition stays on hot and the pass names it as a failure, since
+    removal is the one irreversible step and `select` already fails on the
+    path (review of #202, finding 2). A `finding` voids that root's copy
+    until a later `copy` record, the same rule the re-check applies to
+    findings after the plan (finding 3). The
     seal path re-checks it under the source lock and the ledger lock,
     cheaply: the ledger's tail since the plan (verified onwards from the
     plan's last chain hash, so a replaced ledger drops the plan) names
     neither the partition nor its files except in `manifest`, `copy` and
     `ledger-copy` records, the date is still before the window, and the
-    directory holds no seal debris and no file the plan did not see. Why:
+    directory holds no seal debris, no file the plan did not see and no
+    manifest that differs from the ledger's. Why:
     the pass already folds the whole ledger every 300 s on its own thread,
     while a second full read on the capture thread would mean parsing
     about 0.58 GB per seal pass after a year, where a multi-second stall
     costs irreplaceable live data. Both locks are taken without waiting: a
     held ledger lock skips the pass until the next seal pass.
   - **k counts the ids of the copy targets that presented their marker in
-    the planning pass** (operator, #191 STOP 1 confirmation 3). Why: a
-    target replaced under a new id would otherwise still count with the
-    old id's records. The cost: nothing is removed while a target is
+    the planning pass** (operator, #191 STOP 1 confirmation 3), and the pass
+    plans only when every one of them was written to the end, its ledger
+    copy included: a ledger copy refused as needing the repair holds no
+    verified prefix, so its older `ledger-copy` record must not count for
+    P (review of #202, finding 1). Why: a target replaced under a new id
+    would otherwise still count with the old id's records. The cost: nothing is removed while a target is
     unmounted, and hot grows for the length of the outage, which D10's O
     term sizes.
   - **The hidden name** of a removed partition is `.removed-date=YYYY-MM-DD`
