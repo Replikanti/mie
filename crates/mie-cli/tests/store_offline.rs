@@ -548,6 +548,7 @@ fn a_configuration_without_cold_roots_over_a_tiered_hot_is_refused() {
         ),
         http: Arc::new(common::NoHttp),
         clock: common::FakeClock::new(common::D0, "mie-aggTrade"),
+        device_probe: Arc::new(mie_cli::store::StDevProbe),
     };
     refused(&mie_cli::ingest::run(&plain, transports, shutdown).expect_err("refused"));
     assert!(!plain.paths.journal.exists());

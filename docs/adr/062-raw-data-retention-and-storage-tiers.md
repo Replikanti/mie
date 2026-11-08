@@ -341,55 +341,107 @@ live in more than one root (approved as written at STOP 1).
     refuses to start. On an intact hot
     D6 never removed those, and the union rule is not needed because hot
     still holds every part of them.
-- **Interim (#190 until #191): the writer refuses instead of recalling.**
-  Adoption (D10) records partitions as removed from hot before the
-  recall and the union part numbering exist, so until #191 the writer of
-  a tiered store guards both. When it opens it reads the copy ledger once
-  and folds it for its source: the partitions whose latest `removed` /
-  `returned` record is `removed`, and per partition the highest part
-  number any record names (the `manifest` texts and the `copy`, `lost`,
-  `hold`, `hold-cleared`, `quarantined` and `replaced` paths). Before it
-  creates anything for a new part it refuses, with `Integrity`:
-  - a partition recorded as removed, naming the partition, the ledger and
-    the recall that #191 adds. Why: numbered from hot's empty listing, the
-    new part would be `part-00000`, a path the copy targets already hold
-    (D5);
-  - a partition whose highest recorded part is at or above hot's next
-    number, naming both numbers and the re-run of the adoption. Why:
-    adoption appends the `manifest` record of every source file before
-    its first copy (D10), so from the first published byte on the ledger
-    knows every part of each adopted partition. Until hot holds them all,
-    hot's listing would number a new part onto a path a copy target holds
-    or will hold, with other bytes (D5). Recording the manifests first is
-    what closes the window between a target's publish and its records: a
-    crash, a failed append or a lost marker there would otherwise leave
-    the ledger knowing nothing of a part the target already holds (review
-    of #200). The same check catches a hot that lost a recorded part.
-
-  The refusal poisons the writer, as any failed storage step does. The
-  snapshot taken at writer open is enough: every writer of `removed`
-  records holds that source's writer lock (only `mie store adopt` until
-  #191), so none can run while the writer is open, and the replication
-  pass only records parts hot already holds. A missing or unreadable
-  ledger gives no guard: that is the degraded start (D7), where the live
-  writer writes only hot-window dates and the importer refuses to start.
-  A single-root store never reads the ledger. Rejected, an "adoption in
-  progress" marker under `.mie/` that `mie ingest` and the importer
-  refuse: it is a new on-disk format and a third start refusal, while the
-  part check covers the same crash with no new state. The costs, all
-  until #191:
-  - a late import into an adopted old date fails instead of recalling,
-    and its `PENDING` stays (ADR-034 D4), so every later import resumes
-    the file and is refused again. Only the host work directory holds
-    removed partitions before #191, and nothing imports into it until the
-    importer's tier step;
-  - `mie ingest` refuses a hot-window partition that a crashed adoption
-    left short on hot until the adoption is re-run. Adopted stores are
-    closed stores whose dates precede today, so a capture practically
-    never writes such a partition;
-  - every writer open on a tiered store parses the ledger and checks its
-    chain once, about 0.58 GB after one year (the Numbers table), once
-    per `mie ingest` start and per import, never per part.
+- **As implemented (#191).** The rules above, in the writer of a tiered
+  store (`RawWriter`, `mie-adapter-parquet`), the remover (`removal.rs`)
+  and `mie ingest`:
+  - **Union numbering from a snapshot.** The writer reads the copy ledger
+    once when it opens and folds it for its source: the partitions whose
+    latest `removed` / `returned` record is `removed`, and per partition
+    the highest part number any record names (the `manifest` texts and
+    the `copy`, `lost`, `hold`, `hold-cleared`, `quarantined` and
+    `replaced` paths). It keeps that snapshot current with its own seals,
+    recalls and removals, and a new part takes the larger of hot's next
+    number and that highest part plus one. Why the snapshot is enough:
+    every writer of `removed` / `returned` records for a source holds that
+    source's writer lock (the adoption, the remover, the recall), so none
+    runs beside the open writer but through it, and the replicator only
+    records parts hot already holds, so it never raises a partition's
+    highest part above hot's. The cost: every writer open on a tiered
+    store parses the ledger and checks its chain once, about 0.58 GB after
+    one year (the Numbers table), once per `mie ingest` start and per
+    import, never per part.
+  - **The recall.** Before it opens a part in a partition the snapshot
+    records as removed, the writer reads the ledger fresh (a recall is
+    rare, so a full read is acceptable there) and, when the partition is
+    still recorded removed, copies back every recorded path of it with an
+    ordinary verdict (`select`'s rules, D7), one function
+    (`replica::copy_back`) that the hot restore's step 3 reuses. A held
+    path refuses the recall (`mie store resolve`), and so does a path with
+    two manifest texts or without its manifest; lost, replaced and
+    replacement-pending paths are not copied, since no root holds them in
+    the layout, but the numbering still counts them. Each path comes from
+    the first cold root in read order that holds a verified copy: a root
+    without the copy is skipped as in `read`; a root whose manifest text
+    differs from the ledger's is `Integrity` (two versions of one path,
+    D5), and no other root is tried; a copy that fails its manifest, or
+    that cannot be read, is reported as damaged (the import's output, the
+    `recall` journal line) and the next root is tried (operator, #191
+    STOP 1 decision 1). Why the fallback: a late import must never stop
+    on a fault that a good copy already covers, and the hot restore does
+    the same with the same function. The cost: the damage found by a
+    recall is not recorded in the ledger; #192's verification checks
+    every copy and finds it again. Only then is `returned` appended. Any
+    failure appends nothing and poisons the writer: the partition stays
+    recorded removed, the next recall resumes it (files already on hot
+    are `AlreadyPresent`), or the remover finishes its removal again.
+  - **The degraded writer.** Without a readable copy ledger (missing, or
+    failing its chain before the last record) the writer opens only dates
+    on or after the first hot date taken when it opened, and refuses an
+    earlier one with `Integrity` before anything is created. Why the date
+    at open is enough: D6 removes only dates before the window at the
+    time of removal, and the window only moves forward, so no date at or
+    after the open-time first date was ever removed.
+  - **Eligibility is planned by the replication pass and re-checked in
+    the seal path** (operator, #191 STOP 1 confirmation 2). The pass of
+    `mie ingest` ends with a fresh ledger read, one walk of hot and a pure
+    plan over both (rules (a) to (f): the window; not recorded removed;
+    every configured copy target presented its marker in the pass; no
+    lost, held, conflicting or replacement-pending path in the partition's
+    file set, which is hot's sealed files plus every path the ledger
+    records there, replaced paths excluded; a `manifest` record whose text
+    hot's manifest equals, and a `copy` record per target id with no
+    `finding` about that copy after it, for every file in it; and those
+    records inside P, the smallest latest `ledger-copy` prefix of those
+    ids). A hot manifest that differs from the ledger's is a D5 conflict:
+    the partition stays on hot and the pass names it as a failure, since
+    removal is the one irreversible step and `select` already fails on the
+    path (review of #202, finding 2). A `finding` voids that root's copy
+    until a later `copy` record, the same rule the re-check applies to
+    findings after the plan (finding 3). The
+    seal path re-checks it under the source lock and the ledger lock,
+    cheaply: the ledger's tail since the plan (verified onwards from the
+    plan's last chain hash, so a replaced ledger drops the plan) names
+    neither the partition nor its files except in `manifest`, `copy` and
+    `ledger-copy` records, the date is still before the window, and the
+    directory holds no seal debris, no file the plan did not see and no
+    manifest that differs from the ledger's. Why:
+    the pass already folds the whole ledger every 300 s on its own thread,
+    while a second full read on the capture thread would mean parsing
+    about 0.58 GB per seal pass after a year, where a multi-second stall
+    costs irreplaceable live data. Both locks are taken without waiting: a
+    held ledger lock skips the pass until the next seal pass.
+  - **k counts the ids of the copy targets that presented their marker in
+    the planning pass** (operator, #191 STOP 1 confirmation 3), and the pass
+    plans only when every one of them was written to the end, its ledger
+    copy included: a ledger copy refused as needing the repair holds no
+    verified prefix, so its older `ledger-copy` record must not count for
+    P (review of #202, finding 1). Why: a target replaced under a new id
+    would otherwise still count with the old id's records. The cost: nothing is removed while a target is
+    unmounted, and hot grows for the length of the outage, which D10's O
+    term sizes.
+  - **The hidden name** of a removed partition is `.removed-date=YYYY-MM-DD`
+    in its stream directory, so the rename stays on one filesystem and is
+    atomic, and recovery, `select` and the replica walks, which read only
+    `date=` entries, never see it. A crash after the record leaves the
+    partition recorded removed with its directory on hot, or a hidden
+    leftover; the next pass finishes both without a second record, and a
+    partition with a `returned` record after the plan is left alone.
+  - **The archive source's lock is tried only when the plan names an
+    archive partition or leftover**, about once per imported day, and
+    held for hot-only work that lasts milliseconds. An import that starts
+    inside that hold is refused with `Locked`, naming the holder, and a
+    re-run succeeds.
+  - A single-root store never reads the ledger.
 - **A partition that disappears while it is read** is never read as
   empty; D7 states the rule.
 
@@ -573,6 +625,10 @@ live in more than one root (approved as written at STOP 1).
     `journal/<journal file name>` (the journal copies) and
     `import-ledger/<segment>/<name>.import` (the import-ledger copies). `.mie/` is outside the
     layout, and nothing else in mie writes there.
+  - **The hidden directory of a removal**, `.removed-date=YYYY-MM-DD`
+    beside the partition on hot (D6 *As implemented*), lies outside the
+    layout too: it exists only between the rename and the deletion, or
+    after a crash there until the next remove pass deletes it.
   - **The root marker** is the text `mie-root 1\nid <id>\n`: a versioned
     header and one `id` line; the id passes `validate_segment`. The parser
     is strict: exactly that text. The id `hot` is reserved for hot's
@@ -665,12 +721,16 @@ live in more than one root (approved as written at STOP 1).
     review finding 5). The replication pass hands every truncation to its
     observer before it acts on the append's result: `mie store replicate`
     prints it as a report line of its own, before any `FAIL` line, and `mie
-    ingest` maps it to a capture-journal line (#191). The standalone command
-    never writes the capture journal (operator, #189 STOP 1). Why: a second
-    process appending to it while `mie ingest` writes it through a buffered
-    writer can land inside a half-flushed line, and a torn `run_start`
-    drops that run from `mie replay` (ADR-039 D2). The cost: until #191, a
-    truncation by a manual pass lives in that command's output only. Damage
+    ingest` maps it to a capture-journal line, `copy_ledger_truncated`
+    (the ledger, the truncated bytes and the offset), for the passes of
+    its replicator, the remover's appends and the live writer's recalls
+    alike. The importer prints a recall's truncation as a report line. The
+    standalone command never writes the capture journal (operator, #189
+    STOP 1). Why: a second process appending to it while `mie ingest`
+    writes it through a buffered writer can land inside a half-flushed
+    line, and a torn `run_start` drops that run from `mie replay` (ADR-039
+    D2). The cost: a truncation by a manual pass lives in that command's
+    output only. Damage
     older than the last three records is not seen by an append; it stays
     in the file for readers and the verification to report.
   - **The whole-run hold** of the rebuild and the hot restore takes the
@@ -1037,14 +1097,14 @@ adopted into the production store. The protocol (#190):
   (2) below records every manifest before the first copy, so a run that
   stopped and is re-run against another store (a backup lacking a file,
   another `--from`) would otherwise pass and leave a record that keeps
-  the guard's part check refusing every new part of its partition for
-  good, or a removed file below k, while naming a re-run that already
-  passed (review of #200). The refusal names each path and what it
+  a recorded file that no root completes for good (its partition's
+  recall then fails on it), or a removed file below k, while naming a
+  re-run that already passed (review of #200). The refusal names each path and what it
   lacks, and writes nothing. A file on hot that a replication pass left
   short is refused the same way; `mie store replicate` completes it. The
   same predicate is asserted over every recorded file once the closing
-  pass has run, and a gap fails the run, so a PASS always leaves the
-  guard releasing every adopted partition hot holds. **Limit, until #192:**
+  pass has run, and a gap fails the run, so a PASS always leaves every
+  adopted partition hot holds whole there and every file at k copies. **Limit, until #192:**
   a copy target added after an adoption, or a failed one replaced under a
   new id, holds no copy of the files that already left hot, and the
   replication pass copies from hot only. Those files fail the predicate.
@@ -1052,8 +1112,9 @@ adopted into the production store. The protocol (#190):
   a copy on a configured target, and with at least one `copy` record in
   the ledger on any root id, configured or not. Unlike the other gaps it
   does not block the writes: such a file lies in a partition recorded
-  removed (so the writer guard refuses it whatever happens) and the run
-  never writes its path, so no path is reused and no other bytes get in.
+  removed (so an append recalls it, from a target that holds it) and the
+  run never writes its path, so no path is reused and no other bytes get
+  in.
   The run adopts what it reads, then fails at the end, naming each such
   path, the targets holding its recorded copy, the targets lacking one,
   and the remedy:
@@ -1102,14 +1163,15 @@ adopted into the production store. The protocol (#190):
   after all their parts; (5) the journal, extended as a byte prefix; (6)
   one replication pass under the held pass lock, so the ledger, the
   journal and the entries have k copies before the run returns. Why
-  `removed` first: from the first byte on, the writer's interim guard
-  (D6) refuses an append into those dates, so no path can be reused while
-  the adoption runs or after it crashed. A `removed` record of an adopted
+  `removed` first: from the first byte on, an append into those dates
+  recalls the partition instead of numbering from hot's empty listing
+  (D6), so no path can be reused while the adoption runs or after it
+  crashed. A `removed` record of an adopted
   partition asserts only that hot holds no copy; adoption deletes
   nothing, and a run that leaves a file below k fails. Why the
-  `manifest` records before any copy: the guard's part check then refuses
-  every adopted partition from the first publish until hot holds all its
-  parts (D6 *Interim*). This is the one place where a `manifest` record
+  `manifest` records before any copy: from the first publish on, the
+  writer's union numbering then numbers a new part of every adopted
+  partition above every part the adoption will copy (D6). This is the one place where a `manifest` record
   precedes its first verified copy. Until the re-run completes, a
   selection that covers such a file lists it and its read fails with
   `Integrity` (missing on every root), never a shorter selection. Why
@@ -1119,7 +1181,7 @@ adopted into the production store. The protocol (#190):
   because identical paths are only completed. A re-run must read the
   store the stopped run read, or one holding at least its recorded
   files: a store without one of them is refused (the check above), and
-  the guard's message names the re-run with the store it read. The writes stop at the
+  its message names the re-run with the store it read. The writes stop at the
   first failure, which is named: a store cannot be half adopted on
   purpose, and going on would only copy more bytes before the same
   failure. The source data is verified twice: in the check phase, so a
@@ -1193,16 +1255,61 @@ What breaks:
   with their journal lines, and the lost tail never leaves a cold journal
   naming a missing file. To keep that true when a file fails on a target,
   **a target's journal copy advances only up to the first journal line
-  that names a live file of the pass's listing with no copy record for
-  that target, never through that line**; every line before it is still
-  appended, and the pass names the stop as a failure (operator, #199
-  review). Why bounded at that line and not the whole tail: one
-  unreadable live part on hot (a bad sector, a part failing its manifest)
-  would otherwise keep every later journal line at a single copy on
-  every target, with no limit. Archive parts are never checked: only the
-  capture writes `sealed` lines. The cost is that the lines from that
-  line on stay at one copy until the missing file reaches the target (the
-  single-copy exposure below). A failure
+  that names a live file with no copy record for that target, never
+  through that line**, where the live files are those of the pass's hot
+  listing and those of the ledger's `manifest` and `copy` records; every
+  line before it is still appended, and the pass names the stop as a
+  failure (operator, #199 review). Why bounded at that line and not the
+  whole tail: one unreadable live part on hot (a bad sector, a part
+  failing its manifest) would otherwise keep every later journal line at
+  a single copy on every target, with no limit. Why the ledger's paths
+  too (#199 review carry-over, #191): once D6 removes partitions, a
+  target added after a removal never gets the removed files from hot,
+  because the pass copies from hot only, and a hold keyed on hot's
+  listing alone would let their `sealed` lines through to that target.
+  The cost: that target's journal copy stops at the first removed file's
+  line until #192's repair fills the target, and every pass names the
+  stop and fails. `lost` paths are not counted, since no copy of them can
+  ever reach a target (#192 and #193 decide). Archive parts are never
+  checked: only the capture writes `sealed` lines. The cost is that the
+  lines from that line on stay at one copy until the missing file
+  reaches the target (the single-copy exposure below). A line names a
+  file by token, not by a substring scan per path: for each occurrence of
+  `source=` in the line, the longest run of layout-path bytes
+  (`[A-Za-z0-9._=/-]`) from there, and every prefix of it that ends with
+  `.parquet`, is looked up among the files. It finds the lines the
+  substring rule finds for every path the layout can write, since a data
+  path consists of those bytes and starts with `source=`. Why: with the
+  ledger's paths a new target's set holds every recorded live file (about
+  670 000 after a year, 1 835 a day, M1-9), and a scan per path would
+  take minutes per pass; the token match is O(line length · log n).
+- **Scheduling in `mie ingest`** (#191). On a tiered store a
+  `mie-replicate` thread runs one pass when the capture starts (it
+  resumes what the previous run left) and one after each seal pass, woken
+  by a trigger channel with one pending slot, so a pass that outlasts a
+  seal interval leaves one wake-up behind, never a queue. The pass gets
+  the device probe of the build (*What mie can check*) and `[history]
+  archive_config`; without it `mie ingest` replicates no archive parts,
+  as the standalone pass does not. The seal path never does cold I/O: a
+  hung or unmounted cold root blocks the thread only, never the capture.
+  The remover (D6) runs in the seal path, through the writer that holds
+  the live source's lock, before it wakes the thread, with the plan the
+  previous pass left. Without a readable ledger the pass refuses and
+  gives no plan, so both stop (D7). The journal gets one `replication`
+  line per pass (counts, the first problem, the planned candidates),
+  `removal` and `recall` lines when something happened, and a
+  `copy_ledger_truncated` line per truncation; `read_runs` and the
+  capture report ignore all four. On shutdown the capture is joined, the
+  writer closed and `run_end` written and synced as before; only then is
+  the final pass woken and waited for, at most one seal interval, its
+  `replication` line landing after `run_end`. A pass still running then
+  is abandoned with a line on stderr, and the process exit ends it.
+  Why `run_end` first: a hung mount must not delay the capture's own
+  record, or a service manager's stop timeout could kill the process
+  before it and the run would replay as crashed (ADR-039 D2). Why
+  abandoning is safe: every pass step is crash-safe (a crashed copy is a
+  crashed seal, a torn tail a shorter prefix, #189), and the next start's
+  first pass resumes it. A failure
   to read hot (one part, its manifest, an entry, the journal) is about
   that source and is named; the other files and targets go on, so one bad
   sector on hot cannot stop the replication of everything else. It writes
@@ -1511,6 +1618,7 @@ What breaks:
 | H = 8 days of bytes | D8 | 7 full dates + today's partial date (≤ 1 d) + tomorrow (≈ 0); removal after each seal pass adds ≤ 300 s | Smaller H in D10 under-sizes hot; it is not a free parameter but follows the window |
 | 60 s date grace | ADR-030 D4 | — | Only places yesterday's last records in the window; inside H |
 | 300 s seal cadence | ADR-032 D10 | — | Reused, not chosen: it is the earliest a part can be copied, so it bounds single-copy exposure. A shorter cadence means more files (M1-9 scales with it) |
+| Shutdown waits ≤ 1 seal interval (300 s) for the final pass | D11 *Scheduling in `mie ingest`* (#191 STOP 1 confirmation 4) | a healthy pass copies at most one interval's seals; a pass longer than an interval is already the hung or backlogged case, where waiting gains nothing | Shorter: more healthy final passes are abandoned, so the last files stay at one copy until the next start's first pass, with no loss. Longer: a stuck process stays alive at exit, against a service manager's stop timeout |
 | 25 h absorption run | ADR-051 | — | Read through the union, no hot bound (D8) |
 | 90 min warm-up trigger | ADR-052 D12 | — | Cold reads lengthen `ready_after_ms`; the trigger fires on the measured value, so it stays correct (Consequences) |
 | k = 2 (copies on the copy targets; hot never counts) | Operator, STOP 1 | one device failure must not lose a replicated file (D11) | k = 1: one device failure makes every run containing the file unreplayable. k = 3: +274 … +411 GB per year per added copy (D10) |

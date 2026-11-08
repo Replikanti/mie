@@ -7,6 +7,8 @@
 //! - [`list_sealed`]: the sealed parts of a root's layout;
 //! - [`list_unsealed`]: the seal debris of a root's layout;
 //! - [`copy_sealed`]: the D5 copy of one sealed part;
+//! - [`copy_back`]: the copy of one sealed part from the first cold root
+//!   with a verified copy back onto hot (the recall, the hot restore);
 //! - [`copy_immutable`]: the copy of an immutable small file (an
 //!   import-ledger entry);
 //! - [`extend_prefix`]: the D11 tail append of a line-structured,
@@ -290,7 +292,7 @@ fn for_each_partition(
 /// The values of the `<prefix><value>` subdirectories of `dir` whose value
 /// is a valid segment, sorted. A missing directory, or an entry that
 /// vanishes before it is inspected, has none.
-fn layout_values(dir: &Path, prefix: &str) -> Result<Vec<String>, RawStoreError> {
+pub(crate) fn layout_values(dir: &Path, prefix: &str) -> Result<Vec<String>, RawStoreError> {
     let Some(names) = list_entries(dir)? else {
         return Ok(Vec::new());
     };
@@ -599,6 +601,114 @@ pub fn copy_sealed(
     sync_dir(&partition)?;
     reached(CopyStep::SyncDir)?;
     Ok((CopyOutcome::Copied, text))
+}
+
+/// A cold copy that [`copy_back`] found damaged and passed over.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DamagedCopy {
+    /// The cold root that holds it.
+    pub root: PathBuf,
+    /// What is wrong with it.
+    pub error: RawStoreError,
+}
+
+/// What [`copy_back`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopiedBack {
+    /// The cold root the file was copied from.
+    pub root: PathBuf,
+    /// [`CopyOutcome::AlreadyPresent`] when hot already held it (a crashed
+    /// recall).
+    pub outcome: CopyOutcome,
+    /// The damaged copies passed over before it, in read order.
+    pub damaged: Vec<DamagedCopy>,
+}
+
+/// Copies the sealed file `data_path` back onto `hot` by the D5 copy
+/// ([`copy_sealed`]), from the first cold root in `cold_roots` (read order)
+/// that holds a verified copy: the recall of ADR-062 D6, and the hot
+/// restore's step 3 (D11). `ledger_text` is the copy ledger's manifest
+/// text of the path. The caller holds the source's writer lock.
+///
+/// Per root, in order:
+///
+/// - no manifest there: the copy is absent, and the next root is tried, as
+///   in the tiered `read`;
+/// - a manifest whose text differs from `ledger_text`: two versions of one
+///   path (D5), [`RawStoreError::Integrity`], and no other root is tried;
+/// - data that fails its manifest, or a copy that cannot be read: a damaged
+///   copy. It is handed to `observe` at once and the next root is tried
+///   (#191 STOP 1 decision 1: a late import never stops on a fault a good
+///   copy already covers; #192's verification finds the damage again);
+/// - otherwise the copy onto hot. A copy hot already holds (a crashed
+///   recall) is [`CopyOutcome::AlreadyPresent`].
+///
+/// # Errors
+///
+/// [`RawStoreError::Integrity`] for a differing manifest, and when no root
+/// holds a verified copy, naming the file and every root tried; any error
+/// on hot's side of the copy as [`copy_sealed`] gives it.
+pub fn copy_back(
+    cold_roots: &[PathBuf],
+    hot: &Path,
+    data_path: &str,
+    ledger_text: &str,
+    observe: &mut dyn FnMut(&DamagedCopy),
+) -> Result<CopiedBack, RawStoreError> {
+    let (key, date, part) = layout::parse_data_path(data_path)?;
+    let manifest_rel = layout::file_path(&key, &date, PartFile::Manifest, part);
+    let mut damaged = Vec::new();
+    for root in cold_roots {
+        let path = layout::resolve(root, &manifest_rel);
+        let mut damage = |error: RawStoreError, damaged: &mut Vec<DamagedCopy>| {
+            let copy = DamagedCopy {
+                root: root.clone(),
+                error,
+            };
+            observe(&copy);
+            damaged.push(copy);
+        };
+        match fs::read(&path) {
+            Err(error) if error.kind() == ErrorKind::NotFound => continue,
+            Err(error) => {
+                damage(io_error("read", &path)(error), &mut damaged);
+                continue;
+            }
+            Ok(text) if text != ledger_text.as_bytes() => {
+                return Err(RawStoreError::Integrity(format!(
+                    "{data_path} on {}: its manifest differs from the copy ledger's manifest \
+                     record; the same path must be byte-identical on every root (ADR-062 D5), \
+                     so the recall stops",
+                    root.display()
+                )));
+            }
+            Ok(_) => {}
+        }
+        match copy_sealed(root, hot, data_path) {
+            Ok((outcome, _)) => {
+                return Ok(CopiedBack {
+                    root: root.clone(),
+                    outcome,
+                    damaged,
+                });
+            }
+            // The cold copy fails its manifest or cannot be read.
+            Err(CopyError {
+                side: Side::Source,
+                error,
+            }) => damage(error, &mut damaged),
+            Err(CopyError { error, .. }) => return Err(error),
+        }
+    }
+    let tried: Vec<String> = cold_roots
+        .iter()
+        .map(|root| root.display().to_string())
+        .collect();
+    Err(RawStoreError::Integrity(format!(
+        "{data_path}: no cold root holds a verified copy to recall it from (tried {}); the \
+         partition stays recorded as removed (ADR-062 D6)",
+        tried.join(", ")
+    )))
 }
 
 /// Streams `source` into the new file `dest` through a bounded buffer,

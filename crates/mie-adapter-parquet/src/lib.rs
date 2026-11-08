@@ -63,14 +63,18 @@
 //! error, never a fallback to the next one. A file absent from every root
 //! and a missing copy ledger are both `Integrity` errors.
 //!
-//! Until #191 adds the recall, a tiered store's writer carries an interim
-//! guard (ADR-062 D6): it reads the copy ledger once when it opens and
-//! refuses, with `Integrity` and before anything is created, to open a part
-//! in a partition the ledger records as removed from hot, or in one where
-//! the ledger knows a part number at or above hot's next one (a crashed
-//! adoption, `mie store adopt`). Either append would reuse a path a copy
-//! target holds (D5). A missing or unreadable ledger gives no guard (the
-//! degraded start, D7).
+//! A tiered store's writer ([`ParquetRawStore::tiered_writer`], ADR-062
+//! D6) reads the copy ledger once when it opens. It numbers a new part from
+//! the union of hot and the ledger (lost, held and quarantined entries
+//! included), so a path is never reused; an append to a partition the
+//! ledger records as removed from hot first **recalls** it, copying every
+//! sealed file back from a cold copy ([`replica::copy_back`]) and appending
+//! `returned`; without a readable ledger it is the degraded writer, which
+//! opens only hot-window dates. [`removal`] plans and carries out the hot
+//! removal: a partition before the hot window leaves hot once the ledger
+//! records k verified copies of every file in it inside the prefix k
+//! ledger copies hold, under the source's writer lock and the ledger lock,
+//! with its `removed` record before the rename to a hidden name.
 //!
 //! Once partitions leave hot, an ad-hoc DuckDB query reads a copy target
 //! instead of hot, since a copy target holds every file
@@ -87,6 +91,7 @@ mod manifest;
 pub mod outcome;
 mod reader;
 mod recovery;
+pub mod removal;
 pub mod replica;
 pub mod root_marker;
 mod schema;
@@ -99,7 +104,7 @@ mod testutil;
 pub use copy_ledger::{CopyLedger, LedgerHold};
 pub use reader::ParquetRawStore;
 pub use recovery::RecoveryReport;
-pub use writer::{RawWriter, RotationPolicy};
+pub use writer::{RawWriter, RecallEvent, RecallObserver, RotationPolicy, TierContext};
 
 use mie_ports::raw::RawStoreError;
 use std::fs::{self, File};

@@ -18,6 +18,19 @@ const D0: i64 = 1_791_244_800_000;
 const DAY: i64 = 86_400_000;
 /// The first hot date of the fixture: D0 − 2 days.
 const FIRST_HOT: &str = "2026-10-04";
+/// The fixture's first old live part, which its journal names.
+const OLD_LIVE: &str =
+    "source=binance-um/instrument=BTCUSDT/stream=aggTrade/date=2026-10-01/part-00000.parquet";
+
+/// The writer context of the tests: the fixture's hot window and a fixed
+/// clock.
+fn ctx() -> TierContext {
+    TierContext {
+        first_hot_date: FIRST_HOT.to_owned(),
+        now_ms: Arc::new(|| D0 + 10),
+        on_recall: None,
+    }
+}
 
 /// A fresh directory, removed on drop.
 struct Dir(PathBuf);
@@ -112,9 +125,14 @@ impl Fixture {
             let parts = seal(&raw, ARCHIVE_SOURCE, "aggTrades", day, count);
             write_entry(&raw, &src.join("ledger"), &parts);
         }
+        // The `sealed` line names an old live file, so a target that lacks
+        // it holds its journal copy before that line (ADR-062 D11).
         fs::write(
             src.join("journal.jsonl"),
-            "{\"type\":\"run_start\",\"run_id\":\"r1\"}\n{\"type\":\"sealed\",\"run_id\":\"r1\"}\n",
+            format!(
+                "{{\"type\":\"run_start\",\"run_id\":\"r1\"}}\n{{\"type\":\"sealed\",\
+                 \"run_id\":\"r1\",\"files\":[{{\"path\":\"{OLD_LIVE}\"}}]}}\n"
+            ),
         )
         .unwrap();
 
@@ -168,6 +186,31 @@ impl Fixture {
     fn tiered(&self) -> ParquetRawStore {
         ParquetRawStore::tiered(&self.hot, self.cold.to_vec())
     }
+
+    /// The tiered writer of `source` on hot.
+    fn writer(&self, source: &str) -> Result<RawWriter, RawStoreError> {
+        self.tiered()
+            .tiered_writer(source, RotationPolicy::default(), ctx())
+    }
+}
+
+/// Copies the directory tree `from` to `to`, keeping file permissions.
+fn copy_tree(from: &Path, to: &Path) {
+    fs::create_dir_all(to).unwrap();
+    for entry in fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), &target).unwrap();
+        }
+    }
+}
+
+/// The part number of a data path.
+fn part_of(path: &str) -> u32 {
+    path.rsplit_once("part-").unwrap().1[..5].parse().unwrap()
 }
 
 /// Seals `count` records of `stream` from `start`, one second apart, two
@@ -366,50 +409,99 @@ fn ledger_view(records: &[Record]) -> (BTreeSet<String>, BTreeMap<String, u32>) 
 
 /// Between a crash and the re-run, an append into a source partition that
 /// the crashed adoption has *exposed* (the ledger knows one of its parts,
-/// or a copy target holds one) while hot does not hold all its source
-/// parts yet, or into one recorded as removed, is refused by the writer
-/// guard and creates nothing: otherwise the capture could seal a path a
-/// target holds, or will hold, with other bytes (D5). Exposure is read
-/// from the roots and the ledger, not from the guard's own rule. Returns
-/// how many exposed, incomplete partitions were tried.
-fn assert_guard_refuses(fixture: &Fixture) -> usize {
-    let (removed, highest) = ledger_view(&fixture.records());
-    let mut partly = 0;
+/// or a copy target holds one) while hot does not hold all its source and
+/// recorded parts yet, or into one recorded as removed, never reuses a path
+/// (D5).
+/// It runs on a copy of the roots, so the crashed fixture stays untouched
+/// for the re-run. Each append ends in one of three ways:
+///
+/// - a recall: a removed partition whose recorded files are all on a
+///   target comes back to hot, and the new part follows;
+/// - a part number above every recorded part and every part a target holds
+///   (a partly copied hot-window partition);
+/// - `Integrity` naming a recorded file that no root holds yet (a removed
+///   partition whose adoption stopped before that file's copy).
+///
+/// In no case does a recorded path or a target's path change bytes.
+/// Exposure is read from the roots and the ledger, not from the writer's
+/// own rule. Returns how many exposed, incomplete partitions were tried.
+fn assert_no_path_reused(fixture: &Fixture) -> usize {
+    let scratch = Dir::new("adopt-no-reuse");
+    let hot = scratch.0.join("raw");
+    let cold = [scratch.0.join("cold-a"), scratch.0.join("cold-b")];
+    copy_tree(&fixture.hot, &hot);
+    for (from, to) in fixture.cold.iter().zip(&cold) {
+        copy_tree(from, to);
+    }
+    let roots: Vec<&Path> = std::iter::once(hot.as_path())
+        .chain(cold.iter().map(PathBuf::as_path))
+        .collect();
+    let records = copy_ledger::read(&hot).unwrap().unwrap().records;
+    let (removed, highest) = ledger_view(&records);
+    let (manifests, _, _) = counts(&records);
     let source = replica::list_sealed(&fixture.raw()).unwrap();
-    let on_hot = replica::list_sealed(&fixture.hot).unwrap();
-    let on_targets: Vec<String> = fixture
-        .cold
+    let on_hot = replica::list_sealed(&hot).unwrap();
+    let on_targets: Vec<String> = cold
         .iter()
         .flat_map(|root| replica::list_sealed(root).unwrap())
         .collect();
-    let partitions: BTreeSet<String> = source.iter().map(|p| partition_of(p).to_owned()).collect();
+    // Every recorded path and every target path, data and manifest, by
+    // root, with its bytes.
+    let guarded = |root: &Path| -> BTreeMap<String, Vec<u8>> {
+        let mut paths: BTreeSet<String> = manifests.keys().cloned().collect();
+        paths.extend(on_targets.iter().cloned());
+        let mut out = BTreeMap::new();
+        for path in paths {
+            let manifest = format!("{}.manifest", path.strip_suffix(".parquet").unwrap());
+            for file in [path, manifest] {
+                if let Ok(bytes) = fs::read(root.join(&file)) {
+                    out.insert(file, bytes);
+                }
+            }
+        }
+        out
+    };
+    let store = ParquetRawStore::tiered(&hot, cold.to_vec());
+    // The source's parts and the recorded ones: a re-run may read a store
+    // that no longer lists a recorded file.
+    let expected: BTreeSet<&String> = source.iter().chain(manifests.keys()).collect();
+    let partitions: BTreeSet<String> = expected
+        .iter()
+        .map(|p| partition_of(p).to_owned())
+        .collect();
+    let mut partly = 0;
     for partition in partitions {
         let in_partition = |p: &&String| partition_of(p) == partition;
         let exposed =
             highest.contains_key(&partition) || on_targets.iter().any(|p| in_partition(&p));
-        let complete = source
+        let complete = expected
             .iter()
-            .filter(in_partition)
+            .filter(|p| partition_of(p) == partition)
             .all(|p| on_hot.contains(p));
-        let expected = if removed.contains(&partition) {
-            "is recorded as removed from hot"
-        } else if exposed && !complete {
+        let is_removed = removed.contains(&partition);
+        if !is_removed {
+            if !exposed || complete {
+                continue;
+            }
             partly += 1;
-            "hot's next part number is"
-        } else {
-            continue;
-        };
+        }
         let segments: Vec<&str> = partition.split('/').collect();
         let value = |i: usize, prefix: &str| segments[i].strip_prefix(prefix).unwrap().to_owned();
-        let (source, stream, date) = (value(0, "source="), value(2, "stream="), value(3, "date="));
-        let key = RawStreamKey::new(&source, "BTCUSDT", &stream).unwrap();
+        let (source_name, stream, date) =
+            (value(0, "source="), value(2, "stream="), value(3, "date="));
+        let key = RawStreamKey::new(&source_name, "BTCUSDT", &stream).unwrap();
         let day = mie_adapter_binance::archive::catalog::parse_day(&date).unwrap();
-        let before = files_under(&fixture.hot);
-        let mut writer = fixture
-            .tiered()
-            .writer(&source, RotationPolicy::default())
+        // Recorded files of the partition that no root holds.
+        let unheld: Vec<&String> = manifests
+            .keys()
+            .filter(|p| partition_of(p) == partition)
+            .filter(|p| roots.iter().all(|root| !root.join(p.as_str()).exists()))
+            .collect();
+        let before: Vec<BTreeMap<String, Vec<u8>>> = roots.iter().map(|r| guarded(r)).collect();
+        let mut writer = store
+            .tiered_writer(&source_name, RotationPolicy::default(), ctx())
             .unwrap();
-        let error = writer
+        let result = writer
             .append(
                 &key,
                 RawRecord {
@@ -418,13 +510,47 @@ fn assert_guard_refuses(fixture: &Fixture) -> usize {
                     payload: b"late".to_vec(),
                 },
             )
-            .unwrap_err();
+            .and_then(|()| writer.seal_all());
         drop(writer);
-        assert!(
-            matches!(&error, RawStoreError::Integrity(m) if m.contains(expected) && m.contains(&partition)),
-            "{partition}: {error}"
-        );
-        assert_eq!(files_under(&fixture.hot), before, "{partition}");
+        for (root, before) in roots.iter().zip(&before) {
+            let after = guarded(root);
+            for (file, bytes) in before {
+                assert_eq!(
+                    after.get(file),
+                    Some(bytes),
+                    "{partition}: {file} on {root:?}"
+                );
+            }
+        }
+        match result {
+            Ok(sealed) => {
+                // A recall needs every recorded file on some root.
+                assert!(!is_removed || unheld.is_empty(), "{partition}: {unheld:?}");
+                let part = sealed[0].part;
+                let recorded = highest.get(&partition).copied();
+                let held = on_targets
+                    .iter()
+                    .filter(|p| in_partition(p))
+                    .map(|p| part_of(p))
+                    .max();
+                for known in [recorded, held].into_iter().flatten() {
+                    assert!(part > known, "{partition}: part {part}, known {known}");
+                }
+                if is_removed {
+                    for path in manifests.keys().filter(|p| partition_of(p) == partition) {
+                        assert!(hot.join(path).exists(), "{partition}: {path} recalled");
+                    }
+                }
+            }
+            Err(RawStoreError::Integrity(message)) => {
+                assert!(is_removed, "{partition}: {message}");
+                assert!(
+                    unheld.iter().any(|p| message.contains(p.as_str())),
+                    "{partition}: {message} names none of {unheld:?}"
+                );
+            }
+            Err(other) => panic!("{partition}: {other}"),
+        }
     }
     partly
 }
@@ -449,8 +575,8 @@ fn step_counts() -> BTreeMap<String, usize> {
 
 /// The acceptance item of #190: a crash at every occurrence of every
 /// `AdoptStep`, then a re-run with the same request, passes and ends in the
-/// state of an adoption that never crashed; in between, the guard refuses
-/// appends into old and partly copied partitions.
+/// state of an adoption that never crashed; in between, no append into an
+/// old or partly copied partition reuses a path.
 #[test]
 fn a_crash_at_every_step_is_completed_by_a_re_run() {
     let reference = Fixture::new("adopt-reference");
@@ -462,7 +588,7 @@ fn a_crash_at_every_step_is_completed_by_a_re_run() {
     };
     let expected = roots(&reference);
     let source_tree = files_under(&reference.src);
-    assert_guard_releases(&reference);
+    assert_partitions_take_new_parts(&reference);
 
     let counts = step_counts();
     let mut partly = 0;
@@ -493,7 +619,7 @@ fn a_crash_at_every_step_is_completed_by_a_re_run() {
                 ["simulated crash: the adoption stopped"],
                 "{step:?} #{n}"
             );
-            partly += assert_guard_refuses(&fixture);
+            partly += assert_no_path_reused(&fixture);
 
             let report = fixture.adopt();
             assert_eq!(
@@ -504,7 +630,7 @@ fn a_crash_at_every_step_is_completed_by_a_re_run() {
             assert_adopted(&fixture);
             assert_eq!(roots(&fixture), expected, "{step:?} #{n}");
             assert_eq!(files_under(&fixture.src), source, "{step:?} #{n}");
-            assert_guard_releases(&fixture);
+            assert_partitions_take_new_parts(&fixture);
         }
     }
     assert_eq!(source_tree, files_under(&reference.src));
@@ -581,8 +707,11 @@ fn the_pass_lock_and_the_writers_are_held_for_the_run() {
                 ));
                 for source in ["binance-um", ARCHIVE_SOURCE] {
                     assert!(matches!(
-                        ParquetRawStore::tiered(&hot, cold.clone())
-                            .writer(source, RotationPolicy::default()),
+                        ParquetRawStore::tiered(&hot, cold.clone()).tiered_writer(
+                            source,
+                            RotationPolicy::default(),
+                            ctx()
+                        ),
                         Err(RawStoreError::Locked(_))
                     ));
                 }
@@ -596,17 +725,14 @@ fn the_pass_lock_and_the_writers_are_held_for_the_run() {
     assert!(checked.get() > 0);
     // Released at the end.
     drop(replica::try_replication_lock(&fixture.hot).unwrap());
-    fixture
-        .tiered()
-        .writer("binance-um", RotationPolicy::default())
-        .unwrap();
+    fixture.writer("binance-um").unwrap();
 }
 
 /// Review of #200, finding 1: a stop right after a copy target published a
-/// hot-window part, before any `copy` record, must still leave the writer
-/// guard refusing that partition: the ledger already knows every part of
-/// it, so a restarted capture can never seal the published path with other
-/// bytes, and the re-run completes the adoption.
+/// hot-window part, before any `copy` record: the ledger already knows
+/// every part of the partition, so a restarted capture numbers its part
+/// above them (the union rule) and never seals the published path with
+/// other bytes, and the re-run completes the adoption.
 #[test]
 fn a_stop_right_after_a_target_publish_keeps_the_partition_guarded() {
     let fixture = Fixture::new("adopt-publish-window");
@@ -630,34 +756,12 @@ fn a_stop_right_after_a_target_publish_keeps_the_partition_guarded() {
     assert!(!fixture.hot.join(&path).exists());
 
     // The capture restarts before the re-run.
-    let before = files_under(&fixture.hot);
-    let key = RawStreamKey::new("binance-um", "BTCUSDT", "aggTrade").unwrap();
-    let mut writer = fixture
-        .tiered()
-        .writer("binance-um", RotationPolicy::default())
-        .unwrap();
-    let error = writer
-        .append(
-            &key,
-            RawRecord {
-                event_time: EventTime::from_millis(D0 + 7_200_000),
-                capture: None,
-                payload: b"live-after-crash".to_vec(),
-            },
-        )
-        .unwrap_err();
-    drop(writer);
-    assert!(
-        matches!(&error, RawStoreError::Integrity(m) if m.contains(partition)
-            && m.contains("hot's next part number is 0")),
-        "{error}"
-    );
-    assert_eq!(files_under(&fixture.hot), before);
+    assert!(assert_no_path_reused(&fixture) > 0);
 
     let report = fixture.adopt();
     assert_eq!(report.problems, Vec::<String>::new(), "{report:?}");
     assert_adopted(&fixture);
-    assert_guard_releases(&fixture);
+    assert_partitions_take_new_parts(&fixture);
 }
 
 /// Review of #200, finding 2: a source manifest without its data, or data
@@ -714,9 +818,9 @@ fn a_damaged_source_part_is_refused_before_anything_is_written() {
 /// records, re-run against a store without one of the recorded files (a
 /// backup, another `--from`), refuses and writes nothing, whether the file
 /// is on no root or published on one copy target only without its `copy`
-/// record. Passing would leave a record that keeps the partition guarded
-/// for good. With the store it read, the re-run completes and the guard
-/// releases the partition.
+/// record. Passing would leave a recorded file that no root completes for
+/// good. Meanwhile no append reuses a path. With the store it read, the
+/// re-run completes and the partition takes new parts.
 #[test]
 fn a_re_run_against_a_store_without_a_recorded_file_is_refused() {
     let partition = "source=binance-um/instrument=BTCUSDT/stream=aggTrade/date=2026-10-06";
@@ -776,27 +880,8 @@ fn a_re_run_against_a_store_without_a_recorded_file_is_refused() {
                 "{case} #{attempt}"
             );
         }
-        // The guard still refuses the partition and names the way out.
-        let key = RawStreamKey::new("binance-um", "BTCUSDT", "aggTrade").unwrap();
-        let mut writer = fixture
-            .tiered()
-            .writer("binance-um", RotationPolicy::default())
-            .unwrap();
-        let error = writer
-            .append(
-                &key,
-                RawRecord {
-                    event_time: EventTime::from_millis(D0 + 7_200_000),
-                    capture: None,
-                    payload: b"live".to_vec(),
-                },
-            )
-            .unwrap_err();
-        drop(writer);
-        assert!(
-            error.to_string().contains("with the store it read"),
-            "{case}: {error}"
-        );
+        // No append reuses a path meanwhile.
+        assert!(assert_no_path_reused(&fixture) > 0, "{case}");
 
         // With the store the stopped run read, the re-run completes.
         for name in ["part-00001.parquet", "part-00001.manifest"] {
@@ -805,14 +890,14 @@ fn a_re_run_against_a_store_without_a_recorded_file_is_refused() {
         let report = fixture.adopt();
         assert_eq!(report.problems, Vec::<String>::new(), "{case}: {report:?}");
         assert_adopted(&fixture);
-        assert_guard_releases(&fixture);
+        assert_partitions_take_new_parts(&fixture);
     }
 }
 
 /// The invariant a PASS guarantees (ADR-062 D10): every adopted partition
 /// on hot's side, which hot then holds completely, takes a new part. Each
 /// such partition gets one record appended past its parts.
-fn assert_guard_releases(fixture: &Fixture) {
+fn assert_partitions_take_new_parts(fixture: &Fixture) {
     let source = replica::list_sealed(&fixture.raw()).unwrap();
     let on_hot = replica::list_sealed(&fixture.hot).unwrap();
     let partitions: BTreeSet<&str> = source
@@ -834,10 +919,7 @@ fn assert_guard_releases(fixture: &Fixture) {
         let (source, stream, date) = (value(0, "source="), value(2, "stream="), value(3, "date="));
         let key = RawStreamKey::new(&source, "BTCUSDT", &stream).unwrap();
         let day = mie_adapter_binance::archive::catalog::parse_day(&date).unwrap();
-        let mut writer = fixture
-            .tiered()
-            .writer(&source, RotationPolicy::default())
-            .unwrap();
+        let mut writer = fixture.writer(&source).unwrap();
         writer
             .append(
                 &key,
@@ -847,7 +929,7 @@ fn assert_guard_releases(fixture: &Fixture) {
                     payload: b"after the adoption".to_vec(),
                 },
             )
-            .unwrap_or_else(|e| panic!("{partition}: the guard still refuses after a PASS: {e}"));
+            .unwrap_or_else(|e| panic!("{partition}: an append fails after a PASS: {e}"));
         writer.close().unwrap();
     }
 }
@@ -859,7 +941,9 @@ fn assert_guard_releases(fixture: &Fixture) {
 /// the new target and fails naming only the second store's files with the
 /// remedy (`mie store repair`, #192, or a re-adoption); re-adopting the
 /// second store then passes, and so does a third store. A file of that
-/// class never reaches the writer: its partition stays recorded removed.
+/// class stays off hot: its partition stays recorded removed. The new
+/// target's journal copy stops before the `sealed` line that names an old
+/// file it lacks (ADR-062 D11, the hold on the ledger's paths).
 #[test]
 fn a_target_added_after_an_adoption_is_named_with_its_remedy() {
     let fixture = Fixture::new("adopt-new-target");
@@ -923,6 +1007,18 @@ fn a_target_added_after_an_adoption_is_named_with_its_remedy() {
     ]);
     let mut out = Vec::new();
     crate::store::replicate(&config, Some(&archive), &probe, &|| D0 + 3, &mut out).unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        text.contains("FAIL: the journal copy on cold-c stops before byte")
+            && text.contains(&format!("names {OLD_LIVE}, which is not on cold-c")),
+        "{text}"
+    );
+    let journal = fs::read(dst.join("journal.jsonl")).unwrap();
+    let line = journal.iter().position(|&b| b == b'\n').unwrap() + 1;
+    assert_eq!(
+        fs::read(cold_c.join(".mie/journal/journal.jsonl")).unwrap(),
+        journal[..line].to_vec()
+    );
     let old_of = |raw: &Path| -> Vec<String> {
         replica::list_sealed(raw)
             .unwrap()
@@ -970,36 +1066,12 @@ fn a_target_added_after_an_adoption_is_named_with_its_remedy() {
         repair[0].contains("re-adopt the original store"),
         "{again:?}"
     );
-    // That class never reaches the writer: its partitions stay removed.
-    let key = RawStreamKey::new("binance-um", "BTCUSDT", "aggTrade").unwrap();
-    let mut writer = ParquetRawStore::tiered(
-        &fixture.hot,
-        config
-            .paths
-            .cold_roots
-            .iter()
-            .map(|r| r.path.clone())
-            .collect(),
-    )
-    .writer("binance-um", RotationPolicy::default())
-    .unwrap();
-    let error = writer
-        .append(
-            &key,
-            RawRecord {
-                event_time: EventTime::from_millis(D0 - 4 * DAY + 60_000),
-                capture: None,
-                payload: b"late".to_vec(),
-            },
-        )
-        .unwrap_err();
-    drop(writer);
-    assert!(
-        error
-            .to_string()
-            .contains("is recorded as removed from hot"),
-        "{error}"
-    );
+    // That class stays off hot: its partitions stay recorded removed.
+    let (removed, _) = ledger_view(&fixture.records());
+    for path in &old_b {
+        assert!(removed.contains(partition_of(path)), "{path}");
+        assert!(!fixture.hot.join(path).exists(), "{path}");
+    }
 
     // Re-adopting the second store completes cold-c, and a third store
     // is then adopted.

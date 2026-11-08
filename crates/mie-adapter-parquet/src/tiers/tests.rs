@@ -653,3 +653,112 @@ fn the_first_error_in_path_order() {
         "{message}"
     );
 }
+
+// ------------------------------------------- AW3 with the real remover
+
+/// The real remover (#191): the plan over the fixture's current state and
+/// one remove pass of `binance-um`, with days 0 to 2 before the hot window.
+fn remove_for_real(fx: &TieredFixture) -> crate::removal::RemovalReport {
+    let first = TieredFixture::date(3);
+    let ledger = copy_ledger::read(&fx.hot).unwrap().unwrap();
+    let scan = crate::removal::scan_hot(&fx.hot, &first).unwrap();
+    let plan =
+        crate::removal::plan(&ledger, &scan, &TieredFixture::target_ids(), 2, &first).unwrap();
+    crate::removal::remove_with_lock(&fx.hot, "binance-um", &plan, &first, D0 + 40 * DAY_MS)
+}
+
+#[test]
+fn a_real_removal_between_hot_listing_and_ledger_read_keeps_every_file() {
+    let fx = TieredFixture::new("tiers-real-race");
+    let partition = TieredFixture::partition(&a(), 1);
+    fx.copy(&partition);
+    fx.ledger_copies();
+    let mover = fx.clone();
+    let removed = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let seen = std::rc::Rc::clone(&removed);
+    AFTER_HOT_LISTING.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            *seen.borrow_mut() = remove_for_real(&mover).removed;
+        }));
+    });
+    let result = fx.store().select(&all());
+    assert_eq!(*removed.borrow(), vec![partition.clone()]);
+    assert_eq!(result, fx.reference().select(&all()));
+    assert!(!layout::resolve(&fx.hot, &partition).exists());
+    assert_matches_reference(&fx);
+}
+
+#[test]
+fn a_partition_removed_while_its_files_are_listed_is_never_empty() {
+    let fx = TieredFixture::new("tiers-real-vanish");
+    let target = TieredFixture::partition(&b(), 2);
+    fx.copy(&target);
+    fx.ledger_copies();
+    let mover = fx.clone();
+    let removed = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let seen = std::rc::Rc::clone(&removed);
+    BEFORE_PARTITION_FILES.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |partition: &str| {
+            if partition == TieredFixture::partition(&b(), 2) {
+                *seen.borrow_mut() = remove_for_real(&mover).removed;
+            }
+        }));
+    });
+    let result = fx.store().select(&all());
+    BEFORE_PARTITION_FILES.with(|hook| hook.borrow_mut().take());
+    assert_eq!(*removed.borrow(), vec![target.clone()]);
+    assert_eq!(result, fx.reference().select(&all()));
+}
+
+#[test]
+fn a_select_during_a_recall_holds_every_file() {
+    use crate::writer::{RecallEvent, RecallObserver, RotationPolicy};
+    use mie_ports::raw::RawRecordSink;
+    use std::sync::{Arc, Mutex};
+
+    let fx = TieredFixture::new("tiers-recall-select");
+    let partition = TieredFixture::partition(&a(), 0);
+    assert_eq!(TieredFixture::data_paths(&fx.hot, &partition).len(), 3);
+    fx.copy(&partition);
+    fx.ledger_copies();
+    assert_eq!(remove_for_real(&fx).removed, vec![partition.clone()]);
+
+    let (hot, cold, reference) = (
+        fx.hot.clone(),
+        fx.cold.to_vec(),
+        fx.reference_root().to_path_buf(),
+    );
+    let checked = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::clone(&checked);
+    let on_recall: RecallObserver = Arc::new(move |event| {
+        if !matches!(
+            event,
+            RecallEvent::Copied { .. } | RecallEvent::Returned { .. }
+        ) {
+            return;
+        }
+        let store = ParquetRawStore::tiered(&hot, cold.clone());
+        let expected = ParquetRawStore::new(&reference);
+        for selection in windows() {
+            // Files and dataset version.
+            assert_eq!(
+                store.select(&selection),
+                expected.select(&selection),
+                "{event:?} {selection:?}"
+            );
+        }
+        log.lock().unwrap().push(event.clone());
+    });
+    let mut ctx = TieredFixture::context(&TieredFixture::date(3));
+    ctx.on_recall = Some(on_recall);
+    let mut writer = fx
+        .store()
+        .tiered_writer("binance-um", RotationPolicy::default(), ctx)
+        .unwrap();
+    writer
+        .append(&a(), crate::testutil::record(D0 + 10, 7))
+        .unwrap();
+    writer.close().unwrap();
+    let checked = checked.lock().unwrap();
+    assert_eq!(checked.len(), 4, "three copies and the return: {checked:?}");
+}

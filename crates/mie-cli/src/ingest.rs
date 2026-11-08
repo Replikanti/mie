@@ -72,6 +72,26 @@
 //! 7. On shutdown (SIGINT/SIGTERM sets the flag), join the capture, close
 //!    the writer (sealing everything) and journal a `run_end` summary;
 //!    `events` counts the events delivered to the engine.
+//!
+//! On a tiered store (ADR-062 D6, D11; [`tiers`]) the writer is the tiered
+//! writer, which recalls a removed partition before it appends to it and
+//! journals a `recall` line. A `mie-replicate` thread runs one replication
+//! pass at the start and after every seal pass, so a hung or unmounted cold root never
+//! stalls the capture, and journals a `replication` line per pass; the
+//! remover runs in the seal path and journals a `removal` line when it did
+//! something. Without a readable copy ledger both stop (D7). On shutdown
+//! `run_end` is written and synced first, then the final pass is woken and
+//! waited for at most one seal interval, its line landing after `run_end`;
+//! a pass still running then is abandoned with a line on stderr, and the
+//! process exit ends it. Why `run_end` first: a hung mount must not delay
+//! the capture's own record, or a service manager's stop timeout could
+//! kill the process before it and the run would replay as crashed (ADR-039
+//! D2). Why one seal interval: a healthy pass copies at most one interval's
+//! seals, a longer one is already the hung or backlogged case, and every
+//! pass step is crash-safe. A single-root store has no thread and no new
+//! journal line.
+
+pub mod tiers;
 
 use crate::config::IngestConfig;
 use crate::journal::{
@@ -86,7 +106,7 @@ use mie_adapter_binance::{
     BinanceLiveProvider, BinanceStream, CaptureSummary, ChainTail, CoreFeed, HistoryChain, LiveRun,
     RUN_MARGIN_MS, RunContinuation, run_id, start,
 };
-use mie_adapter_parquet::{ParquetRawStore, RotationPolicy};
+use mie_adapter_parquet::{ParquetRawStore, RawWriter, RotationPolicy, TierContext};
 use mie_app::{HashingProvider, drive_chain};
 use mie_domain::event::MarketEvent;
 use mie_domain::event_hash::{self, EventStreamHash};
@@ -96,14 +116,17 @@ use mie_domain::state_hash::STATE_HASH_ENCODING;
 use mie_domain::time::EventTime;
 use mie_ports::outbound::{MarketDataProvider, ProviderError, Replay, ReplayWindow};
 use mie_ports::raw::{
-    DatasetVersion, RawRecord, RawRecordSource, RawSelection, RawStoreError, RawStreamKey,
+    DatasetVersion, RawRecord, RawRecordSink, RawRecordSource, RawSelection, RawStoreError,
+    RawStreamKey, SealedFile,
 };
 use serde_json::{Value, json};
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 const DAY_MS: i64 = 86_400_000;
 
@@ -139,6 +162,50 @@ pub struct Transports {
     pub http: Arc<dyn HttpGet>,
     /// Clock.
     pub clock: Arc<dyn Clock>,
+    /// The device probe of the replication pass on a tiered store
+    /// (`store::device_probe` in `main`).
+    pub device_probe: Arc<dyn crate::store::DeviceProbe>,
+}
+
+/// The capture's sink: today's writer on a single-root store, the tiered
+/// sink with the remover and the replicator's trigger otherwise.
+enum CaptureSink {
+    Single(RawWriter),
+    Tiered(tiers::TieredSink),
+}
+
+impl RawRecordSink for CaptureSink {
+    fn append(&mut self, stream: &RawStreamKey, record: RawRecord) -> Result<(), RawStoreError> {
+        match self {
+            Self::Single(writer) => writer.append(stream, record),
+            Self::Tiered(sink) => sink.append(stream, record),
+        }
+    }
+
+    fn seal_all(&mut self) -> Result<Vec<SealedFile>, RawStoreError> {
+        match self {
+            Self::Single(writer) => writer.seal_all(),
+            Self::Tiered(sink) => sink.seal_all(),
+        }
+    }
+}
+
+impl CaptureSink {
+    /// Seals everything; the tiered sink also hands back the trigger.
+    fn close(
+        self,
+    ) -> (
+        Result<Vec<SealedFile>, RawStoreError>,
+        Option<SyncSender<()>>,
+    ) {
+        match self {
+            Self::Single(writer) => (writer.close(), None),
+            Self::Tiered(sink) => {
+                let (closed, trigger) = sink.close();
+                (closed, Some(trigger))
+            }
+        }
+    }
 }
 
 /// Test hooks around the warm-up of a chain run ([`run_with_hold`]); [`run`]
@@ -229,10 +296,26 @@ pub fn run_with_hold(
     };
     let sync = || journal.lock().unwrap_or_else(|p| p.into_inner()).sync();
 
-    let writer = store
-        .writer(&config.instrument.source, RotationPolicy::default())
-        .map_err(|e| format!("open the raw store: {e}"))?;
-    let recovery = writer.recovery();
+    let opened_ms = now().div_euclid(1_000_000);
+    let writer = if store.is_tiered() {
+        let ctx = TierContext {
+            first_hot_date: first_hot_date(opened_ms),
+            now_ms: {
+                let clock = Arc::clone(&clock);
+                Arc::new(move || clock.now_utc_ns().div_euclid(1_000_000))
+            },
+            on_recall: Some(tiers::recall_journal(
+                Arc::clone(&journal),
+                Arc::clone(&clock),
+                &config.paths.raw_root,
+            )),
+        };
+        store.tiered_writer(&config.instrument.source, RotationPolicy::default(), ctx)
+    } else {
+        store.writer(&config.instrument.source, RotationPolicy::default())
+    }
+    .map_err(|e| format!("open the raw store: {e}"))?;
+    let recovery = writer.recovery().clone();
     log(
         "recovery",
         json!({
@@ -245,6 +328,35 @@ pub fn run_with_hold(
                 .collect::<Vec<_>>(),
         }),
     );
+
+    // The replicator thread and its sink (module docs). Its first pass runs
+    // at once: it resumes what the previous run left (a final pass that was
+    // abandoned, files sealed at its close), and its plan is ready for the
+    // first seal pass.
+    let (sink, replicator) = if store.is_tiered() {
+        let (trigger, wake) = mpsc::sync_channel(1);
+        let _ = trigger.try_send(());
+        let plan = tiers::PlanSlot::default();
+        let replicator = tiers::spawn_replicator(
+            config,
+            Arc::clone(&transports.device_probe),
+            Arc::clone(&clock),
+            Arc::clone(&journal),
+            Arc::clone(&plan),
+            wake,
+        )?;
+        let sink = tiers::TieredSink {
+            writer,
+            plan,
+            trigger,
+            journal: Arc::clone(&journal),
+            clock: Arc::clone(&clock),
+            hot: config.paths.raw_root.clone(),
+        };
+        (CaptureSink::Tiered(sink), Some(replicator))
+    } else {
+        (CaptureSink::Single(writer), None)
+    };
 
     let streams = config.streams().map_err(|e| e.to_string())?;
     let checkpoint_interval_ms = config
@@ -340,7 +452,7 @@ pub fn run_with_hold(
     let observer = JournalObserver(Arc::clone(&journal));
     let (mut provider, handle) = start(
         live,
-        writer,
+        sink,
         transports.connector,
         transports.http,
         Arc::clone(&clock),
@@ -526,19 +638,24 @@ pub fn run_with_hold(
     drop(provider);
     shutdown.store(true, Ordering::Relaxed);
 
+    let mut trigger = None;
     let summary = match handle.join() {
-        Ok((writer, summary)) => match writer.close() {
-            Ok(files) => {
-                if !files.is_empty() {
-                    log("sealed", json!({"files": files_json(&files)}));
+        Ok((sink, summary)) => {
+            let (closed, sink_trigger) = sink.close();
+            trigger = sink_trigger;
+            match closed {
+                Ok(files) => {
+                    if !files.is_empty() {
+                        log("sealed", json!({"files": files_json(&files)}));
+                    }
+                    Some(summary)
                 }
-                Some(summary)
+                Err(e) => {
+                    error.get_or_insert(format!("close the raw store: {e}"));
+                    Some(summary)
+                }
             }
-            Err(e) => {
-                error.get_or_insert(format!("close the raw store: {e}"));
-                Some(summary)
-            }
-        },
+        }
         Err(e) => {
             error.get_or_insert(e.to_string());
             Some(*e.summary)
@@ -573,12 +690,44 @@ pub fn run_with_hold(
             "streams": stats.map_or(json!({}), |s| pipeline_json(&s.pipeline)),
         }),
     );
-    let mut journal = journal.lock().unwrap_or_else(|p| p.into_inner());
-    journal.sync();
+    sync();
+    // The final replication pass, after `run_end` (module docs).
+    if let Some(replicator) = replicator {
+        if let Some(trigger) = trigger.take() {
+            let _ = trigger.try_send(());
+        }
+        drop(trigger);
+        let bound = Duration::from_secs(config.capture.seal_interval_secs);
+        if join_within(replicator, bound) {
+            sync();
+        } else {
+            eprintln!(
+                "mie ingest: the final replication pass is still running after {} s (one seal \
+                 interval); it is abandoned, and the next start's first pass resumes it",
+                bound.as_secs()
+            );
+        }
+    }
+    let journal = journal.lock().unwrap_or_else(|p| p.into_inner());
     if let Some(write_error) = journal.write_error() {
         eprintln!("mie ingest: journal write failed: {write_error}");
     }
     Ok(outcome)
+}
+
+/// Joins `thread` if it ends within `bound`; otherwise leaves it running
+/// and returns `false`.
+fn join_within(thread: JoinHandle<()>, bound: Duration) -> bool {
+    let deadline = std::time::Instant::now() + bound;
+    while !thread.is_finished() {
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    // A panic in a pass is already over; the run's outcome stands.
+    let _ = thread.join();
+    true
 }
 
 /// Which listing the seeds came from (ADR-062 D7 *Seeds*).

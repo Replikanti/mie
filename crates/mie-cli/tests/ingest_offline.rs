@@ -1090,6 +1090,7 @@ fn overflow_run(tag: &str, max: u64, at: HoldAt) -> (String, Vec<Value>) {
         connector: Arc::new(Ws(Arc::clone(&script))),
         http: Arc::new(Oi(Arc::clone(&script))),
         clock: Arc::new(ClockOf(Arc::clone(&script))),
+        device_probe: Arc::new(mie_cli::store::StDevProbe),
     };
     let hold = match at {
         HoldAt::BeforeGuard => WarmUpHold {
@@ -1172,6 +1173,7 @@ mod tiered_start {
             ),
             http: Arc::new(NoHttp),
             clock: FakeClock::new(D0 + HOUR, "mie-aggTrade"),
+            device_probe: super::common::probe_for(config),
         };
         mie_cli::ingest::run(config, transports, shutdown)
     }
@@ -1565,9 +1567,13 @@ mod tiered_start {
     }
 
     /// AW2 (a) and (b) offline: after an adoption, `mie ingest` starts with
-    /// both copy targets gone, and with the copy ledger deleted on the
-    /// intact hot, captures, and journals the seeds of a single-root start
-    /// over the source; the listing is `union` and `hot`.
+    /// both copy targets gone, with one unmounted (an empty directory
+    /// without its marker), and with the copy ledger deleted on the intact
+    /// hot, captures, and journals the seeds of a single-root start over
+    /// the source; the listing is `union`, `union` and `hot`. The
+    /// replication thread runs throughout (#191): with cold-a unmounted its
+    /// `replication` lines name cold-a as skipped, and cold-b receives the
+    /// newly sealed files.
     #[test]
     fn after_an_adoption_the_capture_starts_with_the_single_root_seeds() {
         let runs: [(i64, &[i64]); 2] = [
@@ -1578,7 +1584,7 @@ mod tiered_start {
             (T - DAY_MS, &[T - DAY_MS + 1_000, T - DAY_MS + 3_000]),
         ];
         let first_hot = mie_cli::ingest::first_hot_date(T);
-        for case in ["targets gone", "ledger deleted"] {
+        for case in ["targets gone", "one target unmounted", "ledger deleted"] {
             let (dir, single) = (TempDir::new("adopted-aw2"), TempDir::new("adopted-aw2-1"));
             let (config, single_config) = adopted(dir.path(), single.path(), &first_hot, &runs);
             if case == "targets gone" {
@@ -1588,13 +1594,43 @@ mod tiered_start {
                     let root = dir.path().join(name);
                     std::fs::rename(&root, root.with_extension("aside")).unwrap();
                 }
+            } else if case == "one target unmounted" {
+                let root = dir.path().join("cold-a");
+                std::fs::rename(&root, root.with_extension("aside")).unwrap();
+                std::fs::create_dir(&root).unwrap();
             } else {
                 std::fs::remove_file(copy_ledger::ledger_path(&config.paths.raw_root)).unwrap();
             }
             let (start, reference) = starts(&config, &single_config);
             assert_ne!(reference["seeds"], serde_json::json!({}), "{case}");
             assert_eq!(start["seeds"], reference["seeds"], "{case}");
-            if case == "targets gone" {
+            if case == "one target unmounted" {
+                let lines = journal(&config);
+                let replication: Vec<&Value> = lines
+                    .iter()
+                    .filter(|l| l["type"] == "replication")
+                    .collect();
+                assert!(!replication.is_empty(), "{case}");
+                let cold_a = dir.path().join("cold-a").display().to_string();
+                for line in &replication {
+                    let first = line["first_problem"].as_str().unwrap();
+                    assert!(
+                        first.contains(&cold_a) && first.contains("skipped for this pass"),
+                        "{line}"
+                    );
+                }
+                let sealed: Vec<&str> = lines
+                    .iter()
+                    .filter(|l| l["type"] == "sealed")
+                    .flat_map(|l| l["files"].as_array().unwrap())
+                    .map(|f| f["path"].as_str().unwrap())
+                    .collect();
+                assert!(!sealed.is_empty(), "{case}");
+                for path in sealed {
+                    assert!(dir.path().join("cold-b").join(path).exists(), "{path}");
+                }
+            }
+            if case != "ledger deleted" {
                 assert_eq!(start["seed_listing"], "union", "{case}: {start}");
             } else {
                 assert_eq!(start["seed_listing"], "hot", "{case}: {start}");
@@ -1644,5 +1680,327 @@ mod tiered_start {
                 assert_eq!(start["seed_listing"], "hot");
             }
         }
+    }
+
+    // ------------------------------- replication and removal (#191)
+
+    use mie_adapter_binance::transport::{Clock, ReadOutcome, WsConnection, WsConnector};
+    use mie_adapter_parquet::{ParquetRawStore, RotationPolicy};
+    use mie_ports::raw::{RawRecord, RawRecordSink, RawRecordSource, RawSelection, RawStreamKey};
+    use std::time::{Duration, Instant};
+
+    /// Real time from a fixed UTC epoch: seal passes come from the wall
+    /// clock, as in production.
+    struct ShiftedClock {
+        base_ns: i64,
+        start: Instant,
+    }
+
+    impl Clock for ShiftedClock {
+        fn now_utc_ns(&self) -> i64 {
+            self.base_ns + self.start.elapsed().as_nanos() as i64
+        }
+
+        fn monotonic_ns(&self) -> u64 {
+            self.start.elapsed().as_nanos() as u64
+        }
+
+        fn sleep(&self, d: Duration) {
+            std::thread::sleep(d);
+        }
+    }
+
+    /// Plays `frames`, then waits (real time) until `done` holds or 30 s
+    /// pass, then asks for shutdown.
+    struct UntilConnector {
+        frames: std::sync::Mutex<Option<Vec<String>>>,
+        done: Arc<dyn Fn() -> bool + Send + Sync>,
+        shutdown: Arc<AtomicBool>,
+    }
+
+    struct UntilConnection {
+        frames: std::collections::VecDeque<String>,
+        done: Arc<dyn Fn() -> bool + Send + Sync>,
+        shutdown: Arc<AtomicBool>,
+        deadline: Instant,
+    }
+
+    impl WsConnector for UntilConnector {
+        fn connect(&self, _: &str) -> Result<Box<dyn WsConnection>, String> {
+            let frames = self
+                .frames
+                .lock()
+                .unwrap()
+                .take()
+                .ok_or("script exhausted")?;
+            Ok(Box::new(UntilConnection {
+                frames: frames.into(),
+                done: Arc::clone(&self.done),
+                shutdown: Arc::clone(&self.shutdown),
+                deadline: Instant::now() + Duration::from_secs(30),
+            }))
+        }
+    }
+
+    impl WsConnection for UntilConnection {
+        fn read(&mut self) -> ReadOutcome {
+            if let Some(frame) = self.frames.pop_front() {
+                return ReadOutcome::Frame(frame.into_bytes());
+            }
+            if (self.done)() || Instant::now() >= self.deadline {
+                self.shutdown
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            ReadOutcome::Timeout
+        }
+
+        fn ping(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn close(&mut self) {}
+    }
+
+    /// A real-time capture of `config` from `base_ms`, until `done`.
+    fn capture_until(
+        config: &IngestConfig,
+        base_ms: i64,
+        done: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> mie_cli::ingest::IngestOutcome {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let transports = Transports {
+            connector: Arc::new(UntilConnector {
+                frames: std::sync::Mutex::new(Some(vec![
+                    agg(1, base_ms + 10),
+                    agg(2, base_ms + 20),
+                ])),
+                done,
+                shutdown: Arc::clone(&shutdown),
+            }),
+            http: Arc::new(NoHttp),
+            clock: Arc::new(ShiftedClock {
+                base_ns: base_ms * 1_000_000,
+                start: Instant::now(),
+            }),
+            device_probe: super::common::probe_for(config),
+        };
+        mie_cli::ingest::run(config, transports, shutdown).expect("ingest starts")
+    }
+
+    /// A tiered store under `dir` (1 s seal interval) whose hot holds a
+    /// live `aggTrade` partition ten days before `base_ms`, copied to both
+    /// targets by one pass; returns the configuration and the partition.
+    fn tiered_with_old_partition(dir: &Path, base_ms: i64) -> (IngestConfig, String) {
+        let mut config = tiered(dir);
+        config.capture.seal_interval_secs = 1;
+        init_tiers(&config.paths.raw_root, &config.paths.cold_roots);
+        let key = RawStreamKey::new("binance-um", "BTCUSDT", "aggTrade").unwrap();
+        let old = base_ms - 10 * DAY_MS;
+        let mut writer = ParquetRawStore::new(&config.paths.raw_root)
+            .writer("binance-um", RotationPolicy::default())
+            .unwrap();
+        for i in 0..3 {
+            writer
+                .append(
+                    &key,
+                    RawRecord {
+                        event_time: EventTime::from_millis(old + i * 1_000),
+                        capture: None,
+                        payload: format!("old-{i}").into_bytes(),
+                    },
+                )
+                .unwrap();
+        }
+        let sealed = writer.close().unwrap();
+        let partition = sealed[0]
+            .relative_path
+            .rsplit_once('/')
+            .unwrap()
+            .0
+            .to_owned();
+        let mut out = Vec::new();
+        let probe = super::common::probe_for(&config);
+        let pass = store::replicate(
+            &config,
+            None,
+            probe.as_ref(),
+            &|| base_ms - DAY_MS,
+            &mut out,
+        )
+        .unwrap();
+        assert!(pass, "{}", String::from_utf8_lossy(&out));
+        (config, partition)
+    }
+
+    /// The selection of the old date.
+    fn old_day(base_ms: i64) -> RawSelection {
+        let start = (base_ms - 10 * DAY_MS).div_euclid(DAY_MS) * DAY_MS;
+        RawSelection::new(
+            [RawStreamKey::new("binance-um", "BTCUSDT", "aggTrade").unwrap()].into(),
+            ReplayWindow {
+                start: EventTime::from_millis(start),
+                end: EventTime::from_millis(start + DAY_MS),
+            },
+        )
+        .unwrap()
+    }
+
+    /// #191: a tiered capture replicates after its seal passes and removes
+    /// a live partition before the hot window once both targets and both
+    /// ledger copies hold it: a `replication` line passed, a `removal` line
+    /// names the partition, the ledger records it removed, its directory
+    /// is gone, and a `select` over the old date is unchanged.
+    #[test]
+    fn a_tiered_capture_replicates_and_removes_old_partitions() {
+        let dir = TempDir::new("tiered-remove");
+        let base = D0 + HOUR;
+        let (config, partition) = tiered_with_old_partition(dir.path(), base);
+        let store =
+            mie_cli::store::raw_store(&config.paths.raw_root, &config.paths.cold_roots).unwrap();
+        let before = store.select(&old_day(base)).unwrap();
+        assert_eq!(before.files.len(), 1);
+
+        let gone = config.paths.raw_root.join(&partition);
+        let outcome = capture_until(&config, base, Arc::new(move || !gone.exists()));
+        assert_eq!(outcome.exit_code(), 0, "{:?}", outcome.error);
+        assert_eq!(outcome.summary.unwrap().stats.records, 2);
+
+        let lines = journal(&config);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l["type"] == "replication" && l["passed"] == true),
+            "{lines:?}"
+        );
+        let removal: Vec<&Value> = lines.iter().filter(|l| l["type"] == "removal").collect();
+        assert!(
+            removal
+                .iter()
+                .any(|l| l["source"] == "binance-um"
+                    && l["removed"] == serde_json::json!([partition])),
+            "{removal:?}"
+        );
+        assert!(!config.paths.raw_root.join(&partition).exists());
+        let records = copy_ledger::read(&config.paths.raw_root)
+            .unwrap()
+            .unwrap()
+            .records;
+        assert!(records.iter().any(|r| matches!(
+            &r.kind,
+            Kind::Removed { partition: p } if *p == partition
+        )));
+        assert_eq!(store.select(&old_day(base)).unwrap(), before);
+        // The run_end comes before the final pass's line.
+        let end = lines.iter().position(|l| l["type"] == "run_end").unwrap();
+        assert!(
+            lines[end + 1..]
+                .iter()
+                .all(|l| l["type"] == "replication" || l["type"] == "copy_ledger_truncated")
+        );
+    }
+
+    /// #191: a copy target whose marker is a FIFO blocks the replication
+    /// thread like a hung mount; the capture still records and seals, ends
+    /// with exit code 0, and `ingest` returns within the bound (one seal
+    /// interval after `run_end`). The blocked thread ends with the test
+    /// binary.
+    #[test]
+    fn a_hung_copy_target_never_stalls_the_capture() {
+        let dir = TempDir::new("tiered-hung");
+        let base = D0 + HOUR;
+        let (config, _) = tiered_with_old_partition(dir.path(), base);
+        let marker = root_marker::marker_path(&dir.path().join("cold-a"));
+        std::fs::remove_file(&marker).unwrap();
+        let made = std::process::Command::new("mkfifo")
+            .arg(&marker)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let started = Instant::now();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let outcome = capture_until(&config, base, Arc::new(move || Instant::now() >= deadline));
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(outcome.exit_code(), 0, "{:?}", outcome.error);
+        assert_eq!(outcome.summary.unwrap().stats.records, 2);
+        let lines = journal(&config);
+        let end = lines.iter().find(|l| l["type"] == "run_end").unwrap();
+        assert_eq!(end["exit_code"], 0);
+        assert!(lines.iter().any(|l| l["type"] == "sealed"), "{lines:?}");
+    }
+
+    /// AW2 (b), #191: without the copy ledger the replication passes name
+    /// it and refuse, and nothing is removed.
+    #[test]
+    fn a_capture_without_the_ledger_journals_the_refusal_and_removes_nothing() {
+        let dir = TempDir::new("tiered-no-ledger-pass");
+        let base = D0 + HOUR;
+        let (config, partition) = tiered_with_old_partition(dir.path(), base);
+        let ledger = copy_ledger::ledger_path(&config.paths.raw_root);
+        std::fs::remove_file(&ledger).unwrap();
+        let outcome = ingest(&config, base, vec![vec![agg(1, base + 10)]]);
+        assert_eq!(outcome.exit_code(), 0, "{:?}", outcome.error);
+        let lines = journal(&config);
+        let replication: Vec<&Value> = lines
+            .iter()
+            .filter(|l| l["type"] == "replication")
+            .collect();
+        assert!(!replication.is_empty());
+        for line in replication {
+            assert_eq!(line["passed"], false);
+            let first = line["first_problem"].as_str().unwrap();
+            assert!(
+                first.contains(&format!("copy ledger {} does not exist", ledger.display())),
+                "{first}"
+            );
+            assert_eq!(line["candidates"], Value::Null);
+        }
+        assert!(lines.iter().all(|l| l["type"] != "removal"));
+        assert!(config.paths.raw_root.join(&partition).exists());
+    }
+
+    /// #191: `read_runs` and `mie capture-report` give the same result over
+    /// a tiered journal, whose `replication` lines land after `run_end`, as
+    /// over the same journal without them.
+    #[test]
+    fn the_new_line_kinds_change_no_run_and_no_report() {
+        let dir = TempDir::new("tiered-lines");
+        let base = D0 + HOUR;
+        let (config, _) = tiered_with_old_partition(dir.path(), base);
+        let outcome = ingest(
+            &config,
+            base,
+            vec![vec![agg(1, base + 10), agg(2, base + 20)]],
+        );
+        assert_eq!(outcome.exit_code(), 0, "{:?}", outcome.error);
+        let text = std::fs::read_to_string(&config.paths.journal).unwrap();
+        assert!(text.contains("\"type\":\"replication\""), "{text}");
+        let plain: String = text
+            .lines()
+            .filter(|l| {
+                !["replication", "removal", "recall", "copy_ledger_truncated"]
+                    .iter()
+                    .any(|kind| l.contains(&format!("\"type\":\"{kind}\"")))
+            })
+            .map(|l| format!("{l}\n"))
+            .collect();
+        let mut stripped = config.clone();
+        stripped.paths.journal = dir.path().join("plain.jsonl");
+        std::fs::write(&stripped.paths.journal, plain).unwrap();
+        assert_eq!(
+            mie_cli::journal::read_runs(&config.paths.journal, "binance-um").unwrap(),
+            mie_cli::journal::read_runs(&stripped.paths.journal, "binance-um").unwrap()
+        );
+        let report = |config: &IngestConfig| {
+            let mut out = Vec::new();
+            let pass =
+                mie_cli::report::run(config, base - HOUR, base + HOUR, 0.0, &mut out).unwrap();
+            (pass, String::from_utf8(out).unwrap())
+        };
+        assert_eq!(report(&config), report(&stripped));
     }
 }

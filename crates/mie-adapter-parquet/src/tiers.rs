@@ -102,13 +102,18 @@ struct Entry {
 
 /// The copy ledger folded per data path.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct LedgerView {
+pub(crate) struct LedgerView {
     entries: BTreeMap<String, Entry>,
 }
 
 impl LedgerView {
     /// Folds the records in file order (the module docs).
-    fn fold(ledger: &Ledger) -> Result<Self, RawStoreError> {
+    ///
+    /// # Errors
+    ///
+    /// [`RawStoreError::Corrupt`] for a `manifest` text that does not
+    /// parse; the ledger parser has already refused it.
+    pub(crate) fn fold(ledger: &Ledger) -> Result<Self, RawStoreError> {
         let mut entries: BTreeMap<String, Entry> = BTreeMap::new();
         for record in &ledger.records {
             match &record.kind {
@@ -156,30 +161,88 @@ impl LedgerView {
     }
 }
 
-/// The interim writer guard of a tiered store (ADR-062 D6, #190 until
-/// #191): what the copy ledger knows of one source's partitions, read once
-/// when the writer opens.
+/// One recorded path's verdict, in `select`'s precedence (module docs).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Verdict {
+    /// An ordinary file, with the ledger's manifest text.
+    Ordinary(String),
+    /// Recorded without a manifest (no `manifest` record).
+    NoManifest,
+    /// `lost`.
+    Lost,
+    /// Two different manifest texts (D5).
+    Conflict,
+    /// Held.
+    Held(HoldReason),
+    /// Replaced by a re-import's entry.
+    Replaced,
+    /// A replacement is pending (`hold-cleared replace`, `quarantined`).
+    Pending,
+}
+
+impl LedgerView {
+    /// The verdict of one recorded entry.
+    fn verdict(entry: &Entry) -> Verdict {
+        if entry.lost {
+            Verdict::Lost
+        } else if entry.conflict {
+            Verdict::Conflict
+        } else if let Some(reason) = entry.held {
+            Verdict::Held(reason)
+        } else if entry.replaced.is_some() {
+            Verdict::Replaced
+        } else if entry.pending.is_some() {
+            Verdict::Pending
+        } else {
+            match &entry.manifest {
+                Some(manifest) => Verdict::Ordinary(manifest.text.clone()),
+                None => Verdict::NoManifest,
+            }
+        }
+    }
+
+    /// Every path the ledger records in the partition directory
+    /// `partition`, in path order, with its verdict: the recall and the
+    /// removal planner apply `select`'s own rules.
+    pub(crate) fn partition(&self, partition: &str) -> Vec<(String, Verdict)> {
+        let prefix = format!("{partition}/");
+        self.entries
+            .range(prefix.clone()..)
+            .take_while(|(path, _)| path.starts_with(&prefix))
+            .map(|(path, entry)| (path.clone(), Self::verdict(entry)))
+            .collect()
+    }
+}
+
+/// The removed partitions of `ledger`: those whose latest `removed` /
+/// `returned` record is `removed` (ADR-062 D6).
+pub(crate) fn removed_partitions(ledger: &Ledger) -> BTreeSet<String> {
+    let mut removed = BTreeSet::new();
+    for record in &ledger.records {
+        match &record.kind {
+            Kind::Removed { partition } => {
+                removed.insert(partition.clone());
+            }
+            Kind::Returned { partition } => {
+                removed.remove(partition);
+            }
+            _ => {}
+        }
+    }
+    removed
+}
+
+/// What the copy ledger knows of one source's partitions, for a tiered
+/// store's writer (ADR-062 D6): the snapshot read once when the writer
+/// opens, kept current with the writer's own seals, recalls and removals.
 ///
-/// Until #191 brings the recall and union part numbering, the writer
-/// numbers a part from hot's listing alone. Two appends would then reuse a
-/// path that a copy target already holds (D5): an append into a partition
-/// the ledger records as removed from hot (an adopted old date), and an
-/// append into a partition whose recorded parts hot does not hold yet (an
-/// adoption that stopped before hot held every part: it records every
-/// source file's manifest before its first copy, so the ledger knows each
-/// part a copy target holds or will hold). The guard refuses both before
-/// anything is created.
-///
-/// The snapshot taken at writer open is enough: every writer of `removed`
-/// records holds the source's writer lock (only `mie store adopt` until
-/// #191), so none runs while this writer is open. `manifest` and `copy`
-/// records that the replication pass appends meanwhile name parts hot
-/// already holds, so they never raise a partition's highest part above
-/// hot's.
+/// The snapshot is enough: every writer of `removed` / `returned` records
+/// for a source holds that source's writer lock (the adoption, the remover,
+/// the recall), so none runs beside this writer but through it, and the
+/// replication pass records only parts hot already holds, so it never
+/// raises a partition's highest part above hot's.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct TierGuard {
-    /// The ledger, for messages.
-    ledger: std::path::PathBuf,
+pub(crate) struct TierState {
     /// Partition directories whose latest `removed` / `returned` record is
     /// `removed`.
     removed: BTreeSet<String>,
@@ -187,9 +250,10 @@ pub(crate) struct TierGuard {
     highest: BTreeMap<String, u32>,
 }
 
-impl TierGuard {
-    /// Folds `ledger` (the copy ledger of the store rooted at `hot`) for
-    /// the partitions of `source`.
+impl TierState {
+    /// Folds `ledger` for the partitions of `source`: the removed set, and
+    /// the highest part per partition over the `manifest`, `copy`, `lost`,
+    /// `hold`, `hold-cleared`, `quarantined` and `replaced` paths.
     ///
     /// # Errors
     ///
@@ -197,12 +261,9 @@ impl TierGuard {
     /// and [`RawStoreError::Invalid`] for a path outside the layout; the
     /// ledger parser has already refused both, so either means the writer
     /// fails closed.
-    pub(crate) fn fold(hot: &Path, ledger: &Ledger, source: &str) -> Result<Self, RawStoreError> {
+    pub(crate) fn fold(ledger: &Ledger, source: &str) -> Result<Self, RawStoreError> {
         let prefix = format!("{}/", layout::source_dir(source));
-        let mut guard = Self {
-            ledger: copy_ledger::ledger_path(hot),
-            ..Self::default()
-        };
+        let mut state = Self::default();
         for record in &ledger.records {
             let path = match &record.kind {
                 Kind::Manifest { text } => manifest::parse(text)?.relative_path,
@@ -214,12 +275,12 @@ impl TierGuard {
                 | Kind::Replaced { path, .. } => path.clone(),
                 Kind::Removed { partition } => {
                     if partition.starts_with(&prefix) {
-                        guard.removed.insert(partition.clone());
+                        state.removed.insert(partition.clone());
                     }
                     continue;
                 }
                 Kind::Returned { partition } => {
-                    guard.removed.remove(partition);
+                    state.removed.remove(partition);
                     continue;
                 }
                 Kind::LedgerCopy { .. } | Kind::Finding { .. } | Kind::Verify { .. } => continue,
@@ -228,44 +289,40 @@ impl TierGuard {
                 continue;
             }
             let (stream, date, part) = layout::parse_data_path(&path)?;
-            let highest = guard
-                .highest
-                .entry(layout::partition_dir(&stream, &date))
-                .or_insert(part);
-            *highest = (*highest).max(part);
+            state.record_part(&layout::partition_dir(&stream, &date), part);
         }
-        Ok(guard)
+        Ok(state)
     }
 
-    /// Refuses a new part `part` (hot's next number) in the partition
-    /// directory `partition`, naming the cause (the type docs).
-    ///
-    /// # Errors
-    ///
-    /// [`RawStoreError::Integrity`] for a partition the ledger records as
-    /// removed from hot, and for one whose highest recorded part is `part`
-    /// or above.
-    pub(crate) fn check(&self, partition: &str, part: u32) -> Result<(), RawStoreError> {
-        if self.removed.contains(partition) {
-            return Err(RawStoreError::Integrity(format!(
-                "partition {partition} is recorded as removed from hot in the copy ledger {}: an \
-                 append to it needs the recall (ADR-062 D6), which #191 adds; until then the \
-                 writer refuses it and writes nothing",
-                self.ledger.display()
-            )));
-        }
-        match self.highest.get(partition) {
-            Some(&recorded) if recorded >= part => Err(RawStoreError::Integrity(format!(
-                "partition {partition}: the copy ledger {} records part {recorded} of it, but \
-                 hot's next part number is {part}, so the new part would reuse a recorded path \
-                 (ADR-062 D5). Hot must first hold every recorded part: re-run the adoption that \
-                 recorded it (`mie store adopt`) with the store it read; when that store no longer \
-                 holds the part, the adoption refuses and names it instead of passing. Union part \
-                 numbering comes with #191. The writer writes nothing",
-                self.ledger.display()
-            ))),
-            _ => Ok(()),
-        }
+    /// Whether the partition directory `partition` is recorded as removed
+    /// from hot.
+    pub(crate) fn is_removed(&self, partition: &str) -> bool {
+        self.removed.contains(partition)
+    }
+
+    /// The next part number of `partition` (the D6 union rule): the larger
+    /// of `hot_next`, hot's own next number, and the highest part any
+    /// record names plus one, so a path is never reused whatever hot holds.
+    pub(crate) fn next_part(&self, partition: &str, hot_next: u32) -> u32 {
+        self.highest
+            .get(partition)
+            .map_or(hot_next, |&highest| hot_next.max(highest.saturating_add(1)))
+    }
+
+    /// The writer removed `partition` from hot.
+    pub(crate) fn mark_removed(&mut self, partition: &str) {
+        self.removed.insert(partition.to_owned());
+    }
+
+    /// The writer recalled `partition` to hot.
+    pub(crate) fn mark_returned(&mut self, partition: &str) {
+        self.removed.remove(partition);
+    }
+
+    /// The writer sealed part `part` of `partition` (or a record names it).
+    pub(crate) fn record_part(&mut self, partition: &str, part: u32) {
+        let highest = self.highest.entry(partition.to_owned()).or_insert(part);
+        *highest = (*highest).max(part);
     }
 }
 

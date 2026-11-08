@@ -794,6 +794,14 @@ pub fn check_chain(bytes: &[u8]) -> ChainCheck {
 pub struct Ledger {
     /// Every complete, verified record, in file order.
     pub records: Vec<Record>,
+    /// The byte offset after each record's `\n`, aligned with `records`.
+    pub ends: Vec<u64>,
+    /// The end of the last verified record, or the header's length: the
+    /// verified prefix a reader saw.
+    pub verified_len: u64,
+    /// The chain hash of the last verified record, or the genesis chain of
+    /// a header-only ledger.
+    pub last_chain: String,
     /// The bytes of the ignored incomplete trailing record, 0 if none.
     pub ignored_bytes: u64,
 }
@@ -850,6 +858,8 @@ pub fn parse(path: &Path, bytes: &[u8]) -> Result<Ledger, RawStoreError> {
         }
     };
     let mut records = Vec::new();
+    let mut ends = Vec::new();
+    let mut last_chain = genesis();
     let mut offset = HEADER.len();
     for number in 1..=kept {
         let len = bytes[offset..]
@@ -864,10 +874,18 @@ pub fn parse(path: &Path, bytes: &[u8]) -> Result<Ledger, RawStoreError> {
             ))
         })?;
         records.push(record);
+        if let Some((_, chain)) = split_line(line) {
+            // The chain verified, so it is ASCII hex.
+            last_chain = String::from_utf8_lossy(chain).into_owned();
+        }
         offset += len + 1;
+        ends.push(offset as u64);
     }
     Ok(Ledger {
         records,
+        ends,
+        verified_len: offset as u64,
+        last_chain,
         ignored_bytes,
     })
 }
@@ -1149,6 +1167,87 @@ impl LedgerHold {
         let body = record.body()?;
         let mut file = open_ledger(&self.ledger)?;
         append_locked(&self.ledger, &mut file, &body)
+    }
+
+    /// The records after byte `offset`, under the held lock, where `chain`
+    /// is the chain hash of the record that ends at `offset` (the genesis
+    /// chain when `offset` is the header's length): the tail a planner that
+    /// read the ledger up to `offset` has not seen (the hot removal,
+    /// ADR-062 D6).
+    ///
+    /// The 65 bytes before `offset` must be `chain` and its `\n` (for a
+    /// header-only prefix, the file must start with the header). The tail
+    /// is verified onwards from `chain`, with the single-trailing-record
+    /// rule of [`read`]: a partial last line, or a complete last line whose
+    /// chain fails after a verified one, is ignored.
+    ///
+    /// # Errors
+    ///
+    /// [`RawStoreError::Integrity`] when the ledger changed since the plan:
+    /// a shorter file, other bytes before `offset`, or a chain failure
+    /// before the last record (for example after a rebuild replaced it);
+    /// [`RawStoreError::Corrupt`] for a verified line outside the grammar;
+    /// [`RawStoreError::Io`] when it cannot be read.
+    pub fn records_after(&self, offset: u64, chain: &str) -> Result<Vec<Record>, RawStoreError> {
+        let path = &self.ledger;
+        let changed = |detail: &str| {
+            RawStoreError::Integrity(format!(
+                "copy ledger {}: the copy ledger changed since the plan ({detail}); the plan is \
+                 dropped (ADR-062 D6)",
+                path.display()
+            ))
+        };
+        let mut file = File::open(path).map_err(io_error("open", path))?;
+        let len = file.metadata().map_err(io_error("stat", path))?.len();
+        let header_len = HEADER.len() as u64;
+        if offset < header_len || len < offset {
+            return Err(changed(&format!("{len} bytes, the plan read {offset}")));
+        }
+        if offset == header_len {
+            if chain != genesis() || read_at(&mut file, path, 0, HEADER.len())? != HEADER.as_bytes()
+            {
+                return Err(changed("its header-only prefix differs"));
+            }
+        } else {
+            let before = CHAIN_LEN as u64 + 1;
+            if offset < header_len + before {
+                return Err(changed("the plan's offset is inside the header"));
+            }
+            let mut expected = chain.as_bytes().to_vec();
+            expected.push(b'\n');
+            if read_at(&mut file, path, offset - before, before as usize)? != expected {
+                return Err(changed(&format!(
+                    "the record before byte {offset} is not the plan's last record"
+                )));
+            }
+        }
+        let tail = read_at(&mut file, path, offset, (len - offset) as usize)?;
+        let mut lines: Vec<(u64, &[u8])> = Vec::new();
+        let mut cursor = 0;
+        while let Some(n) = tail[cursor..].iter().position(|&b| b == b'\n') {
+            lines.push((offset + cursor as u64, &tail[cursor..cursor + n]));
+            cursor += n + 1;
+        }
+        let mut previous = chain.as_bytes().to_vec();
+        let mut records = Vec::new();
+        for (i, (at, line)) in lines.iter().enumerate() {
+            let Some(next) = verified_chain(&previous, line) else {
+                // A complete last line that fails, with no partial tail
+                // after it, is the incomplete trailing record.
+                if i + 1 == lines.len() && cursor == tail.len() {
+                    break;
+                }
+                return Err(changed(&format!("the hash chain fails at byte {at}")));
+            };
+            previous = next.to_vec();
+            records.push(parse_line(line).map_err(|detail| {
+                RawStoreError::Corrupt(format!(
+                    "copy ledger {}: the record at byte {at}: {detail}",
+                    path.display()
+                ))
+            })?);
+        }
+        Ok(records)
     }
 }
 

@@ -33,7 +33,13 @@ USAGE:
         core. Runs until SIGINT or SIGTERM, then seals every open file and
         exits 0. Exits 1 when the capture fails — a failed write (for
         example a full disk) stops it loudly — or the store cannot be
-        opened. See crates/mie-cli/ingest.example.toml.
+        opened. On a tiered store (paths.cold_roots) a replication pass
+        runs after every seal pass on its own thread, and partitions before
+        the hot window leave hot once every copy target holds a verified
+        copy of every file in them and a ledger copy that records it; an
+        append to a removed partition first copies it back from a copy
+        target. The journal gets replication, removal, recall and
+        copy_ledger_truncated lines. See crates/mie-cli/ingest.example.toml.
 
     mie capture-report --config <path> --from <ms> --to <ms>
                        [--max-late-fraction <0..1>]
@@ -53,7 +59,9 @@ USAGE:
         metrics, bookDepth, trades). --dry-run fetches checksums only and
         reports published / missing / imported / changed files. SIGINT or
         SIGTERM stops at the next file boundary. Exits 1 when a file failed
-        or changed upstream. See crates/mie-cli/archive.example.toml.
+        or changed upstream. On a tiered store an import into a partition
+        removed from hot first copies it back from a copy target and prints
+        a recall line. See crates/mie-cli/archive.example.toml.
 
     mie archive-verify --config <path> --from <YYYY-MM-DD> --to <YYYY-MM-DD>
         Re-read every imported file of the range (hash-verified), normalize
@@ -299,7 +307,7 @@ USAGE:
         copied. A copy target's marker is re-read before every write to
         it, and a target's journal copy stops before the first line
         that names a live file missing on that target. Nothing is ever
-        removed. Prints what it copied and every copy-ledger truncation,
+        removed: mie ingest removes from hot. Prints what it copied and every copy-ledger truncation,
         then PASS and exits 0 when every file has a copy on every copy
         target, or one FAIL: <reason> line per file, entry, target or copy
         left short and exits 1.
@@ -327,9 +335,8 @@ USAGE:
         device or an id, --from is not a closed single-root store outside
         hot and every cold root (a writer holds it, it has .mie/, seal
         debris or a pending import), an archive part has no import entry
-        listing it, or another pass or a writer of hot runs. Until the
-        recall exists (#191), the writer refuses appends to a partition
-        recorded as removed from hot. Prints one line per adopted
+        listing it, or another pass or a writer of hot runs. Prints one line
+        per adopted
         partition, a total, the pass's lines, then PASS and exits 0, or
         one FAIL: <reason> line per problem and exits 1; it stops at the
         first failure.
@@ -850,6 +857,7 @@ fn run_ingest(config: &IngestConfig) -> Result<ExitCode, String> {
         connector: Arc::new(TungsteniteConnector::new(timeouts)?),
         http: Arc::new(UreqHttp::new(timeouts)?),
         clock: Arc::new(SystemClock::new()),
+        device_probe: Arc::from(store::device_probe()?),
     };
     let outcome = ingest::run(config, transports, shutdown)?;
     if let Some(error) = &outcome.error {

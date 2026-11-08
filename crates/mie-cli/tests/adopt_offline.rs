@@ -2,8 +2,9 @@
 //! both sources and dates on both sides of the first hot date adopted into
 //! a tiered store; two stores into one; the path rule (AC6); every refusal
 //! writing nothing; the AW1 reports before and after; AW4 with the copy
-//! targets emptied; the interim writer guard refusing an archive import
-//! into a removed date (AC5).
+//! targets emptied; an archive import into a removed date recalling it
+//! (AC5, #191), and AW10 offline: the recall under a running replay, the
+//! remover skipping a locked archive source, the partition removed again.
 
 mod common;
 
@@ -12,8 +13,11 @@ use mie_adapter_binance::archive::catalog::{DAY_MS, Period};
 use mie_adapter_binance::archive::{ARCHIVE_SOURCE, ArchiveStream};
 use mie_adapter_binance::transport::{Clock, HttpDownload, HttpGet};
 use mie_adapter_parquet::copy_ledger::{self, Kind};
+use mie_adapter_parquet::removal::RemovalPlan;
 use mie_adapter_parquet::replica;
-use mie_adapter_parquet::{ParquetRawStore, RotationPolicy};
+use mie_adapter_parquet::{
+    ParquetRawStore, RawWriter, RecallEvent, RecallObserver, RotationPolicy, TierContext,
+};
 use mie_cli::archive::{self, ArchiveTransports, ImportRequest};
 use mie_cli::config::{ArchiveConfig, ColdRoot, IngestConfig};
 use mie_cli::store::{self, AdoptRequest, DeviceProbe};
@@ -352,6 +356,18 @@ impl Fixture {
 
     fn tiered(&self) -> ParquetRawStore {
         store::raw_store(&self.hot(), &self.config.paths.cold_roots).unwrap()
+    }
+
+    /// The tiered writer of `source` on hot, with the fixture's hot window.
+    fn writer(&self, source: &str) -> RawWriter {
+        let ctx = TierContext {
+            first_hot_date: FIRST_HOT.to_owned(),
+            now_ms: Arc::new(|| D0 + 10),
+            on_recall: None,
+        };
+        self.tiered()
+            .tiered_writer(source, RotationPolicy::default(), ctx)
+            .unwrap()
     }
 }
 
@@ -857,14 +873,7 @@ fn every_refusal_writes_nothing() {
         ),
         (
             "a writer on hot",
-            Box::new(move |fixture, _, _| {
-                Box::new(
-                    fixture
-                        .tiered()
-                        .writer(ARCHIVE_SOURCE, RotationPolicy::default())
-                        .unwrap(),
-                )
-            }),
+            Box::new(move |fixture, _, _| Box::new(fixture.writer(ARCHIVE_SOURCE))),
             "open the writer of source binance-archive on hot",
         ),
         (
@@ -1116,60 +1125,260 @@ fn the_reports_are_identical_after_the_adoption_and_from_either_target() {
     assert!(datasets(&none).is_subset(&known), "{none}");
 }
 
-/// AC5: until the recall (#191), the writer guard refuses an archive import
-/// whose rows land in a partition recorded as removed from hot: the
-/// `metrics` file of 2026-10-03, whose partition holds the 23:55 row of
-/// the previous file (ADR-034 D3). Hot's layout, ledger and import entries
-/// stay byte-identical; `PENDING` remains (ADR-034 D4), and a second run is
-/// refused the same way.
+/// The metrics partition of 2026-10-03: removed by the adoption, it holds
+/// the 23:55 row of the 2026-10-02 file (ADR-034 D3).
+const METRICS_03: &str = "source=binance-archive/instrument=BTCUSDT/stream=metrics/date=2026-10-03";
+/// Where the 23:55 row of the 2026-10-03 file lands.
+const METRICS_04: &str = "source=binance-archive/instrument=BTCUSDT/stream=metrics/date=2026-10-04";
+
+/// The import of the 2026-10-03 `metrics` file, with `on_recall`.
+fn import_metrics_03(fixture: &Fixture, on_recall: Option<RecallObserver>) -> String {
+    let day = D0 / DAY_MS - 3;
+    let mut out = Vec::new();
+    let request = ImportRequest {
+        from_day: day,
+        to_day: day,
+        streams: Some(vec![ArchiveStream::Metrics]),
+        dry_run: false,
+    };
+    archive::import_with(
+        &fixture.archive_config,
+        &request,
+        &transports(&fixture.archive),
+        &AtomicBool::new(false),
+        &mut out,
+        on_recall,
+    )
+    .unwrap_or_else(|e| panic!("{e}\n{}", String::from_utf8_lossy(&out)));
+    String::from_utf8(out).unwrap()
+}
+
+/// The data paths hot holds in `partition`.
+fn on_hot(fixture: &Fixture, partition: &str) -> Vec<String> {
+    replica::list_sealed(&fixture.hot())
+        .unwrap()
+        .into_iter()
+        .filter(|path| partition_of(path) == partition)
+        .collect()
+}
+
+/// The `removed` and `returned` records of `partition`, in order.
+fn tier_records(fixture: &Fixture, partition: &str) -> Vec<&'static str> {
+    copy_ledger::read(&fixture.hot())
+        .unwrap()
+        .unwrap()
+        .records
+        .into_iter()
+        .filter_map(|r| match r.kind {
+            Kind::Removed { partition: p } if p == partition => Some("removed"),
+            Kind::Returned { partition: p } if p == partition => Some("returned"),
+            _ => None,
+        })
+        .collect()
+}
+
+/// AC5 (#191): an archive import whose rows land in a partition recorded
+/// as removed from hot recalls it: the `metrics` file of 2026-10-03 copies
+/// `part-00000` (the 23:55 row of the previous file) back from cold-a,
+/// appends `returned`, then `part-00001`; its 23:55 row opens 2026-10-04.
+/// It prints the recall line, writes its entry, and `PENDING` is gone.
 #[test]
-fn an_import_into_a_removed_date_is_refused_and_writes_nothing() {
+fn an_import_into_a_removed_date_recalls_it_and_continues_its_numbering() {
     let dir = TempDir::new("adopt-ac5");
     let fixture = Fixture::new(dir.path());
     assert_pass(&fixture.adopt(&fixture.request()));
-    let partition = "source=binance-archive/instrument=BTCUSDT/stream=metrics/date=2026-10-03";
-    let records = copy_ledger::read(&fixture.hot()).unwrap().unwrap().records;
-    assert!(records.iter().any(|r| matches!(
-        &r.kind,
-        Kind::Removed { partition: p } if p == partition
-    )));
-    let hot = fixture.hot();
-    let ledger_dir = fixture.dir.join("dst/ledger");
-    let entries = |dir: &Path| -> Vec<(String, Vec<u8>)> {
-        files(dir)
-            .into_iter()
-            .filter(|(name, _)| name != "PENDING")
-            .collect()
-    };
-    let (layout, ledger, before_entries) = (
-        files(&hot),
-        std::fs::read(copy_ledger::ledger_path(&hot)).unwrap(),
-        entries(&ledger_dir),
+    assert_eq!(tier_records(&fixture, METRICS_03), ["removed"]);
+    assert!(on_hot(&fixture, METRICS_03).is_empty());
+
+    let out = import_metrics_03(&fixture, None);
+    let line = format!(
+        "recall {METRICS_03}: 1 file(s) copied back to hot ({}: 1); returned\n",
+        dir.path().join("cold-a").display()
     );
-    let day = D0 / DAY_MS - 3;
-    for attempt in 0..2 {
-        let error = import(
-            &fixture.archive_config,
-            &fixture.archive,
-            ArchiveStream::Metrics,
-            day,
-            day,
-        )
-        .expect_err("refused");
-        for text in [partition, "removed from hot", "recall (ADR-062 D6)", "#191"] {
-            assert!(
-                error.contains(text),
-                "attempt {attempt}: {text:?} in {error}"
-            );
-        }
-        assert_eq!(files(&hot), layout, "attempt {attempt}");
-        assert_eq!(
-            std::fs::read(copy_ledger::ledger_path(&hot)).unwrap(),
-            ledger
-        );
-        assert_eq!(entries(&ledger_dir), before_entries);
-        assert!(ledger_dir.join("PENDING").exists(), "attempt {attempt}");
+    assert!(out.contains(&line), "{out}");
+    assert!(
+        out.contains("imported BTCUSDT-metrics-2026-10-03.zip"),
+        "{out}"
+    );
+    assert_eq!(
+        on_hot(&fixture, METRICS_03),
+        [
+            format!("{METRICS_03}/part-00000.parquet"),
+            format!("{METRICS_03}/part-00001.parquet")
+        ]
+    );
+    assert_eq!(
+        on_hot(&fixture, METRICS_04),
+        [format!("{METRICS_04}/part-00000.parquet")]
+    );
+    assert_eq!(tier_records(&fixture, METRICS_03), ["removed", "returned"]);
+    let ledger_dir = fixture.dir.join("dst/ledger");
+    assert!(!ledger_dir.join("PENDING").exists());
+    let entry = files(&ledger_dir)
+        .into_iter()
+        .find(|(name, _)| name.ends_with("metrics-2026-10-03.zip.import"))
+        .expect("the entry");
+    let text = String::from_utf8(entry.1).unwrap();
+    for path in [
+        format!("{METRICS_03}/part-00001.parquet"),
+        format!("{METRICS_04}/part-00000.parquet"),
+    ] {
+        assert!(text.contains(&path), "{path} in {text}");
     }
+}
+
+/// `mie replay --source archive` over 2026-10-03 and 2026-10-04 on the
+/// tiered store, through the binary.
+fn archive_replay(fixture: &Fixture) -> String {
+    let output = Command::new(env!("CARGO_BIN_EXE_mie"))
+        .args(["replay", "--config"])
+        .arg(&fixture.dst_archive)
+        .args([
+            "--source",
+            "archive",
+            "--from",
+            "2026-10-03",
+            "--to",
+            "2026-10-04",
+        ])
+        .env_remove("MIE_DEV_DEVICE_IDS")
+        .output()
+        .unwrap();
+    format!(
+        "{}-- stderr --\n{}exit {:?}\n",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+        output.status.code()
+    )
+}
+
+/// One `mie ingest`-style replication pass with the plan, and the plan.
+fn planned_pass(fixture: &Fixture) -> Option<RemovalPlan> {
+    struct Ignore;
+    impl store::PassObserver for Ignore {
+        fn ledger_truncated(&mut self, _: &Path, _: copy_ledger::Truncation) {}
+    }
+    let (report, plan) = store::replicate::run_planned(
+        &fixture.config,
+        Some(fixture.archive_config.clone()),
+        &fixture.probe(),
+        &|| D0 + 20,
+        &copy_ledger::CopyLedger::at(&fixture.hot()),
+        &mut Ignore,
+        FIRST_HOT,
+    );
+    assert_eq!(report.problems, Vec::<String>::new(), "{report:?}");
+    plan
+}
+
+/// AW10 offline (#191, ADR-062 D6): an archive import into a stream-date
+/// removed from hot recalls the partition and appends the next part
+/// number; a `mie replay --source archive` run during the recall (at its
+/// first copied file) prints the report taken before the import, byte for
+/// byte. A planned pass copies the new parts and the entry and names both
+/// partitions; the remover skips the archive source while an import holds
+/// its lock and changes nothing; once the lock is free it removes both
+/// partitions again, each `removed` record before its rename, and the
+/// replay after the removal equals the one after the import.
+#[test]
+fn aw10_a_late_import_recalls_and_the_partition_leaves_hot_again() {
+    let dir = TempDir::new("adopt-aw10");
+    let fixture = Fixture::new(dir.path());
+    assert_pass(&fixture.adopt(&fixture.request()));
+    let before = archive_replay(&fixture);
+    assert!(before.ends_with("exit Some(0)\n"), "{before}");
+
+    // 2. The import, with the replay run inside the recall.
+    let during: Arc<Mutex<Vec<String>>> = Arc::default();
+    let (sink, dst_archive) = (Arc::clone(&during), fixture.dst_archive.clone());
+    let on_recall: RecallObserver = Arc::new(move |event| {
+        let mut during = sink.lock().unwrap();
+        if matches!(event, RecallEvent::Copied { .. }) && during.is_empty() {
+            let output = Command::new(env!("CARGO_BIN_EXE_mie"))
+                .args(["replay", "--config"])
+                .arg(&dst_archive)
+                .args([
+                    "--source",
+                    "archive",
+                    "--from",
+                    "2026-10-03",
+                    "--to",
+                    "2026-10-04",
+                ])
+                .env_remove("MIE_DEV_DEVICE_IDS")
+                .output()
+                .unwrap();
+            during.push(format!(
+                "{}-- stderr --\n{}exit {:?}\n",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+                output.status.code()
+            ));
+        }
+    });
+    let out = import_metrics_03(&fixture, Some(on_recall));
+    assert!(
+        out.contains(&format!("recall {METRICS_03}: 1 file(s)")),
+        "{out}"
+    );
+    assert_eq!(
+        during.lock().unwrap().as_slice(),
+        std::slice::from_ref(&before)
+    );
+    assert_eq!(
+        on_hot(&fixture, METRICS_03).last().unwrap(),
+        &format!("{METRICS_03}/part-00001.parquet")
+    );
+    let after_import = archive_replay(&fixture);
+    assert!(after_import.ends_with("exit Some(0)\n"), "{after_import}");
+    assert_ne!(after_import, before);
+
+    // 3. A planned pass copies the new parts and the entry and plans both.
+    let plan = planned_pass(&fixture).expect("a plan");
+    let planned: Vec<&str> = plan
+        .candidates
+        .iter()
+        .map(|c| c.partition.as_str())
+        .collect();
+    assert_eq!(planned, [METRICS_03, METRICS_04]);
+
+    // 4. An import holds the archive lock: skipped, nothing changes.
+    let mut live = fixture.writer("binance-um");
+    let held = fixture.writer(ARCHIVE_SOURCE);
+    let layout = files(&fixture.hot());
+    let reports =
+        mie_cli::ingest::tiers::remove_pass(&mut live, &plan, &fixture.hot(), FIRST_HOT, D0 + 30);
+    assert_eq!(reports.len(), 2, "{reports:?}");
+    assert!(reports[0].is_empty(), "{reports:?}");
+    assert!(
+        reports[1].locked && reports[1].removed.is_empty(),
+        "{reports:?}"
+    );
+    assert_eq!(files(&fixture.hot()), layout);
+    drop(held);
+
+    // 5. Free: both are removed, each record before its rename.
+    let reports =
+        mie_cli::ingest::tiers::remove_pass(&mut live, &plan, &fixture.hot(), FIRST_HOT, D0 + 31);
+    assert_eq!(reports[1].removed, [METRICS_03, METRICS_04], "{reports:?}");
+    assert_eq!(
+        tier_records(&fixture, METRICS_03),
+        ["removed", "returned", "removed"]
+    );
+    assert_eq!(tier_records(&fixture, METRICS_04), ["removed"]);
+    for partition in [METRICS_03, METRICS_04] {
+        let dir = fixture.hot().join(partition);
+        assert!(!dir.exists(), "{partition}");
+        let hidden = dir.parent().unwrap().join(format!(
+            ".removed-{}",
+            dir.file_name().unwrap().to_string_lossy()
+        ));
+        assert!(!hidden.exists(), "{partition}");
+    }
+    live.close().unwrap();
+
+    // 6. The replay after the removal equals the one after the import.
+    assert_eq!(archive_replay(&fixture), after_import);
 }
 
 #[test]

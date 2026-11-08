@@ -13,7 +13,9 @@
 //!   copies every sealed file, import-ledger entry and the tails of the
 //!   copy ledger and the journal to the copy targets that present their
 //!   markers, and never removes anything ([`replicate`](mod@replicate) holds
-//!   the pass, #189, ADR-062 D5, D9, D11).
+//!   the pass, #189, ADR-062 D5, D9, D11). `mie ingest` runs the same pass
+//!   after every seal pass, plans the hot removal from it and removes in
+//!   its seal path (#191, D6).
 //! - [`adopt`] (`mie store adopt`) adopts an existing single-root store:
 //!   every sealed file goes straight to every copy target, partitions older
 //!   than the hot window are recorded as removed from hot, the hot-window

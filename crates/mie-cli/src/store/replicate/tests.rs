@@ -765,3 +765,359 @@ fn a_marker_lost_or_changed_mid_pass_stops_its_target() {
         );
     }
 }
+
+// ------------------------------------- the hot removal's side (#191)
+
+impl Fixture {
+    /// One `mie ingest` pass with the plan, the hot window starting on
+    /// `first_hot_date`.
+    fn planned(&self, first_hot_date: &str) -> (PassReport, Option<RemovalPlan>) {
+        let archive = archive_config(&self.config, Some(&self.archive())).unwrap();
+        run_planned(
+            &self.config,
+            archive,
+            &self.probe,
+            &|| D0 + 2,
+            &CopyLedger::at(&self.hot),
+            &mut Seen::default(),
+            first_hot_date,
+        )
+    }
+
+    /// The ingest configuration with a third copy target `cold-c`, its
+    /// archive configuration and probe, created and marked.
+    fn with_cold_c(&self) -> (IngestConfig, PathBuf, Probe) {
+        let cold_c = self.dir.0.join("cold-c");
+        fs::create_dir_all(&cold_c).unwrap();
+        root_marker::create_meta(&cold_c, "cold-c", false).unwrap();
+        let roots = format!(
+            "cold_roots = [\n{{ path = \"{}\", copy_target = true }},\n\
+             {{ path = \"{}\", copy_target = true }},\n\
+             {{ path = \"{}\", copy_target = true }},\n]\n",
+            self.cold[0].display(),
+            self.cold[1].display(),
+            cold_c.display()
+        );
+        let config = IngestConfig::parse(&format!(
+            "[instrument]\nsymbol = \"BTCUSDT\"\nsource = \"binance-um\"\n[paths]\n\
+             raw_root = \"{}\"\njournal = \"{}\"\n{roots}[binance]\n\
+             ws_base_url = \"wss://fake.invalid/ws\"\nrest_base_url = \"https://fake.invalid\"\n\
+             streams = [\"aggTrade\"]\n",
+            self.hot.display(),
+            self.config.paths.journal.display(),
+        ))
+        .unwrap();
+        let archive = self.dir.0.join("archive-c.toml");
+        fs::write(
+            &archive,
+            format!(
+                "[instrument]\nsymbol = \"BTCUSDT\"\n[paths]\nraw_root = \"{}\"\n\
+                 import_ledger = \"{}\"\nstaging = \"{}\"\n{roots}",
+                self.hot.display(),
+                self.dir.0.join("ledger").display(),
+                self.dir.0.join("staging").display(),
+            ),
+        )
+        .unwrap();
+        let probe = Probe(vec![
+            (self.hot.clone(), 1),
+            (self.cold[0].clone(), 2),
+            (self.cold[1].clone(), 3),
+            (cold_c, 4),
+        ]);
+        (config, archive, probe)
+    }
+}
+
+/// The #199 review carry-over: once the hot removal took a file off hot, a
+/// target added later never gets it from hot, so its journal copy stops
+/// before the `sealed` line that names it, keyed on the ledger's paths;
+/// the other targets hold the whole journal.
+#[test]
+fn a_removed_file_holds_a_new_targets_journal_copy_before_its_sealed_line() {
+    let fixture = Fixture::new("pass-removed-journal");
+    let path = first_live(&fixture);
+    let (before, journal) = journal_naming(&fixture, &path);
+    let report = fixture.pass();
+    assert_eq!(report.problems, Vec::<String>::new(), "{report:?}");
+
+    // The real remover, with the hot window after the file's date.
+    let (report, plan) = fixture.planned("2026-10-07");
+    assert_eq!(report.problems, Vec::<String>::new(), "{report:?}");
+    let plan = plan.expect("a plan");
+    let removed =
+        removal::remove_with_lock(&fixture.hot, "binance-um", &plan, "2026-10-07", D0 + 3);
+    let partition = path.rsplit_once('/').unwrap().0;
+    assert_eq!(removed.removed, [partition], "{removed:?}");
+    assert!(!fixture.hot.join(&path).exists());
+
+    // cold-c joins.
+    let (config, archive, probe) = fixture.with_cold_c();
+    let report = run(
+        &config,
+        Some(&archive),
+        &probe,
+        &|| D0 + 4,
+        &CopyLedger::at(&fixture.hot),
+        &mut Seen::default(),
+    );
+    let cold_c = fixture.dir.0.join("cold-c");
+    assert_eq!(
+        fs::read(cold_c.join(".mie/journal/journal.jsonl")).unwrap(),
+        before
+    );
+    assert!(
+        report.problems.iter().any(|p| p.starts_with(&format!(
+            "the journal copy on cold-c stops before byte {} of the journal",
+            before.len()
+        )) && p.contains(&path)),
+        "{report:?}"
+    );
+    for root in &fixture.cold {
+        assert_eq!(
+            fs::read(root.join(".mie/journal/journal.jsonl")).unwrap(),
+            journal
+        );
+    }
+}
+
+/// The substring rule the token match replaces: the first line whose
+/// bytes contain one of `paths`.
+fn substring_rule(journal: &[u8], paths: &BTreeSet<&str>) -> Option<usize> {
+    let mut offset = 0;
+    for line in journal.split_inclusive(|&b| b == b'\n') {
+        if paths
+            .iter()
+            .any(|p| line.windows(p.len()).any(|w| w == p.as_bytes()))
+        {
+            return Some(offset);
+        }
+        offset += line.len();
+    }
+    None
+}
+
+#[test]
+fn first_line_naming_matches_by_layout_tokens() {
+    let dir = Dir::new("token-match");
+    let part = |n: u32| {
+        format!(
+            "source=binance-um/instrument=BTCUSDT/stream=aggTrade/date=2026-10-06/part-0000{n}.parquet"
+        )
+    };
+    let tmp = "source=binance-um/instrument=BTCUSDT/stream=aggTrade/date=2026-10-06/\
+               .part-00003.parquet.tmp";
+    let lines = [
+        "{\"type\":\"run_start\",\"run_id\":\"r1\"}".to_owned(),
+        // A temp name and a path that only shares a prefix: no match.
+        format!(
+            "{{\"type\":\"recovery\",\"rolled_forward\":[],\"discarded\":[{{\"path\":\"{tmp}\",\"bytes\":9}}]}}"
+        ),
+        format!(
+            "{{\"type\":\"sealed\",\"files\":[{{\"path\":\"{}\"}}]}}",
+            part(1).replace(".parquet", ".manifest")
+        ),
+        format!(
+            "{{\"type\":\"recall\",\"partition\":\"x\",\"damaged\":[{{\"path\":\"{}\",\"root\":\"r\"}}]}}",
+            part(4)
+        ),
+        format!(
+            "{{\"type\":\"recovery\",\"rolled_forward\":[\"{}\"]}}",
+            part(2)
+        ),
+        format!(
+            "{{\"type\":\"sealed\",\"files\":[{{\"path\":\"{}\",\"rows\":2}},{{\"path\":\"{}\"}}]}}",
+            part(0),
+            part(1)
+        ),
+    ];
+    let journal: Vec<u8> = lines
+        .iter()
+        .flat_map(|l| format!("{l}\n").into_bytes())
+        .collect();
+    let path = dir.0.join("journal.jsonl");
+    fs::write(&path, &journal).unwrap();
+    let offset_of = |i: usize| -> u64 { lines[..i].iter().map(|l| l.len() as u64 + 1).sum() };
+    let len = journal.len() as u64;
+
+    let one = |p: &str| -> Option<(u64, String)> {
+        let owned = p.to_owned();
+        let set: BTreeSet<&str> = [owned.as_str()].into();
+        first_line_naming(&path, 0, len, &set).unwrap()
+    };
+    // `recovery.rolled_forward` and `sealed` match.
+    assert_eq!(one(&part(2)), Some((offset_of(4), part(2))));
+    assert_eq!(one(&part(0)), Some((offset_of(5), part(0))));
+    // A `sealed` line with two files; the manifest name before it does
+    // not match.
+    assert_eq!(one(&part(1)), Some((offset_of(5), part(1))));
+    // The temp file's data path is never named by its temp name.
+    assert_eq!(one(&part(3)), None);
+    // From a later offset only later lines count.
+    let second = part(2);
+    let set: BTreeSet<&str> = [second.as_str()].into();
+    assert_eq!(
+        first_line_naming(&path, offset_of(5), len, &set).unwrap(),
+        None
+    );
+
+    // Against the substring rule, over every subset of the paths.
+    let all: Vec<String> = (0..5).map(part).collect();
+    for mask in 0..(1u32 << all.len()) {
+        let set: BTreeSet<&str> = all
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| mask & (1 << i) != 0)
+            .map(|(_, p)| p.as_str())
+            .collect();
+        let found = first_line_naming(&path, 0, len, &set)
+            .unwrap()
+            .map(|(offset, _)| offset as usize);
+        assert_eq!(found, substring_rule(&journal, &set), "{set:?}");
+    }
+}
+
+#[test]
+fn a_planned_pass_plans_only_complete_partitions() {
+    let partition = |fixture: &Fixture| first_live(fixture).rsplit_once('/').unwrap().0.to_owned();
+
+    // A target skipped (no marker): no plan.
+    let fixture = Fixture::new("plan-skipped");
+    fs::remove_file(root_marker::marker_path(&fixture.cold[1])).unwrap();
+    let (report, plan) = fixture.planned("2026-10-07");
+    assert!(!report.targets_complete, "{report:?}");
+    assert!(plan.is_none());
+
+    // A target stopped mid-pass: no plan.
+    let fixture = Fixture::new("plan-stopped");
+    let cold_b = fixture.cold[1].clone();
+    ON_STEP.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |step| {
+            if step == PassStep::AfterPublish {
+                let _ = fs::remove_file(root_marker::marker_path(&cold_b));
+            }
+        }));
+    });
+    let (report, plan) = fixture.planned("2026-10-07");
+    ON_STEP.with(|hook| hook.borrow_mut().take());
+    assert!(!report.targets_complete, "{report:?}");
+    assert!(plan.is_none());
+
+    // Complete: the pass's own ledger copies cover its copy records.
+    let fixture = Fixture::new("plan-complete");
+    let (report, plan) = fixture.planned("2026-10-07");
+    assert!(report.targets_complete, "{report:?}");
+    assert_eq!(
+        report.target_ids,
+        ["cold-a", "cold-b"].map(str::to_owned).into()
+    );
+    let plan = plan.expect("a plan");
+    let names: Vec<&str> = plan
+        .candidates
+        .iter()
+        .map(|c| c.partition.as_str())
+        .collect();
+    assert!(names.contains(&partition(&fixture).as_str()), "{plan:?}");
+
+    // A new part whose copy records lie beyond both ledger copies (the
+    // pass stopped before its `ledger-copy` records) is not planned; the
+    // next pass covers it, and its partition is planned again.
+    seal(&fixture.hot, "binance-um", "aggTrade", D0 + 60_000, 2);
+    CRASH_AT.with(|crash| crash.set(Some(PassStep::AfterLedgerExtend)));
+    let (_, plan) = fixture.planned("2026-10-07");
+    CRASH_AT.with(|crash| crash.set(None));
+    assert!(plan.is_none(), "a stopped pass gives no plan");
+    let ledger = copy_ledger::read(&fixture.hot).unwrap().unwrap();
+    let scan = removal::scan_hot(&fixture.hot, "2026-10-07").unwrap();
+    let ids: BTreeSet<String> = ["cold-a", "cold-b"].map(str::to_owned).into();
+    let direct = removal::plan(&ledger, &scan, &ids, 2, "2026-10-07").unwrap();
+    assert!(
+        direct
+            .candidates
+            .iter()
+            .all(|c| c.partition != partition(&fixture)),
+        "{direct:?}"
+    );
+    let (_, plan) = fixture.planned("2026-10-07");
+    let plan = plan.expect("a plan");
+    assert!(
+        plan.candidates
+            .iter()
+            .any(|c| c.partition == partition(&fixture)),
+        "{plan:?}"
+    );
+
+    // `run` never plans and never removes.
+    let report = fixture.pass();
+    assert_eq!(report.problems, Vec::<String>::new(), "{report:?}");
+    assert!(fixture.hot.join(partition(&fixture)).exists());
+}
+
+/// Review of #202, finding 1: a target whose copy-ledger copy is refused
+/// ("needs the repair") holds no verified ledger copy, so its older
+/// `ledger-copy` record must not count for rule (f). The pass is not
+/// complete, gives no plan, and nothing leaves hot.
+#[test]
+fn a_refused_ledger_copy_gives_no_plan_and_removes_nothing() {
+    let fixture = Fixture::new("plan-refused-ledger-copy");
+    let partition = first_live(&fixture).rsplit_once('/').unwrap().0.to_owned();
+    let report = fixture.pass();
+    assert_eq!(report.problems, Vec::<String>::new(), "{report:?}");
+    // cold-b's ledger copy is damaged in its last record.
+    let copy = copy_ledger::ledger_path(&fixture.cold[1]);
+    make_writable(&copy);
+    let mut bytes = fs::read(&copy).unwrap();
+    let at = bytes.len() - 5;
+    bytes[at] ^= 0x01;
+    fs::write(&copy, &bytes).unwrap();
+
+    let (report, plan) = fixture.planned("2026-10-07");
+    assert!(
+        report
+            .problems
+            .iter()
+            .any(|p| p.contains("the copy-ledger copy on cold-b") && p.contains("refused")),
+        "{report:?}"
+    );
+    assert!(!report.targets_complete, "{report:?}");
+    assert!(plan.is_none(), "{plan:?}");
+    assert!(fixture.hot.join(&partition).exists());
+}
+
+/// Review of #202, finding 2: hot holding another version of a recorded
+/// path (a D5 breach that `select` reports) is never removed silently: the
+/// plan leaves the partition on hot and the pass names the conflict.
+#[test]
+fn a_hot_manifest_differing_from_the_ledger_is_never_removed() {
+    let fixture = Fixture::new("plan-d5-conflict");
+    let report = fixture.pass();
+    assert_eq!(report.problems, Vec::<String>::new(), "{report:?}");
+    let other = Dir::new("plan-d5-conflict-other");
+    let path = first_live(&fixture);
+    let alt = seal(&other.0, "binance-um", "aggTrade", D0 + 500, 6);
+    assert!(alt.contains(&path));
+    for file in [path.clone(), manifest_of(&path)] {
+        let dst = fixture.hot.join(&file);
+        make_writable(&dst);
+        fs::remove_file(&dst).unwrap();
+        fs::copy(other.0.join(&file), &dst).unwrap();
+    }
+    let partition = path.rsplit_once('/').unwrap().0.to_owned();
+    let (report, plan) = fixture.planned("2026-10-07");
+    let plan = plan.expect("a plan");
+    assert!(
+        plan.candidates.iter().all(|c| c.partition != partition),
+        "{plan:?}"
+    );
+    assert!(
+        report
+            .problems
+            .iter()
+            .any(|p| p.contains(&path) && p.contains("ADR-062 D5")),
+        "{report:?}"
+    );
+    let removed =
+        removal::remove_with_lock(&fixture.hot, "binance-um", &plan, "2026-10-07", D0 + 3);
+    assert!(removed.removed.is_empty(), "{removed:?}");
+    assert!(fixture.hot.join(&path).exists());
+}

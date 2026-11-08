@@ -12,6 +12,41 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
 
 ### Added
 
+- **Storage tiers, step 5: hot removal, recall and union part numbering
+  in `mie ingest` (#191, ADR-062 D6, D11, proposed).** A tiered store's
+  writer (`ParquetRawStore::tiered_writer`, with a `TierContext`: the
+  first hot date, a clock and a recall observer; `writer()` refuses a
+  tiered store) numbers a new part from the union of hot and the copy
+  ledger, lost, held and quarantined entries included, so a path is never
+  reused. An append to a partition the ledger records as removed from hot
+  first recalls it: every recorded file is copied back from the first
+  cold root holding a verified copy (`replica::copy_back`; a damaged copy
+  is reported and the next root tried, a differing manifest is
+  `Integrity`), then `returned` is appended. Without a readable ledger
+  the writer opens only hot-window dates. The new `removal` module plans
+  the hot removal from one ledger read and one walk of hot (the date
+  before the window, every configured target present, every file with a
+  `manifest` record equal to hot's manifest and k `copy` records without a
+  later `finding`, inside the prefix both ledger copies hold, no lost,
+  held or pending path; a D5 conflict is reported and never removed) and removes under the source lock
+  and a non-waiting ledger lock, re-checking the ledger's tail and the
+  directory: the `removed` record and fsync, then the rename to
+  `.removed-date=…`, then the deletion; a crash is finished by the next
+  pass. `mie ingest` on a tiered store runs a replication pass at the
+  start and after each seal pass on a `mie-replicate` thread, which plans
+  the removal; the remover runs in the seal path for the live source and,
+  when the plan names it, the archive source (skipped while an import
+  holds its lock). Shutdown writes `run_end` first, then waits at most one
+  seal interval for the final pass. New journal lines: `replication`,
+  `removal`, `recall` and `copy_ledger_truncated`. `mie archive-import`
+  recalls a removed partition and prints a recall line. The replication
+  pass holds a target's journal copy on the ledger's live paths as well
+  as hot's listing (a target added after a removal), matching lines by
+  token. Offline tests cover AW3 with the real remover and recall, AW10
+  (a late import under a running replay, the locked archive source, the
+  removal again), each eligibility rule, a crash at every removal and
+  recall step, a hung copy target and the AW2 regression with one target
+  unmounted.
 - **Storage tiers, step 4: adoption, `mie store adopt` (#190, ADR-062
   D10, D8, D6 interim guard, proposed).** `mie store adopt --config
   <ingest config> [--archive-config <archive config>] --from <store root>
@@ -43,7 +78,8 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   recall (#191), a tiered store's writer refuses, with `Integrity` and
   before creating anything, a part in a partition the copy ledger records
   as removed from hot or below a part number the ledger already knows; an
-  import refused this way leaves its `PENDING` in place.
+  import refused this way leaves its `PENDING` in place (replaced by
+  step 5).
   `replica::list_unsealed` lists a root's seal debris and
   `replica::verify_sealed` checks a part's data against its manifest.
   `tools/tier-reports.sh` prints the AW1 reports (`mie replay --source

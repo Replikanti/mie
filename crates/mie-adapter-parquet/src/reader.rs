@@ -6,7 +6,7 @@ use crate::manifest;
 use crate::schema;
 use crate::sorted_entries;
 use crate::tiers;
-use crate::writer::{RawWriter, RotationPolicy};
+use crate::writer::{RawWriter, RotationPolicy, TierContext};
 use bytes::Bytes;
 use mie_ports::raw::{
     RawDataset, RawRecord, RawRecordSource, RawSelection, RawStoreError, RawStreamKey, SealedFile,
@@ -65,21 +65,49 @@ impl ParquetRawStore {
         &self.root
     }
 
-    /// Opens the writer of `source`: creates its directory, takes its lock
-    /// and recovers interrupted seals ([`RawWriter::recovery`]). On a
-    /// tiered store it also reads the copy ledger once for the interim
-    /// writer guard (ADR-062 D6, until #191; [`RawWriter`]): a part in a
-    /// partition the ledger records as removed from hot, or below a part
-    /// number the ledger already knows, is refused with
-    /// [`RawStoreError::Integrity`] when the writer would open it.
+    /// Opens the writer of `source` on a single-root store: creates its
+    /// directory, takes its lock and recovers interrupted seals
+    /// ([`RawWriter::recovery`]).
     ///
     /// # Errors
     ///
-    /// [`RawStoreError::Locked`] when another writer holds the source,
-    /// [`RawStoreError::Invalid`] for a bad source name or policy, and the
-    /// recovery errors of ADR-030.
+    /// [`RawStoreError::Invalid`] on a tiered store, whose writer needs its
+    /// hot window and clock ([`tiered_writer`](Self::tiered_writer)), so no
+    /// path opens a tiered writer without them; [`RawStoreError::Locked`]
+    /// when another writer holds the source; [`RawStoreError::Invalid`] for
+    /// a bad source name or policy; the recovery errors of ADR-030.
     pub fn writer(&self, source: &str, policy: RotationPolicy) -> Result<RawWriter, RawStoreError> {
-        RawWriter::open(&self.root, source, policy, self.is_tiered())
+        if self.is_tiered() {
+            return Err(RawStoreError::Invalid(format!(
+                "{} is a tiered store: its writer needs the hot window and a clock \
+                 (tiered_writer, ADR-062 D6)",
+                self.root.display()
+            )));
+        }
+        RawWriter::open(&self.root, source, policy, None)
+    }
+
+    /// Opens the writer of `source` on a tiered store (ADR-062 D6,
+    /// [`RawWriter`]): as [`writer`](Self::writer), then it reads the copy
+    /// ledger once for the union part numbering and the recall, or, without
+    /// a readable ledger, opens as the degraded writer, which writes only
+    /// dates from `ctx.first_hot_date` on. On a single-root store it is
+    /// [`writer`](Self::writer) and `ctx` is unused.
+    ///
+    /// # Errors
+    ///
+    /// As [`writer`](Self::writer), except the tiered refusal.
+    pub fn tiered_writer(
+        &self,
+        source: &str,
+        policy: RotationPolicy,
+        ctx: TierContext,
+    ) -> Result<RawWriter, RawStoreError> {
+        let tiers = self
+            .tiers
+            .as_ref()
+            .map(|tiers| (tiers.cold_roots.clone(), ctx));
+        RawWriter::open(&self.root, source, policy, tiers)
     }
 
     /// The sealed files of `stream` on `date`, from their manifests.

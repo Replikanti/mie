@@ -196,6 +196,7 @@ pub fn ingest(
         connector: ScriptedConnector::new("btcusdt@aggTrade", connections, &shutdown),
         http: Arc::new(NoHttp),
         clock: FakeClock::new(start_ms, "mie-aggTrade"),
+        device_probe: probe_for(config),
     };
     mie_cli::ingest::run(config, transports, shutdown).expect("ingest starts")
 }
@@ -376,6 +377,7 @@ pub fn depth_transports(
         }),
         http,
         clock: FakeClock::new(start_ms, "mie-depth"),
+        device_probe: Arc::new(mie_cli::store::StDevProbe),
     };
     (transports, shutdown)
 }
@@ -726,6 +728,16 @@ pub fn cold_roots_toml(cold_roots: &[mie_cli::config::ColdRoot]) -> String {
 /// check queries `<root>/..`): distinct devices without distinct
 /// filesystems.
 pub struct MapProbe(pub Vec<(PathBuf, u64)>);
+
+/// The probe of an offline ingest of `config`: distinct devices for hot
+/// and every cold root, so a tiered capture's replication pass runs.
+pub fn probe_for(config: &IngestConfig) -> Arc<dyn mie_cli::store::DeviceProbe> {
+    let mut devices = vec![(config.paths.raw_root.clone(), 1)];
+    for (i, root) in config.paths.cold_roots.iter().enumerate() {
+        devices.push((root.path.clone(), i as u64 + 2));
+    }
+    Arc::new(MapProbe(devices))
+}
 
 impl mie_cli::store::DeviceProbe for MapProbe {
     fn device_id(&self, root: &Path) -> std::io::Result<u64> {
