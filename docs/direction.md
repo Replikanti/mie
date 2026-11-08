@@ -150,3 +150,70 @@ after the results are published.
    market information.
 6. The Research Lab implements T1 to T6. Until it does, this document is
    their specification.
+
+## Addendum 2026-11-08: the open personal inputs
+
+Four inputs were still "to be set" when the #28 outcomes were read
+(2026-10-30), so they are set here under rule 2 instead of in the table,
+which stays as it was. They are set before the replication on
+2020-01 … 2024-09 is designed or read, so they stay blind to the data that
+will judge them. Every number below comes from the calibration slice
+(`c20761ef…`) or counts setups on the #12 year (`5e8e17b0…`) without
+reading an outcome. The computations are exploratory and kept outside the
+repository.
+
+| Input | Value |
+|---|---|
+| False discovery rate (T3) | 0.05 |
+| Maximum acceptable out-of-sample drawdown, in R | 30 |
+| Minimum frequency for A, setups per week | 2 |
+| Minimum frequency for B, alerts per week | 1 |
+| Waiting period for outside interest in C | to be set |
+
+Why these values:
+
+- **False discovery rate 0.05.** A power simulation of T3 on the
+  calibration slice (σ 0.96 at 1d, 0.93 at 4h), with Benjamini–Hochberg
+  across the 48 contexts of the planned replication grid (P1-buy and
+  P1-sell × effort window 5m, 15m, 1h × four regimes × 4h and 1d). Units
+  per context are the #28 units per year scaled to 2020-01 … 2024-09, and
+  all 48 reach n_min. With one real effect on P1-buy w=1h in the high
+  regime at 1d (about 470 units), power at 0.05 against 0.10 is 0.86
+  against 0.90 for an effect of 0.19 R, the gross effect a net μ needs at
+  1d (fee 0.09 R + μ), and 0.16 against 0.22 for 0.10 R. False discoveries
+  per family are 0.10 against 0.23. So 0.10 buys four points of power where
+  A needs it and doubles the false discoveries. At 0.10 R neither level
+  detects reliably, because the sample against 48 tests is the limit, not
+  the level. If the replication needs open interest (from 2021-12), that
+  context has about 280 units, below n_min, and is not read at either level.
+- **Maximum drawdown 30 R.** The drawdown of a strategy at exactly μ, with
+  the 1d outcome shape of the calibration slice and the taker fee at the
+  1d median barrier (0.09 R) netted, over 20 000 paths. Trade outcomes of
+  the P1 contexts on the calibration slice show a lag-1 correlation of 0.03
+  at 4h, at the edge of its permutation null, and +0.04 to +0.12 at 1d by
+  effort window, significant on its own only at w=5m. Between 385 out-of-sample
+  trades (T1's minimum) and 1 000, a strategy at μ exceeds 30 R with
+  probability 0.5–1.9 % in a block bootstrap of the real 1d trades and up
+  to 6.5 % in a pessimistic model with positive dependence at every lag
+  (lag-1 0.11). At 25 R the same figures are up to 6.1 % and 16.1 %, so a
+  lower limit would reject real edges at μ more often than the confidence
+  level allows. A weak edge is caught by T2, not by this limit. What 30 R
+  means in money is set by the risk per trade, which stays out of this
+  repository.
+- **Minimum frequency for A, 2 per week.** Non-overlapping 1d setups on the
+  #12 year: 1.99 per week for P1-buy w=1h in the high regime, 3.66 for both
+  sides and all windows in the high regime, 6.82 for every P1 context. At
+  4 per week no high-regime 1d group qualifies, and 1d is the only horizon
+  where the taker fee leaves room, so A would be decided by frequency before
+  any evidence. At 2 per week a strategy at μ expects 10.4 R a year, has a
+  losing year in 14 % of years, and needs about 2.9 years to win back the
+  30 R limit. P1-buy w=1h in the high regime sits at the threshold; the
+  value follows from these yearly figures, not from admitting that context.
+- **Minimum frequency for B, 1 per week.** B also holds when A's setups are
+  too rare to trade, so B has to admit rarer setups than A. T1 alone
+  (385 units) already implies at least 1.55 per week on the replication's
+  247.9 weeks, so this value binds only on shorter spans (the open-interest
+  era, live data), where it keeps at least one alert a week on average. How
+  many alerts a trader wants is a product judgment no market data settles.
+- **Waiting period for C** stays to be set. It gates no measurement and no
+  part of the replication.
