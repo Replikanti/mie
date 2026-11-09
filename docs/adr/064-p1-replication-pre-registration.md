@@ -553,8 +553,9 @@ two configs are the #12-year store's and the replication store's.
   test entry, no query, no DuckDB client and no measurement ran on the
   window.
 - **Command log**, every command run on the replication store or dataset,
-  and the probe. The last line is the coverage rerun of the amendment
-  below, with `<test binary>` rebuilt from `d9df826`:
+  and the probe. The last two lines are the coverage reruns of the
+  amendment below, with `<test binary>` rebuilt from `d9df826` and from
+  `57699b8`:
 
   ```sh
   2026-11-09T00:21:29Z systemd-run --user --scope -q -p CPUQuota=400% -p MemoryMax=8G <mie> conditional build --config <#12-year archive config> --source archive --streams aggTrades,metrics --trade-correction fold --from 2025-10-01 --to 2025-10-01 --out <probe>
@@ -570,6 +571,7 @@ two configs are the #12-year store's and the replication store's.
   2026-11-09T07:16:46Z systemd-run --user --scope -q -p CPUQuota=400% -p MemoryMax=12G env MIE_OUTCOME_DATASET=<dataset> /usr/bin/time -v <test binary> --ignored --exact --nocapture coverage_p1_replication
   2026-11-09T07:17:00Z systemd-run --user --scope -q -p CPUQuota=400% -p MemoryMax=12G env MIE_OUTCOME_DATASET=<dataset> /usr/bin/time -v <test binary> --ignored --exact --nocapture replication::coverage_p1_replication
   2026-11-09T09:04:39Z systemd-run --user --scope -q -p CPUQuota=400% -p MemoryMax=12G env MIE_OUTCOME_DATASET=<dataset> /usr/bin/time -v <test binary> --ignored --exact --nocapture replication::coverage_p1_replication
+  2026-11-09T09:49:08Z systemd-run --user --scope -q -p CPUQuota=400% -p MemoryMax=12G env MIE_OUTCOME_DATASET=<dataset> /usr/bin/time -v <test binary> --ignored --exact --nocapture replication::coverage_p1_replication
   ```
 
 ### Amendment after review, before any outcome was read
@@ -650,6 +652,14 @@ findings.
     that test fails. The code-freeze test also covers the two new frozen
     lines.
   - The region's hash moves from `cafdbb1b…` to `ece00cf2…`. The ADR's
-    frozen text and the queries are unchanged. The coverage reruns from
-    this fix; pending.
+    frozen text and the queries are unchanged.
+  - **Coverage rerun** from a release test binary of a clean checkout of
+    `57699b842cbc291899b3f33e084f3f2241e2c834`, same cap and dataset; the
+    last line of the command log. Wall time 0:56.55 (m:ss), peak RSS
+    2.5 GB, 1 test ran, coverage twin mismatches 0. Against the previous
+    run only the region hash line changed (`ece00cf2…`) and the new line
+    `test binary code git:57699b842cbc291899b3f33e084f3f2241e2c834`
+    appeared, without `-dirty`. Every count, and 46 of 48 measurable, is
+    identical, so the pins stay. The coverage report now holds this
+    run's output.
 
