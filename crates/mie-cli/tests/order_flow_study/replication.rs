@@ -22,13 +22,14 @@
 //!
 //! ```sh
 //! MIE_OUTCOME_DATASET=<dir> cargo test --release -p mie-cli \
-//!     --test order_flow_study coverage_p1_replication -- --ignored --nocapture
+//!     --test order_flow_study replication::coverage_p1_replication -- --ignored --nocapture
 //! MIE_OUTCOME_DATASET=<dir> cargo test --release -p mie-cli \
-//!     --test order_flow_study measure_p1_replication -- --ignored --nocapture
+//!     --test order_flow_study replication::measure_p1_replication -- --ignored --nocapture
 //! ```
 //!
-//! The measurement (#206) refuses to run until commit 2 of #205 sets
-//! [`REPLICATION_PINS`]; it panics "not pinned" before it opens a dataset.
+//! The measurement (#206) runs only on the dataset [`REPLICATION_PINS`]
+//! names (set by commit 2 of #205 from the coverage run); with an empty pin
+//! it panics "not pinned" before it opens a dataset.
 
 use super::*;
 use mie_adapter_parquet::outcome::OutcomeManifest;
@@ -120,8 +121,14 @@ const UNPINNED: Pins = Pins {
     ran: None,
 };
 
-/// Commit 1 of #205: nothing is pinned, so the measurement cannot run.
-const REPLICATION_PINS: Pins = UNPINNED;
+/// The replication dataset of #205's coverage run (ADR-064
+/// *Pre-registration record*, `docs/research/205-p1-replication-coverage.md`).
+const REPLICATION_PINS: Pins = Pins {
+    data: Some("7e92345c663e72e096cbdf2921f60eaa8d9cbae291cd2f1f82bdd64306d27d10"),
+    content: Some("e985ea3e9efa9cc9aaf15dbc013fe76eb76711e811a4d3f414e79b591402049f"),
+    contexts: Some((2_638_166, 2_498_200, 139_966)),
+    ran: Some([2_634_304, 2_613_978]),
+};
 
 // ---------------------------------------------------------------------------
 // The guard (D1).
@@ -1913,7 +1920,7 @@ fn measure_run(dir: &Path, pins: &Pins, run: &RunSettings) -> Result<String, Str
     let (Some(data), Some(content), Some(contexts_pin), Some(ran_pin)) =
         (pins.data, pins.content, pins.contexts, pins.ran)
     else {
-        panic!("ADR-064 measurement: not pinned (commit 2 of #205 sets the pins)");
+        panic!("ADR-064 measurement: not pinned (the pre-registration record sets the pins)");
     };
     for (what, text, pinned) in [
         ("028 queries", sha256(STUDY_SQL), STUDY_SQL_SHA256),
@@ -1992,7 +1999,7 @@ fn coverage_p1_replication() {
 }
 
 #[test]
-#[ignore = "the #206 measurement; refuses to run until #205 commit 2 sets the pins"]
+#[ignore = "the #206 measurement on the pinned replication dataset; reads outcomes"]
 fn measure_p1_replication() {
     let dir = std::path::PathBuf::from(env("MIE_OUTCOME_DATASET"));
     let text = measure_run(&dir, &REPLICATION_PINS, &RUN)
@@ -2300,6 +2307,36 @@ fn the_coverage_entry_refuses_a_wrong_dataset_before_any_output() {
         let refusal = coverage_run(&built.dir, 1).unwrap_err();
         assert!(!refusal.contains('|'), "{refusal}");
     }
+}
+
+#[test]
+fn the_pins_are_the_coverage_runs() {
+    let coverage = include_str!("../../../../docs/research/205-p1-replication-coverage.md");
+    let pins = REPLICATION_PINS;
+    let (contexts, baseline, trigger) = pins.contexts.expect("pinned");
+    let ran = pins.ran.expect("pinned");
+    for line in [
+        format!(
+            "dataset content {}, data {}, engine {}",
+            pins.content.expect("pinned"),
+            pins.data.expect("pinned"),
+            REPLICATION_PROVENANCE[0]
+        ),
+        format!(
+            "pins: contexts {contexts}, baseline {baseline}, trigger {trigger}, effort rows {}; \
+             races that ran 4h {}, 1d {}",
+            3 * contexts,
+            ran[0],
+            ran[1]
+        ),
+        format!("028-order-flow-interactions.sql sha256 {STUDY_SQL_SHA256}"),
+        format!("205-p1-replication.sql sha256 {REPLICATION_SQL_SHA256}"),
+        format!("ADR-064 frozen text sha256 {ADR_FROZEN_SHA256}"),
+        "coverage twin mismatches 0".to_owned(),
+    ] {
+        assert!(coverage.contains(&line), "{line}");
+    }
+    assert_eq!(contexts, baseline + trigger);
 }
 
 #[test]

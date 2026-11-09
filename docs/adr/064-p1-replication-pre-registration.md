@@ -413,12 +413,109 @@ accepted.
 
 ## Pre-registration record
 
-Filled by #205's second commit, after the operational steps, before #206
-reads any outcome:
+Written by #205's second commit, after the operational steps and before
+any outcome of the window was read. All times 2026-11-09 UTC. Paths are
+placeholders: `<mie>` is the release binary, `<test binary>` the release
+build of `order_flow_study`, `<dataset>` the replication dataset, and the
+two configs are the #12-year store's and the replication store's.
 
-- the dry-run, import and verify results;
-- the dataset manifest;
-- the coverage summary and a link to
-  `docs/research/205-p1-replication-coverage.md`;
-- the full command log of everything run on the window;
-- the frozen SHA-256 values.
+- **Code.** Every step ran from a clean checkout of
+  `72371e363248db70b8a2b2d4445291859d7b311e`, the commit that added this
+  ADR: `cargo build --release -p mie-cli` and `cargo test --release -p
+  mie-cli --test order_flow_study --no-run`, under a 400 % CPU and 8 GB
+  cap. The dataset's `code` line is that commit, without `-dirty`.
+- **Engine-key probe.** One #12-year day, 2025-10-01, built from the
+  #12-year store with #28's streams: engine `4c844593779da2e3-1`,
+  `conditional.sampling@1 2c71fff23e8b0415`, `conditional.labels@2
+  6f90bff079e746f2`, D1's, so the features, sampling and labels are #28's.
+  1 439 records, `verify` PASS, nothing queried.
+- **Dry run** of the import over the window: 1 735 files published, 0
+  missing, 0 failed
+  ([results](https://github.com/Replikanti/mie/issues/205#issuecomment-6729538103)).
+- **Import**, year by year under an 8 GB cap, into the replication store
+  (`streams = ["aggTrades"]`, its own `raw_root`): 366, 365, 365, 365 and
+  274 files, 0 missing, 0 failed, 2 327 594 366 rows, 00:43 … 03:56. The
+  store holds 66.0 GB (66 021 622 871 bytes) for the 1 735 days.
+- **`archive-verify`** over the window: PASS. `aggTrades`: 3 223 files,
+  2 327 594 366 rows, 0 normalize errors, 7 id breaks, 13 holes over 60 s
+  on 9 days (listed in `docs/data-availability.md`), data
+  `7e92345c663e72e096cbdf2921f60eaa8d9cbae291cd2f1f82bdd64306d27d10`. No
+  hash, normalization or ledger error.
+- **Build**, once, under a 400 % CPU and 8 GB cap: wall time 2:44:28
+  (h:mm:ss), peak RSS 0.71 GB, 2 327 594 373 events, 0 rejections,
+  2 638 166 records and labels. `conditional verify` PASS. The manifest:
+
+  | Line | Value |
+  |---|---|
+  | `source` | `archive binance-archive/BTCUSDT streams aggTrades correction fold` |
+  | `replay`, `records` | `1577836800000 1727740800000` |
+  | `data` | `7e92345c663e72e096cbdf2921f60eaa8d9cbae291cd2f1f82bdd64306d27d10` |
+  | `engine` | `4c844593779da2e3-1` |
+  | `sampling` | `conditional.sampling@1 2c71fff23e8b0415` |
+  | `labeling` | `conditional.labels@2 6f90bff079e746f2` |
+  | `contexts.parquet` | 2 638 166 rows, `205a82462872954569738254ea9e0c9b053b1966f20a3fc0e2cac5f2ec802795` |
+  | `outcomes.parquet` | 13 190 830 rows, `d0b88950bc709459e95436283177e0ace7a9c661d587657b0c07a3ac18eb62a7` |
+  | `passages.parquet` | 75 907 rows, `effca270243585914bd86dc8b894142536f8f6141633e3c09079a5e1ac4974f9` |
+  | `effort.parquet` | 7 914 498 rows, `eeeda049d5bb2b3d9d326c9edc92c84a713c026b36af4f971642d78c26cb637a` |
+  | `content` | `e985ea3e9efa9cc9aaf15dbc013fe76eb76711e811a4d3f414e79b591402049f` |
+  | `code` | `git:72371e363248db70b8a2b2d4445291859d7b311e` |
+
+- **Coverage**, under a 400 % CPU and 12 GB cap: wall time 0:39.13
+  (m:ss), peak RSS 2.6 GB, coverage twin mismatches 0. The output is
+  [`docs/research/205-p1-replication-coverage.md`](../research/205-p1-replication-coverage.md).
+  - **46 of 48 contexts are measurable**: all 24 at 4h and 22 of 24 at
+    1d.
+  - **Not measurable:** P1-buy w=1h high 1d, 354 units, and P1-buy w=1h
+    extreme 1d, 288 units. S2 applies: #206 prints only their counts, and
+    they enter BH with p = 1, so m stays 48 (D3).
+  - No member of any context is dropped from E for an empty stratum.
+  - The window's median baseline half-widths are 54.08 bps at 4h and
+    144.98 bps at 1d, so the fee at the median is 0.18 R and 0.069 R,
+    against 0.26 R and 0.09 R on the #12 year.
+- **Against the addendum's assumption.** The `docs/direction.md` addendum
+  of 2026-11-08 sized its power simulation with #28's units per year
+  scaled to this window, which put about 470 units on P1-buy w=1h high at
+  1d and every one of the 48 contexts at n_min or above. The coverage
+  counts 354 units for that context and 288 for P1-buy w=1h extreme at 1d,
+  both below 385. No input changes: q stays 0.05, n_min stays 385, the two
+  contexts read `not measurable`, and the addendum's power figure for its
+  example context does not describe this window.
+- **The pins** the measurement asserts (D1): data `7e92345c…`, content
+  `e985ea3e…`, contexts 2 638 166, baseline 2 498 200, trigger 139 966,
+  effort rows 7 914 498 (3 per context), races that ran 2 634 304 at 4h
+  and 2 613 978 at 1d.
+- **Frozen SHA-256**, as the coverage printed them and as the test pins
+  them: `028-order-flow-interactions.sql`
+  `dd32d605081d6c80992655e16f453d143ee4e3ba5b17f4bbe399fcee0e7144a1`,
+  `205-p1-replication.sql`
+  `5d6d726da962d40d1d18b5295a13b366afa5ebea90fd1e7b49486022a2979014`,
+  this ADR's frozen text
+  `aeeadf25f10c3a8edb17a5f77c9b8ddb088dcef7c697e3a4fa2dd5aa513e3fe4`.
+- **Changes after coverage.** None to the frozen text or the queries. The
+  second commit sets the pins, updates the tool's comments, its ignore
+  reason and the documented test filter, adds a test that the pins equal
+  the coverage report's, and adds the documents. No count changed, so the
+  coverage was not rerun.
+- **Deviations.** The first coverage invocation passed the filter
+  `--exact coverage_p1_replication`, which matches no test (the entry's
+  path is `replication::coverage_p1_replication`), so it ran nothing and
+  printed nothing; it was rerun with the full path 14 s later. No other
+  test entry, no query, no DuckDB client and no measurement ran on the
+  window.
+- **Command log**, every command run on the replication store or dataset,
+  and the probe:
+
+  ```sh
+  2026-11-09T00:21:29Z systemd-run --user --scope -q -p CPUQuota=400% -p MemoryMax=8G <mie> conditional build --config <#12-year archive config> --source archive --streams aggTrades,metrics --trade-correction fold --from 2025-10-01 --to 2025-10-01 --out <probe>
+  2026-11-09T00:21:41Z <mie> archive-import --config <replication archive config> --streams aggTrades --from 2020-01-01 --to 2024-09-30 --dry-run
+  2026-11-09T00:43:17Z systemd-run --user --scope -q -p MemoryMax=8G <mie> archive-import --config <replication archive config> --streams aggTrades --from 2020-01-01 --to 2020-12-31
+  2026-11-09T01:10:44Z systemd-run --user --scope -q -p MemoryMax=8G <mie> archive-import --config <replication archive config> --streams aggTrades --from 2021-01-01 --to 2021-12-31
+  2026-11-09T02:09:51Z systemd-run --user --scope -q -p MemoryMax=8G <mie> archive-import --config <replication archive config> --streams aggTrades --from 2022-01-01 --to 2022-12-31
+  2026-11-09T02:51:36Z systemd-run --user --scope -q -p MemoryMax=8G <mie> archive-import --config <replication archive config> --streams aggTrades --from 2023-01-01 --to 2023-12-31
+  2026-11-09T03:26:44Z systemd-run --user --scope -q -p MemoryMax=8G <mie> archive-import --config <replication archive config> --streams aggTrades --from 2024-01-01 --to 2024-09-30
+  2026-11-09T03:56:05Z systemd-run --user --scope -q -p MemoryMax=8G <mie> archive-verify --config <replication archive config> --from 2020-01-01 --to 2024-09-30
+  2026-11-09T04:32:15Z systemd-run --user --scope -q -p CPUQuota=400% -p MemoryMax=8G /usr/bin/time -v <mie> conditional build --config <replication archive config> --source archive --streams aggTrades --trade-correction fold --from 2020-01-01 --to 2024-09-30 --out <dataset>
+  2026-11-09T07:16:43Z <mie> conditional verify <dataset>
+  2026-11-09T07:16:46Z systemd-run --user --scope -q -p CPUQuota=400% -p MemoryMax=12G env MIE_OUTCOME_DATASET=<dataset> /usr/bin/time -v <test binary> --ignored --exact --nocapture coverage_p1_replication
+  2026-11-09T07:17:00Z systemd-run --user --scope -q -p CPUQuota=400% -p MemoryMax=12G env MIE_OUTCOME_DATASET=<dataset> /usr/bin/time -v <test binary> --ignored --exact --nocapture replication::coverage_p1_replication
+  ```

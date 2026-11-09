@@ -34,8 +34,16 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   exhaustive enumeration and against a free shuffle on clustered
   synthetic data, the guard, the coverage blindness (column lists and
   outcome-swapping datasets), the frozen hashes, and the ADR-058 report
-  byte for byte. The ADR-058 path is unchanged. Nothing was read on the
-  window.
+  byte for byte. The ADR-058 path is unchanged. The window was then
+  imported into its own store (1 735 of 1 735 files, `archive-verify`
+  PASS, 2 327 594 366 rows, 66.0 GB), built once from that commit
+  (content `e985ea3e…`, 2 638 166 records) and covered without reading an
+  outcome: 46 of 48 contexts are measurable, and P1-buy w=1h high and
+  extreme at 1d (354 and 288 units) are not.
+  `docs/research/205-p1-replication-coverage.md` holds the coverage
+  output, ADR-064's pre-registration record the command log, the tool the
+  dataset pins, and `docs/data-availability.md` the imported window. No
+  outcome of the window was read.
 - **Storage tiers, step 5: hot removal, recall and union part numbering
   in `mie ingest` (#191, ADR-062 D6, D11, proposed).** A tiered store's
   writer (`ParquetRawStore::tiered_writer`, with a `TierContext`: the
