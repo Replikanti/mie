@@ -553,7 +553,8 @@ two configs are the #12-year store's and the replication store's.
   test entry, no query, no DuckDB client and no measurement ran on the
   window.
 - **Command log**, every command run on the replication store or dataset,
-  and the probe:
+  and the probe. The last line is the coverage rerun of the amendment
+  below, with `<test binary>` rebuilt from `d9df826`:
 
   ```sh
   2026-11-09T00:21:29Z systemd-run --user --scope -q -p CPUQuota=400% -p MemoryMax=8G <mie> conditional build --config <#12-year archive config> --source archive --streams aggTrades,metrics --trade-correction fold --from 2025-10-01 --to 2025-10-01 --out <probe>
@@ -568,6 +569,7 @@ two configs are the #12-year store's and the replication store's.
   2026-11-09T07:16:43Z <mie> conditional verify <dataset>
   2026-11-09T07:16:46Z systemd-run --user --scope -q -p CPUQuota=400% -p MemoryMax=12G env MIE_OUTCOME_DATASET=<dataset> /usr/bin/time -v <test binary> --ignored --exact --nocapture coverage_p1_replication
   2026-11-09T07:17:00Z systemd-run --user --scope -q -p CPUQuota=400% -p MemoryMax=12G env MIE_OUTCOME_DATASET=<dataset> /usr/bin/time -v <test binary> --ignored --exact --nocapture replication::coverage_p1_replication
+  2026-11-09T09:04:39Z systemd-run --user --scope -q -p CPUQuota=400% -p MemoryMax=12G env MIE_OUTCOME_DATASET=<dataset> /usr/bin/time -v <test binary> --ignored --exact --nocapture replication::coverage_p1_replication
   ```
 
 ### Amendment after review, before any outcome was read
@@ -617,5 +619,15 @@ findings.
   | `205-p1-replication.sql` | `5d6d726da962d40d1d18b5295a13b366afa5ebea90fd1e7b49486022a2979014` | `5e742fed2fba222bb29f501de22bddb3c5d2a399186c495fd574118df7ec74c3` |
   | `replication.rs` frozen decisions | — (not hashed) | `cafdbb1b139beba96739b18d7aa9bf83f83bf2cb64eeb21bf7dbae023e52d852` |
 
-- **Coverage rerun.** Pending: the coverage reruns from the amended
-  commit, and its result and command are recorded here.
+- **Coverage rerun**, from a release test binary of a clean checkout of
+  `d9df826f21df86f4f38329ab4766fe11971b01ea`, the amended commit, under a
+  400 % CPU and 12 GB cap, on the same dataset (content `e985ea3e…`, built
+  from `72371e3`; the amendment changes no code the build runs). The
+  command is the last line of the command log. Wall time 0:42.29 (m:ss),
+  peak RSS 2.6 GB, 1 test ran, coverage twin mismatches 0. Against the
+  first run only the hash lines changed: the `205` queries `5e742fed…`,
+  the frozen text `6ed0f6af…` and the new `replication.rs frozen
+  decisions` line `cafdbb1b…`. Every count, and 46 of 48 measurable, is
+  identical, so the pins stay as they are.
+  [`docs/research/205-p1-replication-coverage.md`](../research/205-p1-replication-coverage.md)
+  now holds the rerun's output.

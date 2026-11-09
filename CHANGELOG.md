@@ -40,7 +40,8 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   imported into its own store (1 735 of 1 735 files, `archive-verify`
   PASS, 2 327 594 366 rows, 66.0 GB), built once from that commit
   (content `e985ea3e…`, 2 638 166 records) and covered without reading an
-  outcome: 46 of 48 contexts are measurable, and P1-buy w=1h high and
+  outcome, again after the review amendment with identical counts: 46 of
+  48 contexts are measurable, and P1-buy w=1h high and
   extreme at 1d (354 and 288 units) are not.
   `docs/research/205-p1-replication-coverage.md` holds the coverage
   output, ADR-064's pre-registration record the command log, the tool the

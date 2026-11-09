@@ -2,13 +2,20 @@
 
 - Issue: #205. Pre-registered by [ADR-064](../adr/064-p1-replication-pre-registration.md)
   (D5; the run and its inputs are in its *Pre-registration record*).
-- Run: 2026-11-09, `coverage_p1_replication`, which reads no outcome.
-- Code: `72371e363248db70b8a2b2d4445291859d7b311e`, the PR's first commit,
-  clean: the dataset's `code` line and the test binary's commit.
+- Run: 2026-11-09, `coverage_p1_replication`, which reads no outcome. This
+  is the rerun after the review amendment (ADR-064 *Pre-registration
+  record*); the first run, from `72371e3`, printed the same counts.
+- Code: the test binary is a release build of
+  `d9df826f21df86f4f38329ab4766fe11971b01ea`, the amended commit, clean.
+  The dataset was built from `72371e363248db70b8a2b2d4445291859d7b311e`,
+  the PR's first commit (its `code` line); the amendment changed no code
+  the build runs.
 - Queries: [`028-order-flow-interactions.sql`](028-order-flow-interactions.sql),
   SHA-256 `dd32d605081d6c80992655e16f453d143ee4e3ba5b17f4bbe399fcee0e7144a1`;
   [`205-p1-replication.sql`](205-p1-replication.sql), SHA-256
-  `5d6d726da962d40d1d18b5295a13b366afa5ebea90fd1e7b49486022a2979014`.
+  `5e742fed2fba222bb29f501de22bddb3c5d2a399186c495fd574118df7ec74c3`.
+- Frozen decisions of `replication.rs`: SHA-256
+  `cafdbb1b139beba96739b18d7aa9bf83f83bf2cb64eeb21bf7dbae023e52d852`.
 
 ## Dataset
 
@@ -37,7 +44,7 @@ ms), `aggTrades` only, built once from the replication's own archive store:
 
 ## Command
 
-From a release build of `72371e3` (`cargo test --release -p mie-cli --test
+From a release build of `d9df826` (`cargo test --release -p mie-cli --test
 order_flow_study --no-run`), under a 12 GB memory and 400 % CPU cap:
 
 ```sh
@@ -45,7 +52,7 @@ MIE_OUTCOME_DATASET=<dataset> <test binary> --ignored --exact --nocapture \
     replication::coverage_p1_replication
 ```
 
-Wall time 0:39.13 (m:ss), peak RSS 2.6 GB.
+Wall time 0:42.29 (m:ss), peak RSS 2.6 GB; 1 test ran.
 
 ## Summary
 
@@ -71,8 +78,9 @@ dataset content e985ea3e9efa9cc9aaf15dbc013fe76eb76711e811a4d3f414e79b591402049f
 source archive binance-archive/BTCUSDT streams aggTrades correction fold; replay (1577836800000, 1727740800000); records (1577836800000, 1727740800000)
 
 queries docs/research/028-order-flow-interactions.sql sha256 dd32d605081d6c80992655e16f453d143ee4e3ba5b17f4bbe399fcee0e7144a1
-queries docs/research/205-p1-replication.sql sha256 5d6d726da962d40d1d18b5295a13b366afa5ebea90fd1e7b49486022a2979014
-ADR-064 frozen text sha256 aeeadf25f10c3a8edb17a5f77c9b8ddb088dcef7c697e3a4fa2dd5aa513e3fe4
+queries docs/research/205-p1-replication.sql sha256 5e742fed2fba222bb29f501de22bddb3c5d2a399186c495fd574118df7ec74c3
+ADR-064 frozen text sha256 6ed0f6afb3688c99ebc501eb1530e0cd088122fa3e7a1e4a067bc08fd6dcafae
+replication.rs frozen decisions sha256 cafdbb1b139beba96739b18d7aa9bf83f83bf2cb64eeb21bf7dbae023e52d852
 
 pins: contexts 2638166, baseline 2498200, trigger 139966, effort rows 7914498; races that ran 4h 2634304, 1d 2613978
 
