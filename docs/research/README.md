@@ -37,4 +37,4 @@ is rebuilt from versioned raw data (ADR-057 D3).
 | Study | Issue | Pre-registered by | Queries | Report |
 |---|---|---|---|---|
 | Order-flow interactions and counter-hypotheses | #28 | ADR-058 | [`028-order-flow-interactions.sql`](028-order-flow-interactions.sql) | [`028-order-flow-interactions.md`](028-order-flow-interactions.md) |
-| P1 replication on 2020-01 … 2024-09 | #205, #206 | ADR-064 | [`205-p1-replication.sql`](205-p1-replication.sql) (after `028-order-flow-interactions.sql`) | coverage: [`205-p1-replication-coverage.md`](205-p1-replication-coverage.md) (#205, dataset content `e985ea3e…`); report: #206 |
+| P1 replication on 2020-01 … 2024-09 | #205, #206 | ADR-064 | [`205-p1-replication.sql`](205-p1-replication.sql) (after `028-order-flow-interactions.sql`) | coverage: [`205-p1-replication-coverage.md`](205-p1-replication-coverage.md) (#205, dataset content `e985ea3e…`); report: [`205-p1-replication.md`](205-p1-replication.md) (#206, dataset content `e985ea3e…`) |
