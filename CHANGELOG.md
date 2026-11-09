@@ -18,22 +18,24 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   2020-01-01 … 2024-09-30 from `aggTrades` only, 48 contexts (side ×
   effort window × regime × 4h and 1d), E exactly as ADR-058 D4, a
   per-label taker fee, T1 on ADR-058 D6 units (n_min 385), T2 on the
-  units' representatives with a 56-day block bootstrap (28 and 112 days
-  for sensitivity, seed 205), T3 as a rotation null by whole weeks within
+  units' representatives, a `neither` exit marked to market at H, with a
+  56-day block bootstrap (28 and 112 days for sensitivity, seed 205), T3 as a rotation null by whole weeks within
   8-week blocks (4 weeks for sensitivity, 10⁶ draws, two-sided),
   Benjamini–Hochberg over all 48 at q = 0.05, the readings and stop
-  rules, and a freeze of its own text. `docs/research/205-p1-replication.sql`
+  rules, and a freeze of its own text, the queries and the tool's
+  decision code (one hashed region, printed by both entries; #206 runs
+  from #207's merge commit exactly). `docs/research/205-p1-replication.sql`
   holds a coverage chain that restates P1 without the outcome-carrying
   views and a measurement chain; `crates/mie-cli/tests/order_flow_study/replication.rs`
   holds the ignored entries `coverage_p1_replication` (reads no outcome:
   its input types have no outcome field, and a twin recounts its units)
-  and `measure_p1_replication` (refuses to run until the dataset is
-  pinned), both behind a window and provenance guard that refuses the
+  and `measure_p1_replication` (runs only on the pinned dataset), both behind a window and provenance guard that refuses the
   calibration slice, another stream set or engine, and a dirty build. The
   fixture tests pin BH on the 1995 example, the rotation null by
   exhaustive enumeration and against a free shuffle on clustered
   synthetic data, the guard, the coverage blindness (column lists and
-  outcome-swapping datasets), the frozen hashes, and the ADR-058 report
+  outcome-swapping datasets), the frozen hashes and that a changed
+  decision moves the code hash, the mark to market, and the ADR-058 report
   byte for byte. The ADR-058 path is unchanged. The window was then
   imported into its own store (1 735 of 1 735 files, `archive-verify`
   PASS, 2 327 594 366 rows, 66.0 GB), built once from that commit

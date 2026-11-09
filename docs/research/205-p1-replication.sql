@@ -15,9 +15,9 @@
 --   from `study_members` or `study_baseline`, which carry outcomes.
 --   `rep_ran` is the only place it touches `race`, and only as whether the
 --   race ran: no direction, and no `neither` against a barrier.
--- - **Measurement** (`rep_members`, `rep_baseline`) adds the mapped outcomes
---   and the races at 4h and 1d to the coverage rows. Only the measurement
---   entry, after its guard, reads it.
+-- - **Measurement** (`rep_marks`, `rep_members`, `rep_baseline`) adds the
+--   mapped outcomes, the races and T2's marks to market at 4h and 1d to the
+--   coverage rows. Only the measurement entry, after its guard, reads it.
 --
 -- Every view ends with ORDER BY its key columns, and every aggregate is
 -- order-independent (bool_or and max over one value per record), so the
@@ -111,19 +111,42 @@ WHERE r.sample = 'baseline'
 GROUP BY e.effort_window, e.window_order
 ORDER BY e.window_order;
 
+-- Measurement only: per record, the mark to market at 4h and 1d,
+-- (last - reference) / (upper - reference): the window's last trade in
+-- half-widths toward the upper barrier, which T2 scores a `neither` exit
+-- by (ADR-064 D3). NULL without barriers or without a last trade.
+CREATE OR REPLACE VIEW rep_marks AS
+SELECT
+    o.record,
+    max(CAST(mie_units(o.last) - mie_units(c.reference) AS DOUBLE)
+        / CAST(mie_units(o.upper) - mie_units(c.reference) AS DOUBLE))
+        FILTER (WHERE o.horizon = '4h') AS mark_4h,
+    max(CAST(mie_units(o.last) - mie_units(c.reference) AS DOUBLE)
+        / CAST(mie_units(o.upper) - mie_units(c.reference) AS DOUBLE))
+        FILTER (WHERE o.horizon = '1d') AS mark_1d
+FROM outcomes o
+JOIN contexts c USING (record)
+WHERE o.horizon IN ('4h', '1d')
+GROUP BY o.record
+ORDER BY o.record;
+
 -- Measurement only: the coverage rows with the aggressor, the hypothesis
--- barrier and the mapped outcomes of `study_members` at 4h and 1d.
+-- barrier, the mapped outcomes of `study_members` and the marks at 4h and
+-- 1d.
 CREATE OR REPLACE VIEW rep_members AS
 SELECT
     c.*,
     m.side,
     m.hypothesis,
     m.out_4h,
-    m.out_1d
+    m.out_1d,
+    k.mark_4h,
+    k.mark_1d
 FROM rep_coverage_members c
 JOIN study_members m
     ON m.pair = c.pair AND m.effort_window = c.effort_window
    AND m.record = c.record
+JOIN rep_marks k ON k.record = c.record
 ORDER BY c.pair, list_position(['5m', '15m', '1h'], c.effort_window), c.record;
 
 -- Measurement only: the baseline rows with their races at 4h and 1d.

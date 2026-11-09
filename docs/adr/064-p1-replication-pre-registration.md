@@ -154,9 +154,29 @@ drawdown 30 R, minimum frequency 2 per week for A and 1 per week for B.
   week × location-bin set), the baseline restricted to the context's
   regime, over every member whose race ran; a member whose stratum holds
   no baseline race of that regime is dropped and counted.
-- **The net outcome of a member at H** is s·x − f:
-  - x is +1 / −1 / 0 for hypothesis / counter / neither (ADR-058 D4; the
-    barriers are symmetric, ADR-056 D4′, so x is the gross outcome in R);
+- **The race outcome x** of a member at H is +1 / −1 / 0 for hypothesis
+  / counter / neither, ADR-058 D4's. E and T3 use x unchanged, so E stays
+  comparable with #28.
+- **The net outcome of a trade held to H**, which T2 and the information
+  figures of D4 use, is s·g − f:
+  - g is the gross outcome in R toward the hypothesis barrier. It is +1 /
+    −1 when the hypothesis / counter barrier came first: the barriers are
+    symmetric (ADR-056 D4′), so a barrier hit is ±1 R.
+  - For `neither`, g is the mark to market at H, σ·m. Here m = (last −
+    reference) / (upper − reference) is the window's last trade
+    (`outcomes.last` at H) in half-widths toward the upper barrier, and σ
+    is +1 for an upper hypothesis (P1-sell) and −1 for a lower one
+    (P1-buy). A `neither` without a last trade is marked at the reference
+    (m = 0).
+  - *Why the mark and not x = 0:* a trade held to H without a barrier hit
+    closes at H at the last price, so its result is the price move, not
+    0 R. Scoring it 0 would make T2 blind to drift between the barriers: a
+    context whose `neither` exits drift against s could pass T2 although
+    its real expectancy per trade is at or below 0, and the reverse. T2 in
+    `docs/direction.md` asks for the net expectancy of trades. ADR-058 D4's
+    x is a race statistic, kept for E, where #28 defined it. (The #207
+    review found the gap; amended before any outcome was read, see the
+    record.)
   - f = 10 bps ÷ the member's own barrier half-width in bps,
     (upper − reference) / reference at H. The fee is per label, not the
     median of #28;
@@ -266,6 +286,8 @@ drawdown 30 R, minimum frequency 2 per week for A and 1 per week for B.
   lower, neither}.
   - `ran` is the input ADR-058 D6's gate already reads. It carries no
     direction and no neither against a barrier.
+  - The marks of D3 (`rep_marks`) are outcomes and belong to the
+    measurement chain only.
   - The coverage chain (`rep_ran`, `rep_coverage_*`) restates the P1
     condition from `study_records` and `study_effort`, and never selects
     from `study_members` or `study_baseline`, which carry outcomes.
@@ -285,6 +307,24 @@ drawdown 30 R, minimum frequency 2 per week for A and 1 per week for B.
   record` is frozen at the commit that adds this ADR. A test pins its
   SHA-256 and the SHA-256 of both query files, and the measurement checks
   the same hashes before it reads.
+- **Frozen code.** The decision region of
+  `crates/mie-cli/tests/order_flow_study/replication.rs`, between the
+  markers `ADR-064 frozen decisions: begin` and `: end`, holds every
+  constant and function that decides the replication. That covers the
+  window and provenance, the grid, the fee, T2 with its marks, T3, BH, the
+  reading, and the measurement that applies them with their settings. The
+  same test pins the region's SHA-256 next to the texts' hashes. Both
+  entries print it, and the measurement refuses to run when it differs.
+  *Why:* hashing the texts alone left the numbers that decide the
+  replication (q, the draws, the block lengths) editable after merge
+  without any check failing (the #207 review). A region hash makes a
+  change to any of them visible, in the tests and in the printed
+  identity.
+- **The run's commit.** #206 runs `measure_p1_replication` from the merge
+  commit of #207 exactly, not from a later main. Its report shows the
+  printed `replication.rs frozen decisions` SHA-256 equal to the pinned
+  one. *Why:* the run also depends on code outside the region (the ADR-058
+  path, the loaders, the twin), which only an exact commit freezes.
 - **Changes after coverage** are allowed only to fix a review defect.
   Each is listed in the pre-registration record with its reason, and the
   coverage reruns if a count changes.
@@ -392,17 +432,26 @@ There is no other number.
 - **Bonferroni over 48.** BH controls the false discovery rate the owner
   set; Bonferroni controls the family-wise rate, which the owner did not
   ask for, at a large cost in power. Rejected.
+- **T2 with `neither` at 0 R** (ADR-058 D4's x). It ignores the price
+  move of a trade that ends between the barriers (D3). Rejected for T2;
+  kept for E.
+- **Freezing only the texts, with #206 run from any later main.** The
+  numbers in the code could change without a failing check (D6).
+  Rejected.
 - **Waiting for the Research Lab's T3 (#32).** It would block this
   replication behind #30. `docs/direction.md` rule 6 makes that document
   the spec until the Lab exists. Rejected; #32 adopts or replaces this.
 
 ## Accept when
 
-#206, from main at or after the merge commit of this ADR's PR:
+#206, from the merge commit of this ADR's PR (#207) exactly:
 
 - `measure_p1_replication` passes the guard of D1, including the pins of
   the pre-registration record, the frozen hashes, the record-set check
   and 0 twin mismatches;
+- the report shows the commit it ran from, equal to that merge commit, and
+  the printed `replication.rs frozen decisions` SHA-256, equal to the
+  pinned one;
 - `docs/research/205-p1-replication.md` records the dataset, the queries'
   hashes, the commands, the inputs and every table the measurement
   prints, `not measurable` contexts and null results included.
@@ -484,18 +533,19 @@ two configs are the #12-year store's and the replication store's.
   `e985ea3e…`, contexts 2 638 166, baseline 2 498 200, trigger 139 966,
   effort rows 7 914 498 (3 per context), races that ran 2 634 304 at 4h
   and 2 613 978 at 1d.
-- **Frozen SHA-256**, as the coverage printed them and as the test pins
-  them: `028-order-flow-interactions.sql`
+- **Frozen SHA-256 at the first coverage** (from `72371e3`), as it
+  printed them; the amendment below replaces the ADR's and the `205`
+  queries': `028-order-flow-interactions.sql`
   `dd32d605081d6c80992655e16f453d143ee4e3ba5b17f4bbe399fcee0e7144a1`,
   `205-p1-replication.sql`
   `5d6d726da962d40d1d18b5295a13b366afa5ebea90fd1e7b49486022a2979014`,
   this ADR's frozen text
   `aeeadf25f10c3a8edb17a5f77c9b8ddb088dcef7c697e3a4fa2dd5aa513e3fe4`.
-- **Changes after coverage.** None to the frozen text or the queries. The
-  second commit sets the pins, updates the tool's comments, its ignore
-  reason and the documented test filter, adds a test that the pins equal
-  the coverage report's, and adds the documents. No count changed, so the
-  coverage was not rerun.
+- **Changes after the first coverage.** The second commit set the pins,
+  updated the tool's comments, its ignore reason and the documented test
+  filter, added a test that the pins equal the coverage report's, and
+  added the documents; it changed no frozen text and no count. The
+  amendment below changes the frozen text, the queries and the code.
 - **Deviations.** The first coverage invocation passed the filter
   `--exact coverage_p1_replication`, which matches no test (the entry's
   path is `replication::coverage_p1_replication`), so it ran nothing and
@@ -519,3 +569,53 @@ two configs are the #12-year store's and the replication store's.
   2026-11-09T07:16:46Z systemd-run --user --scope -q -p CPUQuota=400% -p MemoryMax=12G env MIE_OUTCOME_DATASET=<dataset> /usr/bin/time -v <test binary> --ignored --exact --nocapture coverage_p1_replication
   2026-11-09T07:17:00Z systemd-run --user --scope -q -p CPUQuota=400% -p MemoryMax=12G env MIE_OUTCOME_DATASET=<dataset> /usr/bin/time -v <test binary> --ignored --exact --nocapture replication::coverage_p1_replication
   ```
+
+### Amendment after review, before any outcome was read
+
+Made 2026-11-09 on #207, after the [review](https://github.com/Replikanti/mie/pull/207#issuecomment-6735263891)
+and the [QA report](https://github.com/Replikanti/mie/pull/207#issuecomment-6735947246),
+**before any outcome of the window was read**: the only program that has
+run on the replication dataset is the outcome-blind coverage. D6 allows a
+change after the coverage to fix a review defect; these are the two review
+findings.
+
+- **Finding 1, the freeze did not cover the code.** The review set q to
+  0.20, the draws to 1 000, the null blocks to 2 and 4 weeks and the T2
+  block to 7 days, and every test stayed green: only the texts were
+  hashed, and #206 could run from any later main.
+  - D6 gains *Frozen code*: one marked decision region of
+    `replication.rs` holds every constant and function that decides the
+    replication, its SHA-256 is pinned by the same test as the texts', both
+    entries print it, and the measurement refuses a different one. D6
+    gains *The run's commit*: #206 runs from the merge commit of #207
+    exactly.
+  - *Accept when* requires that commit and the printed region hash.
+  - The decision items moved into the region unchanged, apart from
+    finding 2. A test asserts the D3 numbers and that each of the review's
+    mutations, and changes to BH, the reading, the p-value and the mark,
+    move the region's hash; applied to the file, each of the four review
+    mutations fails `the_frozen_texts_equal_their_pins`.
+- **Finding 2, T2 scored a `neither` exit at 0 R.** A trade held to H
+  without a barrier hit closes at the last price.
+  - D3 splits the race outcome x (ADR-058 D4's, for E and T3, unchanged)
+    from T2's net outcome, whose gross for `neither` is the mark to market
+    σ·m at H, with the reason. D5 notes that the marks are measurement
+    data.
+  - The queries gain `rep_marks` ((last − reference) / (upper −
+    reference) at 4h and 1d), and `rep_members` carries `mark_4h` and
+    `mark_1d`. The coverage chain is unchanged.
+  - Fixture tests: a `neither` exit drifting with the hypothesis, against
+    it and at the reference, for both sides and both directions s, and the
+    marks read back from each label's last trade.
+- *Alternatives considered* gains the two rejected options.
+- **Hashes.** The `028` queries are unchanged
+  (`dd32d605081d6c80992655e16f453d143ee4e3ba5b17f4bbe399fcee0e7144a1`).
+
+  | Text | Before | After |
+  |---|---|---|
+  | ADR-064 frozen text | `aeeadf25f10c3a8edb17a5f77c9b8ddb088dcef7c697e3a4fa2dd5aa513e3fe4` | `6ed0f6afb3688c99ebc501eb1530e0cd088122fa3e7a1e4a067bc08fd6dcafae` |
+  | `205-p1-replication.sql` | `5d6d726da962d40d1d18b5295a13b366afa5ebea90fd1e7b49486022a2979014` | `5e742fed2fba222bb29f501de22bddb3c5d2a399186c495fd574118df7ec74c3` |
+  | `replication.rs` frozen decisions | — (not hashed) | `cafdbb1b139beba96739b18d7aa9bf83f83bf2cb64eeb21bf7dbae023e52d852` |
+
+- **Coverage rerun.** Pending: the coverage reruns from the amended
+  commit, and its result and command are recorded here.

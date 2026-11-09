@@ -17,6 +17,10 @@
 //! - a coverage path whose input types carry no outcome, so the compiler
 //!   keeps it blind (D5), with its own twin.
 //!
+//! Every constant and function that decides the replication lives in one
+//! region between the `ADR-064 frozen decisions` markers, whose SHA-256 is
+//! pinned next to the texts' and printed by both entries (D6).
+//!
 //! The queries are `docs/research/205-p1-replication.sql`, run after the
 //! ADR-058 file. The two ignored entries:
 //!
@@ -36,14 +40,15 @@ use mie_adapter_parquet::outcome::OutcomeManifest;
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
 
-// ---------------------------------------------------------------------------
-// What ADR-064 fixes.
+// ===========================================================================
+// ADR-064 frozen decisions: begin
+//
+// Every constant and function that decides the replication (D1 guard, D2
+// grid, D3 statistics, D4 reading). `the_frozen_texts_equal_their_pins`
+// pins the SHA-256 of the text from this marker to the end marker
+// (D6), and both entries print it.
 
-/// The replication queries (ADR-064 D5, *Changes*).
-const REPLICATION_SQL: &str = include_str!("../../../../docs/research/205-p1-replication.sql");
-
-/// The pre-registration (ADR-064 D6 freezes its text up to the record).
-const ADR_064: &str = include_str!("../../../../docs/adr/064-p1-replication-pre-registration.md");
+// --- D1: the window and the provenance.
 
 /// D1: records = replay = 2020-01-01 … 2024-09-30, `[start, end)` in ms.
 const REPLICATION_RECORDS: (i64, i64) = (1_577_836_800_000, 1_727_740_800_000);
@@ -68,28 +73,29 @@ const REPLICATION_PROVENANCE: [&str; 5] = [
     "6f90bff079e746f2",
 ];
 
-/// D6: SHA-256 of `028-order-flow-interactions.sql` (ADR-058 *Acceptance*),
-/// of `205-p1-replication.sql`, and of ADR-064's frozen text.
-const STUDY_SQL_SHA256: &str = "dd32d605081d6c80992655e16f453d143ee4e3ba5b17f4bbe399fcee0e7144a1";
-const REPLICATION_SQL_SHA256: &str =
-    "5d6d726da962d40d1d18b5295a13b366afa5ebea90fd1e7b49486022a2979014";
-const ADR_FROZEN_SHA256: &str = "aeeadf25f10c3a8edb17a5f77c9b8ddb088dcef7c697e3a4fa2dd5aa513e3fe4";
+// --- The inputs and the D3 settings.
 
 /// The `docs/direction.md` inputs the ADR names: c, μ in R, the taker
 /// round trip in bps, and the false discovery rate (addendum 2026-11-08).
 const CONFIDENCE: f64 = 0.95;
+
 const MU: f64 = 0.10;
+
 const FEE_BPS: f64 = 10.0;
+
 const FDR: f64 = 0.05;
 
 /// D3 T2: resamples, the primary block and the two sensitivity blocks in
 /// days, and the seed.
 const T2_RESAMPLES: usize = 10_000;
+
 const T2_BLOCKS: [usize; 3] = [56, 28, 112];
+
 const REPLICATION_SEED: u64 = 205;
 
 /// D3 T3: draws, and the primary and sensitivity block lengths in weeks.
 const T3_DRAWS: usize = 1_000_000;
+
 const NULL_WEEKS: [i64; 2] = [8, 4];
 
 const WEEK_MS: i64 = 7 * DAY_MS;
@@ -103,35 +109,7 @@ const P1_PAIRS: [&str; 2] = ["P1-buy", "P1-sell"];
 /// The regime index of `not_ready` in [`REGIMES`]: in no context.
 const NOT_READY: usize = 4;
 
-/// The measurement pins (D1), set by commit 2 of #205 from the coverage
-/// run: data version, content hash, contexts / baseline / trigger records,
-/// and the races that ran at 4h and 1d.
-#[derive(Clone, Copy, Debug)]
-struct Pins {
-    data: Option<&'static str>,
-    content: Option<&'static str>,
-    contexts: Option<(u64, u64, u64)>,
-    ran: Option<[u64; 2]>,
-}
-
-const UNPINNED: Pins = Pins {
-    data: None,
-    content: None,
-    contexts: None,
-    ran: None,
-};
-
-/// The replication dataset of #205's coverage run (ADR-064
-/// *Pre-registration record*, `docs/research/205-p1-replication-coverage.md`).
-const REPLICATION_PINS: Pins = Pins {
-    data: Some("7e92345c663e72e096cbdf2921f60eaa8d9cbae291cd2f1f82bdd64306d27d10"),
-    content: Some("e985ea3e9efa9cc9aaf15dbc013fe76eb76711e811a4d3f414e79b591402049f"),
-    contexts: Some((2_638_166, 2_498_200, 139_966)),
-    ran: Some([2_634_304, 2_613_978]),
-};
-
-// ---------------------------------------------------------------------------
-// The guard (D1).
+// --- D1: the guard.
 
 /// Whether `code` is a clean `git:` line: 40 lowercase hex, no `-dirty`.
 fn clean_code(code: &str) -> bool {
@@ -184,91 +162,7 @@ fn guard(manifest: &OutcomeManifest) -> Result<(), String> {
     Ok(())
 }
 
-/// Verifies `dir`, applies the guard and opens the views; prints nothing.
-fn open_guarded(dir: &Path) -> Result<(OutcomeManifest, OutcomeViews), String> {
-    let mut text = Vec::new();
-    if !conditional::verify(dir, &mut text)? {
-        return Err(format!(
-            "verify failed: {}",
-            String::from_utf8_lossy(&text).trim_end()
-        ));
-    }
-    let manifest = OutcomeDataset::open(dir)
-        .map_err(|e| e.to_string())?
-        .manifest()
-        .clone();
-    guard(&manifest)?;
-    let views = OutcomeViews::open(dir).map_err(|e| e.to_string())?;
-    Ok((manifest, views))
-}
-
-/// The study views, then the replication views, without exclusions.
-fn create_replication(views: &OutcomeViews) -> Result<(), String> {
-    create_study(views, &[]);
-    views
-        .create_views(REPLICATION_SQL)
-        .map_err(|e| e.to_string())
-}
-
-fn sha256(text: &str) -> String {
-    Sha256::digest(text.as_bytes())
-        .iter()
-        .fold(String::new(), |mut s, b| {
-            let _ = write!(s, "{b:02x}");
-            s
-        })
-}
-
-/// D6: the frozen text, from `## Context` to the record.
-fn frozen(adr: &str) -> &str {
-    let start = adr.find("\n## Context\n").expect("a Context section") + 1;
-    let end = adr
-        .find("\n## Pre-registration record\n")
-        .expect("a Pre-registration record section")
-        + 1;
-    &adr[start..end]
-}
-
-/// The dataset counts the pins hold: contexts, baseline, trigger, effort
-/// rows, and the races that ran at 4h and 1d. Reads no outcome.
-fn dataset_counts(views: &OutcomeViews) -> ((u64, u64, u64), u64, [u64; 2]) {
-    let mut contexts = (0, 0, 0);
-    each_row(
-        &tsv_lines(
-            views,
-            "SELECT count(*) AS contexts, count(*) FILTER (WHERE sample = 'baseline') AS baseline, \
-             count(*) FILTER (WHERE sample = 'trigger') AS trigger FROM contexts",
-        ),
-        |get| {
-            contexts = (
-                get("contexts").parse().unwrap(),
-                get("baseline").parse().unwrap(),
-                get("trigger").parse().unwrap(),
-            );
-        },
-    );
-    let effort = tsv_lines(views, "SELECT count(*) AS rows FROM effort")[1]
-        .parse()
-        .unwrap();
-    let mut ran = [0, 0];
-    each_row(
-        &tsv_lines(
-            views,
-            "SELECT count(*) FILTER (WHERE ran AND horizon = '4h') AS ran_4h, \
-             count(*) FILTER (WHERE ran AND horizon = '1d') AS ran_1d FROM rep_ran",
-        ),
-        |get| {
-            ran = [
-                get("ran_4h").parse().unwrap(),
-                get("ran_1d").parse().unwrap(),
-            ]
-        },
-    );
-    (contexts, effort, ran)
-}
-
-// ---------------------------------------------------------------------------
-// The grid (D2).
+// --- D2: the grid.
 
 /// One of the 48 contexts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -332,6 +226,829 @@ fn contexts() -> Vec<Context> {
         }
     }
     all
+}
+
+// --- D3: T2, the fee and the information figures.
+
+/// ADR-058 D6 stage 2 as [`unit_count`], returning the counted
+/// representatives' indices into `members` instead of their count.
+fn representatives(members: &[(i64, u64, bool)], horizon_ms: i64) -> Vec<usize> {
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    let mut last: Option<i64> = None;
+    for (i, &(decision, episode, ran)) in members.iter().enumerate() {
+        if !ran || !seen.insert(episode) {
+            continue;
+        }
+        if last.is_none_or(|last| decision >= last + horizon_ms) {
+            out.push(i);
+            last = Some(decision);
+        }
+    }
+    out
+}
+
+/// The weeks of a records window.
+fn weeks_of(window: (i64, i64)) -> f64 {
+    (window.1 - window.0) as f64 / WEEK_MS as f64
+}
+
+fn units_per_week(units: u64, weeks: f64) -> f64 {
+    units as f64 / weeks
+}
+
+/// The per-label fee in R: the round trip in bps over the label's own
+/// barrier half-width in bps.
+fn label_fee(fee_bps: f64, half_bps: f64) -> f64 {
+    fee_bps / half_bps
+}
+
+/// s = sign(E); none when E is 0 or undefined.
+fn direction(effect: Option<f64>) -> Option<f64> {
+    match effect {
+        Some(e) if e > 0.0 => Some(1.0),
+        Some(e) if e < 0.0 => Some(-1.0),
+        _ => None,
+    }
+}
+
+/// T2's net outcome of a trade held to H in direction s: s·g − f, where
+/// the gross g in R toward the hypothesis barrier is +1 / −1 when the
+/// hypothesis / counter barrier came first (the barriers are symmetric,
+/// ADR-056 D4′), and for `neither` the mark to market at H, σ·m, with
+/// m = (last − reference) / (upper − reference) the window's last trade in
+/// half-widths toward the upper barrier and σ = +1 for an upper hypothesis,
+/// −1 for a lower one. A `neither` without a last trade is marked at the
+/// reference (m = 0). E and T3 keep ADR-058 D4's 0 for `neither`.
+fn net_outcome(outcome: Outcome, s: f64, sigma: f64, mark: Option<f64>, fee: f64) -> f64 {
+    let gross = match outcome {
+        Outcome::Hypothesis => 1.0,
+        Outcome::Counter => -1.0,
+        Outcome::Neither => sigma * mark.unwrap_or(0.0),
+        other => panic!("a unit's race ran, not {other:?}"),
+    };
+    s * gross - fee
+}
+
+/// The units' net outcomes per day: `(day, Σ net, count)`, by day.
+fn net_days(nets: &[(usize, f64)]) -> Vec<(usize, f64, i64)> {
+    let mut map: BTreeMap<usize, (f64, i64)> = BTreeMap::new();
+    for &(day, net) in nets {
+        let entry = map.entry(day).or_default();
+        entry.0 += net;
+        entry.1 += 1;
+    }
+    map.into_iter().map(|(d, (s, n))| (d, s, n)).collect()
+}
+
+/// T2's net expectancy under every resample's day weights; `None` when a
+/// resample draws no unit.
+fn t2_values(days: &[(usize, f64, i64)], weights: &[Vec<u32>]) -> Vec<Option<f64>> {
+    weights
+        .iter()
+        .map(|w| {
+            let (mut sum, mut n) = (0.0, 0i64);
+            for &(day, s, count) in days {
+                let k = w[day];
+                if k > 0 {
+                    sum += f64::from(k) * s;
+                    n += i64::from(k) * count;
+                }
+            }
+            (n > 0).then(|| sum / n as f64)
+        })
+        .collect()
+}
+
+/// The maximum drawdown of the cumulative sum of `nets`, from 0.
+fn max_drawdown(nets: &[f64]) -> f64 {
+    let (mut cum, mut peak, mut drawdown) = (0.0f64, 0.0f64, 0.0f64);
+    for x in nets {
+        cum += x;
+        peak = peak.max(cum);
+        drawdown = drawdown.max(peak - cum);
+    }
+    drawdown
+}
+
+/// Net R per year at `units_per_week` units a week (the addendum's
+/// arithmetic: μ × 2 a week × 52 = 10.4 R).
+fn net_r_per_year(expectancy: f64, units_per_week: f64) -> f64 {
+    expectancy * units_per_week * 52.0
+}
+
+// --- D3: Benjamini–Hochberg.
+
+/// Benjamini–Hochberg at level `q` over `M` p-values: reject the k
+/// smallest, k the largest rank with p₍ₖ₎ ≤ k·q/M. Ties keep the input
+/// order (the context order), which does not change the decisions.
+fn bh<const M: usize>(p: &[f64; M], q: f64) -> [bool; M] {
+    let mut order: [usize; M] = std::array::from_fn(|i| i);
+    order.sort_by(|&a, &b| p[a].total_cmp(&p[b]));
+    let mut k = 0;
+    for (rank, &i) in order.iter().enumerate() {
+        if p[i] <= (rank + 1) as f64 * q / M as f64 {
+            k = rank + 1;
+        }
+    }
+    let mut out = [false; M];
+    for &i in &order[..k] {
+        out[i] = true;
+    }
+    out
+}
+
+// --- D3: T3, the rotation null within blocks of whole weeks.
+
+/// The race of a baseline record when it did not run.
+const NOT_RAN: i8 = i8::MIN;
+
+/// The baseline as the null reads it, in minute order.
+#[derive(Clone, Debug, Default)]
+struct NullFrame {
+    /// Strictly increasing: one baseline record per closed minute.
+    minute_end: Vec<i64>,
+    /// Index into [`REGIMES`].
+    regime: Vec<u8>,
+    stratum: Vec<u16>,
+    /// Per replication horizon: +1 upper, −1 lower, 0 neither, or
+    /// [`NOT_RAN`].
+    race: [Vec<i8>; 2],
+}
+
+impl NullFrame {
+    /// The stratum tilts (n_upper − n_lower) / n per horizon, regime label
+    /// and stratum among the frame's races that ran; `None` when none ran.
+    fn tilts(&self) -> Vec<Option<f64>> {
+        let mut counts = vec![(0i64, 0i64); REP_HORIZONS.len() * REGIME_SPLITS.len() * STRATA];
+        for j in 0..self.minute_end.len() {
+            let r = usize::from(self.regime[j]);
+            if r == NOT_READY {
+                continue;
+            }
+            for h in 0..REP_HORIZONS.len() {
+                let d = self.race[h][j];
+                if d != NOT_RAN {
+                    let c = &mut counts[strata_index(h, r, usize::from(self.stratum[j]))];
+                    c.0 += i64::from(d);
+                    c.1 += 1;
+                }
+            }
+        }
+        counts
+            .into_iter()
+            .map(|(diff, n)| (n > 0).then(|| diff as f64 / n as f64))
+            .collect()
+    }
+
+    fn find(&self, minute_end: i64) -> Option<usize> {
+        self.minute_end.binary_search(&minute_end).ok()
+    }
+}
+
+/// The block layout: whole weeks from `origin`, cut into blocks of `weeks`
+/// weeks, the last one shorter; the days after the last whole week never
+/// rotate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Layout {
+    origin: i64,
+    whole_weeks: i64,
+    weeks: i64,
+}
+
+impl Layout {
+    fn new(window: (i64, i64), weeks: i64) -> Self {
+        Self {
+            origin: window.0,
+            whole_weeks: (window.1 - window.0).div_euclid(WEEK_MS),
+            weeks,
+        }
+    }
+
+    /// The rotating blocks' lengths in weeks.
+    fn lengths(&self) -> Vec<i64> {
+        let mut lengths = vec![self.weeks; (self.whole_weeks / self.weeks) as usize];
+        if self.whole_weeks % self.weeks > 0 {
+            lengths.push(self.whole_weeks % self.weeks);
+        }
+        lengths
+    }
+
+    /// The rotating block of `t` with its start and length in weeks;
+    /// `None` outside the whole weeks (the fixed tail).
+    fn block(&self, t: i64) -> Option<(usize, i64, i64)> {
+        let offset = t - self.origin;
+        if offset < 0 || offset >= self.whole_weeks * WEEK_MS {
+            return None;
+        }
+        let b = offset / (self.weeks * WEEK_MS);
+        let start = self.origin + b * self.weeks * WEEK_MS;
+        Some((
+            b as usize,
+            start,
+            self.weeks.min(self.whole_weeks - b * self.weeks),
+        ))
+    }
+
+    /// `t` rotated by `k` whole weeks, circular within its block.
+    fn rotate(&self, t: i64, k: i64) -> i64 {
+        match self.block(t) {
+            None => t,
+            Some((_, start, length)) => {
+                start + (t - start + k * WEEK_MS).rem_euclid(length * WEEK_MS)
+            }
+        }
+    }
+}
+
+/// Per block and rotation: Σ y and the count of the eligible
+/// pseudo-members. The last block is the fixed tail (identity only).
+#[derive(Clone, Debug, PartialEq)]
+struct RotationTable {
+    blocks: Vec<Vec<(f64, i64)>>,
+}
+
+impl RotationTable {
+    fn at(&self, rotations: &[usize]) -> (f64, i64) {
+        let (mut sum, mut n) = (0.0, 0);
+        for (block, &k) in self.blocks.iter().zip(rotations) {
+            let (s, c) = block[k];
+            sum += s;
+            n += c;
+        }
+        (sum, n)
+    }
+
+    /// The observed E (every block at the identity).
+    fn observed(&self) -> Option<f64> {
+        let (sum, n) = self.at(&vec![0; self.blocks.len()]);
+        (n > 0).then(|| sum / n as f64)
+    }
+}
+
+/// The rotation table of one context: each member label at minute `t`
+/// moved to `rotate(t, k)` for every k of its block; a pseudo-member is
+/// the baseline record there when it is eligible (the context's regime,
+/// the race at H ran, a stratum holding a baseline race), and adds
+/// y = σ·(d − tilt(stratum)) with the observed tilts.
+fn rotation_table(
+    frame: &NullFrame,
+    tilts: &[Option<f64>],
+    layout: &Layout,
+    labels: &[i64],
+    regime: usize,
+    h: usize,
+    sigma: f64,
+) -> RotationTable {
+    let lengths = layout.lengths();
+    let mut blocks: Vec<Vec<(f64, i64)>> = lengths
+        .iter()
+        .map(|&l| vec![(0.0, 0); l as usize])
+        .collect();
+    blocks.push(vec![(0.0, 0)]);
+    let tail = lengths.len();
+    for &t in labels {
+        let (b, length) = layout
+            .block(t)
+            .map_or((tail, 1), |(b, _, length)| (b, length));
+        for k in 0..length {
+            let Some(j) = frame.find(layout.rotate(t, k)) else {
+                continue;
+            };
+            let d = frame.race[h][j];
+            if usize::from(frame.regime[j]) != regime || d == NOT_RAN {
+                continue;
+            }
+            let Some(tilt) = tilts[strata_index(h, regime, usize::from(frame.stratum[j]))] else {
+                continue;
+            };
+            let cell = &mut blocks[b][k as usize];
+            cell.0 += sigma * (f64::from(d) - tilt);
+            cell.1 += 1;
+        }
+    }
+    RotationTable { blocks }
+}
+
+/// The seed of draw `draw`'s own stream: the draw-th output of
+/// SplitMix64(`seed`), so a draw does not depend on the draws before it.
+fn draw_seed(seed: u64, draw: usize) -> u64 {
+    SplitMix64(seed.wrapping_add((draw as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))).next()
+}
+
+/// The rotations of one draw: k uniform in 0 … L−1 per rotating block, in
+/// block order, then 0 for the fixed tail.
+fn draw_rotations(lengths: &[i64], seed: u64, draw: usize) -> Vec<usize> {
+    let mut rng = SplitMix64(draw_seed(seed, draw));
+    let mut ks: Vec<usize> = lengths.iter().map(|&l| rng.below(l as usize)).collect();
+    ks.push(0);
+    ks
+}
+
+/// p = min(1, 2·min(p⁺, p⁻)) from the counts of draws at or above and at
+/// or below the observed E.
+fn two_sided(above: u64, below: u64, draws: usize) -> f64 {
+    let b = draws as f64 + 1.0;
+    let plus = (1.0 + above as f64) / b;
+    let minus = (1.0 + below as f64) / b;
+    (2.0 * plus.min(minus)).min(1.0)
+}
+
+/// The two-sided rotation p of every table (`None` when its observed E is
+/// undefined) from `draws` draws, split over `threads` scoped threads; the
+/// counts do not depend on the split. A draw with no eligible
+/// pseudo-member counts toward both tails.
+fn null_p(
+    tables: &[RotationTable],
+    lengths: &[i64],
+    draws: usize,
+    seed: u64,
+    threads: usize,
+) -> Vec<Option<f64>> {
+    let observed: Vec<Option<f64>> = tables.iter().map(RotationTable::observed).collect();
+    let chunk = draws.div_ceil(threads.max(1)).max(1);
+    let parts: Vec<Vec<(u64, u64)>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..draws)
+            .step_by(chunk)
+            .map(|from| {
+                let observed = &observed;
+                scope.spawn(move || {
+                    let mut counts = vec![(0u64, 0u64); tables.len()];
+                    for draw in from..(from + chunk).min(draws) {
+                        let ks = draw_rotations(lengths, seed, draw);
+                        for (c, table) in tables.iter().enumerate() {
+                            let Some(e) = observed[c] else { continue };
+                            let (sum, n) = table.at(&ks);
+                            if n == 0 {
+                                counts[c].0 += 1;
+                                counts[c].1 += 1;
+                                continue;
+                            }
+                            let star = sum / n as f64;
+                            counts[c].0 += u64::from(star >= e);
+                            counts[c].1 += u64::from(star <= e);
+                        }
+                    }
+                    counts
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let mut totals = vec![(0u64, 0u64); tables.len()];
+    for part in parts {
+        for (c, (above, below)) in part.into_iter().enumerate() {
+            totals[c].0 += above;
+            totals[c].1 += below;
+        }
+    }
+    observed
+        .iter()
+        .zip(totals)
+        .map(|(e, (above, below))| e.map(|_| two_sided(above, below, draws)))
+        .collect()
+}
+
+// --- D3, D4: the measurement and its reading.
+
+/// The measurement's settings: draws and threads are parameters so the
+/// fixtures run small.
+#[derive(Clone, Copy, Debug)]
+struct RunSettings {
+    /// μ, which sets n_min: [`MU`] in the run, larger in the fixtures so
+    /// that a few days reach it.
+    mu: f64,
+    t2_resamples: usize,
+    d7_resamples: usize,
+    draws: usize,
+    threads: usize,
+}
+
+const RUN: RunSettings = RunSettings {
+    mu: MU,
+    t2_resamples: T2_RESAMPLES,
+    d7_resamples: RESAMPLES,
+    draws: T3_DRAWS,
+    threads: 4,
+};
+
+/// A context's reading (D4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RepReading {
+    /// `true`: in the hypothesis direction.
+    Replicated(bool),
+    NotMeasurable,
+    NoEffect,
+    NotNetPositive,
+    Insufficient,
+}
+
+impl RepReading {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Replicated(true) => "replicated (hypothesis)",
+            Self::Replicated(false) => "replicated (counter)",
+            Self::NotMeasurable => "not measurable",
+            Self::NoEffect => "no effect",
+            Self::NotNetPositive => "not net positive",
+            Self::Insufficient => "insufficient",
+        }
+    }
+}
+
+/// D4: T1, then T3 after BH, then T2 in direction s.
+fn read(
+    units: u64,
+    n_min: u64,
+    rejected: bool,
+    s: Option<f64>,
+    t2: Option<&Interval>,
+) -> RepReading {
+    if units < n_min {
+        return RepReading::NotMeasurable;
+    }
+    let (Some(s), Some(t2)) = (s, t2) else {
+        return RepReading::NoEffect;
+    };
+    if !rejected {
+        return RepReading::NoEffect;
+    }
+    match t2.reading {
+        Reading::Insufficient => RepReading::Insufficient,
+        Reading::Hypothesis => RepReading::Replicated(s > 0.0),
+        _ => RepReading::NotNetPositive,
+    }
+}
+
+/// One context's measured result.
+#[derive(Clone, Debug)]
+struct ContextResult {
+    ran: u64,
+    dropped: i64,
+    episodes: u64,
+    units: u64,
+    t: Option<f64>,
+    t_b: Option<f64>,
+    effect: Option<f64>,
+    s: Option<f64>,
+    /// T3 at 8 and 4 weeks; `None` when not measurable or E undefined.
+    p: [Option<f64>; 2],
+    /// BH at 8 and 4 weeks.
+    rejected: [bool; 2],
+    /// T2's net expectancy and its intervals at 56, 28 and 112 days.
+    expectancy: Option<f64>,
+    t2: Vec<Interval>,
+    max_drawdown: Option<f64>,
+    /// ADR-058 D7's 56-day reading of E.
+    d7: Option<Interval>,
+    reading: RepReading,
+}
+
+/// The measurement of the 48 contexts.
+fn measure_contexts(measured: &Measured, run: &RunSettings) -> Vec<ContextResult> {
+    let inputs = &measured.inputs;
+    let n_min = n_min(CONFIDENCE, run.mu);
+    let populations = populations();
+    let episodes = member_episodes(inputs, &populations);
+    let cells = replication_cells(inputs);
+    let days: BTreeSet<i64> = inputs
+        .baseline
+        .iter()
+        .map(|b| b.decision)
+        .chain(inputs.members.iter().map(|m| m.decision))
+        .map(|ms| ms.div_euclid(DAY_MS))
+        .collect();
+    let day_index: BTreeMap<i64, usize> = days.iter().enumerate().map(|(i, d)| (*d, i)).collect();
+    let baseline_days = BaselineDays::new(inputs, &day_index);
+    let prepared: Vec<Prepared> = cells
+        .iter()
+        .map(|cell| prepare(inputs, cell, &day_index))
+        .collect();
+    let ones = vec![1u32; day_index.len()];
+    let mut totals = Vec::new();
+    baseline_days.totals(&ones, &mut totals);
+
+    // Counts, E and the units' representatives.
+    let mut results: Vec<ContextResult> = Vec::new();
+    let mut nets: Vec<Vec<(usize, f64)>> = Vec::new();
+    for (c, (context, cell)) in contexts().iter().zip(&cells).enumerate() {
+        let (episodes_ran, units) = cell_units(inputs, &episodes, cell);
+        let point = estimate(&prepared[c], &ones, &totals);
+        let n = point.n();
+        let effect = point.effect();
+        let s = direction(effect);
+        let tuples: Vec<(i64, u64, bool)> = cell
+            .members
+            .iter()
+            .map(|&i| {
+                let m = &inputs.members[i];
+                (m.decision, episodes[i], m.outcomes[cell.horizon].ran())
+            })
+            .collect();
+        let reps: Vec<usize> = representatives(&tuples, context.horizon_ms())
+            .into_iter()
+            .map(|k| cell.members[k])
+            .collect();
+        assert_eq!(reps.len() as u64, units, "{}", context.label());
+        let unit_nets: Vec<(usize, f64)> = match s {
+            Some(s) if units >= n_min => reps
+                .iter()
+                .map(|&i| {
+                    let m = &inputs.members[i];
+                    let half = measured.half_bps[i][context.horizon].expect("barriers");
+                    (
+                        day_index[&m.decision.div_euclid(DAY_MS)],
+                        net_outcome(
+                            m.outcomes[cell.horizon],
+                            s,
+                            context.sigma(),
+                            measured.marks[i][context.horizon],
+                            label_fee(FEE_BPS, half),
+                        ),
+                    )
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        let ran = cell
+            .members
+            .iter()
+            .filter(|&&i| inputs.members[i].outcomes[cell.horizon].ran())
+            .count() as u64;
+        results.push(ContextResult {
+            ran,
+            dropped: point.dropped,
+            episodes: episodes_ran,
+            units,
+            t: (n > 0).then(|| (point.hypothesis - point.counter) as f64 / n as f64),
+            t_b: (n > 0).then(|| point.baseline_sum / n as f64),
+            effect,
+            s,
+            p: [None, None],
+            rejected: [false, false],
+            expectancy: (!unit_nets.is_empty())
+                .then(|| unit_nets.iter().map(|(_, x)| x).sum::<f64>() / unit_nets.len() as f64),
+            t2: Vec::new(),
+            max_drawdown: (!unit_nets.is_empty())
+                .then(|| max_drawdown(&unit_nets.iter().map(|(_, x)| *x).collect::<Vec<_>>())),
+            d7: None,
+            reading: RepReading::NotMeasurable,
+        });
+        nets.push(unit_nets);
+    }
+
+    // T3 and BH, at 8 and 4 weeks.
+    let frame = null_frame(measured);
+    let tilts = frame.tilts();
+    for (n, weeks) in NULL_WEEKS.iter().enumerate() {
+        let layout = Layout::new(measured.window, *weeks);
+        let measurable: Vec<usize> = (0..results.len())
+            .filter(|&c| results[c].units >= n_min && results[c].effect.is_some())
+            .collect();
+        let tables: Vec<RotationTable> = measurable
+            .iter()
+            .map(|&c| {
+                let context = contexts()[c];
+                let labels: Vec<i64> = cells[c]
+                    .members
+                    .iter()
+                    .map(|&i| inputs.members[i].minute_end.unwrap())
+                    .collect();
+                rotation_table(
+                    &frame,
+                    &tilts,
+                    &layout,
+                    &labels,
+                    context.regime,
+                    context.horizon,
+                    context.sigma(),
+                )
+            })
+            .collect();
+        for (k, &c) in measurable.iter().enumerate() {
+            let rotation = tables[k].observed().unwrap();
+            let effect = results[c].effect.unwrap();
+            assert!(
+                (rotation - effect).abs() <= 1e-9,
+                "{}: E {effect} at the identity rotation {rotation}",
+                contexts()[c].label()
+            );
+        }
+        let p = null_p(
+            &tables,
+            &layout.lengths(),
+            run.draws,
+            REPLICATION_SEED,
+            run.threads,
+        );
+        let mut all = [1.0f64; 48];
+        for (k, &c) in measurable.iter().enumerate() {
+            results[c].p[n] = p[k];
+            all[c] = p[k].unwrap_or(1.0);
+        }
+        for (c, rejected) in bh(&all, FDR).into_iter().enumerate() {
+            results[c].rejected[n] = rejected;
+        }
+    }
+
+    // T2 at 56, 28 and 112 days.
+    let settings = Settings {
+        confidence: CONFIDENCE,
+        mu: run.mu,
+        fee_bps: FEE_BPS,
+        resamples: run.t2_resamples,
+        blocks: [T2_BLOCKS[0], T2_BLOCKS[1]],
+        seed: REPLICATION_SEED,
+        threads: run.threads,
+    };
+    let per_day: Vec<Vec<(usize, f64, i64)>> = nets.iter().map(|n| net_days(n)).collect();
+    for block in T2_BLOCKS {
+        let weights = day_weights(day_index.len().max(1), block, &settings);
+        for (c, result) in results.iter_mut().enumerate() {
+            if nets[c].is_empty() {
+                continue;
+            }
+            let values = t2_values(&per_day[c], &weights);
+            result
+                .t2
+                .push(interval(&values, result.units, n_min, CONFIDENCE));
+        }
+    }
+
+    // ADR-058 D7's 56-day reading of E, with ADR-058 D5's settings.
+    let d7_settings = Settings {
+        resamples: run.d7_resamples,
+        blocks: BLOCKS,
+        seed: SEED,
+        ..settings
+    };
+    let weights = day_weights(day_index.len().max(1), BLOCKS[0], &d7_settings);
+    let resampled = bootstrap(&baseline_days, &prepared, &weights, run.threads);
+    for (c, result) in results.iter_mut().enumerate() {
+        if result.units >= n_min {
+            result.d7 = Some(interval(&resampled[c], result.units, n_min, CONFIDENCE));
+        }
+        result.reading = read(
+            result.units,
+            n_min,
+            result.rejected[0],
+            result.s,
+            result.t2.first(),
+        );
+    }
+    results
+}
+
+// ADR-064 frozen decisions: end
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// The texts ADR-064 freezes, their hashes, and the dataset pins.
+
+/// The replication queries (ADR-064 D5, *Changes*).
+const REPLICATION_SQL: &str = include_str!("../../../../docs/research/205-p1-replication.sql");
+
+/// The pre-registration (ADR-064 D6 freezes its text up to the record).
+const ADR_064: &str = include_str!("../../../../docs/adr/064-p1-replication-pre-registration.md");
+
+/// D6: SHA-256 of `028-order-flow-interactions.sql` (ADR-058 *Acceptance*),
+/// of `205-p1-replication.sql`, and of ADR-064's frozen text.
+const STUDY_SQL_SHA256: &str = "dd32d605081d6c80992655e16f453d143ee4e3ba5b17f4bbe399fcee0e7144a1";
+const REPLICATION_SQL_SHA256: &str =
+    "5e742fed2fba222bb29f501de22bddb3c5d2a399186c495fd574118df7ec74c3";
+const ADR_FROZEN_SHA256: &str = "6ed0f6afb3688c99ebc501eb1530e0cd088122fa3e7a1e4a067bc08fd6dcafae";
+
+/// This file: D6 freezes its decision region, between the markers.
+const THIS_FILE: &str = include_str!("replication.rs");
+
+/// D6: SHA-256 of [`frozen_code`] of this file.
+const CODE_FROZEN_SHA256: &str = "cafdbb1b139beba96739b18d7aa9bf83f83bf2cb64eeb21bf7dbae023e52d852";
+
+/// The measurement pins (D1), set by commit 2 of #205 from the coverage
+/// run: data version, content hash, contexts / baseline / trigger records,
+/// and the races that ran at 4h and 1d.
+#[derive(Clone, Copy, Debug)]
+struct Pins {
+    data: Option<&'static str>,
+    content: Option<&'static str>,
+    contexts: Option<(u64, u64, u64)>,
+    ran: Option<[u64; 2]>,
+}
+
+const UNPINNED: Pins = Pins {
+    data: None,
+    content: None,
+    contexts: None,
+    ran: None,
+};
+
+/// The replication dataset of #205's coverage run (ADR-064
+/// *Pre-registration record*, `docs/research/205-p1-replication-coverage.md`).
+const REPLICATION_PINS: Pins = Pins {
+    data: Some("7e92345c663e72e096cbdf2921f60eaa8d9cbae291cd2f1f82bdd64306d27d10"),
+    content: Some("e985ea3e9efa9cc9aaf15dbc013fe76eb76711e811a4d3f414e79b591402049f"),
+    contexts: Some((2_638_166, 2_498_200, 139_966)),
+    ran: Some([2_634_304, 2_613_978]),
+};
+
+// ---------------------------------------------------------------------------
+// Opening a dataset behind the guard; hashes and counts.
+
+/// Verifies `dir`, applies the guard and opens the views; prints nothing.
+fn open_guarded(dir: &Path) -> Result<(OutcomeManifest, OutcomeViews), String> {
+    let mut text = Vec::new();
+    if !conditional::verify(dir, &mut text)? {
+        return Err(format!(
+            "verify failed: {}",
+            String::from_utf8_lossy(&text).trim_end()
+        ));
+    }
+    let manifest = OutcomeDataset::open(dir)
+        .map_err(|e| e.to_string())?
+        .manifest()
+        .clone();
+    guard(&manifest)?;
+    let views = OutcomeViews::open(dir).map_err(|e| e.to_string())?;
+    Ok((manifest, views))
+}
+
+/// The study views, then the replication views, without exclusions.
+fn create_replication(views: &OutcomeViews) -> Result<(), String> {
+    create_study(views, &[]);
+    views
+        .create_views(REPLICATION_SQL)
+        .map_err(|e| e.to_string())
+}
+
+fn sha256(text: &str) -> String {
+    Sha256::digest(text.as_bytes())
+        .iter()
+        .fold(String::new(), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
+}
+
+/// D6: the frozen text, from `## Context` to the record.
+/// D6: the decision region of `source`, from the begin marker's line to the
+/// end of the end marker's line. The markers are built with `concat!` so
+/// that this function's own text does not contain them.
+fn frozen_code(source: &str) -> &str {
+    let begin = concat!("// ADR-064 frozen decisions", ": begin");
+    let end = concat!("// ADR-064 frozen decisions", ": end");
+    let start = source.find(begin).expect("the begin marker");
+    assert_eq!(source.matches(begin).count(), 1, "one begin marker");
+    assert_eq!(source.matches(end).count(), 1, "one end marker");
+    let stop = source.find(end).expect("the end marker") + end.len();
+    assert!(start < stop);
+    &source[start..stop]
+}
+
+fn frozen(adr: &str) -> &str {
+    let start = adr.find("\n## Context\n").expect("a Context section") + 1;
+    let end = adr
+        .find("\n## Pre-registration record\n")
+        .expect("a Pre-registration record section")
+        + 1;
+    &adr[start..end]
+}
+
+/// The dataset counts the pins hold: contexts, baseline, trigger, effort
+/// rows, and the races that ran at 4h and 1d. Reads no outcome.
+fn dataset_counts(views: &OutcomeViews) -> ((u64, u64, u64), u64, [u64; 2]) {
+    let mut contexts = (0, 0, 0);
+    each_row(
+        &tsv_lines(
+            views,
+            "SELECT count(*) AS contexts, count(*) FILTER (WHERE sample = 'baseline') AS baseline, \
+             count(*) FILTER (WHERE sample = 'trigger') AS trigger FROM contexts",
+        ),
+        |get| {
+            contexts = (
+                get("contexts").parse().unwrap(),
+                get("baseline").parse().unwrap(),
+                get("trigger").parse().unwrap(),
+            );
+        },
+    );
+    let effort = tsv_lines(views, "SELECT count(*) AS rows FROM effort")[1]
+        .parse()
+        .unwrap();
+    let mut ran = [0, 0];
+    each_row(
+        &tsv_lines(
+            views,
+            "SELECT count(*) FILTER (WHERE ran AND horizon = '4h') AS ran_4h, \
+             count(*) FILTER (WHERE ran AND horizon = '1d') AS ran_1d FROM rep_ran",
+        ),
+        |get| {
+            ran = [
+                get("ran_4h").parse().unwrap(),
+                get("ran_1d").parse().unwrap(),
+            ]
+        },
+    );
+    (contexts, effort, ran)
 }
 
 // ---------------------------------------------------------------------------
@@ -470,24 +1187,6 @@ fn load_coverage(views: &OutcomeViews, window: (i64, i64)) -> CoverageInputs {
     inputs
 }
 
-/// ADR-058 D6 stage 2 as [`unit_count`], returning the counted
-/// representatives' indices into `members` instead of their count.
-fn representatives(members: &[(i64, u64, bool)], horizon_ms: i64) -> Vec<usize> {
-    let mut seen = BTreeSet::new();
-    let mut out = Vec::new();
-    let mut last: Option<i64> = None;
-    for (i, &(decision, episode, ran)) in members.iter().enumerate() {
-        if !ran || !seen.insert(episode) {
-            continue;
-        }
-        if last.is_none_or(|last| decision >= last + horizon_ms) {
-            out.push(i);
-            last = Some(decision);
-        }
-    }
-    out
-}
-
 /// The episode of every coverage member within its pair × window, formed
 /// before the regime split (ADR-058 D6, D8).
 fn coverage_episodes(members: &[CoverageMember]) -> Vec<u64> {
@@ -618,15 +1317,6 @@ fn coverage_of(inputs: &CoverageInputs) -> Vec<ContextCoverage> {
         .collect()
 }
 
-/// The weeks of a records window.
-fn weeks_of(window: (i64, i64)) -> f64 {
-    (window.1 - window.0) as f64 / WEEK_MS as f64
-}
-
-fn units_per_week(units: u64, weeks: f64) -> f64 {
-    units as f64 / weeks
-}
-
 /// The coverage report's body: everything but the dataset identity line.
 fn coverage_body(
     inputs: &CoverageInputs,
@@ -642,10 +1332,12 @@ fn coverage_body(
         out,
         "queries docs/research/028-order-flow-interactions.sql sha256 {}\n\
          queries docs/research/205-p1-replication.sql sha256 {}\n\
-         ADR-064 frozen text sha256 {}\n",
+         ADR-064 frozen text sha256 {}\n\
+         replication.rs frozen decisions sha256 {}\n",
         sha256(STUDY_SQL),
         sha256(REPLICATION_SQL),
-        sha256(frozen(ADR_064))
+        sha256(frozen(ADR_064)),
+        sha256(frozen_code(THIS_FILE))
     );
     let _ = writeln!(
         out,
@@ -973,353 +1665,6 @@ fn coverage_mismatches(
 }
 
 // ---------------------------------------------------------------------------
-// Statistics (D3).
-
-/// The per-label fee in R: the round trip in bps over the label's own
-/// barrier half-width in bps.
-fn label_fee(fee_bps: f64, half_bps: f64) -> f64 {
-    fee_bps / half_bps
-}
-
-/// s = sign(E); none when E is 0 or undefined.
-fn direction(effect: Option<f64>) -> Option<f64> {
-    match effect {
-        Some(e) if e > 0.0 => Some(1.0),
-        Some(e) if e < 0.0 => Some(-1.0),
-        _ => None,
-    }
-}
-
-/// s·x − f for a race that ran.
-fn net_outcome(outcome: Outcome, s: f64, fee: f64) -> f64 {
-    let x = match outcome {
-        Outcome::Hypothesis => 1.0,
-        Outcome::Counter => -1.0,
-        Outcome::Neither => 0.0,
-        other => panic!("a unit's race ran, not {other:?}"),
-    };
-    s * x - fee
-}
-
-/// The units' net outcomes per day: `(day, Σ net, count)`, by day.
-fn net_days(nets: &[(usize, f64)]) -> Vec<(usize, f64, i64)> {
-    let mut map: BTreeMap<usize, (f64, i64)> = BTreeMap::new();
-    for &(day, net) in nets {
-        let entry = map.entry(day).or_default();
-        entry.0 += net;
-        entry.1 += 1;
-    }
-    map.into_iter().map(|(d, (s, n))| (d, s, n)).collect()
-}
-
-/// T2's net expectancy under every resample's day weights; `None` when a
-/// resample draws no unit.
-fn t2_values(days: &[(usize, f64, i64)], weights: &[Vec<u32>]) -> Vec<Option<f64>> {
-    weights
-        .iter()
-        .map(|w| {
-            let (mut sum, mut n) = (0.0, 0i64);
-            for &(day, s, count) in days {
-                let k = w[day];
-                if k > 0 {
-                    sum += f64::from(k) * s;
-                    n += i64::from(k) * count;
-                }
-            }
-            (n > 0).then(|| sum / n as f64)
-        })
-        .collect()
-}
-
-/// The maximum drawdown of the cumulative sum of `nets`, from 0.
-fn max_drawdown(nets: &[f64]) -> f64 {
-    let (mut cum, mut peak, mut drawdown) = (0.0f64, 0.0f64, 0.0f64);
-    for x in nets {
-        cum += x;
-        peak = peak.max(cum);
-        drawdown = drawdown.max(peak - cum);
-    }
-    drawdown
-}
-
-/// Net R per year at `units_per_week` units a week (the addendum's
-/// arithmetic: μ × 2 a week × 52 = 10.4 R).
-fn net_r_per_year(expectancy: f64, units_per_week: f64) -> f64 {
-    expectancy * units_per_week * 52.0
-}
-
-/// Benjamini–Hochberg at level `q` over `M` p-values: reject the k
-/// smallest, k the largest rank with p₍ₖ₎ ≤ k·q/M. Ties keep the input
-/// order (the context order), which does not change the decisions.
-fn bh<const M: usize>(p: &[f64; M], q: f64) -> [bool; M] {
-    let mut order: [usize; M] = std::array::from_fn(|i| i);
-    order.sort_by(|&a, &b| p[a].total_cmp(&p[b]));
-    let mut k = 0;
-    for (rank, &i) in order.iter().enumerate() {
-        if p[i] <= (rank + 1) as f64 * q / M as f64 {
-            k = rank + 1;
-        }
-    }
-    let mut out = [false; M];
-    for &i in &order[..k] {
-        out[i] = true;
-    }
-    out
-}
-
-// ---------------------------------------------------------------------------
-// T3: the rotation null within blocks of whole weeks (D3).
-
-/// The race of a baseline record when it did not run.
-const NOT_RAN: i8 = i8::MIN;
-
-/// The baseline as the null reads it, in minute order.
-#[derive(Clone, Debug, Default)]
-struct NullFrame {
-    /// Strictly increasing: one baseline record per closed minute.
-    minute_end: Vec<i64>,
-    /// Index into [`REGIMES`].
-    regime: Vec<u8>,
-    stratum: Vec<u16>,
-    /// Per replication horizon: +1 upper, −1 lower, 0 neither, or
-    /// [`NOT_RAN`].
-    race: [Vec<i8>; 2],
-}
-
-impl NullFrame {
-    /// The stratum tilts (n_upper − n_lower) / n per horizon, regime label
-    /// and stratum among the frame's races that ran; `None` when none ran.
-    fn tilts(&self) -> Vec<Option<f64>> {
-        let mut counts = vec![(0i64, 0i64); REP_HORIZONS.len() * REGIME_SPLITS.len() * STRATA];
-        for j in 0..self.minute_end.len() {
-            let r = usize::from(self.regime[j]);
-            if r == NOT_READY {
-                continue;
-            }
-            for h in 0..REP_HORIZONS.len() {
-                let d = self.race[h][j];
-                if d != NOT_RAN {
-                    let c = &mut counts[strata_index(h, r, usize::from(self.stratum[j]))];
-                    c.0 += i64::from(d);
-                    c.1 += 1;
-                }
-            }
-        }
-        counts
-            .into_iter()
-            .map(|(diff, n)| (n > 0).then(|| diff as f64 / n as f64))
-            .collect()
-    }
-
-    fn find(&self, minute_end: i64) -> Option<usize> {
-        self.minute_end.binary_search(&minute_end).ok()
-    }
-}
-
-/// The block layout: whole weeks from `origin`, cut into blocks of `weeks`
-/// weeks, the last one shorter; the days after the last whole week never
-/// rotate.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Layout {
-    origin: i64,
-    whole_weeks: i64,
-    weeks: i64,
-}
-
-impl Layout {
-    fn new(window: (i64, i64), weeks: i64) -> Self {
-        Self {
-            origin: window.0,
-            whole_weeks: (window.1 - window.0).div_euclid(WEEK_MS),
-            weeks,
-        }
-    }
-
-    /// The rotating blocks' lengths in weeks.
-    fn lengths(&self) -> Vec<i64> {
-        let mut lengths = vec![self.weeks; (self.whole_weeks / self.weeks) as usize];
-        if self.whole_weeks % self.weeks > 0 {
-            lengths.push(self.whole_weeks % self.weeks);
-        }
-        lengths
-    }
-
-    /// The rotating block of `t` with its start and length in weeks;
-    /// `None` outside the whole weeks (the fixed tail).
-    fn block(&self, t: i64) -> Option<(usize, i64, i64)> {
-        let offset = t - self.origin;
-        if offset < 0 || offset >= self.whole_weeks * WEEK_MS {
-            return None;
-        }
-        let b = offset / (self.weeks * WEEK_MS);
-        let start = self.origin + b * self.weeks * WEEK_MS;
-        Some((
-            b as usize,
-            start,
-            self.weeks.min(self.whole_weeks - b * self.weeks),
-        ))
-    }
-
-    /// `t` rotated by `k` whole weeks, circular within its block.
-    fn rotate(&self, t: i64, k: i64) -> i64 {
-        match self.block(t) {
-            None => t,
-            Some((_, start, length)) => {
-                start + (t - start + k * WEEK_MS).rem_euclid(length * WEEK_MS)
-            }
-        }
-    }
-}
-
-/// Per block and rotation: Σ y and the count of the eligible
-/// pseudo-members. The last block is the fixed tail (identity only).
-#[derive(Clone, Debug, PartialEq)]
-struct RotationTable {
-    blocks: Vec<Vec<(f64, i64)>>,
-}
-
-impl RotationTable {
-    fn at(&self, rotations: &[usize]) -> (f64, i64) {
-        let (mut sum, mut n) = (0.0, 0);
-        for (block, &k) in self.blocks.iter().zip(rotations) {
-            let (s, c) = block[k];
-            sum += s;
-            n += c;
-        }
-        (sum, n)
-    }
-
-    /// The observed E (every block at the identity).
-    fn observed(&self) -> Option<f64> {
-        let (sum, n) = self.at(&vec![0; self.blocks.len()]);
-        (n > 0).then(|| sum / n as f64)
-    }
-}
-
-/// The rotation table of one context: each member label at minute `t`
-/// moved to `rotate(t, k)` for every k of its block; a pseudo-member is
-/// the baseline record there when it is eligible (the context's regime,
-/// the race at H ran, a stratum holding a baseline race), and adds
-/// y = σ·(d − tilt(stratum)) with the observed tilts.
-fn rotation_table(
-    frame: &NullFrame,
-    tilts: &[Option<f64>],
-    layout: &Layout,
-    labels: &[i64],
-    regime: usize,
-    h: usize,
-    sigma: f64,
-) -> RotationTable {
-    let lengths = layout.lengths();
-    let mut blocks: Vec<Vec<(f64, i64)>> = lengths
-        .iter()
-        .map(|&l| vec![(0.0, 0); l as usize])
-        .collect();
-    blocks.push(vec![(0.0, 0)]);
-    let tail = lengths.len();
-    for &t in labels {
-        let (b, length) = layout
-            .block(t)
-            .map_or((tail, 1), |(b, _, length)| (b, length));
-        for k in 0..length {
-            let Some(j) = frame.find(layout.rotate(t, k)) else {
-                continue;
-            };
-            let d = frame.race[h][j];
-            if usize::from(frame.regime[j]) != regime || d == NOT_RAN {
-                continue;
-            }
-            let Some(tilt) = tilts[strata_index(h, regime, usize::from(frame.stratum[j]))] else {
-                continue;
-            };
-            let cell = &mut blocks[b][k as usize];
-            cell.0 += sigma * (f64::from(d) - tilt);
-            cell.1 += 1;
-        }
-    }
-    RotationTable { blocks }
-}
-
-/// The seed of draw `draw`'s own stream: the draw-th output of
-/// SplitMix64(`seed`), so a draw does not depend on the draws before it.
-fn draw_seed(seed: u64, draw: usize) -> u64 {
-    SplitMix64(seed.wrapping_add((draw as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))).next()
-}
-
-/// The rotations of one draw: k uniform in 0 … L−1 per rotating block, in
-/// block order, then 0 for the fixed tail.
-fn draw_rotations(lengths: &[i64], seed: u64, draw: usize) -> Vec<usize> {
-    let mut rng = SplitMix64(draw_seed(seed, draw));
-    let mut ks: Vec<usize> = lengths.iter().map(|&l| rng.below(l as usize)).collect();
-    ks.push(0);
-    ks
-}
-
-/// p = min(1, 2·min(p⁺, p⁻)) from the counts of draws at or above and at
-/// or below the observed E.
-fn two_sided(above: u64, below: u64, draws: usize) -> f64 {
-    let b = draws as f64 + 1.0;
-    let plus = (1.0 + above as f64) / b;
-    let minus = (1.0 + below as f64) / b;
-    (2.0 * plus.min(minus)).min(1.0)
-}
-
-/// The two-sided rotation p of every table (`None` when its observed E is
-/// undefined) from `draws` draws, split over `threads` scoped threads; the
-/// counts do not depend on the split. A draw with no eligible
-/// pseudo-member counts toward both tails.
-fn null_p(
-    tables: &[RotationTable],
-    lengths: &[i64],
-    draws: usize,
-    seed: u64,
-    threads: usize,
-) -> Vec<Option<f64>> {
-    let observed: Vec<Option<f64>> = tables.iter().map(RotationTable::observed).collect();
-    let chunk = draws.div_ceil(threads.max(1)).max(1);
-    let parts: Vec<Vec<(u64, u64)>> = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..draws)
-            .step_by(chunk)
-            .map(|from| {
-                let observed = &observed;
-                scope.spawn(move || {
-                    let mut counts = vec![(0u64, 0u64); tables.len()];
-                    for draw in from..(from + chunk).min(draws) {
-                        let ks = draw_rotations(lengths, seed, draw);
-                        for (c, table) in tables.iter().enumerate() {
-                            let Some(e) = observed[c] else { continue };
-                            let (sum, n) = table.at(&ks);
-                            if n == 0 {
-                                counts[c].0 += 1;
-                                counts[c].1 += 1;
-                                continue;
-                            }
-                            let star = sum / n as f64;
-                            counts[c].0 += u64::from(star >= e);
-                            counts[c].1 += u64::from(star <= e);
-                        }
-                    }
-                    counts
-                })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
-    });
-    let mut totals = vec![(0u64, 0u64); tables.len()];
-    for part in parts {
-        for (c, (above, below)) in part.into_iter().enumerate() {
-            totals[c].0 += above;
-            totals[c].1 += below;
-        }
-    }
-    observed
-        .iter()
-        .zip(totals)
-        .map(|(e, (above, below))| e.map(|_| two_sided(above, below, draws)))
-        .collect()
-}
-
-// ---------------------------------------------------------------------------
 // The measurement (D3, D4; #206).
 
 /// What the measurement reads: the ADR-058 inputs restricted to the P1
@@ -1328,6 +1673,8 @@ fn null_p(
 struct Measured {
     inputs: Inputs,
     half_bps: Vec<[Option<f64>; 2]>,
+    /// Per member: the mark to market at 4h and 1d (`rep_marks`).
+    marks: Vec<[Option<f64>; 2]>,
     minute_ends: Vec<i64>,
     window: (i64, i64),
 }
@@ -1339,6 +1686,7 @@ fn load_measured(views: &OutcomeViews, window: (i64, i64)) -> Measured {
     let mut measured = Measured {
         inputs: Inputs::default(),
         half_bps: Vec::new(),
+        marks: Vec::new(),
         minute_ends: Vec::new(),
         window,
     };
@@ -1374,6 +1722,8 @@ fn load_measured(views: &OutcomeViews, window: (i64, i64)) -> Measured {
                 ],
             });
             measured.half_bps.push(half_bps);
+            let mark = |name: &str| opt(get(name)).map(|v| v.parse::<f64>().unwrap());
+            measured.marks.push([mark("mark_4h"), mark("mark_1d")]);
         },
     );
     each_selected(views, "SELECT * FROM rep_baseline ORDER BY record", |get| {
@@ -1456,288 +1806,6 @@ fn null_frame(measured: &Measured) -> NullFrame {
             .collect(),
         race: [race(0), race(1)],
     }
-}
-
-/// The measurement's settings: draws and threads are parameters so the
-/// fixtures run small.
-#[derive(Clone, Copy, Debug)]
-struct RunSettings {
-    /// μ, which sets n_min: [`MU`] in the run, larger in the fixtures so
-    /// that a few days reach it.
-    mu: f64,
-    t2_resamples: usize,
-    d7_resamples: usize,
-    draws: usize,
-    threads: usize,
-}
-
-const RUN: RunSettings = RunSettings {
-    mu: MU,
-    t2_resamples: T2_RESAMPLES,
-    d7_resamples: RESAMPLES,
-    draws: T3_DRAWS,
-    threads: 4,
-};
-
-/// A context's reading (D4).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RepReading {
-    /// `true`: in the hypothesis direction.
-    Replicated(bool),
-    NotMeasurable,
-    NoEffect,
-    NotNetPositive,
-    Insufficient,
-}
-
-impl RepReading {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Replicated(true) => "replicated (hypothesis)",
-            Self::Replicated(false) => "replicated (counter)",
-            Self::NotMeasurable => "not measurable",
-            Self::NoEffect => "no effect",
-            Self::NotNetPositive => "not net positive",
-            Self::Insufficient => "insufficient",
-        }
-    }
-}
-
-/// D4: T1, then T3 after BH, then T2 in direction s.
-fn read(
-    units: u64,
-    n_min: u64,
-    rejected: bool,
-    s: Option<f64>,
-    t2: Option<&Interval>,
-) -> RepReading {
-    if units < n_min {
-        return RepReading::NotMeasurable;
-    }
-    let (Some(s), Some(t2)) = (s, t2) else {
-        return RepReading::NoEffect;
-    };
-    if !rejected {
-        return RepReading::NoEffect;
-    }
-    match t2.reading {
-        Reading::Insufficient => RepReading::Insufficient,
-        Reading::Hypothesis => RepReading::Replicated(s > 0.0),
-        _ => RepReading::NotNetPositive,
-    }
-}
-
-/// One context's measured result.
-#[derive(Clone, Debug)]
-struct ContextResult {
-    ran: u64,
-    dropped: i64,
-    episodes: u64,
-    units: u64,
-    t: Option<f64>,
-    t_b: Option<f64>,
-    effect: Option<f64>,
-    s: Option<f64>,
-    /// T3 at 8 and 4 weeks; `None` when not measurable or E undefined.
-    p: [Option<f64>; 2],
-    /// BH at 8 and 4 weeks.
-    rejected: [bool; 2],
-    /// T2's net expectancy and its intervals at 56, 28 and 112 days.
-    expectancy: Option<f64>,
-    t2: Vec<Interval>,
-    max_drawdown: Option<f64>,
-    /// ADR-058 D7's 56-day reading of E.
-    d7: Option<Interval>,
-    reading: RepReading,
-}
-
-/// The measurement of the 48 contexts.
-fn measure_contexts(measured: &Measured, run: &RunSettings) -> Vec<ContextResult> {
-    let inputs = &measured.inputs;
-    let n_min = n_min(CONFIDENCE, run.mu);
-    let populations = populations();
-    let episodes = member_episodes(inputs, &populations);
-    let cells = replication_cells(inputs);
-    let days: BTreeSet<i64> = inputs
-        .baseline
-        .iter()
-        .map(|b| b.decision)
-        .chain(inputs.members.iter().map(|m| m.decision))
-        .map(|ms| ms.div_euclid(DAY_MS))
-        .collect();
-    let day_index: BTreeMap<i64, usize> = days.iter().enumerate().map(|(i, d)| (*d, i)).collect();
-    let baseline_days = BaselineDays::new(inputs, &day_index);
-    let prepared: Vec<Prepared> = cells
-        .iter()
-        .map(|cell| prepare(inputs, cell, &day_index))
-        .collect();
-    let ones = vec![1u32; day_index.len()];
-    let mut totals = Vec::new();
-    baseline_days.totals(&ones, &mut totals);
-
-    // Counts, E and the units' representatives.
-    let mut results: Vec<ContextResult> = Vec::new();
-    let mut nets: Vec<Vec<(usize, f64)>> = Vec::new();
-    for (c, (context, cell)) in contexts().iter().zip(&cells).enumerate() {
-        let (episodes_ran, units) = cell_units(inputs, &episodes, cell);
-        let point = estimate(&prepared[c], &ones, &totals);
-        let n = point.n();
-        let effect = point.effect();
-        let s = direction(effect);
-        let tuples: Vec<(i64, u64, bool)> = cell
-            .members
-            .iter()
-            .map(|&i| {
-                let m = &inputs.members[i];
-                (m.decision, episodes[i], m.outcomes[cell.horizon].ran())
-            })
-            .collect();
-        let reps: Vec<usize> = representatives(&tuples, context.horizon_ms())
-            .into_iter()
-            .map(|k| cell.members[k])
-            .collect();
-        assert_eq!(reps.len() as u64, units, "{}", context.label());
-        let unit_nets: Vec<(usize, f64)> = match s {
-            Some(s) if units >= n_min => reps
-                .iter()
-                .map(|&i| {
-                    let m = &inputs.members[i];
-                    let half = measured.half_bps[i][context.horizon].expect("barriers");
-                    (
-                        day_index[&m.decision.div_euclid(DAY_MS)],
-                        net_outcome(m.outcomes[cell.horizon], s, label_fee(FEE_BPS, half)),
-                    )
-                })
-                .collect(),
-            _ => Vec::new(),
-        };
-        let ran = cell
-            .members
-            .iter()
-            .filter(|&&i| inputs.members[i].outcomes[cell.horizon].ran())
-            .count() as u64;
-        results.push(ContextResult {
-            ran,
-            dropped: point.dropped,
-            episodes: episodes_ran,
-            units,
-            t: (n > 0).then(|| (point.hypothesis - point.counter) as f64 / n as f64),
-            t_b: (n > 0).then(|| point.baseline_sum / n as f64),
-            effect,
-            s,
-            p: [None, None],
-            rejected: [false, false],
-            expectancy: (!unit_nets.is_empty())
-                .then(|| unit_nets.iter().map(|(_, x)| x).sum::<f64>() / unit_nets.len() as f64),
-            t2: Vec::new(),
-            max_drawdown: (!unit_nets.is_empty())
-                .then(|| max_drawdown(&unit_nets.iter().map(|(_, x)| *x).collect::<Vec<_>>())),
-            d7: None,
-            reading: RepReading::NotMeasurable,
-        });
-        nets.push(unit_nets);
-    }
-
-    // T3 and BH, at 8 and 4 weeks.
-    let frame = null_frame(measured);
-    let tilts = frame.tilts();
-    for (n, weeks) in NULL_WEEKS.iter().enumerate() {
-        let layout = Layout::new(measured.window, *weeks);
-        let measurable: Vec<usize> = (0..results.len())
-            .filter(|&c| results[c].units >= n_min && results[c].effect.is_some())
-            .collect();
-        let tables: Vec<RotationTable> = measurable
-            .iter()
-            .map(|&c| {
-                let context = contexts()[c];
-                let labels: Vec<i64> = cells[c]
-                    .members
-                    .iter()
-                    .map(|&i| inputs.members[i].minute_end.unwrap())
-                    .collect();
-                rotation_table(
-                    &frame,
-                    &tilts,
-                    &layout,
-                    &labels,
-                    context.regime,
-                    context.horizon,
-                    context.sigma(),
-                )
-            })
-            .collect();
-        for (k, &c) in measurable.iter().enumerate() {
-            let rotation = tables[k].observed().unwrap();
-            let effect = results[c].effect.unwrap();
-            assert!(
-                (rotation - effect).abs() <= 1e-9,
-                "{}: E {effect} at the identity rotation {rotation}",
-                contexts()[c].label()
-            );
-        }
-        let p = null_p(
-            &tables,
-            &layout.lengths(),
-            run.draws,
-            REPLICATION_SEED,
-            run.threads,
-        );
-        let mut all = [1.0f64; 48];
-        for (k, &c) in measurable.iter().enumerate() {
-            results[c].p[n] = p[k];
-            all[c] = p[k].unwrap_or(1.0);
-        }
-        for (c, rejected) in bh(&all, FDR).into_iter().enumerate() {
-            results[c].rejected[n] = rejected;
-        }
-    }
-
-    // T2 at 56, 28 and 112 days.
-    let settings = Settings {
-        confidence: CONFIDENCE,
-        mu: run.mu,
-        fee_bps: FEE_BPS,
-        resamples: run.t2_resamples,
-        blocks: [T2_BLOCKS[0], T2_BLOCKS[1]],
-        seed: REPLICATION_SEED,
-        threads: run.threads,
-    };
-    let per_day: Vec<Vec<(usize, f64, i64)>> = nets.iter().map(|n| net_days(n)).collect();
-    for block in T2_BLOCKS {
-        let weights = day_weights(day_index.len().max(1), block, &settings);
-        for (c, result) in results.iter_mut().enumerate() {
-            if nets[c].is_empty() {
-                continue;
-            }
-            let values = t2_values(&per_day[c], &weights);
-            result
-                .t2
-                .push(interval(&values, result.units, n_min, CONFIDENCE));
-        }
-    }
-
-    // ADR-058 D7's 56-day reading of E, with ADR-058 D5's settings.
-    let d7_settings = Settings {
-        resamples: run.d7_resamples,
-        blocks: BLOCKS,
-        seed: SEED,
-        ..settings
-    };
-    let weights = day_weights(day_index.len().max(1), BLOCKS[0], &d7_settings);
-    let resampled = bootstrap(&baseline_days, &prepared, &weights, run.threads);
-    for (c, result) in results.iter_mut().enumerate() {
-        if result.units >= n_min {
-            result.d7 = Some(interval(&resampled[c], result.units, n_min, CONFIDENCE));
-        }
-        result.reading = read(
-            result.units,
-            n_min,
-            result.rejected[0],
-            result.s,
-            result.t2.first(),
-        );
-    }
-    results
 }
 
 /// The measurement report (D4; S2: a context that is not measurable shows
@@ -1934,6 +2002,11 @@ fn measure_run(dir: &Path, pins: &Pins, run: &RunSettings) -> Result<String, Str
             sha256(frozen(ADR_064)),
             ADR_FROZEN_SHA256,
         ),
+        (
+            "replication.rs frozen decisions",
+            sha256(frozen_code(THIS_FILE)),
+            CODE_FROZEN_SHA256,
+        ),
     ] {
         if text != pinned {
             return Err(format!("{what} sha256 {text}, pinned {pinned}"));
@@ -1978,7 +2051,9 @@ fn measure_run(dir: &Path, pins: &Pins, run: &RunSettings) -> Result<String, Str
     let _ = writeln!(
         out,
         "queries sha256 028 {STUDY_SQL_SHA256}, 205 {REPLICATION_SQL_SHA256}; ADR-064 frozen \
-         {ADR_FROZEN_SHA256}; record sets equal; ADR-058 twin mismatches 0\n"
+         {ADR_FROZEN_SHA256}; replication.rs frozen decisions sha256 {}; record sets equal; \
+         ADR-058 twin mismatches 0\n",
+        sha256(frozen_code(THIS_FILE))
     );
     out.push_str(&measurement_body(&measured, &results, run));
     Ok(out)
@@ -2040,9 +2115,16 @@ fn rep_offset(rec: &Rec, h: usize) -> i64 {
     (40 + (rec.seq % 61) as i64) * USDT * (h as i64 + 1)
 }
 
-/// `super::label` with per-record barriers; with `scramble`, the race
-/// times and excursions are random (they are outcomes the coverage must
-/// not read).
+/// The last trade of a fixture record's window at horizon `h`, in price
+/// units from the reference: −½, −¼, 0, ¼ or ½ of its half-width, by
+/// record.
+fn rep_drift(rec: &Rec, h: usize) -> i64 {
+    rep_offset(rec, h) * ((rec.seq % 5) as i64 - 2) / 4
+}
+
+/// `super::label` with per-record barriers and last trades
+/// ([`rep_drift`]); with `scramble`, the race times, excursions and last
+/// trades are random (they are outcomes the coverage must not read).
 fn rep_label(rec: &Rec, clear: [bool; 5], scramble: Option<&mut Lcg>) -> ForwardLabel {
     let mut label = label(rec, clear);
     let mut scramble = scramble;
@@ -2053,6 +2135,7 @@ fn rep_label(rec: &Rec, clear: [bool; 5], scramble: Option<&mut Lcg>) -> Forward
                 lower: Price::from_units(R - offset),
                 upper: Price::from_units(R + offset),
             };
+            horizon.last = Some(Price::from_units(R + rep_drift(rec, h)));
         }
         if let Some(lcg) = scramble.as_deref_mut() {
             let at = EventTime::from_millis(rec.decision + 1 + lcg.below(HORIZONS[h].1 as u64));
@@ -2075,6 +2158,12 @@ fn rep_label(rec: &Rec, clear: [bool; 5], scramble: Option<&mut Lcg>) -> Forward
             };
             horizon.up = excursion(lcg);
             horizon.down = excursion(lcg);
+            if horizon.barriers.is_some() {
+                let offset = rep_offset(rec, h);
+                horizon.last = Some(Price::from_units(
+                    R - offset + 1 + lcg.below(2 * offset as u64 - 1),
+                ));
+            }
         }
     }
     label
@@ -2208,10 +2297,83 @@ fn the_frozen_texts_equal_their_pins() {
         ADR_FROZEN_SHA256,
         "ADR-064 frozen text"
     );
+    assert_eq!(
+        sha256(frozen_code(THIS_FILE)),
+        CODE_FROZEN_SHA256,
+        "replication.rs frozen decisions"
+    );
     let text = frozen(ADR_064);
     assert!(text.starts_with("## Context\n"));
     assert!(text.contains("\n## Accept when\n"));
     assert!(!text.contains("## Pre-registration record"));
+}
+
+#[test]
+fn the_code_freeze_holds_every_decision_and_catches_a_change() {
+    let region = frozen_code(THIS_FILE);
+    // The D3 numbers are the ADR's.
+    assert_eq!((CONFIDENCE, MU, FEE_BPS, FDR), (0.95, 0.10, 10.0, 0.05));
+    assert_eq!((T2_RESAMPLES, T2_BLOCKS), (10_000, [56, 28, 112]));
+    assert_eq!(
+        (T3_DRAWS, NULL_WEEKS, REPLICATION_SEED),
+        (1_000_000, [8, 4], 205)
+    );
+    assert_eq!(
+        (RUN.mu, RUN.draws, RUN.t2_resamples, RUN.d7_resamples),
+        (MU, T3_DRAWS, T2_RESAMPLES, RESAMPLES)
+    );
+    // Every decision is inside the region, so any change to one moves its
+    // hash: the review's mutations (q 0.20, 10³ draws, 2-week blocks, a
+    // 7-day T2 block) and the reading, BH, the null and the fee.
+    for (definition, mutated) in [
+        ("const FDR: f64 = 0.05;", "const FDR: f64 = 0.20;"),
+        (
+            "const T3_DRAWS: usize = 1_000_000;",
+            "const T3_DRAWS: usize = 1_000;",
+        ),
+        (
+            "const NULL_WEEKS: [i64; 2] = [8, 4];",
+            "const NULL_WEEKS: [i64; 2] = [2, 4];",
+        ),
+        (
+            "const T2_BLOCKS: [usize; 3] = [56, 28, 112];",
+            "const T2_BLOCKS: [usize; 3] = [7, 28, 112];",
+        ),
+        ("const FEE_BPS: f64 = 10.0;", "const FEE_BPS: f64 = 4.0;"),
+        (
+            "if p[i] <= (rank + 1) as f64 * q / M as f64 {",
+            "if p[i] < (rank + 1) as f64 * q / M as f64 {",
+        ),
+        (
+            "Reading::Hypothesis => RepReading::Replicated(s > 0.0),",
+            "_ => RepReading::Replicated(s > 0.0),",
+        ),
+        (
+            "Outcome::Neither => sigma * mark.unwrap_or(0.0),",
+            "Outcome::Neither => 0.0,",
+        ),
+        ("(2.0 * plus.min(minus)).min(1.0)", "plus.min(minus)"),
+        ("result.rejected[0],", "result.rejected[1],"),
+    ] {
+        assert_eq!(region.matches(definition).count(), 1, "{definition}");
+        let changed = region.replacen(definition, mutated, 1);
+        assert_ne!(sha256(&changed), CODE_FROZEN_SHA256, "{mutated}");
+    }
+    for item in [
+        "fn guard(",
+        "fn contexts(",
+        "fn representatives(",
+        "fn label_fee(",
+        "fn net_outcome(",
+        "fn t2_values(",
+        "fn bh<",
+        "fn rotation_table(",
+        "fn null_p(",
+        "fn read(",
+        "fn measure_contexts(",
+    ] {
+        assert!(region.contains(item), "{item} is frozen");
+    }
 }
 
 #[test]
@@ -2332,6 +2494,7 @@ fn the_pins_are_the_coverage_runs() {
         format!("028-order-flow-interactions.sql sha256 {STUDY_SQL_SHA256}"),
         format!("205-p1-replication.sql sha256 {REPLICATION_SQL_SHA256}"),
         format!("ADR-064 frozen text sha256 {ADR_FROZEN_SHA256}"),
+        format!("replication.rs frozen decisions sha256 {CODE_FROZEN_SHA256}"),
         "coverage twin mismatches 0".to_owned(),
     ] {
         assert!(coverage.contains(&line), "{line}");
@@ -2696,10 +2859,89 @@ fn the_per_label_fee_and_the_direction() {
     assert_eq!(direction(Some(-0.02)), Some(-1.0));
     assert_eq!(direction(Some(0.0)), None);
     assert_eq!(direction(None), None);
-    assert_eq!(net_outcome(Outcome::Hypothesis, 1.0, 0.1), 0.9);
-    assert_eq!(net_outcome(Outcome::Counter, 1.0, 0.1), -1.1);
-    assert_eq!(net_outcome(Outcome::Counter, -1.0, 0.1), 0.9);
-    assert_eq!(net_outcome(Outcome::Neither, -1.0, 0.25), -0.25);
+    assert_eq!(net_outcome(Outcome::Hypothesis, 1.0, 1.0, None, 0.1), 0.9);
+    assert_eq!(net_outcome(Outcome::Counter, 1.0, -1.0, None, 0.1), -1.1);
+    assert_eq!(net_outcome(Outcome::Counter, -1.0, 1.0, None, 0.1), 0.9);
+    // A barrier race ignores the mark.
+    assert_eq!(
+        net_outcome(Outcome::Hypothesis, 1.0, 1.0, Some(-0.7), 0.1),
+        0.9
+    );
+}
+
+#[test]
+fn a_neither_exit_is_marked_to_market_in_t2() {
+    let fee = 0.25;
+    // P1-sell (σ = +1, hypothesis upper) traded toward the hypothesis
+    // (s = +1): the last trade drifting up, with the hypothesis, gains;
+    // drifting down, against it, loses; at the reference only the fee.
+    assert_eq!(
+        net_outcome(Outcome::Neither, 1.0, 1.0, Some(0.5), fee),
+        0.25
+    );
+    assert_eq!(
+        net_outcome(Outcome::Neither, 1.0, 1.0, Some(-0.5), fee),
+        -0.75
+    );
+    assert_eq!(
+        net_outcome(Outcome::Neither, 1.0, 1.0, Some(0.0), fee),
+        -0.25
+    );
+    // P1-buy (σ = −1, hypothesis lower): a fall is with the hypothesis.
+    assert_eq!(
+        net_outcome(Outcome::Neither, 1.0, -1.0, Some(-0.5), fee),
+        0.25
+    );
+    assert_eq!(
+        net_outcome(Outcome::Neither, 1.0, -1.0, Some(0.5), fee),
+        -0.75
+    );
+    // Traded toward the counter barrier (s = −1), the signs turn.
+    assert_eq!(
+        net_outcome(Outcome::Neither, -1.0, -1.0, Some(-0.5), fee),
+        -0.75
+    );
+    assert_eq!(
+        net_outcome(Outcome::Neither, -1.0, 1.0, Some(-0.5), fee),
+        0.25
+    );
+    // Without a last trade: at the reference.
+    assert_eq!(net_outcome(Outcome::Neither, 1.0, 1.0, None, fee), -0.25);
+}
+
+#[test]
+fn the_marks_read_each_labels_last_trade() {
+    let mut recs = rep_recs(3, 5, 12);
+    let built = rep_built(&mut recs, rep_header(), None);
+    let views = rep_views(&built.dir);
+    let measured = load_measured(&views, REPLICATION_RECORDS);
+    // (with the hypothesis, against it, at the reference) among the
+    // `neither` exits seen.
+    let mut seen = [0; 3];
+    for (i, member) in measured.inputs.members.iter().enumerate() {
+        let rec = &recs[member.record as usize];
+        for (h, &index) in REP_HORIZONS.iter().enumerate() {
+            let want = rep_drift(rec, index) as f64 / rep_offset(rec, index) as f64;
+            let Some(mark) = measured.marks[i][h] else {
+                assert_eq!(rec.races[index], R5::Unavailable);
+                continue;
+            };
+            assert!((mark - want).abs() < 1e-12, "{mark} {want}");
+            if member.outcomes[index] != Outcome::Neither {
+                continue;
+            }
+            let sigma = if member.upper { 1.0 } else { -1.0 };
+            let net = net_outcome(Outcome::Neither, 1.0, sigma, Some(mark), 0.0);
+            seen[if net > 0.0 {
+                0
+            } else if net < 0.0 {
+                1
+            } else {
+                2
+            }] += 1;
+        }
+    }
+    assert!(seen.iter().all(|n| *n > 10), "{seen:?}");
 }
 
 #[test]
@@ -2752,7 +2994,7 @@ fn net_expectancy_is_over_the_units_representatives() {
     ];
     let nets: Vec<f64> = representatives(&members, h)
         .iter()
-        .map(|&i| net_outcome(outcomes[i], 1.0, 0.25))
+        .map(|&i| net_outcome(outcomes[i], 1.0, 1.0, Some(0.0), 0.25))
         .collect();
     assert_eq!(nets, [0.75, -0.25]);
     // The representatives are the unit count's, on random members.
@@ -2988,22 +3230,44 @@ fn the_coverage_views_carry_no_outcome() {
             );
         }
     }
-    // The coverage chain never names an outcome-carrying view.
-    let chain = REPLICATION_SQL
-        .split("CREATE OR REPLACE VIEW rep_members")
-        .next()
-        .unwrap();
-    for statement in chain.split("CREATE OR REPLACE VIEW").skip(1) {
+    // The coverage chain never names an outcome-carrying view, a mark or a
+    // race beyond `rep_ran`'s projection to `ran`.
+    let mut coverage_views = 0;
+    for statement in REPLICATION_SQL.split("CREATE OR REPLACE VIEW ").skip(1) {
+        let name = statement.split_whitespace().next().unwrap();
+        if !(name == "rep_ran" || name.starts_with("rep_coverage_")) {
+            continue;
+        }
+        coverage_views += 1;
         let body: String = statement
             .lines()
             .filter(|l| !l.trim_start().starts_with("--"))
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(!body.contains("study_members"), "{body}");
-        assert!(!body.contains("study_baseline"), "{body}");
-        assert!(!body.contains("study_races"), "{body}");
-        assert!(!body.contains("labeled"), "{body}");
+        for forbidden in [
+            "study_members",
+            "study_baseline",
+            "study_races",
+            "labeled",
+            "rep_marks",
+            "rep_members",
+            "rep_baseline",
+            "last",
+            "race_at",
+            "up_at",
+            "down_at",
+        ] {
+            assert!(!body.contains(forbidden), "{name} names {forbidden}");
+        }
+        let races = body.matches("race").count();
+        if name == "rep_ran" {
+            assert_eq!(races, 1, "{body}");
+            assert!(body.contains("race IN ('upper', 'lower', 'neither') AS ran"));
+        } else {
+            assert_eq!(races, 0, "{body}");
+        }
     }
+    assert_eq!(coverage_views, 5);
 }
 
 /// The coverage body of a fixture written from `recs` (cloned) with races
