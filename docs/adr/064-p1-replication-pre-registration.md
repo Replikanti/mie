@@ -617,7 +617,7 @@ findings.
   |---|---|---|
   | ADR-064 frozen text | `aeeadf25f10c3a8edb17a5f77c9b8ddb088dcef7c697e3a4fa2dd5aa513e3fe4` | `6ed0f6afb3688c99ebc501eb1530e0cd088122fa3e7a1e4a067bc08fd6dcafae` |
   | `205-p1-replication.sql` | `5d6d726da962d40d1d18b5295a13b366afa5ebea90fd1e7b49486022a2979014` | `5e742fed2fba222bb29f501de22bddb3c5d2a399186c495fd574118df7ec74c3` |
-  | `replication.rs` frozen decisions | — (not hashed) | `cafdbb1b139beba96739b18d7aa9bf83f83bf2cb64eeb21bf7dbae023e52d852` |
+  | `replication.rs` frozen decisions | — (not hashed) | `cafdbb1b139beba96739b18d7aa9bf83f83bf2cb64eeb21bf7dbae023e52d852` (`d9df826`); after the recheck fix below `ece00cf22aaaa527f2c7f83fe5eb08978267c5599eac203781de5e39ccbd1f7c` |
 
 - **Coverage rerun**, from a release test binary of a clean checkout of
   `d9df826f21df86f4f38329ab4766fe11971b01ea`, the amended commit, under a
@@ -631,3 +631,25 @@ findings.
   identical, so the pins stay as they are.
   [`docs/research/205-p1-replication-coverage.md`](../research/205-p1-replication-coverage.md)
   now holds the rerun's output.
+- **Recheck gap, the entry's settings.** The review's recheck found that
+  `measure_p1_replication` chose its settings outside the region: passing
+  `RUN` with 1 000 draws kept every test green and the region's hash
+  unchanged. Fixed before any outcome was read:
+  - `measure_run` moved into the region, and a frozen
+    `measure_replication(dir)` runs it with the record's pins and `RUN`;
+    the entry calls only that. On the record's pins, `measure_run` refuses
+    any settings but `RUN` and a build that is not a clean `git:` commit,
+    before it opens the dataset.
+  - Both entries print the test binary's code version,
+    `conditional::CODE_VERSION` (the `build.rs` `git:` line that also
+    stamps every dataset manifest's `code`), so a report shows the commit
+    it ran from, which D6 requires to be #207's merge commit.
+  - A test passes the review's mutation and three others on the record's
+    pins and gets a refusal, and checks that the entry goes through
+    `measure_replication`; with the entry edited to the review's mutation
+    that test fails. The code-freeze test also covers the two new frozen
+    lines.
+  - The region's hash moves from `cafdbb1b…` to `ece00cf2…`. The ADR's
+    frozen text and the queries are unchanged. The coverage reruns from
+    this fix; pending.
+

@@ -613,7 +613,7 @@ fn null_p(
 
 /// The measurement's settings: draws and threads are parameters so the
 /// fixtures run small.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct RunSettings {
     /// μ, which sets n_min: [`MU`] in the run, larger in the fixtures so
     /// that a few days reach it.
@@ -899,6 +899,107 @@ fn measure_contexts(measured: &Measured, run: &RunSettings) -> Vec<ContextResult
     results
 }
 
+// --- D6: the measurement entry's path, with the pre-registered settings.
+
+/// The #206 measurement of the replication dataset in `dir`: the pins of
+/// the pre-registration record and the settings [`RUN`], both fixed here.
+fn measure_replication(dir: &Path) -> Result<String, String> {
+    measure_run(dir, &REPLICATION_PINS, &RUN)
+}
+
+/// The measurement run (#206): the pins first, then, on the replication
+/// dataset, the pre-registered settings [`RUN`] and a clean build, then the
+/// frozen hashes, the guard, the counts, the record sets and the twin; only
+/// then the tables. Prints nothing. Fixtures pass their own pins and
+/// settings.
+fn measure_run(dir: &Path, pins: &Pins, run: &RunSettings) -> Result<String, String> {
+    let (Some(data), Some(content), Some(contexts_pin), Some(ran_pin)) =
+        (pins.data, pins.content, pins.contexts, pins.ran)
+    else {
+        panic!("ADR-064 measurement: not pinned (the pre-registration record sets the pins)");
+    };
+    if *pins == REPLICATION_PINS {
+        if *run != RUN {
+            return Err(format!(
+                "the replication dataset is measured only with RUN, not {run:?}"
+            ));
+        }
+        if !clean_code(conditional::CODE_VERSION) {
+            return Err(format!(
+                "the replication dataset is measured only from a clean build, not {}",
+                conditional::CODE_VERSION
+            ));
+        }
+    }
+    for (what, text, pinned) in [
+        ("028 queries", sha256(STUDY_SQL), STUDY_SQL_SHA256),
+        (
+            "205 queries",
+            sha256(REPLICATION_SQL),
+            REPLICATION_SQL_SHA256,
+        ),
+        (
+            "ADR-064 frozen text",
+            sha256(frozen(ADR_064)),
+            ADR_FROZEN_SHA256,
+        ),
+        (
+            "replication.rs frozen decisions",
+            sha256(frozen_code(THIS_FILE)),
+            CODE_FROZEN_SHA256,
+        ),
+    ] {
+        if text != pinned {
+            return Err(format!("{what} sha256 {text}, pinned {pinned}"));
+        }
+    }
+    let (manifest, views) = open_guarded(dir)?;
+    if manifest.data != data || manifest.content != content {
+        return Err(format!(
+            "data {} and content {} are not the pinned {data} and {content}",
+            manifest.data, manifest.content
+        ));
+    }
+    views
+        .set_threads(run.threads as u32)
+        .map_err(|e| e.to_string())?;
+    create_replication(&views)?;
+    let (contexts_count, effort, ran) = dataset_counts(&views);
+    if contexts_count != contexts_pin || effort != 3 * contexts_pin.0 || ran != ran_pin {
+        return Err(format!(
+            "counts {contexts_count:?}, effort {effort}, ran {ran:?}; pinned {contexts_pin:?}, \
+             {}, {ran_pin:?}",
+            3 * contexts_pin.0
+        ));
+    }
+    let difference = record_set_difference(&views);
+    if difference > 0 {
+        return Err(format!(
+            "rep_coverage_members and the P1 rows of study_members differ in {difference} rows"
+        ));
+    }
+    let measured = load_measured(&views, manifest.records);
+    let mismatches = p1_twin_mismatches(&views, &measured.inputs);
+    if mismatches > 0 {
+        return Err(format!(
+            "the ADR-058 twin disagrees on the P1 rows ({mismatches}); nothing is printed"
+        ));
+    }
+    let results = measure_contexts(&measured, run);
+    let mut out = String::new();
+    let _ = writeln!(out, "# P1 replication (#206, ADR-064)\n");
+    out.push_str(&identity(&manifest));
+    let _ = writeln!(
+        out,
+        "queries sha256 028 {STUDY_SQL_SHA256}, 205 {REPLICATION_SQL_SHA256}; ADR-064 frozen \
+         {ADR_FROZEN_SHA256}; replication.rs frozen decisions sha256 {}; record sets equal; \
+         ADR-058 twin mismatches 0\n",
+        sha256(frozen_code(THIS_FILE))
+    );
+    out.push_str(&measurement_body(&measured, &results, run));
+    Ok(out)
+}
+
 // ADR-064 frozen decisions: end
 // ===========================================================================
 
@@ -922,12 +1023,12 @@ const ADR_FROZEN_SHA256: &str = "6ed0f6afb3688c99ebc501eb1530e0cd088122fa3e7a1e4
 const THIS_FILE: &str = include_str!("replication.rs");
 
 /// D6: SHA-256 of [`frozen_code`] of this file.
-const CODE_FROZEN_SHA256: &str = "cafdbb1b139beba96739b18d7aa9bf83f83bf2cb64eeb21bf7dbae023e52d852";
+const CODE_FROZEN_SHA256: &str = "ece00cf22aaaa527f2c7f83fe5eb08978267c5599eac203781de5e39ccbd1f7c";
 
 /// The measurement pins (D1), set by commit 2 of #205 from the coverage
 /// run: data version, content hash, contexts / baseline / trigger records,
 /// and the races that ran at 4h and 1d.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct Pins {
     data: Option<&'static str>,
     content: Option<&'static str>,
@@ -1456,7 +1557,8 @@ fn coverage_body(
 /// The dataset identity line of a report.
 fn identity(manifest: &OutcomeManifest) -> String {
     format!(
-        "dataset content {}, data {}, engine {}, {} {}, {} {}, code {}\nsource {}; replay {:?}; records {:?}\n",
+        "dataset content {}, data {}, engine {}, {} {}, {} {}, code {}\nsource {}; replay {:?}; records {:?}\n\
+         test binary code {}\n",
         manifest.content,
         manifest.data,
         manifest.engine,
@@ -1467,7 +1569,8 @@ fn identity(manifest: &OutcomeManifest) -> String {
         manifest.code,
         manifest.source,
         manifest.replay,
-        manifest.records
+        manifest.records,
+        conditional::CODE_VERSION
     )
 }
 
@@ -1981,84 +2084,6 @@ fn p1_twin_mismatches(views: &OutcomeViews, inputs: &Inputs) -> u64 {
     count
 }
 
-/// The measurement run (#206): the pins first, then the frozen hashes, the
-/// guard, the counts, the record sets and the twin; only then the tables.
-/// Prints nothing.
-fn measure_run(dir: &Path, pins: &Pins, run: &RunSettings) -> Result<String, String> {
-    let (Some(data), Some(content), Some(contexts_pin), Some(ran_pin)) =
-        (pins.data, pins.content, pins.contexts, pins.ran)
-    else {
-        panic!("ADR-064 measurement: not pinned (the pre-registration record sets the pins)");
-    };
-    for (what, text, pinned) in [
-        ("028 queries", sha256(STUDY_SQL), STUDY_SQL_SHA256),
-        (
-            "205 queries",
-            sha256(REPLICATION_SQL),
-            REPLICATION_SQL_SHA256,
-        ),
-        (
-            "ADR-064 frozen text",
-            sha256(frozen(ADR_064)),
-            ADR_FROZEN_SHA256,
-        ),
-        (
-            "replication.rs frozen decisions",
-            sha256(frozen_code(THIS_FILE)),
-            CODE_FROZEN_SHA256,
-        ),
-    ] {
-        if text != pinned {
-            return Err(format!("{what} sha256 {text}, pinned {pinned}"));
-        }
-    }
-    let (manifest, views) = open_guarded(dir)?;
-    if manifest.data != data || manifest.content != content {
-        return Err(format!(
-            "data {} and content {} are not the pinned {data} and {content}",
-            manifest.data, manifest.content
-        ));
-    }
-    views
-        .set_threads(run.threads as u32)
-        .map_err(|e| e.to_string())?;
-    create_replication(&views)?;
-    let (contexts_count, effort, ran) = dataset_counts(&views);
-    if contexts_count != contexts_pin || effort != 3 * contexts_pin.0 || ran != ran_pin {
-        return Err(format!(
-            "counts {contexts_count:?}, effort {effort}, ran {ran:?}; pinned {contexts_pin:?}, \
-             {}, {ran_pin:?}",
-            3 * contexts_pin.0
-        ));
-    }
-    let difference = record_set_difference(&views);
-    if difference > 0 {
-        return Err(format!(
-            "rep_coverage_members and the P1 rows of study_members differ in {difference} rows"
-        ));
-    }
-    let measured = load_measured(&views, manifest.records);
-    let mismatches = p1_twin_mismatches(&views, &measured.inputs);
-    if mismatches > 0 {
-        return Err(format!(
-            "the ADR-058 twin disagrees on the P1 rows ({mismatches}); nothing is printed"
-        ));
-    }
-    let results = measure_contexts(&measured, run);
-    let mut out = String::new();
-    let _ = writeln!(out, "# P1 replication (#206, ADR-064)\n");
-    out.push_str(&identity(&manifest));
-    let _ = writeln!(
-        out,
-        "queries sha256 028 {STUDY_SQL_SHA256}, 205 {REPLICATION_SQL_SHA256}; ADR-064 frozen \
-         {ADR_FROZEN_SHA256}; replication.rs frozen decisions sha256 {}; record sets equal; \
-         ADR-058 twin mismatches 0\n",
-        sha256(frozen_code(THIS_FILE))
-    );
-    out.push_str(&measurement_body(&measured, &results, run));
-    Ok(out)
-}
-
 // ---------------------------------------------------------------------------
 // The entries (run by the main session; see the module docs).
 
@@ -2077,8 +2102,7 @@ fn coverage_p1_replication() {
 #[ignore = "the #206 measurement on the pinned replication dataset; reads outcomes"]
 fn measure_p1_replication() {
     let dir = std::path::PathBuf::from(env("MIE_OUTCOME_DATASET"));
-    let text = measure_run(&dir, &REPLICATION_PINS, &RUN)
-        .unwrap_or_else(|error| panic!("refused: {error}"));
+    let text = measure_replication(&dir).unwrap_or_else(|error| panic!("refused: {error}"));
     print!("{text}");
 }
 
@@ -2354,6 +2378,11 @@ fn the_code_freeze_holds_every_decision_and_catches_a_change() {
         ),
         ("(2.0 * plus.min(minus)).min(1.0)", "plus.min(minus)"),
         ("result.rejected[0],", "result.rejected[1],"),
+        (
+            "measure_run(dir, &REPLICATION_PINS, &RUN)",
+            "measure_run(dir, &REPLICATION_PINS, &RunSettings { draws: 1_000, ..RUN })",
+        ),
+        ("if *run != RUN {", "if false {"),
     ] {
         assert_eq!(region.matches(definition).count(), 1, "{definition}");
         let changed = region.replacen(definition, mutated, 1);
@@ -2371,6 +2400,8 @@ fn the_code_freeze_holds_every_decision_and_catches_a_change() {
         "fn null_p(",
         "fn read(",
         "fn measure_contexts(",
+        "fn measure_replication(",
+        "fn measure_run(",
     ] {
         assert!(region.contains(item), "{item} is frozen");
     }
@@ -2500,6 +2531,38 @@ fn the_pins_are_the_coverage_runs() {
         assert!(coverage.contains(&line), "{line}");
     }
     assert_eq!(contexts, baseline + trigger);
+}
+
+#[test]
+fn the_replication_dataset_is_measured_only_with_the_pre_registered_settings() {
+    // The review's mutation: the entry passes RUN with 10³ draws. On the
+    // replication pins the frozen measure_run refuses it before it opens
+    // the dataset (the path does not exist).
+    for run in [
+        RunSettings {
+            draws: 1_000,
+            ..RUN
+        },
+        RunSettings { mu: 0.2, ..RUN },
+        RunSettings {
+            t2_resamples: 100,
+            ..RUN
+        },
+        FIXTURE_RUN,
+    ] {
+        let refusal =
+            measure_run(Path::new("no-such-dataset"), &REPLICATION_PINS, &run).unwrap_err();
+        assert!(refusal.contains("only with RUN"), "{refusal}");
+    }
+    // With RUN the check passes and the next step (a clean build, or the
+    // hashes, or opening the dataset) is what refuses.
+    let refusal = measure_run(Path::new("no-such-dataset"), &REPLICATION_PINS, &RUN).unwrap_err();
+    assert!(!refusal.contains("only with RUN"), "{refusal}");
+    // The entry goes through the frozen path.
+    let entry = &THIS_FILE[THIS_FILE.find("fn measure_p1_replication()").unwrap()..];
+    let entry = &entry[..entry.find("\n}\n").unwrap()];
+    assert!(entry.contains("measure_replication(&dir)"), "{entry}");
+    assert!(!entry.contains("measure_run") && !entry.contains("RunSettings"));
 }
 
 #[test]
