@@ -363,7 +363,13 @@ fn rebuilds_from_full_stale_and_empty_agree() {
                 "empty" => damage_both_copies(&fixture),
                 _ => {}
             }
-            let (pass, out) = rebuild(&fixture, Flags::default(), REBUILT);
+            // The full start holds the part already; the stale and the
+            // empty one re-derive the hold, recorded with the flag.
+            let flags = Flags {
+                record_unlisted: with_hold,
+                ..Flags::default()
+            };
+            let (pass, out) = rebuild(&fixture, flags, REBUILT);
             assert_eq!(pass, !with_hold, "{start}: {out}");
             assert!(out.contains("wrote "), "{start}: {out}");
             if start == "empty" {
@@ -532,7 +538,14 @@ fn without_pending_the_same_parts_are_held_and_the_importer_refuses() {
     let (_dir, fixture) = adopted("rebuild-no-pending");
     let (day, parts) = interrupted_import(&fixture, false);
     fs::remove_file(hot_ledger(&fixture)).unwrap();
+    // Without --record-unlisted the parts are named and nothing is written.
     let (pass, out) = rebuild(&fixture, Flags::default(), REBUILT);
+    assert!(!pass && out.contains("nothing written"), "{out}");
+    assert!(!hot_ledger(&fixture).exists());
+    for part in &parts {
+        assert_fail_line(&out, &[part, "--record-unlisted"]);
+    }
+    let (pass, out) = rebuild(&fixture, record_unlisted(), REBUILT + 1);
     assert!(!pass, "{out}");
     assert_eq!(held(&fixture), parts.iter().cloned().collect());
     let error = run_import(&fixture, &metrics_day(day, false)).unwrap_err();
@@ -550,7 +563,7 @@ fn the_importer_refuses_while_a_hold_is_open() {
     let (_dir, fixture) = adopted("rebuild-importer-hold");
     let part = seal_unlisted_archive_part(&fixture);
     fs::remove_file(hot_ledger(&fixture)).unwrap();
-    let (pass, out) = rebuild(&fixture, Flags::default(), REBUILT);
+    let (pass, out) = rebuild(&fixture, record_unlisted(), REBUILT);
     assert!(!pass, "{out}");
     assert_fail_line(&out, &[&part, "held (unlisted)"]);
     let before = files(&fixture.dir);
@@ -672,4 +685,71 @@ fn a_missing_import_ledger_stops_the_rebuild() {
     assert!(pass, "{out}");
     assert!(held(&fixture).is_empty());
     run_import(&fixture, &metrics_day(day_index("2026-10-04"), true)).unwrap();
+}
+
+fn record_unlisted() -> Flags {
+    Flags {
+        record_unlisted: true,
+        ..Flags::default()
+    }
+}
+
+/// Re-review of #209, bypass (a): the import-ledger path exists but is an
+/// empty directory, as an unmounted mount point is. Without
+/// `--record-unlisted` nothing is installed and the output names the
+/// directory, its entry count and the target entries hot lacks, so no
+/// `unlisted` hold is written from an absence the operator never saw.
+#[test]
+fn an_empty_import_ledger_writes_no_unlisted_hold_without_the_flag() {
+    let (_dir, fixture) = adopted("rebuild-empty-import-ledger");
+    let day = day_index("2026-10-03");
+    run_import(&fixture, &metrics_day(day, false)).unwrap();
+    fs::remove_file(hot_ledger(&fixture)).unwrap();
+    let ledger_dir = fixture.archive_config.paths.import_ledger.clone();
+    let away = ledger_dir.with_extension("unmounted");
+    fs::rename(&ledger_dir, &away).unwrap();
+    fs::create_dir(&ledger_dir).unwrap();
+    let (pass, out) = rebuild(&fixture, Flags::default(), REBUILT);
+    fs::remove_dir(&ledger_dir).unwrap();
+    fs::rename(&away, &ledger_dir).unwrap();
+    assert!(!pass, "{out}");
+    assert!(out.contains("nothing written"), "{out}");
+    assert!(!hot_ledger(&fixture).exists(), "{out}");
+    assert_fail_line(
+        &out,
+        &[
+            &ledger_dir.display().to_string(),
+            "holds 0 entries",
+            "5 entries",
+            "--record-unlisted",
+        ],
+    );
+    // With the directory back, the rebuild passes, holds nothing and the
+    // importer runs.
+    let (pass, out) = rebuild(&fixture, Flags::default(), REBUILT + 1);
+    assert!(pass, "{out}");
+    assert!(held(&fixture).is_empty());
+    run_import(&fixture, &metrics_day(day_index("2026-10-04"), true)).unwrap();
+}
+
+/// Re-review of #209, bypass (b): the import-ledger path is a symlink to an
+/// unmounted disk. It is followed, so it is missing, and the rebuild stops
+/// with nothing written.
+#[test]
+fn a_dangling_import_ledger_symlink_stops_the_rebuild() {
+    let (_dir, fixture) = adopted("rebuild-dangling-import-ledger");
+    let day = day_index("2026-10-03");
+    run_import(&fixture, &metrics_day(day, false)).unwrap();
+    fs::remove_file(hot_ledger(&fixture)).unwrap();
+    let ledger_dir = fixture.archive_config.paths.import_ledger.clone();
+    let away = ledger_dir.with_extension("unmounted");
+    fs::rename(&ledger_dir, &away).unwrap();
+    std::os::unix::fs::symlink(ledger_dir.with_extension("disk-not-mounted"), &ledger_dir).unwrap();
+    let (pass, out) = rebuild(&fixture, record_unlisted(), REBUILT);
+    fs::remove_file(&ledger_dir).unwrap();
+    fs::rename(&away, &ledger_dir).unwrap();
+    assert!(!pass, "{out}");
+    assert_fail_line(&out, &[&ledger_dir.display().to_string(), "does not exist"]);
+    assert!(out.contains("nothing written"), "{out}");
+    assert!(!hot_ledger(&fixture).exists());
 }

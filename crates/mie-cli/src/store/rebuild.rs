@@ -51,7 +51,11 @@
 //!   import entry that no root holds is a candidate, recorded `lost` only
 //!   with `--record-lost`; a name outside the layout is reported, never
 //!   recorded; a path the start records lost stays lost.
-//! - **B7 Archive holds**, re-derived ([`archive_checks`]).
+//! - **B7 Archive holds**, re-derived ([`archive_checks`]). A new
+//!   `unlisted` hold comes from an absence, so it is written only with
+//!   `--record-unlisted`; without it the rebuild reports the candidates,
+//!   the import ledger's entry count and the target entries hot lacks, and
+//!   installs nothing. Conflict holds are always written.
 //! - **B8 Removed:** a partition with a verified cold copy and no
 //!   directory on hot; inside the hot window it is also a `FAIL:` line.
 //! - **B9 Install:** markers re-read, the old ledger linked aside, the gate
@@ -115,6 +119,11 @@ fn hook(slot: &'static std::thread::LocalKey<Hook>) {
 pub struct Flags {
     /// `--record-lost`: write the `lost` records (#193 STOP 1 decision 1).
     pub record_lost: bool,
+    /// `--record-unlisted`: write the `unlisted` holds. Like `lost`, a
+    /// hold derived from an absence (no current entry lists the part) is
+    /// irreversible before #194, and an empty or unmounted import ledger
+    /// reads as no entries (re-review of #209).
+    pub record_unlisted: bool,
     /// `--replace-hot-ledger`: replace a readable hot ledger (decision 2).
     pub replace_hot_ledger: bool,
 }
@@ -230,6 +239,10 @@ pub struct RebuildInputs {
     pub first_hot_date: String,
     /// `--record-lost`.
     pub record_lost: bool,
+    /// `--record-unlisted`.
+    pub record_unlisted: bool,
+    /// Hot's import-ledger directory as configured, named in the report.
+    pub import_ledger: Option<String>,
     /// Whether an archive configuration was given.
     pub archive_configured: bool,
     /// Hot's import-ledger directory (`paths.import_ledger`), named, when
@@ -294,6 +307,9 @@ pub struct Derived {
     pub lost: Vec<LostFile>,
     /// Every derived hold, in path order.
     pub holds: Vec<(String, HoldReason)>,
+    /// The new `unlisted` holds left unrecorded without
+    /// `--record-unlisted`: the rebuild then installs nothing.
+    pub unrecorded_unlisted: Vec<String>,
     /// Report lines (B11): the start, the rejected copies, the journal,
     /// the records added, the lost files, the holds.
     pub lines: Vec<String>,
@@ -873,22 +889,58 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
     }
 
     // B7: holds.
+    // An `unlisted` hold comes from an absence (no current entry lists the
+    // part), so a new one is written only with `--record-unlisted`, as a
+    // `lost` record only with `--record-lost`: an empty or unmounted import
+    // ledger reads as no entries (re-review of #209). The conflict reasons
+    // come from positive evidence and are always written.
     let mut holds = Vec::new();
     let mut hold_records = Vec::new();
+    let mut unrecorded_unlisted = Vec::new();
     for (path, reason) in &findings.holds {
         holds.push((path.clone(), *reason));
+        let new = state.hold_reason(path).is_none();
+        if new && *reason == HoldReason::Unlisted && !inputs.record_unlisted {
+            lines.push(format!("unlisted: {path} (not recorded)"));
+            problems.push(format!(
+                "{path}: no current import entry lists it, so it would be held (unlisted); \
+                 nothing is written without --record-unlisted (ADR-062 D7 step 5a, D11)"
+            ));
+            unrecorded_unlisted.push(path.clone());
+            continue;
+        }
         lines.push(format!("hold: {path} ({})", reason.as_str()));
         problems.push(format!(
             "{path}: held ({}): the importer refuses and every selection that covers it fails \
              until the hold is resolved (`mie store resolve`, #194; ADR-062 D11)",
             reason.as_str()
         ));
-        if state.hold_reason(path).is_none() {
+        if new {
             hold_records.push(Kind::Hold {
                 path: path.clone(),
                 reason: *reason,
             });
         }
+    }
+    if !unrecorded_unlisted.is_empty() {
+        let on_hot = inputs
+            .entries
+            .values()
+            .filter(|copies| copies.iter().any(|copy| copy.root == "hot"))
+            .count();
+        let targets_only = inputs.entries.len() - on_hot;
+        problems.push(format!(
+            "{} archive part(s) are listed by no current import entry. Hot's import ledger {} \
+             holds {on_hot} entries, and the copy targets hold {targets_only} entries that hot \
+             lacks: an empty or unmounted import ledger reads as no entries. Check it; once it \
+             is the store's, `mie store rebuild --record-unlisted` records these holds, which \
+             only the hold resolution clears (#194; ADR-062 D7 step 5a)",
+            unrecorded_unlisted.len(),
+            inputs
+                .import_ledger
+                .as_deref()
+                .unwrap_or("(none configured)")
+        ));
     }
     let mut start_holds = BTreeSet::new();
     for record in &start_ledger.records {
@@ -992,6 +1044,7 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
         added,
         lost,
         holds,
+        unrecorded_unlisted,
         lines,
         problems,
     })
@@ -1181,7 +1234,9 @@ fn rebuild(
     let mut missing_import_ledger = None;
     if let Some(archive) = &archive {
         let ledger_dir = &archive.paths.import_ledger;
-        match fs::symlink_metadata(ledger_dir) {
+        // Links are followed: a symlink to an unmounted disk is missing
+        // (re-review of #209).
+        match fs::metadata(ledger_dir) {
             Ok(_) => {}
             Err(error) if error.kind() == ErrorKind::NotFound => {
                 missing_import_ledger = Some(ledger_dir.display().to_string());
@@ -1265,6 +1320,10 @@ fn rebuild(
         at_ms,
         first_hot_date: first_hot_date.to_owned(),
         record_lost: flags.record_lost,
+        record_unlisted: flags.record_unlisted,
+        import_ledger: archive
+            .as_ref()
+            .map(|archive| archive.paths.import_ledger.display().to_string()),
         archive_configured: archive.is_some(),
         missing_import_ledger,
         ledger_copies,
@@ -1279,7 +1338,7 @@ fn rebuild(
     let derived = derive(&inputs)?;
     report.lines.extend(derived.lines.iter().cloned());
     report.problems.extend(derived.problems.iter().cloned());
-    if derived.lost.iter().any(|file| !file.recorded) {
+    if derived.lost.iter().any(|file| !file.recorded) || !derived.unrecorded_unlisted.is_empty() {
         report.lines.push("nothing written".to_owned());
         return Ok(());
     }

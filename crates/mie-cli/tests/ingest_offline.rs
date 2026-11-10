@@ -1499,12 +1499,15 @@ mod tiered_start {
                 std::fs::remove_file(ledger).unwrap();
             });
         assert!(before.0, "{}", before.1);
-        let rebuild = || {
+        let rebuild = |record_unlisted: bool| {
             let mut out = Vec::new();
             let pass = mie_cli::store::rebuild(
                 &config,
                 Some(&dir.path().join("archive.toml")),
-                mie_cli::store::rebuild::Flags::default(),
+                mie_cli::store::rebuild::Flags {
+                    record_unlisted,
+                    ..mie_cli::store::rebuild::Flags::default()
+                },
                 &mie_cli::ingest::first_hot_date(T),
                 super::common::probe_for(&config).as_ref(),
                 &|| T + HOUR,
@@ -1516,11 +1519,18 @@ mod tiered_start {
         // The fixture seals its archive rows without the importer, so no
         // import ledger exists: with archive parts on hot that is a stop
         // (review of #209, finding 2). An importer that ran creates it.
-        let (pass, text) = rebuild();
+        let (pass, text) = rebuild(false);
         assert!(!pass && text.contains("nothing written"), "{text}");
         assert!(text.contains("does not exist"), "{text}");
         std::fs::create_dir_all(dir.path().join("ledger")).unwrap();
-        let (pass, text) = rebuild();
+        // With the directory, its archive parts are listed by no entry: the
+        // first run names them and writes nothing, the second records the
+        // holds (--record-unlisted).
+        let (pass, text) = rebuild(false);
+        assert!(!pass && text.contains("nothing written"), "{text}");
+        assert!(text.contains("--record-unlisted"), "{text}");
+        assert!(!copy_ledger::ledger_path(&config.paths.raw_root).exists());
+        let (pass, text) = rebuild(true);
         assert!(
             text.contains("started empty") && text.contains("wrote "),
             "{text}"

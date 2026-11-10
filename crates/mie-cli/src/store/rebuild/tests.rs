@@ -23,6 +23,8 @@ fn inputs() -> RebuildInputs {
         first_hot_date: "2026-10-05".to_owned(),
         record_lost: false,
         archive_configured: true,
+        record_unlisted: false,
+        import_ledger: Some("the import ledger".to_owned()),
         missing_import_ledger: None,
         ledger_copies: vec![
             LedgerCopyRead {
@@ -265,6 +267,7 @@ fn records_are_appended_in_a_fixed_order() {
     let archive = part("aggTrades", "2026-10-02", 0);
     let mut inputs = inputs();
     inputs.record_lost = true;
+    inputs.record_unlisted = true;
     for path in [&p2, &p1, &archive] {
         let t = text(path, &sha(path));
         on(&mut inputs, 1, path, good(&t));
@@ -791,4 +794,43 @@ fn a_missing_import_ledger_stops_only_where_it_could_hide_entries() {
             "{case}: {why}"
         );
     }
+}
+
+/// Re-review of #209: a new `unlisted` hold is written only with
+/// `--record-unlisted`; without it the candidate is named, the import
+/// ledger's counts too, and nothing may be installed. A conflict hold
+/// needs no flag.
+#[test]
+fn unlisted_holds_need_the_flag() {
+    let path = part("aggTrades", "2026-10-06", 0);
+    let mut inputs = inputs();
+    on_hot(&mut inputs, &path, &text(&path, &sha("a")));
+    inputs.entries.insert(
+        NAME.to_owned(),
+        vec![EntryCopy {
+            root: "cold-a".to_owned(),
+            bytes: entry(&[]),
+        }],
+    );
+    let derived = derive_ok(&inputs);
+    assert!(derived.added.is_empty(), "{:?}", derived.added);
+    assert_eq!(derived.unrecorded_unlisted, vec![path.clone()]);
+    assert_problem(&derived, &[&path, "--record-unlisted"]);
+    assert_problem(
+        &derived,
+        &[
+            "the import ledger holds 0 entries",
+            "hold 1 entries that hot lacks",
+        ],
+    );
+    inputs.record_unlisted = true;
+    let derived = derive_ok(&inputs);
+    assert!(derived.unrecorded_unlisted.is_empty());
+    assert_eq!(
+        added(&derived),
+        vec![Kind::Hold {
+            path,
+            reason: HoldReason::Unlisted
+        }]
+    );
 }

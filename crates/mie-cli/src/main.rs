@@ -393,7 +393,7 @@ USAGE:
         exits 1.
 
     mie store rebuild --config <path> [--archive-config <path>]
-                      [--record-lost] [--replace-hot-ledger]
+                      [--record-lost] [--record-unlisted] [--replace-hot-ledger]
         Rebuild hot's copy ledger of a tiered raw store (ADR-062 D7) after
         it was lost or damaged, while mie ingest keeps capturing. It starts
         from the longest copy-ledger copy on a copy target whose hash chain
@@ -405,10 +405,17 @@ USAGE:
         on hot as removed, and the archive holds it re-derives. A file a
         record names that no root holds is reported lost; --record-lost
         records it, after which every replay that covers it fails, so pass
-        it only after a run without it reported the file. A readable hot
-        ledger is replaced only with --replace-hot-ledger. The old ledger,
-        and every ledger copy that is no prefix of the new one, is moved
-        into .mie/damaged/<time>/, never deleted. Every root, read-only
+        it only after a run without it reported the file. An archive part
+        no import entry lists is held only with --record-unlisted, after
+        which the importer refuses until the hold is resolved; a run
+        without it names the parts, the import ledger's directory, how many
+        entries it holds and how many entries the copy targets hold that
+        hot lacks (an empty or unmounted directory reads as no entries),
+        and writes nothing. A missing import-ledger directory, or a link to
+        a missing one, stops the rebuild while archive data exists. A
+        readable hot ledger is replaced only with --replace-hot-ledger. The
+        old ledger, and every ledger copy that is no prefix of the new one,
+        is moved into .mie/damaged/<time>/, never deleted. Every root, read-only
         roots included, must carry its marker. The rebuild reads every copy
         on every root once, the cost of one verification; replication, hot
         removal and imports pause meanwhile, and hot removal resumes only
@@ -917,13 +924,14 @@ fn dispatch(args: &[String]) -> Result<ExitCode, String> {
                 let options = Options::parse(
                     &args[2..],
                     &["--config", "--archive-config"],
-                    &["--record-lost", "--replace-hot-ledger"],
+                    &["--record-lost", "--record-unlisted", "--replace-hot-ledger"],
                 )?;
                 let config =
                     IngestConfig::load(&options.path("--config")?).map_err(|e| e.to_string())?;
                 let archive = options.optional("--archive-config").map(PathBuf::from);
                 let flags = store::rebuild::Flags {
                     record_lost: options.flag("--record-lost"),
+                    record_unlisted: options.flag("--record-unlisted"),
                     replace_hot_ledger: options.flag("--replace-hot-ledger"),
                 };
                 let probe = store::device_probe()?;
@@ -949,7 +957,8 @@ fn dispatch(args: &[String]) -> Result<ExitCode, String> {
                  <dir>]`, `mie store verify --config <path> [--archive-config <path>] \
                  --period-hours <P>`, `mie store repair --config <path> [--archive-config \
                  <path>] [--record-lost]` or `mie store rebuild --config <path> \
-                 [--archive-config <path>] [--record-lost] [--replace-hot-ledger]`"
+                 [--archive-config <path>] [--record-lost] [--record-unlisted] \
+                 [--replace-hot-ledger]`"
                     .to_owned(),
             ),
         },

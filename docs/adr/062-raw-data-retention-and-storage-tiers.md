@@ -987,16 +987,20 @@ live in more than one root (approved as written at STOP 1).
     error is refused. Archive paths on any root or in the start copy with
     no archive configuration are refused: without the import ledger
     neither the step 4 cross-check nor step 5a can run. A hot
-    import-ledger directory that does not exist is refused too, while an
+    import-ledger directory that does not exist, links followed (a link to
+    an unmounted disk is missing), is refused too, while an
     archive part exists on any root or in the start copy or a copy target
     holds import entries: an unmounted or misconfigured directory reads as
     empty, the same trap the root markers exist for, and every archive
     part only hot holds would become a permanent `unlisted` hold (review of
-    #209, finding 2). An archive configuration that names another existing
-    import ledger is not detected: the directory carries no binding to the
-    store (no marker or store id), and the configuration check compares
-    `raw_root` and `cold_roots` only. A complete binding needs such a marker,
-    a format change outside this step.
+    #209, finding 2). An existing directory that is empty (an unmounted
+    mount point) or another store's import ledger is not detected here: the
+    directory carries no binding to the store (no marker or store id), the
+    configuration check compares `raw_root` and `cold_roots` only, and an
+    import ledger that is genuinely gone must stay recoverable. B7 covers
+    both: a new `unlisted` hold, the only reason derived from an absence,
+    is written only with `--record-unlisted`. A complete binding needs a
+    marker in the import ledger, a format change outside this step.
   - **B1 Read order**, nothing written: every copy target's ledger copy;
     hot's journal up to the length J read now (bytes after J, and a line
     cut at J, are not parsed); every import entry on hot and on the
@@ -1050,7 +1054,16 @@ live in more than one root (approved as written at STOP 1).
     except the parts of `PENDING`'s stream dated in the importer's orphan
     window `[first day − 1, last day + 1]` of its period (one function of
     the importer, so the two never disagree), and one reason per path,
-    `manifest-conflict` > `entry-conflict` > `unlisted`. A `PENDING` that
+    `manifest-conflict` > `entry-conflict` > `unlisted`. A new `unlisted`
+    hold is written only with `--record-unlisted` (operator, re-review of
+    #209, the principle of #193 STOP 1 decision 1: an irreversible record
+    derived from an absence needs an explicit flag). Without it every
+    candidate is a `FAIL:` line, the output names the import ledger's
+    directory, how many entries it holds and how many entries the copy
+    targets hold that hot lacks, so an empty or unmounted directory shows
+    before the flag is passed, and nothing is installed. The conflict
+    reasons come from positive evidence (two texts, two entry copies) and
+    are always written. A `PENDING` that
     cannot be read or parsed exempts nothing. A hold the start carries
     that the sources no longer derive stays held and is named: no record
     clears a hold before #194.
@@ -1754,7 +1767,8 @@ What breaks:
     The checks of step 5 are one pure function shared by the rebuild
     (D7 step 5a) and the hot restore, which passes no `PENDING`; a part
     that qualifies for several reasons gets one, `manifest-conflict` >
-    `entry-conflict` > `unlisted`.
+    `entry-conflict` > `unlisted`. The rebuild writes a new `unlisted`
+    hold only with `--record-unlisted` (D7 *As implemented* B7).
 
   Why a restore and not "the capture continues": on an empty hot the
   writer numbers new parts from `part-00000` under paths that cold
