@@ -12,6 +12,9 @@ every result, null results included.
   run by the study's tool, which loads the file with `include_str!`, so the
   file in the repository is the file that ran.
 - `NNN-slug.md`: the study's report, one per study, same name.
+- `NNN-slug-coverage.md`: for a study whose window is read in a later
+  issue, the output of its coverage run, which reads no outcome: the units
+  each cell can reach, written before any outcome is read.
 
 No data files: a report names its dataset by content hash, and the dataset
 is rebuilt from versioned raw data (ADR-057 D3).
@@ -34,3 +37,4 @@ is rebuilt from versioned raw data (ADR-057 D3).
 | Study | Issue | Pre-registered by | Queries | Report |
 |---|---|---|---|---|
 | Order-flow interactions and counter-hypotheses | #28 | ADR-058 | [`028-order-flow-interactions.sql`](028-order-flow-interactions.sql) | [`028-order-flow-interactions.md`](028-order-flow-interactions.md) |
+| P1 replication on 2020-01 … 2024-09 | #205, #206 | ADR-064 | [`205-p1-replication.sql`](205-p1-replication.sql) (after `028-order-flow-interactions.sql`) | coverage: [`205-p1-replication-coverage.md`](205-p1-replication-coverage.md) (#205, dataset content `e985ea3e…`); report: [`205-p1-replication.md`](205-p1-replication.md) (#206, dataset content `e985ea3e…`) |

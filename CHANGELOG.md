@@ -38,7 +38,49 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   `lost` record only with `--record-lost`), and ends with one replication
   pass. The hot removal and the replication pass now treat a copy-ledger
   finding as voiding that target's ledger copy until it is repaired.
-
+- **P1 replication on 2020-01 … 2024-09, measured: not replicated (#206,
+  ADR-064 accepted).** `docs/research/205-p1-replication.md` holds the one
+  pre-registered run of `measure_p1_replication` from #207's merge commit
+  and its whole output: 46 of 48 contexts measurable, all 46 read `no
+  effect` (no context rejected by Benjamini–Hochberg at q = 0.05), so
+  `replicated: 0 of 48` and stop rule S3 applies; nothing is promoted and
+  the hold-out stays unread. ADR-064 gains its `## Acceptance` section and
+  status `accepted`. Docs only.
+- **P1 replication on 2020-01 … 2024-09, pre-registered and blind (#205,
+  ADR-064, proposed).** ADR-064 fixes the replication of #28's P1-buy and
+  P1-sell before any outcome of the window is read: records = replay =
+  2020-01-01 … 2024-09-30 from `aggTrades` only, 48 contexts (side ×
+  effort window × regime × 4h and 1d), E exactly as ADR-058 D4, a
+  per-label taker fee, T1 on ADR-058 D6 units (n_min 385), T2 on the
+  units' representatives, a `neither` exit marked to market at H, with a
+  56-day block bootstrap (28 and 112 days for sensitivity, seed 205), T3 as a rotation null by whole weeks within
+  8-week blocks (4 weeks for sensitivity, 10⁶ draws, two-sided),
+  Benjamini–Hochberg over all 48 at q = 0.05, the readings and stop
+  rules, and a freeze of its own text, the queries and the tool's
+  decision code (one hashed region, printed by both entries; #206 runs
+  from #207's merge commit exactly). `docs/research/205-p1-replication.sql`
+  holds a coverage chain that restates P1 without the outcome-carrying
+  views and a measurement chain; `crates/mie-cli/tests/order_flow_study/replication.rs`
+  holds the ignored entries `coverage_p1_replication` (reads no outcome:
+  its input types have no outcome field, and a twin recounts its units)
+  and `measure_p1_replication` (runs only on the pinned dataset), both behind a window and provenance guard that refuses the
+  calibration slice, another stream set or engine, and a dirty build. The
+  fixture tests pin BH on the 1995 example, the rotation null by
+  exhaustive enumeration and against a free shuffle on clustered
+  synthetic data, the guard, the coverage blindness (column lists and
+  outcome-swapping datasets), the frozen hashes and that a changed
+  decision moves the code hash, the mark to market, and the ADR-058 report
+  byte for byte. The ADR-058 path is unchanged. The window was then
+  imported into its own store (1 735 of 1 735 files, `archive-verify`
+  PASS, 2 327 594 366 rows, 66.0 GB), built once from that commit
+  (content `e985ea3e…`, 2 638 166 records) and covered without reading an
+  outcome, again after the review amendment with identical counts: 46 of
+  48 contexts are measurable, and P1-buy w=1h high and
+  extreme at 1d (354 and 288 units) are not.
+  `docs/research/205-p1-replication-coverage.md` holds the coverage
+  output, ADR-064's pre-registration record the command log, the tool the
+  dataset pins, and `docs/data-availability.md` the imported window. No
+  outcome of the window was read.
 - **Storage tiers, step 5: hot removal, recall and union part numbering
   in `mie ingest` (#191, ADR-062 D6, D11, proposed).** A tiered store's
   writer (`ParquetRawStore::tiered_writer`, with a `TierContext`: the
