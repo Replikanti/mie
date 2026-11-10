@@ -806,3 +806,98 @@ fn the_locks_refuse_and_a_read_only_source_is_never_written() {
         );
     }
 }
+
+/// Review of #203, finding 2 (R9): the only good copy of a removed file
+/// sits on cold-b, which fails to read (EIO from a failing disk; here a
+/// mode-000 file). The repair names cold-b's read error and reports the
+/// file "not repairable in this run", never lost: with `--record-lost` no
+/// `lost` record is appended, and cold-b's copy stays byte-identical. Once
+/// the read error is gone, the next repair repairs cold-a from cold-b.
+#[test]
+fn a_read_error_on_the_only_good_copy_is_not_repairable_never_lost() {
+    let (_dir, fixture) = adopted("repair-read-error");
+    let path = removed_file(&fixture);
+    flip(&cold(&fixture, "cold-a").join(&path), 40);
+    assert!(!verify(&fixture, VERIFIED).0);
+    let good = cold(&fixture, "cold-b").join(&path);
+    let good_bytes = fs::read(&good).unwrap();
+    fs::set_permissions(&good, fs::Permissions::from_mode(0o000)).unwrap();
+    let (pass, out) = repair_with(
+        &fixture.config,
+        &fixture.dst_archive,
+        &fixture.probe(),
+        REPAIRED,
+        true,
+    );
+    writable(&good);
+    assert!(!pass, "{out}");
+    assert_fail_line(
+        &out,
+        &[
+            &path,
+            "not repairable in this run",
+            "cold-b",
+            "cannot be read",
+        ],
+    );
+    assert!(!out.contains(&format!("{path} is lost")), "{out}");
+    assert_eq!(fs::read(&good).unwrap(), good_bytes);
+    assert!(
+        !records(&fixture)
+            .iter()
+            .any(|r| matches!(r.kind, Kind::Lost { .. })),
+        "a file whose good copy is intact on cold-b was recorded lost"
+    );
+
+    let (pass, out) = repair(&fixture, REPAIRED + 1);
+    assert!(pass, "{out}");
+    assert_eq!(
+        fs::read(cold(&fixture, "cold-a").join(&path)).unwrap(),
+        good_bytes
+    );
+}
+
+/// Review of #203, finding 3 (R6): cold-a's ledger copy holds every
+/// complete record of hot's but NULs in place of its last line (a crash
+/// during `extend_prefix` on a filesystem that exposes the new size before
+/// the data). Verify records it, the pass refuses the copy, and the repair
+/// rebuilds it up to its last complete record; the closing pass extends
+/// it, the removal plan has candidates again and the next verify passes.
+#[test]
+fn a_ledger_copy_with_a_damaged_tail_is_rebuilt_and_extended() {
+    let (_dir, fixture) = adopted("repair-ledger-tail");
+    let copy = copy_ledger::ledger_path(&cold(&fixture, "cold-a"));
+    let bytes = fs::read(&copy).unwrap();
+    let last_start = bytes[..bytes.len() - 1]
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .unwrap()
+        + 1;
+    let mut damaged = bytes[..last_start].to_vec();
+    damaged.extend_from_slice(&[0u8; 40]);
+    writable(&copy);
+    fs::write(&copy, &damaged).unwrap();
+    let (pass, out) = verify(&fixture, VERIFIED);
+    assert!(!pass, "{out}");
+    assert_fail_line(&out, &["copy ledger on copy target", "cold-a", "prefix:"]);
+    assert!(planned(&plan(&fixture, VERIFIED + 1)).is_empty());
+
+    let (pass, out) = repair(&fixture, REPAIRED);
+    assert!(pass, "{out}");
+    let repaired = fs::read(&copy).unwrap();
+    assert_eq!(copy_ledger::check_chain(&repaired).failure, None);
+    assert_eq!(copy_ledger::check_chain(&repaired).tail_bytes, 0);
+    let hot = fs::read(copy_ledger::ledger_path(&fixture.hot())).unwrap();
+    assert!(hot.starts_with(&repaired));
+    assert!(repaired.len() > last_start, "the closing pass extended it");
+    assert_eq!(
+        fs::read(
+            replica::damaged_dir(&cold(&fixture, "cold-a"), REPAIRED).join(".mie/copy-ledger")
+        )
+        .unwrap(),
+        damaged
+    );
+    assert!(!planned(&plan(&fixture, REPAIRED + 1)).is_empty());
+    let (pass, out) = verify(&fixture, REPAIRED + 2);
+    assert!(pass, "{out}");
+}

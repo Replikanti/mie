@@ -32,12 +32,18 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   moving the damaged bytes aside into `<root>/.mie/damaged/<time>/`, ends
   each with a fresh `copy` record so the partition becomes removable
   again, refills a target added or replaced after files left hot, rebuilds
-  ledger and journal copies from hot where that is safe, refuses divergent
-  ledger copies, unattributable journal copies and entry conflicts,
-  reports a file with no good copy left as lost and writes nothing (the
-  `lost` record only with `--record-lost`), and ends with one replication
-  pass. The hot removal and the replication pass now treat a copy-ledger
-  finding as voiding that target's ledger copy until it is repaired.
+  ledger and journal copies from hot where that is safe (a ledger copy
+  whose only damage is an unterminated tail, such as NULs left by a crash,
+  is cut back to its last complete record), refuses divergent ledger
+  copies, unattributable journal copies and entry conflicts, reports a
+  file with no good copy left as lost and writes nothing (the `lost`
+  record only with `--record-lost`; a root that fails to read or no
+  longer carries its marker makes the file "not repairable in this run"
+  instead), skips a hot copy whose partition a concurrent removal
+  recorded removed, and ends with one replication pass. The hot removal
+  and the replication pass now treat a copy-ledger finding as voiding that
+  target's ledger copy until it is repaired, including a finding a
+  verification records while the pass runs.
 - **P1 replication on 2020-01 … 2024-09, measured: not replicated (#206,
   ADR-064 accepted).** `docs/research/205-p1-replication.md` holds the one
   pre-registered run of `measure_p1_replication` from #207's merge commit

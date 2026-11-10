@@ -1036,13 +1036,25 @@ pub enum LedgerCopyCheck {
         /// The first differing byte.
         offset: u64,
     },
-    /// The chain verifies and the copy agrees with hot's ledger, but it is
-    /// longer than hot's verified prefix.
+    /// The chain verifies and the copy's complete records agree with hot's
+    /// ledger, but they run past hot's verified prefix.
     Longer {
-        /// The copy's length.
+        /// The end of the copy's last complete record.
         len: u64,
         /// Hot's verified prefix.
         verified: u64,
+    },
+    /// Every complete record verifies and equals hot's, but the
+    /// unterminated tail after them differs from hot's bytes or runs past
+    /// hot's verified prefix: a crash during the tail append on a
+    /// filesystem that exposes the extended size before the data (XFS,
+    /// ext4 with `data=writeback`) leaves NULs there. The tail is no
+    /// record, so cutting the copy back to `offset` loses nothing (review
+    /// of #203, finding 3).
+    Tail {
+        /// The end of the copy's last complete record: where its tail
+        /// starts.
+        offset: u64,
     },
 }
 
@@ -1076,18 +1088,30 @@ pub fn check_copy(hot_root: &Path, target_root: &Path) -> Result<LedgerCopyCheck
 
 /// The classification of [`check_copy`] over the bytes of a copy and of
 /// hot's ledger, whose verified prefix is `verified` bytes long.
+///
+/// `Diverged` and `Longer` look at the complete records only: two valid
+/// chains, one holding records the other lacks. An unterminated tail after
+/// them is no record (`check_chain` ignores it too), so a tail that differs
+/// from hot's bytes, or runs past hot's verified prefix, is `Tail` (review
+/// of #203, finding 3).
 fn classify_copy(copy: &[u8], hot: &[u8], verified: u64) -> LedgerCopyCheck {
-    if let Some(ChainFailure { record, offset }) = check_chain(copy).failure {
+    let chain = check_chain(copy);
+    if let Some(ChainFailure { record, offset }) = chain.failure {
         return LedgerCopyCheck::Chain { record, offset };
     }
-    if let Some(offset) = copy.iter().zip(hot).position(|(a, b)| a != b) {
+    let complete = copy.len() - chain.tail_bytes as usize;
+    if let Some(offset) = copy[..complete].iter().zip(hot).position(|(a, b)| a != b) {
         return LedgerCopyCheck::Diverged {
             offset: offset as u64,
         };
     }
-    let len = copy.len() as u64;
+    let len = complete as u64;
     if len > verified {
         return LedgerCopyCheck::Longer { len, verified };
+    }
+    let tail = &copy[complete..];
+    if copy.len() as u64 > verified || hot.get(complete..copy.len()) != Some(tail) {
+        return LedgerCopyCheck::Tail { offset: len };
     }
     LedgerCopyCheck::Good
 }
@@ -1226,6 +1250,55 @@ impl CopyLedger {
             Err(TryLockError::Error(error)) => Err(io_error("lock", &self.lock)(error)),
         }
     }
+
+    /// Appends `record` under a blocking lock, as [`append`](Self::append)
+    /// does, unless `veto` refuses it. Under that same lock `veto` sees
+    /// the records after byte `offset`, whose record ends with the chain
+    /// hash `chain` (as [`LedgerHold::records_after`] reads them), so no
+    /// other append lands between the check and the record. Why: a pass
+    /// that read the ledger at `offset` must not append a `ledger-copy`
+    /// record after a copy-ledger finding it never saw, which would close
+    /// that finding with no repair (review of #203, finding 1).
+    ///
+    /// # Errors
+    ///
+    /// As [`append`](Self::append), and as [`LedgerHold::records_after`]
+    /// for the tail read (nothing is appended then).
+    pub fn append_unless(
+        &self,
+        record: &Record,
+        offset: u64,
+        chain: &str,
+        veto: &dyn Fn(&[Record]) -> Option<String>,
+    ) -> Result<Guarded, AppendError> {
+        record.body()?;
+        match fs::symlink_metadata(&self.ledger) {
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                return Err(missing_ledger(&self.ledger).into());
+            }
+            Err(error) => return Err(io_error("inspect", &self.ledger)(error).into()),
+            Ok(_) => {}
+        }
+        let lock = open_lock(&self.lock)?;
+        lock.lock().map_err(io_error("lock", &self.lock))?;
+        let hold = LedgerHold {
+            ledger: self.ledger.clone(),
+            _lock: lock,
+        };
+        if let Some(reason) = veto(&hold.records_after(offset, chain)?) {
+            return Ok(Guarded::Vetoed(reason));
+        }
+        hold.append(record).map(Guarded::Appended)
+    }
+}
+
+/// What [`CopyLedger::append_unless`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Guarded {
+    /// The record was appended.
+    Appended(AppendOutcome),
+    /// The veto refused it, for this reason; nothing was written.
+    Vetoed(String),
 }
 
 /// The copy-ledger lock held for a whole run; dropping it releases the
@@ -1268,66 +1341,87 @@ impl LedgerHold {
     /// [`RawStoreError::Corrupt`] for a verified line outside the grammar;
     /// [`RawStoreError::Io`] when it cannot be read.
     pub fn records_after(&self, offset: u64, chain: &str) -> Result<Vec<Record>, RawStoreError> {
-        let path = &self.ledger;
-        let changed = |detail: &str| {
-            RawStoreError::Integrity(format!(
-                "copy ledger {}: the copy ledger changed since the plan ({detail}); the plan is \
-                 dropped (ADR-062 D6)",
+        tail_after(&self.ledger, offset, chain)
+    }
+}
+
+/// [`LedgerHold::records_after`] over the ledger at `path`; the caller
+/// decides whether it holds the lock.
+fn tail_after(path: &Path, offset: u64, chain: &str) -> Result<Vec<Record>, RawStoreError> {
+    let changed = |detail: &str| {
+        RawStoreError::Integrity(format!(
+            "copy ledger {}: the copy ledger changed since the plan ({detail}); the plan is \
+             dropped (ADR-062 D6)",
+            path.display()
+        ))
+    };
+    let mut file = File::open(path).map_err(io_error("open", path))?;
+    let len = file.metadata().map_err(io_error("stat", path))?.len();
+    let header_len = HEADER.len() as u64;
+    if offset < header_len || len < offset {
+        return Err(changed(&format!("{len} bytes, the plan read {offset}")));
+    }
+    if offset == header_len {
+        if chain != genesis() || read_at(&mut file, path, 0, HEADER.len())? != HEADER.as_bytes() {
+            return Err(changed("its header-only prefix differs"));
+        }
+    } else {
+        let before = CHAIN_LEN as u64 + 1;
+        if offset < header_len + before {
+            return Err(changed("the plan's offset is inside the header"));
+        }
+        let mut expected = chain.as_bytes().to_vec();
+        expected.push(b'\n');
+        if read_at(&mut file, path, offset - before, before as usize)? != expected {
+            return Err(changed(&format!(
+                "the record before byte {offset} is not the plan's last record"
+            )));
+        }
+    }
+    let tail = read_at(&mut file, path, offset, (len - offset) as usize)?;
+    let mut lines: Vec<(u64, &[u8])> = Vec::new();
+    let mut cursor = 0;
+    while let Some(n) = tail[cursor..].iter().position(|&b| b == b'\n') {
+        lines.push((offset + cursor as u64, &tail[cursor..cursor + n]));
+        cursor += n + 1;
+    }
+    let mut previous = chain.as_bytes().to_vec();
+    let mut records = Vec::new();
+    for (i, (at, line)) in lines.iter().enumerate() {
+        let Some(next) = verified_chain(&previous, line) else {
+            // A complete last line that fails, with no partial tail
+            // after it, is the incomplete trailing record.
+            if i + 1 == lines.len() && cursor == tail.len() {
+                break;
+            }
+            return Err(changed(&format!("the hash chain fails at byte {at}")));
+        };
+        previous = next.to_vec();
+        records.push(parse_line(line).map_err(|detail| {
+            RawStoreError::Corrupt(format!(
+                "copy ledger {}: the record at byte {at}: {detail}",
                 path.display()
             ))
-        };
-        let mut file = File::open(path).map_err(io_error("open", path))?;
-        let len = file.metadata().map_err(io_error("stat", path))?.len();
-        let header_len = HEADER.len() as u64;
-        if offset < header_len || len < offset {
-            return Err(changed(&format!("{len} bytes, the plan read {offset}")));
-        }
-        if offset == header_len {
-            if chain != genesis() || read_at(&mut file, path, 0, HEADER.len())? != HEADER.as_bytes()
-            {
-                return Err(changed("its header-only prefix differs"));
-            }
-        } else {
-            let before = CHAIN_LEN as u64 + 1;
-            if offset < header_len + before {
-                return Err(changed("the plan's offset is inside the header"));
-            }
-            let mut expected = chain.as_bytes().to_vec();
-            expected.push(b'\n');
-            if read_at(&mut file, path, offset - before, before as usize)? != expected {
-                return Err(changed(&format!(
-                    "the record before byte {offset} is not the plan's last record"
-                )));
-            }
-        }
-        let tail = read_at(&mut file, path, offset, (len - offset) as usize)?;
-        let mut lines: Vec<(u64, &[u8])> = Vec::new();
-        let mut cursor = 0;
-        while let Some(n) = tail[cursor..].iter().position(|&b| b == b'\n') {
-            lines.push((offset + cursor as u64, &tail[cursor..cursor + n]));
-            cursor += n + 1;
-        }
-        let mut previous = chain.as_bytes().to_vec();
-        let mut records = Vec::new();
-        for (i, (at, line)) in lines.iter().enumerate() {
-            let Some(next) = verified_chain(&previous, line) else {
-                // A complete last line that fails, with no partial tail
-                // after it, is the incomplete trailing record.
-                if i + 1 == lines.len() && cursor == tail.len() {
-                    break;
-                }
-                return Err(changed(&format!("the hash chain fails at byte {at}")));
-            };
-            previous = next.to_vec();
-            records.push(parse_line(line).map_err(|detail| {
-                RawStoreError::Corrupt(format!(
-                    "copy ledger {}: the record at byte {at}: {detail}",
-                    path.display()
-                ))
-            })?);
-        }
-        Ok(records)
+        })?);
     }
+    Ok(records)
+}
+
+/// The records after byte `offset` of the copy ledger of the store rooted
+/// at `raw_root`, as [`LedgerHold::records_after`] reads them but without
+/// the lock: what a reader that read the ledger up to `offset` has not seen
+/// yet. A check that must not race an append uses
+/// [`CopyLedger::append_unless`] instead.
+///
+/// # Errors
+///
+/// As [`LedgerHold::records_after`].
+pub fn records_after(
+    raw_root: &Path,
+    offset: u64,
+    chain: &str,
+) -> Result<Vec<Record>, RawStoreError> {
+    tail_after(&ledger_path(raw_root), offset, chain)
 }
 
 /// The error for a ledger that does not exist.

@@ -397,6 +397,16 @@ impl LedgerAppend for Truncating<'_> {
             }),
         })
     }
+
+    fn append_unless(
+        &self,
+        record: &Record,
+        offset: u64,
+        chain: &str,
+        veto: &dyn Fn(&[Record]) -> Option<String>,
+    ) -> Result<copy_ledger::Guarded, AppendError> {
+        self.inner.append_unless(record, offset, chain, veto)
+    }
 }
 
 /// The acceptance item of #189 (review of #197, finding 5): a failed
@@ -1186,4 +1196,165 @@ fn an_open_copy_ledger_finding_holds_the_ledger_copy_until_cleared() {
     assert_eq!(ledger_copies(&fixture, "cold-a"), a_before + 1);
     // The finding is closed: the next ordinary pass passes.
     assert_eq!(fixture.pass().problems, Vec::<String>::new());
+}
+
+/// Damages cold-a's ledger copy in its first record, which
+/// `extend_prefix` never re-reads (it compares only the last line), and
+/// returns the copy's path.
+fn damage_first_ledger_record(fixture: &Fixture) -> PathBuf {
+    let copy_a = copy_ledger::ledger_path(&fixture.cold[0]);
+    let mut bytes = fs::read(&copy_a).unwrap();
+    let at = copy_ledger::HEADER.len() + 3;
+    bytes[at] = if bytes[at] == b'1' { b'2' } else { b'1' };
+    fs::write(&copy_a, &bytes).unwrap();
+    assert!(bytes.iter().filter(|&&b| b == b'\n').count() >= 4);
+    assert!(copy_ledger::check_chain(&bytes).failure.is_some());
+    copy_a
+}
+
+/// A `mie store verify` run over the fixture, as a closure a pass hook
+/// calls (V10: the verification takes no pass lock).
+fn verification(fixture: &Fixture) -> impl Fn() -> crate::store::verify::VerifyReport + 'static {
+    let config = fixture.config.clone();
+    let archive = fixture.archive();
+    let probe = Probe(fixture.probe.0.clone());
+    let hot = fixture.hot.clone();
+    move || {
+        crate::store::verify::run(
+            &config,
+            Some(&archive),
+            "1",
+            &probe,
+            &|| D0 + 36_000_000,
+            &CopyLedger::at(&hot),
+        )
+    }
+}
+
+/// Whether cold-a has an open copy-ledger finding in hot's ledger.
+fn open_ledger_finding_on_a(fixture: &Fixture) -> bool {
+    let ledger = copy_ledger::read(&fixture.hot).unwrap().unwrap();
+    verification::CopyState::fold(&ledger)
+        .unwrap()
+        .open_ledger_finding("cold-a")
+}
+
+/// What a pass that met a mid-pass copy-ledger finding on cold-a must
+/// leave: the finding open, no `ledger-copy` record for cold-a after it,
+/// the pass not complete and so no removal plan; cold-b goes on.
+fn assert_held_by_mid_pass_finding(
+    fixture: &Fixture,
+    report: &PassReport,
+    plan: Option<&RemovalPlan>,
+    a_before: usize,
+) {
+    let ledger_copies = |id: &str| {
+        fixture
+            .records()
+            .iter()
+            .filter(|r| matches!(&r.kind, Kind::LedgerCopy { root, .. } if root == id))
+            .count()
+    };
+    assert!(
+        open_ledger_finding_on_a(fixture),
+        "the finding was closed by the in-flight pass's ledger-copy record with no repair: \
+         {report:?}"
+    );
+    assert_eq!(ledger_copies("cold-a"), a_before, "{report:?}");
+    assert!(!report.targets_complete, "{report:?}");
+    assert!(
+        plan.is_none(),
+        "a removal plan against a damaged ledger copy"
+    );
+    assert!(
+        report
+            .problems
+            .iter()
+            .any(|p| p.contains("cold-a") && p.contains("copy-ledger finding")),
+        "{report:?}"
+    );
+}
+
+/// Review of #203, finding 1 (L2): a verification that records a
+/// copy-ledger finding after the pass read the ledger and before its step
+/// 3 holds the ledger copy: the pass re-reads the ledger's tail before it
+/// extends the copy, so the copy is neither extended nor recorded, and the
+/// same pass's `ledger-copy` record never closes the finding.
+#[test]
+fn a_finding_recorded_before_step_3_holds_the_ledger_copy() {
+    let fixture = Fixture::new("pass-l2-mid-pass");
+    assert_eq!(fixture.pass().problems, Vec::<String>::new());
+    let copy_a = damage_first_ledger_record(&fixture);
+    let damaged = fs::read(&copy_a).unwrap();
+    let a_before = fixture
+        .records()
+        .iter()
+        .filter(|r| matches!(&r.kind, Kind::LedgerCopy { root, .. } if root == "cold-a"))
+        .count();
+    let verify = verification(&fixture);
+    let verified = std::rc::Rc::new(RefCell::new(None));
+    let out = verified.clone();
+    AFTER_LISTING.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || *out.borrow_mut() = Some(verify())));
+    });
+    let (report, plan) = fixture.planned("2026-10-07");
+    let verified = verified.borrow().clone().expect("the verification ran");
+    assert!(
+        verified
+            .problems
+            .iter()
+            .any(|p| p.contains("cold-a") && p.contains("chain")),
+        "{verified:?}"
+    );
+    assert_held_by_mid_pass_finding(&fixture, &report, plan.as_ref(), a_before);
+    assert_eq!(
+        fs::read(&copy_a).unwrap(),
+        damaged,
+        "the damaged copy is not extended"
+    );
+}
+
+/// Review of #203, finding 1, the narrow window: a finding recorded after
+/// the copy was extended and before its `ledger-copy` record. The check and
+/// the append run under one hold of the copy-ledger lock, so the record is
+/// refused; the reverse order (the pass inside the verification's window)
+/// is AW11 in `verify_concurrency.rs`.
+#[test]
+fn a_finding_recorded_between_the_extension_and_its_record_refuses_the_record() {
+    let fixture = Fixture::new("pass-l2-extend-window");
+    assert_eq!(fixture.pass().problems, Vec::<String>::new());
+    damage_first_ledger_record(&fixture);
+    // New parts, so the pass appends records and cold-a's copy is not
+    // current: step 3 extends it and reaches its `ledger-copy` record.
+    fixture.seal("binance-um", "aggTrade", D0 + 86_400_000, 2);
+    let a_before = fixture
+        .records()
+        .iter()
+        .filter(|r| matches!(&r.kind, Kind::LedgerCopy { root, .. } if root == "cold-a"))
+        .count();
+    let verify = verification(&fixture);
+    let mut once = Some(verify);
+    ON_STEP.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |step| {
+            if step == PassStep::AfterLedgerExtend
+                && let Some(verify) = once.take()
+            {
+                let report = verify();
+                assert!(
+                    report.problems.iter().any(|p| p.contains("cold-a")),
+                    "{report:?}"
+                );
+            }
+        }));
+    });
+    let (report, plan) = fixture.planned("2026-10-07");
+    ON_STEP.with(|hook| hook.borrow_mut().take());
+    assert_held_by_mid_pass_finding(&fixture, &report, plan.as_ref(), a_before);
+    assert!(
+        report
+            .lines
+            .iter()
+            .any(|l| l.starts_with("copy-ledger copy on cold-b")),
+        "cold-b goes on: {report:?}"
+    );
 }

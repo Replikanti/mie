@@ -462,7 +462,16 @@ live in more than one root (approved as written at STOP 1).
     targets that the repair's closing pass names as rebuilt are exempt.
     Why: the next pass's `ledger-copy` record would otherwise end L1's
     void with no repair at all, over a copy whose damage may lie before
-    its tail, where the pass never looks.
+    its tail, where the pass never looks. The verification takes no pass
+    lock (V10), so a finding can land after the pass read the ledger. The
+    pass therefore re-reads the records after its read, from its offset
+    and chain (as the remover's re-check does), before it extends a copy,
+    and appends the `ledger-copy` record with the same check under the
+    same hold of the ledger lock (`CopyLedger::append_unless`); a finding
+    on the target there holds the copy like one in the fold (review of
+    #203, finding 1). Why under the lock: a finding appended between an
+    unlocked check and the record would still be closed by it. AW11 pins
+    the other order, a pass inside the verification's window.
 - **A partition that disappears while it is read** is never read as
   empty; D7 states the rule.
 
@@ -1674,8 +1683,15 @@ What breaks:
       all have `copy` records for the target older than G, byte for byte
       (`missing entry:<e>`, `entry`). Copy ledger: absent while S holds a
       `ledger-copy` record for the target is `missing`; then `chain`,
-      naming the record and its byte; then `prefix` for a copy longer
-      than hot's verified prefix or with one differing byte. Journal:
+      naming the record and its byte; then `prefix` for complete records
+      that run past hot's verified prefix or differ from hot's by one
+      byte; then `prefix` for an unterminated tail after the last complete
+      record that differs from hot's bytes or runs past hot's verified
+      prefix. Why the tail separately: a crash during the tail append on a
+      filesystem that exposes the new size before the data (XFS, ext4
+      with `data=writeback`) leaves NULs there; the tail is no record, so
+      R6 can cut it off, while differing complete records are two valid
+      chains (review of #203, finding 3). Journal:
       absent while the target has a `copy` record is `missing`; otherwise
       the bytes are compared in bounded chunks, and a difference is
       `prefix` naming the first differing byte. Why bytes instead of the
@@ -1757,12 +1773,21 @@ What breaks:
       order, read-only roots included, never the destination. A source
       counts only when its manifest text equals the ledger's byte for byte
       and its data verifies; a source whose own manifest differs is never
-      written.
+      written. A root whose copy cannot be read (an I/O error, EIO from a
+      failing disk, say) is no source, and the report names it with its
+      error, also when a later root serves; R9 never calls a path lost past
+      it (review of #203, finding 2).
     - **R4** A bad hot copy, or a recorded path hot lacks although its
       partition is not recorded removed, is replaced from the first good
       cold copy (`replica::copy_back`) after R5, under the source's writer
       lock taken without waiting; a held lock leaves it unrepaired and
-      named. Hot copies get no record.
+      named. Under that lock the ledger is read again, and a path whose
+      partition is now recorded removed is skipped and named. Why: the hot
+      removal records `removed` and deletes under the same lock but
+      without the pass lock, so a partition the run's first ledger read
+      still saw on hot can leave it before R4 lists hot, and R4 would
+      re-create files on hot in a removed partition (review of #203,
+      finding 4). Hot copies get no record.
     - **R5** The move-aside, into `<root>/.mie/damaged/<run at_ms>/<relative
       path>`: the data first, then its manifest and the seal temp names,
       each an atomic rename on the root's filesystem, the directories
@@ -1778,8 +1803,12 @@ What breaks:
       fails at or before the first byte f where it differs from hot is
       moved aside and rebuilt as hot's verified bytes up to f (a temp
       name, fsync, read-back, rename, directory fsync); the closing pass
-      extends it. A copy whose chain verifies but differs from hot, or is
-      longer than hot's verified prefix, is refused: both chains are valid,
+      extends it. A copy whose complete records all equal hot's within
+      hot's verified prefix, with only an unterminated tail that differs
+      or runs past it (V4), is moved aside and rebuilt the same way up to
+      the end of its last complete record. A copy whose complete records
+      verify but differ from hot's, or run past hot's verified prefix, is
+      refused: both chains are valid,
       so one holds records the other lacks (a damaged last record on hot
       that an append truncated as torn, D7, say), and overwriting it could
       destroy the last copy of a record. The rebuild (#193) decides.
@@ -1796,9 +1825,14 @@ What breaks:
       entry conflict for the hold resolution (#194). An absent copy is
       left to the closing pass.
     - **R9 The lost-file rule as implemented** (operator, #192 STOP 1
-      decision 1). A path with no good source, while every root the
-      ledger records a copy of it on presented its marker, is reported
-      lost; nothing is re-created and nothing is written to any root. Only
+      decision 1). A path with no good source is reported lost only when
+      every root the ledger records a copy of it on presents its marker
+      again at that moment (not only at the start of the run: an
+      unmounted target is an empty mount point, where every copy checks as
+      missing) and every root tried as a source was read without error
+      (R3). Otherwise it is "not repairable in this run", naming the
+      roots, and nothing is recorded (review of #203, finding 2). A lost
+      path: nothing is re-created and nothing is written to any root. Only
       `--record-lost`, passed after a run without it reported the path,
       appends `lost <at_ms> <path> verify <sha256>`. Why: a `lost` record
       is irreversible (every selection covering the path fails for good,

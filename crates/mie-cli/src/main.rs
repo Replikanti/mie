@@ -375,18 +375,22 @@ USAGE:
         copy is moved aside into <root>/.mie/damaged/<time>/, never deleted,
         and replaced from the first good copy (hot, then the cold roots in
         order), verified by its SHA-256 and recorded. Copy-ledger and
-        journal copies are rebuilt from hot where that is safe; a copy
-        ledger whose chain verifies but differs from hot's, a journal copy
-        no other copy agrees with, and an import entry hot cannot vouch for
-        are refused and named. A file with no good copy left is reported
-        lost and nothing is written; --record-lost then appends its lost
-        record, after which every replay that covers it fails, so pass it
-        only after a run without it reported the file. Replication pauses
-        while the repair runs; it ends with one replication pass. Refused
-        like mie store verify, and when a replication pass runs. Prints what
-        it repaired and the pass's lines, then PASS and exits 0, or one
-        FAIL: <reason> line per copy left unrepaired, file lost or refused,
-        and exits 1.
+        journal copies are rebuilt from hot where that is safe (a damaged
+        unterminated tail is cut off); a copy ledger whose complete records
+        verify but differ from hot's, a journal copy no other copy agrees
+        with, and an import entry hot cannot vouch for are refused and
+        named. A file with no good copy left is reported lost and nothing
+        is written, but only when every root that records a copy of it
+        still carries its marker and every root was read without error;
+        otherwise it is not repairable in this run, naming those roots.
+        --record-lost then appends its lost record, after which every
+        replay that covers it fails, so pass it only after a run without it
+        reported the file. Replication pauses while the repair runs; it
+        ends with one replication pass. Refused like mie store verify, and
+        when a replication pass runs. Prints what it repaired and the
+        pass's lines, then PASS and exits 0, or one FAIL: <reason> line per
+        copy left unrepaired, file lost or not repairable, or refused, and
+        exits 1.
 
     mie --help
 ";

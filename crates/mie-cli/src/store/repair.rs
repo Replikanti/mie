@@ -30,13 +30,16 @@
 //! - **R3 Sources, in order:** hot, then every cold root in configuration
 //!   order (copy targets and read-only roots alike), never the destination.
 //!   A source counts only when its manifest text equals the ledger's byte
-//!   for byte and its data verifies.
+//!   for byte and its data verifies. A root whose copy cannot be read is
+//!   no source and is named (review of #203, finding 2).
 //! - **R4 Hot copies:** a bad hot copy, or a recorded path hot lacks
 //!   although its partition is not recorded removed, is replaced from the
 //!   first good cold copy after R5's move-aside, under the source's writer
 //!   lock, taken without waiting. A writer holding it (`mie ingest` for the
 //!   live source, an import for the archive) leaves the copy unrepaired and
-//!   named. Hot copies get no record: they never count (D11).
+//!   named. Under the lock the ledger is read again, and a path whose
+//!   partition the hot removal recorded removed since is skipped (review of
+//!   #203, finding 4). Hot copies get no record: they never count (D11).
 //! - **R5 Move-aside** into `<root>/.mie/damaged/<run at_ms>/<relative
 //!   path>`: the data first, then its manifest and the seal temp names,
 //!   each an atomic rename on the same filesystem. Nothing in mie deletes or
@@ -45,10 +48,12 @@
 //! - **R6 Ledger copies with an open copy-ledger finding:** when the copy's
 //!   chain fails at or before the first byte f where it differs from hot,
 //!   it is moved aside and rebuilt as hot's verified bytes up to f, and the
-//!   closing pass extends it; when its chain verifies but it differs from
-//!   hot, or is longer than hot's verified prefix, both chains are valid and
-//!   one of them holds records the other lacks, so it is refused for the
-//!   ledger rebuild (#193).
+//!   closing pass extends it; when only its unterminated tail differs (a
+//!   crashed extension), it is rebuilt the same way up to its last complete
+//!   record (review of #203, finding 3); when its complete records verify
+//!   but differ from hot's, or run past hot's verified prefix, both chains
+//!   are valid and one of them holds records the other lacks, so it is
+//!   refused for the ledger rebuild (#193).
 //! - **R7 Journal copies with an open journal finding:** let d be the first
 //!   byte where the copy differs from hot. Repaired only when another
 //!   target's copy is longer than d and equals hot over `[0, d]` (two of
@@ -64,9 +69,10 @@
 //!   conflict, for the hold resolution (#194). An absent copy is left to the
 //!   closing pass.
 //! - **R9 The lost-file rule:** a path with no good source, while every
-//!   root the ledger records a copy of it on presented its marker in this
-//!   run, is reported lost, and nothing is re-created or written to any
-//!   root. Only with `--record-lost` does the run also append `lost <at_ms>
+//!   root the ledger records a copy of it on presents its marker again at
+//!   that moment and every root tried was read without error, is reported
+//!   lost, and nothing is re-created or written to any root; otherwise it
+//!   is "not repairable in this run" (review of #203, finding 2). Only with `--record-lost` does the run also append `lost <at_ms>
 //!   <path> verify <sha256>`, which fails every selection that covers the
 //!   path for good; the operator passes it after a run without it reported
 //!   the path (#192, STOP 1 decision 1). A recorded copy on a root that is
@@ -130,6 +136,10 @@ thread_local! {
     /// Test hook: the repair stops at the first occurrence of this step.
     pub(crate) static CRASH_AT: std::cell::Cell<Option<RepairStep>> =
         const { std::cell::Cell::new(None) };
+    /// Test hook: runs once after the run's ledger read and marker reads,
+    /// before R1 (a concurrent removal, an unmount mid-run).
+    pub(crate) static BEFORE_WORK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
 }
 
 /// Why the repair stopped early.
@@ -179,6 +189,15 @@ struct Marked {
     path: PathBuf,
     id: String,
     copy_target: bool,
+}
+
+/// What R3 found for one path.
+struct Sources {
+    /// The first root with a good copy.
+    good: Option<PathBuf>,
+    /// The roots tried before it whose copy could not be read, each with
+    /// its error.
+    unread: Vec<String>,
 }
 
 /// The repair in progress.
@@ -360,6 +379,10 @@ pub fn run(
         judged: BTreeSet::new(),
         report,
     };
+    #[cfg(test)]
+    if let Some(hook) = BEFORE_WORK.with(|hook| hook.borrow_mut().take()) {
+        hook();
+    }
     match repair.repair_all() {
         Ok(()) => {
             // R10: the closing pass under the held pass lock.
@@ -560,18 +583,45 @@ impl Repair<'_> {
         Ok(())
     }
 
-    /// The first good source of `path` (R3), never `exclude`.
-    fn source(&self, path: &str, text: &str, exclude: &Path) -> Option<PathBuf> {
-        std::iter::once(self.hot)
+    /// The first good source of `path` (R3), never `exclude`, and every
+    /// root tried before it whose copy could not be read. A read error is
+    /// no verdict on the copy (EIO from a failing disk may hide intact
+    /// bytes), so R9 never calls a path lost past one (review of #203,
+    /// finding 2).
+    fn source(&self, path: &str, text: &str, exclude: &Path) -> Sources {
+        let mut unread = Vec::new();
+        for root in std::iter::once(self.hot)
             .chain(self.marked.iter().map(|root| root.path.as_path()))
             .filter(|root| *root != exclude)
-            .find(|root| {
-                matches!(
-                    replica::check_sealed_copy(root, path, text),
-                    Ok(CopyCheck::Good)
-                )
-            })
-            .map(Path::to_path_buf)
+        {
+            match replica::check_sealed_copy(root, path, text) {
+                Ok(CopyCheck::Good) => {
+                    return Sources {
+                        good: Some(root.to_path_buf()),
+                        unread,
+                    };
+                }
+                Ok(_) => {}
+                Err(error) => unread.push(format!("{} cannot be read ({error})", root.display())),
+            }
+        }
+        Sources { good: None, unread }
+    }
+
+    /// The good source of `path` from `sources`, naming the roots that
+    /// could not be read on the way; R9 when there is none.
+    fn good_source(&mut self, path: &str, text: &str, sources: Sources) -> Option<PathBuf> {
+        let Some(good) = sources.good else {
+            self.lost(path, text, &sources.unread);
+            return None;
+        };
+        for unread in sources.unread {
+            self.line(format!(
+                "{path}: {unread}; it is skipped as a source and {} is used",
+                good.display()
+            ));
+        }
+        Some(good)
     }
 
     /// R1 (`refill` false) or R2 (`refill` true) for the copy of `path` on
@@ -612,8 +662,8 @@ impl Repair<'_> {
             }
             _ => {}
         }
-        let Some(source) = self.source(path, text, &root) else {
-            self.lost(path, text);
+        let sources = self.source(path, text, &root);
+        let Some(source) = self.good_source(path, text, sources) else {
             return Ok(());
         };
         if !self.marker_present(i) {
@@ -676,8 +726,9 @@ impl Repair<'_> {
         Ok(())
     }
 
-    /// R9 for `path`, which has no good source.
-    fn lost(&mut self, path: &str, text: &str) {
+    /// R9 for `path`, which has no good source; `unread` names the roots
+    /// whose copy could not be read.
+    fn lost(&mut self, path: &str, text: &str, unread: &[String]) {
         if !self.judged.insert(path.to_owned()) {
             return;
         }
@@ -696,6 +747,40 @@ impl Repair<'_> {
                  copy ledger records copies on {}, which did not present a marker or are no \
                  longer configured; it is not lost (ADR-062 D11)",
                 elsewhere.join(", ")
+            ));
+            return;
+        }
+        // Every root that records a copy must present its marker now, not
+        // only when the run started: a target unmounted mid-run leaves an
+        // empty mount point, where every copy checks as missing (review of
+        // #203, finding 2).
+        let recorded: BTreeSet<&str> = self
+            .state
+            .copies_of(path)
+            .filter(|(_, copy)| copy.latest.is_some())
+            .map(|(id, _)| id)
+            .collect();
+        let mut doubts: Vec<String> = unread.to_vec();
+        for root in self
+            .marked
+            .iter()
+            .filter(|root| recorded.contains(root.id.as_str()))
+        {
+            match root_marker::read(&root.path) {
+                Ok(Some(id)) if id == root.id => {}
+                _ => doubts.push(format!(
+                    "{} ({}) no longer presents its marker (an unmounted mount point?)",
+                    root.path.display(),
+                    root.id
+                )),
+            }
+        }
+        if !doubts.is_empty() {
+            self.problem(format!(
+                "{path}: not repairable in this run: no root yielded a good copy, but {}; it is \
+                 not lost, and nothing is recorded. Run the repair again once every root reads \
+                 (ADR-062 D11)",
+                doubts.join(", ")
             ));
             return;
         }
@@ -718,10 +803,10 @@ impl Repair<'_> {
              --record-lost` records it."
         };
         self.problem(format!(
-            "{path} is lost: no root holds a good copy (hot, then every cold root tried), and \
-             every root the copy ledger records a copy on presented its marker. Nothing is \
-             re-created and nothing is written to any root (ADR-062 D11, the lost-file rule).\
-             {recorded}"
+            "{path} is lost: no root holds a good copy (hot, then every cold root tried, each read \
+             without error), and every root the copy ledger records a copy on presented its \
+             marker, again at this check. Nothing is re-created and nothing is written to any \
+             root (ADR-062 D11, the lost-file rule).{recorded}"
         ));
     }
 
@@ -757,15 +842,23 @@ impl Repair<'_> {
                 Err(error) => self.problem(format!("{path} on hot: cannot be checked: {error}")),
             }
         }
+        let mut unread = Vec::new();
         for (path, verdict) in self.state.paths() {
             if verdict == PathVerdict::Ordinary
                 && !listed.contains(path)
                 && !self.removed.contains(partition_of(path))
                 && let Some(text) = self.state.ledger_text(path)
-                && !matches!(replica::sealed_manifest(self.hot, path), Ok(Some(_)))
             {
-                work.push((path.to_owned(), text.to_owned()));
+                match replica::sealed_manifest(self.hot, path) {
+                    Ok(Some(_)) => {}
+                    Ok(None) => work.push((path.to_owned(), text.to_owned())),
+                    // A read error is no absence: never R9 over it.
+                    Err(error) => unread.push(format!("{path} on hot: cannot be checked: {error}")),
+                }
             }
+        }
+        for problem in unread {
+            self.problem(problem);
         }
         work.sort();
         for (path, text) in work {
@@ -776,8 +869,8 @@ impl Repair<'_> {
 
     /// R4 for one hot copy.
     fn repair_hot_copy(&mut self, path: &str, text: &str) -> Result<(), Stop> {
-        let Some(source) = self.source(path, text, self.hot) else {
-            self.lost(path, text);
+        let sources = self.source(path, text, self.hot);
+        let Some(source) = self.good_source(path, text, sources) else {
             return Ok(());
         };
         let lock = match removal::try_source_lock(self.hot, source_of(path)) {
@@ -796,6 +889,36 @@ impl Repair<'_> {
                 return Ok(());
             }
         };
+        // The hot removal records `removed` and deletes under this lock,
+        // without the pass lock, so a partition the run's ledger read saw
+        // on hot may have left it since: re-read under the lock (review of
+        // #203, finding 4).
+        match copy_ledger::read(self.hot) {
+            Ok(Some(ledger)) => {
+                if adopt::ledger_states(&ledger.records)
+                    .0
+                    .contains(partition_of(path))
+                {
+                    self.line(format!(
+                        "{path} on hot: skipped: its partition was recorded removed during this \
+                         run, so nothing is re-created on hot (ADR-062 D6, D11)"
+                    ));
+                    return Ok(());
+                }
+            }
+            Ok(None) => {
+                self.problem(format!(
+                    "{path} on hot: not repaired: hot's copy ledger is gone"
+                ));
+                return Ok(());
+            }
+            Err(error) => {
+                self.problem(format!(
+                    "{path} on hot: not repaired: hot's copy ledger cannot be re-read: {error}"
+                ));
+                return Ok(());
+            }
+        }
         let aside = replica::damaged_dir(self.hot, self.run_ms);
         match replica::move_aside(self.hot, path, &aside) {
             Ok(moved) if !moved.is_empty() => {
@@ -873,11 +996,8 @@ impl Repair<'_> {
                 ));
                 return Ok(());
             }
-            LedgerCopyCheck::Chain { .. } => {}
+            LedgerCopyCheck::Chain { .. } | LedgerCopyCheck::Tail { .. } => {}
         }
-        let LedgerCopyCheck::Chain { record, offset } = check else {
-            return Ok(());
-        };
         let read = |path: &Path| fs::read(path).map_err(|e| format!("{}: {e}", path.display()));
         let (mine, hot_bytes) = match (read(&copy), read(&copy_ledger::ledger_path(self.hot))) {
             (Ok(mine), Ok(hot_bytes)) => (mine, hot_bytes),
@@ -893,29 +1013,46 @@ impl Repair<'_> {
                 return Ok(());
             }
         };
-        let first = mine
-            .iter()
-            .zip(&hot_bytes)
-            .position(|(a, b)| a != b)
-            .map_or(mine.len().min(hot_bytes.len()) as u64, |at| at as u64);
-        if offset > first {
-            self.problem(format!(
-                "the copy ledger on {name} ({}): refused: its chain fails at record {record} (byte \
-                 {offset}), after byte {first} where it first differs from hot's, so a record \
-                 that verifies differs from hot's; the copy-ledger rebuild decides (#193)",
-                copy.display()
-            ));
-            return Ok(());
-        }
-        let upto = first.min(verified);
+        let (upto, why) = match check {
+            // Every complete record equals hot's; only the unterminated
+            // tail differs, and a tail is no record (review of #203).
+            LedgerCopyCheck::Tail { offset } => (
+                offset.min(verified),
+                format!(
+                    "its unterminated tail from byte {offset} differs from hot's (a crashed \
+                     extension), every complete record equals hot's"
+                ),
+            ),
+            LedgerCopyCheck::Chain { record, offset } => {
+                let first = mine
+                    .iter()
+                    .zip(&hot_bytes)
+                    .position(|(a, b)| a != b)
+                    .map_or(mine.len().min(hot_bytes.len()) as u64, |at| at as u64);
+                if offset > first {
+                    self.problem(format!(
+                        "the copy ledger on {name} ({}): refused: its chain fails at record \
+                         {record} (byte {offset}), after byte {first} where it first differs from \
+                         hot's, so a record that verifies differs from hot's; the copy-ledger \
+                         rebuild decides (#193)",
+                        copy.display()
+                    ));
+                    return Ok(());
+                }
+                (
+                    first.min(verified),
+                    format!("its chain failed at record {record} (byte {offset})"),
+                )
+            }
+            _ => return Ok(()),
+        };
         let aside = aside_of(&root, self.run_ms, Path::new(".mie/copy-ledger"));
         match replica::rebuild_prefix(TailSource::Bytes(&hot_bytes), &copy, upto, &aside) {
             Ok(()) => {
                 self.cleared.insert(id);
                 self.line(format!(
-                    "the copy ledger on {name}: its chain failed at record {record} (byte \
-                     {offset}); moved aside to {} and rebuilt from hot's first {upto} byte(s), the \
-                     closing pass extends it",
+                    "the copy ledger on {name}: {why}; moved aside to {} and rebuilt from hot's \
+                     first {upto} byte(s), the closing pass extends it",
                     aside.display()
                 ));
                 reached(RepairStep::AfterTailRebuild)

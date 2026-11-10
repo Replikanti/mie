@@ -794,6 +794,13 @@ impl Verify<'_> {
                      byte prefix of it"
                 ),
             )),
+            LedgerCopyCheck::Tail { offset } => Some((
+                FindingCode::Prefix,
+                format!(
+                    "prefix: its unterminated tail from byte {offset} differs from hot's copy \
+                     ledger (a crashed extension); every complete record equals hot's"
+                ),
+            )),
             LedgerCopyCheck::Longer { len, verified } => Some((
                 FindingCode::Prefix,
                 format!(

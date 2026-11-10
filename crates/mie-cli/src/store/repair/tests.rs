@@ -143,3 +143,132 @@ fn a_crash_at_every_repair_step_is_completed_by_the_next_run() {
         assert_eq!(verified.problems, Vec::<String>::new(), "{step:?}");
     }
 }
+
+/// The fixture's first live file, after its partition left hot: recorded
+/// removed and deleted from hot, as the hot removal leaves it.
+fn removed_live_file(fixture: &Fixture) -> String {
+    let live = replica::list_sealed(&fixture.hot)
+        .unwrap()
+        .into_iter()
+        .find(|p| p.starts_with("source=binance-um"))
+        .unwrap();
+    let partition = partition_of(&live).to_owned();
+    CopyLedger::at(&fixture.hot)
+        .append(&Record {
+            at_ms: D0 + 2,
+            kind: Kind::Removed {
+                partition: partition.clone(),
+            },
+        })
+        .unwrap();
+    fs::remove_dir_all(fixture.hot.join(&partition)).unwrap();
+    live
+}
+
+/// Review of #203, finding 2 (R9), the unmount: cold-b presents its marker
+/// when the run starts and holds the only good copy of a file that left
+/// hot, then is unmounted mid-run (its mount point an empty directory, so
+/// the copy checks as missing). R9 re-reads the marker of every root that
+/// records a copy before it calls a file lost, so the file is "not
+/// repairable in this run", and `--record-lost` appends nothing.
+#[test]
+fn a_target_unmounted_mid_run_makes_a_file_not_repairable_never_lost() {
+    let fixture = Fixture::new("repair-unmounted");
+    assert_eq!(fixture.pass().problems, Vec::<String>::new());
+    let live = removed_live_file(&fixture);
+    flip(&fixture.cold[0].join(&live), 30);
+    let found = verify::run(
+        &fixture.config,
+        Some(&fixture.archive()),
+        "24",
+        &fixture.probe,
+        &|| D0 + HOUR,
+        &CopyLedger::at(&fixture.hot),
+    );
+    assert!(!found.problems.is_empty(), "{found:?}");
+    let cold_b = fixture.cold[1].clone();
+    let hidden = fixture.dir.0.join("cold-b.mounted");
+    {
+        let (cold_b, hidden) = (cold_b.clone(), hidden.clone());
+        BEFORE_WORK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                fs::rename(&cold_b, &hidden).unwrap();
+                fs::create_dir(&cold_b).unwrap();
+            }));
+        });
+    }
+    let report = run(
+        &fixture.config,
+        Some(&fixture.archive()),
+        true,
+        &fixture.probe,
+        &|| D0 + 2 * HOUR,
+        &CopyLedger::at(&fixture.hot),
+    );
+    fs::remove_dir(&cold_b).unwrap();
+    fs::rename(&hidden, &cold_b).unwrap();
+    assert!(
+        report.problems.iter().any(|p| p.contains(&live)
+            && p.contains("not repairable in this run")
+            && p.contains("cold-b")),
+        "{report:?}"
+    );
+    assert!(
+        !report.problems.iter().any(|p| p.contains("is lost")),
+        "{report:?}"
+    );
+    assert!(
+        !fixture
+            .records()
+            .iter()
+            .any(|r| matches!(r.kind, Kind::Lost { .. })),
+        "a file whose good copy sits on an unmounted target was recorded lost"
+    );
+}
+
+/// Review of #203, finding 4 (R4): the hot removal records a partition
+/// removed and deletes it after the repair read the ledger and before R4
+/// lists hot. R4 re-reads the ledger under the source's writer lock and
+/// skips the partition: nothing is re-created on hot in a partition the
+/// ledger records removed.
+#[test]
+fn a_partition_removed_during_the_run_is_not_recreated_on_hot() {
+    let fixture = Fixture::new("repair-removed-mid-run");
+    assert_eq!(fixture.pass().problems, Vec::<String>::new());
+    let live = replica::list_sealed(&fixture.hot)
+        .unwrap()
+        .into_iter()
+        .find(|p| p.starts_with("source=binance-um"))
+        .unwrap();
+    let partition = partition_of(&live).to_owned();
+    {
+        let (hot, partition) = (fixture.hot.clone(), partition.clone());
+        BEFORE_WORK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                // The remover's order: the record, then the deletion.
+                CopyLedger::at(&hot)
+                    .append(&Record {
+                        at_ms: D0 + 2,
+                        kind: Kind::Removed {
+                            partition: partition.clone(),
+                        },
+                    })
+                    .unwrap();
+                fs::remove_dir_all(hot.join(&partition)).unwrap();
+            }));
+        });
+    }
+    let report = repair(&fixture, D0 + 2 * HOUR);
+    assert!(
+        !fixture.hot.join(&partition).exists(),
+        "R4 re-created a partition the ledger records removed: {report:?}"
+    );
+    assert!(
+        report
+            .lines
+            .iter()
+            .any(|l| l.contains(&live) && l.contains("recorded removed")),
+        "{report:?}"
+    );
+    assert_eq!(report.problems, Vec::<String>::new(), "{report:?}");
+}
