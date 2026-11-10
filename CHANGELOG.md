@@ -12,6 +12,14 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
 
 ### Added
 
+- **P1 replication on 2020-01 … 2024-09, measured: not replicated (#206,
+  ADR-064 accepted).** `docs/research/205-p1-replication.md` holds the one
+  pre-registered run of `measure_p1_replication` from #207's merge commit
+  and its whole output: 46 of 48 contexts measurable, all 46 read `no
+  effect` (no context rejected by Benjamini–Hochberg at q = 0.05), so
+  `replicated: 0 of 48` and stop rule S3 applies; nothing is promoted and
+  the hold-out stays unread. ADR-064 gains its `## Acceptance` section and
+  status `accepted`. Docs only.
 - **P1 replication on 2020-01 … 2024-09, pre-registered and blind (#205,
   ADR-064, proposed).** ADR-064 fixes the replication of #28's P1-buy and
   P1-sell before any outcome of the window is read: records = replay =

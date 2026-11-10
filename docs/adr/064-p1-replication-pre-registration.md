@@ -1,6 +1,6 @@
 # ADR-064: P1 replication on 2020-01 … 2024-09 — a pre-registered grid of 48 contexts, per-label fees, a rotation null and Benjamini–Hochberg
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-11-09
 
 ## Context
@@ -663,3 +663,34 @@ findings.
     identical, so the pins stay. The coverage report now holds this
     run's output.
 
+## Acceptance
+
+Accepted by #206 on 2026-11-09. The measurement ran once, from a release
+build of `1bfaf40c2a46d647f960365975d711fbbe0a20be`, the merge commit of
+#207, in a detached clean worktree. The report is
+[`docs/research/205-p1-replication.md`](../research/205-p1-replication.md).
+
+Each *Accept when* condition, against what the run printed:
+
+- `measure_p1_replication` passed the guard of D1: the pins of the
+  pre-registration record, the frozen hashes, the record-set check
+  (`record sets equal`) and `ADR-058 twin mismatches 0`. Why this proves
+  the run was the registered one: the entry refuses before it prints
+  anything when any of these fails, so a printed output is a passed guard.
+- The run's commit equals #207's merge commit: the printed `test binary
+  code` is `git:1bfaf40c2a46d647f960365975d711fbbe0a20be`, without
+  `-dirty`. The printed `replication.rs frozen decisions` SHA-256 is
+  `ece00cf22aaaa527f2c7f83fe5eb08978267c5599eac203781de5e39ccbd1f7c`, the
+  pinned one. Why both: the region hash freezes the decisions, the commit
+  freezes the code outside the region (D6).
+- The report records the dataset (content `e985ea3e…`), the queries'
+  hashes, the commands, the inputs, and the whole output of the tool, the
+  two `not measurable` contexts and all 46 `no effect` rows included.
+
+Outcome: 46 of 48 contexts measurable, `replicated: 0 of 48`, so stop rule
+S3 applies. P1 is recorded as not replicated at 4h / 1d on archive
+`aggTrades` 2020-01 … 2024-09, and no later re-run on this window with
+changed definitions counts as confirmatory; a better definition is a new
+pre-registration on new data. Nothing is promoted and the hold-out stays
+unread. S3 is an outcome, not a failure, so it does not block acceptance
+(*Accept when*).
