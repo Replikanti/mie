@@ -22,7 +22,7 @@
 //! | `domain_rejection` | ingest | an event the engine rejected |
 //! | `state_checkpoint` | ingest | `ordinal` (events delivered so far, rejections included), `as_of` (ms or null), `event_hash` and `state_hash` (16 hex digits), `last`: a checkpoint of the core (ADR-041) |
 //! | `run_end` | ingest | totals (`events`, `domain_rejections`, `records`) and the exit code |
-//! | `replication` | ingest | one per replication pass of a tiered store (ADR-062 D11, after every seal pass, on the `mie-replicate` thread): `passed`, `files_copied`, `entries_copied`, `ledger_bytes`, `journal_bytes`, `problems` (a count), `first_problem` (text or null; `mie store replicate` prints the full list) and `candidates` (the partitions planned for removal from hot, or null without a plan). The final pass's line lands after `run_end` |
+//! | `replication` | ingest | one per replication pass of a tiered store (ADR-062 D11, after every seal pass, on the `mie-replicate` thread): `passed`, `files_copied`, `entries_copied`, `ledger_bytes`, `journal_bytes`, `problems` (a count), `first_problem` (text or null; `mie store replicate` prints the full list), `candidates` (the partitions planned for removal from hot, or null without a plan) and `removal_waiting` (text or null: after a copy-ledger rebuild, why the plan waits for a verification covering the rebuilt ledger, ADR-062 D7 step 6, #193 B10). The final pass's line lands after `run_end` |
 //! | `copy_ledger_truncated` | ingest | an append truncated the copy ledger's incomplete trailing record (ADR-062 D7): `ledger` (path), `bytes`, `offset` |
 //! | `removal` | ingest | a hot-removal pass in the seal path that did something (ADR-062 D6): `source`, `removed` and `completed` (partitions), `skipped` (`[{partition, reason}]`), `locked` (the source's lock was held by an import) and `error` (text or null) |
 //! | `recall` | ingest | the live writer recalled a partition removed from hot (ADR-062 D6): `partition`, `files`, `from` (`{cold root: files}`) and `damaged` (`[{path, root, error}]`, the damaged copies passed over) |
@@ -1023,6 +1023,7 @@ pub fn replication_json(report: &PassReport, plan: Option<&RemovalPlan>) -> Valu
         "problems": report.problems.len(),
         "first_problem": report.problems.first(),
         "candidates": plan.map(|plan| plan.candidates.len()),
+        "removal_waiting": plan.and_then(|plan| plan.waiting.as_deref()),
     })
 }
 

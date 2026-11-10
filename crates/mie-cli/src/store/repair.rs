@@ -53,7 +53,8 @@
 //!   record (review of #203, finding 3); when its complete records verify
 //!   but differ from hot's, or run past hot's verified prefix, both chains
 //!   are valid and one of them holds records the other lacks, so it is
-//!   refused for the ledger rebuild (#193).
+//!   refused, naming `mie store rebuild --replace-hot-ledger`, which
+//!   supersedes both chains (#193).
 //! - **R7 Journal copies with an open journal finding:** let d be the first
 //!   byte where the copy differs from hot. Repaired only when another
 //!   target's copy is longer than d and equals hot over `[0, d]` (two of
@@ -991,7 +992,7 @@ impl Repair<'_> {
                      differs from hot's or is longer than hot's verified prefix, so both chains are \
                      valid and one holds records the other lacks (a damaged last record on hot \
                      that an append truncated, say); overwriting it could destroy the last copy of \
-                     a record. The copy-ledger rebuild decides (#193; ADR-062 D7, D11)",
+                     a record. `mie store rebuild --replace-hot-ledger` decides (ADR-062 D7, D11)",
                     copy.display()
                 ));
                 return Ok(());
@@ -1033,8 +1034,8 @@ impl Repair<'_> {
                     self.problem(format!(
                         "the copy ledger on {name} ({}): refused: its chain fails at record \
                          {record} (byte {offset}), after byte {first} where it first differs from \
-                         hot's, so a record that verifies differs from hot's; the copy-ledger \
-                         rebuild decides (#193)",
+                         hot's, so a record that verifies differs from hot's; `mie store rebuild \
+                         --replace-hot-ledger` decides (ADR-062 D7)",
                         copy.display()
                     ));
                     return Ok(());

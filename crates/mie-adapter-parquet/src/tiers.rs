@@ -223,6 +223,12 @@ impl LedgerView {
             .map(|manifest| manifest.text.as_str())
     }
 
+    /// The open hold of `path`, whatever its verdict: the last `hold`
+    /// record not cleared after it.
+    pub(crate) fn hold_reason(&self, path: &str) -> Option<HoldReason> {
+        self.entries.get(path).and_then(|entry| entry.held)
+    }
+
     /// Every path the ledger records in the partition directory
     /// `partition`, in path order, with its verdict: the recall and the
     /// removal planner apply `select`'s own rules.

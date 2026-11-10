@@ -392,6 +392,30 @@ USAGE:
         copy left unrepaired, file lost or not repairable, or refused, and
         exits 1.
 
+    mie store rebuild --config <path> [--archive-config <path>]
+                      [--record-lost] [--replace-hot-ledger]
+        Rebuild hot's copy ledger of a tiered raw store (ADR-062 D7) after
+        it was lost or damaged, while mie ingest keeps capturing. It starts
+        from the longest copy-ledger copy on a copy target whose hash chain
+        verifies (or empty, and says so), lists every manifest on every
+        root, checks each cold copy's data against it, and cross-checks
+        hot's journal and the import ledger (the archive configuration:
+        --archive-config, else [history] archive_config): it records every
+        verified copy, every partition with cold copies and no directory
+        on hot as removed, and the archive holds it re-derives. A file a
+        record names that no root holds is reported lost; --record-lost
+        records it, after which every replay that covers it fails, so pass
+        it only after a run without it reported the file. A readable hot
+        ledger is replaced only with --replace-hot-ledger. The old ledger,
+        and every ledger copy that is no prefix of the new one, is moved
+        into .mie/damaged/<time>/, never deleted. Every root, read-only
+        roots included, must carry its marker. The rebuild reads every copy
+        on every root once, the cost of one verification; replication, hot
+        removal and imports pause meanwhile, and hot removal resumes only
+        after the next mie store verify. Prints the start, the records
+        added, every lost file and hold and the ledger written, then PASS
+        and exits 0, or one FAIL: <reason> line per problem and exits 1.
+
     mie --help
 ";
 
@@ -889,14 +913,43 @@ fn dispatch(args: &[String]) -> Result<ExitCode, String> {
                 )?;
                 Ok(exit(pass))
             }
+            Some("rebuild") => {
+                let options = Options::parse(
+                    &args[2..],
+                    &["--config", "--archive-config"],
+                    &["--record-lost", "--replace-hot-ledger"],
+                )?;
+                let config =
+                    IngestConfig::load(&options.path("--config")?).map_err(|e| e.to_string())?;
+                let archive = options.optional("--archive-config").map(PathBuf::from);
+                let flags = store::rebuild::Flags {
+                    record_lost: options.flag("--record-lost"),
+                    replace_hot_ledger: options.flag("--replace-hot-ledger"),
+                };
+                let probe = store::device_probe()?;
+                let clock = SystemClock::new();
+                let now_ms = || clock.now_utc_ns().div_euclid(1_000_000);
+                let first_hot_date = ingest::first_hot_date(now_ms());
+                let pass = store::rebuild(
+                    &config,
+                    archive.as_deref(),
+                    flags,
+                    &first_hot_date,
+                    probe.as_ref(),
+                    &now_ms,
+                    &mut std::io::stdout().lock(),
+                )?;
+                Ok(exit(pass))
+            }
             _ => Err(
                 "expected `mie store init --config <path>`, `mie store init-root \
                  --config <path> --root <path> --id <id>`, `mie store replicate --config \
                  <path> [--archive-config <path>]`, `mie store adopt --config <path> \
                  [--archive-config <path>] --from <path> [--journal <path>] [--import-ledger \
                  <dir>]`, `mie store verify --config <path> [--archive-config <path>] \
-                 --period-hours <P>` or `mie store repair --config <path> [--archive-config \
-                 <path>] [--record-lost]`"
+                 --period-hours <P>`, `mie store repair --config <path> [--archive-config \
+                 <path>] [--record-lost]` or `mie store rebuild --config <path> \
+                 [--archive-config <path>] [--record-lost] [--replace-hot-ledger]`"
                     .to_owned(),
             ),
         },

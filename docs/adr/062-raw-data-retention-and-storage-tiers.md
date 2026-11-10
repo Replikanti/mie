@@ -472,6 +472,24 @@ live in more than one root (approved as written at STOP 1).
     #203, finding 1). Why under the lock: a finding appended between an
     unlocked check and the record would still be closed by it. AW11 pins
     the other order, a pass inside the verification's window.
+- **As implemented (#193): rule (g), removal waits after a rebuild.**
+  After `mie store rebuild` the plan reads the ledger first and the gate
+  `.mie/rebuilt` second (D7 *Formats and layout*). With the gate holding
+  L, it plans no candidate unless L ≤ the read's verified length and
+  every target id has a `verify` record whose prefix is at least L; the
+  `replication` journal line names why in `removal_waiting`. A gate that
+  cannot be read or parsed gives no plan and a problem. Why prefix ≥ L is
+  exact: a `verify` record's prefix is hot's verified length when that
+  verification read its snapshot; every `verify` record inside the start
+  copy lies below its own offset, so below L, and the verify lock keeps a
+  verification from running across the install, so only one that read
+  the rebuilt ledger qualifies. Why the gate is written before the
+  ledger's rename: a read that sees the rebuilt ledger always finds its
+  gate, and a gate without its ledger only delays removal. A plan made
+  before the install is dropped by the remover's re-check, which sees a
+  replaced ledger. With L = 1 000: prefix 999 waits, 1 000 and 1 001
+  plan, one of two targets verified still waits. Incomplete removals and
+  leftovers are not affected: their records are already written.
 - **A partition that disappears while it is read** is never read as
   empty; D7 states the rule.
 
@@ -662,8 +680,17 @@ live in more than one root (approved as written at STOP 1).
     keeps a finding from voiding a copy the repair made after that read
     (D11 *As implemented*, V10). Every root may also hold `damaged/<at_ms>/`
     (#192): `mie store repair` moves each damaged copy there under its
-    relative path instead of deleting it, one directory per run. Nothing
-    in mie lists or deletes it, and it is outside the layout, so
+    relative path instead of deleting it, one directory per run, and `mie
+    store rebuild` (#193) puts hot's former ledger there as
+    `damaged/<at_ms>/copy-ledger` (a hard link) and moves there each copy
+    target's ledger copy that is no prefix of the rebuilt ledger. On hot,
+    after a rebuild, `.mie/rebuilt` is the removal gate, `mie-rebuilt
+    1\nprefix <L>\n` with L the rebuilt ledger's length (D6 rule (g),
+    rebuild B10), written by temp name, fsync, rename and directory fsync
+    before the ledger's rename; its parser is strict. The rebuild holds,
+    for its whole run, the copy-ledger hold, `replicate.lock`,
+    `verify.lock` and the archive source's writer lock, each taken without
+    waiting. Nothing in mie lists or deletes `damaged/`, and it is outside the layout, so
     `select`, recovery and every walk of the layout never see it. `.mie/`
     is outside the layout, and nothing else in mie writes there.
   - **The hidden directory of a removal**, `.removed-date=YYYY-MM-DD`
@@ -928,6 +955,135 @@ live in more than one root (approved as written at STOP 1).
      the records it added and every lost file. The next replication pass
      copies it, and hot removal resumes only after the next full
      verification pass.
+- **As implemented (#193): `mie store rebuild --config <ingest config>
+  [--archive-config <path>] [--record-lost] [--replace-hot-ledger]`.** The
+  ledger grammar does not change (header `mie-copy-ledger 1`, no new
+  kind). The rules, numbered as in the #193 plan (the tests cite them):
+  - **B0 Refusals and locks.** Refused with nothing written: an empty
+    `cold_roots`, a hot without its marker, an archive configuration of
+    another store; a configured root, copy target or read-only root,
+    without its marker or with an unreadable one (step 2: the marker is
+    what tells an unmounted root from an empty one), a cold marker with
+    hot's id, one id on two roots, hot and the copy targets not on
+    pairwise distinct devices. Then, each without waiting and held for the
+    whole run, in this order: the copy-ledger hold (*The whole-run hold*),
+    the pass lock (no pass extends a ledger copy or appends mid-run), the
+    verify lock (no verification reads a snapshot the install replaces,
+    which the removal gate below relies on) and the archive source's
+    writer lock (no import writes parts, entries or `PENDING` mid-run).
+    The live source's lock is not taken: `mie ingest` keeps capturing,
+    its degraded writer opens only hot-window dates, and its remover and
+    replicator need the ledger or the pass lock. Hot's own ledger: absent,
+    or unreadable as `Integrity` or `Corrupt` (the degraded start's
+    "missing or unreadable"), proceeds; readable is refused unless
+    `--replace-hot-ledger` is given (operator, #193 STOP 1 decision 2: a
+    mistyped command must not drop findings and `verify` records); an I/O
+    error is refused. Archive paths on any root or in the start copy with
+    no archive configuration are refused: without the import ledger
+    neither the step 4 cross-check nor step 5a can run.
+  - **B1 Read order**, nothing written: every copy target's ledger copy;
+    hot's journal up to the length J read now (bytes after J, and a line
+    cut at J, are not parsed); every import entry on hot and on the
+    targets, and hot's `PENDING`; hot's layout (manifests, `date=`
+    directories); each cold root's layout in configuration order, with
+    every copy's data checked against that root's own manifest (size
+    before SHA-256, streamed). The journal and the entries come before
+    the listings because a part is sealed before its `sealed` line and an
+    archive part before the entry that lists it, so a "no root holds it"
+    verdict never comes from a listing that ran ahead of the record. An
+    I/O error on a listing, a manifest, the journal, an entry or a ledger
+    copy stops the rebuild, since a skipped directory would turn its files
+    into lost candidates; unreadable data is a damaged copy, never an
+    absence.
+  - **B2 Start (step 1).** The longest verified prefix among the copy
+    targets' ledger copies, the incomplete trailing record dropped;
+    configuration order breaks a tie; every rejected copy is named. Hot's
+    own ledger is never a candidate.
+  - **B3, B4, B5 (step 3).** A root *holds* a path when its layout has
+    the path's manifest. The path's texts are the distinct texts that
+    parse and describe its own location, from every root and the start's
+    `manifest` records; a text that does not do both is a damaged copy,
+    never a second text. Two texts on a live path stop the rebuild with
+    nothing written; on an archive path they are a `manifest-conflict`
+    hold. A copy is verified when it sits on a copy target, carries the
+    path's one text and its data matches. `manifest` is appended when the
+    start lacks one, `copy` per verified copy the start does not record;
+    a `copy` record the start holds is never repeated, so an open finding
+    stays open until the repair re-verifies the copy. A held conflict gets
+    the one text whose SHA-256 its current entry lists. A copy that does
+    not verify gets no record and a `FAIL:` line naming `mie store
+    verify`, then `mie store repair`: findings are the verification's.
+  - **B6 Lost (step 4).** The sources are every path a start record
+    names, hot's journal (`sealed` `files[].path`, `recovery`
+    `rolled_forward[]`; complete non-JSON lines are counted, not parsed)
+    and the file lines of the current entries. A name that passes the
+    layout's grammar and that no root holds (no data file and no manifest
+    on hot or any cold root) is a candidate, with origin `ledger` (the
+    start has its manifest) > `import` > `journal` > `recovery`; the
+    output names every source. It is written as `lost` only with
+    `--record-lost` (operator, #193 STOP 1 decision 1, as for the
+    repair): without it nothing is written, the ledger stays missing and
+    every selection keeps failing on it, never shorter. A name outside
+    the grammar (look-alike characters, a trailing blank, `..`, an
+    absolute path) is reported and never recorded. A path the start
+    records lost that a root holds again stays lost. The lines of an
+    entry held as `entry-conflict` are no source.
+  - **B7 Archive holds (step 5a)** are one pure function shared with the
+    hot restore's step 5, which passes no `PENDING`: entry resolution as
+    in that step, `unlisted` for an archive part no current entry lists
+    except the parts of `PENDING`'s stream dated in the importer's orphan
+    window `[first day − 1, last day + 1]` of its period (one function of
+    the importer, so the two never disagree), and one reason per path,
+    `manifest-conflict` > `entry-conflict` > `unlisted`. A `PENDING` that
+    cannot be read or parsed exempts nothing. A hold the start carries
+    that the sources no longer derive stays held and is named: no record
+    clears a hold before #194.
+  - **B8 Removed (step 5).** A partition with a verified copy on a cold
+    root and no `date=` directory on hot (a removal's hidden leftover is
+    none) is recorded `removed` unless the start already says so. One
+    dated on or after the first hot date is recorded too and named as hot
+    damage: D6 never removes it, and a running `mie ingest` should be
+    restarted so its writer numbers parts from the union. A partition the
+    start records removed whose directory is still on hot is left for D6
+    to finish.
+  - **B9 Install (step 6).** Records per path in path order (`manifest`,
+    then `copy` per target in configuration order), then `lost`,
+    `removed` and `hold`, each in path order, all with the run's one
+    `at_ms`: equal inputs give byte-identical ledgers. Every root's marker
+    is re-read first (a mount lost during the listing reads as absent
+    files, and `lost` cannot be undone). Then hot's ledger, if any, is
+    hard-linked into `.mie/damaged/<at_ms>/copy-ledger` (never a moment
+    without a ledger on hot; an existing evidence name stops the
+    rebuild), the gate `.mie/rebuilt` is written, and the new ledger goes
+    to a temp name, is fsynced, checked to parse whole and renamed into
+    place. Last, every copy target's ledger copy that is no byte prefix of
+    the new ledger is moved aside into its own
+    `.mie/damaged/<at_ms>/copy-ledger`; the next pass copies the rebuilt
+    ledger from byte 0. That is how the rebuild decides #192 R6: two valid
+    chains are no open question once the rebuilt ledger supersedes both.
+    A crash before the gate leaves only the link; after it, the old or no
+    ledger next to the gate, which only makes removal wait; a re-run
+    completes it.
+  - **B10 Removal waits for a verification** (step 6). The gate is
+    `mie-rebuilt 1\nprefix <L>\n`, L the rebuilt ledger's length in
+    bytes; D6 rule (g). Why a file and not a record kind (operator, #193
+    STOP 1 decision 3): a kind is a format change, a header v2 under every
+    existing ledger.
+  - **B11 Output.** The start, every rejected copy, the journal bytes read
+    and the non-JSON lines counted, the records added per kind, every lost
+    file with its sources, every hold, the gate, every ledger copy moved
+    aside, then `wrote …` or `nothing written`; `PASS` and exit 0 only
+    with the ledger written and no `FAIL:` line (no lost file, hold,
+    damaged copy, hot-window removal, leftover start hold or differing
+    entry copy), as `mie store repair` does.
+  - **Cost.** The rebuild reads every copy on every root once, as one
+    verification pass does (D11, P's lower bound); replication, hot
+    removal and imports pause meanwhile.
+  - **Invariance limits of an empty start.** It cannot see what only the
+    lost ledger held: a `lost` path a root holds again, a text in the lost
+    ledger only, findings and `verify` records. Selections can differ from
+    a full start only there; the first contradicts the lost-file rule's
+    premise, the others are double faults, and the output names each.
 - **Seeds.** The capture start's seed scan (`ingest.rs` `seeds`, window
   `[now − 7 d, now + 1 d)`) calls `select` only and takes
   `max_event_time` from the manifests; it never reads a data file. With a
@@ -1574,6 +1730,15 @@ What breaks:
     throws away the good copy of a completed import. Rejected, editing the
     old import entry: entries are immutable (ADR-034 D4), and the
     superseded one is the record of what was imported.
+  - **As implemented (#193).** The importer (`mie archive-import`, its dry
+    run included) refuses while any hold is open, right after its
+    copy-ledger refusal and folded from that same ledger read, so it
+    costs no I/O: the message names the count, the first held path in
+    path order, its reason and the resolution `mie store resolve` (#194).
+    The checks of step 5 are one pure function shared by the rebuild
+    (D7 step 5a) and the hot restore, which passes no `PENDING`; a part
+    that qualifies for several reasons gets one, `manifest-conflict` >
+    `entry-conflict` > `unlisted`.
 
   Why a restore and not "the capture continues": on an empty hot the
   writer numbers new parts from `part-00000` under paths that cold
@@ -1811,7 +1976,10 @@ What breaks:
       refused: both chains are valid,
       so one holds records the other lacks (a damaged last record on hot
       that an append truncated as torn, D7, say), and overwriting it could
-      destroy the last copy of a record. The rebuild (#193) decides.
+      destroy the last copy of a record. `mie store rebuild
+      --replace-hot-ledger` decides (#193, D7 *As implemented* B9): the
+      rebuilt ledger supersedes both chains, the old hot ledger is linked
+      into `.mie/damaged/` and the copy is moved aside.
     - **R7** A journal copy with an open journal finding is repaired only
       when another target's copy is longer than the first differing byte d
       and equals hot over `[0, d]`, so two of three agree; it is rebuilt

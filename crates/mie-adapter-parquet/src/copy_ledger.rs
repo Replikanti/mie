@@ -60,6 +60,10 @@
 //! even when the append failed. The ledger is never created by an append;
 //! only the init step creates it (ADR-062 D7,
 //! [`create_meta`](crate::root_marker::create_meta)).
+//!
+//! The rebuild (ADR-062 D7 step 6, #193) builds a whole ledger in memory
+//! ([`LedgerBuilder`]) and installs it under its whole-run hold
+//! ([`LedgerHold::replace`]): the only writer that replaces the file.
 
 use crate::io_error;
 use crate::layout::{self, COPY_LEDGER, COPY_LEDGER_LOCK, META_DIR, PartFile};
@@ -605,6 +609,14 @@ fn check_at_ms(at_ms: i64) -> Result<(), String> {
     }
 }
 
+/// Whether `path` is a sealed data path a record may name: the layout's
+/// grammar, written exactly as the layout writes it. The rebuild (#193 B6)
+/// reports a journal or entry name that fails it instead of recording it,
+/// since the render would refuse the record.
+pub fn is_data_path(path: &str) -> bool {
+    check_data_path(path).is_ok()
+}
+
 /// A sealed data path that renders back to itself.
 fn check_data_path(path: &str) -> Result<(), String> {
     let (key, date, part) = layout::parse_data_path(path).map_err(|e| e.to_string())?;
@@ -895,6 +907,80 @@ fn parse_line(line: &[u8]) -> Result<Record, String> {
     let (body, _) = split_line(line).ok_or("no chain field")?;
     let body = std::str::from_utf8(body).map_err(|_| "not UTF-8".to_owned())?;
     parse_body(body)
+}
+
+/// A ledger built in memory by the rebuild (ADR-062 D7, #193 B9): a start
+/// (header only, or a verified prefix), then records chained onto it, then
+/// the bytes [`LedgerHold::replace`] installs. Each record is rendered and
+/// chained exactly as an append writes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LedgerBuilder {
+    bytes: Vec<u8>,
+    chain: String,
+    added: u64,
+}
+
+impl LedgerBuilder {
+    /// A header-only start.
+    pub fn empty() -> Self {
+        Self {
+            bytes: HEADER.as_bytes().to_vec(),
+            chain: genesis(),
+            added: 0,
+        }
+    }
+
+    /// A start from the ledger `bytes` (a ledger copy; `path` names it in
+    /// errors): its verified prefix, the incomplete trailing record
+    /// dropped, as [`parse`] reads it.
+    ///
+    /// # Errors
+    ///
+    /// As [`parse`].
+    pub fn from_prefix(path: &Path, bytes: &[u8]) -> Result<Self, RawStoreError> {
+        let ledger = parse(path, bytes)?;
+        Ok(Self {
+            bytes: bytes[..ledger.verified_len as usize].to_vec(),
+            chain: ledger.last_chain,
+            added: 0,
+        })
+    }
+
+    /// Chains `record` onto the ledger.
+    ///
+    /// # Errors
+    ///
+    /// [`RawStoreError::Invalid`] for a record outside the grammar; nothing
+    /// is added.
+    pub fn push(&mut self, record: &Record) -> Result<(), RawStoreError> {
+        let body = record.body()?;
+        let chain = chain_of(self.chain.as_bytes(), body.as_bytes());
+        self.bytes
+            .extend_from_slice(format!("{body} {chain}\n").as_bytes());
+        self.chain = chain;
+        self.added += 1;
+        Ok(())
+    }
+
+    /// The ledger's length so far, in bytes.
+    pub fn len(&self) -> u64 {
+        self.bytes.len() as u64
+    }
+
+    /// Whether the ledger holds the header only.
+    pub fn is_empty(&self) -> bool {
+        self.bytes.len() == HEADER.len()
+    }
+
+    /// The records pushed onto the start.
+    pub fn added(&self) -> u64 {
+        self.added
+    }
+
+    /// The ledger's bytes.
+    pub fn finish(self) -> Vec<u8> {
+        self.bytes
+    }
 }
 
 /// An incomplete trailing record that an append truncated (ADR-062 D7).
@@ -1343,6 +1429,147 @@ impl LedgerHold {
     pub fn records_after(&self, offset: u64, chain: &str) -> Result<Vec<Record>, RawStoreError> {
         tail_after(&self.ledger, offset, chain)
     }
+
+    /// Replaces the ledger by `bytes` under the held lock (ADR-062 D7 step
+    /// 6, #193 B9 steps 3 to 5), in this order:
+    ///
+    /// 0. `bytes` must parse as a whole ledger with no incomplete trailing
+    ///    record ([`parse`]); otherwise nothing is touched. An invalid
+    ///    ledger is never installed.
+    /// 1. With `aside` and a ledger on hot, the ledger is hard-linked to
+    ///    `aside` (a `.mie/damaged/<at_ms>/copy-ledger` of hot), its
+    ///    directory fsynced: there is never a moment without a ledger on
+    ///    hot, and an existing `aside` stops the replacement, since
+    ///    evidence is never overwritten.
+    /// 2. The removal gate is written ([`rebuilt::write`](crate::rebuilt::write)),
+    ///    before the rename, so a planner that reads the new ledger always
+    ///    finds its gate.
+    /// 3. `bytes` go to `.mie/.copy-ledger.rebuild.tmp` (a stale one is
+    ///    removed first), fsynced, renamed over the ledger, and `.mie`
+    ///    fsynced.
+    ///
+    /// A crash before step 2 leaves the old state plus the link; after it,
+    /// the old ledger (or none) next to the gate, which only makes removal
+    /// wait; a re-run at another `at_ms` completes it. An append waiting
+    /// for the lock opens the ledger only once it holds the lock, so it
+    /// writes into the installed one.
+    ///
+    /// # Errors
+    ///
+    /// [`RawStoreError::Invalid`] for `bytes` that do not parse whole
+    /// (nothing is touched); [`RawStoreError::Integrity`] when `aside`
+    /// exists (nothing is touched); [`RawStoreError::Io`] on I/O failure.
+    pub fn replace(&self, bytes: &[u8], aside: Option<&Path>) -> Result<(), RawStoreError> {
+        match parse(&self.ledger, bytes) {
+            Ok(ledger) if ledger.ignored_bytes == 0 => {}
+            Ok(ledger) => {
+                return Err(RawStoreError::Invalid(format!(
+                    "the rebuilt copy ledger ends in an incomplete record of {} bytes; it is \
+                     not installed (ADR-062 D7)",
+                    ledger.ignored_bytes
+                )));
+            }
+            Err(error) => {
+                return Err(RawStoreError::Invalid(format!(
+                    "the rebuilt copy ledger does not parse ({error}); it is not installed \
+                     (ADR-062 D7)"
+                )));
+            }
+        }
+        let meta = self.ledger.parent().ok_or_else(|| {
+            RawStoreError::Invalid(format!("{} has no directory", self.ledger.display()))
+        })?;
+        let raw_root = meta
+            .parent()
+            .ok_or_else(|| RawStoreError::Invalid(format!("{} has no root", meta.display())))?;
+        if let Some(aside) = aside {
+            link_aside(&self.ledger, aside)?;
+        }
+        replace_reached(ReplaceStep::Link)?;
+        crate::rebuilt::write(raw_root, bytes.len() as u64)?;
+        replace_reached(ReplaceStep::Gate)?;
+        let tmp = meta.join(format!(".{COPY_LEDGER}.rebuild.tmp"));
+        match fs::remove_file(&tmp) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(io_error("remove", &tmp)(error)),
+        }
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .map_err(io_error("create", &tmp))?;
+        file.write_all(bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(io_error("write", &tmp))?;
+        drop(file);
+        replace_reached(ReplaceStep::Temp)?;
+        fs::rename(&tmp, &self.ledger).map_err(io_error("rename", &tmp))?;
+        crate::sync_dir(meta)
+    }
+}
+
+/// Hard-links the ledger at `ledger` to `aside`, creating its directories
+/// and fsyncing them; no ledger is no error. An existing `aside` is
+/// [`RawStoreError::Integrity`].
+fn link_aside(ledger: &Path, aside: &Path) -> Result<(), RawStoreError> {
+    match fs::symlink_metadata(ledger) {
+        Ok(_) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(io_error("inspect", ledger)(error)),
+    }
+    let dir = aside
+        .parent()
+        .ok_or_else(|| RawStoreError::Invalid(format!("{} has no directory", aside.display())))?;
+    fs::create_dir_all(dir).map_err(io_error("create", dir))?;
+    match fs::hard_link(ledger, aside) {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            return Err(RawStoreError::Integrity(format!(
+                "{} exists: evidence is never overwritten (ADR-062 D7)",
+                aside.display()
+            )));
+        }
+        Err(error) => return Err(io_error("link", aside)(error)),
+    }
+    crate::sync_dir(dir)
+}
+
+/// The steps of [`LedgerHold::replace`]. Tests stop a replacement after
+/// any of them to simulate a crash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplaceStep {
+    /// The old ledger is linked aside (or there was none).
+    Link,
+    /// The removal gate is written.
+    Gate,
+    /// The new ledger is written to its temp name and fsynced.
+    Temp,
+}
+
+#[cfg(test)]
+impl ReplaceStep {
+    /// Every step, in order.
+    pub(crate) const ALL: [Self; 3] = [Self::Link, Self::Gate, Self::Temp];
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: the next replacement on this thread stops after this step.
+    pub(crate) static REPLACE_CRASH_AFTER: std::cell::Cell<Option<ReplaceStep>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Marks the end of a replacement step; under test, simulates a crash
+/// there once.
+fn replace_reached(step: ReplaceStep) -> Result<(), RawStoreError> {
+    #[cfg(test)]
+    if REPLACE_CRASH_AFTER.with(|crash| crash.get() == Some(step)) {
+        REPLACE_CRASH_AFTER.with(|crash| crash.set(None));
+        return Err(RawStoreError::Io(format!("simulated crash after {step:?}")));
+    }
+    let _ = step;
+    Ok(())
 }
 
 /// [`LedgerHold::records_after`] over the ledger at `path`; the caller

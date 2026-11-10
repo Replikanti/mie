@@ -175,7 +175,12 @@ pub fn import_with(
     // Dry runs too: the days an import names can lie outside the hot window,
     // whose removed partitions only the copy ledger lists (ADR-062 D7, *Hot
     // intact, ledger lost*).
-    crate::store::check_copy_ledger(&config.paths.raw_root, &config.paths.cold_roots)?;
+    let ledger = crate::store::check_copy_ledger(&config.paths.raw_root, &config.paths.cold_roots)?;
+    // Dry runs too, from that same read: an open hold halts the importer
+    // until it is resolved (ADR-062 D11, #193 H1).
+    if let Some(ledger) = &ledger {
+        crate::store::check_holds(ledger)?;
+    }
     let store = crate::store::raw_store(&config.paths.raw_root, &config.paths.cold_roots)?;
     let options = import_options(config, request)?;
     let fetcher = Fetcher::new(

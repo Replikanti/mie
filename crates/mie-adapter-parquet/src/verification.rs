@@ -25,7 +25,7 @@
 //!
 //! The path verdicts are those of the union `select` ([`tiers`](crate::tiers)).
 
-use crate::copy_ledger::{FindingCode, Kind, Ledger, Record, Subject};
+use crate::copy_ledger::{FindingCode, HoldReason, Kind, Ledger, Record, Subject};
 use crate::manifest;
 use crate::tiers::{self, LedgerView, Verdict};
 use mie_ports::raw::RawStoreError;
@@ -269,6 +269,25 @@ impl CopyState {
     /// The verdict of `path`, `None` when the ledger does not record it.
     pub fn verdict(&self, path: &str) -> Option<PathVerdict> {
         self.view.verdict_of(path).map(PathVerdict::from)
+    }
+
+    /// The open hold of `path`, whatever its verdict (a lost path can
+    /// carry one too).
+    pub fn hold_reason(&self, path: &str) -> Option<HoldReason> {
+        self.view.hold_reason(path)
+    }
+
+    /// Every held path, in path order, with its reason: the paths whose
+    /// verdict is held, as `select` sees them (the importer's refusal,
+    /// ADR-062 D11, #193 H1).
+    pub fn held(&self) -> Vec<(String, HoldReason)> {
+        self.view
+            .all()
+            .filter_map(|(path, verdict)| match verdict {
+                Verdict::Held(reason) => Some((path.to_owned(), reason)),
+                _ => None,
+            })
+            .collect()
     }
 
     /// The ledger's first manifest text of `path`, whatever its verdict.

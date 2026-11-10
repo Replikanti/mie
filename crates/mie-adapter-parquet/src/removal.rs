@@ -201,6 +201,10 @@ pub struct RemovalPlan {
     /// record (D5), as a message: its partition stays on hot, and the pass
     /// reports it.
     pub conflicts: Vec<String>,
+    /// Why the plan has no candidate although the gate of a copy-ledger
+    /// rebuild is in place (rule (g)); `None` without a gate or once a
+    /// verification of every target covers it.
+    pub waiting: Option<String>,
 }
 
 impl RemovalPlan {
@@ -239,7 +243,18 @@ impl RemovalPlan {
 ///   in `targets`: they lie in the prefix that k verified ledger copies
 ///   hold. A `finding` about an id's copy ledger after its latest
 ///   `ledger-copy` record voids that record, so there is no P and no plan
-///   until a later one (L1 of #192).
+///   until a later one (L1 of #192);
+/// - (g) after a copy-ledger rebuild, whose gate `rebuilt` = `Some(L)`
+///   holds the installed ledger's length ([`rebuilt`](crate::rebuilt),
+///   #193 B10): L lies inside this read, and every id in `targets` has a
+///   `verify` record with a prefix of at least L. Every `verify` record
+///   inside the start copy the rebuild began from has a prefix below its
+///   own offset, so below L, and the verification lock keeps a
+///   verification from running across the install, so only a
+///   verification that read the rebuilt ledger qualifies (D7 step 6:
+///   removal resumes only after the next full verification). Otherwise
+///   [`RemovalPlan::waiting`] names the reason. Incomplete removals and
+///   leftovers are not affected: their records are already written.
 ///
 /// A partition with debris can still be planned: the `.tmp` rule must be
 /// checked under the source lock, so the remover refuses it there.
@@ -255,6 +270,7 @@ pub fn plan(
     targets: &BTreeSet<String>,
     k: usize,
     first_hot_date: &str,
+    rebuilt: Option<u64>,
 ) -> Result<RemovalPlan, RawStoreError> {
     let mut plan = RemovalPlan {
         ledger_len: ledger.verified_len,
@@ -263,6 +279,7 @@ pub fn plan(
         incomplete: Vec::new(),
         leftovers: scan.leftovers.clone(),
         conflicts: Vec::new(),
+        waiting: None,
     };
     if targets.len() != k || k == 0 {
         return Ok(plan);
@@ -284,6 +301,9 @@ pub fn plan(
         return Ok(plan);
     };
     let inside = |end: Option<u64>| end.is_some_and(|end| end <= prefix);
+    // Rule (g): after a rebuild, only a verification of every target that
+    // read the rebuilt ledger lets candidates through.
+    let waiting = rebuilt.and_then(|len| gate_waits(&state, ledger, targets, len));
 
     for (partition, on_hot) in &scan.partitions {
         let Ok((_, date)) = layout::parse_partition_dir(partition) else {
@@ -341,11 +361,46 @@ pub fn plan(
         };
         if recorded_removed {
             plan.incomplete.push(candidate);
-        } else {
+        } else if waiting.is_none() {
             plan.candidates.push(candidate);
         }
     }
+    plan.waiting = waiting;
     Ok(plan)
+}
+
+/// Rule (g) of [`plan`] for the gate `len`: why removal still waits, or
+/// `None` when a verification of every id in `targets` covers it.
+fn gate_waits(
+    state: &CopyState,
+    ledger: &Ledger,
+    targets: &BTreeSet<String>,
+    len: u64,
+) -> Option<String> {
+    if len > ledger.verified_len {
+        return Some(format!(
+            "the copy-ledger rebuild installed {len} bytes, more than the {} this read verified; \
+             removal waits (ADR-062 D7)",
+            ledger.verified_len
+        ));
+    }
+    let unverified: Vec<&str> = targets
+        .iter()
+        .filter(|id| {
+            !state
+                .verifies(id)
+                .iter()
+                .any(|pass| pass.prefix_bytes >= len)
+        })
+        .map(String::as_str)
+        .collect();
+    (!unverified.is_empty()).then(|| {
+        format!(
+            "the copy ledger was rebuilt ({len} bytes); removal waits for a `mie store verify` \
+             that covers it on {} (ADR-062 D7 step 6)",
+            unverified.join(", ")
+        )
+    })
 }
 
 /// The writer lock of a source, taken by the remover; dropping it releases

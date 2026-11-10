@@ -47,6 +47,19 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+/// The days whose partitions an import of a file of `period` may have
+/// sealed parts in, as `(first, last)` days since 1970-01-01, both
+/// inclusive: from the day before the period's first day to the day after
+/// its last one. A row's ordering time may lie up to a day outside the
+/// period (step 4), and a `metrics` file's 23:55 row is filed under the
+/// next day (ADR-034 D3). A crash during steps 6–8 leaves its orphans
+/// only there; the resume looks for them there, and the copy-ledger
+/// rebuild exempts the parts there of the file `PENDING` names from its
+/// holds (ADR-062 D7 step 5a, #193 B7), so the two never disagree.
+pub fn orphan_days(period: Period) -> (i64, i64) {
+    (period.first_day() - 1, period.end_day())
+}
+
 /// What to import and where the bookkeeping lives.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportOptions {
@@ -556,11 +569,10 @@ impl<'a> Importer<'a> {
         pending: Option<&Pending>,
     ) -> Result<FileOutcome, FileError> {
         let entry = job.file_name.replace(".zip", ".csv");
-        let (first_day, end_day) = (job.period.first_day(), job.period.end_day());
-
         // Orphans: sealed parts in the partitions this file may touch that
         // no ledger lists.
-        let orphans = self.orphans(job, first_day - 1, end_day)?;
+        let (first_orphan_day, last_orphan_day) = orphan_days(job.period);
+        let orphans = self.orphans(job, first_orphan_day, last_orphan_day)?;
         if pending.is_none() && !orphans.is_empty() {
             return Err(ImportError::Integrity(format!(
                 "{} sealed files of {} near {} are in no ledger and no import is pending: {}",
