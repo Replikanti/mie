@@ -539,7 +539,7 @@ pub fn repair(
 /// ([`crate::ingest::first_hot_date`] in production). `now_ms` is read once:
 /// it stamps every record and names the run's `.mie/damaged/` directories.
 ///
-/// It prints the start, the records added, every lost file and hold, the
+/// It prints the start, the records derived, every lost file and hold, the
 /// gate and every ledger copy moved aside, then `wrote …` or `nothing
 /// written`, then `PASS` (returns `true`) or one `FAIL: <problem>` line per
 /// problem (returns `false`).

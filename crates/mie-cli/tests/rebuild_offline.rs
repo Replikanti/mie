@@ -285,7 +285,10 @@ fn aw8_a_file_missing_from_every_root_is_reported_then_recorded_lost() {
 
     let (pass, out) = rebuild(&fixture, record_lost(), REBUILT + 1);
     assert!(!pass, "{out}");
-    assert_fail_line(&out, &[&path, "recorded lost"]);
+    assert_fail_line(
+        &out,
+        &[&path, "--record-lost", "derived into the rebuilt ledger"],
+    );
     assert!(out.contains("wrote "), "{out}");
     let records = copy_ledger::read(&fixture.hot()).unwrap().unwrap().records;
     assert!(

@@ -439,7 +439,12 @@ fn journal_is_read_before_the_roots_are_listed() {
     );
     assert_eq!(sealed.borrow().len(), 1);
     assert_pass(&report);
-    assert!(!report.lines.iter().any(|l| l.starts_with("lost:")));
+    assert!(
+        !report
+            .lines
+            .iter()
+            .any(|l| l.starts_with("lost candidate:"))
+    );
 }
 
 /// B8: a removal's hidden leftover is no directory, so its partition is
@@ -563,5 +568,45 @@ fn a_live_manifest_conflict_stops_the_rebuild() {
     let before = snapshot(&fixture);
     let report = rebuild(&fixture, Flags::default());
     assert_stopped(&report, &[&part, "cold-b", "different manifest texts"]);
+    assert_eq!(snapshot(&fixture), before);
+}
+
+/// Re-review 2 of #209, finding 3: a run that writes nothing says nothing
+/// was linked, recorded or added. Here hot's ledger is unreadable and an
+/// archive part no entry lists is left unrecorded without
+/// `--record-unlisted`.
+#[test]
+fn a_run_that_writes_nothing_reports_no_write() {
+    let fixture = Fixture::new("rebuild-nothing-written");
+    assert_eq!(fixture.pass().problems, Vec::<String>::new());
+    fs::write(
+        copy_ledger::ledger_path(&fixture.hot),
+        b"mie-copy-ledger 9\n",
+    )
+    .unwrap();
+    fixture.seal("binance-archive", "aggTrades", D0 + 7_200_000, 2);
+    let before = snapshot(&fixture);
+    let report = rebuild(
+        &fixture,
+        Flags {
+            record_lost: true,
+            ..Flags::default()
+        },
+    );
+    assert_eq!(
+        report.lines.last().map(String::as_str),
+        Some("nothing written"),
+        "{report:#?}"
+    );
+    for line in report.lines.iter().chain(&report.problems) {
+        assert!(
+            !line.contains("linked")
+                && !line.contains("recorded lost")
+                && !line.contains("records added")
+                && !line.starts_with("wrote ")
+                && !line.starts_with("gate: "),
+            "{line}"
+        );
+    }
     assert_eq!(snapshot(&fixture), before);
 }

@@ -1536,14 +1536,23 @@ mod tiered_start {
             "{text}"
         );
         // The fixture seals its archive rows without import entries, so the
-        // rebuild holds them (ADR-062 D11, unlisted); the live source has
-        // no finding.
+        // rebuild holds them (ADR-062 D11, unlisted), and the flagged run
+        // names the import ledger's counts too; the live source has no
+        // finding.
         let fails: Vec<&str> = text.lines().filter(|l| l.starts_with("FAIL: ")).collect();
         assert!(!pass && !fails.is_empty(), "{text}");
+        let (summary, holds): (Vec<&str>, Vec<&str>) = fails
+            .iter()
+            .partition(|l| l.contains("listed by no current import entry"));
         assert!(
-            fails
-                .iter()
-                .all(|l| l.contains("source=binance-archive/") && l.contains("held (unlisted)")),
+            summary.len() == 1 && summary[0].contains("holds 0 entries"),
+            "{text}"
+        );
+        assert!(
+            !holds.is_empty()
+                && holds
+                    .iter()
+                    .all(|l| l.contains("source=binance-archive/") && l.contains("held (unlisted)")),
             "{text}"
         );
         assert_eq!(replay_before_t(&config), before);

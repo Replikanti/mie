@@ -311,7 +311,9 @@ pub struct Derived {
     /// `--record-unlisted`: the rebuild then installs nothing.
     pub unrecorded_unlisted: Vec<String>,
     /// Report lines (B11): the start, the rejected copies, the journal,
-    /// the records added, the lost files, the holds.
+    /// the records derived, the lost files, the holds. They state what the
+    /// rebuilt ledger holds, never that it was written: only the install's
+    /// `wrote …` line does.
     pub lines: Vec<String>,
     /// Every `FAIL:` finding.
     pub problems: Vec<String>,
@@ -863,13 +865,18 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
             (LostOrigin::Ledger, None)
         };
         lines.push(format!(
-            "lost: {path}: origin {}, sha256 {}; named by {}",
+            "lost candidate: {path}: origin {}, sha256 {}; named by {}",
             origin.as_str(),
             sha256.as_deref().unwrap_or("-"),
             described.join(", ")
         ));
+        // The derivation states what the rebuilt ledger holds, never that
+        // it was written: the install comes later and may not happen
+        // (re-review 2 of #209, finding 2).
         let what = if inputs.record_lost {
-            "recorded lost (--record-lost): every selection that covers it fails from now on"
+            "with --record-lost its `lost` record is derived into the rebuilt ledger, and it \
+             takes effect only if this run installs it (`wrote …` below): then every selection \
+             that covers it fails"
         } else {
             "nothing is written; after checking for a shared cause (an unmounted root, roots \
              restored from an old backup), `mie store rebuild --record-lost` records it lost"
@@ -897,9 +904,13 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
     let mut holds = Vec::new();
     let mut hold_records = Vec::new();
     let mut unrecorded_unlisted = Vec::new();
+    let mut new_unlisted = 0usize;
     for (path, reason) in &findings.holds {
         holds.push((path.clone(), *reason));
         let new = state.hold_reason(path).is_none();
+        if new && *reason == HoldReason::Unlisted {
+            new_unlisted += 1;
+        }
         if new && *reason == HoldReason::Unlisted && !inputs.record_unlisted {
             lines.push(format!("unlisted: {path} (not recorded)"));
             problems.push(format!(
@@ -909,10 +920,11 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
             unrecorded_unlisted.push(path.clone());
             continue;
         }
-        lines.push(format!("hold: {path} ({})", reason.as_str()));
+        lines.push(format!("hold derived: {path} ({})", reason.as_str()));
         problems.push(format!(
-            "{path}: held ({}): the importer refuses and every selection that covers it fails \
-             until the hold is resolved (`mie store resolve`, #194; ADR-062 D11)",
+            "{path}: held ({}) in the rebuilt ledger: once it is installed, the importer refuses \
+             and every selection that covers it fails until the hold is resolved (`mie store \
+             resolve`, #194; ADR-062 D11)",
             reason.as_str()
         ));
         if new {
@@ -922,7 +934,19 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
             });
         }
     }
-    if !unrecorded_unlisted.is_empty() {
+    // The evidence line on every run that derives a new `unlisted` hold,
+    // the flagged run included: an import-ledger disk that became an empty
+    // mount point between two runs must show in the run that writes the
+    // holds (re-review 2 of #209, finding 1).
+    if new_unlisted > 0 {
+        let what = if inputs.record_unlisted {
+            "With --record-unlisted their holds are derived into the rebuilt ledger, and only \
+             the hold resolution clears them once it is installed; if these counts show an empty \
+             or unmounted import ledger, fix it before a run that installs"
+        } else {
+            "Check it; once it is the store's, `mie store rebuild --record-unlisted` records \
+             these holds, which only the hold resolution clears"
+        };
         let on_hot = inputs
             .entries
             .values()
@@ -930,12 +954,10 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
             .count();
         let targets_only = inputs.entries.len() - on_hot;
         problems.push(format!(
-            "{} archive part(s) are listed by no current import entry. Hot's import ledger {} \
-             holds {on_hot} entries, and the copy targets hold {targets_only} entries that hot \
-             lacks: an empty or unmounted import ledger reads as no entries. Check it; once it \
-             is the store's, `mie store rebuild --record-unlisted` records these holds, which \
-             only the hold resolution clears (#194; ADR-062 D7 step 5a)",
-            unrecorded_unlisted.len(),
+            "{new_unlisted} archive part(s) are listed by no current import entry. Hot's import \
+             ledger {} holds {on_hot} entries, and the copy targets hold {targets_only} entries \
+             that hot lacks: an empty or unmounted import ledger reads as no entries. {what} \
+             (#194; ADR-062 D7 step 5a)",
             inputs
                 .import_ledger
                 .as_deref()
@@ -954,7 +976,7 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
         {
             problems.push(format!(
                 "{path}: the start copy holds it ({}) and the sources no longer derive that \
-                 hold; it stays held, since no record clears a hold before #194 (AW12) (ADR-062 \
+                 hold; it stays held in the rebuilt ledger, since no record clears a hold before #194 (AW12) (ADR-062 \
                  D11)",
                 reason.as_str()
             ));
@@ -992,8 +1014,8 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
             problems.push(format!(
                 "{partition}: verified cold copies and no directory on hot, but it is dated inside \
                  the hot window, which starts on {}: the hot removal never removes such a \
-                 partition, so this is hot damage. It is recorded removed, so a writer recalls it \
-                 before it appends; restart a running `mie ingest` so its writer numbers parts \
+                 partition, so this is hot damage. Its `removed` record is derived, so once the \
+                 ledger is installed a writer recalls it before it appends; restart a running `mie ingest` so its writer numbers parts \
                  from the union (ADR-062 D6, D8)",
                 inputs.first_hot_date
             ));
@@ -1035,7 +1057,7 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
     // After the start, the rejected copies and the journal line.
     lines.insert(
         2 + rejected.len(),
-        format!("records added: {}", counted.join(", ")),
+        format!("records derived: {}", counted.join(", ")),
     );
     Ok(Derived {
         start,
@@ -1188,7 +1210,7 @@ fn rebuild(
         }
         Err(RawStoreError::Integrity(error) | RawStoreError::Corrupt(error)) => {
             report.lines.push(format!(
-                "hot's copy ledger is unreadable ({error}); it is linked aside"
+                "hot's copy ledger is unreadable ({error}); the install links it aside"
             ));
             true
         }

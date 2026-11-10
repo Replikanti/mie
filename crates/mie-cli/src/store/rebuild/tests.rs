@@ -826,11 +826,62 @@ fn unlisted_holds_need_the_flag() {
     inputs.record_unlisted = true;
     let derived = derive_ok(&inputs);
     assert!(derived.unrecorded_unlisted.is_empty());
+    // Re-review 2 of #209, finding 1: the flagged run, which writes the
+    // holds, names the import ledger's counts too.
+    assert_problem(
+        &derived,
+        &[
+            "the import ledger holds 0 entries",
+            "hold 1 entries that hot lacks",
+        ],
+    );
     assert_eq!(
         added(&derived),
         vec![Kind::Hold {
             path,
             reason: HoldReason::Unlisted
         }]
+    );
+}
+
+/// Re-review 2 of #209, finding 2: with `--record-lost` alone and an
+/// unrecorded `unlisted` candidate the run installs nothing, so no line
+/// may say a record was recorded or added; the derivation's lines speak of
+/// derived records, and only the install reports what it wrote.
+#[test]
+fn a_derivation_never_claims_a_record_was_written() {
+    let gone = live("2026-10-06", 5);
+    let archive = part("aggTrades", "2026-10-06", 0);
+    let mut inputs = inputs();
+    inputs.record_lost = true;
+    inputs.journal.names.push(JournalName {
+        path: gone.clone(),
+        line: 2,
+        run_id: "r1".to_owned(),
+        recovery: false,
+    });
+    on_hot(&mut inputs, &archive, &text(&archive, &sha("a")));
+    let derived = derive_ok(&inputs);
+    assert_eq!(derived.unrecorded_unlisted, vec![archive]);
+    assert_eq!(derived.lost.len(), 1);
+    for line in derived.lines.iter().chain(&derived.problems) {
+        assert!(
+            !line.contains("recorded lost")
+                && !line.contains("records added")
+                && !line.contains("from now on"),
+            "{line}"
+        );
+    }
+    assert!(
+        derived
+            .lines
+            .iter()
+            .any(|l| l.starts_with("records derived: ") && l.contains("lost 1")),
+        "{:?}",
+        derived.lines
+    );
+    assert_problem(
+        &derived,
+        &[&gone, "--record-lost", "only if this run installs"],
     );
 }

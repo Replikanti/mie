@@ -1058,10 +1058,12 @@ live in more than one root (approved as written at STOP 1).
     hold is written only with `--record-unlisted` (operator, re-review of
     #209, the principle of #193 STOP 1 decision 1: an irreversible record
     derived from an absence needs an explicit flag). Without it every
-    candidate is a `FAIL:` line, the output names the import ledger's
-    directory, how many entries it holds and how many entries the copy
-    targets hold that hot lacks, so an empty or unmounted directory shows
-    before the flag is passed, and nothing is installed. The conflict
+    candidate is a `FAIL:` line and nothing is installed. On every run
+    that derives a new one, the flagged run included, the output names the
+    import ledger's directory, how many entries it holds and how many
+    entries the copy targets hold that hot lacks, so an empty or unmounted
+    directory shows before the flag is passed and again in the run that
+    writes the holds (re-review 2 of #209). The conflict
     reasons come from positive evidence (two texts, two entry copies) and
     are always written. A `PENDING` that
     cannot be read or parsed exempts nothing. A hold the start carries
@@ -1099,9 +1101,15 @@ live in more than one root (approved as written at STOP 1).
     STOP 1 decision 3): a kind is a format change, a header v2 under every
     existing ledger.
   - **B11 Output.** The start, every rejected copy, the journal bytes read
-    and the non-JSON lines counted, the records added per kind, every lost
-    file with its sources, every hold, the gate, every ledger copy moved
-    aside, then `wrote …` or `nothing written`; `PASS` and exit 0 only
+    and the non-JSON lines counted, the records derived per kind, every
+    lost file with its sources, every hold, and on every run that derives
+    a new `unlisted` hold, flagged or not, the import ledger's directory,
+    its entry count and the target entries hot lacks; then the gate, every
+    ledger copy moved aside, then `wrote …` or `nothing written`. The lines
+    before the install state what the rebuilt ledger holds, never that it
+    was written (a run can still install nothing): only the lines after
+    the install, ending with `wrote …`, report writes (re-review 2 of
+    #209); `PASS` and exit 0 only
     with the ledger written and no `FAIL:` line (no lost file, hold,
     damaged copy, hot-window removal, leftover start hold or differing
     entry copy), as `mie store repair` does.

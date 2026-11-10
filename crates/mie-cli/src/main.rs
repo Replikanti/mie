@@ -420,8 +420,10 @@ USAGE:
         on every root once, the cost of one verification; replication, hot
         removal and imports pause meanwhile, and hot removal resumes only
         after the next mie store verify. Prints the start, the records
-        added, every lost file and hold and the ledger written, then PASS
-        and exits 0, or one FAIL: <reason> line per problem and exits 1.
+        derived, every lost file and hold, then the ledger written (`wrote
+        …`) or `nothing written`; only that line says whether anything was
+        written. Then PASS and exits 0, or one FAIL: <reason> line per
+        problem and exits 1.
 
     mie --help
 ";
