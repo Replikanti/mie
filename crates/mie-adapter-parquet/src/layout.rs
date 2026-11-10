@@ -12,9 +12,11 @@
 //! `<root>/.mie/`: the root marker ([`ROOT_MARKER`]) on every root, and on
 //! hot the copy ledger ([`COPY_LEDGER`]) with its lock file
 //! ([`COPY_LEDGER_LOCK`]), the replication pass lock ([`REPLICATE_LOCK`])
-//! and the verification lock ([`VERIFY_LOCK`]). On every root,
-//! `mie store repair` moves damaged copies aside into [`DAMAGED_DIR`]
-//! instead of deleting them; nothing in mie lists or deletes it. `.mie/`
+//! and the verification lock ([`VERIFY_LOCK`]), and after a copy-ledger
+//! rebuild its removal gate ([`REBUILT`]). On every root, `mie store
+//! repair` and `mie store rebuild` move damaged copies aside into
+//! [`DAMAGED_DIR`] instead of deleting them; nothing in mie lists or
+//! deletes it. `.mie/`
 //! lies outside the layout: `select` and recovery walk only `source=`
 //! entries, so they never see it.
 
@@ -54,6 +56,12 @@ pub(crate) const REPLICATE_LOCK: &str = "replicate.lock";
 /// only the repair writes a second `copy` record for such a copy, so the
 /// lock keeps a finding from voiding a copy made after the read.
 pub(crate) const VERIFY_LOCK: &str = "verify.lock";
+
+/// The post-rebuild removal gate in hot's [`META_DIR`] (ADR-062 D7, #193
+/// B10): the length of the ledger `mie store rebuild` installed. The hot
+/// removal plans nothing until a verification of every copy target covers
+/// it ([`rebuilt`](crate::rebuilt)).
+pub(crate) const REBUILT: &str = "rebuilt";
 
 /// The directory in a root's [`META_DIR`] that `mie store repair` moves
 /// damaged copies into, one subdirectory per run (ADR-062 D11, #192): the

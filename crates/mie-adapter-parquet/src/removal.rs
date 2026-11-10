@@ -15,6 +15,8 @@
 //!   tail since the plan ([`LedgerHold::records_after`](crate::LedgerHold::records_after)) names neither the
 //!   partition nor its files, the date is still before the hot window, and
 //!   the directory holds no seal debris and no file the plan did not see.
+//!   After a copy-ledger rebuild it also requires the rebuild's gate to be
+//!   the one the plan was made under (rule (g) of [`plan`]).
 //!   Only then does it append `removed` and fsync, rename the directory to
 //!   the hidden name `.removed-date=YYYY-MM-DD` beside it (same directory,
 //!   so the same filesystem and an atomic rename; recovery, `select` and
@@ -201,6 +203,14 @@ pub struct RemovalPlan {
     /// record (D5), as a message: its partition stays on hot, and the pass
     /// reports it.
     pub conflicts: Vec<String>,
+    /// Why the plan has no candidate although the gate of a copy-ledger
+    /// rebuild is in place (rule (g)); `None` without a gate or once a
+    /// verification of every target covers it.
+    pub waiting: Option<String>,
+    /// The rebuild's gate the plan was made under (`.mie/rebuilt`, rule
+    /// (g)): the remover drops the plan when the gate it reads under its
+    /// locks differs, since a rebuild installed a ledger after the plan.
+    pub gate: Option<u64>,
 }
 
 impl RemovalPlan {
@@ -239,7 +249,18 @@ impl RemovalPlan {
 ///   in `targets`: they lie in the prefix that k verified ledger copies
 ///   hold. A `finding` about an id's copy ledger after its latest
 ///   `ledger-copy` record voids that record, so there is no P and no plan
-///   until a later one (L1 of #192).
+///   until a later one (L1 of #192);
+/// - (g) after a copy-ledger rebuild, whose gate `rebuilt` = `Some(L)`
+///   holds the installed ledger's length ([`rebuilt`](crate::rebuilt),
+///   #193 B10): L lies inside this read, and every id in `targets` has a
+///   `verify` record with a prefix of at least L. Every `verify` record
+///   inside the start copy the rebuild began from has a prefix below its
+///   own offset, so below L, and the verification lock keeps a
+///   verification from running across the install, so only a
+///   verification that read the rebuilt ledger qualifies (D7 step 6:
+///   removal resumes only after the next full verification). Otherwise
+///   [`RemovalPlan::waiting`] names the reason. Incomplete removals and
+///   leftovers are not affected: their records are already written.
 ///
 /// A partition with debris can still be planned: the `.tmp` rule must be
 /// checked under the source lock, so the remover refuses it there.
@@ -255,6 +276,7 @@ pub fn plan(
     targets: &BTreeSet<String>,
     k: usize,
     first_hot_date: &str,
+    rebuilt: Option<u64>,
 ) -> Result<RemovalPlan, RawStoreError> {
     let mut plan = RemovalPlan {
         ledger_len: ledger.verified_len,
@@ -263,6 +285,8 @@ pub fn plan(
         incomplete: Vec::new(),
         leftovers: scan.leftovers.clone(),
         conflicts: Vec::new(),
+        waiting: None,
+        gate: rebuilt,
     };
     if targets.len() != k || k == 0 {
         return Ok(plan);
@@ -284,6 +308,9 @@ pub fn plan(
         return Ok(plan);
     };
     let inside = |end: Option<u64>| end.is_some_and(|end| end <= prefix);
+    // Rule (g): after a rebuild, only a verification of every target that
+    // read the rebuilt ledger lets candidates through.
+    let waiting = rebuilt.and_then(|len| gate_waits(&state, ledger, targets, len));
 
     for (partition, on_hot) in &scan.partitions {
         let Ok((_, date)) = layout::parse_partition_dir(partition) else {
@@ -341,11 +368,46 @@ pub fn plan(
         };
         if recorded_removed {
             plan.incomplete.push(candidate);
-        } else {
+        } else if waiting.is_none() {
             plan.candidates.push(candidate);
         }
     }
+    plan.waiting = waiting;
     Ok(plan)
+}
+
+/// Rule (g) of [`plan`] for the gate `len`: why removal still waits, or
+/// `None` when a verification of every id in `targets` covers it.
+fn gate_waits(
+    state: &CopyState,
+    ledger: &Ledger,
+    targets: &BTreeSet<String>,
+    len: u64,
+) -> Option<String> {
+    if len > ledger.verified_len {
+        return Some(format!(
+            "the copy-ledger rebuild installed {len} bytes, more than the {} this read verified; \
+             removal waits (ADR-062 D7)",
+            ledger.verified_len
+        ));
+    }
+    let unverified: Vec<&str> = targets
+        .iter()
+        .filter(|id| {
+            !state
+                .verifies(id)
+                .iter()
+                .any(|pass| pass.prefix_bytes >= len)
+        })
+        .map(String::as_str)
+        .collect();
+    (!unverified.is_empty()).then(|| {
+        format!(
+            "the copy ledger was rebuilt ({len} bytes); removal waits for a `mie store verify` \
+             that covers it on {} (ADR-062 D7 step 6)",
+            unverified.join(", ")
+        )
+    })
 }
 
 /// The writer lock of a source, taken by the remover; dropping it releases
@@ -519,6 +581,43 @@ pub(crate) fn remove_locked(
             return report;
         }
     };
+    // Rule (g) under the locks: a rebuild that installed its ledger after
+    // the plan leaves the plan's prefix intact (the start copy is a prefix
+    // of hot's), so the tail check alone would carry out a plan made before
+    // the install, before any verification covered the rebuilt ledger
+    // (review of #209, finding 1). The gate is the rebuild's trace: the
+    // plan is dropped unless it was made under the gate read now. A plan
+    // made under a gate L already found a verification covering L, and a
+    // later rebuild of the same length cannot keep the plan's prefix,
+    // which then lies past L, so equality is enough.
+    match crate::rebuilt::read(hot) {
+        Ok(gate) if gate == plan.gate => {}
+        Ok(gate) => {
+            for candidate in plan.candidates.iter().chain(&plan.incomplete) {
+                if ours(&&candidate.partition) {
+                    report.skipped.push((
+                        candidate.partition.clone(),
+                        format!(
+                            "the copy ledger was rebuilt since the plan (its gate is now {}, \
+                             the plan read {}); the plan is dropped, and removal waits for a \
+                             verification covering the rebuilt ledger (ADR-062 D6 rule (g), D7 \
+                             step 6)",
+                            gate.map_or("none".to_owned(), |len| len.to_string()),
+                            plan.gate.map_or("none".to_owned(), |len| len.to_string())
+                        ),
+                    ));
+                }
+            }
+            return report;
+        }
+        Err(error) => {
+            report.error = Some(format!(
+                "the copy-ledger rebuild's gate cannot be read ({error}); nothing is removed \
+                 (ADR-062 D6 rule (g))"
+            ));
+            return report;
+        }
+    }
     let tail = match hold.records_after(plan.ledger_len, &plan.chain) {
         Ok(tail) => tail,
         Err(error) => {

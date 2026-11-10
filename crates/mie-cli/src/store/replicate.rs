@@ -89,6 +89,7 @@ use mie_adapter_binance::archive::ledger::ImportLedger;
 use mie_adapter_parquet::copy_ledger::{
     self, AppendError, AppendOutcome, CopyLedger, Guarded, Kind, Record, Subject, Truncation,
 };
+use mie_adapter_parquet::rebuilt;
 use mie_adapter_parquet::removal::{self, RemovalPlan};
 use mie_adapter_parquet::replica::{self, CopyError, CopyOutcome, Side, TailSource};
 use mie_adapter_parquet::root_marker::{self, HOT_ID};
@@ -535,6 +536,10 @@ pub fn run(
 /// presented its marker and none stopped, the hot removal's plan from a
 /// fresh ledger read and one walk of hot, with the hot window starting on
 /// `first_hot_date`. A failed read or walk is a problem and gives no plan.
+/// After a copy-ledger rebuild the plan reads its gate (`.mie/rebuilt`,
+/// #193 B10) after the ledger and waits for a verification of every target
+/// that covers the rebuilt ledger; a gate that cannot be read or parsed
+/// gives no plan.
 pub fn run_planned(
     config: &IngestConfig,
     archive: Option<ArchiveConfig>,
@@ -564,10 +569,19 @@ pub fn run_planned(
         .iter()
         .filter(|root| root.copy_target)
         .count();
+    // The ledger first, the rebuild's gate second: the rebuild writes the
+    // gate before it renames the ledger into place, so a read that sees the
+    // rebuilt ledger always finds its gate (#193 B10).
     let planned = match copy_ledger::read(hot) {
-        Ok(Some(read)) => removal::scan_hot(hot, first_hot_date)
-            .and_then(|scan| removal::plan(&read, &scan, &report.target_ids, k, first_hot_date))
-            .map_err(|error| error.to_string()),
+        Ok(Some(read)) => rebuilt::read(hot)
+            .map_err(|error| format!("the copy-ledger rebuild's gate: {error}"))
+            .and_then(|gate| {
+                removal::scan_hot(hot, first_hot_date)
+                    .and_then(|scan| {
+                        removal::plan(&read, &scan, &report.target_ids, k, first_hot_date, gate)
+                    })
+                    .map_err(|error| error.to_string())
+            }),
         Ok(None) => Err(format!(
             "copy ledger {} does not exist",
             copy_ledger::ledger_path(hot).display()
@@ -827,20 +841,31 @@ pub(super) fn is_archive_part(path: &str) -> bool {
         .is_some_and(|(source, _)| source == ARCHIVE_SOURCE)
 }
 
-/// The import-ledger entries on hot, `<segment>/<name>.import`, sorted;
-/// `PENDING`, hidden temp files and anything else are never listed. An
-/// entry that cannot be read or parsed is returned as a problem.
-pub(super) fn hot_entries(import_ledger: &Path) -> (Vec<Entry>, Vec<String>) {
-    let (mut entries, mut problems) = (Vec::new(), Vec::new());
+/// One import-entry file of an import-ledger directory.
+pub(super) struct EntryFile {
+    /// `<segment>/<name>.import`.
+    pub(super) name: String,
+    pub(super) segment: String,
+    pub(super) file_name: String,
+    pub(super) path: PathBuf,
+}
+
+/// The import-entry files of the import-ledger directory `import_ledger`
+/// (hot's, or a copy target's `.mie/import-ledger/`),
+/// `<segment>/<name>.import`, sorted; `PENDING`, hidden temp files and
+/// anything else are never listed. Every listing error is returned, with
+/// the files of the directories that could be listed: the pass names it
+/// and goes on, the rebuild stops on it (#193 B1).
+pub(super) fn entry_files(import_ledger: &Path) -> (Vec<EntryFile>, Vec<String>) {
+    let (mut files, mut errors) = (Vec::new(), Vec::new());
     let segments = match sorted_names(import_ledger) {
         Ok(names) => names,
         Err(error) => {
-            problems.push(format!(
-                "import ledger {}: cannot list it ({error}); no entry and no archive part is \
-                 replicated in this pass",
+            errors.push(format!(
+                "import ledger {}: cannot list it ({error})",
                 import_ledger.display()
             ));
-            return (entries, problems);
+            return (files, errors);
         }
     };
     for segment in segments {
@@ -851,7 +876,7 @@ pub(super) fn hot_entries(import_ledger: &Path) -> (Vec<Entry>, Vec<String>) {
         let names = match sorted_names(&dir) {
             Ok(names) => names,
             Err(error) => {
-                problems.push(format!("import ledger {}: {error}", dir.display()));
+                errors.push(format!("import ledger {}: {error}", dir.display()));
                 continue;
             }
         };
@@ -859,29 +884,54 @@ pub(super) fn hot_entries(import_ledger: &Path) -> (Vec<Entry>, Vec<String>) {
             if file_name.starts_with('.') || !file_name.ends_with(".import") {
                 continue;
             }
-            let name = format!("{segment}/{file_name}");
-            let path = dir.join(&file_name);
-            let parsed = fs::read_to_string(&path)
-                .map_err(|e| e.to_string())
-                .and_then(|text| ImportLedger::parse(&text).map_err(|e| e.to_string()));
-            match parsed {
-                Ok(ledger) => entries.push(Entry {
-                    name,
-                    segment: segment.clone(),
-                    file_name,
-                    path,
-                    files: ledger
-                        .files
-                        .into_iter()
-                        .map(|file| (file.relative_path, file.sha256))
-                        .collect(),
-                }),
-                Err(error) => problems.push(format!(
-                    "import entry {name} ({}): {error}; neither it nor the parts it lists are \
-                     replicated",
-                    path.display()
-                )),
+            files.push(EntryFile {
+                name: format!("{segment}/{file_name}"),
+                segment: segment.clone(),
+                path: dir.join(&file_name),
+                file_name,
+            });
+        }
+    }
+    (files, errors)
+}
+
+/// The import-ledger entries on hot, `<segment>/<name>.import`, sorted;
+/// `PENDING`, hidden temp files and anything else are never listed. An
+/// entry that cannot be read or parsed is returned as a problem.
+pub(super) fn hot_entries(import_ledger: &Path) -> (Vec<Entry>, Vec<String>) {
+    let (files, listing) = entry_files(import_ledger);
+    let mut problems: Vec<String> = listing
+        .into_iter()
+        .map(|error| {
+            if error.contains("cannot list it") {
+                format!("{error}; no entry and no archive part is replicated in this pass")
+            } else {
+                error
             }
+        })
+        .collect();
+    let mut entries = Vec::new();
+    for file in files {
+        let parsed = fs::read_to_string(&file.path)
+            .map_err(|e| e.to_string())
+            .and_then(|text| ImportLedger::parse(&text).map_err(|e| e.to_string()));
+        match parsed {
+            Ok(ledger) => entries.push(Entry {
+                name: file.name,
+                segment: file.segment,
+                file_name: file.file_name,
+                path: file.path,
+                files: ledger
+                    .files
+                    .into_iter()
+                    .map(|file| (file.relative_path, file.sha256))
+                    .collect(),
+            }),
+            Err(error) => problems.push(format!(
+                "import entry {} ({}): {error}; neither it nor the parts it lists are replicated",
+                file.name,
+                file.path.display()
+            )),
         }
     }
     (entries, problems)

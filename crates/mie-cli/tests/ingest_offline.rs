@@ -1370,8 +1370,21 @@ mod tiered_start {
     /// each naming the ledger. `union_error` is how the union `select`'s
     /// error displays (its kind).
     fn assert_degraded_start(tag: &str, union_error: &str, damage: impl FnOnce(&Path)) {
+        degraded_start(tag, union_error, |_| (), damage);
+    }
+
+    /// [`assert_degraded_start`], with `before` run on the intact store
+    /// before the damage; returns the directories (kept alive), the
+    /// tiered configuration and what `before` returned.
+    fn degraded_start<R>(
+        tag: &str,
+        union_error: &str,
+        before: impl FnOnce(&IngestConfig) -> R,
+        damage: impl FnOnce(&Path),
+    ) -> (TempDir, TempDir, IngestConfig, R) {
         let (dir, single) = (TempDir::new(tag), TempDir::new(&format!("{tag}-1")));
         let (config, single_config) = tiered_chain(dir.path(), single.path());
+        let seen = before(&config);
         damage(&copy_ledger::ledger_path(&config.paths.raw_root));
         let ledger = format!(
             "copy ledger {}",
@@ -1447,9 +1460,112 @@ mod tiered_start {
             text.contains(union_error) && text.contains(&ledger),
             "{text}"
         );
+        (dir, single, config, seen)
     }
 
     const INTEGRITY: &str = "raw store integrity check failed";
+
+    /// The live replay of `config` over `[CUTOVER, end)`.
+    fn live_replay(config: &IngestConfig, end: i64) -> (bool, String) {
+        let mut out = Vec::new();
+        let replayed = replay::run(
+            &ReplayRequest {
+                source: ReplaySource::Live(config.clone()),
+                window: ReplayWindow {
+                    start: EventTime::from_millis(CUTOVER),
+                    end: EventTime::from_millis(end),
+                },
+            },
+            &mut out,
+        )
+        .unwrap();
+        (replayed.pass, String::from_utf8(out).unwrap())
+    }
+
+    /// The live replay of the prior run's hour, before the degraded
+    /// capture's.
+    fn replay_before_t(config: &IngestConfig) -> (bool, String) {
+        live_replay(config, CUTOVER + HOUR + 30 * 60_000)
+    }
+
+    /// AW8 offline (#193): after the degraded start (the capture runs, the
+    /// warm-up fails naming the ledger, a replay fails with `Integrity`),
+    /// `mie store rebuild` restores the ledger, and the live replay equals
+    /// the one taken before the damage.
+    #[test]
+    fn aw8_degraded_capture_then_rebuild() {
+        let (dir, single, config, before) =
+            degraded_start("tiered-aw8", INTEGRITY, replay_before_t, |ledger| {
+                std::fs::remove_file(ledger).unwrap();
+            });
+        assert!(before.0, "{}", before.1);
+        let rebuild = |record_unlisted: bool| {
+            let mut out = Vec::new();
+            let pass = mie_cli::store::rebuild(
+                &config,
+                Some(&dir.path().join("archive.toml")),
+                mie_cli::store::rebuild::Flags {
+                    record_unlisted,
+                    ..mie_cli::store::rebuild::Flags::default()
+                },
+                &mie_cli::ingest::first_hot_date(T),
+                super::common::probe_for(&config).as_ref(),
+                &|| T + HOUR,
+                &mut out,
+            )
+            .unwrap();
+            (pass, String::from_utf8(out).unwrap())
+        };
+        // The fixture seals its archive rows without the importer, so no
+        // import ledger exists: with archive parts on hot that is a stop
+        // (review of #209, finding 2). An importer that ran creates it.
+        let (pass, text) = rebuild(false);
+        assert!(!pass && text.contains("nothing written"), "{text}");
+        assert!(text.contains("does not exist"), "{text}");
+        std::fs::create_dir_all(dir.path().join("ledger")).unwrap();
+        // With the directory, its archive parts are listed by no entry: the
+        // first run names them and writes nothing, the second records the
+        // holds (--record-unlisted).
+        let (pass, text) = rebuild(false);
+        assert!(!pass && text.contains("nothing written"), "{text}");
+        assert!(text.contains("--record-unlisted"), "{text}");
+        assert!(!copy_ledger::ledger_path(&config.paths.raw_root).exists());
+        let (pass, text) = rebuild(true);
+        assert!(
+            text.contains("started empty") && text.contains("wrote "),
+            "{text}"
+        );
+        // The fixture seals its archive rows without import entries, so the
+        // rebuild holds them (ADR-062 D11, unlisted), and the flagged run
+        // names the import ledger's counts too; the live source has no
+        // finding.
+        let fails: Vec<&str> = text.lines().filter(|l| l.starts_with("FAIL: ")).collect();
+        assert!(!pass && !fails.is_empty(), "{text}");
+        let (summary, holds): (Vec<&str>, Vec<&str>) = fails
+            .iter()
+            .partition(|l| l.contains("listed by no current import entry"));
+        assert!(
+            summary.len() == 1 && summary[0].contains("holds 0 entries"),
+            "{text}"
+        );
+        assert!(
+            !holds.is_empty()
+                && holds
+                    .iter()
+                    .all(|l| l.contains("source=binance-archive/") && l.contains("held (unlisted)")),
+            "{text}"
+        );
+        assert_eq!(replay_before_t(&config), before);
+        // The whole day, the degraded capture included, replays as the
+        // single-root reference that ran the same capture (its trade ids
+        // restart below the prior run's, so both report the same domain
+        // rejections).
+        let reference = super::common::config(single.path());
+        assert_eq!(
+            live_replay(&config, CUTOVER + DAY_MS),
+            live_replay(&reference, CUTOVER + DAY_MS)
+        );
+    }
 
     #[test]
     fn a_missing_ledger_is_the_degraded_start() {

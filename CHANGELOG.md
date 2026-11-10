@@ -12,6 +12,36 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
 
 ### Added
 
+- **Storage tiers, step 7: `mie store rebuild` (#193, ADR-062 D7,
+  proposed).** `mie store rebuild --config <ingest config>
+  [--archive-config <path>] [--record-lost] [--record-unlisted]
+  [--replace-hot-ledger]`
+  restores a lost or damaged copy ledger while `mie ingest` keeps
+  capturing. It requires every root's marker, takes the copy-ledger, pass,
+  verify and archive-writer locks without waiting, starts from the longest
+  ledger copy on a copy target whose hash chain verifies (or empty, and
+  says so), lists every manifest on every root and checks each cold copy's
+  data, and cross-checks hot's journal and the import ledger. It records
+  every verified copy, every partition with cold copies and no directory
+  on hot as removed, and re-derives the archive holds (`entry-conflict`
+  and `manifest-conflict` always, `unlisted` only with
+  `--record-unlisted`, after a run without it named the parts, the import
+  ledger's entry count and the target entries hot lacks; the parts of the
+  import `PENDING` names are left for its resume). A file a record names that no
+  root holds is reported lost and nothing is written; `--record-lost`
+  records it. A live manifest conflict, a missing marker or an I/O error
+  on a listing stops the run with nothing written. A readable hot ledger
+  is replaced only with `--replace-hot-ledger`; the old ledger and every
+  ledger copy that is no prefix of the new one go to `.mie/damaged/<time>/`,
+  never deleted, which also decides the copies `mie store repair` refuses
+  as divergent. The new ledger is installed by temp name and rename after
+  the gate `.mie/rebuilt`: the hot removal then waits until a `mie store
+  verify` of every copy target covers the rebuilt ledger, and the
+  `replication` journal line names why in `removal_waiting`; the remover
+  drops a plan made before the rebuild. A missing hot import-ledger
+  directory, links followed, stops the rebuild while archive parts or
+  target entries exist, since it would read as empty. The importer now refuses, dry runs
+  included, while any hold is open.
 - **Storage tiers, step 6: `mie store verify` and `mie store repair` (#192,
   ADR-062 D11, proposed).** `mie store verify --config <ingest config>
   [--archive-config <path>] --period-hours <P>` checks every copy of a

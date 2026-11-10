@@ -8,7 +8,15 @@
 //!   archive-import`: with `cold_roots` configured, hot must carry its
 //!   marker.
 //! - [`check_copy_ledger`] is the importer's second start refusal: with
-//!   `cold_roots` configured, hot's copy ledger must be readable.
+//!   `cold_roots` configured, hot's copy ledger must be readable; and
+//!   [`check_holds`], folded from the same read, its third: no open hold
+//!   (#193 H1, ADR-062 D11).
+//! - [`rebuild`] (`mie store rebuild`) rebuilds a lost or damaged copy
+//!   ledger from the ledger copies, the manifests on every root, the
+//!   journal and the import ledger, records what it finds lost only with
+//!   `--record-lost`, and gates the hot removal on the next verification
+//!   ([`rebuild`](mod@rebuild) holds the rules, #193, ADR-062 D7); the
+//!   archive holds it re-derives are [`archive_checks`].
 //! - [`replicate`] (`mie store replicate`) runs one replication pass: it
 //!   copies every sealed file, import-ledger entry and the tails of the
 //!   copy ledger and the journal to the copy targets that present their
@@ -63,6 +71,8 @@ use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 pub mod adopt;
+pub mod archive_checks;
+pub mod rebuild;
 pub mod repair;
 pub mod replicate;
 pub mod verify;
@@ -274,23 +284,27 @@ pub fn raw_store(raw_root: &Path, cold_roots: &[ColdRoot]) -> Result<ParquetRawS
 }
 
 /// The importer's refusal on a missing or unreadable copy ledger (ADR-062
-/// D6, D7 *Hot intact, ledger lost*). With `cold_roots` empty it returns at
-/// once, without a filesystem call.
+/// D6, D7 *Hot intact, ledger lost*). With `cold_roots` empty it returns
+/// `None` at once, without a filesystem call; otherwise the ledger read,
+/// which [`check_holds`] folds.
 ///
 /// # Errors
 ///
 /// A description naming the ledger, and the read failure if there is one:
 /// the importer refuses, since its days can lie outside the hot window, and
 /// the copy-ledger rebuild restores the ledger.
-pub fn check_copy_ledger(raw_root: &Path, cold_roots: &[ColdRoot]) -> Result<(), String> {
+pub fn check_copy_ledger(
+    raw_root: &Path,
+    cold_roots: &[ColdRoot],
+) -> Result<Option<copy_ledger::Ledger>, String> {
     if cold_roots.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     let path = copy_ledger::ledger_path(raw_root);
     let refusal = "the importer refuses, since its days can lie outside the hot window; the \
                    copy-ledger rebuild restores the ledger (ADR-062 D7)";
     match copy_ledger::read(raw_root) {
-        Ok(Some(_)) => Ok(()),
+        Ok(Some(ledger)) => Ok(Some(ledger)),
         Ok(None) => Err(format!(
             "copy ledger {} does not exist although paths.cold_roots is configured: {refusal}",
             path.display()
@@ -298,6 +312,30 @@ pub fn check_copy_ledger(raw_root: &Path, cold_roots: &[ColdRoot]) -> Result<(),
         Err(error) => Err(format!(
             "copy ledger {} cannot be read ({error}): {refusal}",
             path.display()
+        )),
+    }
+}
+
+/// The importer's refusal while a hold is open (ADR-062 D11, #193 H1),
+/// folded from the read of [`check_copy_ledger`], so it costs no extra I/O:
+/// every held path fails the selections that cover it, and an import could
+/// write parts next to it before the hold is resolved.
+///
+/// # Errors
+///
+/// A description naming the count, the first held path in path order, its
+/// reason and the resolution step.
+pub fn check_holds(ledger: &copy_ledger::Ledger) -> Result<(), String> {
+    let state = mie_adapter_parquet::verification::CopyState::fold(ledger)
+        .map_err(|error| format!("the copy ledger cannot be folded: {error}"))?;
+    let held = state.held();
+    match held.first() {
+        None => Ok(()),
+        Some((path, reason)) => Err(format!(
+            "{} archive part(s) are held, the first {path} ({}): the importer refuses until \
+             every hold is resolved by `mie store resolve` (#194; ADR-062 D11)",
+            held.len(),
+            reason.as_str()
         )),
     }
 }
@@ -491,6 +529,34 @@ pub fn repair(
 ) -> Result<bool, String> {
     let ledger = copy_ledger::CopyLedger::at(&config.paths.raw_root);
     let report = repair::run(config, archive, record_lost, probe, now_ms, &ledger);
+    print_report(report.lines, &report.problems, out)
+}
+
+/// `mie store rebuild`: one copy-ledger rebuild of the store of `config`
+/// (ADR-062 D7, the module [`rebuild`](mod@rebuild)), with the archive
+/// configuration `archive`, else `[history] archive_config`, else none,
+/// and the hot window starting on `first_hot_date`
+/// ([`crate::ingest::first_hot_date`] in production). `now_ms` is read once:
+/// it stamps every record and names the run's `.mie/damaged/` directories.
+///
+/// It prints the start, the records derived, every lost file and hold, the
+/// gate and every ledger copy moved aside, then `wrote …` or `nothing
+/// written`, then `PASS` (returns `true`) or one `FAIL: <problem>` line per
+/// problem (returns `false`).
+///
+/// # Errors
+///
+/// A description when the report cannot be written.
+pub fn rebuild(
+    config: &IngestConfig,
+    archive: Option<&Path>,
+    flags: rebuild::Flags,
+    first_hot_date: &str,
+    probe: &dyn DeviceProbe,
+    now_ms: &dyn Fn() -> i64,
+    out: &mut dyn Write,
+) -> Result<bool, String> {
+    let report = rebuild::run(config, archive, flags, first_hot_date, probe, now_ms);
     print_report(report.lines, &report.problems, out)
 }
 

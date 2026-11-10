@@ -51,7 +51,11 @@
 //! removal, the replication pass, `mie store verify` and `mie store repair`
 //! all read (ADR-062 D6, D11).
 //!
-//! With no cold root configured neither is ever created.
+//! [`rebuilt`] is the gate `mie store rebuild` leaves on hot: the hot
+//! removal waits until a verification of every copy target covers the
+//! rebuilt ledger (ADR-062 D7 step 6).
+//!
+//! With no cold root configured none of them is ever created.
 //!
 //! # Tiered store
 //!
@@ -94,6 +98,7 @@ mod layout;
 mod manifest;
 pub mod outcome;
 mod reader;
+pub mod rebuilt;
 mod recovery;
 pub mod removal;
 pub mod replica;

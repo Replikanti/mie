@@ -1272,6 +1272,7 @@ mod tests {
             &TieredFixture::target_ids(),
             2,
             &first_hot(),
+            None,
         )
         .unwrap();
         let report = writer.remove_partitions(&plan, &first_hot(), FIXTURE_D0 + 40 * DAY);

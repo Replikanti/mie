@@ -1305,3 +1305,189 @@ fn append_unless_vetoes_on_the_records_after_the_read() {
     );
     assert_eq!(fs::read(ledger_path(dir.path())).unwrap(), changed);
 }
+
+// ------------------------------------------------- the rebuild's writes (#193)
+
+/// The builder (#193): from header-only, it writes byte for byte what the
+/// appender writes; from a verified prefix with a torn trailing record, it
+/// drops the torn bytes and continues the prefix's chain, and the result
+/// parses back to the same records.
+#[test]
+fn builder_appends_records_that_parse_back() {
+    let records = golden_records();
+    let mut built = LedgerBuilder::empty();
+    for record in &records {
+        built.push(record).unwrap();
+    }
+    assert_eq!(built.added(), records.len() as u64);
+    assert_eq!(built.finish(), GOLDEN.as_bytes());
+
+    let dir = store("ledger-builder");
+    append_all(dir.path(), &records[..4]);
+    let mut prefix = fs::read(ledger_path(dir.path())).unwrap();
+    let complete = prefix.len() as u64;
+    prefix.extend_from_slice(b"removed 1 torn");
+    let mut built = LedgerBuilder::from_prefix(Path::new("copy-ledger"), &prefix).unwrap();
+    assert_eq!(built.len(), complete);
+    assert_eq!(built.added(), 0);
+    for record in &records[4..] {
+        built.push(record).unwrap();
+    }
+    let bytes = built.finish();
+    assert_eq!(bytes, GOLDEN.as_bytes());
+    assert_eq!(parsed(&bytes).unwrap().records, records);
+
+    // A record outside the grammar is refused and adds nothing.
+    let mut built = LedgerBuilder::empty();
+    let bad = record(
+        0,
+        Kind::Copy {
+            path: "not/a/data/path".to_owned(),
+            root: "cold-a".to_owned(),
+        },
+    );
+    assert!(matches!(built.push(&bad), Err(RawStoreError::Invalid(_))));
+    assert_eq!(built.finish(), HEADER.as_bytes());
+
+    // A prefix that fails its chain before its last record is no start.
+    let mut damaged = GOLDEN.as_bytes().to_vec();
+    flip(&mut damaged, HEADER.len() + 3);
+    assert!(matches!(
+        LedgerBuilder::from_prefix(Path::new("copy-ledger"), &damaged),
+        Err(RawStoreError::Integrity(_))
+    ));
+}
+
+/// Every file under `.mie/` of `root` with its bytes, the lock file left
+/// out.
+fn meta_files(root: &Path) -> Vec<(String, Vec<u8>)> {
+    fn walk(dir: &Path, base: &Path, out: &mut Vec<(String, Vec<u8>)>) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(&path, base, out);
+            } else if !path.to_string_lossy().ends_with(".lock") {
+                let rel = path.strip_prefix(base).unwrap().display().to_string();
+                out.push((rel, fs::read(&path).unwrap()));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(&root.join(META_DIR), root, &mut out);
+    out.sort();
+    out
+}
+
+/// `replace` (#193 B9 step 5): bytes that fail their chain, their grammar,
+/// or end in an incomplete record are refused with nothing touched; valid
+/// bytes are installed after the old ledger is linked aside and the gate
+/// written.
+#[test]
+fn replace_installs_only_a_ledger_that_parses() {
+    let records = golden_records();
+    let dir = store("ledger-replace");
+    append_all(dir.path(), &records[..2]);
+    let old = fs::read(ledger_path(dir.path())).unwrap();
+    let hold = CopyLedger::at(dir.path()).try_hold().unwrap();
+    let aside = dir.path().join(".mie/damaged/7/copy-ledger");
+    let before = meta_files(dir.path());
+
+    let mut flipped = GOLDEN.as_bytes().to_vec();
+    flip(&mut flipped, HEADER.len() + 3);
+    let mut torn = GOLDEN.as_bytes().to_vec();
+    torn.extend_from_slice(b"removed 1 torn");
+    for bad in [
+        flipped,
+        ledger_of(&["bogus 1 x"]),
+        torn,
+        b"mie-copy-ledger 2\n".to_vec(),
+        Vec::new(),
+    ] {
+        let error = hold.replace(&bad, Some(&aside)).unwrap_err();
+        assert!(matches!(error, RawStoreError::Invalid(_)), "{error:?}");
+        assert_eq!(meta_files(dir.path()), before);
+    }
+
+    hold.replace(GOLDEN.as_bytes(), Some(&aside)).unwrap();
+    assert_eq!(
+        fs::read(ledger_path(dir.path())).unwrap(),
+        GOLDEN.as_bytes()
+    );
+    assert_eq!(fs::read(&aside).unwrap(), old);
+    assert_eq!(
+        crate::rebuilt::read(dir.path()).unwrap(),
+        Some(GOLDEN.len() as u64)
+    );
+    // Appends through the hold land in the installed ledger.
+    hold.append(&records[0]).unwrap();
+    assert_eq!(read(dir.path()).unwrap().unwrap().records.len(), 13);
+
+    // Without a ledger on hot nothing is linked.
+    let empty = TempDir::new("ledger-replace-none");
+    fs::create_dir(empty.path().join(META_DIR)).unwrap();
+    let hold = CopyLedger::at(empty.path()).try_hold().unwrap();
+    let aside = empty.path().join(".mie/damaged/7/copy-ledger");
+    hold.replace(HEADER.as_bytes(), Some(&aside)).unwrap();
+    assert!(!aside.exists());
+    assert_eq!(
+        fs::read(ledger_path(empty.path())).unwrap(),
+        HEADER.as_bytes()
+    );
+}
+
+/// A crash after every step of `replace` (#193 B9 crash analysis) leaves
+/// the old ledger in place, never a torn one, with at most the evidence
+/// link, the gate and a temp file; a re-run at a later `at_ms` installs.
+#[test]
+fn a_crash_after_the_gate_before_the_rename_reruns_cleanly() {
+    let records = golden_records();
+    for step in ReplaceStep::ALL {
+        let dir = store(&format!("ledger-replace-crash-{step:?}"));
+        append_all(dir.path(), &records[..2]);
+        let old = fs::read(ledger_path(dir.path())).unwrap();
+        let hold = CopyLedger::at(dir.path()).try_hold().unwrap();
+        REPLACE_CRASH_AFTER.with(|crash| crash.set(Some(step)));
+        let first = dir.path().join(".mie/damaged/7/copy-ledger");
+        assert!(hold.replace(GOLDEN.as_bytes(), Some(&first)).is_err());
+        assert_eq!(REPLACE_CRASH_AFTER.with(std::cell::Cell::get), None);
+        assert_eq!(fs::read(ledger_path(dir.path())).unwrap(), old, "{step:?}");
+        assert_eq!(fs::read(&first).unwrap(), old, "{step:?}");
+        let gate = crate::rebuilt::read(dir.path()).unwrap();
+        if step == ReplaceStep::Link {
+            assert_eq!(gate, None, "{step:?}");
+        } else {
+            assert_eq!(gate, Some(GOLDEN.len() as u64), "{step:?}");
+        }
+
+        let second = dir.path().join(".mie/damaged/8/copy-ledger");
+        hold.replace(GOLDEN.as_bytes(), Some(&second)).unwrap();
+        assert_eq!(
+            fs::read(ledger_path(dir.path())).unwrap(),
+            GOLDEN.as_bytes()
+        );
+        assert_eq!(fs::read(&second).unwrap(), old, "{step:?}");
+        let names: Vec<String> = fs::read_dir(dir.path().join(META_DIR))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert_eq!(names, Vec::<String>::new(), "{step:?}");
+    }
+}
+
+/// An evidence name that exists already stops `replace` before anything
+/// is written: evidence is never overwritten (#193 B9 step 3).
+#[test]
+fn existing_evidence_is_never_overwritten() {
+    let dir = store("ledger-replace-evidence");
+    append_all(dir.path(), &golden_records()[..2]);
+    let aside = dir.path().join(".mie/damaged/7/copy-ledger");
+    fs::create_dir_all(aside.parent().unwrap()).unwrap();
+    fs::write(&aside, b"earlier evidence").unwrap();
+    let before = meta_files(dir.path());
+    let hold = CopyLedger::at(dir.path()).try_hold().unwrap();
+    let error = hold.replace(GOLDEN.as_bytes(), Some(&aside)).unwrap_err();
+    assert!(matches!(error, RawStoreError::Integrity(_)), "{error:?}");
+    assert_eq!(meta_files(dir.path()), before);
+    assert_eq!(fs::read(&aside).unwrap(), b"earlier evidence");
+}

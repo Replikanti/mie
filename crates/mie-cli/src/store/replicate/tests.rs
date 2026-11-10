@@ -1042,7 +1042,7 @@ fn a_planned_pass_plans_only_complete_partitions() {
     let ledger = copy_ledger::read(&fixture.hot).unwrap().unwrap();
     let scan = removal::scan_hot(&fixture.hot, "2026-10-07").unwrap();
     let ids: BTreeSet<String> = ["cold-a", "cold-b"].map(str::to_owned).into();
-    let direct = removal::plan(&ledger, &scan, &ids, 2, "2026-10-07").unwrap();
+    let direct = removal::plan(&ledger, &scan, &ids, 2, "2026-10-07", None).unwrap();
     assert!(
         direct
             .candidates
@@ -1357,4 +1357,53 @@ fn a_finding_recorded_between_the_extension_and_its_record_refuses_the_record() 
             .any(|l| l.starts_with("copy-ledger copy on cold-b")),
         "cold-b goes on: {report:?}"
     );
+}
+
+/// #193 B10: the planned pass reads the rebuild's gate after the ledger; a
+/// gate that cannot be parsed gives no plan and a problem, a valid one no
+/// verification covers makes the plan wait, and the journal line names
+/// why (`removal_waiting`).
+#[test]
+fn a_rebuild_gate_makes_the_plan_wait_and_a_malformed_one_gives_none() {
+    let fixture = Fixture::new("replicate-gate");
+    let planned = || {
+        run_planned(
+            &fixture.config,
+            archive_config(&fixture.config, Some(&fixture.archive())).unwrap(),
+            &fixture.probe,
+            &|| D0 + 1,
+            &CopyLedger::at(&fixture.hot),
+            &mut Seen::default(),
+            "2026-10-07",
+        )
+    };
+    let gate = fixture.hot.join(".mie/rebuilt");
+    for bad in [
+        "mie-rebuilt 1\nprefix 01000\n",
+        "mie-rebuilt 2\nprefix 1\n",
+        "",
+    ] {
+        fs::write(&gate, bad).unwrap();
+        let (report, plan) = planned();
+        assert!(plan.is_none(), "{bad:?}");
+        assert!(
+            report.problems.iter().any(|p| p.contains("gate")),
+            "{bad:?}: {report:?}"
+        );
+    }
+    fs::write(&gate, "mie-rebuilt 1\nprefix 18\n").unwrap();
+    let (report, plan) = planned();
+    let plan = plan.expect("a plan");
+    assert!(plan.waiting.is_some(), "{plan:?}");
+    let line = crate::journal::replication_json(&report, Some(&plan));
+    assert!(
+        line["removal_waiting"]
+            .as_str()
+            .is_some_and(|w| w.contains("mie store verify"))
+    );
+    fs::remove_file(&gate).unwrap();
+    let (report, plan) = planned();
+    assert_eq!(plan.as_ref().and_then(|p| p.waiting.clone()), None);
+    let line = crate::journal::replication_json(&report, plan.as_ref());
+    assert!(line["removal_waiting"].is_null());
 }

@@ -555,7 +555,14 @@ fn a_ledger_copy_is_rebuilt_and_a_divergent_one_refused() {
     assert_fail_line(&out, &["copy ledger on copy target", "cold-a", "prefix:"]);
     let (pass, out) = repair(&fixture, REPAIRED);
     assert!(!pass, "{out}");
-    assert_fail_line(&out, &["cold-a", "refused", "#193"]);
+    assert_fail_line(
+        &out,
+        &[
+            "cold-a",
+            "refused",
+            "mie store rebuild --replace-hot-ledger",
+        ],
+    );
     assert_eq!(fs::read(&copy).unwrap(), diverged);
 }
 
