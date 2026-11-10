@@ -34,7 +34,19 @@
 //!    that copy. The ledger's paths count because the hot removal (#191,
 //!    ADR-062 D6) takes files off hot: a target added after a removal never
 //!    gets them from hot, and its journal copy waits at the first removed
-//!    file's line until #192's repair fills it.
+//!    file's line until `mie store repair` fills it.
+//!
+//! **A target with an open copy-ledger finding** (a `finding R …
+//! copy-ledger` after its latest `ledger-copy R` record) gets no ledger
+//! copy extension and no `ledger-copy` record in step 3 (L2 of #192): such
+//! a record would end the finding's void without any repair. The pass
+//! names it as needing `mie store repair` and is not complete for the hot
+//! removal. Only the closing pass of a repair, which names the targets it
+//! repaired, extends them. A finding `mie store verify` records after the
+//! pass read the ledger (it takes no pass lock) counts too: step 3 re-reads
+//! the records after its read before it extends a copy, and appends the
+//! `ledger-copy` record only under the same check inside one hold of the
+//! ledger lock (review of #203, finding 1).
 //!
 //! **The target's marker is re-read before every write to it** (a sealed
 //! copy, an entry, the ledger and journal tails) and before every record
@@ -75,11 +87,12 @@ use crate::config::{ArchiveConfig, IngestConfig};
 use mie_adapter_binance::archive::ARCHIVE_SOURCE;
 use mie_adapter_binance::archive::ledger::ImportLedger;
 use mie_adapter_parquet::copy_ledger::{
-    self, AppendError, AppendOutcome, CopyLedger, Kind, Record, Truncation,
+    self, AppendError, AppendOutcome, CopyLedger, Guarded, Kind, Record, Subject, Truncation,
 };
 use mie_adapter_parquet::removal::{self, RemovalPlan};
 use mie_adapter_parquet::replica::{self, CopyError, CopyOutcome, Side, TailSource};
 use mie_adapter_parquet::root_marker::{self, HOT_ID};
+use mie_adapter_parquet::verification;
 use mie_ports::raw::{RawStoreError, validate_segment};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -87,13 +100,13 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 /// Where a copy target keeps its copies of hot's metadata (ADR-062 D7
 /// *Formats and layout*).
-const META_DIR: &str = ".mie";
-const JOURNAL_DIR: &str = "journal";
-const IMPORT_LEDGER_DIR: &str = "import-ledger";
+pub(super) const META_DIR: &str = ".mie";
+pub(super) const JOURNAL_DIR: &str = "journal";
+pub(super) const IMPORT_LEDGER_DIR: &str = "import-ledger";
 
 /// The appender the pass writes the copy ledger through: [`CopyLedger`] in
 /// production, a failing one in tests.
@@ -107,6 +120,20 @@ pub trait LedgerAppend {
     ///
     /// As [`CopyLedger::append`].
     fn append(&self, record: &Record) -> Result<AppendOutcome, AppendError>;
+
+    /// Appends `record` unless `veto`, given the records after byte
+    /// `offset` as they stand under the same lock, refuses it.
+    ///
+    /// # Errors
+    ///
+    /// As [`CopyLedger::append_unless`].
+    fn append_unless(
+        &self,
+        record: &Record,
+        offset: u64,
+        chain: &str,
+        veto: &dyn Fn(&[Record]) -> Option<String>,
+    ) -> Result<Guarded, AppendError>;
 }
 
 impl LedgerAppend for CopyLedger {
@@ -116,6 +143,16 @@ impl LedgerAppend for CopyLedger {
 
     fn append(&self, record: &Record) -> Result<AppendOutcome, AppendError> {
         CopyLedger::append(self, record)
+    }
+
+    fn append_unless(
+        &self,
+        record: &Record,
+        offset: u64,
+        chain: &str,
+        veto: &dyn Fn(&[Record]) -> Option<String>,
+    ) -> Result<Guarded, AppendError> {
+        CopyLedger::append_unless(self, record, offset, chain, veto)
     }
 }
 
@@ -232,6 +269,8 @@ pub(super) struct Fold {
     pub(super) copies: BTreeMap<String, BTreeSet<String>>,
     /// The paths of `lost` records: no copy of them can reach a target.
     pub(super) lost: BTreeSet<String>,
+    /// The root ids with an open copy-ledger finding (L2 of #192).
+    pub(super) open_ledger: BTreeSet<String>,
 }
 
 impl Fold {
@@ -263,6 +302,7 @@ impl Fold {
                 _ => {}
             }
         }
+        fold.open_ledger = verification::open_ledger_findings(records);
         Ok(fold)
     }
 
@@ -287,6 +327,10 @@ pub(super) struct Entry {
     pub(super) files: Vec<(String, String)>,
 }
 
+/// A check over the records after the pass's ledger read: `Some` with
+/// the reason it refuses an append.
+type Veto<'a> = &'a dyn Fn(&[Record]) -> Option<String>;
+
 /// The pass in progress.
 struct Pass<'a> {
     hot: &'a Path,
@@ -302,6 +346,10 @@ struct Pass<'a> {
     now_ms: &'a dyn Fn() -> i64,
     targets: Vec<Target>,
     fold: Fold,
+    /// The end of the verified prefix the pass read, and the chain hash of
+    /// its last record: step 3 re-reads the records after it (L2).
+    read_len: u64,
+    read_chain: String,
     report: PassReport,
     /// Per file or entry, why it is short of a copy.
     reasons: BTreeMap<String, Vec<String>>,
@@ -310,6 +358,8 @@ struct Pass<'a> {
     /// pass is not complete for the hot removal's rule (f) (review of #202,
     /// finding 1).
     ledger_copy_failed: bool,
+    /// The root ids whose ledger copy a repair rebuilt: exempt from L2.
+    cleared: &'a BTreeSet<String>,
 }
 
 impl Pass<'_> {
@@ -371,12 +421,30 @@ impl Pass<'_> {
     /// Appends one record. A truncation goes to the observer first, also
     /// when the append fails; a failed append stops the pass.
     fn append(&mut self, kind: Kind) -> Result<(), Stop> {
+        self.append_guarded(kind, None).map(|_| ())
+    }
+
+    /// [`append`](Self::append), or with a `veto` the guarded append of
+    /// [`LedgerAppend::append_unless`] over the records after the pass's
+    /// read; `Some` with the veto's reason when it refused the record.
+    fn append_guarded(
+        &mut self,
+        kind: Kind,
+        veto: Option<Veto<'_>>,
+    ) -> Result<Option<String>, Stop> {
         let record = Record {
             at_ms: (self.now_ms)(),
             kind,
         };
-        let (truncation, result) = match self.ledger.append(&record) {
-            Ok(outcome) => (outcome.truncation, Ok(())),
+        let appended = match veto {
+            None => self.ledger.append(&record).map(Guarded::Appended),
+            Some(veto) => self
+                .ledger
+                .append_unless(&record, self.read_len, &self.read_chain, veto),
+        };
+        let (truncation, result) = match appended {
+            Ok(Guarded::Appended(outcome)) => (outcome.truncation, Ok(None)),
+            Ok(Guarded::Vetoed(reason)) => (None, Ok(Some(reason))),
             Err(AppendError { error, truncation }) => (truncation, Err(error)),
         };
         if let Some(truncation) = truncation {
@@ -450,7 +518,16 @@ pub fn run(
     observer: &mut dyn PassObserver,
 ) -> PassReport {
     let archive = archive_config(config, archive);
-    run_with(config, archive, probe, now_ms, ledger, observer, None)
+    run_with(
+        config,
+        archive,
+        probe,
+        now_ms,
+        ledger,
+        observer,
+        None,
+        &BTreeSet::new(),
+    )
 }
 
 /// The pass of `mie ingest` (module docs): [`run`] with the archive
@@ -467,7 +544,16 @@ pub fn run_planned(
     observer: &mut dyn PassObserver,
     first_hot_date: &str,
 ) -> (PassReport, Option<RemovalPlan>) {
-    let mut report = run_with(config, Ok(archive), probe, now_ms, ledger, observer, None);
+    let mut report = run_with(
+        config,
+        Ok(archive),
+        probe,
+        now_ms,
+        ledger,
+        observer,
+        None,
+        &BTreeSet::new(),
+    );
     if !report.targets_complete {
         return (report, None);
     }
@@ -504,7 +590,11 @@ pub fn run_planned(
 }
 
 /// [`run`] under a pass lock the caller already holds: `mie store adopt`
-/// ends with one pass and holds the lock for its whole run (ADR-062 D10).
+/// and `mie store repair` end with one pass and hold the lock for their
+/// whole run (ADR-062 D10, D11). `cleared` names the copy targets whose
+/// ledger copy the repair rebuilt, which L2 then lets through; the adoption
+/// passes an empty set.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_locked(
     config: &IngestConfig,
     archive: Option<&Path>,
@@ -513,12 +603,23 @@ pub(crate) fn run_locked(
     ledger: &dyn LedgerAppend,
     observer: &mut dyn PassObserver,
     lock: replica::ReplicationLock,
+    cleared: &BTreeSet<String>,
 ) -> PassReport {
     let archive = archive_config(config, archive);
-    run_with(config, archive, probe, now_ms, ledger, observer, Some(lock))
+    run_with(
+        config,
+        archive,
+        probe,
+        now_ms,
+        ledger,
+        observer,
+        Some(lock),
+        cleared,
+    )
 }
 
 /// The pass, taking the lock at its place in step 0 unless one is given.
+#[allow(clippy::too_many_arguments)]
 fn run_with(
     config: &IngestConfig,
     archive: Result<Option<ArchiveConfig>, String>,
@@ -527,6 +628,7 @@ fn run_with(
     ledger: &dyn LedgerAppend,
     observer: &mut dyn PassObserver,
     lock: Option<replica::ReplicationLock>,
+    cleared: &BTreeSet<String>,
 ) -> PassReport {
     let mut report = PassReport::default();
     let Some(mut pass) = start(
@@ -537,6 +639,7 @@ fn run_with(
         ledger,
         observer,
         lock,
+        cleared,
         &mut report,
     ) else {
         return report;
@@ -558,6 +661,7 @@ fn start<'a>(
     ledger: &'a dyn LedgerAppend,
     observer: &'a mut dyn PassObserver,
     lock: Option<replica::ReplicationLock>,
+    cleared: &'a BTreeSet<String>,
     report: &mut PassReport,
 ) -> Option<Pass<'a>> {
     let mut refuse = |problem: String| {
@@ -586,8 +690,8 @@ fn start<'a>(
     let ledger_path = copy_ledger::ledger_path(hot);
     let degraded = "the pass does nothing (the degraded start, ADR-062 D7); the copy-ledger \
                     rebuild restores the ledger";
-    let records = match copy_ledger::read(hot) {
-        Ok(Some(ledger)) => ledger.records,
+    let (records, read_len, read_chain) = match copy_ledger::read(hot) {
+        Ok(Some(ledger)) => (ledger.records, ledger.verified_len, ledger.last_chain),
         Ok(None) => {
             return refuse(format!(
                 "copy ledger {} does not exist: {degraded}",
@@ -678,10 +782,42 @@ fn start<'a>(
         now_ms,
         targets,
         fold,
+        read_len,
+        read_chain,
         report: std::mem::take(report),
         reasons: BTreeMap::new(),
         ledger_copy_failed: false,
+        cleared,
     })
+}
+
+/// L2 for a finding the pass's fold never saw: the first copy-ledger
+/// finding on `id` among the records after the pass's ledger read. Only
+/// the pass appends `ledger-copy` records (it holds the pass lock), so
+/// such a finding is still open.
+fn finding_since_read(tail: &[Record], id: &str) -> Option<String> {
+    tail.iter().find_map(|record| match &record.kind {
+        Kind::Finding {
+            root,
+            code,
+            subject: Subject::CopyLedger,
+        } if root == id => Some(format!(
+            "a `finding {id} {} copy-ledger` record appended at {} after this pass read the \
+             copy ledger",
+            code.as_str(),
+            record.at_ms
+        )),
+        _ => None,
+    })
+}
+
+/// The problem of a ledger copy held by a finding recorded during the pass.
+fn held_by(id: &str, target: &Path, reason: &str) -> String {
+    format!(
+        "the copy-ledger copy on {id} ({}) has an open copy-ledger finding ({reason}): it gets \
+         no ledger-copy record until `mie store repair` repairs it (ADR-062 D6, D11)",
+        copy_ledger::ledger_path(target).display()
+    )
 }
 
 /// Whether a data path belongs to the archive source.
@@ -1167,6 +1303,37 @@ impl Pass<'_> {
                 continue;
             }
             let (path, id) = (self.targets[i].path.clone(), self.targets[i].id.clone());
+            // L2 (#192): an open copy-ledger finding blocks the extension
+            // and its record until a repair rebuilt the copy.
+            if self.fold.open_ledger.contains(&id) && !self.cleared.contains(&id) {
+                self.ledger_copy_failed = true;
+                self.problem(format!(
+                    "the copy-ledger copy on {id} ({}) has an open copy-ledger finding: it is \
+                     not extended and gets no ledger-copy record until `mie store repair` \
+                     repairs it (ADR-062 D6, D11)",
+                    copy_ledger::ledger_path(&path).display()
+                ));
+                continue;
+            }
+            // L2 again, for a finding recorded after the pass read the
+            // ledger: `mie store verify` takes no pass lock (V10), and the
+            // fold above never saw it (review of #203, finding 1).
+            match copy_ledger::records_after(self.hot, self.read_len, &self.read_chain) {
+                Ok(tail) => {
+                    if let Some(reason) = finding_since_read(&tail, &id) {
+                        self.ledger_copy_failed = true;
+                        self.problem(held_by(&id, &path, &reason));
+                        continue;
+                    }
+                }
+                Err(error) => {
+                    self.ledger_copy_failed = true;
+                    self.problem(format!(
+                        "hot's copy ledger cannot be re-read for the ledger copies: {error}"
+                    ));
+                    return Ok(appended);
+                }
+            }
             let copy = match copy_ledger::extend_copy(self.hot, &path, &id) {
                 Ok(copy) => copy,
                 Err(CopyError {
@@ -1201,11 +1368,22 @@ impl Pass<'_> {
             if !self.marker_present(i) {
                 continue;
             }
-            self.append(Kind::LedgerCopy {
-                root: id.clone(),
-                prefix_bytes: copy.prefix_bytes,
-                prefix_sha256: copy.prefix_sha256,
-            })?;
+            // The check and the record under one hold of the ledger lock: a
+            // finding recorded after the extension is still seen.
+            let veto = |tail: &[Record]| finding_since_read(tail, &id);
+            let vetoed = self.append_guarded(
+                Kind::LedgerCopy {
+                    root: id.clone(),
+                    prefix_bytes: copy.prefix_bytes,
+                    prefix_sha256: copy.prefix_sha256,
+                },
+                Some(&veto),
+            )?;
+            if let Some(reason) = vetoed {
+                self.ledger_copy_failed = true;
+                self.problem(held_by(&id, &path, &reason));
+                continue;
+            }
             self.line(format!(
                 "copy-ledger copy on {id}: appended {} byte(s), now {} bytes",
                 copy.appended_bytes, copy.prefix_bytes
@@ -1224,7 +1402,7 @@ impl Pass<'_> {
     /// everything before that line is still appended. The ledger's paths
     /// count because the hot removal takes files off hot, and a target added
     /// after it never gets them from hot (#199 review carry-over): its copy
-    /// waits until #192's repair fills the target. Archive parts are never
+    /// waits until `mie store repair` fills the target. Archive parts are never
     /// checked: only the capture writes `sealed` lines. Lost paths are not
     /// added: no copy of them can ever reach a target (#192, #193 decide).
     fn copy_journal_tail(&mut self, paths: &[String]) -> u64 {

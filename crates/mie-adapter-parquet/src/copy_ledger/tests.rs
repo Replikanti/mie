@@ -1072,3 +1072,236 @@ fn records_after_a_plans_prefix() {
         Err(RawStoreError::Integrity(_))
     ));
 }
+
+/// Every class of [`check_copy`] (#192 V4), in its precedence: absent,
+/// good (a partial tail included), chain, diverged, longer.
+#[test]
+fn check_copy_classifies_every_ledger_copy() {
+    let records = golden_records();
+    let (_dir, hot, cold) = replicated("ledger-check-copy", &records[..6]);
+    let [a, _] = &cold;
+    assert_eq!(check_copy(&hot, a).unwrap(), LedgerCopyCheck::Absent);
+    let hot_bytes = fs::read(ledger_path(&hot)).unwrap();
+    let write = |bytes: &[u8]| fs::write(ledger_path(a), bytes).unwrap();
+
+    write(&hot_bytes);
+    assert_eq!(check_copy(&hot, a).unwrap(), LedgerCopyCheck::Good);
+    // A copy that stopped mid-record is a prefix, no chain failure.
+    write(&hot_bytes[..hot_bytes.len() - 7]);
+    assert_eq!(check_copy(&hot, a).unwrap(), LedgerCopyCheck::Good);
+
+    // A flipped byte in record 3 fails its chain there.
+    let (offset, _) = spans(&hot_bytes)[2];
+    let mut damaged = hot_bytes.clone();
+    flip(&mut damaged, offset + 4);
+    write(&damaged);
+    assert_eq!(
+        check_copy(&hot, a).unwrap(),
+        LedgerCopyCheck::Chain {
+            record: 3,
+            offset: offset as u64
+        }
+    );
+
+    // A valid chain that leaves hot's after record 4.
+    let (end4, len4) = spans(&hot_bytes)[3];
+    let prefix = &hot_bytes[..end4 + len4 + 1];
+    let other = store("ledger-check-copy-other");
+    fs::write(ledger_path(other.path()), prefix).unwrap();
+    append_all(
+        other.path(),
+        &[record(
+            50,
+            Kind::Removed {
+                partition: PARTITION.to_owned(),
+            },
+        )],
+    );
+    let diverged = fs::read(ledger_path(other.path())).unwrap();
+    write(&diverged);
+    let first = diverged
+        .iter()
+        .zip(&hot_bytes)
+        .position(|(x, y)| x != y)
+        .unwrap();
+    assert!(first > end4 + len4, "it differs after record 4");
+    assert_eq!(
+        check_copy(&hot, a).unwrap(),
+        LedgerCopyCheck::Diverged {
+            offset: first as u64
+        }
+    );
+
+    // Hot's verified prefix plus a complete record hot lacks.
+    let mut longer = hot_bytes.clone();
+    let hot_ledger = parsed(&hot_bytes).unwrap();
+    let body = format!("removed {} {PARTITION}", AT + 99);
+    longer.extend_from_slice(
+        format!(
+            "{body} {}\n",
+            chain_of(hot_ledger.last_chain.as_bytes(), body.as_bytes())
+        )
+        .as_bytes(),
+    );
+    write(&longer);
+    assert_eq!(
+        check_copy(&hot, a).unwrap(),
+        LedgerCopyCheck::Longer {
+            len: longer.len() as u64,
+            verified: hot_bytes.len() as u64
+        }
+    );
+
+    // The copy is read before hot: hot growing in between never makes a
+    // good copy look longer or diverged.
+    write(&hot_bytes);
+    append_all(&hot, &records[6..8]);
+    assert_eq!(check_copy(&hot, a).unwrap(), LedgerCopyCheck::Good);
+}
+
+/// Review of #203, finding 3: a ledger copy whose complete records all
+/// equal hot's but whose unterminated tail does not (NULs where the last
+/// line should be, left by a crash during `extend_prefix` on a filesystem
+/// that exposes the extended size before the data: XFS, ext4 with
+/// `data=writeback`) is [`LedgerCopyCheck::Tail`], which the repair
+/// rebuilds, never `Diverged`: the tail is no record. A differing complete
+/// record before such a tail is still `Diverged`, and a tail that runs past
+/// hot's verified prefix into hot's own ignored trailing record is a tail
+/// too, never `Longer`.
+#[test]
+fn a_damaged_unterminated_tail_is_a_tail_not_a_divergence() {
+    let records = golden_records();
+    let (_dir, hot, cold) = replicated("ledger-check-copy-tail", &records[..6]);
+    let [a, _] = &cold;
+    let hot_bytes = fs::read(ledger_path(&hot)).unwrap();
+    let write = |bytes: &[u8]| fs::write(ledger_path(a), bytes).unwrap();
+    let (last_start, _) = spans(&hot_bytes)[spans(&hot_bytes).len() - 1];
+
+    // Every complete record of hot but the last, then 40 NULs.
+    let mut nul_tail = hot_bytes[..last_start].to_vec();
+    nul_tail.extend_from_slice(&[0u8; 40]);
+    write(&nul_tail);
+    assert_eq!(
+        check_copy(&hot, a).unwrap(),
+        LedgerCopyCheck::Tail {
+            offset: last_start as u64
+        }
+    );
+
+    // A tail that equals hot's bytes up to its last byte, then differs.
+    let mut late = hot_bytes[..last_start + 9].to_vec();
+    late.push(hot_bytes[last_start + 9] ^ 0x01);
+    write(&late);
+    assert_eq!(
+        check_copy(&hot, a).unwrap(),
+        LedgerCopyCheck::Tail {
+            offset: last_start as u64
+        }
+    );
+
+    // A differing complete record before the damaged tail stays Diverged:
+    // its chain verifies (another valid chain), so it may be the last copy
+    // of a record.
+    let (start2, _) = spans(&hot_bytes)[1];
+    let other = store("ledger-check-copy-tail-other");
+    fs::write(ledger_path(other.path()), &hot_bytes[..start2]).unwrap();
+    append_all(
+        other.path(),
+        &[record(
+            50,
+            Kind::Removed {
+                partition: PARTITION.to_owned(),
+            },
+        )],
+    );
+    let mut diverged = fs::read(ledger_path(other.path())).unwrap();
+    let first = diverged
+        .iter()
+        .zip(&hot_bytes)
+        .position(|(x, y)| x != y)
+        .unwrap();
+    diverged.extend_from_slice(&[0u8; 12]);
+    write(&diverged);
+    assert_eq!(
+        check_copy(&hot, a).unwrap(),
+        LedgerCopyCheck::Diverged {
+            offset: first as u64
+        }
+    );
+
+    // Hot with an ignored partial trailing record; a copy holding hot's
+    // verified prefix plus those partial bytes has only a tail past the
+    // verified prefix, no record: a tail, never Longer.
+    let mut torn = hot_bytes.clone();
+    torn.extend_from_slice(b"removed 17");
+    fs::write(ledger_path(&hot), &torn).unwrap();
+    write(&torn);
+    assert_eq!(
+        check_copy(&hot, a).unwrap(),
+        LedgerCopyCheck::Tail {
+            offset: hot_bytes.len() as u64
+        }
+    );
+    // The same copy cut back to a byte prefix of hot's verified prefix is
+    // good.
+    write(&hot_bytes[..last_start + 9]);
+    assert_eq!(check_copy(&hot, a).unwrap(), LedgerCopyCheck::Good);
+}
+
+/// `append_unless` (review of #203, finding 1): the veto sees exactly the
+/// records after the caller's read; a veto writes nothing, no veto
+/// appends; a ledger changed before the read offset fails the append.
+#[test]
+fn append_unless_vetoes_on_the_records_after_the_read() {
+    let records = golden_records();
+    let dir = store("ledger-append-unless");
+    append_all(dir.path(), &records[..3]);
+    let at_read = read(dir.path()).unwrap().unwrap();
+    append_all(dir.path(), &records[3..5]);
+    let ledger = CopyLedger::at(dir.path());
+    let before = fs::read(ledger_path(dir.path())).unwrap();
+    let seen = std::cell::RefCell::new(Vec::new());
+    let outcome = ledger
+        .append_unless(
+            &records[5],
+            at_read.verified_len,
+            &at_read.last_chain,
+            &|tail| {
+                seen.borrow_mut().extend_from_slice(tail);
+                Some("held".to_owned())
+            },
+        )
+        .unwrap();
+    assert_eq!(outcome, Guarded::Vetoed("held".to_owned()));
+    assert_eq!(*seen.borrow(), records[3..5]);
+    assert_eq!(fs::read(ledger_path(dir.path())).unwrap(), before);
+
+    let outcome = ledger
+        .append_unless(
+            &records[5],
+            at_read.verified_len,
+            &at_read.last_chain,
+            &|_| None,
+        )
+        .unwrap();
+    assert!(matches!(outcome, Guarded::Appended(_)), "{outcome:?}");
+    assert_eq!(read(dir.path()).unwrap().unwrap().records, records[..6]);
+
+    let mut changed = fs::read(ledger_path(dir.path())).unwrap();
+    // A byte of the chain hash that ends at the read offset.
+    flip(&mut changed, at_read.verified_len as usize - 5);
+    fs::write(ledger_path(dir.path()), &changed).unwrap();
+    let error = ledger
+        .append_unless(
+            &records[6],
+            at_read.verified_len,
+            &at_read.last_chain,
+            &|_| None,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(&error.error, RawStoreError::Integrity(_)),
+        "{error:?}"
+    );
+    assert_eq!(fs::read(ledger_path(dir.path())).unwrap(), changed);
+}

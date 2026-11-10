@@ -11,9 +11,12 @@
 //! A tiered store (ADR-062 D4, D7) also keeps its own metadata in
 //! `<root>/.mie/`: the root marker ([`ROOT_MARKER`]) on every root, and on
 //! hot the copy ledger ([`COPY_LEDGER`]) with its lock file
-//! ([`COPY_LEDGER_LOCK`]) and the replication pass lock
-//! ([`REPLICATE_LOCK`]). `.mie/` lies outside the layout: `select` and
-//! recovery walk only `source=` entries, so they never see it.
+//! ([`COPY_LEDGER_LOCK`]), the replication pass lock ([`REPLICATE_LOCK`])
+//! and the verification lock ([`VERIFY_LOCK`]). On every root,
+//! `mie store repair` moves damaged copies aside into [`DAMAGED_DIR`]
+//! instead of deleting them; nothing in mie lists or deletes it. `.mie/`
+//! lies outside the layout: `select` and recovery walk only `source=`
+//! entries, so they never see it.
 
 use mie_ports::raw::{RawStoreError, RawStreamKey};
 use std::path::{Path, PathBuf};
@@ -44,6 +47,18 @@ pub(crate) const COPY_LEDGER_LOCK: &str = "copy-ledger.lock";
 /// The replication pass lock in hot's [`META_DIR`] (ADR-062 D7, D11): one
 /// pass at a time, since two passes would append the same tail twice.
 pub(crate) const REPLICATE_LOCK: &str = "replicate.lock";
+
+/// The verification lock in hot's [`META_DIR`] (ADR-062 D11, #192): one
+/// `mie store verify` or `mie store repair` at a time. A verification
+/// records findings only about copies its ledger read already records, and
+/// only the repair writes a second `copy` record for such a copy, so the
+/// lock keeps a finding from voiding a copy made after the read.
+pub(crate) const VERIFY_LOCK: &str = "verify.lock";
+
+/// The directory in a root's [`META_DIR`] that `mie store repair` moves
+/// damaged copies into, one subdirectory per run (ADR-062 D11, #192): the
+/// bytes are the evidence of a shared cause, and a rename costs no I/O.
+pub(crate) const DAMAGED_DIR: &str = "damaged";
 
 /// Days between 0000-03-01 and 1970-01-01 in the proleptic Gregorian
 /// calendar (the epoch shift of the civil-date algorithm).

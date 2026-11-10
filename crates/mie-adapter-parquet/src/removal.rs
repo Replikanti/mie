@@ -29,7 +29,8 @@
 use crate::copy_ledger::{CopyLedger, Kind, Ledger, Record, Subject, Truncation};
 use crate::layout::{self, PartFile};
 use crate::replica::layout_values;
-use crate::tiers::{self, LedgerView, Verdict};
+use crate::tiers::Verdict;
+use crate::verification::CopyState;
 use crate::{io_error, list_entries, sync_dir};
 use mie_ports::raw::RawStoreError;
 use std::collections::{BTreeMap, BTreeSet};
@@ -236,7 +237,9 @@ impl RemovalPlan {
 /// - (f) that `manifest` record and those `copy` records end at or before
 ///   P, the smallest of the latest `ledger-copy` prefix lengths of the ids
 ///   in `targets`: they lie in the prefix that k verified ledger copies
-///   hold.
+///   hold. A `finding` about an id's copy ledger after its latest
+///   `ledger-copy` record voids that record, so there is no P and no plan
+///   until a later one (L1 of #192).
 ///
 /// A partition with debris can still be planned: the `.tmp` rule must be
 /// checked under the source lock, so the remover refuses it there.
@@ -264,44 +267,17 @@ pub fn plan(
     if targets.len() != k || k == 0 {
         return Ok(plan);
     }
-    let view = LedgerView::fold(ledger)?;
-    let removed = tiers::removed_partitions(ledger);
-    // Where each path's first `manifest` record and each id's first `copy`
-    // record end, and P. A `finding` about a file on a root voids that
-    // root's copy until a later `copy` record (review of #202, finding 3).
-    let mut manifest_end: BTreeMap<String, u64> = BTreeMap::new();
-    let mut copy_end: BTreeMap<(String, String), Option<u64>> = BTreeMap::new();
-    let mut ledger_copy: BTreeMap<&str, u64> = BTreeMap::new();
-    for (record, &end) in ledger.records.iter().zip(&ledger.ends) {
-        match &record.kind {
-            Kind::Manifest { text } => {
-                let path = crate::manifest::parse(text)?.relative_path;
-                manifest_end.entry(path).or_insert(end);
-            }
-            Kind::Copy { path, root } => {
-                copy_end
-                    .entry((path.clone(), root.clone()))
-                    .or_insert(None)
-                    .get_or_insert(end);
-            }
-            Kind::Finding {
-                root,
-                subject: Subject::File(path),
-                ..
-            } => {
-                copy_end.insert((path.clone(), root.clone()), None);
-            }
-            Kind::LedgerCopy {
-                root, prefix_bytes, ..
-            } => {
-                ledger_copy.insert(root.as_str(), *prefix_bytes);
-            }
-            _ => {}
-        }
-    }
+    // The one copy state (`verification`): where each path's first
+    // `manifest` record and each id's first `copy` record after its latest
+    // finding end, and P. A `finding` about a file on a root voids that
+    // root's copy until a later `copy` record (review of #202, finding 3); a
+    // copy-ledger finding voids the root's `ledger-copy` record until a later
+    // one, so with it there is no P (L1 of #192).
+    let state = CopyState::fold(ledger)?;
+    let view = state.view();
     let Some(prefix) = targets
         .iter()
-        .map(|id| ledger_copy.get(id.as_str()).copied())
+        .map(|id| state.ledger_copy(id))
         .collect::<Option<Vec<u64>>>()
         .and_then(|lengths| lengths.into_iter().min())
     else {
@@ -313,7 +289,7 @@ pub fn plan(
         let Ok((_, date)) = layout::parse_partition_dir(partition) else {
             continue;
         };
-        let recorded_removed = removed.contains(partition);
+        let recorded_removed = state.is_removed(partition);
         if !recorded_removed && date.as_str() >= first_hot_date {
             continue;
         }
@@ -350,10 +326,10 @@ pub fn plan(
             }
         }
         safe &= files.iter().all(|path| {
-            inside(manifest_end.get(path).copied())
+            inside(state.manifest_end(path))
                 && targets
                     .iter()
-                    .all(|id| inside(copy_end.get(&(path.clone(), id.clone())).copied().flatten()))
+                    .all(|id| inside(state.copy(path, id).and_then(|copy| copy.valid_end)))
         });
         if !safe || files.is_empty() {
             continue;
@@ -652,7 +628,10 @@ fn recheck(
                 Subject::File(path) => {
                     files.contains(path.as_str()) || path.starts_with(&format!("{partition}/"))
                 }
-                _ => false,
+                // A copy-ledger finding voids a ledger copy, so the prefix
+                // the plan relied on may be gone (L1 of #192).
+                Subject::CopyLedger => true,
+                Subject::Journal | Subject::Entry(_) => false,
             },
             Kind::Verify { .. } => false,
         };

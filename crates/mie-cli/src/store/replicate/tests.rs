@@ -11,13 +11,13 @@ use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// 2026-10-06T00:00:00Z.
-const D0: i64 = 1_791_244_800_000;
+pub(crate) const D0: i64 = 1_791_244_800_000;
 
 /// A fresh directory, removed on drop.
-struct Dir(PathBuf);
+pub(crate) struct Dir(pub(crate) PathBuf);
 
 impl Dir {
-    fn new(tag: &str) -> Self {
+    pub(crate) fn new(tag: &str) -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
@@ -37,7 +37,7 @@ impl Drop for Dir {
 }
 
 /// Device ids by canonical path: hot 1, the copy targets 2 and 3.
-struct Probe(Vec<(PathBuf, u64)>);
+pub(crate) struct Probe(pub(crate) Vec<(PathBuf, u64)>);
 
 impl DeviceProbe for Probe {
     fn device_id(&self, root: &Path) -> io::Result<u64> {
@@ -52,7 +52,7 @@ impl DeviceProbe for Probe {
 
 /// Records every truncation it is handed.
 #[derive(Default)]
-struct Seen(Vec<(PathBuf, Truncation)>);
+pub(crate) struct Seen(pub(crate) Vec<(PathBuf, Truncation)>);
 
 impl PassObserver for Seen {
     fn ledger_truncated(&mut self, ledger: &Path, truncation: Truncation) {
@@ -63,16 +63,16 @@ impl PassObserver for Seen {
 /// A tiered store: hot with live parts of `aggTrade` (three parts) and two
 /// archive parts of one archive file, a journal, an archive configuration
 /// and the import entry of the archive file, and two marked copy targets.
-struct Fixture {
-    dir: Dir,
-    config: IngestConfig,
-    hot: PathBuf,
-    cold: [PathBuf; 2],
-    probe: Probe,
+pub(crate) struct Fixture {
+    pub(crate) dir: Dir,
+    pub(crate) config: IngestConfig,
+    pub(crate) hot: PathBuf,
+    pub(crate) cold: [PathBuf; 2],
+    pub(crate) probe: Probe,
 }
 
 impl Fixture {
-    fn new(tag: &str) -> Self {
+    pub(crate) fn new(tag: &str) -> Self {
         let dir = Dir::new(tag);
         let hot = dir.0.join("raw");
         let cold = [dir.0.join("cold-a"), dir.0.join("cold-b")];
@@ -131,12 +131,12 @@ impl Fixture {
     }
 
     /// Seals `count` records of `stream` from `start` on hot.
-    fn seal(&self, source: &str, stream: &str, start: i64, count: i64) -> Vec<String> {
+    pub(crate) fn seal(&self, source: &str, stream: &str, start: i64, count: i64) -> Vec<String> {
         seal(&self.hot, source, stream, start, count)
     }
 
     /// Writes the import entry listing `parts`.
-    fn write_entry(&self, parts: &[String]) {
+    pub(crate) fn write_entry(&self, parts: &[String]) {
         let mut text = format!(
             "mie-archive-import 1\n\
              archive data/futures/um/daily/aggTrades/BTCUSDT/BTCUSDT-aggTrades-2026-10-05.zip\n\
@@ -153,12 +153,12 @@ impl Fixture {
         fs::write(dir.join("BTCUSDT-aggTrades-2026-10-05.zip.import"), text).unwrap();
     }
 
-    fn archive(&self) -> PathBuf {
+    pub(crate) fn archive(&self) -> PathBuf {
         self.dir.0.join("archive.toml")
     }
 
     /// One pass through `ledger`.
-    fn pass_with(&self, ledger: &dyn LedgerAppend, seen: &mut Seen) -> PassReport {
+    pub(crate) fn pass_with(&self, ledger: &dyn LedgerAppend, seen: &mut Seen) -> PassReport {
         let archive = self.archive();
         run(
             &self.config,
@@ -170,17 +170,17 @@ impl Fixture {
         )
     }
 
-    fn pass(&self) -> PassReport {
+    pub(crate) fn pass(&self) -> PassReport {
         self.pass_with(&CopyLedger::at(&self.hot), &mut Seen::default())
     }
 
     /// Hot's copy-ledger records.
-    fn records(&self) -> Vec<Record> {
+    pub(crate) fn records(&self) -> Vec<Record> {
         copy_ledger::read(&self.hot).unwrap().unwrap().records
     }
 
     /// The copy target of `id`.
-    fn target(&self, id: &str) -> &Path {
+    pub(crate) fn target(&self, id: &str) -> &Path {
         match id {
             "cold-a" => &self.cold[0],
             "cold-b" => &self.cold[1],
@@ -191,7 +191,7 @@ impl Fixture {
 
 /// Seals `count` records of `stream` from `start` on `hot`, two per part,
 /// and returns the data paths of the new parts.
-fn seal(hot: &Path, source: &str, stream: &str, start: i64, count: i64) -> Vec<String> {
+pub(crate) fn seal(hot: &Path, source: &str, stream: &str, start: i64, count: i64) -> Vec<String> {
     let before = replica::list_sealed(hot).unwrap();
     let key = RawStreamKey::new(source, "BTCUSDT", stream).unwrap();
     let policy = RotationPolicy {
@@ -223,7 +223,9 @@ fn seal(hot: &Path, source: &str, stream: &str, start: i64, count: i64) -> Vec<S
 
 /// The `manifest` records per data path and the `copy` records per path
 /// and root.
-fn counts(records: &[Record]) -> (BTreeMap<String, usize>, BTreeMap<(String, String), usize>) {
+pub(crate) fn counts(
+    records: &[Record],
+) -> (BTreeMap<String, usize>, BTreeMap<(String, String), usize>) {
     let (mut manifests, mut copies) = (BTreeMap::new(), BTreeMap::new());
     for record in records {
         match &record.kind {
@@ -241,7 +243,7 @@ fn counts(records: &[Record]) -> (BTreeMap<String, usize>, BTreeMap<(String, Str
 }
 
 /// The manifest path of a data path.
-fn manifest_of(data_path: &str) -> String {
+pub(crate) fn manifest_of(data_path: &str) -> String {
     format!("{}.manifest", data_path.strip_suffix(".parquet").unwrap())
 }
 
@@ -394,6 +396,16 @@ impl LedgerAppend for Truncating<'_> {
                 offset: 4_242,
             }),
         })
+    }
+
+    fn append_unless(
+        &self,
+        record: &Record,
+        offset: u64,
+        chain: &str,
+        veto: &dyn Fn(&[Record]) -> Option<String>,
+    ) -> Result<copy_ledger::Guarded, AppendError> {
+        self.inner.append_unless(record, offset, chain, veto)
     }
 }
 
@@ -1120,4 +1132,229 @@ fn a_hot_manifest_differing_from_the_ledger_is_never_removed() {
         removal::remove_with_lock(&fixture.hot, "binance-um", &plan, "2026-10-07", D0 + 3);
     assert!(removed.removed.is_empty(), "{removed:?}");
     assert!(fixture.hot.join(&path).exists());
+}
+
+/// L2 of #192: an open copy-ledger finding holds the target's ledger copy
+/// (no extension, no `ledger-copy` record, the pass not complete for the
+/// hot removal) while the other target goes on; the closing pass of a
+/// repair, which names the target as cleared, extends it and appends the
+/// record that ends the finding's void.
+#[test]
+fn an_open_copy_ledger_finding_holds_the_ledger_copy_until_cleared() {
+    let fixture = Fixture::new("pass-l2");
+    assert_eq!(fixture.pass().problems, Vec::<String>::new());
+    CopyLedger::at(&fixture.hot)
+        .append(&Record {
+            at_ms: D0 + 2,
+            kind: Kind::Finding {
+                root: "cold-a".to_owned(),
+                code: copy_ledger::FindingCode::Chain,
+                subject: copy_ledger::Subject::CopyLedger,
+            },
+        })
+        .unwrap();
+    let copy_a = copy_ledger::ledger_path(&fixture.cold[0]);
+    let before = fs::read(&copy_a).unwrap();
+    let ledger_copies = |fixture: &Fixture, id: &str| {
+        fixture
+            .records()
+            .iter()
+            .filter(|r| matches!(&r.kind, Kind::LedgerCopy { root, .. } if root == id))
+            .count()
+    };
+    let (a_before, b_before) = (
+        ledger_copies(&fixture, "cold-a"),
+        ledger_copies(&fixture, "cold-b"),
+    );
+    let report = fixture.pass();
+    assert!(!report.targets_complete, "{report:?}");
+    assert!(
+        report
+            .problems
+            .iter()
+            .any(|p| p.contains("cold-a") && p.contains("open copy-ledger finding")),
+        "{report:?}"
+    );
+    assert_eq!(fs::read(&copy_a).unwrap(), before);
+    assert_eq!(ledger_copies(&fixture, "cold-a"), a_before);
+    assert_eq!(ledger_copies(&fixture, "cold-b"), b_before + 1);
+
+    let lock = replica::try_replication_lock(&fixture.hot).unwrap();
+    let archive = fixture.archive();
+    let report = run_locked(
+        &fixture.config,
+        Some(&archive),
+        &fixture.probe,
+        &|| D0 + 3,
+        &CopyLedger::at(&fixture.hot),
+        &mut Seen::default(),
+        lock,
+        &["cold-a".to_owned()].into(),
+    );
+    assert_eq!(report.problems, Vec::<String>::new(), "{report:?}");
+    assert!(report.targets_complete);
+    assert_eq!(ledger_copies(&fixture, "cold-a"), a_before + 1);
+    // The finding is closed: the next ordinary pass passes.
+    assert_eq!(fixture.pass().problems, Vec::<String>::new());
+}
+
+/// Damages cold-a's ledger copy in its first record, which
+/// `extend_prefix` never re-reads (it compares only the last line), and
+/// returns the copy's path.
+fn damage_first_ledger_record(fixture: &Fixture) -> PathBuf {
+    let copy_a = copy_ledger::ledger_path(&fixture.cold[0]);
+    let mut bytes = fs::read(&copy_a).unwrap();
+    let at = copy_ledger::HEADER.len() + 3;
+    bytes[at] = if bytes[at] == b'1' { b'2' } else { b'1' };
+    fs::write(&copy_a, &bytes).unwrap();
+    assert!(bytes.iter().filter(|&&b| b == b'\n').count() >= 4);
+    assert!(copy_ledger::check_chain(&bytes).failure.is_some());
+    copy_a
+}
+
+/// A `mie store verify` run over the fixture, as a closure a pass hook
+/// calls (V10: the verification takes no pass lock).
+fn verification(fixture: &Fixture) -> impl Fn() -> crate::store::verify::VerifyReport + 'static {
+    let config = fixture.config.clone();
+    let archive = fixture.archive();
+    let probe = Probe(fixture.probe.0.clone());
+    let hot = fixture.hot.clone();
+    move || {
+        crate::store::verify::run(
+            &config,
+            Some(&archive),
+            "1",
+            &probe,
+            &|| D0 + 36_000_000,
+            &CopyLedger::at(&hot),
+        )
+    }
+}
+
+/// Whether cold-a has an open copy-ledger finding in hot's ledger.
+fn open_ledger_finding_on_a(fixture: &Fixture) -> bool {
+    let ledger = copy_ledger::read(&fixture.hot).unwrap().unwrap();
+    verification::CopyState::fold(&ledger)
+        .unwrap()
+        .open_ledger_finding("cold-a")
+}
+
+/// What a pass that met a mid-pass copy-ledger finding on cold-a must
+/// leave: the finding open, no `ledger-copy` record for cold-a after it,
+/// the pass not complete and so no removal plan; cold-b goes on.
+fn assert_held_by_mid_pass_finding(
+    fixture: &Fixture,
+    report: &PassReport,
+    plan: Option<&RemovalPlan>,
+    a_before: usize,
+) {
+    let ledger_copies = |id: &str| {
+        fixture
+            .records()
+            .iter()
+            .filter(|r| matches!(&r.kind, Kind::LedgerCopy { root, .. } if root == id))
+            .count()
+    };
+    assert!(
+        open_ledger_finding_on_a(fixture),
+        "the finding was closed by the in-flight pass's ledger-copy record with no repair: \
+         {report:?}"
+    );
+    assert_eq!(ledger_copies("cold-a"), a_before, "{report:?}");
+    assert!(!report.targets_complete, "{report:?}");
+    assert!(
+        plan.is_none(),
+        "a removal plan against a damaged ledger copy"
+    );
+    assert!(
+        report
+            .problems
+            .iter()
+            .any(|p| p.contains("cold-a") && p.contains("copy-ledger finding")),
+        "{report:?}"
+    );
+}
+
+/// Review of #203, finding 1 (L2): a verification that records a
+/// copy-ledger finding after the pass read the ledger and before its step
+/// 3 holds the ledger copy: the pass re-reads the ledger's tail before it
+/// extends the copy, so the copy is neither extended nor recorded, and the
+/// same pass's `ledger-copy` record never closes the finding.
+#[test]
+fn a_finding_recorded_before_step_3_holds_the_ledger_copy() {
+    let fixture = Fixture::new("pass-l2-mid-pass");
+    assert_eq!(fixture.pass().problems, Vec::<String>::new());
+    let copy_a = damage_first_ledger_record(&fixture);
+    let damaged = fs::read(&copy_a).unwrap();
+    let a_before = fixture
+        .records()
+        .iter()
+        .filter(|r| matches!(&r.kind, Kind::LedgerCopy { root, .. } if root == "cold-a"))
+        .count();
+    let verify = verification(&fixture);
+    let verified = std::rc::Rc::new(RefCell::new(None));
+    let out = verified.clone();
+    AFTER_LISTING.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || *out.borrow_mut() = Some(verify())));
+    });
+    let (report, plan) = fixture.planned("2026-10-07");
+    let verified = verified.borrow().clone().expect("the verification ran");
+    assert!(
+        verified
+            .problems
+            .iter()
+            .any(|p| p.contains("cold-a") && p.contains("chain")),
+        "{verified:?}"
+    );
+    assert_held_by_mid_pass_finding(&fixture, &report, plan.as_ref(), a_before);
+    assert_eq!(
+        fs::read(&copy_a).unwrap(),
+        damaged,
+        "the damaged copy is not extended"
+    );
+}
+
+/// Review of #203, finding 1, the narrow window: a finding recorded after
+/// the copy was extended and before its `ledger-copy` record. The check and
+/// the append run under one hold of the copy-ledger lock, so the record is
+/// refused; the reverse order (the pass inside the verification's window)
+/// is AW11 in `verify_concurrency.rs`.
+#[test]
+fn a_finding_recorded_between_the_extension_and_its_record_refuses_the_record() {
+    let fixture = Fixture::new("pass-l2-extend-window");
+    assert_eq!(fixture.pass().problems, Vec::<String>::new());
+    damage_first_ledger_record(&fixture);
+    // New parts, so the pass appends records and cold-a's copy is not
+    // current: step 3 extends it and reaches its `ledger-copy` record.
+    fixture.seal("binance-um", "aggTrade", D0 + 86_400_000, 2);
+    let a_before = fixture
+        .records()
+        .iter()
+        .filter(|r| matches!(&r.kind, Kind::LedgerCopy { root, .. } if root == "cold-a"))
+        .count();
+    let verify = verification(&fixture);
+    let mut once = Some(verify);
+    ON_STEP.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |step| {
+            if step == PassStep::AfterLedgerExtend
+                && let Some(verify) = once.take()
+            {
+                let report = verify();
+                assert!(
+                    report.problems.iter().any(|p| p.contains("cold-a")),
+                    "{report:?}"
+                );
+            }
+        }));
+    });
+    let (report, plan) = fixture.planned("2026-10-07");
+    ON_STEP.with(|hook| hook.borrow_mut().take());
+    assert_held_by_mid_pass_finding(&fixture, &report, plan.as_ref(), a_before);
+    assert!(
+        report
+            .lines
+            .iter()
+            .any(|l| l.starts_with("copy-ledger copy on cold-b")),
+        "cold-b goes on: {report:?}"
+    );
 }

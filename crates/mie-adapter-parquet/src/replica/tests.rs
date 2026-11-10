@@ -629,3 +629,158 @@ fn every_failure_names_its_side() {
         Side::Destination
     );
 }
+
+/// Every class of [`check_sealed_copy`] (#192 V4), in its precedence, the
+/// data always checked against the ledger's text.
+#[test]
+fn check_sealed_copy_classifies_every_copy() {
+    let fixture = TieredFixture::new("replica-check");
+    let (path, _) = first_part(&fixture);
+    let manifest = TieredFixture::manifest_of(&path);
+    let text = fs::read_to_string(layout::resolve(&fixture.hot, &manifest)).unwrap();
+    let [a, _] = &fixture.cold;
+    let check = |root: &Path| check_sealed_copy(root, &path, &text).unwrap();
+    assert_eq!(check(a), CopyCheck::Missing);
+    copy_sealed(&fixture.hot, a, &path).unwrap();
+    assert_eq!(check(a), CopyCheck::Good);
+    assert_eq!(check(&fixture.hot), CopyCheck::Good);
+
+    let data = layout::resolve(a, &path);
+    let manifest_file = layout::resolve(a, &manifest);
+    let original = fs::read(&data).unwrap();
+    flip_file(&data, 30);
+    assert_eq!(check(a), CopyCheck::Sha256);
+    fs::write(&data, [original.as_slice(), b"x"].concat()).unwrap();
+    assert_eq!(check(a), CopyCheck::Size);
+    fs::write(&data, &original).unwrap();
+
+    // Another manifest: one row more, so the data still matches it (a
+    // self-consistent other file), or another SHA-256 (not).
+    writable(&manifest_file);
+    let mut other = manifest::parse(&text).unwrap();
+    other.rows += 1;
+    fs::write(&manifest_file, manifest::render(&other)).unwrap();
+    assert_eq!(check(a), CopyCheck::Manifest { other_file: true });
+    other.sha256 = "0".repeat(64);
+    fs::write(&manifest_file, manifest::render(&other)).unwrap();
+    assert_eq!(check(a), CopyCheck::Manifest { other_file: false });
+    fs::remove_file(&manifest_file).unwrap();
+    assert_eq!(check(a), CopyCheck::Manifest { other_file: false });
+    // Missing comes first: a manifest without its data.
+    fs::write(&manifest_file, &text).unwrap();
+    fs::remove_file(&data).unwrap();
+    assert_eq!(check(a), CopyCheck::Missing);
+    // A directory where the data should be is an I/O error, not a finding.
+    fs::create_dir(&data).unwrap();
+    assert!(matches!(
+        check_sealed_copy(a, &path, &text),
+        Err(RawStoreError::Io(_))
+    ));
+}
+
+/// The move-aside renames the data first, then its manifest and the seal
+/// temp names, keeps the bytes and the relative path, and refuses to
+/// replace what an earlier run moved.
+#[test]
+fn move_aside_keeps_the_bytes_data_first() {
+    let fixture = TieredFixture::new("replica-move-aside");
+    let (path, partition) = first_part(&fixture);
+    let [a, _] = &fixture.cold;
+    copy_sealed(&fixture.hot, a, &path).unwrap();
+    let part = layout::parse_data_path(&path).unwrap().2;
+    let tmp = layout::resolve(a, &partition).join(PartFile::DataTmp.name(part));
+    fs::write(&tmp, b"debris").unwrap();
+    let before = partition_files(a, &partition);
+    let aside = damaged_dir(a, 7);
+    assert!(aside.ends_with(".mie/damaged/7"));
+    let moved = move_aside(a, &path, &aside).unwrap();
+    let names: Vec<String> = [PartFile::Data, PartFile::Manifest, PartFile::DataTmp]
+        .iter()
+        .map(|kind| format!("{partition}/{}", kind.name(part)))
+        .collect();
+    assert_eq!(moved, names);
+    assert!(partition_files(a, &partition).is_empty());
+    assert_eq!(partition_files(&aside, &partition), before);
+    // Nothing left to move; a second copy moved into the same directory
+    // is refused rather than replacing the first.
+    assert!(move_aside(a, &path, &aside).unwrap().is_empty());
+    copy_sealed(&fixture.hot, a, &path).unwrap();
+    assert!(matches!(
+        move_aside(a, &path, &aside),
+        Err(RawStoreError::Integrity(_))
+    ));
+}
+
+/// The first difference, the start of a line, and the rebuild of a tail
+/// copy, across a crash after either step.
+#[test]
+fn a_tail_copy_is_rebuilt_from_a_prefix_across_crashes() {
+    let dir = TempDir::new("replica-rebuild");
+    let source = dir.path().join("journal.jsonl");
+    let text = b"{\"a\":1}\n{\"b\":22}\n{\"c\":333}\n";
+    fs::write(&source, text).unwrap();
+    let copy = dir.path().join("cold/.mie/journal/journal.jsonl");
+    fs::create_dir_all(copy.parent().unwrap()).unwrap();
+    let mut damaged = text.to_vec();
+    damaged[12] ^= 0x01;
+    fs::write(&copy, &damaged).unwrap();
+    let len = text.len() as u64;
+    assert_eq!(
+        first_difference(&copy, TailSource::File(&source), len).unwrap(),
+        Some(12)
+    );
+    assert_eq!(
+        first_difference(&source, TailSource::Bytes(text), len).unwrap(),
+        None
+    );
+    assert_eq!(line_start(TailSource::File(&source), 12).unwrap(), 8);
+    assert_eq!(line_start(TailSource::Bytes(text), 8).unwrap(), 8);
+    assert_eq!(line_start(TailSource::Bytes(text), 3).unwrap(), 0);
+
+    for (i, step) in [
+        Some(RebuildStep::MoveAside),
+        Some(RebuildStep::WriteTemp),
+        None,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        fs::write(&copy, &damaged).unwrap();
+        let aside = dir
+            .path()
+            .join(format!("cold/.mie/damaged/{i}/journal.jsonl"));
+        REBUILD_CRASH_AFTER.with(|crash| crash.set(step));
+        let result = rebuild_prefix(TailSource::File(&source), &copy, 8, &aside);
+        assert_eq!(fs::read(&aside).unwrap(), damaged, "{step:?}");
+        if step.is_some() {
+            assert!(result.is_err(), "{step:?}");
+            // The copy is absent (the next pass creates it), and a re-run
+            // removes the temp name and rebuilds.
+            assert!(!copy.exists(), "{step:?}");
+            let again = dir
+                .path()
+                .join(format!("cold/.mie/damaged/{i}-again/journal.jsonl"));
+            rebuild_prefix(TailSource::File(&source), &copy, 8, &again).unwrap();
+            assert!(!again.exists(), "nothing was left to move aside");
+        } else {
+            result.unwrap();
+        }
+        assert_eq!(fs::read(&copy).unwrap(), &text[..8], "{step:?}");
+        let tmp = copy.with_file_name(".journal.jsonl.rebuild.tmp");
+        assert!(!tmp.exists(), "{step:?}");
+    }
+}
+
+/// The verification lock refuses a second holder.
+#[test]
+fn the_verify_lock_refuses_a_second_holder() {
+    let dir = TempDir::new("replica-verify-lock");
+    fs::create_dir(dir.path().join(META_DIR)).unwrap();
+    let held = try_verify_lock(dir.path()).unwrap();
+    assert!(matches!(
+        try_verify_lock(dir.path()),
+        Err(RawStoreError::Locked(_))
+    ));
+    drop(held);
+    try_verify_lock(dir.path()).unwrap();
+}

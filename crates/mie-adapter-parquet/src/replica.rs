@@ -13,7 +13,14 @@
 //!   import-ledger entry);
 //! - [`extend_prefix`]: the D11 tail append of a line-structured,
 //!   append-only file (the journal, the copy ledger);
-//! - [`try_replication_lock`]: the pass lock on hot.
+//! - [`try_replication_lock`]: the pass lock on hot;
+//! - [`check_sealed_copy`]: the verification's classification of one copy
+//!   against the copy ledger's manifest text (#192);
+//! - [`move_aside`], [`rebuild_prefix`]: the repair's move of a damaged
+//!   copy into `.mie/damaged/` and its rebuild of a tail copy (#192);
+//! - [`first_difference`], [`line_start`]: where a tail copy first differs
+//!   from hot's file, and where the line holding a byte starts;
+//! - [`try_verify_lock`]: the verification lock on hot (#192).
 //!
 //! Every primitive takes its source and destination explicitly, so the
 //! adoption of another store, the recall onto hot and the repair reuse them
@@ -37,7 +44,7 @@
 //! The bytes are streamed verbatim through a bounded buffer: a copy never
 //! recompresses, merges parts or re-encodes (D5).
 
-use crate::layout::{self, META_DIR, PartFile, REPLICATE_LOCK};
+use crate::layout::{self, DAMAGED_DIR, META_DIR, PartFile, REPLICATE_LOCK, VERIFY_LOCK};
 use crate::manifest::{self, hex};
 use crate::recovery::{mark_read_only, rename_no_replace};
 use crate::{io_error, list_entries, sync_dir};
@@ -1097,4 +1104,364 @@ pub fn try_replication_lock(raw_root: &Path) -> Result<ReplicationLock, RawStore
         ))),
         Err(TryLockError::Error(error)) => Err(io_error("lock", &path)(error)),
     }
+}
+
+/// The verification lock on hot; dropping it releases the lock.
+#[derive(Debug)]
+pub struct VerifyLock {
+    _file: File,
+}
+
+/// The verification lock's path on the store rooted at `raw_root`.
+pub fn verify_lock_path(raw_root: &Path) -> PathBuf {
+    raw_root.join(META_DIR).join(VERIFY_LOCK)
+}
+
+/// Takes the verification lock `<raw_root>/.mie/verify.lock` without
+/// waiting (ADR-062 D11, #192): `mie store verify` and `mie store repair`
+/// hold it for their whole run, so a verification never records a finding
+/// about a copy that a repair made after the verification read the ledger.
+///
+/// # Errors
+///
+/// [`RawStoreError::Locked`] when another verification or repair holds it;
+/// [`RawStoreError::Io`] when the lock file cannot be opened.
+pub fn try_verify_lock(raw_root: &Path) -> Result<VerifyLock, RawStoreError> {
+    let path = verify_lock_path(raw_root);
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .map_err(io_error("open", &path))?;
+    match file.try_lock() {
+        Ok(()) => Ok(VerifyLock { _file: file }),
+        Err(TryLockError::WouldBlock) => Err(RawStoreError::Locked(format!(
+            "another mie store verify or mie store repair holds {}",
+            path.display()
+        ))),
+        Err(TryLockError::Error(error)) => Err(io_error("lock", &path)(error)),
+    }
+}
+
+/// What [`check_sealed_copy`] found, in its precedence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyCheck {
+    /// The data and its manifest match the ledger's manifest text.
+    Good,
+    /// No data: no file at all, or a manifest without its data.
+    Missing,
+    /// No manifest next to the data, or one whose text differs from the
+    /// ledger's. `other_file` when the data matches that differing
+    /// manifest: two sealed files under one path (D5), never a damaged
+    /// copy of the ledger's file.
+    Manifest {
+        /// The root holds a self-consistent other file.
+        other_file: bool,
+    },
+    /// The data's size differs from the ledger's manifest.
+    Size,
+    /// The data's SHA-256 differs from the ledger's manifest.
+    Sha256,
+}
+
+/// Classifies the copy of the sealed part `data_path` on `root` against
+/// `ledger_text`, the copy ledger's manifest text of the path (ADR-062 D11,
+/// #192 V4), in this precedence: [`CopyCheck::Missing`], then
+/// [`CopyCheck::Manifest`], then [`CopyCheck::Size`], then
+/// [`CopyCheck::Sha256`]. The data is always checked against the ledger's
+/// text, size before hash, streamed through a bounded buffer. A data path
+/// that is no regular file (a directory, say) is an I/O error, never a
+/// finding.
+///
+/// # Errors
+///
+/// [`RawStoreError::Invalid`] for a path outside the layout;
+/// [`RawStoreError::Corrupt`] for a ledger text that does not parse;
+/// [`RawStoreError::Io`] for any I/O failure on `root` other than an absent
+/// file.
+pub fn check_sealed_copy(
+    root: &Path,
+    data_path: &str,
+    ledger_text: &str,
+) -> Result<CopyCheck, RawStoreError> {
+    let expected = manifest::parse(ledger_text)?;
+    let (key, date, part) = layout::parse_data_path(data_path)?;
+    let data = layout::resolve(root, data_path);
+    let manifest_path = layout::resolve(
+        root,
+        &layout::file_path(&key, &date, PartFile::Manifest, part),
+    );
+    let mut file = match File::open(&data) {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(CopyCheck::Missing),
+        Err(error) => return Err(io_error("open", &data)(error)),
+    };
+    let metadata = file.metadata().map_err(io_error("inspect", &data))?;
+    if !metadata.is_file() {
+        return Err(RawStoreError::Io(format!(
+            "{} is not a regular file",
+            data.display()
+        )));
+    }
+    let present = match fs::read(&manifest_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            return Ok(CopyCheck::Manifest { other_file: false });
+        }
+        Err(error) => return Err(io_error("read", &manifest_path)(error)),
+    };
+    if present != ledger_text.as_bytes() {
+        let own = std::str::from_utf8(&present)
+            .ok()
+            .and_then(|text| manifest::parse(text).ok())
+            .filter(|own| own.stream == key && own.date == date && own.part == part);
+        let other_file = match own {
+            Some(own) => metadata.len() == own.bytes && hash_open(&mut file, &data)? == own.sha256,
+            None => false,
+        };
+        return Ok(CopyCheck::Manifest { other_file });
+    }
+    if metadata.len() != expected.bytes {
+        return Ok(CopyCheck::Size);
+    }
+    Ok(if hash_open(&mut file, &data)? == expected.sha256 {
+        CopyCheck::Good
+    } else {
+        CopyCheck::Sha256
+    })
+}
+
+/// The SHA-256 of an open file from its start, streamed.
+fn hash_open(file: &mut File, path: &Path) -> Result<String, RawStoreError> {
+    file.seek(SeekFrom::Start(0))
+        .map_err(io_error("read", path))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0; CHUNK];
+    loop {
+        let n = file.read(&mut buffer).map_err(io_error("read", path))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buffer[..n]);
+    }
+    Ok(hex(&hasher.finalize()))
+}
+
+/// The directory a repair run at `at_ms` moves the damaged copies of
+/// `root` into: `<root>/.mie/damaged/<at_ms>` (ADR-062 D7, D11, #192).
+pub fn damaged_dir(root: &Path, at_ms: i64) -> PathBuf {
+    root.join(META_DIR)
+        .join(DAMAGED_DIR)
+        .join(at_ms.to_string())
+}
+
+/// Moves the copy of the sealed part `data_path` on `root` aside into
+/// `aside` (a [`damaged_dir`] of the same root, so the same filesystem and
+/// atomic renames), under the same relative path, and returns the names
+/// moved (#192 R5). The data file goes first, then its manifest, then the
+/// seal temp names of the path: a concurrent `read` skips a root without
+/// the data, and a crash after the first rename leaves a manifest without
+/// data, which the verification reports as `missing` and the next repair
+/// completes. Every rename refuses to replace; the directories are
+/// fsynced. A name that does not exist is skipped.
+///
+/// # Errors
+///
+/// [`RawStoreError::Invalid`] for a path outside the layout;
+/// [`RawStoreError::Integrity`] when `aside` already holds a name;
+/// [`RawStoreError::Io`] on I/O failure.
+pub fn move_aside(
+    root: &Path,
+    data_path: &str,
+    aside: &Path,
+) -> Result<Vec<String>, RawStoreError> {
+    let (key, date, part) = layout::parse_data_path(data_path)?;
+    let partition_rel = layout::partition_dir(&key, &date);
+    let partition = layout::resolve(root, &partition_rel);
+    let dest = layout::resolve(aside, &partition_rel);
+    let mut moved = Vec::new();
+    for kind in [
+        PartFile::Data,
+        PartFile::Manifest,
+        PartFile::DataTmp,
+        PartFile::ManifestTmp,
+    ] {
+        let name = kind.name(part);
+        let from = partition.join(&name);
+        if !exists(&from)? {
+            continue;
+        }
+        ensure_dir(&dest)?;
+        rename_no_replace(&from, &dest.join(&name))?;
+        sync_dir(&dest)?;
+        sync_dir(&partition)?;
+        moved.push(format!("{partition_rel}/{name}"));
+    }
+    Ok(moved)
+}
+
+/// Moves the single file `path` (an import-ledger entry copy, a tail copy)
+/// to `aside`, a path under a [`damaged_dir`] of the same root (#192 R5):
+/// the parent directories are created, the rename refuses to replace, and
+/// both directories are fsynced. A missing `path` is no error.
+///
+/// # Errors
+///
+/// [`RawStoreError::Integrity`] when `aside` exists; [`RawStoreError::Io`]
+/// on I/O failure.
+pub fn move_file_aside(path: &Path, aside: &Path) -> Result<bool, RawStoreError> {
+    if !exists(path)? {
+        return Ok(false);
+    }
+    let (Some(dir), Some(aside_dir)) = (path.parent(), aside.parent()) else {
+        return Err(RawStoreError::Invalid(format!(
+            "{} or {} has no directory",
+            path.display(),
+            aside.display()
+        )));
+    };
+    ensure_dir(aside_dir)?;
+    rename_no_replace(path, aside)?;
+    sync_dir(aside_dir)?;
+    sync_dir(dir)?;
+    Ok(true)
+}
+
+/// The first byte in `[0, len)` where the file `copy` differs from
+/// `source`, compared in bounded chunks with each chunk of the copy read
+/// before the source's; `None` when they agree. The caller makes sure both
+/// are at least `len` bytes long.
+///
+/// # Errors
+///
+/// A [`CopyError`] on [`Side::Destination`] when the copy cannot be read,
+/// on [`Side::Source`] when the source cannot.
+pub fn first_difference(
+    copy: &Path,
+    source: TailSource<'_>,
+    len: u64,
+) -> Result<Option<u64>, CopyError> {
+    let mut file = File::open(copy).map_err(io_error("open", copy))?;
+    let mut offset = 0;
+    while offset < len {
+        let n = (len - offset).min(CHUNK as u64) as usize;
+        let mine = read_at(&mut file, copy, offset, n)?;
+        let theirs = source.read_at(offset, n)?;
+        if let Some(i) = mine.iter().zip(&theirs).position(|(a, b)| a != b) {
+            return Ok(Some(offset + i as u64));
+        }
+        offset += n as u64;
+    }
+    Ok(None)
+}
+
+/// Where the line holding byte `offset` of `source` starts: after the last
+/// `\n` before it, or 0.
+///
+/// # Errors
+///
+/// A [`CopyError`] on [`Side::Source`] when the source cannot be read.
+pub fn line_start(source: TailSource<'_>, offset: u64) -> Result<u64, CopyError> {
+    let mut end = offset;
+    while end > 0 {
+        let start = end.saturating_sub(CHUNK as u64);
+        let chunk = source.read_at(start, (end - start) as usize)?;
+        if let Some(i) = chunk.iter().rposition(|&b| b == b'\n') {
+            return Ok(start + i as u64 + 1);
+        }
+        end = start;
+    }
+    Ok(0)
+}
+
+/// The steps of [`rebuild_prefix`]. Tests stop a rebuild after either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RebuildStep {
+    /// The damaged copy is moved aside.
+    MoveAside,
+    /// The new copy is written to its temp name, fsynced and read back.
+    WriteTemp,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: the next rebuild on this thread stops after this step.
+    pub(crate) static REBUILD_CRASH_AFTER: std::cell::Cell<Option<RebuildStep>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Marks the end of a rebuild step; under test, simulates a crash there
+/// once.
+fn rebuild_reached(step: RebuildStep) -> Result<(), RawStoreError> {
+    #[cfg(test)]
+    if REBUILD_CRASH_AFTER.with(|crash| crash.get() == Some(step)) {
+        REBUILD_CRASH_AFTER.with(|crash| crash.set(None));
+        return Err(RawStoreError::Io(format!("simulated crash after {step:?}")));
+    }
+    let _ = step;
+    Ok(())
+}
+
+/// Replaces the tail copy `dest` (a journal or copy-ledger copy on a copy
+/// target) by the byte prefix `[0, upto)` of `source` (#192 R6, R7). The
+/// damaged copy is moved to `aside` first ([`RebuildStep::MoveAside`]; the
+/// rename refuses to replace, its directories fsynced); then the prefix is
+/// written to the temp name `.<name>.rebuild.tmp` beside `dest` in bounded
+/// chunks, fsynced and read back ([`RebuildStep::WriteTemp`]), renamed into
+/// place without replacing, and the directory fsynced. A crash leaves the
+/// copy absent, which the next replication pass creates from hot, or a
+/// stale temp name, which the next rebuild removes. A missing `dest` is no
+/// error: there is nothing to move aside.
+///
+/// # Errors
+///
+/// A [`CopyError`] on [`Side::Source`] when the source cannot be read (one
+/// shorter than `upto` included); on [`Side::Destination`] for a read-back
+/// mismatch ([`RawStoreError::Integrity`]) and any I/O failure there.
+pub fn rebuild_prefix(
+    source: TailSource<'_>,
+    dest: &Path,
+    upto: u64,
+    aside: &Path,
+) -> Result<(), CopyError> {
+    let dir = dest
+        .parent()
+        .ok_or_else(|| RawStoreError::Invalid(format!("{} has no directory", dest.display())))?;
+    let name = dest
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| RawStoreError::Invalid(format!("{} has no file name", dest.display())))?;
+    let tmp = dir.join(format!(".{name}.rebuild.tmp"));
+    remove_if_present(&tmp)?;
+    move_file_aside(dest, aside)?;
+    rebuild_reached(RebuildStep::MoveAside)?;
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .map_err(io_error("create", &tmp))?;
+    append_range(&mut file, &tmp, source, 0, upto)?;
+    file.sync_all().map_err(io_error("sync", &tmp))?;
+    let mut offset = 0;
+    while offset < upto {
+        let n = (upto - offset).min(CHUNK as u64) as usize;
+        if read_at(&mut file, &tmp, offset, n)? != source.read_at(offset, n)? {
+            drop(file);
+            remove_if_present(&tmp)?;
+            return Err(RawStoreError::Integrity(format!(
+                "{}: the rebuilt copy read back differently from {}",
+                tmp.display(),
+                source.describe()
+            ))
+            .into());
+        }
+        offset += n as u64;
+    }
+    drop(file);
+    rebuild_reached(RebuildStep::WriteTemp)?;
+    rename_no_replace(&tmp, dest)?;
+    sync_dir(dir)?;
+    Ok(())
 }

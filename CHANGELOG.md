@@ -12,6 +12,38 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
 
 ### Added
 
+- **Storage tiers, step 6: `mie store verify` and `mie store repair` (#192,
+  ADR-062 D11, proposed).** `mie store verify --config <ingest config>
+  [--archive-config <path>] --period-hours <P>` checks every copy of a
+  tiered store: hot's sealed files against the copy ledger's manifests;
+  on every copy target with its marker, every recorded copy (present,
+  manifest identical to the ledger's, size, SHA-256), the files short of a
+  copy, the import-ledger entries byte for byte, the copy-ledger copy (its
+  hash chain, naming the first failing record, and a byte prefix of hot's)
+  and the journal copy (naming the first differing byte); on read-only
+  roots, the copies they hold. It appends each finding on a copy target to
+  the ledger, then one `verify` record per target, names targets that did
+  not present a marker with their copies whose last good verification is
+  older than P, writes nothing to any root, and exits 1 on any finding. It
+  takes the new `.mie/verify.lock` and runs beside `mie ingest`. `mie store
+  repair [--record-lost]` re-checks every copy the ledger records as
+  damaged or missing, records again what came back, replaces the rest
+  from the first good copy (hot, then the cold roots in order) after
+  moving the damaged bytes aside into `<root>/.mie/damaged/<time>/`, ends
+  each with a fresh `copy` record so the partition becomes removable
+  again, refills a target added or replaced after files left hot, rebuilds
+  ledger and journal copies from hot where that is safe (a ledger copy
+  whose only damage is an unterminated tail, such as NULs left by a crash,
+  is cut back to its last complete record), refuses divergent ledger
+  copies, unattributable journal copies and entry conflicts, reports a
+  file with no good copy left as lost and writes nothing (the `lost`
+  record only with `--record-lost`; a root that fails to read or no
+  longer carries its marker makes the file "not repairable in this run"
+  instead), skips a hot copy whose partition a concurrent removal
+  recorded removed, and ends with one replication pass. The hot removal
+  and the replication pass now treat a copy-ledger finding as voiding that
+  target's ledger copy until it is repaired, including a finding a
+  verification records while the pass runs.
 - **P1 replication on 2020-01 … 2024-09, measured: not replicated (#206,
   ADR-064 accepted).** `docs/research/205-p1-replication.md` holds the one
   pre-registered run of `measure_p1_replication` from #207's merge commit

@@ -22,6 +22,14 @@
 //!   partitions, the journal and the import entries go to hot, and one
 //!   replication pass follows. The source is only read
 //!   ([`adopt`](mod@adopt) holds the run, #190, ADR-062 D10, D8, D6).
+//! - [`verify`] (`mie store verify`) checks every copy on every root and
+//!   appends its findings to the copy ledger; it reads the roots only
+//!   ([`verify`](mod@verify) holds the rules, #192, ADR-062 D11).
+//! - [`repair`] (`mie store repair`) replaces the damaged or missing
+//!   copies the ledger records from a good one, moves each damaged copy
+//!   aside into `.mie/damaged/`, fills a target that lacks the files that
+//!   left hot, and ends with one replication pass
+//!   ([`repair`](mod@repair) holds the rules, #192, ADR-062 D11).
 //! - [`check_devices`] refuses two roots that report one device id, before
 //!   any `mie store` command writes a byte to a copy target.
 //! - [`raw_store`] builds the raw store of every command: the tiered store
@@ -55,10 +63,14 @@ use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 pub mod adopt;
+pub mod repair;
 pub mod replicate;
+pub mod verify;
 
 pub use adopt::{AdoptReport, AdoptRequest};
+pub use repair::RepairReport;
 pub use replicate::{LedgerAppend, PassObserver, PassReport, truncation_line};
+pub use verify::VerifyReport;
 
 /// The device a root lives on.
 ///
@@ -422,6 +434,78 @@ pub fn adopt(
             .iter()
             .map(|problem| format!("FAIL: {problem}")),
     );
+    for line in lines {
+        writeln!(out, "{line}").map_err(|e| format!("write the report: {e}"))?;
+    }
+    out.flush().map_err(|e| format!("write the report: {e}"))?;
+    Ok(pass)
+}
+
+/// `mie store verify`: one verification of the store of `config` (ADR-062
+/// D11, the module [`verify`](mod@verify)), with the archive configuration
+/// `archive`, else `[history] archive_config`, else none, and P from
+/// `period_hours` (`--period-hours`, refused unless a whole number of at
+/// least 1). `now_ms` stamps the records and is "now" for P and G.
+///
+/// It prints one summary line per root and every copy-ledger truncation,
+/// then `PASS` (returns `true`) or one `FAIL: <finding>` line per finding
+/// or refusal (returns `false`).
+///
+/// # Errors
+///
+/// A description when the report cannot be written.
+pub fn verify(
+    config: &IngestConfig,
+    archive: Option<&Path>,
+    period_hours: &str,
+    probe: &dyn DeviceProbe,
+    now_ms: &dyn Fn() -> i64,
+    out: &mut dyn Write,
+) -> Result<bool, String> {
+    let ledger = copy_ledger::CopyLedger::at(&config.paths.raw_root);
+    let report = verify::run(config, archive, period_hours, probe, now_ms, &ledger);
+    print_report(report.lines, &report.problems, out)
+}
+
+/// `mie store repair`: one repair of the store of `config` (ADR-062 D11,
+/// the module [`repair`](mod@repair)), with the archive configuration
+/// `archive`, else `[history] archive_config`, else none. With
+/// `record_lost` (`--record-lost`) a lost file gets its `lost` record.
+/// `now_ms` stamps the records and names the run's `.mie/damaged/`
+/// directories.
+///
+/// It prints what it repaired, the closing pass's lines and every
+/// copy-ledger truncation, then `PASS` (returns `true`) or one `FAIL:
+/// <problem>` line per problem (returns `false`).
+///
+/// # Errors
+///
+/// A description when the report cannot be written.
+pub fn repair(
+    config: &IngestConfig,
+    archive: Option<&Path>,
+    record_lost: bool,
+    probe: &dyn DeviceProbe,
+    now_ms: &dyn Fn() -> i64,
+    out: &mut dyn Write,
+) -> Result<bool, String> {
+    let ledger = copy_ledger::CopyLedger::at(&config.paths.raw_root);
+    let report = repair::run(config, archive, record_lost, probe, now_ms, &ledger);
+    print_report(report.lines, &report.problems, out)
+}
+
+/// Prints `lines`, then `PASS` without problems or one `FAIL:` line per
+/// problem; returns whether it passed.
+fn print_report(
+    mut lines: Vec<String>,
+    problems: &[String],
+    out: &mut dyn Write,
+) -> Result<bool, String> {
+    let pass = problems.is_empty();
+    if pass {
+        lines.push("PASS".to_owned());
+    }
+    lines.extend(problems.iter().map(|problem| format!("FAIL: {problem}")));
     for line in lines {
         writeln!(out, "{line}").map_err(|e| format!("write the report: {e}"))?;
     }
