@@ -2,7 +2,7 @@
 //! the journal read (B1).
 
 use super::*;
-use crate::store::archive_checks::tests::{entry, part, sha, text};
+use crate::store::archive_checks::tests::{NAME, entry, part, sha, text};
 use mie_adapter_parquet::copy_ledger::{FindingCode, LedgerBuilder, Subject};
 
 /// The run's `at_ms`: 2026-10-06T03:00:00Z.
@@ -23,6 +23,7 @@ fn inputs() -> RebuildInputs {
         first_hot_date: "2026-10-05".to_owned(),
         record_lost: false,
         archive_configured: true,
+        missing_import_ledger: None,
         ledger_copies: vec![
             LedgerCopyRead {
                 id: "cold-a".to_owned(),
@@ -732,4 +733,62 @@ fn non_json_journal_lines_are_counted_not_parsed() {
             recovery: true,
         }]
     );
+}
+
+/// Review of #209, finding 2: a missing hot import-ledger directory stops
+/// the rebuild when an archive part exists on a root or in the start, or a
+/// copy target holds import entries; otherwise it is no stop.
+#[test]
+fn a_missing_import_ledger_stops_only_where_it_could_hide_entries() {
+    let missing = Some("the configured import ledger".to_owned());
+    let mut quiet = inputs();
+    quiet.missing_import_ledger = missing.clone();
+    on(
+        &mut quiet,
+        0,
+        &live("2026-10-06", 0),
+        good(&text(&live("2026-10-06", 0), &sha("a"))),
+    );
+    quiet
+        .hot
+        .partitions
+        .insert(partition(&live("2026-10-06", 0)));
+    derive_ok(&quiet);
+
+    let archive = part("aggTrades", "2026-10-06", 0);
+    let mut on_hot_only = inputs();
+    on_hot_only.missing_import_ledger = missing.clone();
+    on_hot(&mut on_hot_only, &archive, &text(&archive, &sha("a")));
+    let mut in_start = inputs();
+    in_start.missing_import_ledger = missing.clone();
+    start_on(
+        &mut in_start,
+        0,
+        ledger(&[Kind::Hold {
+            path: archive.clone(),
+            reason: HoldReason::Unlisted,
+        }]),
+    );
+    let mut target_entries = inputs();
+    target_entries.missing_import_ledger = missing;
+    target_entries.entries.insert(
+        NAME.to_owned(),
+        vec![EntryCopy {
+            root: "cold-a".to_owned(),
+            bytes: entry(&[]),
+        }],
+    );
+    for (case, inputs) in [
+        ("hot", on_hot_only),
+        ("start", in_start),
+        ("target entries", target_entries),
+    ] {
+        let Err(Stop(why)) = derive(&inputs) else {
+            panic!("{case}: a missing import ledger must stop the rebuild");
+        };
+        assert!(
+            why.contains("the configured import ledger") && why.contains("does not exist"),
+            "{case}: {why}"
+        );
+    }
 }

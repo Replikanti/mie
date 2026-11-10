@@ -23,7 +23,9 @@
 //!   Hot's own ledger: absent or unreadable (`Integrity`, `Corrupt`)
 //!   proceeds; readable is refused without `--replace-hot-ledger`; an `Io`
 //!   error is refused. Archive paths without an archive configuration are
-//!   refused.
+//!   refused, and so is a missing hot import-ledger directory while an
+//!   archive part exists or a copy target holds entries: an unmounted or
+//!   misconfigured directory reads as empty (review of #209, finding 2).
 //! - **B1 Read order**, nothing written: every copy target's ledger copy;
 //!   hot's journal up to the length J read now (a line cut at J is not
 //!   parsed); every import entry on hot and on the targets, and hot's
@@ -230,6 +232,10 @@ pub struct RebuildInputs {
     pub record_lost: bool,
     /// Whether an archive configuration was given.
     pub archive_configured: bool,
+    /// Hot's import-ledger directory (`paths.import_ledger`), named, when
+    /// it does not exist: an unmounted or misconfigured directory reads as
+    /// empty, so the derivation stops when it could hide entries.
+    pub missing_import_ledger: Option<String>,
     /// The copy targets' ledger copies, in configuration order.
     pub ledger_copies: Vec<LedgerCopyRead>,
     /// Hot's journal.
@@ -548,6 +554,41 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
                  (--archive-config or [history] archive_config): without the import ledger the \
                  rebuild can neither cross-check archive files nor derive their holds (ADR-062 \
                  D7)"
+            )));
+        }
+    }
+
+    // B0 again: a missing hot import ledger reads as empty, and every
+    // archive part only hot holds would become a permanent `unlisted` hold
+    // (nothing clears a hold before #194; review of #209, finding 2). It
+    // stops the rebuild wherever it could hide an entry: an archive part
+    // on a root or in the start, or a copy target holding entries.
+    if let Some(dir) = &inputs.missing_import_ledger {
+        let part = inputs
+            .hot
+            .files
+            .keys()
+            .chain(&inputs.hot.orphan_data)
+            .chain(
+                inputs
+                    .roots
+                    .iter()
+                    .flat_map(|root| root.files.keys().chain(&root.orphan_data)),
+            )
+            .chain(sources.keys())
+            .find(|path| is_archive_part(path));
+        let why = match (part, inputs.entries.keys().next()) {
+            (Some(path), _) => Some(format!("archive part {path} exists")),
+            (None, Some(entry)) => Some(format!("the copy targets hold import entry {entry}")),
+            (None, None) => None,
+        };
+        if let Some(why) = why {
+            return Err(Stop(format!(
+                "hot's import ledger {dir} (paths.import_ledger of the archive configuration) \
+                 does not exist, while {why}: an unmounted or misconfigured directory reads as \
+                 empty and would turn every archive part only hot holds into a permanent \
+                 `unlisted` hold. Mount it or fix the archive configuration, then run the \
+                 rebuild again; nothing is written (ADR-062 D7)"
             )));
         }
     }
@@ -1137,8 +1178,21 @@ fn rebuild(
     hook(&AFTER_JOURNAL);
     let mut entries: BTreeMap<String, Vec<EntryCopy>> = BTreeMap::new();
     let mut pending = None;
+    let mut missing_import_ledger = None;
     if let Some(archive) = &archive {
         let ledger_dir = &archive.paths.import_ledger;
+        match fs::symlink_metadata(ledger_dir) {
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                missing_import_ledger = Some(ledger_dir.display().to_string());
+            }
+            Err(error) => {
+                return Err(io(format!(
+                    "inspect the import ledger {}",
+                    ledger_dir.display()
+                ))(error));
+            }
+        }
         let dirs = std::iter::once(("hot".to_owned(), ledger_dir.clone())).chain(
             targets.iter().map(|target| {
                 (
@@ -1212,6 +1266,7 @@ fn rebuild(
         first_hot_date: first_hot_date.to_owned(),
         record_lost: flags.record_lost,
         archive_configured: archive.is_some(),
+        missing_import_ledger,
         ledger_copies,
         journal,
         entries,

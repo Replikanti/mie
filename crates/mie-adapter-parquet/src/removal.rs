@@ -15,6 +15,8 @@
 //!   tail since the plan ([`LedgerHold::records_after`](crate::LedgerHold::records_after)) names neither the
 //!   partition nor its files, the date is still before the hot window, and
 //!   the directory holds no seal debris and no file the plan did not see.
+//!   After a copy-ledger rebuild it also requires the rebuild's gate to be
+//!   the one the plan was made under (rule (g) of [`plan`]).
 //!   Only then does it append `removed` and fsync, rename the directory to
 //!   the hidden name `.removed-date=YYYY-MM-DD` beside it (same directory,
 //!   so the same filesystem and an atomic rename; recovery, `select` and
@@ -205,6 +207,10 @@ pub struct RemovalPlan {
     /// rebuild is in place (rule (g)); `None` without a gate or once a
     /// verification of every target covers it.
     pub waiting: Option<String>,
+    /// The rebuild's gate the plan was made under (`.mie/rebuilt`, rule
+    /// (g)): the remover drops the plan when the gate it reads under its
+    /// locks differs, since a rebuild installed a ledger after the plan.
+    pub gate: Option<u64>,
 }
 
 impl RemovalPlan {
@@ -280,6 +286,7 @@ pub fn plan(
         leftovers: scan.leftovers.clone(),
         conflicts: Vec::new(),
         waiting: None,
+        gate: rebuilt,
     };
     if targets.len() != k || k == 0 {
         return Ok(plan);
@@ -574,6 +581,43 @@ pub(crate) fn remove_locked(
             return report;
         }
     };
+    // Rule (g) under the locks: a rebuild that installed its ledger after
+    // the plan leaves the plan's prefix intact (the start copy is a prefix
+    // of hot's), so the tail check alone would carry out a plan made before
+    // the install, before any verification covered the rebuilt ledger
+    // (review of #209, finding 1). The gate is the rebuild's trace: the
+    // plan is dropped unless it was made under the gate read now. A plan
+    // made under a gate L already found a verification covering L, and a
+    // later rebuild of the same length cannot keep the plan's prefix,
+    // which then lies past L, so equality is enough.
+    match crate::rebuilt::read(hot) {
+        Ok(gate) if gate == plan.gate => {}
+        Ok(gate) => {
+            for candidate in plan.candidates.iter().chain(&plan.incomplete) {
+                if ours(&&candidate.partition) {
+                    report.skipped.push((
+                        candidate.partition.clone(),
+                        format!(
+                            "the copy ledger was rebuilt since the plan (its gate is now {}, \
+                             the plan read {}); the plan is dropped, and removal waits for a \
+                             verification covering the rebuilt ledger (ADR-062 D6 rule (g), D7 \
+                             step 6)",
+                            gate.map_or("none".to_owned(), |len| len.to_string()),
+                            plan.gate.map_or("none".to_owned(), |len| len.to_string())
+                        ),
+                    ));
+                }
+            }
+            return report;
+        }
+        Err(error) => {
+            report.error = Some(format!(
+                "the copy-ledger rebuild's gate cannot be read ({error}); nothing is removed \
+                 (ADR-062 D6 rule (g))"
+            ));
+            return report;
+        }
+    }
     let tail = match hold.records_after(plan.ledger_len, &plan.chain) {
         Ok(tail) => tail,
         Err(error) => {

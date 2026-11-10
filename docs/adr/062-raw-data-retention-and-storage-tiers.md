@@ -486,8 +486,14 @@ live in more than one root (approved as written at STOP 1).
   the rebuilt ledger qualifies. Why the gate is written before the
   ledger's rename: a read that sees the rebuilt ledger always finds its
   gate, and a gate without its ledger only delays removal. A plan made
-  before the install is dropped by the remover's re-check, which sees a
-  replaced ledger. With L = 1 000: prefix 999 waits, 1 000 and 1 001
+  before the install is dropped by the remover: under its locks it reads
+  the gate again and carries out a plan only when the plan was made under
+  that same gate, since the rebuilt ledger keeps the start copy's bytes,
+  so the plan's prefix and chain can still match (review of #209, finding
+  1). A plan made under a gate L already found a verification covering L,
+  and a later rebuild of the same length cannot keep that plan's prefix,
+  which lies past L. A gate that cannot be read or parsed removes nothing
+  and is reported. With L = 1 000: prefix 999 waits, 1 000 and 1 001
   plan, one of two targets verified still waits. Incomplete removals and
   leftovers are not affected: their records are already written.
 - **A partition that disappears while it is read** is never read as
@@ -980,7 +986,17 @@ live in more than one root (approved as written at STOP 1).
     mistyped command must not drop findings and `verify` records); an I/O
     error is refused. Archive paths on any root or in the start copy with
     no archive configuration are refused: without the import ledger
-    neither the step 4 cross-check nor step 5a can run.
+    neither the step 4 cross-check nor step 5a can run. A hot
+    import-ledger directory that does not exist is refused too, while an
+    archive part exists on any root or in the start copy or a copy target
+    holds import entries: an unmounted or misconfigured directory reads as
+    empty, the same trap the root markers exist for, and every archive
+    part only hot holds would become a permanent `unlisted` hold (review of
+    #209, finding 2). An archive configuration that names another existing
+    import ledger is not detected: the directory carries no binding to the
+    store (no marker or store id), and the configuration check compares
+    `raw_root` and `cold_roots` only. A complete binding needs such a marker,
+    a format change outside this step.
   - **B1 Read order**, nothing written: every copy target's ledger copy;
     hot's journal up to the length J read now (bytes after J, and a line
     cut at J, are not parsed); every import entry on hot and on the

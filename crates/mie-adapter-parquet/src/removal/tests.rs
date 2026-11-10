@@ -648,3 +648,84 @@ fn the_plan_waits_for_a_verify_covering_the_rebuilt_ledger() {
         assert_eq!(plan.waiting.is_some(), !plans, "{verifies:?} {gate:?}");
     }
 }
+
+/// Review of #209, finding 1: a plan made before a copy-ledger rebuild is
+/// dropped by the remover, under its locks, once the rebuild installed its
+/// gate, although the plan's prefix still matches the rebuilt ledger; a
+/// gate that cannot be parsed removes nothing and is an error; a plan made
+/// under the current gate, once a verification covers it, removes.
+#[test]
+fn a_plan_made_before_a_rebuild_is_dropped_by_the_remover() {
+    let fx = eligible("removal-stale-plan");
+    let targets = TieredFixture::target_ids();
+    // The pass plans (no gate yet) and hands the plan to the seal path.
+    let stale = plan_now(&fx, &targets, 2, &first_hot());
+    assert_eq!(stale.candidates.len(), 1);
+    // `mie store rebuild` runs before the next seal: start = a ledger copy
+    // equal to hot's prefix, plus one derived record, installed with its
+    // gate.
+    {
+        let hold = CopyLedger::at(&fx.hot).try_hold().unwrap();
+        let bytes = fs::read(copy_ledger::ledger_path(&fx.hot)).unwrap();
+        let mut builder =
+            copy_ledger::LedgerBuilder::from_prefix(Path::new("start"), &bytes).unwrap();
+        builder
+            .push(&copy_ledger::Record {
+                at_ms: D0 + 41 * DAY_MS,
+                kind: Kind::Verify {
+                    root: "cold-a".to_owned(),
+                    prefix_bytes: 0,
+                    findings: 0,
+                },
+            })
+            .unwrap();
+        hold.replace(&builder.finish(), None).unwrap();
+    }
+    let gate = crate::rebuilt::read(&fx.hot).unwrap();
+    assert!(gate.is_some());
+    // A fresh plan waits, as rule (g) says ...
+    let ledger = copy_ledger::read(&fx.hot).unwrap().unwrap();
+    let scan = scan_hot(&fx.hot, &first_hot()).unwrap();
+    let fresh = plan(&ledger, &scan, &targets, 2, &first_hot(), gate).unwrap();
+    assert!(
+        fresh.candidates.is_empty() && fresh.waiting.is_some(),
+        "{fresh:?}"
+    );
+    // ... and the seal path drops the stale plan.
+    let report = remove(&fx, &stale);
+    assert!(report.removed.is_empty(), "{report:?}");
+    assert_eq!(report.skipped.len(), 1, "{report:?}");
+    assert!(report.skipped[0].1.contains("rebuilt"), "{report:?}");
+    assert!(layout::resolve(&fx.hot, &partition()).exists());
+    assert_eq!(removed_records(&fx, &partition()), 0);
+
+    // A malformed gate: nothing is removed, and the pass reports it.
+    let gate_path = crate::rebuilt::gate_path(&fx.hot);
+    let good = fs::read(&gate_path).unwrap();
+    fs::write(&gate_path, b"mie-rebuilt 1\nprefix 01\n").unwrap();
+    let report = remove(&fx, &stale);
+    assert!(report.removed.is_empty(), "{report:?}");
+    assert!(
+        report.error.as_deref().is_some_and(|e| e.contains("gate")),
+        "{report:?}"
+    );
+    assert!(layout::resolve(&fx.hot, &partition()).exists());
+    fs::write(&gate_path, good).unwrap();
+
+    // Once a verification of both targets covers the rebuilt ledger, a plan
+    // made under that gate removes.
+    for root in ["cold-a", "cold-b"] {
+        fx.append(Kind::Verify {
+            root: root.to_owned(),
+            prefix_bytes: gate.unwrap(),
+            findings: 0,
+        });
+    }
+    fx.ledger_copies();
+    let ledger = copy_ledger::read(&fx.hot).unwrap().unwrap();
+    let scan = scan_hot(&fx.hot, &first_hot()).unwrap();
+    let covered = plan(&ledger, &scan, &targets, 2, &first_hot(), gate).unwrap();
+    assert_eq!(covered.waiting, None, "{covered:?}");
+    let report = remove(&fx, &covered);
+    assert_eq!(report.removed, vec![partition()], "{report:?}");
+}

@@ -1499,18 +1499,28 @@ mod tiered_start {
                 std::fs::remove_file(ledger).unwrap();
             });
         assert!(before.0, "{}", before.1);
-        let mut out = Vec::new();
-        let pass = mie_cli::store::rebuild(
-            &config,
-            Some(&dir.path().join("archive.toml")),
-            mie_cli::store::rebuild::Flags::default(),
-            &mie_cli::ingest::first_hot_date(T),
-            super::common::probe_for(&config).as_ref(),
-            &|| T + HOUR,
-            &mut out,
-        )
-        .unwrap();
-        let text = String::from_utf8(out).unwrap();
+        let rebuild = || {
+            let mut out = Vec::new();
+            let pass = mie_cli::store::rebuild(
+                &config,
+                Some(&dir.path().join("archive.toml")),
+                mie_cli::store::rebuild::Flags::default(),
+                &mie_cli::ingest::first_hot_date(T),
+                super::common::probe_for(&config).as_ref(),
+                &|| T + HOUR,
+                &mut out,
+            )
+            .unwrap();
+            (pass, String::from_utf8(out).unwrap())
+        };
+        // The fixture seals its archive rows without the importer, so no
+        // import ledger exists: with archive parts on hot that is a stop
+        // (review of #209, finding 2). An importer that ran creates it.
+        let (pass, text) = rebuild();
+        assert!(!pass && text.contains("nothing written"), "{text}");
+        assert!(text.contains("does not exist"), "{text}");
+        std::fs::create_dir_all(dir.path().join("ledger")).unwrap();
+        let (pass, text) = rebuild();
         assert!(
             text.contains("started empty") && text.contains("wrote "),
             "{text}"

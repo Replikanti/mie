@@ -34,8 +34,11 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   as divergent. The new ledger is installed by temp name and rename after
   the gate `.mie/rebuilt`: the hot removal then waits until a `mie store
   verify` of every copy target covers the rebuilt ledger, and the
-  `replication` journal line names why in `removal_waiting`. The importer
-  now refuses, dry runs included, while any hold is open.
+  `replication` journal line names why in `removal_waiting`; the remover
+  drops a plan made before the rebuild. A missing hot import-ledger
+  directory stops the rebuild while archive parts or target entries exist,
+  since it would read as empty. The importer now refuses, dry runs
+  included, while any hold is open.
 - **Storage tiers, step 6: `mie store verify` and `mie store repair` (#192,
   ADR-062 D11, proposed).** `mie store verify --config <ingest config>
   [--archive-config <path>] --period-hours <P>` checks every copy of a

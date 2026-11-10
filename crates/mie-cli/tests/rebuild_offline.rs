@@ -638,3 +638,38 @@ fn a_diverging_ledger_copy_is_decided_by_the_rebuild() {
     assert!(pass, "{out}");
     assert_pass(&replicate(&fixture, D0 + 7 * HOUR + 1));
 }
+
+/// Review of #209, finding 2: a hot import-ledger directory that is
+/// missing (an unmounted disk, a wrong `import_ledger`) would read as
+/// empty and turn every archive part only hot holds into a permanent
+/// `unlisted` hold. The rebuild stops with nothing written instead, and
+/// with the directory back it passes with no hold and the importer runs.
+#[test]
+fn a_missing_import_ledger_stops_the_rebuild() {
+    let (_dir, fixture) = adopted("rebuild-missing-import-ledger");
+    let day = day_index("2026-10-03");
+    let before = replica::list_sealed(&fixture.hot()).unwrap();
+    run_import(&fixture, &metrics_day(day, false)).unwrap();
+    let parts: Vec<String> = replica::list_sealed(&fixture.hot())
+        .unwrap()
+        .into_iter()
+        .filter(|path| !before.contains(path))
+        .filter(|path| !cold(&fixture, "cold-a").join(path).exists())
+        .collect();
+    assert!(!parts.is_empty());
+    fs::remove_file(hot_ledger(&fixture)).unwrap();
+    let ledger_dir = fixture.archive_config.paths.import_ledger.clone();
+    let away = ledger_dir.with_extension("unmounted");
+    fs::rename(&ledger_dir, &away).unwrap();
+    let (pass, out) = rebuild(&fixture, Flags::default(), REBUILT);
+    fs::rename(&away, &ledger_dir).unwrap();
+    assert!(!pass, "{out}");
+    assert_fail_line(&out, &[&ledger_dir.display().to_string(), "does not exist"]);
+    assert!(out.contains("nothing written"), "{out}");
+    assert!(!hot_ledger(&fixture).exists());
+
+    let (pass, out) = rebuild(&fixture, Flags::default(), REBUILT + 1);
+    assert!(pass, "{out}");
+    assert!(held(&fixture).is_empty());
+    run_import(&fixture, &metrics_day(day_index("2026-10-04"), true)).unwrap();
+}
