@@ -485,6 +485,176 @@ fn rebuilds_after_a_superseding_readmit_agree() {
     }
 }
 
+/// Review of #212, finding 1: a generation-0 `entry-conflict` hold whose
+/// E0 copies agree again (as `mie store repair` R8 leaves them) is
+/// re-admitted with S1 and E1, not by the clearing alone (RA5 (c)), so a
+/// full, a stale and an empty rebuild start all clear it (B7′ takes only
+/// an entry of generation ≥ 1 as evidence for `entry-conflict`).
+#[test]
+fn a_gen0_entry_conflict_readmit_survives_a_stale_rebuild() {
+    for start in ["full", "stale", "empty"] {
+        let (_dir, fixture) = adopted(&format!("resolve-gen0-{start}"));
+        conflict(&fixture);
+        let e0 = format!("{}.import", metrics_name());
+        let copy = target_file(&fixture, "cold-a", &e0); // what R8 does
+        fs::remove_file(&copy).unwrap();
+        fs::copy(ledger_file(&fixture, &e0), &copy).unwrap();
+        let (pass, out) = resolve(&fixture, Some(&metrics_file()), RESOLVED);
+        assert!(pass, "{out}");
+        let wrote: Vec<&str> = out.lines().filter(|l| l.starts_with("wrote ")).collect();
+        assert_eq!(
+            wrote,
+            vec![
+                format!("wrote metrics/{}.1.supersede.import", metrics_name()),
+                format!("wrote metrics/{}.1.import", metrics_name()),
+            ],
+            "case (d), not (c): {out}"
+        );
+        replicate(&fixture, RESOLVED + 1);
+        fs::remove_file(hot_ledger(&fixture)).unwrap();
+        match start {
+            "stale" => cut_after_last_hold(&fixture),
+            "empty" => damage_both_copies(&fixture),
+            _ => {}
+        }
+        let (_, out) = rebuild(&fixture, Flags::default(), RESOLVED + HOUR);
+        assert!(held(&fixture).is_empty(), "{start}: {out}");
+    }
+}
+
+/// The same for case (a): every copy of E0 gone while its parts are held
+/// `entry-conflict`, so the entry resolve writes is the only evidence a
+/// stale rebuild start can clear those holds on: S1 naming no entry, then
+/// E1.
+#[test]
+fn an_entry_conflict_readmit_of_a_missing_entry_survives_a_stale_rebuild() {
+    for start in ["full", "stale", "empty"] {
+        let (_dir, fixture) = adopted(&format!("resolve-gone-{start}"));
+        conflict(&fixture);
+        let e0 = format!("{}.import", metrics_name());
+        for path in [
+            ledger_file(&fixture, &e0),
+            target_file(&fixture, "cold-a", &e0),
+            target_file(&fixture, "cold-b", &e0),
+        ] {
+            fs::remove_file(path).unwrap();
+        }
+        let (pass, out) = resolve(&fixture, Some(&metrics_file()), RESOLVED);
+        assert!(pass, "{out}");
+        let s1 = format!("{}.1.supersede.import", metrics_name());
+        let record =
+            SupersedeRecord::parse(&fs::read_to_string(ledger_file(&fixture, &s1)).unwrap())
+                .unwrap();
+        assert!(record.entries.is_empty(), "{out}");
+        assert!(
+            ledger_file(&fixture, &format!("{}.1.import", metrics_name())).exists(),
+            "{out}"
+        );
+        replicate(&fixture, RESOLVED + 1);
+        fs::remove_file(hot_ledger(&fixture)).unwrap();
+        match start {
+            "stale" => cut_after_last_hold(&fixture),
+            "empty" => damage_both_copies(&fixture),
+            _ => {}
+        }
+        let (_, out) = rebuild(&fixture, Flags::default(), RESOLVED + HOUR);
+        assert!(held(&fixture).is_empty(), "{start}: {out}");
+    }
+}
+
+/// Rewrites the `sha256` line of the import-entry copy at `copy` to
+/// another published SHA-256: a second variant listing the same files.
+fn rewrite_published_sha(copy: &Path) {
+    let text = fs::read_to_string(copy).unwrap();
+    let sha = text
+        .lines()
+        .find_map(|line| line.strip_prefix("sha256 "))
+        .unwrap()
+        .to_owned();
+    let other = format!(
+        "{}{}",
+        &sha[..63],
+        if sha.ends_with('0') { '1' } else { '0' }
+    );
+    overwrite(copy, text.replace(&sha, &other).as_bytes());
+}
+
+/// Overwrites the read-only import-ledger copy at `path`.
+fn overwrite(path: &Path, bytes: &[u8]) {
+    let mut permissions = fs::metadata(path).unwrap().permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    permissions.set_readonly(false);
+    fs::set_permissions(path, permissions).unwrap();
+    fs::write(path, bytes).unwrap();
+}
+
+/// Review of #212, finding 2: after a superseding re-admit and its pass,
+/// cold-a's copy of the superseded E0 rots, which no verification checks
+/// and no repair touches; a later conflict on E1 is still re-admitted (S2,
+/// E2), the rotten copy named.
+#[test]
+fn a_rotten_superseded_copy_blocks_no_later_readmit() {
+    let (_dir, fixture) = adopted("resolve-rotten-superseded");
+    conflict(&fixture);
+    assert_pass(&resolve(&fixture, Some(&metrics_file()), RESOLVED));
+    replicate(&fixture, RESOLVED + 1);
+    let e0 = format!("{}.import", metrics_name());
+    let e1 = format!("{}.1.import", metrics_name());
+    overwrite(&target_file(&fixture, "cold-a", &e0), b"rotten\n");
+    rewrite_published_sha(&target_file(&fixture, "cold-b", &e1));
+    fs::remove_file(hot_ledger(&fixture)).unwrap();
+    let (pass, out) = rebuild(&fixture, Flags::default(), RESOLVED + HOUR);
+    assert!(!pass && held(&fixture).len() == 2, "{out}");
+
+    let (pass, out) = resolve(&fixture, Some(&metrics_file()), RESOLVED + 2 * HOUR);
+    assert!(pass && out.ends_with("PASS\n"), "{out}");
+    let wrote: Vec<&str> = out.lines().filter(|l| l.starts_with("wrote ")).collect();
+    assert_eq!(
+        wrote,
+        vec![
+            format!("wrote metrics/{}.2.supersede.import", metrics_name()),
+            format!("wrote metrics/{}.2.import", metrics_name()),
+        ],
+        "{out}"
+    );
+    assert!(
+        out.lines()
+            .any(|l| l.contains(&format!("metrics/{e0}")) && l.contains("superseded")),
+        "{out}"
+    );
+    assert!(held(&fixture).is_empty(), "{out}");
+}
+
+/// Review of #212, finding 2: a malformed name of F on a copy target only
+/// counts for nothing anywhere, so it is named and blocks nothing; on hot
+/// it still refuses.
+#[test]
+fn a_malformed_name_on_a_target_only_blocks_no_readmit() {
+    let (_dir, fixture) = adopted("resolve-malformed-target");
+    missing_entry(&fixture);
+    let bad = format!("{}.01.import", metrics_name());
+    let on_target = target_file(&fixture, "cold-a", &bad);
+    fs::create_dir_all(on_target.parent().unwrap()).unwrap();
+    fs::write(&on_target, b"anything\n").unwrap();
+    let on_hot = ledger_file(&fixture, &bad);
+    fs::write(&on_hot, b"anything\n").unwrap();
+    let before = files(&fixture.dir);
+    let (pass, out) = resolve(&fixture, Some(&metrics_file()), RESOLVED);
+    assert!(!pass, "{out}");
+    assert_fail_line(&out, &[&bad, "on hot", "malformed"]);
+    assert_eq!(files(&fixture.dir), before);
+
+    fs::remove_file(&on_hot).unwrap();
+    let (pass, out) = resolve(&fixture, Some(&metrics_file()), RESOLVED);
+    assert!(pass && out.ends_with("PASS\n"), "{out}");
+    assert!(
+        out.lines()
+            .any(|l| l.contains(&bad) && l.contains("cold-a") && l.contains("malformed")),
+        "{out}"
+    );
+    assert!(held(&fixture).is_empty(), "{out}");
+}
+
 /// Hot's import-ledger files, the held paths and the selections.
 type Outcome = (Vec<(String, Vec<u8>)>, BTreeSet<String>, Vec<String>);
 

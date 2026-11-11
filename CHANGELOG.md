@@ -25,8 +25,12 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   it writes the missing import entry, or a supersede record naming every
   variant of a conflicting entry and a superseding entry, then one
   `hold-cleared <path> readmit` record per part; bytes, paths and dataset
-  versions stay as they were and the importer runs again. A difference
-  names the first differing row and writes nothing; a `manifest-conflict`
+  versions stay as they were and the importer runs again. A part held as
+  `entry-conflict` always gets a superseding entry, so a rebuild from any
+  start clears it; a superseded entry copy that no longer reads and a
+  malformed name on a copy target only are named and block nothing. A
+  difference names the first differing row and writes nothing; a
+  `manifest-conflict`
   hold, a part without a manifest, a `PENDING` naming the file and a
   superseded entry that would leave a listed part orphaned are refused.
   It takes the archive source's writer lock without waiting (creating it

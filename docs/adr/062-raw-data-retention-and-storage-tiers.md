@@ -1077,7 +1077,8 @@ live in more than one root (approved as written at STOP 1).
     the path's archive file has a current entry listing it with the
     SHA-256 of its one manifest text, and the start reason is `unlisted`,
     or `entry-conflict` with that entry of generation ≥ 1 (written by a
-    resolve). Every other start hold stays held and is named: a
+    resolve, which re-admits an `entry-conflict` part only on such an
+    entry, RA5). Every other start hold stays held and is named: a
     `manifest-conflict`, or an `entry-conflict` whose generation-0 copies
     merely agree now. Why: step 5a promises the same holds from a full,
     a stale and an empty start, and a stale copy that ends between the
@@ -1874,12 +1875,33 @@ What breaks:
       every held part with its manifest's rows and SHA-256 and every other
       path it lists is ordinary: write nothing but the clearing; (d)
       otherwise write S_n naming every variant of the latest entry, then
-      E_n, n = 1 + the highest generation. A malformed or unparseable file
-      of F, a file on the targets only and differing record copies are
-      refused, naming `mie store verify` and `mie store repair`. No orphan
-      is left behind: a path a superseded variant lists that is not held
-      for F must be on no root and unrecorded, otherwise the run is
-      refused; an unheld path no root holds is named.
+      E_n, n = 1 + the highest generation. A part held as `entry-conflict`
+      takes (d) instead of (a), with S_1 naming no entry, and instead of
+      (c) when the latest entry is of generation 0. Why (review of #212,
+      finding 1): B7′ clears an `entry-conflict` start hold only on an
+      entry of generation ≥ 1, because generation-0 copies that merely
+      agree now (after `mie store repair` R8 replaced one) are no evidence;
+      a re-admit that wrote nothing, or wrote E_0, would leave a stale
+      start holding the parts while a full and an empty start do not.
+      Rejected, letting B7′ accept generation 0 for `entry-conflict`: that
+      is the absence-shaped evidence B7′ refuses on purpose. Read and
+      bound (G1–G3) must be every supersede record and every copy of the
+      entry the case decides on: the latest entry in (c) and (d), and in
+      (b) the copies of the generation below m whose bytes S_m names.
+      Every other entry copy is superseded by name (G4), decides neither
+      the case, the record, the entry written nor the parts cleared, and
+      is reached by no verification and no repair (C4, C5); one that does
+      not read is named and blocks nothing, as is a malformed name on a
+      copy target only, which no reader counts. Why (review of #212,
+      finding 2): refusing on them named `mie store verify` and `mie store
+      repair` as the remedy, and neither touches them, so the hold could
+      only be cleared by hand. A malformed name on hot (the importer and
+      the replication fail F closed on it), a file on the targets only,
+      an unreadable copy of a deciding entry and differing record copies
+      are still refused, naming `mie store verify` and `mie store repair`.
+      No orphan is left behind: a path a superseded variant lists that is
+      not held for F must be on no root and unrecorded, otherwise the run
+      is refused; an unheld path no root holds is named.
     - **RA6 The row check** downloads F with the importer's fetch policy
       (the zip is removed in every outcome), validates it with the
       importer's own per-row function, and compares positionally per UTC

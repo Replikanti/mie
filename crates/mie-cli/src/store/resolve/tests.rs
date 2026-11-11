@@ -71,6 +71,7 @@ fn inputs(files: Vec<FileOf>, parts: &[&str]) -> PlanInputs {
         files,
         malformed: Vec::new(),
         parts: parts.iter().map(|p| manifest(p)).collect(),
+        entry_conflict: false,
         verdicts: BTreeMap::new(),
         located: BTreeMap::new(),
     }
@@ -207,8 +208,11 @@ fn plan_table() {
     );
     // A malformed name of F.
     let mut malformed = inputs(vec![file("hot", &e0, &v1)], &both);
-    malformed.malformed = vec![format!("{F}.01.import on hot")];
-    refused(&malformed, &[&format!("{F}.01.import"), "malformed"]);
+    malformed.malformed = vec![("hot".to_owned(), format!("{F}.01.import"))];
+    refused(
+        &malformed,
+        &[&format!("{F}.01.import"), "on hot", "malformed"],
+    );
     // The generation never wraps.
     let top = format!("{F}.{}.import", u32::MAX);
     let wrong = String::from_utf8(listing("top", &[a.as_str()]))
@@ -254,6 +258,164 @@ fn plan_table() {
             .any(|l| l.contains(&c) && l.contains("no root holds it")),
         "{:?}",
         planned.lines
+    );
+}
+
+/// RA5, review of #212 finding 1: an `entry-conflict` part never ends on
+/// an entry of generation 0, which B7′ does not take as evidence.
+#[test]
+fn an_entry_conflict_part_gets_an_entry_of_generation_1_or_more() {
+    let (a, b) = (
+        part("aggTrades", "2026-10-01", 0),
+        part("aggTrades", "2026-10-01", 1),
+    );
+    let both = [a.as_str(), b.as_str()];
+    let e0 = format!("{F}.import");
+    let (e1, s1) = (format!("{F}.1.import"), format!("{F}.1.supersede.import"));
+    let v0 = listing("v0", &both);
+    let conflicted = |files: Vec<FileOf>| {
+        let mut inputs = inputs(files, &both);
+        inputs.entry_conflict = true;
+        inputs
+    };
+
+    // E0 in one variant listing the parts: (c) for `unlisted`, (d) for
+    // `entry-conflict`, S1 naming that one variant.
+    let agree = vec![file("hot", &e0, &v0), file("cold-a", &e0, &v0)];
+    assert_eq!(
+        plan(&inputs(agree.clone(), &both)).unwrap().case,
+        Case::Listed
+    );
+    let planned = plan(&conflicted(agree)).unwrap();
+    assert_eq!((planned.case, planned.entry), (Case::Supersede, Some(1)));
+    let (n, record) = planned.record.unwrap();
+    assert_eq!(n, 1);
+    assert_eq!(
+        record.entries,
+        vec![SupersededEntry::of(format!("aggTrades/{e0}"), &v0)]
+    );
+    assert_eq!(planned.check_set, vec![a.clone(), b.clone()]);
+
+    // No file of F: (a) for `unlisted`, S1 naming no entry and E1 for
+    // `entry-conflict`.
+    assert_eq!(
+        plan(&inputs(Vec::new(), &both)).unwrap().case,
+        Case::Missing
+    );
+    let planned = plan(&conflicted(Vec::new())).unwrap();
+    assert_eq!((planned.case, planned.entry), (Case::Supersede, Some(1)));
+    let (n, record) = planned.record.unwrap();
+    assert_eq!((n, record.entries), (1, Vec::new()));
+
+    // A latest entry of generation ≥ 1 listing the parts: (c) either way.
+    let latest = vec![
+        file("hot", &e0, &listing("v1", &both)),
+        file("hot", &s1, &record_naming(&[])),
+        file("hot", &e1, &v0),
+    ];
+    assert_eq!(plan(&conflicted(latest)).unwrap().case, Case::Listed);
+    // Interrupted after S1 of an (a): (b) writes E1.
+    let planned = plan(&conflicted(vec![file("hot", &s1, &record_naming(&[]))])).unwrap();
+    assert_eq!((planned.case, planned.entry), (Case::Interrupted, Some(1)));
+}
+
+/// A supersede record of F naming `entries` as (entry name, bytes).
+fn record_naming(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut entries: Vec<SupersededEntry> = entries
+        .iter()
+        .map(|(name, bytes)| SupersededEntry::of(format!("aggTrades/{name}"), bytes))
+        .collect();
+    entries.sort();
+    SupersedeRecord {
+        archive: ARCHIVE.to_owned(),
+        stream: key(),
+        period: Period::Day(parse_day("2026-10-01").unwrap()),
+        entries,
+        quarantine: None,
+    }
+    .render()
+    .into_bytes()
+}
+
+/// RA5, review of #212 finding 2: only the entry copies the case decides
+/// on must read; any other unreadable copy, and a malformed name on a
+/// copy target only, is named and blocks nothing.
+#[test]
+fn only_the_deciding_entry_copies_must_read() {
+    let (a, b) = (
+        part("aggTrades", "2026-10-01", 0),
+        part("aggTrades", "2026-10-01", 1),
+    );
+    let both = [a.as_str(), b.as_str()];
+    let e0 = format!("{F}.import");
+    let (e1, s1) = (format!("{F}.1.import"), format!("{F}.1.supersede.import"));
+    let (v0, v1) = (listing("v0", &both), listing("v1", &both));
+    let rotten: &[u8] = b"damaged\n";
+    let named = |planned: &Planned, needles: &[&str]| {
+        assert!(
+            planned
+                .lines
+                .iter()
+                .any(|l| needles.iter().all(|n| l.contains(n))),
+            "{needles:?} in {:?}",
+            planned.lines
+        );
+    };
+
+    // (c) and (d): a superseded E0 copy that does not read is named.
+    let mut files = vec![
+        file("hot", &e0, &v0),
+        file("cold-a", &e0, rotten),
+        file("hot", &s1, &record_naming(&[(&e0, &v0)])),
+        file("cold-a", &s1, &record_naming(&[(&e0, &v0)])),
+        file("hot", &e1, &v1),
+        file("cold-a", &e1, &v1),
+    ];
+    let planned = plan(&inputs(files.clone(), &both)).unwrap();
+    assert_eq!(planned.case, Case::Listed);
+    named(&planned, &[&e0, "cold-a", "superseded", "decides nothing"]);
+    let planned = plan(&inputs(files.clone(), &[a.as_str()])).unwrap();
+    assert_eq!(planned.case, Case::Listed);
+    files.push(file("cold-b", &e1, &listing("v2", &both)));
+    let planned = plan(&inputs(files.clone(), &both)).unwrap();
+    assert_eq!((planned.case, planned.entry), (Case::Supersede, Some(2)));
+    named(&planned, &[&e0, "cold-a", "superseded"]);
+    // The latest entry's copy that does not read still refuses.
+    files.pop();
+    files.push(file("cold-b", &e1, rotten));
+    refused(
+        &inputs(files, &both),
+        &[&e1, "cold-b", "cannot be read", "mie store repair"],
+    );
+
+    // (b): below m, a copy of bytes S1 names must read; one S1 never saw
+    // is named.
+    let interrupted = |record: Vec<u8>| {
+        inputs(
+            vec![
+                file("hot", &e0, &v0),
+                file("cold-a", &e0, rotten),
+                file("hot", &s1, &record),
+            ],
+            &both,
+        )
+    };
+    let planned = plan(&interrupted(record_naming(&[(&e0, &v0)]))).unwrap();
+    assert_eq!((planned.case, planned.entry), (Case::Interrupted, Some(1)));
+    named(&planned, &[&e0, "cold-a", "superseded"]);
+    refused(
+        &interrupted(record_naming(&[(&e0, &v0), (&e0, rotten)])),
+        &[&e0, "cold-a", "cannot be read"],
+    );
+
+    // A malformed name on a copy target only is named; on hot it refuses
+    // (plan_table).
+    let mut malformed = inputs(vec![file("hot", &e0, &v0)], &both);
+    malformed.malformed = vec![("cold-a".to_owned(), format!("{F}.01.import"))];
+    let planned = plan(&malformed).unwrap();
+    named(
+        &planned,
+        &[&format!("{F}.01.import"), "cold-a", "malformed"],
     );
 }
 

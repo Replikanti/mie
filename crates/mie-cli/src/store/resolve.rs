@@ -50,8 +50,20 @@
 //!   but the clearing; (d) otherwise supersede: a record of generation n
 //!   (1 + the highest generation; never wrapping past [`u32::MAX`]) naming
 //!   every variant of the latest entry, then the entry of generation n.
-//!   No orphan is left behind: a path a superseded variant lists that is
-//!   not held for F must be on no root and unrecorded.
+//!   A part of parts(F) held as `entry-conflict` takes (d) instead of (a)
+//!   and instead of (c) at generation 0 (a record naming no entry when F
+//!   has none): the rebuild clears such a hold only on an entry of
+//!   generation ≥ 1 (B7′), so a stale start agrees with a full and an
+//!   empty one (review of #212, finding 1). No orphan is left behind: a
+//!   path a superseded variant lists that is not held for F must be on no
+//!   root and unrecorded. Read and bound as G1–G3 must be every supersede
+//!   record and every copy of the entry the case decides on: the latest
+//!   entry in (c) and (d), and in (b) the copies below m whose bytes the
+//!   record names. Any other entry copy is superseded, decides nothing,
+//!   and no verification or repair reaches it (C4, C5); one that does not
+//!   read is named, as is a malformed name on a copy target only, which no
+//!   reader counts (review of #212, finding 2). A malformed name on hot,
+//!   a name on the targets only and differing record copies are refused.
 //! - **RA6 Row check** ([`readmit::check`]).
 //! - **RA7 Writes**, in this order: the record, the entry, then one
 //!   `hold-cleared <path> readmit` per part with one `at_ms`. The fold takes
@@ -275,11 +287,13 @@ pub struct PlanInputs {
     pub period: Period,
     /// F's files on hot and on every copy target.
     pub files: Vec<FileOf>,
-    /// Malformed names in those directories that belong to F, with their
-    /// root.
-    pub malformed: Vec<String>,
+    /// Malformed names in those directories that belong to F, as (root,
+    /// name).
+    pub malformed: Vec<Malformed>,
     /// parts(F), in path order.
     pub parts: Vec<SealedFile>,
+    /// Whether a part of parts(F) is held as `entry-conflict`.
+    pub entry_conflict: bool,
     /// The copy ledger's verdict of every recorded path.
     pub verdicts: BTreeMap<String, PathVerdict>,
     /// Where each path an entry of F lists is held: hot's or a cold root's
@@ -339,9 +353,19 @@ fn variants<'a>(files: &[&'a FileOf]) -> Vec<(&'a [u8], Vec<&'a str>)> {
 /// The refusal; nothing may be written.
 pub fn plan(inputs: &PlanInputs) -> Result<Planned, String> {
     let repair = "run `mie store verify`, then `mie store repair` (or the hot restore, #195)";
-    if let Some(name) = inputs.malformed.first() {
-        return Err(format!(
-            "{name} is a malformed import-ledger name of this archive file: {repair}"
+    // A malformed name on hot fails the importer and the replication of F
+    // closed; on a copy target only it counts for nothing anywhere.
+    let mut notes = Vec::new();
+    for (root, name) in &inputs.malformed {
+        if root == HOT_ID {
+            return Err(format!(
+                "{name} on {root} is a malformed import-ledger name of this archive file: {repair}"
+            ));
+        }
+        notes.push(format!(
+            "{}/{name} on {root}: a malformed import-ledger name on a copy target only; no \
+             reader counts it, so it decides nothing here (ADR-062 D11)",
+            inputs.segment
         ));
     }
     // By name: its copies.
@@ -351,6 +375,9 @@ pub fn plan(inputs: &PlanInputs) -> Result<Planned, String> {
     }
     let mut parsed: BTreeMap<&LedgerName, Vec<Variant<'_>>> = BTreeMap::new();
     let mut records: BTreeMap<u32, SupersedeRecord> = BTreeMap::new();
+    // Entry variants that cannot be read or bound: (generation, bytes,
+    // the refusal or note naming it).
+    let mut unreadable: Vec<(u32, &[u8], String)> = Vec::new();
     for (name, copies) in &by_name {
         let label = format!("{}/{}", inputs.segment, name.render());
         if !copies.iter().any(|copy| copy.root == HOT_ID) {
@@ -369,16 +396,21 @@ pub fn plan(inputs: &PlanInputs) -> Result<Planned, String> {
                 "the copies of supersede record {label} differ: {repair}"
             ));
         }
-        let pairs: Vec<(LedgerName, Vec<u8>)> = found
-            .iter()
-            .map(|(bytes, _)| ((*name).clone(), bytes.to_vec()))
-            .collect();
-        for pair in &pairs {
-            mie_adapter_binance::archive::ledger::classify(
+        for (bytes, roots) in &found {
+            let pair = ((*name).clone(), bytes.to_vec());
+            if let Err(e) = mie_adapter_binance::archive::ledger::classify(
                 &inputs.segment,
-                std::slice::from_ref(pair),
-            )
-            .map_err(|e| format!("{label}: it cannot be read as such ({e}): {repair}"))?;
+                std::slice::from_ref(&pair),
+            ) {
+                let why = format!(
+                    "{label} on {}: it cannot be read as such ({e})",
+                    roots.join(", ")
+                );
+                match name.kind {
+                    LedgerKind::Supersede => return Err(format!("{why}: {repair}")),
+                    LedgerKind::Entry => unreadable.push((name.generation, bytes, why)),
+                }
+            }
         }
         match name.kind {
             LedgerKind::Supersede => {
@@ -450,14 +482,30 @@ pub fn plan(inputs: &PlanInputs) -> Result<Planned, String> {
         Ok(lines)
     };
 
+    // The entry copies the case decides on must read; any other is
+    // superseded and only named.
+    let decided = |decides: &dyn Fn(u32, &[u8]) -> bool| {
+        let mut lines = notes.clone();
+        for (generation, bytes, why) in &unreadable {
+            if decides(*generation, bytes) {
+                return Err(format!("{why}: {repair}"));
+            }
+            lines.push(format!(
+                "{why}: a superseded entry copy, which decides nothing here and which no \
+                 verification or repair reaches (ADR-062 D11)"
+            ));
+        }
+        Ok(lines)
+    };
+
     // (a)
-    if by_name.is_empty() {
+    if by_name.is_empty() && !inputs.entry_conflict {
         return Ok(Planned {
             case: Case::Missing,
             record: None,
             entry: Some(0),
             check_set: parts_set,
-            lines: Vec::new(),
+            lines: notes,
         });
     }
     // (b)
@@ -476,10 +524,22 @@ pub fn plan(inputs: &PlanInputs) -> Result<Planned, String> {
         let below = parsed
             .iter()
             .filter(|(name, _)| name.generation < m)
-            .max_by_key(|(name, _)| name.generation)
-            .map(|(_, list)| list.as_slice())
-            .unwrap_or_default();
-        let lines = no_orphan(below)?;
+            .max_by_key(|(name, _)| name.generation);
+        // The record names the bytes it supersedes; a copy of other bytes
+        // is one it never saw, superseded by name all the same (G4).
+        let below_generation = below.map(|(name, _)| name.generation);
+        let below_label = below.map(|(name, _)| format!("{}/{}", inputs.segment, name.render()));
+        let named = |bytes: &[u8]| {
+            below_label.as_ref().is_some_and(|label| {
+                records[&m]
+                    .entries
+                    .contains(&SupersededEntry::of(label.clone(), bytes))
+            })
+        };
+        let mut lines =
+            decided(&|generation, bytes| Some(generation) == below_generation && named(bytes))?;
+        let below = below.map(|(_, list)| list.as_slice()).unwrap_or_default();
+        lines.extend(no_orphan(below)?);
         return Ok(Planned {
             case: Case::Interrupted,
             record: None,
@@ -488,10 +548,19 @@ pub fn plan(inputs: &PlanInputs) -> Result<Planned, String> {
             lines,
         });
     }
-    let g = highest_entry.ok_or_else(|| "no entry and no supersede record".to_owned())?;
-    let (latest_name, latest) = variants_of(g).ok_or_else(|| "no latest entry".to_owned())?;
-    // (c)
-    if let [(_, _, Some(ledger))] = latest.as_slice() {
+    // The latest entry: none only in (a) with an `entry-conflict` part.
+    let latest = match highest_entry {
+        Some(g) => Some(variants_of(g).ok_or_else(|| "no latest entry".to_owned())?),
+        None if by_name.is_empty() => None,
+        None => return Err("no entry and no supersede record".to_owned()),
+    };
+    let mut lines = decided(&|generation, _| Some(generation) == highest_entry)?;
+    // (c), never at generation 0 for an `entry-conflict` part: B7′ clears
+    // such a hold only on an entry of generation ≥ 1.
+    if let Some((_, list)) = latest
+        && let [(_, _, Some(ledger))] = list.as_slice()
+        && !(inputs.entry_conflict && highest_entry == Some(0))
+    {
         let by_path: BTreeMap<&str, (u64, &str)> = ledger
             .files
             .iter()
@@ -517,7 +586,7 @@ pub fn plan(inputs: &PlanInputs) -> Result<Planned, String> {
                     .iter()
                     .map(|f| f.relative_path.clone())
                     .collect(),
-                lines: Vec::new(),
+                lines,
             });
         }
     }
@@ -530,16 +599,19 @@ pub fn plan(inputs: &PlanInputs) -> Result<Planned, String> {
             u32::MAX
         )
     })?;
-    let lines = no_orphan(latest)?;
-    let mut entries: Vec<SupersededEntry> = latest
-        .iter()
-        .map(|(bytes, _, _)| {
-            SupersededEntry::of(
-                format!("{}/{}", inputs.segment, latest_name.render()),
-                bytes,
-            )
-        })
-        .collect();
+    let mut entries: Vec<SupersededEntry> = Vec::new();
+    if let Some((latest_name, latest)) = latest {
+        lines.extend(no_orphan(latest)?);
+        entries = latest
+            .iter()
+            .map(|(bytes, _, _)| {
+                SupersededEntry::of(
+                    format!("{}/{}", inputs.segment, latest_name.render()),
+                    bytes,
+                )
+            })
+            .collect();
+    }
     entries.sort();
     entries.dedup();
     Ok(Planned {
@@ -601,13 +673,16 @@ struct Target {
     id: String,
 }
 
+/// A malformed import-ledger name of F: (root, name).
+pub type Malformed = (String, String);
+
 /// Lists F's import-ledger files in `dir` of `root`: its parsed names with
 /// their bytes, and the malformed names that belong to F.
 fn files_in(
     root: &str,
     dir: &Path,
     archive_file: &str,
-) -> Result<(Vec<FileOf>, Vec<String>), Stop> {
+) -> Result<(Vec<FileOf>, Vec<Malformed>), Stop> {
     let io = |error: std::io::Error| {
         Stop(format!(
             "the import ledger {} on {root} cannot be read ({error}); nothing is written",
@@ -640,7 +715,7 @@ fn files_in(
             Ok(_) => {}
             Err(_) => {
                 if name.starts_with(&format!("{archive_file}.")) {
-                    malformed.push(format!("{name} on {root}"));
+                    malformed.push((root.to_owned(), name));
                 }
             }
         }
@@ -789,6 +864,10 @@ fn resolve(
         }
     };
     let parts = attribute(&symbol, file, &holds, pending.as_deref()).map_err(Stop)?;
+    let entry_conflict = holds.iter().any(|held| {
+        held.reason == HoldReason::EntryConflict
+            && parts.iter().any(|part| part.relative_path == held.path)
+    });
     let segment = stream.raw_name().to_owned();
     let file_name = stream.file_name(&symbol, period);
     let mut files = Vec::new();
@@ -872,6 +951,7 @@ fn resolve(
         files,
         malformed,
         parts: parts.clone(),
+        entry_conflict,
         verdicts,
         located,
     })
