@@ -4,6 +4,7 @@
 - Measured: 2026-10-29 (#27 M3, see *Acceptance*); accepted, every D9
   criterion met on the #12 year and the R0 live store
 - Date: 2026-10-28
+- Amended: 2026-11-11 (#213)
 
 ## Context
 
@@ -465,7 +466,13 @@ race's touch, c for the race's censor:
 
   The warm rows are what `rust-cache` usually restores (dependencies,
   never the workspace crates); the cold rows are what a lockfile change, a
-  new toolchain or an evicted cache costs.
+  new toolchain or an evicted cache costs. Since #213
+  (`[profile.dev.build-override] debug = false`) the clippy and the test
+  build share one build-script hash, so the `check` job compiles DuckDB
+  once: on the CI runner with the dependency cache restored and DuckDB
+  cold, clippy 553 s + test 376 s (15.9 min for the whole job), against
+  clippy 711 s + test 986 s in the matching row above; the release job
+  still compiles it twice.
 - **Timeouts.** A fully cold `check` job was not observed on the runner;
   the laptop measurement bounds it. On the same work the runner took 0.50
   of the laptop's time (the cold release job) and 0.68 (the warm `check`
