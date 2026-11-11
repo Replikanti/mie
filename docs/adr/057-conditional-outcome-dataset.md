@@ -466,13 +466,7 @@ race's touch, c for the race's censor:
 
   The warm rows are what `rust-cache` usually restores (dependencies,
   never the workspace crates); the cold rows are what a lockfile change, a
-  new toolchain or an evicted cache costs. Since #213
-  (`[profile.dev.build-override] debug = false`) the clippy and the test
-  build share one build-script hash, so the `check` job compiles DuckDB
-  once: on the CI runner with the dependency cache restored and DuckDB
-  cold, clippy 553 s + test 376 s (15.9 min for the whole job), against
-  clippy 711 s + test 986 s in the matching row above; the release job
-  still compiles it twice.
+  new toolchain or an evicted cache costs.
 - **Timeouts.** A fully cold `check` job was not observed on the runner;
   the laptop measurement bounds it. On the same work the runner took 0.50
   of the laptop's time (the cold release job) and 0.68 (the warm `check`
@@ -675,3 +669,33 @@ these builds and the `measure_outcome_views` run on the first year build.
   count and the row counts and digests per view: no upper/lower share,
   quantile or per-context outcome. Outcome reading stays with #28 and the
   calibration slice of `docs/direction.md`.
+
+## Justification addendum (2026-11-11)
+
+Added for #213. It records when the build-cost facts of D8 changed and
+why the `check` timeout still holds. It changes no value, criterion or
+decision. Run numbers are GitHub Actions run ids of this repository.
+
+- **History.** When D8 was measured, a cold cache compiled DuckDB twice
+  per `check` job. Cargo built the `libduckdb-sys` build script with
+  different debuginfo flags in the check build (clippy used
+  `-C strip=debuginfo`) and in the test build (no strip), so the script
+  had two hashes and two `OUT_DIR`s, and each ran the C++ compile.
+  Since #213 the workspace sets
+  `[profile.dev.build-override] debug = false`. Both builds now resolve
+  to one build-script hash and one `OUT_DIR`, and the `check` job
+  compiles DuckDB once. The release job still compiles it twice, once
+  for the tests and once optimized, as D8 states.
+- **Measured.** With main's dependency cache restored and DuckDB cold,
+  the `check` job of run 43084255755 took 952 s (15.9 min), clippy 553 s
+  and test 376 s. The matching row of the D8 table, with two compiles,
+  has clippy 711 s and test 986 s (28.7 min). The test build alone went
+  from 13 min 41 s (run 42301587883 on main, DuckDB also cold) to 2 min
+  22 s. The run restored main's cache with a full key match, because the
+  `rust-cache` key did not change with the `[profile]` edit. That cache
+  held DuckDB only under the old build-script hashes, so DuckDB was cold
+  and every other dependency warm.
+- **Why the timeouts hold.** The `check` timeout of 50 min derives from
+  the laptop's fully cold 45.7 min, measured with two DuckDB compiles.
+  One compile less only shortens the job, so the bound holds with more
+  room than before. The release `build` timeout of 65 min is unaffected.
