@@ -6,17 +6,23 @@
 
 use super::{D0, HOUR, MapProbe, agg};
 use mie_adapter_binance::archive::catalog::{DAY_MS, Period};
+use mie_adapter_binance::archive::ledger::{LedgerDir, Pending};
 use mie_adapter_binance::archive::{ARCHIVE_SOURCE, ArchiveStream};
 use mie_adapter_binance::transport::{Clock, HttpDownload, HttpGet};
+use mie_adapter_parquet::copy_ledger;
+use mie_adapter_parquet::replica;
+use mie_adapter_parquet::verification::CopyState;
 use mie_adapter_parquet::{ParquetRawStore, RawWriter, RotationPolicy, TierContext};
 use mie_cli::archive::{self, ArchiveTransports, ImportRequest};
 use mie_cli::config::{ArchiveConfig, ColdRoot, IngestConfig};
 use mie_cli::store::{self, AdoptRequest, DeviceProbe};
 use mie_domain::time::EventTime;
 use mie_ports::outbound::ReplayWindow;
+use mie_ports::raw::RawRecordSource;
 use mie_ports::raw::{RawSelection, RawStreamKey};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -462,4 +468,106 @@ pub fn reports(dir: &Path, ingest: &Path, archive: &Path) -> String {
 #[track_caller]
 pub fn assert_pass((pass, out): &(bool, String)) {
     assert!(*pass && out.ends_with("PASS\n"), "{out}");
+}
+
+// ------------------------------------------- shared by rebuild and resolve
+
+pub fn cold(fixture: &Fixture, name: &str) -> PathBuf {
+    fixture.dir.join(name)
+}
+
+/// Days since 1970-01-01 of a `YYYY-MM-DD` date.
+pub fn day_index(date: &str) -> i64 {
+    mie_adapter_binance::archive::catalog::parse_day(date).unwrap()
+}
+
+/// Every selection's result (dataset version and files, or the error
+/// text), in [`selections`] order.
+pub fn selected(fixture: &Fixture) -> Vec<String> {
+    let store = fixture.tiered();
+    selections()
+        .iter()
+        .map(|selection| match store.select(selection) {
+            Ok(dataset) => format!("{dataset:?}"),
+            Err(error) => format!("error: {error}"),
+        })
+        .collect()
+}
+
+/// The held paths of hot's ledger.
+pub fn held(fixture: &Fixture) -> BTreeSet<String> {
+    let ledger = copy_ledger::read(&fixture.hot()).unwrap().unwrap();
+    CopyState::fold(&ledger)
+        .unwrap()
+        .held()
+        .into_iter()
+        .map(|(path, _)| path)
+        .collect()
+}
+
+/// The import request of one `metrics` day.
+pub fn metrics_day(day: i64, dry_run: bool) -> ImportRequest {
+    ImportRequest {
+        from_day: day,
+        to_day: day,
+        streams: Some(vec![ArchiveStream::Metrics]),
+        dry_run,
+    }
+}
+
+pub fn run_import(fixture: &Fixture, request: &ImportRequest) -> Result<String, String> {
+    let mut out = Vec::new();
+    archive::import(
+        &fixture.archive_config,
+        request,
+        &transports(&fixture.archive),
+        &AtomicBool::new(false),
+        &mut out,
+    )
+    .map(|_| String::from_utf8(out.clone()).unwrap())
+}
+
+/// The `metrics` file of 2026-10-03 imported into hot, then its entry
+/// removed: its parts are the orphans an import that crashed between its
+/// seal and its entry leaves. With `pending`, its `PENDING` is written too.
+pub fn interrupted_import(fixture: &Fixture, pending: bool) -> (i64, Vec<String>) {
+    let (day, parts, _) = interrupted_import_saving(fixture, pending);
+    (day, parts)
+}
+
+/// [`interrupted_import`], also returning the removed entry's bytes.
+pub fn interrupted_import_saving(fixture: &Fixture, pending: bool) -> (i64, Vec<String>, Vec<u8>) {
+    let day = day_index("2026-10-03");
+    let before = replica::list_sealed(&fixture.hot()).unwrap();
+    run_import(fixture, &metrics_day(day, false)).unwrap();
+    let parts: Vec<String> = replica::list_sealed(&fixture.hot())
+        .unwrap()
+        .into_iter()
+        .filter(|path| !before.contains(path))
+        // The recall brought 2026-10-03's earlier parts back to hot.
+        .filter(|path| !cold(fixture, "cold-a").join(path).exists())
+        .collect();
+    assert_eq!(parts.len(), 2, "{parts:?}");
+    let ledgers = LedgerDir::new(&fixture.archive_config.paths.import_ledger);
+    let name = ArchiveStream::Metrics.file_name(SYMBOL, Period::Day(day));
+    let entry = ledgers.ledger_path(ArchiveStream::Metrics, &name);
+    let bytes = fs::read(&entry).unwrap();
+    fs::remove_file(&entry).unwrap();
+    if pending {
+        let path = ArchiveStream::Metrics.archive_path(SYMBOL, Period::Day(day));
+        let (_, body) = fixture
+            .archive
+            .get(&format!("{BASE}/{path}.CHECKSUM"))
+            .unwrap();
+        let sha = String::from_utf8(body).unwrap()[..64].to_owned();
+        ledgers
+            .set_pending(&Pending {
+                archive: path,
+                sha256: sha,
+                stream: RawStreamKey::new(ARCHIVE_SOURCE, SYMBOL, "metrics").unwrap(),
+                period: Period::Day(day),
+            })
+            .unwrap();
+    }
+    (day, parts, bytes)
 }

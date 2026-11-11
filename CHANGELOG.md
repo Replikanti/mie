@@ -12,6 +12,33 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
 
 ### Added
 
+- **Storage tiers, step 8a: `mie store resolve` (#210, ADR-062 D11,
+  proposed).** `mie store resolve --config <ingest config>
+  [--archive-config <path>] [--file <archive path>]` resolves held
+  archive parts by re-admitting them. Without `--file` it prints the
+  archive file each open hold proposes, by the catalog's period rules
+  (the `metrics` 23:55 row belongs to the previous day's file,
+  `fundingRate` files are monthly), and writes nothing. With `--file` it
+  downloads that file once and compares every row, positionally per UTC
+  day, with the held parts that propose it, through the importer's own
+  row validation and reading each part through the tiered store. Equal:
+  it writes the missing import entry, or a supersede record naming every
+  variant of a conflicting entry and a superseding entry, then one
+  `hold-cleared <path> readmit` record per part; bytes, paths and dataset
+  versions stay as they were and the importer runs again. A part held as
+  `entry-conflict` always gets a superseding entry, so a rebuild from any
+  start clears it; a superseded entry copy on a copy target that no
+  longer reads and a malformed name on a copy target only are named and
+  block nothing (on hot both are still refused). A
+  difference names the first differing row and writes nothing; a
+  `manifest-conflict`
+  hold, a part without a manifest, a `PENDING` naming the file and a
+  superseded entry that would leave a listed part orphaned are refused.
+  It takes the archive source's writer lock without waiting (creating it
+  when absent), so it excludes the importer, the rebuild and a second
+  resolve; a re-run completes an interrupted one. The replace path is
+  #211.
+
 - **Storage tiers, step 7: `mie store rebuild` (#193, ADR-062 D7,
   proposed).** `mie store rebuild --config <ingest config>
   [--archive-config <path>] [--record-lost] [--record-unlisted]
@@ -827,6 +854,29 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   (ADR-040 D4).
 
 ### Changed
+
+- **Import-ledger generations and current entries (#210, ADR-062 D11,
+  proposed; ADR-034 D4 superseded at one point).** An import entry is
+  still never edited, but a later one can supersede it: next to
+  `F.import`, the import ledger holds `F.<n>.import` and
+  `F.<n>.supersede.import` (strict names, `n` from 1 to 4 294 967 295,
+  every other `.import` name an error). The current entry of an archive
+  file is the highest entry generation at or above the highest supersede
+  generation; every reader goes through it: the importer (a file whose
+  entries are all superseded is imported fresh), `mie archive-verify`,
+  replication (supersede records are copied like entries, superseded
+  entries never, and an archive file with a malformed file fails closed),
+  verification (supersede records checked like entries, superseded ones
+  not), repair, the adoption (refuses a source holding generations) and
+  the rebuild. Existing entries keep their names and bytes.
+- **The rebuild clears a leftover start hold on positive evidence (#210,
+  ADR-062 D7 B7′).** A start hold the sources no longer derive is cleared
+  with `hold-cleared <path> readmit` when its archive file has a current
+  entry listing it with its manifest's SHA-256 and the hold is `unlisted`,
+  or `entry-conflict` with an entry written by a resolve; every other one
+  stays held and named, so a full, a stale and an empty start agree after
+  a re-admit. The writer's source lock is now taken through
+  `removal::take_source_lock`, shared with `mie store resolve`.
 
 - **Breaking: `LiveReplay::run_replay` streams (#140, ADR-063).** It no longer collects and sorts a whole run before the
   recompute. A first pass reads each of the run's files once and checks

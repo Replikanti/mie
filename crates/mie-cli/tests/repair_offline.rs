@@ -649,7 +649,13 @@ fn an_entry_copy_is_replaced_from_hot_unless_hot_cannot_vouch_for_it() {
     assert!(!pass, "{out}");
     assert_fail_line(
         &out,
-        &[&name, "cold-a", "refused", "entry conflict", "#194"],
+        &[
+            &name,
+            "cold-a",
+            "refused",
+            "entry conflict",
+            "mie store resolve",
+        ],
     );
     assert_eq!(
         fs::read(entry_dir(&fixture, "cold-a").join(&name)).unwrap(),

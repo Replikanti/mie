@@ -6,6 +6,7 @@
 //! never taken from the archive's bucket listing, which lags the CDN by
 //! months: each file is probed through its `.CHECKSUM` sidecar instead.
 
+use super::normalize::METRICS_RESOLUTION_MS;
 use mie_domain::bars::Timeframe;
 use mie_domain::event::Stream;
 use std::fmt;
@@ -305,6 +306,24 @@ impl ArchiveStream {
         )
     }
 
+    /// The period of the file a row with ordering time `ordering_ms` is
+    /// published in, by the catalog's rules (ADR-034 D3): a `metrics` row
+    /// is ordered at `create_time` + [`METRICS_RESOLUTION_MS`], so its file
+    /// is the day of t − that step (the 23:55 sample, ordered at the next
+    /// midnight, belongs to the previous day's file); `fundingRate` files
+    /// are monthly; every other stream's file is the day of t. `mie store
+    /// resolve` proposes a held part's file from it (#210 RA3); a wrong
+    /// proposal only fails the row check.
+    pub fn period_of(self, ordering_ms: i64) -> Period {
+        match self {
+            Self::Metrics => {
+                Period::Day((ordering_ms - i64::from(METRICS_RESOLUTION_MS)).div_euclid(DAY_MS))
+            }
+            Self::FundingRate => Period::month_of(ordering_ms.div_euclid(DAY_MS)),
+            _ => Period::Day(ordering_ms.div_euclid(DAY_MS)),
+        }
+    }
+
     /// The exact header line of the CSV inside the zip (checked 2025-10 and
     /// 2026-09).
     pub fn expected_header(self) -> &'static str {
@@ -342,6 +361,26 @@ impl ArchiveStream {
     pub fn replay_default(self) -> bool {
         !matches!(self, Self::Trades | Self::BookDepth)
     }
+}
+
+/// The stream and period whose [`ArchiveStream::archive_path`] under
+/// `symbol` is exactly `path`; `None` for anything else (another symbol, a
+/// URL, a leading `/`, a trailing blank, a day that does not exist, a
+/// daily path of a monthly dataset). Only an exact round trip is accepted,
+/// so `mie store resolve --file` (#210 RA3) names one catalog file.
+pub fn parse_archive_path(symbol: &str, path: &str) -> Option<(ArchiveStream, Period)> {
+    let name = path.rsplit('/').next()?;
+    ArchiveStream::ALL.into_iter().find_map(|stream| {
+        let prefix = stream.file_name(symbol, Period::Day(0));
+        let prefix = prefix.strip_suffix("1970-01-01.zip")?;
+        let period = Period::parse(name.strip_prefix(prefix)?.strip_suffix(".zip")?)?;
+        let kind = match period {
+            Period::Day(_) => PeriodKind::Daily,
+            Period::Month { .. } => PeriodKind::Monthly,
+        };
+        (kind == stream.period_kind() && stream.archive_path(symbol, period) == path)
+            .then_some((stream, period))
+    })
 }
 
 impl fmt::Display for ArchiveStream {
@@ -486,6 +525,103 @@ mod tests {
         assert_eq!(
             Period::parse("2026-09-30"),
             Some(Period::Day(parse_day("2026-09-30").unwrap()))
+        );
+    }
+    /// `--file` of `mie store resolve` (#210 RA3): every stream round-trips,
+    /// every look-alike is refused.
+    #[test]
+    fn archive_paths_round_trip_and_reject_lookalikes() {
+        let day = Period::Day(parse_day("2026-10-03").unwrap());
+        let month = Period::Month {
+            year: 2026,
+            month: 10,
+        };
+        for stream in ArchiveStream::ALL {
+            let period = match stream.period_kind() {
+                PeriodKind::Daily => day,
+                PeriodKind::Monthly => month,
+            };
+            let path = stream.archive_path("BTCUSDT", period);
+            assert_eq!(
+                parse_archive_path("BTCUSDT", &path),
+                Some((stream, period)),
+                "{path}"
+            );
+        }
+        let agg = ArchiveStream::AggTrades.archive_path("BTCUSDT", day);
+        let funding = ArchiveStream::FundingRate.archive_path("BTCUSDT", month);
+        for bad in [
+            ArchiveStream::AggTrades.archive_path("ETHUSDT", day),
+            format!("/{agg}"),
+            format!("https://data.binance.vision/{agg}"),
+            format!("~/{agg}"),
+            format!("file:{agg}"),
+            format!("{agg} "),
+            format!("{agg}\n"),
+            agg.replace("2026-10-03", "２026-10-03"),
+            agg.replace("2026-10-03", "2026-10\u{200B}-03"),
+            funding.replace("monthly", "daily"),
+            agg.replace("daily", "monthly"),
+            agg.replace("2026-10-03", "2026-02-30"),
+            agg.replace(".zip", ".ZIP"),
+            agg.replace("aggTrades/BTCUSDT/", "aggTrades/BTCUSDT/../BTCUSDT/"),
+            agg.replace("2026-10-03", "2026-10"),
+            funding.replace("2026-10", "2026-10-03"),
+            String::new(),
+        ] {
+            assert_eq!(parse_archive_path("BTCUSDT", &bad), None, "{bad:?}");
+        }
+    }
+
+    /// The catalog's period rules (ADR-034 D3): the `metrics` 23:55 row
+    /// belongs to the previous day's file, `fundingRate` is monthly, every
+    /// other stream daily.
+    #[test]
+    fn period_of_follows_the_catalog_rules() {
+        let ms = |date: &str, h: i64, m: i64, s: i64, milli: i64| {
+            parse_day(date).unwrap() * DAY_MS + ((h * 60 + m) * 60 + s) * 1000 + milli
+        };
+        let day = |date: &str| Period::Day(parse_day(date).unwrap());
+        let metrics = ArchiveStream::Metrics;
+        assert_eq!(
+            metrics.period_of(ms("2026-10-04", 0, 0, 0, 0)),
+            day("2026-10-03")
+        );
+        assert_eq!(
+            metrics.period_of(ms("2026-10-03", 0, 5, 0, 0)),
+            day("2026-10-03")
+        );
+        assert_eq!(
+            metrics.period_of(ms("2026-10-03", 0, 0, 0, 0)),
+            day("2026-10-02")
+        );
+        let funding = ArchiveStream::FundingRate;
+        assert_eq!(
+            funding.period_of(ms("2026-10-31", 23, 59, 59, 999)),
+            Period::Month {
+                year: 2026,
+                month: 10
+            }
+        );
+        assert_eq!(
+            funding.period_of(ms("2026-11-01", 0, 0, 0, 0)),
+            Period::Month {
+                year: 2026,
+                month: 11
+            }
+        );
+        let agg = ArchiveStream::AggTrades;
+        assert_eq!(
+            agg.period_of(ms("2026-10-03", 23, 59, 59, 999)),
+            day("2026-10-03")
+        );
+        assert_eq!(
+            agg.period_of(ms("2026-10-04", 0, 0, 0, 0)),
+            day("2026-10-04")
+        );
+        assert_eq!(
+            ArchiveStream::Klines(Timeframe::D1).period_of(ms("2026-10-03", 23, 59, 59, 999)),
+            day("2026-10-03")
         );
     }
 }

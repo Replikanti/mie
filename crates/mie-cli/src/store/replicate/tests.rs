@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::config::IngestConfig;
+use mie_adapter_binance::archive::ledger::ImportLedger;
 use mie_adapter_parquet::{ParquetRawStore, RotationPolicy};
 use mie_domain::time::EventTime;
 use mie_ports::raw::{RawRecord, RawRecordSink, RawStreamKey};
@@ -151,6 +152,38 @@ impl Fixture {
         let dir = self.dir.0.join("ledger").join("aggTrades");
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("BTCUSDT-aggTrades-2026-10-05.zip.import"), text).unwrap();
+    }
+
+    /// Supersedes the fixture's entry E0 (#210): writes S1, naming E0's
+    /// bytes, and with `e1` an E1 listing the same parts. Returns the
+    /// names `aggTrades/<file>` of E0, S1 and E1.
+    pub(crate) fn supersede(&self, e1: bool) -> [String; 3] {
+        use mie_adapter_binance::archive::ledger::{SupersedeRecord, SupersededEntry};
+        let file = "BTCUSDT-aggTrades-2026-10-05.zip";
+        let dir = self.dir.0.join("ledger").join("aggTrades");
+        let e0 = fs::read(dir.join(format!("{file}.import"))).unwrap();
+        let text = String::from_utf8(e0.clone()).unwrap();
+        let entry = ImportLedger::parse(&text).unwrap();
+        let record = SupersedeRecord {
+            archive: entry.archive.clone(),
+            stream: entry.stream.clone(),
+            period: entry.period,
+            entries: vec![SupersededEntry::of(format!("aggTrades/{file}.import"), &e0)],
+            quarantine: None,
+        };
+        fs::write(
+            dir.join(format!("{file}.1.supersede.import")),
+            record.render(),
+        )
+        .unwrap();
+        if e1 {
+            fs::write(dir.join(format!("{file}.1.import")), &text).unwrap();
+        }
+        [
+            format!("aggTrades/{file}.import"),
+            format!("aggTrades/{file}.1.supersede.import"),
+            format!("aggTrades/{file}.1.import"),
+        ]
     }
 
     pub(crate) fn archive(&self) -> PathBuf {
@@ -1406,4 +1439,82 @@ fn a_rebuild_gate_makes_the_plan_wait_and_a_malformed_one_gives_none() {
     assert_eq!(plan.as_ref().and_then(|p| p.waiting.clone()), None);
     let line = crate::journal::replication_json(&report, plan.as_ref());
     assert!(line["removal_waiting"].is_null());
+}
+
+/// #210 C3: S1 and E1 are copied byte-identical and a second pass copies
+/// nothing; a superseded E0 is never copied to a target that lacks it; a
+/// part listed only by E0 waits for its import entry, while S1 is copied
+/// without a part gate.
+#[test]
+fn superseded_entries_are_absent_for_replication() {
+    let fixture = Fixture::new("supersede-copy");
+    let [e0, s1, e1] = fixture.supersede(true);
+    let report = fixture.pass();
+    assert_eq!(report.problems, Vec::<String>::new(), "{report:?}");
+    let hot_ledger = fixture.dir.0.join("ledger");
+    for root in &fixture.cold {
+        let copies = root.join(".mie/import-ledger");
+        for name in [&s1, &e1] {
+            assert_eq!(
+                fs::read(copies.join(name)).unwrap(),
+                fs::read(hot_ledger.join(name)).unwrap(),
+                "{name}"
+            );
+        }
+        assert!(!copies.join(&e0).exists(), "{e0} on {}", root.display());
+    }
+    let again = fixture.pass();
+    assert_eq!(again.problems, Vec::<String>::new(), "{again:?}");
+    assert_eq!((again.files_copied, again.entries_copied), (0, 0));
+
+    // S1 without E1: E0's parts wait, S1 is copied anyway.
+    let fixture = Fixture::new("supersede-wait");
+    let [e0, s1, _] = fixture.supersede(false);
+    let report = fixture.pass();
+    let parts: Vec<String> = replica::list_sealed(&fixture.hot)
+        .unwrap()
+        .into_iter()
+        .filter(|p| p.starts_with("source=binance-archive"))
+        .collect();
+    assert_eq!(parts.len(), 2);
+    for part in &parts {
+        assert!(
+            report
+                .problems
+                .iter()
+                .any(|p| p.contains(part.as_str()) && p.contains("waiting for its import entry")),
+            "{report:?}"
+        );
+    }
+    for root in &fixture.cold {
+        let copies = root.join(".mie/import-ledger");
+        assert!(copies.join(&s1).exists());
+        assert!(!copies.join(&e0).exists());
+        assert!(!root.join(&parts[0]).exists());
+    }
+}
+
+/// #210 C3: an archive file with a malformed import-ledger name fails
+/// closed: none of its files is copied and none of its parts authorized.
+#[test]
+fn a_malformed_name_fails_its_archive_file_closed() {
+    let fixture = Fixture::new("supersede-malformed");
+    let dir = fixture.dir.0.join("ledger").join("aggTrades");
+    fs::write(dir.join("BTCUSDT-aggTrades-2026-10-05.zip.01.import"), "x").unwrap();
+    let report = fixture.pass();
+    assert!(
+        report
+            .problems
+            .iter()
+            .any(|p| p.contains("zip.01.import") && p.contains("none of its parts is authorized")),
+        "{report:?}"
+    );
+    for root in &fixture.cold {
+        assert!(
+            !root.join(".mie/import-ledger/aggTrades").exists()
+                || sorted_names(&root.join(".mie/import-ledger/aggTrades"))
+                    .unwrap()
+                    .is_empty()
+        );
+    }
 }

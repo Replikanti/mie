@@ -28,6 +28,14 @@
 //! stops the run before anything is appended, and so is an orphan when no
 //! file is pending.
 //!
+//! Every ledger above is the archive file's **current entry** (ADR-062
+//! D11, proposed; #210 C1): an entry that a supersede record supersedes
+//! counts as absent, so a file whose entries are all superseded reads as
+//! not imported, is imported fresh and gets its entry at the supersede
+//! generation ([`LedgerDir`]). `skipped`, `changed` and "the ledger lists
+//! …; not re-imported" are only ever judged against the current entry, and
+//! the parts only a superseded entry lists are orphans.
+//!
 //! The importer sees the store only through the raw-store ports (ADR-025).
 
 use super::ARCHIVE_SOURCE;
@@ -332,6 +340,70 @@ struct Validated {
 /// The UTC day of an event time.
 fn day_of(millis: i64) -> i64 {
     millis.div_euclid(DAY_MS)
+}
+
+/// The importer's per-row validation (step 4), one function shared with
+/// the re-admit check of `mie store resolve` ([`super::readmit`], #210
+/// RA6), so the two never disagree: the first line is the dataset's
+/// header or a data row; every data row's ordering time parses and lies
+/// within the file's period ± 1 day, which catches a millisecond →
+/// microsecond switch.
+#[derive(Debug, Clone)]
+pub(crate) struct RowValidator {
+    stream: ArchiveStream,
+    period: Period,
+    lower: i64,
+    upper: i64,
+    first: bool,
+    header: bool,
+    rows: usize,
+}
+
+impl RowValidator {
+    /// A validator for a file of `stream` and `period`.
+    pub(crate) fn new(stream: ArchiveStream, period: Period) -> Self {
+        Self {
+            stream,
+            period,
+            lower: period.start_ms() - DAY_MS,
+            upper: period.end_ms() + DAY_MS,
+            first: true,
+            header: false,
+            rows: 0,
+        }
+    }
+
+    /// Validates the next line: `None` for the header, otherwise the
+    /// row's line number in the file (from 1) and its ordering time.
+    ///
+    /// # Errors
+    ///
+    /// The reason, naming the line.
+    pub(crate) fn line(&mut self, row: &[u8]) -> Result<Option<(usize, i64)>, String> {
+        let expected = self.stream.expected_header();
+        if std::mem::take(&mut self.first) && row == expected.as_bytes() {
+            self.header = true;
+            return Ok(None);
+        }
+        let line = self.rows + 1 + usize::from(self.header);
+        let time = record_time(self.stream, row)
+            .map_err(|e| format!("line {line}: {e} (a header must be exactly {expected:?})"))?
+            .as_millis();
+        if !(self.lower..self.upper).contains(&time) {
+            return Err(format!(
+                "line {line}: time {time} ms is outside {} ± 1 day",
+                self.period
+            ));
+        }
+        self.rows += 1;
+        Ok(Some((line, time)))
+    }
+
+    /// The header line, `None` for a headerless file.
+    pub(crate) fn header(&self) -> Option<String> {
+        self.header
+            .then(|| self.stream.expected_header().to_owned())
+    }
 }
 
 /// Imports archive files into the raw store.
@@ -711,8 +783,9 @@ impl<'a> Importer<'a> {
         })
     }
 
-    /// Step 4: header, row times within one day of the period, and for a
-    /// resumed file the orphan prefix per partition.
+    /// Step 4: header, row times within one day of the period
+    /// ([`RowValidator`]), and for a resumed file the orphan prefix per
+    /// partition.
     fn validate(
         &self,
         job: &Job,
@@ -720,32 +793,13 @@ impl<'a> Importer<'a> {
         entry: &str,
         orphans: &BTreeMap<i64, Vec<RawRecord>>,
     ) -> Result<Validated, FileError> {
-        let lower = job.period.start_ms() - DAY_MS;
-        let upper = job.period.end_ms() + DAY_MS;
-        let expected = job.stream.expected_header();
-        let mut header = None;
-        let mut first = true;
+        let mut validator = RowValidator::new(job.stream, job.period);
         let mut times = Vec::new();
         let mut seen: BTreeMap<i64, usize> = BTreeMap::new();
         for_each_line(zip, entry, |row| -> Result<(), FileError> {
-            if std::mem::take(&mut first) && row == expected.as_bytes() {
-                header = Some(expected.to_owned());
+            let Some((line, time)) = validator.line(row).map_err(FileError::Invalid)? else {
                 return Ok(());
-            }
-            let line = times.len() + 1 + usize::from(header.is_some());
-            let time = record_time(job.stream, row)
-                .map_err(|e| {
-                    FileError::Invalid(format!(
-                        "line {line}: {e} (a header must be exactly {expected:?})"
-                    ))
-                })?
-                .as_millis();
-            if !(lower..upper).contains(&time) {
-                return Err(FileError::Invalid(format!(
-                    "line {line}: time {time} ms is outside {} ± 1 day",
-                    job.period
-                )));
-            }
+            };
             let day = day_of(time);
             let position = seen.entry(day).or_default();
             if let Some(stored) = orphans.get(&day).and_then(|records| records.get(*position)) {
@@ -768,7 +822,10 @@ impl<'a> Importer<'a> {
             times.push(time);
             Ok(())
         })?;
-        Ok(Validated { header, times })
+        Ok(Validated {
+            header: validator.header(),
+            times,
+        })
     }
 
     /// Sealed files of `job`'s stream in the partitions of days

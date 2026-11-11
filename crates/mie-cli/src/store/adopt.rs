@@ -65,7 +65,9 @@
 //!       record (marker re-read before and after the copy, then the `copy`
 //!       record), then to hot when its partition is on hot's side.
 //!    4. The source's import entries to hot's import ledger, after all
-//!       their parts.
+//!       their parts. A source import ledger holding a supersede record or
+//!       an entry of generation ≥ 1 is refused with nothing written: only
+//!       `mie store resolve` writes them, on a tiered store (#210 C6).
 //!    5. The source journal to hot's journal, as a byte-prefix extension.
 //!    6. One replication pass under the held pass lock, so the ledger, the
 //!       journal and the entries have k copies before the run returns.
@@ -79,6 +81,7 @@ use super::replicate::{self, Entry, Fold, LedgerAppend, PassObserver};
 use super::{DeviceProbe, check_devices, check_hot, exists, raw_store, truncation_line};
 use crate::config::IngestConfig;
 use mie_adapter_binance::archive::ARCHIVE_SOURCE;
+use mie_adapter_binance::archive::ledger::LedgerKind;
 use mie_adapter_binance::archive::ledger::PENDING_FILE;
 use mie_adapter_parquet::copy_ledger::{self, AppendError, CopyLedger, Kind, Record, Truncation};
 use mie_adapter_parquet::replica::{self, CopyError, CopyOutcome, Side, TailSource};
@@ -758,12 +761,28 @@ impl Run<'_> {
                 pending.display()
             )));
         }
-        let (entries, problems) = replicate::hot_entries(ledger);
-        if !problems.is_empty() {
-            self.report.problems.extend(problems);
+        let found = replicate::hot_entries(ledger);
+        if !found.problems.is_empty() {
+            self.report.problems.extend(found.problems);
             return Err(Stop::Failed);
         }
-        Ok(entries)
+        // Only `mie store resolve` writes a supersede record or an entry of
+        // generation ≥ 1, and only on a tiered store, so a single-root
+        // store never holds one (#210 C6).
+        let tiered = found
+            .entries
+            .iter()
+            .find(|entry| entry.kind == LedgerKind::Supersede || entry.generation > 0)
+            .map(|entry| entry.name.clone())
+            .or_else(|| found.superseded.keys().next().cloned());
+        if let Some(name) = tiered {
+            return Err(self.fail(format!(
+                "--import-ledger holds {name}, a supersede record or an entry it supersedes or \
+                 writes: only `mie store resolve` writes them, on a tiered store, so this is no \
+                 single-root store's import ledger; nothing is adopted (ADR-062 D11)"
+            )));
+        }
+        Ok(found.entries)
     }
 
     /// Every archive part has an entry that lists it with its manifest's
