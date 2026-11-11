@@ -425,6 +425,28 @@ USAGE:
         written. Then PASS and exits 0, or one FAIL: <reason> line per
         problem and exits 1.
 
+    mie store resolve --config <path> [--archive-config <path>]
+                      [--file <archive path>]
+        Resolve the held archive parts of a tiered raw store (ADR-062 D11)
+        by re-admitting them. Without --file it prints, for every open
+        hold, the archive file its stream and ordering times propose by the
+        catalog's period rules (a metrics 23:55 row belongs to the previous
+        day's file, fundingRate files are monthly), writes nothing, and
+        exits 0 only when no hold is open. With --file (exactly an archive
+        path as proposed, below the base URL) it downloads that file once
+        and compares every row with the held parts that propose it: when
+        they are equal it writes the missing import entry, or a supersede
+        record and a superseding entry when a conflicting one exists, then
+        clears the holds; bytes, paths and dataset versions stay as they
+        were, and the importer runs again. When a row differs it names the
+        first difference, writes nothing and keeps the hold (the replace
+        resolution is a later step). A part held because two roots hold
+        different files under its path is refused. It takes the archive
+        source's writer lock without waiting, so it refuses while an import
+        or a rebuild runs. Every copy target must carry its marker. Prints
+        what it read, checked and wrote, then PASS and exits 0, or one
+        FAIL: <reason> line and exits 1.
+
     mie --help
 ";
 
@@ -951,6 +973,33 @@ fn dispatch(args: &[String]) -> Result<ExitCode, String> {
                 )?;
                 Ok(exit(pass))
             }
+            Some("resolve") => {
+                let options =
+                    Options::parse(&args[2..], &["--config", "--archive-config", "--file"], &[])?;
+                let config =
+                    IngestConfig::load(&options.path("--config")?).map_err(|e| e.to_string())?;
+                let archive = options.optional("--archive-config").map(PathBuf::from);
+                let file = options.optional("--file").map(str::to_owned);
+                let probe = store::device_probe()?;
+                let client = Arc::new(UreqDownload::new(DownloadTimeouts::default())?);
+                let transports = ArchiveTransports {
+                    http: client.clone(),
+                    download: client,
+                    clock: Arc::new(SystemClock::new()),
+                };
+                let clock = SystemClock::new();
+                let now_ms = || clock.now_utc_ns().div_euclid(1_000_000);
+                let pass = store::resolve(
+                    &config,
+                    archive.as_deref(),
+                    file.as_deref(),
+                    &transports,
+                    probe.as_ref(),
+                    &now_ms,
+                    &mut std::io::stdout().lock(),
+                )?;
+                Ok(exit(pass))
+            }
             _ => Err(
                 "expected `mie store init --config <path>`, `mie store init-root \
                  --config <path> --root <path> --id <id>`, `mie store replicate --config \
@@ -958,9 +1007,10 @@ fn dispatch(args: &[String]) -> Result<ExitCode, String> {
                  [--archive-config <path>] --from <path> [--journal <path>] [--import-ledger \
                  <dir>]`, `mie store verify --config <path> [--archive-config <path>] \
                  --period-hours <P>`, `mie store repair --config <path> [--archive-config \
-                 <path>] [--record-lost]` or `mie store rebuild --config <path> \
+                 <path>] [--record-lost]`, `mie store rebuild --config <path> \
                  [--archive-config <path>] [--record-lost] [--record-unlisted] \
-                 [--replace-hot-ledger]`"
+                 [--replace-hot-ledger]` or `mie store resolve --config <path> \
+                 [--archive-config <path>] [--file <archive path>]`"
                     .to_owned(),
             ),
         },

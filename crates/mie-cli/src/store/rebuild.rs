@@ -55,10 +55,20 @@
 //!   `unlisted` hold comes from an absence, so it is written only with
 //!   `--record-unlisted`; without it the rebuild reports the candidates,
 //!   the import ledger's entry count and the target entries hot lacks, and
-//!   installs nothing. Conflict holds are always written.
+//!   installs nothing. Conflict holds are always written. "New" means no
+//!   open hold: a start hold already cleared that the sources derive again
+//!   gets a new `hold`.
+//! - **B7′ Leftover start holds** (#210). A start hold the sources no
+//!   longer derive is cleared (`hold-cleared <path> readmit`) only on
+//!   positive evidence: its archive file has a current entry listing it
+//!   with the SHA-256 of its one manifest text, and the hold is `unlisted`,
+//!   or `entry-conflict` with that entry of generation ≥ 1 (a resolve wrote
+//!   it). Every other one, `manifest-conflict` always, stays held and is
+//!   named. So a full, a stale and an empty start agree after a re-admit.
 //! - **B8 Removed:** a partition with a verified cold copy and no
 //!   directory on hot; inside the hot window it is also a `FAIL:` line.
-//! - **B9 Install:** markers re-read, the old ledger linked aside, the gate
+//! - **B9 Install:** records per path, then `lost`, `removed`, `hold` and
+//!   `hold-cleared`, each in path order; markers re-read, the old ledger linked aside, the gate
 //!   written, the new ledger renamed into place
 //!   ([`LedgerHold::replace`](mie_adapter_parquet::LedgerHold::replace)),
 //!   then every ledger copy that is no prefix of it moved aside.
@@ -72,9 +82,10 @@ use super::replicate::{self, IMPORT_LEDGER_DIR, META_DIR, entry_files, is_archiv
 use super::{DeviceProbe, check_devices, check_hot};
 use crate::config::IngestConfig;
 use mie_adapter_binance::archive::ARCHIVE_SOURCE;
-use mie_adapter_binance::archive::ledger::{PENDING_FILE, Pending};
+use mie_adapter_binance::archive::ledger::{LedgerName, PENDING_FILE, Pending};
 use mie_adapter_parquet::copy_ledger::{
     self, CopyLedger, HoldReason, Kind, LedgerBuilder, LedgerCopyCheck, LostOrigin, Record,
+    Resolution,
 };
 use mie_adapter_parquet::removal;
 use mie_adapter_parquet::replica::{self, CopyCheck};
@@ -120,9 +131,9 @@ pub struct Flags {
     /// `--record-lost`: write the `lost` records (#193 STOP 1 decision 1).
     pub record_lost: bool,
     /// `--record-unlisted`: write the `unlisted` holds. Like `lost`, a
-    /// hold derived from an absence (no current entry lists the part) is
-    /// irreversible before #194, and an empty or unmounted import ledger
-    /// reads as no entries (re-review of #209).
+    /// hold derived from an absence (no current entry lists the part) needs
+    /// an explicit resolution (`mie store resolve`), and an empty or
+    /// unmounted import ledger reads as no entries (re-review of #209).
     pub record_unlisted: bool,
     /// `--replace-hot-ledger`: replace a readable hot ledger (decision 2).
     pub replace_hot_ledger: bool,
@@ -577,8 +588,8 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
     }
 
     // B0 again: a missing hot import ledger reads as empty, and every
-    // archive part only hot holds would become a permanent `unlisted` hold
-    // (nothing clears a hold before #194; review of #209, finding 2). It
+    // archive part only hot holds would become an `unlisted` hold that only
+    // `mie store resolve` clears (review of #209, finding 2). It
     // stops the rebuild wherever it could hide an entry: an archive part
     // on a root or in the start, or a copy target holding entries.
     if let Some(dir) = &inputs.missing_import_ledger {
@@ -924,7 +935,7 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
         problems.push(format!(
             "{path}: held ({}) in the rebuilt ledger: once it is installed, the importer refuses \
              and every selection that covers it fails until the hold is resolved (`mie store \
-             resolve`, #194; ADR-062 D11)",
+             resolve`; ADR-062 D11)",
             reason.as_str()
         ));
         if new {
@@ -957,30 +968,69 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
             "{new_unlisted} archive part(s) are listed by no current import entry. Hot's import \
              ledger {} holds {on_hot} entries, and the copy targets hold {targets_only} entries \
              that hot lacks: an empty or unmounted import ledger reads as no entries. {what} \
-             (#194; ADR-062 D7 step 5a)",
+             (ADR-062 D7 step 5a, D11)",
             inputs
                 .import_ledger
                 .as_deref()
                 .unwrap_or("(none configured)")
         ));
     }
+    // B7′ (#210): a start hold the sources no longer derive is cleared
+    // only on positive evidence in the import ledger, which is immutable
+    // and replicated: the path's archive file has a current entry listing
+    // it with the SHA-256 of its one manifest text, and the hold is
+    // `unlisted`, or `entry-conflict` with that entry written by a resolve
+    // (generation ≥ 1). An absence (an emptied or unmounted import-ledger
+    // directory) never clears one, and a `manifest-conflict` never is.
     let mut start_holds = BTreeSet::new();
     for record in &start_ledger.records {
         if let Kind::Hold { path, .. } = &record.kind {
             start_holds.insert(path.clone());
         }
     }
+    let mut cleared_records = Vec::new();
     for path in start_holds {
-        if let Some(reason) = state.hold_reason(&path)
-            && !findings.holds.contains_key(&path)
-        {
-            problems.push(format!(
-                "{path}: the start copy holds it ({}) and the sources no longer derive that \
-                 hold; it stays held in the rebuilt ledger, since no record clears a hold before #194 (AW12) (ADR-062 \
-                 D11)",
-                reason.as_str()
-            ));
+        let Some(reason) = state.hold_reason(&path) else {
+            continue;
+        };
+        if findings.holds.contains_key(&path) {
+            continue;
         }
+        let evidence = match distinct(&path)[..] {
+            [only] => replica::parse_manifest(only).ok().and_then(|file| {
+                findings
+                    .current
+                    .iter()
+                    .filter(|(_, files)| files.contains(&(path.clone(), file.sha256.clone())))
+                    .filter_map(|(name, _)| {
+                        let (_, file_name) = name.split_once('/')?;
+                        LedgerName::parse(file_name).ok()
+                    })
+                    .map(|name| name.generation)
+                    .max()
+            }),
+            _ => None,
+        };
+        let clears = match (reason, evidence) {
+            (HoldReason::Unlisted, Some(_)) => true,
+            (HoldReason::EntryConflict, Some(generation)) => generation >= 1,
+            _ => false,
+        };
+        if clears {
+            lines.push(format!("hold-cleared {path} readmit"));
+            cleared_records.push(Kind::HoldCleared {
+                path: path.clone(),
+                resolution: Resolution::Readmit,
+            });
+            continue;
+        }
+        problems.push(format!(
+            "{path}: the start copy holds it ({}) and the sources no longer derive that hold; it \
+             stays held in the rebuilt ledger, since only positive evidence in the import ledger \
+             clears a hold (a current entry listing it, written by `mie store resolve` for an \
+             entry conflict); resolve it with `mie store resolve` (ADR-062 D7 step 5a, D11)",
+            reason.as_str()
+        ));
     }
     for path in &findings.exempt {
         lines.push(format!(
@@ -1035,6 +1085,7 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
     }
     records.extend(removed);
     records.extend(hold_records);
+    records.extend(cleared_records);
     let mut added = Vec::new();
     for kind in records {
         let record = Record {
@@ -1050,10 +1101,17 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
     for record in &added {
         *counts.entry(record.kind.name()).or_default() += 1;
     }
-    let counted: Vec<String> = ["manifest", "copy", "lost", "removed", "hold"]
-        .iter()
-        .map(|kind| format!("{kind} {}", counts.get(kind).copied().unwrap_or(0)))
-        .collect();
+    let counted: Vec<String> = [
+        "manifest",
+        "copy",
+        "lost",
+        "removed",
+        "hold",
+        "hold-cleared",
+    ]
+    .iter()
+    .map(|kind| format!("{kind} {}", counts.get(kind).copied().unwrap_or(0)))
+    .collect();
     // After the start, the rejected copies and the journal line.
     lines.insert(
         2 + rejected.len(),

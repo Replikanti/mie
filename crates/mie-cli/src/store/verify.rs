@@ -38,12 +38,15 @@
 //!     path.
 //!   - *k:* an ordinary path (the hot listing plus the ledger's manifests,
 //!     minus lost, replaced and pending paths) without a `copy` record (P,
-//!     R) is `copies`, except an archive part that no hot entry lists (it
-//!     waits for its entry) and a file on hot whose data mtime lies within
+//!     R) is `copies`, except an archive part that no current hot entry
+//!     lists (it waits for its entry) and a file on hot whose data mtime lies within
 //!     G before now.
-//!   - *Entries:* each hot entry whose listed parts all have `copy` records
-//!     for R older than G: absent is `missing entry:<e>`, other bytes are
-//!     `entry`. Without an archive configuration entries are not checked
+//!   - *Entries:* each current hot entry whose listed parts all have
+//!     `copy` records for R older than G, and each supersede record whose
+//!     mtime on hot lies outside G before now (a future mtime is never
+//!     exempt): absent is `missing entry:<e>`, other bytes are `entry`. A
+//!     superseded entry is not checked, so an open finding about one closes
+//!     at the next pass over R (#210 C4). Without an archive configuration entries are not checked
 //!     and archive parts get no k check; one `FAIL` line says so when the
 //!     store holds archive parts.
 //!   - *Copy ledger:* absent while S holds a `ledger-copy R` record is
@@ -99,6 +102,7 @@ use super::replicate::{
 };
 use super::{DeviceProbe, check_devices, check_hot, truncation_line};
 use crate::config::{ArchiveConfig, IngestConfig};
+use mie_adapter_binance::archive::ledger::LedgerKind;
 use mie_adapter_parquet::copy_ledger::{
     self, AppendError, FindingCode, Kind, LedgerCopyCheck, Record, Subject,
 };
@@ -113,7 +117,7 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 /// Milliseconds per hour.
 const HOUR_MS: i64 = 3_600_000;
@@ -296,9 +300,9 @@ pub fn run(
     let mut hot_problems = Vec::new();
     let entries = match &archive {
         Some(archive) => {
-            let (entries, problems) = hot_entries(&archive.paths.import_ledger);
-            hot_problems.extend(problems);
-            entries
+            let found = hot_entries(&archive.paths.import_ledger);
+            hot_problems.extend(found.problems);
+            found.entries
         }
         None => Vec::new(),
     };
@@ -454,7 +458,13 @@ impl Verify<'_> {
                 return true;
             }
         }
-        let modified = fs::metadata(self.hot.join(path))
+        self.within_grace(&self.hot.join(path))
+    }
+
+    /// Whether `file`'s mtime lies within G before now (V8): a future mtime
+    /// is never within it.
+    fn within_grace(&self, file: &Path) -> bool {
+        let modified = fs::metadata(file)
             .and_then(|metadata| metadata.modified())
             .ok()
             .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
@@ -690,13 +700,16 @@ impl Verify<'_> {
             let entries: Vec<(String, String, String, PathBuf)> = self
                 .entries
                 .iter()
-                .filter(|entry| {
-                    entry.files.iter().all(|(file, _)| {
+                .filter(|entry| match entry.kind {
+                    // A supersede record has no part: its own mtime on hot
+                    // gives the replicator its G (#210 C4).
+                    LedgerKind::Supersede => !self.within_grace(&entry.path),
+                    LedgerKind::Entry => entry.files.iter().all(|(file, _)| {
                         self.state
                             .copy(file, &id)
                             .and_then(|copy| copy.latest)
                             .is_some_and(|(_, at)| at <= self.now - self.grace_ms)
-                    })
+                    }),
                 })
                 .map(|entry| {
                     (

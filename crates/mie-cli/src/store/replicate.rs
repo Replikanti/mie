@@ -18,11 +18,17 @@
 //!    record (with the first copy) and the `copy` record are appended. Hot's
 //!    manifest is checked against the ledger's `manifest` record before
 //!    anything is copied (D5). A live part is always eligible; an archive
-//!    part only once an import entry on hot lists it with its manifest's
-//!    SHA-256 (D11 *Archive parts wait for their import entry*).
+//!    part only once a current import entry on hot lists it with its
+//!    manifest's SHA-256 (D11 *Archive parts wait for their import
+//!    entry*).
 //! 2. **Import-ledger entries.** An entry goes to a target only once every
 //!    part it lists has a copy record for that target, so per archive file
-//!    its parts precede its entry. `PENDING` is never copied.
+//!    its parts precede its entry. `PENDING` is never copied. Only current
+//!    entries are copied, and supersede records, with no part gate (#210
+//!    C3): a superseded entry is never copied and authorizes no part, and
+//!    an archive file one of whose import-ledger files is malformed,
+//!    unreadable or bound to another file has none of its files copied and
+//!    none of its parts authorized in the pass.
 //! 3. **The copy-ledger tail**, to hot's verified prefix, then one
 //!    `ledger-copy` record per target whose copy was not up to date. After
 //!    steps 1 and 2, so this pass's copy records lie inside the prefix.
@@ -85,7 +91,7 @@
 use super::{DeviceProbe, check_devices, check_hot};
 use crate::config::{ArchiveConfig, IngestConfig};
 use mie_adapter_binance::archive::ARCHIVE_SOURCE;
-use mie_adapter_binance::archive::ledger::ImportLedger;
+use mie_adapter_binance::archive::ledger::{LedgerKind, LedgerName, classify};
 use mie_adapter_parquet::copy_ledger::{
     self, AppendError, AppendOutcome, CopyLedger, Guarded, Kind, Record, Subject, Truncation,
 };
@@ -316,16 +322,35 @@ impl Fold {
     }
 }
 
-/// One import-ledger entry on hot (or, for the adoption, in the import
-/// ledger of the store it adopts).
+/// One import-ledger file on hot (or, for the adoption, in the import
+/// ledger of the store it adopts) that is copied like an entry: a current
+/// entry or a supersede record (ADR-062 D11, proposed; #210 C3).
 pub(super) struct Entry {
     /// `<segment>/<name>.import`.
     pub(super) name: String,
     pub(super) segment: String,
     pub(super) file_name: String,
     pub(super) path: PathBuf,
-    /// The data paths it lists, with their SHA-256.
+    /// The data paths it lists, with their SHA-256; none for a supersede
+    /// record, which authorizes no part and waits for none.
     pub(super) files: Vec<(String, String)>,
+    /// Its generation (G1).
+    pub(super) generation: u32,
+    /// An entry or a supersede record.
+    pub(super) kind: LedgerKind,
+}
+
+/// The import ledger as the copy commands read it (#210 C3): every current
+/// entry and supersede record, the superseded entries, and every problem.
+#[derive(Default)]
+pub(super) struct HotEntries {
+    /// Current entries and supersede records, by name.
+    pub(super) entries: Vec<Entry>,
+    /// Every superseded entry `<segment>/<name>.import`, with the supersede
+    /// record of the highest generation of its archive file.
+    pub(super) superseded: BTreeMap<String, String>,
+    /// Listing, read, name, parse and binding failures.
+    pub(super) problems: Vec<String>,
 }
 
 /// A check over the records after the pass's ledger read: `Some` with
@@ -895,46 +920,152 @@ pub(super) fn entry_files(import_ledger: &Path) -> (Vec<EntryFile>, Vec<String>)
     (files, errors)
 }
 
-/// The import-ledger entries on hot, `<segment>/<name>.import`, sorted;
-/// `PENDING`, hidden temp files and anything else are never listed. An
-/// entry that cannot be read or parsed is returned as a problem.
-pub(super) fn hot_entries(import_ledger: &Path) -> (Vec<Entry>, Vec<String>) {
+/// The archive file a malformed import-ledger name belongs to, when it
+/// can tell: the name up to its first `.zip.`.
+fn archive_file_of(file_name: &str) -> Option<&str> {
+    file_name
+        .find(".zip.")
+        .map(|at| &file_name[..at + ".zip".len()])
+}
+
+/// The files of one archive file in one directory, or why it fails closed.
+type Group = Result<Vec<(EntryFile, LedgerName)>, String>;
+
+/// The import ledger at `import_ledger` (hot's, or the store an adoption
+/// reads), classified per archive file (#210 G1–G4, C3): the current
+/// entries and the supersede records are returned to be copied, the
+/// superseded entries are named. `PENDING`, hidden temp files and other
+/// names are never listed. A file of an archive file that is malformed,
+/// cannot be read or parsed, or names another archive file fails that
+/// archive file closed: a problem names it, and none of its files is
+/// returned, so none is copied and none of its parts is authorized.
+pub(super) fn hot_entries(import_ledger: &Path) -> HotEntries {
     let (files, listing) = entry_files(import_ledger);
-    let mut problems: Vec<String> = listing
-        .into_iter()
-        .map(|error| {
-            if error.contains("cannot list it") {
-                format!("{error}; no entry and no archive part is replicated in this pass")
-            } else {
-                error
-            }
-        })
-        .collect();
-    let mut entries = Vec::new();
+    let mut found = HotEntries {
+        problems: listing
+            .into_iter()
+            .map(|error| {
+                if error.contains("cannot list it") {
+                    format!("{error}; no entry and no archive part is replicated in this pass")
+                } else {
+                    error
+                }
+            })
+            .collect(),
+        ..HotEntries::default()
+    };
+    // Per (segment, archive file): its files, or why it fails closed.
+    let mut groups: BTreeMap<(String, String), Group> = BTreeMap::new();
     for file in files {
-        let parsed = fs::read_to_string(&file.path)
-            .map_err(|e| e.to_string())
-            .and_then(|text| ImportLedger::parse(&text).map_err(|e| e.to_string()));
-        match parsed {
-            Ok(ledger) => entries.push(Entry {
+        match LedgerName::parse(&file.file_name) {
+            Ok(name) => {
+                if let Ok(list) = groups
+                    .entry((file.segment.clone(), name.file.clone()))
+                    .or_insert_with(|| Ok(Vec::new()))
+                {
+                    list.push((file, name));
+                }
+            }
+            Err(error) => {
+                let why = format!(
+                    "import-ledger file {} ({}): {error}",
+                    file.name,
+                    file.path.display()
+                );
+                match archive_file_of(&file.file_name) {
+                    Some(archive_file) => {
+                        groups.insert((file.segment.clone(), archive_file.to_owned()), Err(why));
+                    }
+                    None => found
+                        .problems
+                        .push(format!("{why}; it is not replicated (ADR-062 D11)")),
+                }
+            }
+        }
+    }
+    for ((segment, archive_file), group) in groups {
+        let fail = |why: String| {
+            format!(
+                "{why}; no import-ledger file of {segment}/{archive_file} is replicated \
+                 and none of its parts is authorized in this pass (ADR-062 D11)"
+            )
+        };
+        let files = match group {
+            Ok(files) => files,
+            Err(why) => {
+                found.problems.push(fail(why));
+                continue;
+            }
+        };
+        let mut pairs = Vec::new();
+        let mut unreadable = None;
+        for (file, name) in &files {
+            match fs::read(&file.path) {
+                Ok(bytes) => pairs.push((name.clone(), bytes)),
+                Err(error) => {
+                    unreadable = Some(format!(
+                        "import-ledger file {} ({}): {error}",
+                        file.name,
+                        file.path.display()
+                    ));
+                    break;
+                }
+            }
+        }
+        if let Some(why) = unreadable {
+            found.problems.push(fail(why));
+            continue;
+        }
+        let classified = match classify(&segment, &pairs) {
+            Ok(classified) => classified,
+            Err(error) => {
+                found.problems.push(fail(format!(
+                    "import ledger {}: {error}",
+                    import_ledger.display()
+                )));
+                continue;
+            }
+        };
+        let latest_record = classified
+            .records
+            .last()
+            .map(|(name, _)| format!("{segment}/{}", name.render()));
+        for name in &classified.superseded {
+            found.superseded.insert(
+                format!("{segment}/{}", name.render()),
+                latest_record.clone().unwrap_or_default(),
+            );
+        }
+        let current = classified.current.as_ref().map(|(name, _)| name);
+        for (file, name) in files {
+            let listed = match (name.kind, Some(&name) == current) {
+                (LedgerKind::Entry, true) => classified
+                    .current
+                    .as_ref()
+                    .map(|(_, ledger)| {
+                        ledger
+                            .files
+                            .iter()
+                            .map(|f| (f.relative_path.clone(), f.sha256.clone()))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                (LedgerKind::Supersede, _) => Vec::new(),
+                (LedgerKind::Entry, false) => continue,
+            };
+            found.entries.push(Entry {
                 name: file.name,
                 segment: file.segment,
                 file_name: file.file_name,
                 path: file.path,
-                files: ledger
-                    .files
-                    .into_iter()
-                    .map(|file| (file.relative_path, file.sha256))
-                    .collect(),
-            }),
-            Err(error) => problems.push(format!(
-                "import entry {} ({}): {error}; neither it nor the parts it lists are replicated",
-                file.name,
-                file.path.display()
-            )),
+                files: listed,
+                generation: name.generation,
+                kind: name.kind,
+            });
         }
     }
-    (entries, problems)
+    found.entries.sort_by(|a, b| a.name.cmp(&b.name));
+    found
 }
 
 /// The byte offset and the path of the first line of `journal` in
@@ -1060,9 +1191,11 @@ impl Pass<'_> {
         if let Some(hook) = AFTER_LISTING.with(|hook| hook.borrow_mut().take()) {
             hook();
         }
-        let (entries, problems) = match &self.archive {
+        let HotEntries {
+            entries, problems, ..
+        } = match &self.archive {
             Some(archive) => hot_entries(&archive.paths.import_ledger),
-            None => (Vec::new(), Vec::new()),
+            None => HotEntries::default(),
         };
         self.report.problems.extend(problems);
         let mut copied = 0usize;

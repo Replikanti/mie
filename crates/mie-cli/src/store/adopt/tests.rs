@@ -1233,3 +1233,64 @@ fn every_target_replaced_after_two_adoptions_is_filled_by_re_adoptions() {
         }
     }
 }
+
+/// #210 C6: a source import ledger holding a supersede record or an entry
+/// of generation ≥ 1 is refused with nothing written: only `mie store
+/// resolve` writes them, on a tiered store.
+#[test]
+fn adoption_refuses_supersede_records_in_the_source() {
+    for extra in ["record", "generation-1 entry"] {
+        let fixture = Fixture::new("adopt-supersede");
+        let dir = fixture.src.join("ledger").join("aggTrades");
+        let e0 = sorted_names_of(&dir).into_iter().next().unwrap();
+        let file = e0.strip_suffix(".import").unwrap().to_owned();
+        let date = file
+            .strip_prefix("BTCUSDT-aggTrades-")
+            .and_then(|f| f.strip_suffix(".zip"))
+            .unwrap();
+        let (name, text) = if extra == "record" {
+            (
+                format!("{file}.1.supersede.import"),
+                format!(
+                    "mie-archive-supersede 1\narchive data/futures/um/daily/aggTrades/BTCUSDT/{file}\n\
+                     stream binance-archive/BTCUSDT/aggTrades\nperiod {date}\nquarantine -\n"
+                ),
+            )
+        } else {
+            (
+                format!("{file}.1.import"),
+                fs::read_to_string(dir.join(&e0)).unwrap(),
+            )
+        };
+        fs::write(dir.join(&name), text).unwrap();
+        let before = [&fixture.hot, &fixture.cold[0], &fixture.cold[1]].map(|r| files_under(r));
+        let ledger = fs::read(copy_ledger::ledger_path(&fixture.hot)).unwrap();
+        let report = fixture.adopt();
+        assert!(
+            report
+                .problems
+                .iter()
+                .any(|p| p.contains(&name) && p.contains("nothing is adopted")),
+            "{extra}: {report:?}"
+        );
+        assert_eq!(
+            fs::read(copy_ledger::ledger_path(&fixture.hot)).unwrap(),
+            ledger
+        );
+        assert_eq!(
+            [&fixture.hot, &fixture.cold[0], &fixture.cold[1]].map(|r| files_under(r)),
+            before,
+            "{extra}"
+        );
+    }
+}
+
+/// The names in `dir`, sorted.
+fn sorted_names_of(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    names
+}

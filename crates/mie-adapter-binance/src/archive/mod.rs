@@ -12,8 +12,9 @@
 //! | [`normalize`] | Archive row → domain events, shared with replay (#11) |
 //! | [`fold`] | The aggTrades fold: uncovered trades from the `trades` archive (ADR-050) |
 //! | [`fetch`] | Paced, retried, checksum-verified downloads and zip lines |
-//! | [`ledger`] | Per-file import ledger and the `PENDING` marker |
+//! | [`ledger`] | Per-file import ledger, its generations and supersede records, and the `PENDING` marker |
 //! | [`import`] | Exactly-once import: skip, conflict, validate, append, resume |
+//! | [`readmit`] | The re-admit row check of `mie store resolve` (ADR-062 D11, #210) |
 //! | [`replay`] | Archive replay: streaming canonical merge, continuity and missing-partition gaps (#11) |
 
 pub mod catalog;
@@ -22,6 +23,7 @@ pub mod fold;
 pub mod import;
 pub mod ledger;
 pub mod normalize;
+pub mod readmit;
 pub mod replay;
 
 /// The raw-store source of every archive record. Fixed in code, never

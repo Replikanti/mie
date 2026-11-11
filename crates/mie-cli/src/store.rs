@@ -38,6 +38,11 @@
 //!   aside into `.mie/damaged/`, fills a target that lacks the files that
 //!   left hot, and ends with one replication pass
 //!   ([`repair`](mod@repair) holds the rules, #192, ADR-062 D11).
+//! - [`resolve`] (`mie store resolve`) proposes the archive file of every
+//!   open hold, and with `--file` re-admits the held parts of that file
+//!   when they equal its published rows: it writes the missing or a
+//!   superseding import entry and clears the holds
+//!   ([`resolve`](mod@resolve) holds the rules, #210, ADR-062 D11).
 //! - [`check_devices`] refuses two roots that report one device id, before
 //!   any `mie store` command writes a byte to a copy target.
 //! - [`raw_store`] builds the raw store of every command: the tiered store
@@ -75,6 +80,7 @@ pub mod archive_checks;
 pub mod rebuild;
 pub mod repair;
 pub mod replicate;
+pub mod resolve;
 pub mod verify;
 
 pub use adopt::{AdoptReport, AdoptRequest};
@@ -333,7 +339,7 @@ pub fn check_holds(ledger: &copy_ledger::Ledger) -> Result<(), String> {
         None => Ok(()),
         Some((path, reason)) => Err(format!(
             "{} archive part(s) are held, the first {path} ({}): the importer refuses until \
-             every hold is resolved by `mie store resolve` (#194; ADR-062 D11)",
+             every hold is resolved by `mie store resolve` (ADR-062 D11)",
             held.len(),
             reason.as_str()
         )),
@@ -557,6 +563,31 @@ pub fn rebuild(
     out: &mut dyn Write,
 ) -> Result<bool, String> {
     let report = rebuild::run(config, archive, flags, first_hot_date, probe, now_ms);
+    print_report(report.lines, &report.problems, out)
+}
+
+/// `mie store resolve`: proposes the archive file of every open hold, or
+/// with `file` (`--file`) re-admits that file's held parts (ADR-062 D11,
+/// the module [`resolve`](mod@resolve)), with the archive configuration
+/// `archive`, else `[history] archive_config`. `transports` fetch the
+/// file; `now_ms` stamps the `hold-cleared` records.
+///
+/// It prints what it read, checked and wrote, then `PASS` (returns
+/// `true`) or one `FAIL: <problem>` line per problem (returns `false`).
+///
+/// # Errors
+///
+/// A description when the report cannot be written.
+pub fn resolve(
+    config: &IngestConfig,
+    archive: Option<&Path>,
+    file: Option<&str>,
+    transports: &crate::archive::ArchiveTransports,
+    probe: &dyn DeviceProbe,
+    now_ms: &dyn Fn() -> i64,
+    out: &mut dyn Write,
+) -> Result<bool, String> {
+    let report = resolve::run(config, archive, file, transports, probe, now_ms);
     print_report(report.lines, &report.problems, out)
 }
 

@@ -442,6 +442,44 @@ pub fn try_source_lock(hot: &Path, source: &str) -> Result<Option<SourceLock>, R
     }
 }
 
+/// Takes the writer lock `source=<source>/.lock` of `root` without
+/// waiting, creating the source directory and the lock file when they are
+/// absent: the writer's open path and `mie store resolve` (#210 RA1) share
+/// it. Unlike [`try_source_lock`] it never answers "no lock", so two
+/// callers can never both proceed on a source that had no lock file.
+///
+/// # Errors
+///
+/// [`RawStoreError::Locked`] when another writer holds it;
+/// [`RawStoreError::Io`] when it cannot be created, opened or locked.
+pub fn take_source_lock(root: &Path, source: &str) -> Result<SourceLock, RawStoreError> {
+    let source_dir = root.join(layout::source_dir(source));
+    fs::create_dir_all(&source_dir).map_err(io_error("create", &source_dir))?;
+    sync_dir(root)?;
+    let lock_path = source_dir.join(".lock");
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .map_err(io_error("open", &lock_path))?;
+    match lock.try_lock() {
+        Ok(()) => Ok(SourceLock { _file: lock }),
+        Err(TryLockError::WouldBlock) => Err(RawStoreError::Locked(format!(
+            "another writer holds source {source} in {}",
+            root.display()
+        ))),
+        Err(TryLockError::Error(error)) => Err(io_error("lock", &lock_path)(error)),
+    }
+}
+
+impl SourceLock {
+    /// The locked file, for a writer that releases it explicitly.
+    pub(crate) fn into_file(self) -> File {
+        self._file
+    }
+}
+
 /// What one remove pass over one source did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RemovalReport {

@@ -93,3 +93,89 @@ fn aw11_a_pass_between_the_snapshot_and_the_first_append_keeps_every_chain_valid
     );
     assert_eq!(report.problems, Vec::<String>::new(), "{report:?}");
 }
+
+/// Sets `path`'s mtime to `ms` since the epoch, making it writable first.
+pub(crate) fn set_mtime(path: &Path, ms: i64) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o644)).unwrap();
+    let time = UNIX_EPOCH + std::time::Duration::from_millis(ms as u64);
+    fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(time)
+        .unwrap();
+}
+
+/// Flips one byte of `path`, making it writable first.
+pub(crate) fn flip_byte(path: &Path, offset: usize) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o644)).unwrap();
+    let mut bytes = fs::read(path).unwrap();
+    bytes[offset] ^= 0x01;
+    fs::write(path, bytes).unwrap();
+}
+
+/// #210 C4, with G = 600 000 ms: a supersede record whose mtime on hot is
+/// now − 599 999 is not checked; now − 600 000 and now + 1 are; a flipped
+/// byte is `entry`, an absent copy `missing`. A superseded E0 that differs
+/// on a target gets no finding, and an earlier open finding about it
+/// closes.
+#[test]
+fn verify_checks_supersede_records_and_skips_superseded_entries() {
+    let fixture = Fixture::new("verify-supersede");
+    let [e0, s1, _] = fixture.supersede(true);
+    assert_eq!(fixture.pass().problems, Vec::<String>::new());
+    let hot_s1 = fixture.dir.0.join("ledger").join(&s1);
+    let cold_a = |name: &str| fixture.cold[0].join(".mie/import-ledger").join(name);
+    flip_byte(&cold_a(&s1), 3);
+    // A superseded E0 that differs on cold-a, with an open finding.
+    let e0_copy = cold_a(&e0);
+    fs::write(&e0_copy, b"another E0\n").unwrap();
+    let now = D0 + 10 * 3_600_000;
+    CopyLedger::at(&fixture.hot)
+        .append(&Record {
+            at_ms: now - 1,
+            kind: Kind::Finding {
+                root: "cold-a".to_owned(),
+                code: FindingCode::Entry,
+                subject: Subject::Entry(e0.clone()),
+            },
+        })
+        .unwrap();
+    let verify = |now: i64| {
+        run(
+            &fixture.config,
+            Some(&fixture.archive()),
+            "24",
+            &fixture.probe,
+            &|| now,
+            &CopyLedger::at(&fixture.hot),
+        )
+    };
+    let about = |report: &VerifyReport, name: &str, what: &str| {
+        report
+            .problems
+            .iter()
+            .any(|p| p.contains(name) && p.contains(what))
+    };
+    set_mtime(&hot_s1, now - 599_999);
+    let report = verify(now);
+    assert!(!about(&report, &s1, "import entry"), "{report:?}");
+    assert!(
+        !report.problems.iter().any(|p| p.contains(&e0)),
+        "{report:?}"
+    );
+    let ledger = copy_ledger::read(&fixture.hot).unwrap().unwrap();
+    let state = CopyState::fold(&ledger).unwrap();
+    assert!(state.open_entry_findings("cold-a").is_empty());
+    for (at, offset) in [(now + 1, -600_000), (now + 2, 1)] {
+        set_mtime(&hot_s1, at + offset);
+        let report = verify(at);
+        assert!(about(&report, &s1, "entry: the copy differs"), "{report:?}");
+    }
+    fs::remove_file(cold_a(&s1)).unwrap();
+    set_mtime(&hot_s1, now - 600_000);
+    let report = verify(now + 3);
+    assert!(about(&report, &s1, "missing"), "{report:?}");
+}

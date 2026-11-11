@@ -6,9 +6,9 @@
 Relation to earlier ADRs: this ADR supersedes one point of ADR-034 D4:
 an archive file's import entry can be superseded by a later one (D11,
 *Held archive parts and their resolution*), where ADR-034 D4 has exactly
-one immutable entry per archive file. ADR-034 keeps its status line until
-the follow-up PR that implements this changes the importer, as ADR-052
-does for the ADRs it supersedes. It builds on ADR-030 (the immutable raw
+one immutable entry per archive file. ADR-034's status line records it
+since #210, the PR that changed the importer, as ADR-052 does for the ADRs
+it supersedes. It builds on ADR-030 (the immutable raw
 store and its dataset version), ADR-032 D5 and D10 (the seed lookback,
 the seal cadence), ADR-039 (replay over the raw store) and ADR-052 (the
 history chain from a fixed origin). The CLAUDE.md invariant 4,
@@ -921,8 +921,10 @@ live in more than one root (approved as written at STOP 1).
      starting ledger copy, every capture journal's `sealed` records
      and `recovery` `rolled_forward` paths (live files), and every
      import ledger entry's `file` lines (archive files, with their
-     SHA-256). For each archive file only its **latest entry that no
-     supersede record names** counts; files listed only by a
+     SHA-256). For each archive file only its **current entry**
+     counts: the entry of the highest generation at or above the
+     highest supersede generation over hot and the copy targets (D11
+     *As implemented (#210)*, G4); files listed only by a
      superseded entry are expected in quarantine (step 5a), never
      lost. The journals and the import ledger, entries and supersede
      records alike, are k-copied too (D11). A path any of them names
@@ -1066,9 +1068,26 @@ live in more than one root (approved as written at STOP 1).
     writes the holds (re-review 2 of #209). The conflict
     reasons come from positive evidence (two texts, two entry copies) and
     are always written. A `PENDING` that
-    cannot be read or parsed exempts nothing. A hold the start carries
-    that the sources no longer derive stays held and is named: no record
-    clears a hold before #194.
+    cannot be read or parsed exempts nothing. "New" means no open hold:
+    a start hold already cleared (`hold`, then `hold-cleared`) that the
+    sources derive again gets a new `hold`.
+  - **B7′ Leftover start holds** (#210, replacing #193's "stays held
+    until #194"). A start hold that the sources no longer derive is
+    cleared with `hold-cleared <path> readmit` only on positive evidence:
+    the path's archive file has a current entry listing it with the
+    SHA-256 of its one manifest text, and the start reason is `unlisted`,
+    or `entry-conflict` with that entry of generation ≥ 1 (written by a
+    resolve). Every other start hold stays held and is named: a
+    `manifest-conflict`, or an `entry-conflict` whose generation-0 copies
+    merely agree now. Why: step 5a promises the same holds from a full,
+    a stale and an empty start, and a stale copy that ends between the
+    rebuild's `hold` records and the resolve's `hold-cleared` records
+    would otherwise keep the parts held while the other two starts do
+    not. Why positive evidence only: clearing because a conflicting copy
+    is absent (an emptied or unmounted import-ledger directory on a
+    target) would admit parts on an absence, the class #193 STOP 1 put
+    behind an explicit flag; the import ledger is immutable and
+    replicated, and every clear is printed.
   - **B8 Removed (step 5).** A partition with a verified copy on a cold
     root and no `date=` directory on hot (a removal's hidden leftover is
     none) is recorded `removed` unless the start already says so. One
@@ -1079,7 +1098,7 @@ live in more than one root (approved as written at STOP 1).
     to finish.
   - **B9 Install (step 6).** Records per path in path order (`manifest`,
     then `copy` per target in configuration order), then `lost`,
-    `removed` and `hold`, each in path order, all with the run's one
+    `removed`, `hold` and `hold-cleared` (B7′), each in path order, all with the run's one
     `at_ms`: equal inputs give byte-identical ledgers. Every root's marker
     is re-read first (a mount lost during the listing reads as absent
     files, and `lost` cannot be undone). Then hot's ledger, if any, is
@@ -1110,7 +1129,8 @@ live in more than one root (approved as written at STOP 1).
     was written (a run can still install nothing): only the lines after
     the install, ending with `wrote …`, report writes (re-review 2 of
     #209); `PASS` and exit 0 only
-    with the ledger written and no `FAIL:` line (no lost file, hold,
+    with the ledger written and no `FAIL:` line (a start hold B7′ clears
+    is a report line, not a `FAIL:`; no lost file, hold,
     damaged copy, hot-window removal, leftover start hold or differing
     entry copy), as `mie store repair` does.
   - **Cost.** The rebuild reads every copy on every root once, as one
@@ -1572,7 +1592,7 @@ What breaks:
   replicated only once the `.import` entry that lists it exists on hot,
   and per archive file the pass copies its parts, then its entry: an entry
   goes to a copy target only once every part it lists has a copy record
-  for that target, and an archive part only once an entry on hot lists it
+  for that target, and an archive part only once a current entry on hot (#210 G4) lists it
   with its manifest's SHA-256 (another SHA-256 is `Integrity`, and the
   part is not copied). Whether an entry is already on a target is read
   from one listing of the target's entry directory, never by re-reading
@@ -1771,12 +1791,113 @@ What breaks:
     run included) refuses while any hold is open, right after its
     copy-ledger refusal and folded from that same ledger read, so it
     costs no I/O: the message names the count, the first held path in
-    path order, its reason and the resolution `mie store resolve` (#194).
+    path order, its reason and the resolution `mie store resolve` (#210).
     The checks of step 5 are one pure function shared by the rebuild
     (D7 step 5a) and the hot restore, which passes no `PENDING`; a part
     that qualifies for several reasons gets one, `manifest-conflict` >
     `entry-conflict` > `unlisted`. The rebuild writes a new `unlisted`
     hold only with `--record-unlisted` (D7 *As implemented* B7).
+
+  - **As implemented (#210): re-admit, supersede records and `mie store
+    resolve`.** The replace path, quarantine renames, the `.quarantine/`
+    part of rebuild step 5a and AW12 are #211; the hot restore is #195,
+    and it must take the archive source's writer lock too (RA1). The
+    rules, as numbered in the #210 plan (the tests cite them):
+    - **G1 Names.** In `<import ledger>/<raw stream>/`, with F the archive
+      file name: `F.import` is the entry of generation 0 (every existing
+      entry keeps its name and bytes), `F.<n>.import` the entry of
+      generation n, `F.<n>.supersede.import` the supersede record of
+      generation n; n is a canonical decimal from 1 to 4 294 967 295. Any
+      other name ending in `.import` and not starting with `.` is
+      malformed, an error that names it, never skipped. Why `.import`
+      everywhere: the `entry:<segment>/<name>.import` subject and the
+      `replaced` record accept these names unchanged, so the copy-ledger
+      grammar stays `mie-copy-ledger 1`. Rejected, a `.supersede`
+      extension: a closed-grammar change, header v2 under every ledger.
+    - **G2 The supersede record**: `mie-archive-supersede 1`, then
+      `archive`, `stream`, `period`, one `entry <segment>/<name> <sha256>`
+      per distinct (entry, SHA-256) of the superseded generation over hot
+      and every copy target (sorted, unique, each an entry of the same F;
+      none when F had no entry), and `quarantine -`, or `quarantine <id>`
+      with one or more sorted `moved <path>` lines (T8b's form). The
+      parser accepts only what the renderer writes (printable ASCII, keys
+      in order). It is written like an entry: temp file, fsync, rename,
+      directory fsync, read-only, never replaced.
+    - **G3 Binding.** From generation 1 on, an entry and every record
+      must name their own archive file and directory; generation-0
+      entries keep the rules of ADR-034, so nothing written before #210
+      gets a new refusal.
+    - **G4 The current entry** of F: with m the highest supersede
+      generation (0 without one), the entry of the highest generation g ≥
+      m; without one F reads as not imported. Supersession goes by
+      generation, never by the `entry` lines, which are the evidence of
+      the superseded bytes, so a variant the record never saw (a target
+      unmounted at resolve time) is superseded too.
+    - **G5** The importer's ledger directory reads and lists current
+      entries, writes an entry at generation m and a record only above
+      every generation, each once.
+    - **C1–C7** A superseded entry counts as absent for the importer
+      (fresh import, entry at generation m), `mie archive-verify`,
+      replication (supersede records copied like entries without a part
+      gate; superseded entries never copied and authorizing no part; an
+      archive file with a malformed, unreadable or unbound file fails
+      closed), the verification, the repair, the adoption (a source
+      holding a record or a generation ≥ 1 is refused: only resolve writes
+      them, on a tiered store) and the rebuild (step 4 above; B7′).
+    - **RA0–RA2** `mie store resolve --config <ingest config>
+      [--archive-config <path>] [--file <archive path>]`. Refused with
+      nothing written: an empty `cold_roots`, a hot without its marker, no
+      or another store's archive configuration, a missing copy ledger, a
+      copy target without a readable marker, one id on two roots, two
+      roots on one device. Then one lock: the archive source's writer
+      lock, without waiting, created when absent (one function shared with
+      the writer's open path). It excludes the importer, the rebuild and a
+      second resolve; created, so two resolves can never both see "no
+      lock". The copy-ledger lock is taken per append only, because `mie
+      ingest`'s remover appends from the seal path and a whole-run hold
+      would stall the capture for a download.
+    - **RA3 Proposals.** A held part is proposed the file of its stream
+      and ordering times: `metrics` the day of t − 300 000 ms, `fundingRate`
+      the month, every other stream the day of t; a part whose first and
+      last times map to two files gets none. `--file` must equal one
+      catalog archive path exactly.
+    - **RA4 Attribution.** parts(F) are the open holds proposing F.
+      Refused: none; a `manifest-conflict` hold (operator, #210 STOP 1
+      decision 1: re-admit never chooses between two sealed files under
+      one path; with the wrong copy on hot every `select` would keep
+      failing with D5 after the clearing); a part without a manifest;
+      hot's text differing from the ledger's; a `PENDING` naming F.
+    - **RA5 The plan**, over F's files on hot and the targets: (a) none,
+      write `F.import`; (b) a supersede generation m above every entry, an
+      interrupted re-admit: write E_m (a record with a quarantine id is a
+      pending replace, #211); (c) the latest entry, in one variant, lists
+      every held part with its manifest's rows and SHA-256 and every other
+      path it lists is ordinary: write nothing but the clearing; (d)
+      otherwise write S_n naming every variant of the latest entry, then
+      E_n, n = 1 + the highest generation. A malformed or unparseable file
+      of F, a file on the targets only and differing record copies are
+      refused, naming `mie store verify` and `mie store repair`. No orphan
+      is left behind: a path a superseded variant lists that is not held
+      for F must be on no root and unrecorded, otherwise the run is
+      refused; an unheld path no root holds is named.
+    - **RA6 The row check** downloads F with the importer's fetch policy
+      (the zip is removed in every outcome), validates it with the
+      importer's own per-row function, and compares positionally per UTC
+      day: the held parts dated d, in path order and record order, equal
+      the file's rows of day d in file order, every row counted both ways.
+      Parts are read through the tiered store, each copy verified against
+      its manifest. A match yields the entry the importer would write for
+      the same parts, byte for byte.
+    - **RA7 Writes**, in order: S_n, the entry, one `hold-cleared <path>
+      readmit` per part with one `at_ms`. Why: the fold takes
+      `hold-cleared readmit` as proof and lists the part at once, so the
+      entry listing it must exist first, as D7 orders `replaced` after the
+      re-import's entry; S_n precedes E_n as in the replace, so one resume
+      rule serves both. After S_n a re-run takes (b), after the entry (c);
+      in every state a `select` covering a still-held part fails, never
+      shorter.
+    - **RA8** A difference names the first differing row, writes nothing
+      and keeps the hold.
 
   Why a restore and not "the capture continues": on an empty hot the
   writer numbers new parts from `part-00000` under paths that cold
@@ -1881,10 +2002,12 @@ What breaks:
       other file (data matching its own differing manifest) is `manifest`
       with D5's wording, two sealed files under one path. k: an ordinary
       path without a `copy` record for the target is `copies`, except an
-      archive part no hot entry lists yet and a file on hot whose data
-      mtime lies within G before now. Entries: each hot entry whose parts
-      all have `copy` records for the target older than G, byte for byte
-      (`missing entry:<e>`, `entry`). Copy ledger: absent while S holds a
+      archive part no current hot entry lists yet and a file on hot whose
+      data mtime lies within G before now. Entries: each current hot entry
+      whose parts all have `copy` records for the target older than G,
+      and each supersede record whose mtime on hot lies outside G before
+      now (#210 C4), byte for byte (`missing entry:<e>`, `entry`); a
+      superseded entry is not checked. Copy ledger: absent while S holds a
       `ledger-copy` record for the target is `missing`; then `chain`,
       naming the record and its byte; then `prefix` for complete records
       that run past hot's verified prefix or differ from hot's by one
@@ -2028,8 +2151,10 @@ What breaks:
     - **R8** An entry copy with an open entry finding is replaced from hot
       only when hot's entry lists every file with the SHA-256 of the
       ledger's `manifest` record (else hot's manifest); otherwise it is an
-      entry conflict for the hold resolution (#194). An absent copy is
-      left to the closing pass.
+      entry conflict for the hold resolution (`mie store resolve`). An
+      absent copy is left to the closing pass. A supersede record's copy is
+      replaced from hot when hot's record parses and passes G3; a finding
+      on a superseded entry is one line, not a problem (#210 C5).
     - **R9 The lost-file rule as implemented** (operator, #192 STOP 1
       decision 1). A path with no good source is reported lost only when
       every root the ledger records a copy of it on presents its marker
@@ -2091,6 +2216,10 @@ What breaks:
 | Initial copy-device sizes | D10 | year 1, week-weighted: 273.9 + 2.6 + 51.0 + 15.8 + 3.7 = 347 GB; busiest: 411.1 + 6.1 + 51.0 + 15.8 + 3.7 = 488 GB. Later years: 273.9 + 2.6 + 15.8 = 292 GB; 411.1 + 6.1 + 15.8 = 433 GB | See D10 *What breaks* |
 | O (cold-outage days) | Operator input at provisioning | lower bound: the longest cold outage the operator expects to repair (a NAS reboot, a disk swap); upper bound: what hot can hold, (hot − reserve − (Σ r_s + a) × H − J × t) / (Σ r_s + a) | Too small: an outage longer than O fills hot and stops the capture (D10). Larger: more hot disk, and O is also the longest single-copy window (D11) |
 | P (verification period) | Operator input at provisioning | lower bound: bytes on the largest copy device / slowest root's measured read throughput | Below the lower bound a pass cannot finish. Larger: a damaged copy stays unnoticed longer, a window with one good copy at k = 2 (D11) |
+| Generation 1 … 4 294 967 295 (`u32`) | #210 G1 | the generation's range; each superseding resolve of a file adds one generation, so a file would need 4 294 967 295 resolves to reach it | Below 1: `F.0.import` would alias `F.import`. Wrapping past the bound would name the first entry again, so the next generation is refused instead |
+| `metrics` proposal shift 300 000 ms | ADR-034 D3 (`METRICS_RESOLUTION_MS`) | ordering = `create_time` + 300 000 ms, so t − 300 000 ms recovers the create time's day | 0: the 23:55 sample, ordered at the next midnight, is proposed for the next day's file and its re-admit fails. Another value misattributes other boundary samples; a wrong proposal only fails the check |
+| Supersede records exempt for G = 600 000 ms on hot | V8: 2 × `seal_interval_secs` (300 s) | a record has no part to age, so its own mtime on hot gives the replicator the same two intervals a part gets | Shorter: a record written just before a pass is checked before the pass copied it, a false `missing`. Longer: a damaged copy stays unnoticed for longer. A future mtime is never exempt |
+| ≤ 3 parts in memory during a re-admit | `RotationPolicy` defaults (1 000 000 rows, 128 MiB payload per part); the importer's orphan window | one part per day cursor; a daily file touches its day ± 1 | More days per file (a monthly `fundingRate` file, ≤ 33 days of a few rows each) stay small; a larger part limit raises the memory bound linearly |
 | Origin 2025-10-01 | ADR-052 D1 | — | Why growth has no bound: nothing before the origin can be deleted while it holds (Consequences) |
 
 ### Out of scope
