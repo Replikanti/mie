@@ -17,7 +17,10 @@
 //! - [`check_sealed_copy`]: the verification's classification of one copy
 //!   against the copy ledger's manifest text (#192);
 //! - [`move_aside`], [`rebuild_prefix`]: the repair's move of a damaged
-//!   copy into `.mie/damaged/` and its rebuild of a tail copy (#192);
+//!   copy into `.mie/damaged/` and its rebuild of a tail copy (#192); the
+//!   replace's move of a superseded part into [`quarantine_dir`] (#211);
+//! - [`list_quarantine`]: a root's `.quarantine/` directory, as the
+//!   rebuild reads it (ADR-062 D7 step 5a, #211);
 //! - [`first_difference`], [`line_start`]: where a tail copy first differs
 //!   from hot's file, and where the line holding a byte starts;
 //! - [`try_verify_lock`]: the verification lock on hot (#192).
@@ -1257,14 +1260,16 @@ pub fn damaged_dir(root: &Path, at_ms: i64) -> PathBuf {
 }
 
 /// Moves the copy of the sealed part `data_path` on `root` aside into
-/// `aside` (a [`damaged_dir`] of the same root, so the same filesystem and
-/// atomic renames), under the same relative path, and returns the names
-/// moved (#192 R5). The data file goes first, then its manifest, then the
-/// seal temp names of the path: a concurrent `read` skips a root without
-/// the data, and a crash after the first rename leaves a manifest without
+/// `aside` (a [`damaged_dir`] or a [`quarantine_dir`] of the same root, so
+/// the same filesystem and atomic renames), under the same relative path,
+/// and returns the names moved (#192 R5, #211 W3). The data file goes
+/// first, then its manifest, then the seal temp names of the path: a
+/// concurrent `read` skips a root without the data, and a crash after the first rename leaves a manifest without
 /// data, which the verification reports as `missing` and the next repair
 /// completes. Every rename refuses to replace; the directories are
-/// fsynced. A name that does not exist is skipped.
+/// fsynced. A name that does not exist is skipped, so a re-run completes
+/// a part whose data moved and whose manifest did not; a name present both
+/// in the layout and in `aside` is `Integrity` and nothing is overwritten.
 ///
 /// # Errors
 ///
@@ -1326,6 +1331,106 @@ pub fn move_file_aside(path: &Path, aside: &Path) -> Result<bool, RawStoreError>
     sync_dir(aside_dir)?;
     sync_dir(dir)?;
     Ok(true)
+}
+
+/// The directory below every root that holds the quarantined parts of a
+/// replace (ADR-062 D11): outside the layout, so `select`, recovery and
+/// every walk of the layout skip it, and never deleted by mie.
+pub const QUARANTINE_DIR: &str = ".quarantine";
+
+/// The directory the replace with quarantine id `id` moves the parts of
+/// `root` into: `<root>/.quarantine/<id>` (ADR-062 D11, #211 W3). The
+/// parts keep their relative path below it.
+pub fn quarantine_dir(root: &Path, id: &str) -> PathBuf {
+    root.join(QUARANTINE_DIR).join(id)
+}
+
+/// One part found in a quarantine directory.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QuarantinedCopy {
+    /// Its manifest's text when the manifest is there and is UTF-8; it is
+    /// not parsed here.
+    pub text: Option<String>,
+    /// Whether its data file is there. The data is never read: quarantined
+    /// bytes are evidence.
+    pub data: bool,
+}
+
+/// A root's `.quarantine/` directory (ADR-062 D7 step 5a, #211 Q1).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QuarantineListing {
+    /// Per id directory whose name is a valid segment, the parts below it
+    /// by data path.
+    pub ids:
+        std::collections::BTreeMap<String, std::collections::BTreeMap<String, QuarantinedCopy>>,
+    /// The names in `.quarantine/` that are no valid segment (a look-alike
+    /// hyphen, a trailing blank, a zero-width character): reported, and
+    /// they count for nothing.
+    pub bad_names: Vec<String>,
+}
+
+/// Lists the quarantine directory of `root` (#211 Q1): every id directory
+/// and below it every part of the layout, with its manifest text or its
+/// data alone. A missing `.quarantine/` is empty. Seal temp names and
+/// names outside the layout are skipped.
+///
+/// # Errors
+///
+/// [`RawStoreError::Integrity`] when `.quarantine` exists and is no
+/// directory (a symlink included); [`RawStoreError::Io`] when a directory
+/// or a manifest cannot be read: a skipped directory would read as parts
+/// gone.
+pub fn list_quarantine(root: &Path) -> Result<QuarantineListing, RawStoreError> {
+    let dir = root.join(QUARANTINE_DIR);
+    match fs::symlink_metadata(&dir) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            return Err(RawStoreError::Integrity(format!(
+                "{} is no directory",
+                dir.display()
+            )));
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            return Ok(QuarantineListing::default());
+        }
+        Err(error) => return Err(io_error("inspect", &dir)(error)),
+    }
+    let mut listing = QuarantineListing::default();
+    for name in list_entries(&dir)?.unwrap_or_default() {
+        if validate_segment(&name).is_err() {
+            listing.bad_names.push(name);
+            continue;
+        }
+        let id_dir = dir.join(&name);
+        let mut found: Vec<(String, PartFile)> = Vec::new();
+        for_each_partition(&id_dir, |key, date, names| {
+            for entry in names {
+                if let Some((kind @ (PartFile::Data | PartFile::Manifest), part)) =
+                    PartFile::classify(entry)
+                {
+                    found.push((layout::file_path(key, date, PartFile::Data, part), kind));
+                }
+            }
+        })?;
+        let mut parts = std::collections::BTreeMap::new();
+        for (path, kind) in found {
+            let copy: &mut QuarantinedCopy = parts.entry(path.clone()).or_default();
+            match kind {
+                PartFile::Data => copy.data = true,
+                _ => {
+                    let (key, date, part) = layout::parse_data_path(&path)?;
+                    let manifest = layout::resolve(
+                        &id_dir,
+                        &layout::file_path(&key, &date, PartFile::Manifest, part),
+                    );
+                    let bytes = fs::read(&manifest).map_err(io_error("read", &manifest))?;
+                    copy.text = String::from_utf8(bytes).ok();
+                }
+            }
+        }
+        listing.ids.insert(name, parts);
+    }
+    Ok(listing)
 }
 
 /// The first byte in `[0, len)` where the file `copy` differs from

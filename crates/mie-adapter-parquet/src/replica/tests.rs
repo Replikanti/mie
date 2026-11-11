@@ -711,6 +711,77 @@ fn move_aside_keeps_the_bytes_data_first() {
     ));
 }
 
+/// #211: the quarantine move completes a half-moved part (data moved, the
+/// manifest not) and never overwrites a quarantined copy; the listing
+/// reads every id directory, names a bad id and refuses a `.quarantine`
+/// that is no directory.
+#[test]
+fn quarantine_moves_and_listing() {
+    let fixture = TieredFixture::new("replica-quarantine");
+    let (path, partition) = first_part(&fixture);
+    let hot = &fixture.hot;
+    let text = fs::read_to_string(layout::resolve(
+        hot,
+        &format!("{}.manifest", path.strip_suffix(".parquet").unwrap()),
+    ))
+    .unwrap();
+    let dir = quarantine_dir(hot, "q-7");
+    assert!(dir.ends_with(".quarantine/q-7"));
+    // A stop after the data's rename: the manifest is still in place.
+    let part = layout::parse_data_path(&path).unwrap().2;
+    let data = layout::resolve(hot, &partition).join(PartFile::Data.name(part));
+    let dest = layout::resolve(&dir, &partition);
+    fs::create_dir_all(&dest).unwrap();
+    fs::rename(&data, dest.join(PartFile::Data.name(part))).unwrap();
+    let listing = list_quarantine(hot).unwrap();
+    assert_eq!(
+        listing.ids["q-7"][&path],
+        QuarantinedCopy {
+            text: None,
+            data: true
+        }
+    );
+    // The resume completes it.
+    let moved = move_aside(hot, &path, &dir).unwrap();
+    assert_eq!(
+        moved,
+        vec![format!("{partition}/{}", PartFile::Manifest.name(part))]
+    );
+    let listing = list_quarantine(hot).unwrap();
+    assert_eq!(
+        listing.ids["q-7"][&path],
+        QuarantinedCopy {
+            text: Some(text),
+            data: true
+        }
+    );
+    // A name in both places: `Integrity`, nothing overwritten.
+    let before = partition_files(&dir, &partition);
+    fs::create_dir_all(layout::resolve(hot, &partition)).unwrap();
+    fs::write(data.clone(), b"another").unwrap();
+    assert!(matches!(
+        move_aside(hot, &path, &dir),
+        Err(RawStoreError::Integrity(_))
+    ));
+    assert_eq!(partition_files(&dir, &partition), before);
+    assert_eq!(fs::read(&data).unwrap(), b"another");
+    // Bad ids are named and count for nothing.
+    for bad in ["q\u{2010}1", "q-1 ", "q\u{200b}-1"] {
+        fs::create_dir_all(hot.join(QUARANTINE_DIR).join(bad)).unwrap();
+    }
+    let listing = list_quarantine(hot).unwrap();
+    assert_eq!(listing.bad_names.len(), 3, "{listing:?}");
+    assert_eq!(listing.ids.keys().collect::<Vec<_>>(), vec!["q-7"]);
+    // A root without `.quarantine/` lists empty; a file there is refused.
+    let [a, _] = &fixture.cold;
+    assert_eq!(list_quarantine(a).unwrap(), QuarantineListing::default());
+    fs::write(a.join(QUARANTINE_DIR), b"").unwrap();
+    assert!(matches!(
+        list_quarantine(a),
+        Err(RawStoreError::Integrity(_))
+    ));
+}
+
 /// The first difference, the start of a line, and the rebuild of a tail
 /// copy, across a crash after either step.
 #[test]

@@ -216,6 +216,41 @@ impl ParquetRawStore {
     }
 }
 
+/// The importer's view of a store (ADR-062 D11, #211 I2): [`select`]
+/// treats a quarantined path whose replacement is pending, and that hot no
+/// longer lists, as absent instead of failing, so the re-import a replace
+/// waits for can run its orphan check over the quarantined parts' window.
+/// `read` is the store's. A single-root store has no quarantine and
+/// answers as [`ParquetRawStore`] does.
+///
+/// [`select`]: RawRecordSource::select
+#[derive(Debug, Clone, Copy)]
+pub struct ImportView<'a> {
+    store: &'a ParquetRawStore,
+}
+
+impl ParquetRawStore {
+    /// The importer's view of this store ([`ImportView`]). Only the
+    /// importer reads through it; every other reader keeps the strict
+    /// rule.
+    pub fn import_view(&self) -> ImportView<'_> {
+        ImportView { store: self }
+    }
+}
+
+impl RawRecordSource for ImportView<'_> {
+    fn select(&self, selection: &RawSelection) -> Result<RawDataset, RawStoreError> {
+        match &self.store.tiers {
+            None => self.store.select_hot(selection),
+            Some(_) => tiers::select_with(&self.store.root, selection, tiers::Mode::Import),
+        }
+    }
+
+    fn read(&self, file: &SealedFile) -> Result<Vec<RawRecord>, RawStoreError> {
+        self.store.read(file)
+    }
+}
+
 impl RawRecordSource for ParquetRawStore {
     fn select(&self, selection: &RawSelection) -> Result<RawDataset, RawStoreError> {
         match &self.tiers {

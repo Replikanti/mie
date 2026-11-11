@@ -414,6 +414,23 @@ pub fn current_generation(files: impl IntoIterator<Item = (u32, LedgerKind)>) ->
         .max()
 }
 
+/// The generation of the entry that replaces the quarantine of the
+/// supersede record of generation `record` (ADR-062 D11, #211 I3): the
+/// lowest entry generation g ≥ `record` among `files`. Not the current
+/// generation: a later record supersedes that entry in turn, and the
+/// paths `record` moved were replaced by the first entry written after it.
+/// `None` while no such entry exists.
+pub fn replacement_generation(
+    record: u32,
+    files: impl IntoIterator<Item = (u32, LedgerKind)>,
+) -> Option<u32> {
+    files
+        .into_iter()
+        .filter(|(generation, kind)| *kind == LedgerKind::Entry && *generation >= record)
+        .map(|(generation, _)| generation)
+        .min()
+}
+
 /// One superseded entry a supersede record names.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SupersededEntry {
@@ -693,6 +710,17 @@ pub fn classify(segment: &str, files: &[(LedgerName, Vec<u8>)]) -> Result<Classi
     })
 }
 
+/// One supersede record found by [`LedgerDir::supersede_records`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SupersedeOf {
+    /// Its raw stream's directory.
+    pub stream: ArchiveStream,
+    /// Its name.
+    pub name: LedgerName,
+    /// The record, or why it cannot be read, parsed or bound (G2, G3).
+    pub record: Result<SupersedeRecord, LedgerError>,
+}
+
 /// The ledger directory: ledgers per raw stream and the pending marker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LedgerDir {
@@ -958,6 +986,66 @@ impl LedgerDir {
         Ok(ledgers)
     }
 
+    /// Every supersede record of every archive stream, each stream's
+    /// directory listed once, in stream and name order (#211). A record
+    /// that cannot be read, parsed or bound is returned as its error, so
+    /// each caller decides whether it fails closed or names it. Names that
+    /// do not parse are skipped: they are no record, and the readers of
+    /// their archive file refuse them (G1).
+    ///
+    /// # Errors
+    ///
+    /// [`LedgerError`] when a directory cannot be listed.
+    pub fn supersede_records(&self) -> Result<Vec<SupersedeOf>, LedgerError> {
+        let mut found = Vec::new();
+        for stream in ArchiveStream::ALL {
+            let dir = self.root.join(stream.raw_name());
+            let entries = match fs::read_dir(&dir) {
+                Ok(entries) => entries,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(io("list", &dir)(e)),
+            };
+            let mut names = Vec::new();
+            for entry in entries {
+                let entry = entry.map_err(io("list", &dir))?;
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with('.') || !name.ends_with(SUFFIX) {
+                    continue;
+                }
+                if let Ok(parsed) = LedgerName::parse(&name)
+                    && parsed.kind == LedgerKind::Supersede
+                {
+                    names.push(parsed);
+                }
+            }
+            names.sort();
+            for name in names {
+                let path = dir.join(name.render());
+                let record = fs::read(&path)
+                    .map_err(io("read", &path))
+                    .and_then(|bytes| {
+                        String::from_utf8(bytes)
+                            .map_err(|_| LedgerError(format!("{}: not UTF-8", path.display())))
+                    })
+                    .and_then(|text| {
+                        SupersedeRecord::parse(&text)
+                            .map_err(|e| LedgerError(format!("{}: {}", path.display(), e.0)))
+                    })
+                    .and_then(|record| {
+                        check_binding(stream.raw_name(), &name, &record.archive, &record.stream)
+                            .map(|()| record)
+                    });
+                found.push(SupersedeOf {
+                    stream,
+                    name,
+                    record,
+                });
+            }
+        }
+        Ok(found)
+    }
+
     fn pending_path(&self) -> PathBuf {
         self.root.join(PENDING_FILE)
     }
@@ -1165,6 +1253,89 @@ mod tests {
         ] {
             assert_eq!(current_generation(files.clone()), current, "{files:?}");
         }
+    }
+
+    /// #211 I3: the entry that replaces a quarantine is the lowest entry
+    /// generation at or above the record's, never wrapping.
+    #[test]
+    fn replacement_generation_table() {
+        use LedgerKind::{Entry as E, Supersede as S};
+        for (files, record, replacement) in [
+            (vec![(0, E), (1, S)], 1, None),
+            (vec![(0, E), (1, S), (1, E)], 1, Some(1)),
+            (vec![(0, E), (1, S), (2, S), (2, E)], 1, Some(2)),
+            (vec![(0, E), (1, S), (2, S), (2, E)], 2, Some(2)),
+            (vec![(0, E), (1, S), (1, E), (2, S), (2, E)], 1, Some(1)),
+            (vec![(0, E), (1, S), (1, E), (2, S), (2, E)], 2, Some(2)),
+            (
+                vec![(0, E), (u32::MAX, S), (u32::MAX, E)],
+                u32::MAX,
+                Some(u32::MAX),
+            ),
+            (vec![], 1, None),
+        ] {
+            assert_eq!(
+                replacement_generation(record, files.clone()),
+                replacement,
+                "{files:?} S{record}"
+            );
+        }
+    }
+
+    /// #211 RQ4: a record moving paths on two dates renders and parses
+    /// back equal, and lists them sorted.
+    #[test]
+    fn supersede_record_with_moved_paths_round_trips() {
+        let moved = vec![
+            "source=binance-archive/instrument=BTCUSDT/stream=metrics/date=2026-10-03/part-00001.parquet".to_owned(),
+            "source=binance-archive/instrument=BTCUSDT/stream=metrics/date=2026-10-04/part-00000.parquet".to_owned(),
+        ];
+        let replace = SupersedeRecord {
+            entries: Vec::new(),
+            quarantine: Some(Quarantine {
+                id: "q-1791259200000".to_owned(),
+                moved: moved.clone(),
+            }),
+            ..record()
+        };
+        let text = replace.render();
+        assert_eq!(SupersedeRecord::parse(&text), Ok(replace));
+        let swapped = text
+            .replace(&moved[0], "X")
+            .replace(&moved[1], &moved[0])
+            .replace('X', &moved[1]);
+        assert!(SupersedeRecord::parse(&swapped).is_err(), "{swapped}");
+    }
+
+    /// #211: every record of every stream, a broken one as its error; a
+    /// malformed name and an entry are skipped.
+    #[test]
+    fn supersede_records_lists_every_stream_once() {
+        let dir = Dir::new("supersede-records");
+        let ledgers = LedgerDir::new(&dir.0);
+        let metrics = dir.0.join("metrics");
+        fs::create_dir_all(&metrics).unwrap();
+        fs::write(
+            metrics.join(format!("{F}.1.supersede.import")),
+            record().render(),
+        )
+        .unwrap();
+        fs::write(metrics.join(format!("{F}.2.supersede.import")), b"rotten\n").unwrap();
+        fs::write(metrics.join(format!("{F}.import")), b"entry\n").unwrap();
+        fs::write(metrics.join(format!("{F}.01.import")), b"malformed\n").unwrap();
+        let found = ledgers.supersede_records().unwrap();
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert_eq!(found[0].name, LedgerName::supersede(F, 1));
+        assert_eq!(found[0].record, Ok(record()));
+        assert_eq!(found[1].name, LedgerName::supersede(F, 2));
+        assert!(found[1].record.is_err());
+        assert!(found.iter().all(|f| f.stream == ArchiveStream::Metrics));
+        assert!(
+            LedgerDir::new(dir.0.join("none"))
+                .supersede_records()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     fn metrics_key() -> RawStreamKey {

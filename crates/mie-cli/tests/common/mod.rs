@@ -19,6 +19,7 @@ use std::time::Duration;
 
 pub mod bootstrap;
 pub mod clock;
+pub mod resolve;
 pub mod tapes;
 pub mod tiers;
 pub mod warm;
