@@ -26,12 +26,25 @@
 //! - **Precedence:** one reason per path, `manifest-conflict` >
 //!   `entry-conflict` > `unlisted`.
 //!
-//! Supersede records and the quarantine listings join these inputs with
-//! the hold resolution (#194).
+//! - **Generations** (ADR-062 D7 step 4, D11, proposed; #210 C7). The
+//!   union's names are grouped by archive file (`<segment>`, F). Only the
+//!   current generation's entry name (the highest entry generation at or
+//!   above the highest supersede generation, over hot and the targets)
+//!   goes through entry resolution; a superseded entry is no current
+//!   entry, no conflict and no source of lost files. Copies of one
+//!   supersede record that differ, or that do not parse, are named for
+//!   `mie store repair` (R8), and its generation still counts; a record on
+//!   the targets only counts and is named. A malformed name is named and
+//!   counts for nothing.
+//!
+//! The quarantine listings join these inputs with the replace resolution
+//! (#211).
 
 use mie_adapter_binance::archive::catalog::parse_day;
 use mie_adapter_binance::archive::import::orphan_days;
-use mie_adapter_binance::archive::ledger::{ImportLedger, Pending};
+use mie_adapter_binance::archive::ledger::{
+    ImportLedger, LedgerKind, LedgerName, Pending, SupersedeRecord, current_generation,
+};
 use mie_adapter_parquet::copy_ledger::HoldReason;
 use mie_adapter_parquet::replica;
 use mie_ports::raw::RawStreamKey;
@@ -93,8 +106,39 @@ pub struct ArchiveFindings {
 pub fn check(inputs: &ArchiveInputs) -> ArchiveFindings {
     let mut found = ArchiveFindings::default();
     let mut conflicting: BTreeSet<String> = BTreeSet::new();
-    for (name, copies) in &inputs.entries {
-        resolve(name, copies, inputs, &mut found, &mut conflicting);
+    // Per (segment, archive file): every name with its generation and kind.
+    let mut files: BTreeMap<(&str, String), Vec<(LedgerName, &str)>> = BTreeMap::new();
+    for name in inputs.entries.keys() {
+        let parsed = name
+            .split_once('/')
+            .ok_or_else(|| format!("{name:?} has no segment"))
+            .and_then(|(segment, file)| {
+                LedgerName::parse(file)
+                    .map(|parsed| (segment, parsed))
+                    .map_err(|e| e.to_string())
+            });
+        match parsed {
+            Ok((segment, parsed)) => files
+                .entry((segment, parsed.file.clone()))
+                .or_default()
+                .push((parsed, name.as_str())),
+            Err(error) => found.problems.push(format!(
+                "import-ledger file {name}: {error}; it counts for nothing (ADR-062 D11)"
+            )),
+        }
+    }
+    for names in files.values() {
+        let current = current_generation(names.iter().map(|(n, _)| (n.generation, n.kind)));
+        for (parsed, name) in names {
+            let copies = &inputs.entries[*name];
+            match parsed.kind {
+                LedgerKind::Supersede => check_record(name, copies, &mut found),
+                LedgerKind::Entry if Some(parsed.generation) == current => {
+                    resolve(name, copies, inputs, &mut found, &mut conflicting);
+                }
+                LedgerKind::Entry => {}
+            }
+        }
     }
     let listed: BTreeSet<&str> = found
         .current
@@ -145,6 +189,55 @@ pub fn check(inputs: &ArchiveInputs) -> ArchiveFindings {
         }
     }
     found
+}
+
+/// A supersede record's copies: named when they are not on hot, differ or
+/// do not parse. Its generation counts whatever its bytes (G4 goes by
+/// names).
+fn check_record(name: &str, copies: &[EntryCopy], found: &mut ArchiveFindings) {
+    if copies.is_empty() {
+        return;
+    }
+    if !copies.iter().any(|copy| copy.root == "hot") {
+        let roots: Vec<&str> = copies.iter().map(|copy| copy.root.as_str()).collect();
+        found.problems.push(format!(
+            "supersede record {name}: on {} only, not on hot, where the importer reads it; it \
+             counts (ADR-062 D11)",
+            roots.join(", ")
+        ));
+    }
+    let mut variants: Vec<&[u8]> = copies.iter().map(|copy| copy.bytes.as_slice()).collect();
+    variants.sort_unstable();
+    variants.dedup();
+    if variants.len() > 1 {
+        let roots: Vec<String> = copies
+            .iter()
+            .map(|copy| {
+                let variant = variants
+                    .iter()
+                    .position(|v| *v == copy.bytes.as_slice())
+                    .unwrap_or(0);
+                format!("{} (variant {})", copy.root, variant + 1)
+            })
+            .collect();
+        found.problems.push(format!(
+            "supersede record {name}: its copies differ ({}); `mie store repair` replaces a \
+             damaged copy from hot (R8), and its generation still counts (ADR-062 D11)",
+            roots.join(", ")
+        ));
+    }
+    for copy in copies {
+        let parses = std::str::from_utf8(&copy.bytes)
+            .ok()
+            .is_some_and(|text| SupersedeRecord::parse(text).is_ok());
+        if !parses {
+            found.problems.push(format!(
+                "supersede record {name} on {}: it does not parse; its generation still counts \
+                 (ADR-062 D11)",
+                copy.root
+            ));
+        }
+    }
 }
 
 /// Entry resolution for the copies of `name`.

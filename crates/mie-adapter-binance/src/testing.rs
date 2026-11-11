@@ -55,6 +55,16 @@ impl MemorySource {
         self.files.push((file, records));
     }
 
+    /// The number of files sealed.
+    pub(crate) fn file_count(&self) -> usize {
+        self.files.len()
+    }
+
+    /// The path of the `index`-th file sealed.
+    pub(crate) fn path_at(&self, index: usize) -> String {
+        self.files[index].0.relative_path.clone()
+    }
+
     /// The manifest of the file at `path`.
     pub(crate) fn file(&self, path: &str) -> SealedFile {
         self.files

@@ -2,7 +2,7 @@
 //! the journal read (B1).
 
 use super::*;
-use crate::store::archive_checks::tests::{NAME, entry, part, sha, text};
+use crate::store::archive_checks::tests::{E1, NAME, S1, entry, part, sha, supersede, text};
 use mie_adapter_parquet::copy_ledger::{FindingCode, LedgerBuilder, Subject};
 
 /// The run's `at_ms`: 2026-10-06T03:00:00Z.
@@ -609,37 +609,128 @@ fn a_path_the_start_records_lost_stays_lost() {
     assert_problem(&derived, &[&path, "stays lost"]);
 }
 
-/// A hold the start carries that the sources no longer derive stays held
-/// (no clearing record exists before #194) and is named.
+/// B7′ (#210): a start hold the sources no longer derive is cleared only on
+/// positive evidence in the import ledger; every other one stays held and
+/// is named; a cleared hold the sources derive again gets a new `hold`.
 #[test]
-fn a_start_hold_the_sources_no_longer_derive_stays_held_and_is_named() {
+fn a_start_hold_is_cleared_only_on_positive_evidence() {
     let path = part("aggTrades", "2026-10-06", 0);
     let t = text(&path, &sha("a"));
-    let mut inputs = inputs();
-    on_hot(&mut inputs, &path, &t);
-    inputs.entries.insert(
-        "aggTrades/x.zip.import".to_owned(),
+    let listing = entry(&[(&path, &sha("a"))]);
+    let hot_copy = |bytes: &[u8]| {
         vec![EntryCopy {
             root: "hot".to_owned(),
-            bytes: entry(&[(&path, &sha("a"))]),
-        }],
+            bytes: bytes.to_vec(),
+        }]
+    };
+    let base = |reason: HoldReason, entries: &[(&str, Vec<EntryCopy>)]| {
+        let mut inputs = inputs();
+        on_hot(&mut inputs, &path, &t);
+        for (name, copies) in entries {
+            inputs.entries.insert((*name).to_owned(), copies.clone());
+        }
+        start_on(
+            &mut inputs,
+            0,
+            ledger(&[Kind::Hold {
+                path: path.clone(),
+                reason,
+            }]),
+        );
+        inputs
+    };
+    let held_after = |derived: &Derived| {
+        let rebuilt = copy_ledger::parse(Path::new("rebuilt"), &derived.ledger).unwrap();
+        CopyState::fold(&rebuilt).unwrap().hold_reason(&path)
+    };
+    let cleared = Kind::HoldCleared {
+        path: path.clone(),
+        resolution: Resolution::Readmit,
+    };
+
+    // An `unlisted` start hold with a current E0 listing it: cleared.
+    let derived = derive_ok(&base(HoldReason::Unlisted, &[(NAME, hot_copy(&listing))]));
+    assert_eq!(added(&derived), vec![cleared.clone()]);
+    assert!(
+        derived
+            .lines
+            .contains(&format!("hold-cleared {path} readmit")),
+        "{:?}",
+        derived.lines
     );
+    assert!(
+        !derived.problems.iter().any(|p| p.contains(&path)),
+        "{:?}",
+        derived.problems
+    );
+    assert_eq!(held_after(&derived), None);
+
+    // An `entry-conflict` start hold with E1 (written by a resolve) current:
+    // cleared.
+    let derived = derive_ok(&base(
+        HoldReason::EntryConflict,
+        &[
+            (NAME, hot_copy(&entry(&[(&path, &sha("other"))]))),
+            (S1, hot_copy(&supersede())),
+            (E1, hot_copy(&listing)),
+        ],
+    ));
+    assert_eq!(added(&derived), vec![cleared.clone()]);
+    assert_eq!(held_after(&derived), None);
+
+    // An `entry-conflict` start hold whose E0 copies merely agree now: it
+    // stays, named.
+    let derived = derive_ok(&base(
+        HoldReason::EntryConflict,
+        &[(NAME, hot_copy(&listing))],
+    ));
+    assert!(derived.added.is_empty(), "{:?}", derived.added);
+    assert_problem(&derived, &[&path, "stays held", "mie store resolve"]);
+    assert_eq!(held_after(&derived), Some(HoldReason::EntryConflict));
+
+    // A `manifest-conflict` start hold: it stays, even with a current entry.
+    let derived = derive_ok(&base(
+        HoldReason::ManifestConflict,
+        &[
+            (NAME, hot_copy(&entry(&[(&path, &sha("other"))]))),
+            (S1, hot_copy(&supersede())),
+            (E1, hot_copy(&listing)),
+        ],
+    ));
+    assert!(derived.added.is_empty(), "{:?}", derived.added);
+    assert_problem(&derived, &[&path, "stays held"]);
+    assert_eq!(held_after(&derived), Some(HoldReason::ManifestConflict));
+
+    // No entry at all: an absence never clears an `unlisted` hold. The
+    // sources derive it again, so it is no leftover either.
+    let derived = derive_ok(&base(HoldReason::Unlisted, &[]));
+    assert!(derived.added.is_empty(), "{:?}", derived.added);
+    assert_eq!(held_after(&derived), Some(HoldReason::Unlisted));
+
+    // A cleared start hold that the sources derive again: a new `hold`.
+    let mut inputs = inputs();
+    inputs.record_unlisted = true;
+    on_hot(&mut inputs, &path, &t);
     start_on(
         &mut inputs,
         0,
-        ledger(&[Kind::Hold {
-            path: path.clone(),
-            reason: HoldReason::Unlisted,
-        }]),
+        ledger(&[
+            Kind::Hold {
+                path: path.clone(),
+                reason: HoldReason::Unlisted,
+            },
+            cleared.clone(),
+        ]),
     );
     let derived = derive_ok(&inputs);
-    assert!(derived.added.is_empty(), "{:?}", derived.added);
-    assert_problem(&derived, &[&path, "stays held", "#194"]);
-    let rebuilt = copy_ledger::parse(Path::new("rebuilt"), &derived.ledger).unwrap();
     assert_eq!(
-        CopyState::fold(&rebuilt).unwrap().hold_reason(&path),
-        Some(HoldReason::Unlisted)
+        added(&derived),
+        vec![Kind::Hold {
+            path: path.clone(),
+            reason: HoldReason::Unlisted
+        }]
     );
+    assert_eq!(held_after(&derived), Some(HoldReason::Unlisted));
 }
 
 /// B8 at the hot window's first date (now 2026-11-10, first hot date

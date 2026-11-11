@@ -67,8 +67,11 @@
 //! - **R8 Entry copies with an open entry finding:** replaced from hot only
 //!   when hot's entry lists every file with the SHA-256 of the ledger's
 //!   `manifest` record (else hot's manifest); otherwise refused as an entry
-//!   conflict, for the hold resolution (#194). An absent copy is left to the
-//!   closing pass.
+//!   conflict, for the hold resolution (`mie store resolve`, ADR-062 D11).
+//!   An absent copy is left to the closing pass. A supersede record's copy
+//!   is replaced from hot when hot's record parses and names its own file
+//!   (it lists no part); a finding on a superseded entry is one line and no
+//!   problem, and the next verification closes it (#210 C5).
 //! - **R9 The lost-file rule:** a path with no good source, while every
 //!   root the ledger records a copy of it on presents its marker again at
 //!   that moment and every root tried was read without error, is reported
@@ -102,7 +105,7 @@ use mie_adapter_parquet::replica::{self, CopyCheck, CopyError, Side, TailSource}
 use mie_adapter_parquet::root_marker::{self, HOT_ID};
 use mie_adapter_parquet::verification::{CopyState, PathVerdict};
 use mie_ports::raw::RawStoreError;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{ErrorKind, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -218,6 +221,9 @@ struct Repair<'a> {
     /// Every cold root that presented its marker, in configuration order.
     marked: Vec<Marked>,
     entries: Vec<Entry>,
+    /// Every superseded entry, with the record that supersedes it (#210
+    /// C5).
+    superseded: BTreeMap<String, String>,
     /// The copy targets whose ledger copy R6 repaired (exempt from L2).
     cleared: BTreeSet<String>,
     /// The paths already judged by R9 in this run.
@@ -352,13 +358,13 @@ pub fn run(
     }
     report.problems.extend(skipped);
     let mut problems = Vec::new();
-    let entries = match &archive_config {
+    let (entries, superseded) = match &archive_config {
         Some(archive) => {
-            let (entries, entry_problems) = hot_entries(&archive.paths.import_ledger);
-            problems.extend(entry_problems);
-            entries
+            let found = hot_entries(&archive.paths.import_ledger);
+            problems.extend(found.problems);
+            (found.entries, found.superseded)
         }
-        None => Vec::new(),
+        None => (Vec::new(), BTreeMap::new()),
     };
     report.problems.extend(problems);
 
@@ -376,6 +382,7 @@ pub fn run(
         removed,
         marked,
         entries,
+        superseded,
         cleared: BTreeSet::new(),
         judged: BTreeSet::new(),
         report,
@@ -1201,6 +1208,13 @@ impl Repair<'_> {
             .join(IMPORT_LEDGER_DIR)
             .join(segment)
             .join(file_name);
+        if let Some(record) = self.superseded.get(entry) {
+            self.line(format!(
+                "import entry {entry} on {name}: superseded by {record}; not repaired; the next \
+                 verification closes the finding"
+            ));
+            return Ok(());
+        }
         let Some(hot_entry) = self.entries.iter().find(|e| e.name == entry) else {
             let why = if self.archive.is_none() {
                 "no archive configuration is given, so hot's entry is not read"
@@ -1256,8 +1270,8 @@ impl Repair<'_> {
             self.problem(format!(
                 "import entry {entry} on {name}: refused: hot's entry lists {} with another \
                  SHA-256 than the copy ledger's manifest record (else hot's manifest), so hot's \
-                 entry is no good source: an entry conflict, for the hold resolution (#194; \
-                 ADR-062 D11)",
+                 entry is no good source: an entry conflict, for the hold resolution (`mie store \
+                 resolve`; ADR-062 D11)",
                 wrong.join(", ")
             ));
             return Ok(());

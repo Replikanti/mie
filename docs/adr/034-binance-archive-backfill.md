@@ -1,6 +1,6 @@
 # ADR-034: Binance archive backfill — verbatim rows, per-file ledger, end-of-interval open interest
 
-- Status: accepted
+- Status: accepted; D4's single immutable entry per archive file is superseded at one point by ADR-062 D11 (a later entry can supersede it through a supersede record, #210)
 - Date: 2026-10-06
 - Amended: 2026-10-10 (#76)
 

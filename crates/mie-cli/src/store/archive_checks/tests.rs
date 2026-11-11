@@ -371,3 +371,128 @@ fn hold_reason_precedence() {
     });
     assert_eq!(held(&findings), vec![(c, HoldReason::EntryConflict)]);
 }
+
+pub(crate) const E1: &str = "aggTrades/BTCUSDT-aggTrades-2026-10-01.zip.1.import";
+pub(crate) const S1: &str = "aggTrades/BTCUSDT-aggTrades-2026-10-01.zip.1.supersede.import";
+
+/// A supersede record of the fixture's archive file, with no `entry` line.
+pub(crate) fn supersede() -> Vec<u8> {
+    format!(
+        "mie-archive-supersede 1\n\
+         archive data/futures/um/daily/aggTrades/BTCUSDT/BTCUSDT-aggTrades-2026-10-01.zip\n\
+         stream {AGG}\nperiod 2026-10-01\nquarantine -\n"
+    )
+    .into_bytes()
+}
+
+/// The copies of one name, as `(root, bytes)`.
+type Copies<'a> = &'a [(&'a str, &'a [u8])];
+
+/// #210 C7: only the current generation's entry goes through entry
+/// resolution; supersede records count by generation and are named when
+/// they are on the targets only or their copies differ.
+#[test]
+fn supersede_records_join_entry_resolution() {
+    let (a, b) = (
+        part("aggTrades", "2026-10-01", 0),
+        part("aggTrades", "2026-10-01", 1),
+    );
+    let parts = on_roots(&[a.clone(), b.clone()]);
+    let good = entry(&[(&a, &sha(&a)), (&b, &sha(&b))]);
+    let wrong = entry(&[(&a, &sha("other")), (&b, &sha(&b))]);
+    let wrong_too = entry(&[(&a, &sha("x")), (&b, &sha("y"))]);
+    let record = supersede();
+    let run = |entries: &[(&str, Copies<'_>)]| {
+        check(&ArchiveInputs {
+            entries: entries
+                .iter()
+                .map(|(name, list)| ((*name).to_owned(), copies(list)))
+                .collect(),
+            parts: parts.clone(),
+            pending: None,
+        })
+    };
+
+    // E0 variants that conflict, superseded by S1 and an identical E1:
+    // E1 is current, nothing is held, and E0 is no conflict.
+    let found = run(&[
+        (NAME, &[("hot", &wrong), ("cold-a", &wrong_too)]),
+        (S1, &[("hot", &record), ("cold-a", &record)]),
+        (E1, &[("hot", &good), ("cold-a", &good)]),
+    ]);
+    assert_eq!(held(&found), vec![]);
+    assert_eq!(found.current.keys().collect::<Vec<_>>(), vec![E1]);
+    assert_eq!(found.problems, Vec::<String>::new());
+
+    // E0 and S1 without E1: no current entry, the parts are unlisted.
+    let found = run(&[
+        (NAME, &[("hot", &good), ("cold-a", &good)]),
+        (S1, &[("hot", &record)]),
+    ]);
+    assert!(found.current.is_empty());
+    assert_eq!(
+        held(&found),
+        vec![
+            (a.clone(), HoldReason::Unlisted),
+            (b.clone(), HoldReason::Unlisted),
+        ]
+    );
+
+    // E1 variants that conflict: entry-conflict on E1's parts.
+    let found = run(&[
+        (NAME, &[("hot", &good)]),
+        (S1, &[("hot", &record)]),
+        (E1, &[("hot", &wrong), ("cold-a", &wrong_too)]),
+    ]);
+    assert_eq!(
+        held(&found),
+        vec![
+            (a.clone(), HoldReason::EntryConflict),
+            (b.clone(), HoldReason::EntryConflict),
+        ]
+    );
+    assert!(
+        found.problems.iter().any(|p| p.contains(E1)),
+        "{:?}",
+        found.problems
+    );
+
+    // A target-only S1 counts and is named.
+    let found = run(&[(NAME, &[("hot", &good)]), (S1, &[("cold-a", &record)])]);
+    assert!(found.current.is_empty());
+    assert_eq!(held(&found).len(), 2);
+    assert!(
+        found
+            .problems
+            .iter()
+            .any(|p| p.contains(S1) && p.contains("cold-a only")),
+        "{:?}",
+        found.problems
+    );
+
+    // Differing record copies are named; the generation still counts.
+    let found = run(&[
+        (NAME, &[("hot", &good)]),
+        (S1, &[("hot", &record), ("cold-a", b"damaged\n")]),
+        (E1, &[("hot", &good)]),
+    ]);
+    assert_eq!(found.current.keys().collect::<Vec<_>>(), vec![E1]);
+    assert!(
+        found
+            .problems
+            .iter()
+            .any(|p| p.contains(S1) && p.contains("differ")),
+        "{:?}",
+        found.problems
+    );
+
+    // A malformed name is named and counts for nothing.
+    let bad = "aggTrades/BTCUSDT-aggTrades-2026-10-01.zip.01.import";
+    let found = run(&[(NAME, &[("hot", &good)]), (bad, &[("hot", &good)])]);
+    assert_eq!(found.current.keys().collect::<Vec<_>>(), vec![NAME]);
+    assert!(
+        found.problems.iter().any(|p| p.contains(bad)),
+        "{:?}",
+        found.problems
+    );
+}

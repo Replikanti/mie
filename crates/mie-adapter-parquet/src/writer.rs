@@ -17,7 +17,7 @@ use mie_ports::raw::{
 use parquet::arrow::ArrowWriter;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File, OpenOptions, TryLockError};
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -283,26 +283,7 @@ impl RawWriter {
                 "rotation policy {policy:?}: limits must be positive and spans non-negative"
             )));
         }
-        let source_dir = root.join(layout::source_dir(source));
-        fs::create_dir_all(&source_dir).map_err(io_error("create", &source_dir))?;
-        sync_dir(root)?;
-        let lock_path = source_dir.join(".lock");
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&lock_path)
-            .map_err(io_error("open", &lock_path))?;
-        match lock.try_lock() {
-            Ok(()) => {}
-            Err(TryLockError::WouldBlock) => {
-                return Err(RawStoreError::Locked(format!(
-                    "another writer holds source {source} in {}",
-                    root.display()
-                )));
-            }
-            Err(TryLockError::Error(error)) => return Err(io_error("lock", &lock_path)(error)),
-        }
+        let lock = removal::take_source_lock(root, source)?.into_file();
         let recovery = recovery::recover(root, source)?;
         let tiers = match tiers {
             Some((cold_roots, ctx)) => {

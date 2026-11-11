@@ -272,3 +272,56 @@ fn a_partition_removed_during_the_run_is_not_recreated_on_hot() {
     );
     assert_eq!(report.problems, Vec::<String>::new(), "{report:?}");
 }
+
+/// #210 C5: R8 replaces a damaged supersede-record copy from hot, moving
+/// the damaged copy to `damaged/`; a finding on a superseded E0 is one
+/// line and no problem.
+#[test]
+fn repair_handles_supersede_records_and_superseded_entries() {
+    use crate::store::verify::tests::{flip_byte, set_mtime};
+    let fixture = Fixture::new("repair-supersede");
+    let [e0, s1, _] = fixture.supersede(true);
+    assert_eq!(fixture.pass().problems, Vec::<String>::new());
+    let hot_s1 = fixture.dir.0.join("ledger").join(&s1);
+    let cold_a = |name: &str| fixture.cold[0].join(".mie/import-ledger").join(name);
+    flip_byte(&cold_a(&s1), 3);
+    set_mtime(&hot_s1, D0);
+    let report = verify::run(
+        &fixture.config,
+        Some(&fixture.archive()),
+        "24",
+        &fixture.probe,
+        &|| D0 + HOUR,
+        &CopyLedger::at(&fixture.hot),
+    );
+    assert!(
+        report.problems.iter().any(|p| p.contains(&s1)),
+        "{report:?}"
+    );
+    // A finding on the superseded E0, after that verification.
+    CopyLedger::at(&fixture.hot)
+        .append(&Record {
+            at_ms: D0 + HOUR + 1,
+            kind: Kind::Finding {
+                root: "cold-a".to_owned(),
+                code: copy_ledger::FindingCode::Entry,
+                subject: copy_ledger::Subject::Entry(e0.clone()),
+            },
+        })
+        .unwrap();
+    let damaged = fs::read(cold_a(&s1)).unwrap();
+    let report = repair(&fixture, D0 + 2 * HOUR);
+    assert_eq!(report.problems, Vec::<String>::new(), "{report:?}");
+    assert_eq!(fs::read(cold_a(&s1)).unwrap(), fs::read(&hot_s1).unwrap());
+    let aside = replica::damaged_dir(&fixture.cold[0], D0 + 2 * HOUR)
+        .join(".mie/import-ledger")
+        .join(&s1);
+    assert_eq!(fs::read(aside).unwrap(), damaged);
+    assert!(
+        report
+            .lines
+            .iter()
+            .any(|l| l.contains(&e0) && l.contains("superseded by") && l.contains(&s1)),
+        "{report:?}"
+    );
+}

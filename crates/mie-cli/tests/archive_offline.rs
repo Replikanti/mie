@@ -1519,3 +1519,67 @@ fn an_import_without_cold_roots_creates_no_meta_directory() {
     assert!(config.paths.raw_root.exists());
     assert!(!config.paths.raw_root.join(".mie").exists());
 }
+
+/// #210 C1: a superseded entry counts as absent. After a supersede record
+/// (here a replace's, with its parts moved away), a dry run reports the
+/// file published, a real run imports it fresh and writes `F.1.import`,
+/// "not re-imported" is never judged against E0, and the next run skips
+/// the file by its current entry E1.
+#[test]
+fn a_superseded_entry_counts_as_absent_for_the_importer() {
+    use mie_adapter_binance::archive::ledger::{
+        ImportLedger, Quarantine, SupersedeRecord, SupersededEntry,
+    };
+    let dir = TempDir::new("archive-superseded");
+    let config = config(dir.path(), r#"["bookDepth"]"#);
+    let archive = Arc::new(FakeArchive::default());
+    let d = day("2026-09-30");
+    publish_all(&archive, d, d, 3_600_000);
+    let (first, _) = run_import(&config, &archive, d, d, false);
+    assert_eq!(first.imported, 1);
+    let stream = ArchiveStream::BookDepth;
+    let name = stream.file_name(SYMBOL, Period::Day(d));
+    let ledgers = LedgerDir::new(&config.paths.import_ledger);
+    let e0_path = ledgers.ledger_path(stream, &name);
+    let e0_bytes = std::fs::read(&e0_path).unwrap();
+    let e0 = ImportLedger::parse(std::str::from_utf8(&e0_bytes).unwrap()).unwrap();
+    // The replace moves E0's parts out of the layout (T8b's quarantine).
+    let quarantine = dir.path().join("quarantine");
+    for file in &e0.files {
+        for path in [
+            file.relative_path.clone(),
+            file.relative_path.replace(".parquet", ".manifest"),
+        ] {
+            let to = quarantine.join(&path);
+            std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+            std::fs::rename(config.paths.raw_root.join(&path), &to).unwrap();
+        }
+    }
+    let record = SupersedeRecord {
+        archive: e0.archive.clone(),
+        stream: e0.stream.clone(),
+        period: e0.period,
+        entries: vec![SupersededEntry::of(
+            format!("bookDepth/{name}.import"),
+            &e0_bytes,
+        )],
+        quarantine: Some(Quarantine {
+            id: "q-1".to_owned(),
+            moved: e0.files.iter().map(|f| f.relative_path.clone()).collect(),
+        }),
+    };
+    ledgers.write_supersede(stream, &name, 1, &record).unwrap();
+
+    let (dry, out) = run_import(&config, &archive, d, d, true);
+    assert_eq!(dry.published, 1, "{out}");
+    assert!(!out.contains("not re-imported"), "{out}");
+    let (fresh, out) = run_import(&config, &archive, d, d, false);
+    assert_eq!((fresh.imported, fresh.failed), (1, 0), "{out}");
+    assert!(!out.contains("not re-imported"), "{out}");
+    let e1_path = e0_path.with_file_name(format!("{name}.1.import"));
+    let e1 = ImportLedger::parse(&std::fs::read_to_string(&e1_path).unwrap()).unwrap();
+    assert_eq!(e1.rows, e0.rows);
+    assert_eq!(std::fs::read(&e0_path).unwrap(), e0_bytes);
+    let (again, out) = run_import(&config, &archive, d, d, false);
+    assert_eq!((again.skipped, again.imported), (1, 0), "{out}");
+}

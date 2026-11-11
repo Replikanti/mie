@@ -93,7 +93,9 @@ impl RawRecordSink for NoWrites {
     }
 }
 
-fn fetch_policy(config: &ArchiveConfig) -> FetchPolicy {
+/// The importer's fetch policy (`[archive]` pacing, retries, backoff),
+/// shared with the re-admit check of `mie store resolve` (#210 RA6).
+pub(crate) fn fetch_policy(config: &ArchiveConfig) -> FetchPolicy {
     let a = &config.archive;
     FetchPolicy {
         request_interval: Duration::from_millis(a.request_interval_ms),
