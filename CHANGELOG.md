@@ -27,8 +27,9 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   `hold-cleared <path> readmit` record per part; bytes, paths and dataset
   versions stay as they were and the importer runs again. A part held as
   `entry-conflict` always gets a superseding entry, so a rebuild from any
-  start clears it; a superseded entry copy that no longer reads and a
-  malformed name on a copy target only are named and block nothing. A
+  start clears it; a superseded entry copy on a copy target that no
+  longer reads and a malformed name on a copy target only are named and
+  block nothing (on hot both are still refused). A
   difference names the first differing row and writes nothing; a
   `manifest-conflict`
   hold, a part without a manifest, a `PENDING` naming the file and a

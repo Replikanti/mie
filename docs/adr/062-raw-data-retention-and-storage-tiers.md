@@ -1885,18 +1885,24 @@ What breaks:
       start holding the parts while a full and an empty start do not.
       Rejected, letting B7′ accept generation 0 for `entry-conflict`: that
       is the absence-shaped evidence B7′ refuses on purpose. Read and
-      bound (G1–G3) must be every supersede record and every copy of the
-      entry the case decides on: the latest entry in (c) and (d), and in
-      (b) the copies of the generation below m whose bytes S_m names.
-      Every other entry copy is superseded by name (G4), decides neither
-      the case, the record, the entry written nor the parts cleared, and
-      is reached by no verification and no repair (C4, C5); one that does
-      not read is named and blocks nothing, as is a malformed name on a
-      copy target only, which no reader counts. Why (review of #212,
+      bound (G1–G3) must be every supersede record, every file of F on
+      hot, and every copy of the entry the case decides on: the latest
+      entry in (c) and (d), and in (b) the copies of the generation below
+      m whose bytes S_m names. Every other entry copy on a copy target is
+      superseded by name (G4), decides neither the case, the record, the
+      entry written nor the parts cleared, and is reached by no
+      verification and no repair (C4, C5); one that does not read is named
+      and blocks nothing, as is a malformed name on a copy target only,
+      which no reader counts. Why hot's files of every generation (re-review
+      of #212, finding 3): the importer and the replication read them all
+      and fail F closed on one that does not read, so a re-admit past it
+      would clear the holds while F stays unimportable and its new files
+      never replicate; the remedy is the hot restore (#195). Why (review of #212,
       finding 2): refusing on them named `mie store verify` and `mie store
       repair` as the remedy, and neither touches them, so the hold could
-      only be cleared by hand. A malformed name on hot (the importer and
-      the replication fail F closed on it), a file on the targets only,
+      only be cleared by hand. A malformed name or an unreadable file on
+      hot (the importer and the replication fail F closed on both), a file
+      on the targets only,
       an unreadable copy of a deciding entry and differing record copies
       are still refused, naming `mie store verify` and `mie store repair`.
       No orphan is left behind: a path a superseded variant lists that is

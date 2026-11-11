@@ -625,6 +625,36 @@ fn a_rotten_superseded_copy_blocks_no_later_readmit() {
     assert!(held(&fixture).is_empty(), "{out}");
 }
 
+/// Re-review of #212, finding 3: the same rot on hot's copy of the
+/// superseded E0 still refuses. On hot it stops the importer and the
+/// replication of F (both read every file of F), so a re-admit that cleared
+/// the holds would leave F unimportable and S2/E2 unreplicated.
+#[test]
+fn a_rotten_superseded_copy_on_hot_still_refuses() {
+    let (_dir, fixture) = adopted("resolve-rotten-superseded-hot");
+    conflict(&fixture);
+    assert_pass(&resolve(&fixture, Some(&metrics_file()), RESOLVED));
+    replicate(&fixture, RESOLVED + 1);
+    let e0 = format!("{}.import", metrics_name());
+    let e1 = format!("{}.1.import", metrics_name());
+    overwrite(&ledger_file(&fixture, &e0), b"rotten\n");
+    rewrite_published_sha(&target_file(&fixture, "cold-b", &e1));
+    fs::remove_file(hot_ledger(&fixture)).unwrap();
+    let (pass, out) = rebuild(&fixture, Flags::default(), RESOLVED + HOUR);
+    assert!(!pass && !held(&fixture).is_empty(), "{out}");
+
+    let before = files(&fixture.dir);
+    let held_before = held(&fixture);
+    let (pass, out) = resolve(&fixture, Some(&metrics_file()), RESOLVED + 2 * HOUR);
+    assert!(!pass, "{out}");
+    assert_fail_line(
+        &out,
+        &[&format!("metrics/{e0}"), "on hot", "cannot be read", "#195"],
+    );
+    assert_eq!(files(&fixture.dir), before, "{out}");
+    assert_eq!(held(&fixture), held_before, "{out}");
+}
+
 /// Review of #212, finding 2: a malformed name of F on a copy target only
 /// counts for nothing anywhere, so it is named and blocks nothing; on hot
 /// it still refuses.

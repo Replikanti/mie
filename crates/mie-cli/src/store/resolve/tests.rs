@@ -380,6 +380,15 @@ fn only_the_deciding_entry_copies_must_read() {
     let planned = plan(&inputs(files.clone(), &both)).unwrap();
     assert_eq!((planned.case, planned.entry), (Case::Supersede, Some(2)));
     named(&planned, &[&e0, "cold-a", "superseded"]);
+    // On hot, a superseded copy that does not read still refuses: the
+    // importer and the replication read it (re-review finding 3).
+    let mut on_hot = files.clone();
+    on_hot[0] = file("hot", &e0, rotten);
+    on_hot[1] = file("cold-a", &e0, &v0);
+    refused(
+        &inputs(on_hot, &both),
+        &[&e0, "on hot", "cannot be read", "#195"],
+    );
     // The latest entry's copy that does not read still refuses.
     files.pop();
     files.push(file("cold-b", &e1, rotten));

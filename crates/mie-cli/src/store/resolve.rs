@@ -57,11 +57,13 @@
 //!   empty one (review of #212, finding 1). No orphan is left behind: a
 //!   path a superseded variant lists that is not held for F must be on no
 //!   root and unrecorded. Read and bound as G1–G3 must be every supersede
-//!   record and every copy of the entry the case decides on: the latest
-//!   entry in (c) and (d), and in (b) the copies below m whose bytes the
-//!   record names. Any other entry copy is superseded, decides nothing,
-//!   and no verification or repair reaches it (C4, C5); one that does not
-//!   read is named, as is a malformed name on a copy target only, which no
+//!   record, every file of F on hot (the importer and the replication
+//!   read them all and fail F closed; re-review of #212, finding 3) and
+//!   every copy of the entry the case decides on: the latest entry in (c)
+//!   and (d), and in (b) the copies below m whose bytes the record names.
+//!   Any other entry copy on a target is superseded, decides nothing, and
+//!   no verification or repair reaches it (C4, C5); one that does not read
+//!   is named, as is a malformed name on a copy target only, which no
 //!   reader counts (review of #212, finding 2). A malformed name on hot,
 //!   a name on the targets only and differing record copies are refused.
 //! - **RA6 Row check** ([`readmit::check`]).
@@ -406,9 +408,15 @@ pub fn plan(inputs: &PlanInputs) -> Result<Planned, String> {
                     "{label} on {}: it cannot be read as such ({e})",
                     roots.join(", ")
                 );
+                // Hot's copy of any generation is read by the importer and
+                // the replication, which fail F closed on it (re-review of
+                // #212, finding 3): only a target's copy may be superseded
+                // and merely named.
                 match name.kind {
-                    LedgerKind::Supersede => return Err(format!("{why}: {repair}")),
-                    LedgerKind::Entry => unreadable.push((name.generation, bytes, why)),
+                    LedgerKind::Entry if !roots.contains(&HOT_ID) => {
+                        unreadable.push((name.generation, bytes, why));
+                    }
+                    _ => return Err(format!("{why}: {repair}")),
                 }
             }
         }
