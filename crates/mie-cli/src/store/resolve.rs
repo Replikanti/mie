@@ -116,9 +116,11 @@
 //!   roots in configuration order, hot last, each root's marker re-read
 //!   first; W4 `hold-cleared <path> replace` per open hold. Every
 //!   intermediate state fails a covering selection instead of shortening
-//!   it, and the importer stays halted until hot's renames (I1).
+//!   it, and the importer stays halted until every root's renames (I1).
 //! - **RQ7 Resume.** With `--file F` whose highest supersede generation is
-//!   above every entry and carries a quarantine: no new record, M from
+//!   above every entry and carries a quarantine, or with a supersede
+//!   record of F whose moved paths some root's layout still holds (review
+//!   of #215, finding 1): no new record, M from
 //!   S_m, W2 for what the ledger lacks (a path pending under another id is
 //!   refused), W3 idempotent (a name in both places is `Integrity`, never
 //!   overwritten), W4; `--replace` is not needed.
@@ -988,7 +990,9 @@ fn resolve(
                 holds.len()
             ));
         }
-        let (lines, problems) = quarantine::replace_lines(hot, &ledgers, &state).map_err(Stop)?;
+        let roots = quarantine::ReplaceRoots::read(hot, cold_roots);
+        let (lines, problems) =
+            quarantine::replace_lines(&roots, &ledgers, &state).map_err(Stop)?;
         report.lines.extend(lines);
         report.problems.extend(problems);
         return Ok(());
@@ -1040,7 +1044,10 @@ fn resolve(
     }
 
     // RQ7 (a pending replace resumes), RQ0 (`--replace`), else re-admit.
-    let resume = replace::pending_replace(&files);
+    let layouts = quarantine::ReplaceRoots::read(hot, cold_roots);
+    let resume = replace::pending_replace(&files, &|record| {
+        !matches!(layouts.unfinished(record, false), Ok(None))
+    });
     let replacing = resume.is_some() || replace;
     let mut roots = replace::marked_roots(cold_roots);
     let _pass = if replacing {

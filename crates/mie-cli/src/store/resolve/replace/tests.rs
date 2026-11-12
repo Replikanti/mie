@@ -208,6 +208,41 @@ fn cost_overlap_bounds() {
     assert!(lines.contains(&"cost: no journal: no warm run recorded".to_owned()));
 }
 
+/// RQ5 (review of #215, finding 2): a moved path without a manifest
+/// covers its whole stream-day, so every warm run whose prefix overlaps
+/// that day is named; a run that ends at the day's start is not.
+#[test]
+fn a_manifest_less_moved_path_names_the_runs_over_its_day() {
+    let a = part("aggTrades", "2026-10-01", 0);
+    let day = mie_adapter_binance::archive::catalog::parse_day("2026-10-01").unwrap() * 86_400_000;
+    let bare = MovedFile {
+        path: a.clone(),
+        manifests: Vec::new(),
+    };
+    let named = |prefix: (i64, i64)| {
+        cost(
+            std::slice::from_ref(&bare),
+            &Journal::Runs(vec![("r".to_owned(), warm(prefix.0, prefix.1))]),
+        )
+        .iter()
+        .any(|l| l.starts_with("cost: warm run r") && l.contains(&a))
+    };
+    assert!(
+        named((day + 23 * 3_600_000, day + 86_400_000 * 2)),
+        "late in the day"
+    );
+    assert!(named((day - 86_400_000, day + 1)), "its first millisecond");
+    assert!(
+        named((day + 86_400_000 - 1, day + 86_400_000 * 2)),
+        "its last millisecond"
+    );
+    assert!(!named((day - 86_400_000, day)), "ends at its start");
+    assert!(
+        !named((day + 86_400_000, day + 86_400_000 * 2)),
+        "starts the next day"
+    );
+}
+
 /// RQ5: only `warm_start` lines with `warm: true` are read; a cold start
 /// and a non-JSON line name no run, a missing journal is `None`, an
 /// unreadable one is an error.

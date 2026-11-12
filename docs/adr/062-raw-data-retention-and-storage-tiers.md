@@ -2072,7 +2072,9 @@ What breaks:
       enumerate, so the moved paths with their event ranges are what lets
       a reader decide which of their own recorded versions change; the
       list is a superset, since an old run's chain streams are not
-      journaled. Rejected, printing each moved stream-day's union
+      journaled. A moved path without a manifest covers its whole
+      stream-day, as `select` fails it, so every warm run whose prefix
+      overlaps that day is listed (review of #215, finding 2). Rejected, printing each moved stream-day's union
       version before the hold: it needs an "as if ordinary" select path
       and names a version no report printed.
     - **RQ6 Writes**, in order: **W1** S_n (`write_supersede`, durable);
@@ -2089,10 +2091,16 @@ What breaks:
       would drop out of every `select` without an error between its
       rename and its record. With the records first, every intermediate
       state fails a covering selection instead of shortening it; hot last
-      makes hot's layout the importer's commit point (I1); the holds
-      cleared last keep the importer halted by its hold check until then.
+      keeps hot's copy, which every `select` lists, until every cold copy
+      has moved; the holds cleared last
+      keep the importer halted by its hold check until then, and I1 keeps
+      it halted after a rebuild that has no hold.
     - **RQ7 Resume.** With `--file F` whose highest supersede generation m
-      is above every entry generation and whose S_m carries a quarantine:
+      is above every entry generation and whose S_m carries a quarantine,
+      or with a record of F carrying a quarantine whose moved paths some
+      root's layout still holds although F's replacement entry exists (a
+      store from before I1's every-root rule, or a root restored from an
+      old backup; review of #215, finding 1):
       no new record and no attribution; M is S_m's `moved` and RQ1
       applies; W2 writes what the ledger lacks (a path pending under
       another id is refused); W3 is idempotent (a name already moved is
@@ -2105,16 +2113,27 @@ What breaks:
       new replace S_{m+1} runs.
     - **RQ8 Proposals** (no `--file`): besides the open holds, one line
       per supersede record on hot with a quarantine; an incomplete
-      replace (a moved path in hot's layout, not recorded quarantined, or
-      still held) is a `FAIL:` line naming `--file F`; a complete one
+      replace (a moved path in any root's layout, a cold root without a
+      readable marker, a path not recorded quarantined, or still held) is
+      a `FAIL:` line naming `--file F`; a complete one
       without its replacement entry gets an info line.
     - **I1 The importer's gate.** `mie archive-import`, its dry runs too,
       refuses after its hold check and from the same ledger read while a
       supersede record on hot with a quarantine has a moved path whose
-      data or manifest is in hot's layout, or whose verdict is neither
-      pending nor replaced, naming F and `mie store resolve --file F`.
-      Hot's layout as the commit point keeps the gate exact after a
-      rebuild from an empty start, which has no hold record. A record that
+      data or manifest is in the layout of any root, hot or a configured
+      cold root, or whose verdict is neither pending nor replaced; and,
+      while a moved path is not yet replaced, while a configured cold root
+      presents no readable marker (an unmounted root reads as empty). The
+      message names F and `mie store resolve --file F`. Why every root and
+      not hot alone (review of #215, finding 1): the parts of a day already
+      removed from hot (D6) live on cold roots only, so a replace that
+      stopped between two cold roots leaves hot's layout empty; after a
+      rebuild from an empty start, which has no hold record, a hot-only
+      gate let the import write `replaced` for paths a cold root still
+      held, the resume could no longer reach them, and a full and an empty
+      rebuild start then disagreed. Every root's layout is the commit
+      point, and the gate stays exact without a hold record. The cost is
+      one stat per moved path and root per import run. A record that
       does not parse is skipped here: F's own import fails closed on it
       (C1).
     - **I2 The import view.** The importer reads the store through an
@@ -2134,7 +2153,11 @@ What breaks:
       hot with the listed SHA-256 (hot's manifest, else an ordinary
       ledger text), one `replaced <path> <segment>/<E_g>` per moved path
       still pending is appended, one `at_ms` per sweep; otherwise the
-      missing file is named and nothing is appended (D7 *Write order*). A
+      missing file is named and nothing is appended (D7 *Write order*);
+      nothing is appended either while the replace is unfinished on a root
+      by I1's rule, since a rebuild re-derives `replaced` only for a path
+      no root's layout holds (Q4), so an empty start agrees with a full
+      one. A
       crash between the entry and its records is completed by the next
       import run or by a rebuild (Q4). The re-import numbers its parts
       from the union (D6), which counts the quarantined paths through

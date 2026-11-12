@@ -807,8 +807,11 @@ fn the_next_import_completes_the_replaced_records() {
     let manifest = fixture.hot().join(manifest_of(&fresh[0]));
     let aside = fixture.dir.join("aside.manifest");
     fs::rename(&manifest, &aside).unwrap();
+    let roots =
+        store::quarantine::ReplaceRoots::read(&fixture.hot(), &fixture.config.paths.cold_roots);
     let lines =
-        store::quarantine::record_replacements(&fixture.hot(), &ledgers, &|| RESOLVED + 2).unwrap();
+        store::quarantine::record_replacements(&fixture.hot(), &roots, &ledgers, &|| RESOLVED + 2)
+            .unwrap();
     assert!(
         lines
             .iter()
@@ -966,5 +969,179 @@ fn aw12_reimport_after_an_empty_start_rebuild_numbers_above_the_quarantine() {
     for (old, new) in parts.iter().zip(&fresh) {
         assert_eq!(partition_of(old), partition_of(new));
         assert!(part_number(new) > part_number(old), "{old} {new}");
+    }
+}
+
+/// Review of #215, finding 1: the moved parts live on the cold roots only
+/// (hot's partitions removed, D6); the replace stops between cold-a and
+/// cold-b; a rebuild from an empty start has no hold. The importer still
+/// refuses, its dry run too, because cold-b's layout holds the moved
+/// parts (I1 checks every root); proposals name the stop; `resolve --file
+/// F` completes it; the import then runs, and a full and an empty rebuild
+/// start agree (AW12). A part put back into a layout after its
+/// replacement halts the importer again and the resume moves it.
+#[test]
+fn a_replace_stopped_between_cold_roots_keeps_the_importer_halted() {
+    let (_dir, fixture) = adopted("replace-cold-only");
+    if !permissions_bind(&fixture.dir) {
+        return;
+    }
+    let (_, parts) = conflict(&fixture);
+    // The D6 hot removal of both partitions, simulated.
+    let aside = fixture.dir.join("hot-aside");
+    for part in &parts {
+        let from = fixture.hot().join(partition_of(part));
+        let to = aside.join(partition_of(part));
+        fs::create_dir_all(to.parent().unwrap()).unwrap();
+        fs::rename(&from, &to).unwrap();
+    }
+    replicate(&fixture, RESOLVED - 10);
+    rebuild_from(&fixture, "full", Flags::default(), RESOLVED - 5);
+    assert_eq!(held(&fixture), parts.iter().cloned().collect());
+
+    // The replace stops between cold-a and cold-b.
+    let b = cold(&fixture, "cold-b");
+    let partition = b.join(partition_of(&parts[0]));
+    chmod(&partition, 0o555);
+    let (pass, out) = replace(&fixture, RESOLVED);
+    chmod(&partition, 0o755);
+    assert!(!pass, "{out}");
+    assert!(b.join(&parts[0]).exists());
+
+    // An empty start: no hold, and still no import.
+    replicate(&fixture, RESOLVED + 1);
+    let (_, out) = rebuild_from(&fixture, "empty", Flags::default(), RESOLVED + HOUR);
+    assert!(held(&fixture).is_empty(), "{out}");
+    for dry_run in [true, false] {
+        let error = run_import(&fixture, &metrics_day(day(), dry_run)).unwrap_err();
+        assert!(
+            error.contains("incomplete") && error.contains("cold-b's layout"),
+            "{error}"
+        );
+    }
+    assert!(replaced(&fixture).is_empty());
+    let (pass, out) = resolve(&fixture, None, RESOLVED + HOUR + 1);
+    assert!(!pass, "{out}");
+    assert_fail_line(&out, &["incomplete", "cold-b's layout", &metrics_file()]);
+
+    // The resume completes it; the import runs.
+    let (pass, out) = resolve(&fixture, Some(&metrics_file()), RESOLVED + 2 * HOUR);
+    assert!(pass && out.contains("resume:"), "{out}");
+    for part in &parts {
+        assert!(!b.join(part).exists(), "{out}");
+        assert!(
+            replica::quarantine_dir(&b, &id()).join(part).exists(),
+            "{out}"
+        );
+    }
+    run_import(&fixture, &metrics_day(day(), false)).unwrap();
+    assert_eq!(replaced(&fixture).len(), 2);
+
+    // AW12: a full and an empty start agree.
+    replicate(&fixture, RESOLVED + 3 * HOUR);
+    let copies: Vec<(PathBuf, Vec<u8>)> = ["cold-a", "cold-b"]
+        .iter()
+        .map(|name| {
+            let path = copy_ledger::ledger_path(&cold(&fixture, name));
+            let bytes = fs::read(&path).unwrap();
+            (path, bytes)
+        })
+        .collect();
+    let hot_bytes = fs::read(hot_ledger(&fixture)).unwrap();
+    let live = selected(&fixture);
+    rebuild_from(&fixture, "full", Flags::default(), RESOLVED + 4 * HOUR);
+    let after_full = selected(&fixture);
+    fs::write(hot_ledger(&fixture), &hot_bytes).unwrap();
+    for (path, bytes) in &copies {
+        fs::write(path, bytes).unwrap();
+    }
+    let (_, out) = rebuild_from(&fixture, "empty", Flags::default(), RESOLVED + 4 * HOUR);
+    let after_empty = selected(&fixture);
+    assert_eq!(after_full, live);
+    assert_eq!(after_empty, after_full, "{out}");
+    assert!(
+        after_empty.iter().all(|s| !s.starts_with("error")),
+        "{after_empty:?}"
+    );
+
+    // A moved part back in cold-b's layout after its replacement.
+    let q = replica::quarantine_dir(&b, &id());
+    for file in [parts[0].clone(), manifest_of(&parts[0])] {
+        fs::rename(q.join(&file), b.join(&file)).unwrap();
+    }
+    let error = run_import(&fixture, &metrics_day(day(), true)).unwrap_err();
+    assert!(error.contains("cold-b's layout"), "{error}");
+    let (pass, out) = resolve(&fixture, Some(&metrics_file()), RESOLVED + 5 * HOUR);
+    assert!(pass && out.contains("resume:"), "{out}");
+    assert!(
+        !b.join(&parts[0]).exists() && q.join(&parts[0]).exists(),
+        "{out}"
+    );
+    run_import(&fixture, &metrics_day(day(), true)).unwrap();
+}
+
+/// AW12 (review of #215, test gap): another file's hold left unresolved
+/// next to a replace. After the replace of 2026-10-03's metrics, the
+/// rebuilds from a full, a stale and an empty start keep 2026-10-02's
+/// parts held and the replaced parts quarantined, never ordinary files,
+/// and the three starts give the same selections.
+#[test]
+fn aw12_an_unresolved_hold_beside_a_replace_stays_held_in_every_rebuild() {
+    let mut expected: Option<Vec<String>> = None;
+    for start in ["full", "stale", "empty"] {
+        let (_dir, fixture) = adopted(&format!("replace-aw12-beside-{start}"));
+        let (_, parts, _) = missing_entry(&fixture);
+        // 2026-10-02's metrics entry gone everywhere: its parts are held
+        // `unlisted` and stay so, since nothing resolves them.
+        let name = ArchiveStream::Metrics
+            .file_name(SYMBOL, Period::Day(day_index("2026-10-02")))
+            .replace(".zip", ".zip.import");
+        let mut gone = 0;
+        for path in [
+            ledger_file(&fixture, &name),
+            target_file(&fixture, "cold-a", &name),
+            target_file(&fixture, "cold-b", &name),
+        ] {
+            if path.exists() {
+                fs::remove_file(path).unwrap();
+                gone += 1;
+            }
+        }
+        assert!(gone >= 1);
+        let flags = Flags {
+            record_unlisted: true,
+            ..Flags::default()
+        };
+        fs::remove_file(hot_ledger(&fixture)).unwrap();
+        rebuild(&fixture, flags, REBUILT + 1);
+        let other: BTreeSet<String> = held(&fixture)
+            .into_iter()
+            .filter(|path| !parts.contains(path))
+            .collect();
+        assert!(!other.is_empty());
+
+        assert_pass(&replace(&fixture, RESOLVED));
+        assert_eq!(held(&fixture), other);
+        replicate(&fixture, RESOLVED + 1);
+        let after_replace = selected(&fixture);
+        let (_, out) = rebuild_from(&fixture, start, flags, RESOLVED + HOUR);
+        assert_eq!(held(&fixture), other, "{start}: {out}");
+        assert_eq!(
+            quarantined(&fixture),
+            parts.iter().cloned().collect(),
+            "{start}: {out}"
+        );
+        let rebuilt = selected(&fixture);
+        assert_eq!(rebuilt, after_replace, "{start}: {out}");
+        for dataset in rebuilt.iter().filter(|s| !s.starts_with("error")) {
+            for path in parts.iter().chain(&other) {
+                assert!(!dataset.contains(path.as_str()), "{start}: {dataset}");
+            }
+        }
+        assert!(run_import(&fixture, &metrics_day(day(), false)).is_err());
+        match &expected {
+            None => expected = Some(rebuilt),
+            Some(expected) => assert_eq!(&rebuilt, expected, "{start}"),
+        }
     }
 }

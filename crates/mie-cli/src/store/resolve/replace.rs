@@ -276,12 +276,22 @@ pub fn cost(moved: &[MovedFile], journal: &Journal) -> Vec<String> {
         Journal::Missing => lines.push("cost: no journal: no warm run recorded".to_owned()),
         Journal::Runs(handoffs) => {
             for (run_id, handoff) in handoffs {
+                let overlaps =
+                    |(min, max): (i64, i64)| min < handoff.cutover_ms && max >= handoff.origin_ms;
                 let covered: Vec<&str> = moved
                     .iter()
                     .filter(|file| {
+                        // Without a manifest the path covers its whole
+                        // stream-day, as `select` fails it (review of
+                        // #215, finding 2): the superset rule.
+                        if file.manifests.is_empty() {
+                            return whole_day(&file.path).is_none_or(overlaps);
+                        }
                         file.manifests.iter().any(|manifest| {
-                            manifest.min_event_time.as_millis() < handoff.cutover_ms
-                                && manifest.max_event_time.as_millis() >= handoff.origin_ms
+                            overlaps((
+                                manifest.min_event_time.as_millis(),
+                                manifest.max_event_time.as_millis(),
+                            ))
                         })
                     })
                     .map(|file| file.path.as_str())
@@ -306,6 +316,18 @@ pub fn cost(moved: &[MovedFile], journal: &Journal) -> Vec<String> {
         moved.len()
     ));
     lines
+}
+
+/// The event-time range `[first, last]` ms of the day a data path's
+/// `date=` segment names; `None` when it names none (then every run is
+/// taken to cover it, never fewer).
+fn whole_day(path: &str) -> Option<(i64, i64)> {
+    use mie_adapter_binance::archive::catalog::{DAY_MS, parse_day};
+    let day = path
+        .split('/')
+        .find_map(|segment| segment.strip_prefix("date="))
+        .and_then(parse_day)?;
+    Some((day * DAY_MS, (day + 1) * DAY_MS - 1))
 }
 
 // ------------------------------------------------------------- the run
@@ -881,25 +903,41 @@ pub(super) fn run_resume(
     Ok(())
 }
 
-/// Whether F's latest supersede generation is above every entry and
-/// carries a quarantine (RQ7): hot's copy, parsed.
-pub fn pending_replace(files: &[FileOf]) -> Option<(u32, SupersedeRecord)> {
+/// The replace the resume completes (RQ7), as (generation, record): F's
+/// latest supersede record on hot when its generation is above every entry
+/// and it carries a quarantine; otherwise the latest record on hot with a
+/// quarantine that `unfinished` says some root's layout still holds (a
+/// replace stopped between cold roots whose entry exists, review of #215,
+/// finding 1). I1 keeps the importer from writing that entry now, but a
+/// store from before the fix, or a root restored from an old backup, can
+/// still be in that state, and only the resume moves the copies left.
+pub fn pending_replace(
+    files: &[FileOf],
+    unfinished: &dyn Fn(&SupersedeRecord) -> bool,
+) -> Option<(u32, SupersedeRecord)> {
     use mie_adapter_binance::archive::ledger::LedgerKind;
     let highest_entry = files
         .iter()
         .filter(|f| f.name.kind == LedgerKind::Entry)
         .map(|f| f.name.generation)
         .max();
-    let record = files
+    let mut records: Vec<(u32, SupersedeRecord)> = files
         .iter()
         .filter(|f| f.root == HOT_ID && f.name.kind == LedgerKind::Supersede)
-        .max_by_key(|f| f.name.generation)?;
-    let m = record.name.generation;
-    if highest_entry.is_some_and(|g| g >= m) {
-        return None;
+        .filter_map(|f| {
+            std::str::from_utf8(&f.bytes)
+                .ok()
+                .and_then(|text| SupersedeRecord::parse(text).ok())
+                .map(|record| (f.name.generation, record))
+        })
+        .collect();
+    records.sort_by_key(|(generation, _)| std::cmp::Reverse(*generation));
+    if let Some((m, latest)) = records.first()
+        && highest_entry.is_none_or(|g| g < *m)
+    {
+        return latest.quarantine.is_some().then(|| (*m, latest.clone()));
     }
-    let parsed = std::str::from_utf8(&record.bytes)
-        .ok()
-        .and_then(|text| SupersedeRecord::parse(text).ok())?;
-    parsed.quarantine.is_some().then_some((m, parsed))
+    records
+        .into_iter()
+        .find(|(_, record)| record.quarantine.is_some() && unfinished(record))
 }

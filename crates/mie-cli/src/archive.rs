@@ -184,11 +184,15 @@ pub fn import_with(
     // its renames halts the importer until it is completed (ADR-062 D11,
     // #211 I1).
     let ledgers = LedgerDir::new(&config.paths.import_ledger);
+    let replace_roots = crate::store::quarantine::ReplaceRoots::read(
+        &config.paths.raw_root,
+        &config.paths.cold_roots,
+    );
     if let Some(ledger) = &ledger {
         crate::store::check_holds(ledger)?;
         let state = mie_adapter_parquet::verification::CopyState::fold(ledger)
             .map_err(|error| format!("the copy ledger cannot be folded: {error}"))?;
-        crate::store::quarantine::check_replaces(&config.paths.raw_root, &ledgers, &state)?;
+        crate::store::quarantine::check_replaces(&replace_roots, &ledgers, &state)?;
     }
     let has_ledger = ledger.is_some();
     let store = crate::store::raw_store(&config.paths.raw_root, &config.paths.cold_roots)?;
@@ -200,8 +204,15 @@ pub fn import_with(
     // #211 I3, never in a dry run: the `replaced` records of an entry a
     // crash left without them.
     let replacements = |out: &mut dyn Write| -> Result<(), String> {
+        // The markers are read again: a root unmounted meanwhile holds it
+        // back (I1's rule).
+        let roots = crate::store::quarantine::ReplaceRoots::read(
+            &config.paths.raw_root,
+            &config.paths.cold_roots,
+        );
         for line in crate::store::quarantine::record_replacements(
             &config.paths.raw_root,
+            &roots,
             &ledgers,
             &now_ms,
         )? {

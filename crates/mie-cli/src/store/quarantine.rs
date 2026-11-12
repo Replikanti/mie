@@ -3,12 +3,18 @@
 //!
 //! - **I1 Gate** ([`check_replaces`]). `mie archive-import`, its dry runs
 //!   too, refuses while a supersede record on hot with a quarantine has a
-//!   moved path whose data or manifest is in hot's layout, or whose
-//!   copy-ledger verdict is neither pending nor replaced. The replace
-//!   renames hot last, so hot's layout is the commit point, which keeps
-//!   the gate exact after a rebuild from an empty start (no hold record).
-//!   A record that does not parse is skipped here: the import of its own
-//!   archive file fails closed on it (#210 C1).
+//!   moved path whose data or manifest is in the layout of any root, hot
+//!   or a configured cold root, or whose copy-ledger verdict is neither
+//!   pending nor replaced; and, while a moved path is not yet replaced,
+//!   while a configured cold root presents no readable marker (an
+//!   unmounted root reads as empty, so its layout cannot be confirmed
+//!   free). Every root's layout, not hot's alone, is the commit point: the
+//!   parts of a day already taken off hot live on cold roots only, and a
+//!   replace that stopped between two of them must keep the importer
+//!   halted after a rebuild from an empty start too, which has no hold
+//!   record (review of #215, finding 1). A record that does not parse is
+//!   skipped here: the import of its own archive file fails closed on it
+//!   (#210 C1).
 //! - **I3 Replacement records** ([`record_replacements`]). For each such
 //!   record S_n, E_g is its archive file's entry of the lowest generation
 //!   g ≥ n on hot ([`replacement_generation`]). Once E_g parses and every
@@ -17,7 +23,10 @@
 //!   <segment>/<E_g>` record is appended per moved path that is still
 //!   pending, all with one `at_ms`; otherwise the missing file is named and
 //!   nothing is appended (D7 *Write order*: `replaced` only after the
-//!   entry and its parts are sealed). The importer runs it at its start and
+//!   entry and its parts are sealed). It also waits while the replace is
+//!   unfinished on any root (I1's rule), so a `replaced` record never
+//!   names a path some root's layout still holds, which a rebuild from
+//!   an empty start could not re-derive (Q4). The importer runs it at its start and
 //!   after its run, never in a dry run, so a crash between the entry and
 //!   the records is completed by the next import (or by a rebuild, Q4).
 //! - **The text rule** ([`text_rule`]), shared by the replace (W2) and the
@@ -26,8 +35,9 @@
 //!   superseded entry lists; otherwise none, and the path then covers its
 //!   whole stream-day in `select`, failing more selections, never fewer.
 //! - **RQ8 proposals** ([`replace_lines`]): one line per supersede record
-//!   on hot that carries a quarantine; an incomplete replace is a problem
-//!   naming `mie store resolve --file F`.
+//!   on hot that carries a quarantine; an incomplete replace (unfinished
+//!   on any root, by I1's rule) is a problem naming `mie store resolve
+//!   --file F`.
 
 use mie_adapter_binance::archive::ledger::{
     ImportLedger, LedgerDir, LedgerKind, LedgerName, SupersedeRecord, replacement_generation,
@@ -38,7 +48,66 @@ use mie_adapter_parquet::verification::{CopyState, PathVerdict};
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::ErrorKind;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// Every root a replace renames on: hot, then each configured cold root
+/// with its marker's id as read now (`None` without a readable marker).
+#[derive(Debug, Clone)]
+pub struct ReplaceRoots {
+    roots: Vec<(String, PathBuf, Option<String>)>,
+}
+
+impl ReplaceRoots {
+    /// Hot at `hot` and the configured `cold` roots, markers read now.
+    pub fn read(hot: &Path, cold: &[crate::config::ColdRoot]) -> Self {
+        let mut roots = vec![("hot".to_owned(), hot.to_owned(), Some("hot".to_owned()))];
+        for root in cold {
+            let id = mie_adapter_parquet::root_marker::read(&root.path)
+                .ok()
+                .flatten();
+            let label = id
+                .clone()
+                .unwrap_or_else(|| root.path.display().to_string());
+            roots.push((label, root.path.clone(), id));
+        }
+        Self { roots }
+    }
+
+    /// Why the replace of `record` is unfinished on the roots, if it is: a
+    /// root whose layout still holds a moved path, or, with
+    /// `require_markers`, a cold root without a readable marker, whose
+    /// layout cannot be confirmed free.
+    ///
+    /// # Errors
+    ///
+    /// An I/O error inspecting a root.
+    pub fn unfinished(
+        &self,
+        record: &SupersedeRecord,
+        require_markers: bool,
+    ) -> Result<Option<String>, String> {
+        let Some(quarantine) = &record.quarantine else {
+            return Ok(None);
+        };
+        for (label, root, id) in &self.roots {
+            if id.is_none() {
+                if require_markers {
+                    return Ok(Some(format!(
+                        "cold root {label} presents no readable marker, so its layout cannot be \
+                         confirmed free of the moved paths (an unmounted root reads as empty)"
+                    )));
+                }
+                continue;
+            }
+            for path in &quarantine.moved {
+                if in_layout(root, path).map_err(|e| format!("inspect {path} on {label}: {e}"))? {
+                    return Ok(Some(format!("{path} is still in {label}'s layout")));
+                }
+            }
+        }
+        Ok(None)
+    }
+}
 
 /// Whether the layout of `root` holds `path`: its data file or its
 /// manifest.
@@ -122,24 +191,24 @@ pub fn superseded_shas(
 }
 
 /// Why the replace of `record` is not complete (RQ8, I1), if it is not:
-/// a moved path in hot's layout, not recorded `quarantined` under its id,
-/// or still held.
+/// unfinished on a root ([`ReplaceRoots::unfinished`]), a moved path not
+/// recorded `quarantined` under its id, or still held.
 ///
 /// # Errors
 ///
 /// An I/O error inspecting hot.
 fn incomplete(
-    hot: &Path,
+    roots: &ReplaceRoots,
     record: &SupersedeRecord,
     state: &CopyState,
 ) -> Result<Option<String>, String> {
     let Some(quarantine) = &record.quarantine else {
         return Ok(None);
     };
+    if let Some(why) = roots.unfinished(record, true)? {
+        return Ok(Some(why));
+    }
     for path in &quarantine.moved {
-        if in_layout(hot, path).map_err(|e| format!("inspect {path} on hot: {e}"))? {
-            return Ok(Some(format!("{path} is still in hot's layout")));
-        }
         if state.quarantine(path) != Some(quarantine.id.as_str()) {
             return Ok(Some(format!(
                 "{path} is not recorded quarantined under {}",
@@ -158,7 +227,11 @@ fn incomplete(
 /// # Errors
 ///
 /// The refusal, naming the archive file and `mie store resolve --file F`.
-pub fn check_replaces(hot: &Path, ledgers: &LedgerDir, state: &CopyState) -> Result<(), String> {
+pub fn check_replaces(
+    roots: &ReplaceRoots,
+    ledgers: &LedgerDir,
+    state: &CopyState,
+) -> Result<(), String> {
     let records = ledgers
         .supersede_records()
         .map_err(|error| format!("the import ledger's supersede records: {error}"))?;
@@ -169,21 +242,25 @@ pub fn check_replaces(hot: &Path, ledgers: &LedgerDir, state: &CopyState) -> Res
         let Some(quarantine) = &record.quarantine else {
             continue;
         };
+        let refuse = |why: String| {
+            Err(format!(
+                "the replace of {} under quarantine {} is incomplete: {why}; the importer refuses \
+                 until `mie store resolve --config <ingest config> --file {}` completes it (ADR-062 \
+                 D11)",
+                record.archive, quarantine.id, record.archive
+            ))
+        };
+        let pending = quarantine
+            .moved
+            .iter()
+            .any(|path| state.verdict(path) != Some(PathVerdict::Replaced));
+        if let Some(why) = roots.unfinished(record, pending)? {
+            return refuse(why);
+        }
         for path in &quarantine.moved {
-            let on_hot = in_layout(hot, path).map_err(|e| format!("inspect {path} on hot: {e}"))?;
             let verdict = state.verdict(path);
-            if on_hot || !matches!(verdict, Some(PathVerdict::Pending | PathVerdict::Replaced)) {
-                let why = if on_hot {
-                    "is still in hot's layout".to_owned()
-                } else {
-                    format!("has the copy-ledger verdict {verdict:?}")
-                };
-                return Err(format!(
-                    "the replace of {} under quarantine {} is incomplete: {path} {why}; the importer \
-                     refuses until `mie store resolve --config <ingest config> --file {}` completes \
-                     it (ADR-062 D11)",
-                    record.archive, quarantine.id, record.archive
-                ));
+            if !matches!(verdict, Some(PathVerdict::Pending | PathVerdict::Replaced)) {
+                return refuse(format!("{path} has the copy-ledger verdict {verdict:?}"));
             }
         }
     }
@@ -199,6 +276,7 @@ pub fn check_replaces(hot: &Path, ledgers: &LedgerDir, state: &CopyState) -> Res
 /// or folded, or an append fails.
 pub fn record_replacements(
     hot: &Path,
+    roots: &ReplaceRoots,
     ledgers: &LedgerDir,
     now_ms: &dyn Fn() -> i64,
 ) -> Result<Vec<String>, String> {
@@ -231,6 +309,14 @@ pub fn record_replacements(
             .filter(|path| state.verdict(path) == Some(PathVerdict::Pending))
             .collect();
         if pending.is_empty() {
+            continue;
+        }
+        if let Some(why) = roots.unfinished(record, true)? {
+            lines.push(format!(
+                "replacement waits: the replace of {} under {} is unfinished ({why}); no \
+                 `replaced` record is appended until `mie store resolve --file {}` completes it",
+                record.archive, quarantine.id, record.archive
+            ));
             continue;
         }
         let files = ledgers
@@ -329,7 +415,7 @@ pub fn record_replacements(
 ///
 /// The supersede records cannot be listed or hot cannot be inspected.
 pub fn replace_lines(
-    hot: &Path,
+    roots: &ReplaceRoots,
     ledgers: &LedgerDir,
     state: &CopyState,
 ) -> Result<(Vec<String>, Vec<String>), String> {
@@ -351,7 +437,7 @@ pub fn replace_lines(
         let Some(quarantine) = &record.quarantine else {
             continue;
         };
-        if let Some(why) = incomplete(hot, record, state)? {
+        if let Some(why) = incomplete(roots, record, state)? {
             problems.push(format!(
                 "the replace of {} under quarantine {} ({label}) is incomplete: {why}; `mie store \
                  resolve --file {}` completes it",
