@@ -52,3 +52,19 @@ opt-level = 2
 [profile.dev.package.libduckdb-sys]
 debug = false
 opt-level = 1
+
+# Build scripts and proc macros, with their dependencies, compile without
+# debuginfo in check and build mode alike (#213). Left at the default, cargo
+# gave them different flags per mode, measured 2026-11-11 from empty target
+# dirs: `cargo clippy` (check mode) compiled the libduckdb-sys build script
+# with `-C strip=debuginfo` and its build dependencies (serde, serde_json,
+# flate2) without debuginfo, `cargo test` (build mode) the build script
+# without the strip and those dependencies with `-C debuginfo=2`. The build
+# script so had two hashes (9e691222057aea9f, 2b51f0a7f39ed6a2), each ran
+# into its own OUT_DIR, and the bundled DuckDB above compiled twice per
+# target dir. With `debug = false` both modes give the build script one hash
+# and identical flags, so DuckDB compiles once. Only build scripts and proc
+# macros lose debuginfo, and nothing here debugs them; the libduckdb-sys
+# library keeps the package override above. The test profile inherits this.
+[profile.dev.build-override]
+debug = false
