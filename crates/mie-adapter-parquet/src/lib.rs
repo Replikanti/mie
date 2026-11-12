@@ -112,7 +112,7 @@ mod writer;
 mod testutil;
 
 pub use copy_ledger::{CopyLedger, LedgerHold};
-pub use reader::ParquetRawStore;
+pub use reader::{ImportView, ParquetRawStore};
 pub use recovery::RecoveryReport;
 pub use writer::{RawWriter, RecallEvent, RecallObserver, RotationPolicy, TierContext};
 

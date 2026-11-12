@@ -6,10 +6,11 @@ use crate::store::archive_checks::tests::{entry, part, sha, text};
 use mie_adapter_binance::archive::catalog::parse_day;
 
 const SYMBOL: &str = "BTCUSDT";
-const F: &str = "BTCUSDT-aggTrades-2026-10-01.zip";
-const ARCHIVE: &str = "data/futures/um/daily/aggTrades/BTCUSDT/BTCUSDT-aggTrades-2026-10-01.zip";
+pub(super) const F: &str = "BTCUSDT-aggTrades-2026-10-01.zip";
+pub(super) const ARCHIVE: &str =
+    "data/futures/um/daily/aggTrades/BTCUSDT/BTCUSDT-aggTrades-2026-10-01.zip";
 
-fn manifest(path: &str) -> SealedFile {
+pub(super) fn manifest(path: &str) -> SealedFile {
     replica::parse_manifest(&text(path, &sha(path))).unwrap()
 }
 
@@ -25,7 +26,7 @@ fn held(path: &str, reason: HoldReason) -> HeldPart {
 
 /// An entry of F listing `paths` with their manifests' SHA-256; `zip`
 /// tags the published SHA-256, so two tags are two variants.
-fn listing(zip: &str, paths: &[&str]) -> Vec<u8> {
+pub(super) fn listing(zip: &str, paths: &[&str]) -> Vec<u8> {
     let files: Vec<(String, String)> = paths.iter().map(|p| ((*p).to_owned(), sha(p))).collect();
     let refs: Vec<(&str, &str)> = files
         .iter()
@@ -35,7 +36,7 @@ fn listing(zip: &str, paths: &[&str]) -> Vec<u8> {
     text.replace(&sha("zip"), &sha(zip)).into_bytes()
 }
 
-fn record(quarantine: Option<&str>) -> Vec<u8> {
+pub(super) fn record(quarantine: Option<&str>) -> Vec<u8> {
     SupersedeRecord {
         archive: ARCHIVE.to_owned(),
         stream: key(),
@@ -54,7 +55,7 @@ fn key() -> RawStreamKey {
     RawStreamKey::new(ARCHIVE_SOURCE, SYMBOL, "aggTrades").unwrap()
 }
 
-fn file(root: &str, name: &str, bytes: &[u8]) -> FileOf {
+pub(super) fn file(root: &str, name: &str, bytes: &[u8]) -> FileOf {
     FileOf {
         root: root.to_owned(),
         name: LedgerName::parse(name).unwrap(),
@@ -62,7 +63,7 @@ fn file(root: &str, name: &str, bytes: &[u8]) -> FileOf {
     }
 }
 
-fn inputs(files: Vec<FileOf>, parts: &[&str]) -> PlanInputs {
+pub(super) fn inputs(files: Vec<FileOf>, parts: &[&str]) -> PlanInputs {
     PlanInputs {
         segment: "aggTrades".to_owned(),
         archive: ARCHIVE.to_owned(),
@@ -115,7 +116,7 @@ fn plan_table() {
     .unwrap();
     assert_eq!(planned.case, Case::Interrupted);
     assert_eq!((planned.record.is_some(), planned.entry), (false, Some(1)));
-    // S1 with a quarantine id: a pending replace, #211.
+    // S1 with a quarantine id: a pending replace, which the resume owns (#211 RQ7).
     refused(
         &inputs(
             vec![
@@ -124,7 +125,7 @@ fn plan_table() {
             ],
             &both,
         ),
-        &["q-1", "#211"],
+        &["q-1", "a replace is pending", "RQ7"],
     );
 
     // (c) The latest entry lists the held parts: no import-ledger write.
@@ -449,7 +450,8 @@ fn attribution_refusals() {
         why.contains(ARCHIVE) && why.contains("2026-10-02.zip"),
         "{why}"
     );
-    // A manifest-conflict hold names #211.
+    // A manifest-conflict hold names the replace (#211); a replace
+    // attributes it, and hot's text differing from the ledger's too.
     let why = attribute(
         SYMBOL,
         ARCHIVE,
@@ -458,9 +460,22 @@ fn attribution_refusals() {
     )
     .unwrap_err();
     assert!(
-        why.contains("manifest-conflict") && why.contains("#211"),
+        why.contains("manifest-conflict") && why.contains("--replace"),
         "{why}"
     );
+    let conflicted = held(&a, HoldReason::ManifestConflict);
+    let differing_text = HeldPart {
+        hot_text: Some(text(&a, &sha("other"))),
+        ..held(&a, HoldReason::Unlisted)
+    };
+    for part in [conflicted, differing_text] {
+        assert_eq!(
+            attribute_with(SYMBOL, ARCHIVE, &[part], None, true)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
     // No manifest on hot or in the ledger: no proposal, named.
     let bare = HeldPart {
         hot_text: None,

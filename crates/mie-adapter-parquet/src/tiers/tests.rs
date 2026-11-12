@@ -769,3 +769,83 @@ fn a_select_during_a_recall_holds_every_file() {
     let checked = checked.lock().unwrap();
     assert_eq!(checked.len(), 4, "three copies and the return: {checked:?}");
 }
+
+/// #211 I2: the import view skips a path only while its replacement is
+/// pending under a `quarantined` record and hot does not list it; a
+/// `hold-cleared replace` alone, a quarantined path still on hot, an open
+/// hold and a lost record still fail there, and the strict `select` fails
+/// on all of them.
+#[test]
+fn the_import_view_skips_only_a_quarantined_pending_path() {
+    let partition = TieredFixture::partition(&a(), 1);
+    let covering = selection(&[a()], D0 + DAY_MS, D0 + 2 * DAY_MS);
+    let import = |fx: &TieredFixture| fx.store().import_view().select(&covering);
+
+    // Quarantined and gone from hot: absent in the import view only.
+    let fx = TieredFixture::new("tiers-import-view");
+    fx.copy(&partition);
+    let path = TieredFixture::data_paths(&fx.hot, &partition)[1].clone();
+    fx.append(Kind::Hold {
+        path: path.clone(),
+        reason: HoldReason::Unlisted,
+    });
+    fx.append(Kind::Quarantined {
+        path: path.clone(),
+        quarantine: "q-0001".to_owned(),
+    });
+    // Held still: both fail.
+    assert!(integrity(import(&fx)).contains("is held"));
+    fx.append(Kind::HoldCleared {
+        path: path.clone(),
+        resolution: Resolution::Replace,
+    });
+    // Still on hot: both fail.
+    assert!(integrity(import(&fx)).contains("quarantined under q-0001"));
+    fx.quarantine(&path, "q-0001");
+    let mut expected = fx.reference().select(&covering).unwrap().files;
+    expected.retain(|f| f.relative_path != path);
+    let got = import(&fx).unwrap();
+    assert_eq!(got.files, expected);
+    assert_eq!(
+        got.version,
+        manifest::dataset_version(covering.window(), covering.streams(), &expected)
+    );
+    assert!(integrity(fx.store().select(&covering)).contains("quarantined under q-0001"));
+    // The single-root view is the single-root `select`.
+    let reference = fx.reference();
+    assert_eq!(
+        reference.import_view().select(&covering),
+        reference.select(&covering)
+    );
+
+    // `hold-cleared replace` without `quarantined`, gone from hot.
+    let fx = TieredFixture::new("tiers-import-view-cleared");
+    fx.copy(&partition);
+    let path = TieredFixture::data_paths(&fx.hot, &partition)[1].clone();
+    fx.append(Kind::Hold {
+        path: path.clone(),
+        reason: HoldReason::Unlisted,
+    });
+    fx.append(Kind::HoldCleared {
+        path: path.clone(),
+        resolution: Resolution::Replace,
+    });
+    fx.quarantine(&path, "q-0002");
+    assert!(integrity(import(&fx)).contains("its hold was resolved by replace"));
+
+    // Lost, then quarantined: lost wins.
+    let fx = TieredFixture::new("tiers-import-view-lost");
+    fx.copy(&partition);
+    let path = TieredFixture::data_paths(&fx.hot, &partition)[1].clone();
+    fx.quarantine(&path, "q-0003");
+    fx.append(Kind::Lost {
+        path: path.clone(),
+        origin: LostOrigin::Verify,
+        sha256: None,
+    });
+    fx.append(Kind::Quarantined {
+        path: path.clone(),
+        quarantine: "q-0003".to_owned(),
+    });
+    assert!(integrity(import(&fx)).contains("is lost"));
+}

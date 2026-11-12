@@ -67,8 +67,16 @@
 //!   named. So a full, a stale and an empty start agree after a re-admit.
 //! - **B8 Removed:** a partition with a verified cold copy and no
 //!   directory on hot; inside the hot window it is also a `FAIL:` line.
+//! - **Q1–Q6 Quarantine** (step 5a, #211). Q1: each root's `.quarantine/`
+//!   is read with the layouts (an I/O error stops the run). Q2–Q5 are
+//!   [`archive_checks::quarantine`]: the set Q of moved and quarantined
+//!   paths and their records. Q3: every Q path skips B4 to B8. Q6: their
+//!   records follow B7′'s, as `manifest`, `hold-cleared … replace`,
+//!   `quarantined` and `replaced`, each in path order; `records derived`
+//!   counts them, and the report has one line per quarantine id.
 //! - **B9 Install:** records per path, then `lost`, `removed`, `hold` and
-//!   `hold-cleared`, each in path order; markers re-read, the old ledger linked aside, the gate
+//!   `hold-cleared`, each in path order, then the quarantine's (Q6);
+//!   markers re-read, the old ledger linked aside, the gate
 //!   written, the new ledger renamed into place
 //!   ([`LedgerHold::replace`](mie_adapter_parquet::LedgerHold::replace)),
 //!   then every ledger copy that is no prefix of it moved aside.
@@ -77,7 +85,9 @@
 //! - **B11** The report; `PASS` only with the ledger written and no `FAIL:`
 //!   line.
 
-use super::archive_checks::{self, ArchiveInputs, EntryCopy, PartTexts};
+use super::archive_checks::{
+    self, ArchiveInputs, EntryCopy, PartTexts, QuarantineInputs, RootQuarantine,
+};
 use super::replicate::{self, IMPORT_LEDGER_DIR, META_DIR, entry_files, is_archive_part};
 use super::{DeviceProbe, check_devices, check_hot};
 use crate::config::IngestConfig;
@@ -88,7 +98,7 @@ use mie_adapter_parquet::copy_ledger::{
     Resolution,
 };
 use mie_adapter_parquet::removal;
-use mie_adapter_parquet::replica::{self, CopyCheck};
+use mie_adapter_parquet::replica::{self, CopyCheck, QuarantineListing};
 use mie_adapter_parquet::root_marker::{self, HOT_ID};
 use mie_adapter_parquet::verification::{CopyState, PathVerdict};
 use mie_ports::raw::RawStoreError;
@@ -194,6 +204,8 @@ pub struct RootRead {
     pub files: BTreeMap<String, RootCopy>,
     /// The data files it holds without their manifest.
     pub orphan_data: BTreeSet<String>,
+    /// Its `.quarantine/` directory (Q1).
+    pub quarantine: QuarantineListing,
 }
 
 /// Hot's layout.
@@ -206,6 +218,8 @@ pub struct HotRead {
     /// Its `date=` partition directories (a removal's hidden leftover is
     /// none).
     pub partitions: BTreeSet<String>,
+    /// Its `.quarantine/` directory (Q1).
+    pub quarantine: QuarantineListing,
 }
 
 /// One copy target's ledger copy.
@@ -685,12 +699,55 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
         )));
     }
 
+    // Q2 to Q5: the quarantine, before B4 to B8, which skip its paths (Q3).
+    let mut layout: BTreeMap<String, Vec<(String, Option<String>)>> = BTreeMap::new();
+    let roots_layout = std::iter::once(("hot", &inputs.hot.files, &inputs.hot.orphan_data)).chain(
+        inputs
+            .roots
+            .iter()
+            .map(|root| (root.id.as_str(), &root.files, &root.orphan_data)),
+    );
+    for (root, files, orphans) in roots_layout {
+        for (path, copy) in files {
+            let text = match copy {
+                RootCopy::Text { text, .. } => Some(text.clone()),
+                RootCopy::BadText(_) => None,
+            };
+            layout
+                .entry(path.clone())
+                .or_default()
+                .push((root.to_owned(), text));
+        }
+        for path in orphans {
+            let slot = layout.entry(path.clone()).or_default();
+            if !slot.iter().any(|(r, _)| r == root) {
+                slot.push((root.to_owned(), None));
+            }
+        }
+    }
+    let quarantines: Vec<RootQuarantine> = std::iter::once(RootQuarantine {
+        root: "hot".to_owned(),
+        listing: inputs.hot.quarantine.clone(),
+    })
+    .chain(inputs.roots.iter().map(|root| RootQuarantine {
+        root: root.id.clone(),
+        listing: root.quarantine.clone(),
+    }))
+    .collect();
+    let quarantine = archive_checks::quarantine(&QuarantineInputs {
+        entries: &inputs.entries,
+        roots: &quarantines,
+        layout: &layout,
+        start: &state,
+    });
+    let in_q = |path: &str| quarantine.paths.contains_key(path);
+
     // B7: the archive checks.
     let parts: BTreeMap<String, PartTexts> = holders
         .keys()
         .copied()
         .chain(sources.keys().map(String::as_str))
-        .filter(|path| is_archive_part(path))
+        .filter(|path| is_archive_part(path) && !in_q(path))
         .map(|path| {
             let roots = holders
                 .get(path)
@@ -728,6 +785,9 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
     // B4, B5: per path in path order.
     let mut records: Vec<Kind> = Vec::new();
     for path in holders.keys().copied() {
+        if in_q(path) {
+            continue;
+        }
         let texts = distinct(path);
         let text: Option<&str> = match texts[..] {
             [only] => Some(only),
@@ -833,6 +893,9 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
     };
     let mut lost = Vec::new();
     for (path, named) in &sources {
+        if in_q(path) {
+            continue;
+        }
         let described: Vec<String> = named.iter().map(Source::describe).collect();
         if !copy_ledger::is_data_path(path) {
             problems.push(format!(
@@ -993,6 +1056,9 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
         let Some(reason) = state.hold_reason(&path) else {
             continue;
         };
+        if in_q(&path) {
+            continue;
+        }
         if findings.holds.contains_key(&path) {
             continue;
         }
@@ -1038,20 +1104,23 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
         ));
     }
     problems.extend(findings.problems.iter().cloned());
+    lines.extend(quarantine.lines.iter().cloned());
+    problems.extend(quarantine.problems.iter().cloned());
 
     // B8: removed.
     let partitions: BTreeSet<&str> = inputs
         .roots
         .iter()
         .flat_map(|root| &root.files)
-        .filter(|(_, copy)| {
-            matches!(
-                copy,
-                RootCopy::Text {
-                    data: DataCheck::Good,
-                    ..
-                }
-            )
+        .filter(|(path, copy)| {
+            !in_q(path)
+                && matches!(
+                    copy,
+                    RootCopy::Text {
+                        data: DataCheck::Good,
+                        ..
+                    }
+                )
         })
         .map(|(path, _)| partition_of(path))
         .collect();
@@ -1086,6 +1155,7 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
     records.extend(removed);
     records.extend(hold_records);
     records.extend(cleared_records);
+    records.extend(quarantine.records.iter().cloned());
     let mut added = Vec::new();
     for kind in records {
         let record = Record {
@@ -1108,6 +1178,8 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
         "removed",
         "hold",
         "hold-cleared",
+        "quarantined",
+        "replaced",
     ]
     .iter()
     .map(|kind| format!("{kind} {}", counts.get(kind).copied().unwrap_or(0)))
@@ -1371,7 +1443,18 @@ fn rebuild(
             root.display()
         ))
     };
-    let mut hot_read = HotRead::default();
+    let quarantine = |root: &Path, error: RawStoreError| {
+        Stop(format!(
+            "cannot read the quarantine of {} ({error}); a skipped quarantine would turn its \
+             files into lost candidates, so the rebuild stops with nothing written (ADR-062 D7 \
+             step 5a)",
+            root.display()
+        ))
+    };
+    let mut hot_read = HotRead {
+        quarantine: replica::list_quarantine(hot).map_err(|e| quarantine(hot, e))?,
+        ..HotRead::default()
+    };
     for path in replica::list_sealed(hot).map_err(|e| listing(hot, e))? {
         let copy = read_copy(hot, &path, false)?;
         hot_read.files.insert(path, copy);
@@ -1394,6 +1477,8 @@ fn rebuild(
             copy_target: root.copy_target,
             files,
             orphan_data: orphan_data(&root.path).map_err(|e| listing(&root.path, e))?,
+            quarantine: replica::list_quarantine(&root.path)
+                .map_err(|e| quarantine(&root.path, e))?,
         });
     }
     let inputs = RebuildInputs {

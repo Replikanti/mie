@@ -46,6 +46,7 @@ fn inputs() -> RebuildInputs {
                 copy_target: true,
                 files: BTreeMap::new(),
                 orphan_data: BTreeSet::new(),
+                quarantine: QuarantineListing::default(),
             })
             .into(),
     }
@@ -975,4 +976,97 @@ fn a_derivation_never_claims_a_record_was_written() {
         &derived,
         &[&gone, "--record-lost", "only if this run installs"],
     );
+}
+
+/// Q1 to Q6 (#211): a replaced generation whose part sits in hot's
+/// quarantine and on cold-a's: the start's hold on it neither stays held
+/// nor gives a B7′ line, the start's records name it and no lost candidate
+/// comes of it; the quarantine's records follow the others in Q6's order,
+/// and equal inputs give byte-identical ledgers.
+#[test]
+fn equal_inputs_give_byte_identical_ledgers_with_quarantine() {
+    use mie_adapter_binance::archive::ledger::{Quarantine, SupersedeRecord};
+    use mie_adapter_parquet::replica::QuarantinedCopy;
+    let p = part("aggTrades", "2026-10-01", 0);
+    let live_path = live("2026-10-06", 0);
+    let t = text(&p, &sha("p"));
+    let record = SupersedeRecord {
+        archive: "data/futures/um/daily/aggTrades/BTCUSDT/BTCUSDT-aggTrades-2026-10-01.zip"
+            .to_owned(),
+        stream: mie_ports::raw::RawStreamKey::new("binance-archive", "BTCUSDT", "aggTrades")
+            .unwrap(),
+        period: mie_adapter_binance::archive::catalog::Period::Day(
+            mie_adapter_binance::archive::catalog::parse_day("2026-10-01").unwrap(),
+        ),
+        entries: Vec::new(),
+        quarantine: Some(Quarantine {
+            id: "q-1".to_owned(),
+            moved: vec![p.clone()],
+        }),
+    };
+    let mut inputs = inputs();
+    inputs.entries.insert(
+        S1.to_owned(),
+        vec![EntryCopy {
+            root: "hot".to_owned(),
+            bytes: record.render().into_bytes(),
+        }],
+    );
+    let quarantined = QuarantinedCopy {
+        text: Some(t.clone()),
+        data: true,
+    };
+    for listing in std::iter::once(&mut inputs.hot.quarantine)
+        .chain(std::iter::once(&mut inputs.roots[0].quarantine))
+    {
+        listing.ids.insert(
+            "q-1".to_owned(),
+            BTreeMap::from([(p.clone(), quarantined.clone())]),
+        );
+    }
+    let lt = text(&live_path, &sha("live"));
+    on_hot(&mut inputs, &live_path, &lt);
+    on(&mut inputs, 0, &live_path, good(&lt));
+    start_on(
+        &mut inputs,
+        0,
+        ledger(&[Kind::Hold {
+            path: p.clone(),
+            reason: HoldReason::Unlisted,
+        }]),
+    );
+    let derived = derive_ok(&inputs);
+    assert!(derived.lost.is_empty(), "{derived:#?}");
+    assert!(derived.holds.is_empty(), "{derived:#?}");
+    assert_eq!(derived.problems, Vec::<String>::new(), "{derived:#?}");
+    assert_eq!(
+        added(&derived),
+        vec![
+            manifest(&lt),
+            copy(&live_path, "cold-a"),
+            manifest(&t),
+            Kind::HoldCleared {
+                path: p.clone(),
+                resolution: Resolution::Replace
+            },
+            Kind::Quarantined {
+                path: p.clone(),
+                quarantine: "q-1".to_owned()
+            },
+        ]
+    );
+    assert!(
+        derived
+            .lines
+            .iter()
+            .any(|l| l.contains("quarantined 1, replaced 0")),
+        "{derived:#?}"
+    );
+    assert!(
+        derived
+            .lines
+            .iter()
+            .any(|l| l == "quarantine q-1: 1 path(s), 1 complete, 0 incomplete")
+    );
+    assert_eq!(derive_ok(&inputs).ledger, derived.ledger);
 }

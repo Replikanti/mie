@@ -496,3 +496,312 @@ fn supersede_records_join_entry_resolution() {
         found.problems
     );
 }
+
+// ----------------------------------------------------------- quarantine
+
+use mie_adapter_binance::archive::ledger::{Quarantine, SupersededEntry};
+use mie_adapter_parquet::copy_ledger::{LedgerBuilder, Record};
+use mie_adapter_parquet::replica::QuarantinedCopy;
+
+const QID: &str = "q-1791259200000";
+
+/// S1 of the fixture's archive file moving `moved` (sorted) under
+/// [`QID`], naming `entries`.
+fn moving(moved: &[&str], entries: Vec<SupersededEntry>) -> Vec<u8> {
+    let mut moved: Vec<String> = moved.iter().map(|p| (*p).to_owned()).collect();
+    moved.sort();
+    SupersedeRecord {
+        archive: "data/futures/um/daily/aggTrades/BTCUSDT/BTCUSDT-aggTrades-2026-10-01.zip"
+            .to_owned(),
+        stream: RawStreamKey::new("binance-archive", "BTCUSDT", "aggTrades").unwrap(),
+        period: Period::Day(parse_day("2026-10-01").unwrap()),
+        entries,
+        quarantine: Some(Quarantine {
+            id: QID.to_owned(),
+            moved,
+        }),
+    }
+    .render()
+    .into_bytes()
+}
+
+/// The start's copy state from `kinds`.
+fn start(kinds: Vec<Kind>) -> CopyState {
+    let mut builder = LedgerBuilder::empty();
+    for kind in kinds {
+        builder.push(&Record { at_ms: 1, kind }).unwrap();
+    }
+    let ledger =
+        mie_adapter_parquet::copy_ledger::parse(std::path::Path::new("start"), &builder.finish())
+            .unwrap();
+    CopyState::fold(&ledger).unwrap()
+}
+
+/// A root's quarantine `QID` holding `parts` with their texts.
+fn quarantined_on(root: &str, parts: &[(&str, Option<&str>)]) -> RootQuarantine {
+    let mut listing = QuarantineListing::default();
+    listing.ids.insert(
+        QID.to_owned(),
+        parts
+            .iter()
+            .map(|(path, text)| {
+                (
+                    (*path).to_owned(),
+                    QuarantinedCopy {
+                        text: text.map(str::to_owned),
+                        data: true,
+                    },
+                )
+            })
+            .collect(),
+    );
+    RootQuarantine {
+        root: root.to_owned(),
+        listing,
+    }
+}
+
+fn run_quarantine(
+    entries: &BTreeMap<String, Vec<EntryCopy>>,
+    roots: &[RootQuarantine],
+    layout: &BTreeMap<String, Vec<(String, Option<String>)>>,
+    start: &CopyState,
+) -> QuarantineFindings {
+    quarantine(&QuarantineInputs {
+        entries,
+        roots,
+        layout,
+        start,
+    })
+}
+
+fn record_of(bytes: Vec<u8>) -> BTreeMap<String, Vec<EntryCopy>> {
+    BTreeMap::from([(S1.to_owned(), copies(&[("hot", &bytes)]))])
+}
+
+#[track_caller]
+fn has_problem(found: &QuarantineFindings, needles: &[&str]) {
+    assert!(
+        found
+            .problems
+            .iter()
+            .any(|p| needles.iter().all(|n| p.contains(n))),
+        "no problem with {needles:?}: {:#?}",
+        found.problems
+    );
+}
+
+/// Q1/Q2: an id directory named with a look-alike hyphen, a trailing blank
+/// or a zero-width character is named and its files count for nothing.
+#[test]
+fn quarantine_names_outside_the_id_grammar_are_named_not_recorded() {
+    let mut root = RootQuarantine {
+        root: "hot".to_owned(),
+        listing: QuarantineListing::default(),
+    };
+    root.listing.bad_names = vec![
+        "q\u{2010}1".to_owned(),
+        "q-1 ".to_owned(),
+        "q\u{200b}-1".to_owned(),
+    ];
+    let found = run_quarantine(
+        &BTreeMap::new(),
+        &[root],
+        &BTreeMap::new(),
+        &start(Vec::new()),
+    );
+    assert_eq!(found.problems.len(), 3, "{found:#?}");
+    assert!(found.records.is_empty() && found.paths.is_empty());
+}
+
+/// Q2: a moved path with a fullwidth digit makes its record unparseable
+/// (no path of it counts); a non-canonical ASCII path and a live path are
+/// named and never recorded, and the derivation goes on.
+#[test]
+fn moved_paths_outside_the_layout_are_named_never_recorded() {
+    let good = part("aggTrades", "2026-10-01", 0);
+    let odd =
+        "source=binance-archive/instrument=BTCUSDT/stream=aggTrades/date=2026-10-01/part-7.parquet";
+    let live =
+        "source=binance-um/instrument=BTCUSDT/stream=aggTrade/date=2026-10-01/part-00000.parquet";
+    let wide = good.replace("2026-10-01", "2026-10-0\u{ff11}");
+    let entries = BTreeMap::from([
+        (
+            S1.to_owned(),
+            copies(&[("hot", &moving(&[&good, odd, live], Vec::new()))]),
+        ),
+        (
+            "aggTrades/BTCUSDT-aggTrades-2026-10-01.zip.2.supersede.import".to_owned(),
+            copies(&[("hot", &moving(&[&wide], Vec::new()))]),
+        ),
+    ]);
+    let found = run_quarantine(&entries, &[], &BTreeMap::new(), &start(Vec::new()));
+    assert_eq!(found.paths.keys().collect::<Vec<_>>(), vec![&good]);
+    has_problem(&found, &[odd, "never recorded"]);
+    has_problem(&found, &[live, "never recorded"]);
+    assert!(found.records.iter().all(|kind| match kind {
+        Kind::Quarantined { path, .. } => *path == good,
+        _ => true,
+    }));
+}
+
+/// Q4/Q5: a moved path that no root's layout or quarantine holds is still
+/// recorded quarantined, and named: its bytes are gone.
+#[test]
+fn a_quarantined_path_gone_from_every_root_is_still_quarantined() {
+    let p = part("aggTrades", "2026-10-01", 0);
+    let found = run_quarantine(
+        &record_of(moving(&[&p], Vec::new())),
+        &[],
+        &BTreeMap::new(),
+        &start(Vec::new()),
+    );
+    assert_eq!(
+        found.records,
+        vec![Kind::Quarantined {
+            path: p.clone(),
+            quarantine: QID.to_owned()
+        }]
+    );
+    has_problem(&found, &[&p, "bytes are gone"]);
+}
+
+/// Q2/Q5: a quarantined file no record names takes its directory's id and
+/// is named.
+#[test]
+fn an_unnamed_quarantine_file_is_quarantined_and_named() {
+    let p = part("aggTrades", "2026-10-01", 0);
+    let t = text(&p, &sha("a"));
+    let found = run_quarantine(
+        &BTreeMap::new(),
+        &[quarantined_on("cold-a", &[(&p, Some(&t))])],
+        &BTreeMap::new(),
+        &start(Vec::new()),
+    );
+    assert_eq!(found.paths[&p].record, None);
+    assert_eq!(
+        found.records,
+        vec![
+            Kind::Manifest { text: t },
+            Kind::Quarantined {
+                path: p.clone(),
+                quarantine: QID.to_owned()
+            }
+        ]
+    );
+    has_problem(&found, &[&p, "no supersede record names it"]);
+}
+
+/// Q4/Q5: a start hold on a complete Q path is cleared by `replace`; on
+/// an incomplete one (hot's layout still holds it) it stays open and the
+/// stop is named; `replaced` follows an entry of generation ≥ 1, never an
+/// incomplete path.
+#[test]
+fn start_holds_on_quarantined_paths() {
+    let (done, stopped) = (
+        part("aggTrades", "2026-10-01", 0),
+        part("aggTrades", "2026-10-01", 1),
+    );
+    let mut entries = record_of(moving(&[&done, &stopped], Vec::new()));
+    entries.insert(E1.to_owned(), copies(&[("hot", &entry(&[]))]));
+    let layout = BTreeMap::from([(
+        stopped.clone(),
+        vec![("hot".to_owned(), Some(text(&stopped, &sha("s"))))],
+    )]);
+    let holds = vec![
+        Kind::Hold {
+            path: done.clone(),
+            reason: HoldReason::Unlisted,
+        },
+        Kind::Hold {
+            path: stopped.clone(),
+            reason: HoldReason::Unlisted,
+        },
+        Kind::Manifest {
+            text: text(&done, &sha("d")),
+        },
+        Kind::Manifest {
+            text: text(&stopped, &sha("s")),
+        },
+    ];
+    let found = run_quarantine(
+        &entries,
+        &[quarantined_on("hot", &[(&done, None)])],
+        &layout,
+        &start(holds),
+    );
+    assert_eq!(
+        found.records,
+        vec![
+            Kind::HoldCleared {
+                path: done.clone(),
+                resolution: Resolution::Replace
+            },
+            Kind::Quarantined {
+                path: done.clone(),
+                quarantine: QID.to_owned()
+            },
+            Kind::Quarantined {
+                path: stopped.clone(),
+                quarantine: QID.to_owned()
+            },
+            Kind::Replaced {
+                path: done.clone(),
+                entry: E1.to_owned()
+            },
+        ]
+    );
+    has_problem(&found, &[&stopped, "stopped between renames"]);
+    assert!(found.paths[&done].complete && !found.paths[&stopped].complete);
+    assert!(
+        found
+            .lines
+            .iter()
+            .any(|l| l.contains("1 complete, 1 incomplete"))
+    );
+}
+
+/// Q4, the text rule: two texts in quarantine give the one whose SHA-256
+/// the superseded entry lists, as a full start has it.
+#[test]
+fn the_quarantine_manifest_text_follows_the_superseded_entry() {
+    let p = part("aggTrades", "2026-10-01", 0);
+    let (listed, other) = (text(&p, &sha("listed")), text(&p, &sha("other")));
+    let e0 = entry(&[(&p, &sha("listed"))]);
+    let named = SupersededEntry::of(NAME.to_owned(), &e0);
+    let mut entries = record_of(moving(&[&p], vec![named]));
+    entries.insert(NAME.to_owned(), copies(&[("hot", &e0)]));
+    for order in [[&listed, &other], [&other, &listed]] {
+        let found = run_quarantine(
+            &entries,
+            &[
+                quarantined_on("hot", &[(&p, Some(order[0]))]),
+                quarantined_on("cold-a", &[(&p, Some(order[1]))]),
+            ],
+            &BTreeMap::new(),
+            &start(Vec::new()),
+        );
+        assert_eq!(
+            found.records[0],
+            Kind::Manifest {
+                text: listed.clone()
+            }
+        );
+    }
+    // Without the entry's evidence, two texts give none.
+    let found = run_quarantine(
+        &record_of(moving(&[&p], Vec::new())),
+        &[
+            quarantined_on("hot", &[(&p, Some(&listed))]),
+            quarantined_on("cold-a", &[(&p, Some(&other))]),
+        ],
+        &BTreeMap::new(),
+        &start(Vec::new()),
+    );
+    assert!(
+        found
+            .records
+            .iter()
+            .all(|kind| !matches!(kind, Kind::Manifest { .. }))
+    );
+}

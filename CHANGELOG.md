@@ -12,6 +12,34 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
 
 ### Added
 
+- **Storage tiers, step 8b: the replace into quarantine (#211, ADR-062
+  D5, D7, D11, proposed).** `mie store resolve --file <archive path>
+  --replace` resolves held archive parts whose rows differ from the
+  published file, or that the operator decides to replace, without any
+  download. It prints the cost first (every moved path with its stream,
+  date, event range, rows and SHA-256, and every journaled warm run whose
+  prefix covers one, by run id and `prefix_dataset`), then writes a
+  supersede record naming the quarantine id `q-<time>` and the moved
+  paths, records each path `quarantined` (with its `manifest` when the
+  copy ledger has none), renames it on every root into
+  `.quarantine/<id>/<path>` (cold roots first, hot last, nothing ever
+  deleted) and clears the holds. The moved set is the whole superseded
+  generation: the held parts and every other part of the entry they
+  supersede that a root holds; a `manifest-conflict` part can be
+  replaced. Until the re-import's entry exists every selection covering
+  a moved path fails. `mie archive-import` refuses while a replace is
+  incomplete, reads the store through an import view that skips the
+  quarantined parts no longer on hot, numbers the re-imported parts above
+  them, and appends one `replaced` record per moved path once its new
+  entry and every part it lists are sealed on hot (also at its next
+  start, after a crash). A replace that stopped is completed by `mie
+  store resolve --file <archive path>`; without `--file` the command names
+  every incomplete replace. A re-admit that finds a difference prints the
+  replace's cost and command and still writes nothing. `mie store
+  rebuild` reads every root's `.quarantine/` and re-derives the
+  `quarantined`, `hold-cleared … replace` and `replaced` records, so a
+  rebuild from a full, a stale or an empty start gives the same
+  selections (AW12).
 - **Storage tiers, step 8a: `mie store resolve` (#210, ADR-062 D11,
   proposed).** `mie store resolve --config <ingest config>
   [--archive-config <path>] [--file <archive path>]` resolves held

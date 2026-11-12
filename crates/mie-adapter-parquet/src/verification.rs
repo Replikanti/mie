@@ -290,6 +290,18 @@ impl CopyState {
             .collect()
     }
 
+    /// The quarantine id of `path`'s pending replacement, whatever its
+    /// verdict (#211).
+    pub fn quarantine(&self, path: &str) -> Option<&str> {
+        self.view.quarantine(path)
+    }
+
+    /// The import entry of `path`'s `replaced` record, whatever its
+    /// verdict (#211).
+    pub fn replaced(&self, path: &str) -> Option<&str> {
+        self.view.replaced(path)
+    }
+
     /// The ledger's first manifest text of `path`, whatever its verdict.
     pub fn ledger_text(&self, path: &str) -> Option<&str> {
         self.view.text(path)

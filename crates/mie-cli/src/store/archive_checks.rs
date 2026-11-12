@@ -37,16 +37,45 @@
 //!   the targets only counts and is named. A malformed name is named and
 //!   counts for nothing.
 //!
-//! The quarantine listings join these inputs with the replace resolution
-//! (#211).
+//! **Quarantine** ([`quarantine`], ADR-062 D7 step 5a, D11; #211 Q2–Q5),
+//! one pure function shared with the hot restore (#195):
+//!
+//! - **Q2 The set Q**: every `moved` path of every supersede record with a
+//!   quarantine (the union over hot and the targets: hot's copy when it
+//!   parses, else the first target copy that parses), plus every path
+//!   found in a root's `.quarantine/<id>/`. A moved path outside the
+//!   layout's grammar, or no archive part, is a problem and never
+//!   recorded. A path takes its record's id; a path found only in a
+//!   quarantine directory takes that directory's id and is named. An id
+//!   directory whose name is no valid segment counts for nothing.
+//! - **Q3** The caller skips every Q path in B4 to B8: no `copy` record,
+//!   no damage line, no lost candidate, no hold, no `removed` partition.
+//! - **Q4 Records per Q path**: `manifest` when the start lacks a text
+//!   (the text rule over the layouts' and the quarantines' texts, the
+//!   superseded entry breaking a tie); `hold-cleared <path> replace` when
+//!   the start holds it open, a record names it and it is complete (no
+//!   root's layout holds it); `quarantined <path> <id>` unless the start
+//!   has it pending under that id; `replaced <path> <segment>/<E_g>` when
+//!   it is complete, a record S_n names it, an entry of the lowest
+//!   generation g ≥ n exists in the union and the start has no `replaced`
+//!   for it.
+//! - **Q5 Problems**, none derived from an absence, so the ledger is
+//!   still installed: an incomplete path (the replace stopped between
+//!   renames; an open start hold stays open), a path no root's layout or
+//!   quarantine holds (its bytes are gone), a quarantined path no record
+//!   names.
 
+use super::quarantine::{superseded_shas, text_rule};
+use super::replicate::is_archive_part;
 use mie_adapter_binance::archive::catalog::parse_day;
 use mie_adapter_binance::archive::import::orphan_days;
 use mie_adapter_binance::archive::ledger::{
     ImportLedger, LedgerKind, LedgerName, Pending, SupersedeRecord, current_generation,
+    replacement_generation,
 };
-use mie_adapter_parquet::copy_ledger::HoldReason;
-use mie_adapter_parquet::replica;
+use mie_adapter_parquet::copy_ledger::{self, HoldReason, Kind, Resolution};
+use mie_adapter_parquet::replica::{self, QuarantineListing};
+use mie_adapter_parquet::verification::CopyState;
 use mie_ports::raw::RawStreamKey;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -366,4 +395,295 @@ fn resumes(pending: &Pending, path: &str) -> bool {
     let (first, last) = orphan_days(pending.period);
     RawStreamKey::new(source, instrument, stream).is_ok_and(|key| key == pending.stream)
         && parse_day(date).is_some_and(|day| (first..=last).contains(&day))
+}
+
+// ----------------------------------------------------------- quarantine
+
+/// One root's `.quarantine/` directory as the caller read it (Q1).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RootQuarantine {
+    /// `hot`, or a cold root's id.
+    pub root: String,
+    /// Its listing.
+    pub listing: QuarantineListing,
+}
+
+/// What [`quarantine`] reads.
+#[derive(Debug, Clone, Copy)]
+pub struct QuarantineInputs<'a> {
+    /// Every copy of every import-ledger file by name, hot's first.
+    pub entries: &'a BTreeMap<String, Vec<EntryCopy>>,
+    /// Hot's quarantine first, then every cold root's in configuration
+    /// order.
+    pub roots: &'a [RootQuarantine],
+    /// Per data path, the roots whose layout holds it (a manifest or a
+    /// data file), with the text when the manifest parses and describes
+    /// the path.
+    pub layout: &'a BTreeMap<String, Vec<(String, Option<String>)>>,
+    /// The starting ledger, folded.
+    pub start: &'a CopyState,
+}
+
+/// One path of the set Q.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuarantinedPath {
+    /// Its quarantine id.
+    pub id: String,
+    /// The supersede record naming it, `<segment>/<name>`; `None` when
+    /// only a quarantine directory holds it.
+    pub record: Option<String>,
+    /// No root's layout holds it.
+    pub complete: bool,
+}
+
+/// What [`quarantine`] found.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QuarantineFindings {
+    /// The set Q.
+    pub paths: BTreeMap<String, QuarantinedPath>,
+    /// The records to add, in Q6's order: `manifest`, `hold-cleared`,
+    /// `quarantined`, `replaced`, each group in path order.
+    pub records: Vec<Kind>,
+    /// One report line per quarantine id.
+    pub lines: Vec<String>,
+    /// Every Q5 problem.
+    pub problems: Vec<String>,
+}
+
+/// A supersede record with a quarantine, as Q2 reads it.
+struct Moving<'a> {
+    /// `<segment>/<name>`.
+    label: String,
+    segment: &'a str,
+    name: LedgerName,
+    record: SupersedeRecord,
+}
+
+/// Q2 to Q5 (module docs), pure.
+pub fn quarantine(inputs: &QuarantineInputs<'_>) -> QuarantineFindings {
+    let mut found = QuarantineFindings::default();
+    // Q2: the records, the union over hot and the targets.
+    let mut records: Vec<Moving<'_>> = Vec::new();
+    for (label, copies) in inputs.entries {
+        let Some((segment, file)) = label.split_once('/') else {
+            continue;
+        };
+        let Ok(name) = LedgerName::parse(file) else {
+            continue;
+        };
+        if name.kind != LedgerKind::Supersede {
+            continue;
+        }
+        let parse = |copy: &EntryCopy| {
+            std::str::from_utf8(&copy.bytes)
+                .ok()
+                .and_then(|text| SupersedeRecord::parse(text).ok())
+        };
+        let record = copies
+            .iter()
+            .filter(|copy| copy.root == "hot")
+            .find_map(parse)
+            .or_else(|| copies.iter().find_map(parse));
+        if let Some(record) = record
+            && record.quarantine.is_some()
+        {
+            records.push(Moving {
+                label: label.clone(),
+                segment,
+                name,
+                record,
+            });
+        }
+    }
+    // Per Q path: its record (the highest generation naming it) or its
+    // directory's id.
+    let mut by_path: BTreeMap<String, (String, Option<usize>)> = BTreeMap::new();
+    for (i, moving) in records.iter().enumerate() {
+        let quarantine = moving.record.quarantine.as_ref().expect("filtered above");
+        for path in &quarantine.moved {
+            if !copy_ledger::is_data_path(path) || !is_archive_part(path) {
+                found.problems.push(format!(
+                    "{path:?}, moved by supersede record {}, is no archive data path of the \
+                     layout: reported, never recorded (ADR-062 D7 step 5a)",
+                    moving.label
+                ));
+                continue;
+            }
+            let newer = by_path.get(path).is_none_or(|(_, known)| {
+                known.is_none_or(|j| records[j].name.generation < moving.name.generation)
+            });
+            if newer {
+                by_path.insert(path.clone(), (quarantine.id.clone(), Some(i)));
+            }
+        }
+    }
+    for root in inputs.roots {
+        for name in &root.listing.bad_names {
+            found.problems.push(format!(
+                "{}/{name:?} on {}: no valid quarantine id (a look-alike or invisible character, \
+                 a blank); its files count for nothing (ADR-062 D7 step 5a)",
+                replica::QUARANTINE_DIR,
+                root.root
+            ));
+        }
+        for (id, parts) in &root.listing.ids {
+            for path in parts.keys() {
+                if !by_path.contains_key(path) {
+                    by_path.insert(path.clone(), (id.clone(), None));
+                }
+            }
+        }
+    }
+
+    // Q4, Q5.
+    let mut groups: [Vec<Kind>; 4] = Default::default();
+    let mut per_id: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
+    for (path, (id, record)) in &by_path {
+        let layout: Vec<&(String, Option<String>)> =
+            inputs.layout.get(path).into_iter().flatten().collect();
+        let complete = layout.is_empty();
+        let quarantined: Vec<(&str, Option<&str>)> = inputs
+            .roots
+            .iter()
+            .filter_map(|root| {
+                root.listing
+                    .ids
+                    .get(id)
+                    .and_then(|parts| parts.get(path))
+                    .map(|copy| (root.root.as_str(), copy.text.as_deref()))
+            })
+            .collect();
+        let moving = record.map(|i| &records[i]);
+        let counts = per_id.entry(id).or_default();
+        if complete {
+            counts.0 += 1;
+        } else {
+            counts.1 += 1;
+        }
+        // The text rule.
+        if inputs.start.ledger_text(path).is_none() {
+            let texts = layout
+                .iter()
+                .filter_map(|(_, text)| text.as_deref())
+                .chain(quarantined.iter().filter_map(|(_, text)| *text))
+                .filter(|text| {
+                    replica::parse_manifest(text).is_ok_and(|file| file.relative_path == *path)
+                });
+            let listed = moving.map_or_else(BTreeSet::new, |moving| {
+                let files: Vec<(LedgerName, Vec<u8>)> =
+                    files_of(inputs.entries, moving.segment, &moving.name.file);
+                superseded_shas(&moving.record, moving.segment, &files, path)
+            });
+            if let Some(text) = text_rule(texts, &listed) {
+                groups[0].push(Kind::Manifest { text });
+            }
+        }
+        if moving.is_some() && complete && inputs.start.hold_reason(path).is_some() {
+            groups[1].push(Kind::HoldCleared {
+                path: path.clone(),
+                resolution: Resolution::Replace,
+            });
+        }
+        if inputs.start.quarantine(path) != Some(id.as_str()) {
+            groups[2].push(Kind::Quarantined {
+                path: path.clone(),
+                quarantine: id.clone(),
+            });
+        }
+        if let Some(moving) = moving
+            && complete
+            && inputs.start.replaced(path).is_none()
+        {
+            let names: Vec<(u32, LedgerKind)> =
+                names_of(inputs.entries, moving.segment, &moving.name.file);
+            if let Some(g) = replacement_generation(moving.name.generation, names) {
+                groups[3].push(Kind::Replaced {
+                    path: path.clone(),
+                    entry: format!(
+                        "{}/{}",
+                        moving.segment,
+                        LedgerName::entry(&moving.name.file, g).render()
+                    ),
+                });
+            }
+        }
+        match moving {
+            None => found.problems.push(format!(
+                "{path} is in {}/{id}/ and no supersede record names it: it is recorded \
+                 quarantined under {id} and never listed again (ADR-062 D7 step 5a)",
+                replica::QUARANTINE_DIR
+            )),
+            Some(moving) if !complete => {
+                let roots: Vec<&str> = layout.iter().map(|(root, _)| root.as_str()).collect();
+                found.problems.push(format!(
+                    "{path}: the replace of {} under {id} stopped between renames ({} still \
+                     hold it); `mie store resolve --file {}` completes it, and its hold stays \
+                     open until then (ADR-062 D11)",
+                    moving.record.archive,
+                    roots.join(", "),
+                    moving.record.archive
+                ));
+            }
+            Some(_) => {}
+        }
+        if complete && quarantined.is_empty() {
+            found.problems.push(format!(
+                "{path}: quarantined under {id}, and no root's layout or quarantine holds it: its \
+                 bytes are gone; nothing in mie deletes them (ADR-062 D5)"
+            ));
+        }
+        found.paths.insert(
+            path.clone(),
+            QuarantinedPath {
+                id: id.clone(),
+                record: moving.map(|moving| moving.label.clone()),
+                complete,
+            },
+        );
+    }
+    for (id, (complete, incomplete)) in per_id {
+        found.lines.push(format!(
+            "quarantine {id}: {} path(s), {complete} complete, {incomplete} incomplete",
+            complete + incomplete
+        ));
+    }
+    found.records = groups.into_iter().flatten().collect();
+    found
+}
+
+/// Every copy of the import-ledger files of archive file `file` in
+/// `segment`, as (name, bytes).
+fn files_of(
+    entries: &BTreeMap<String, Vec<EntryCopy>>,
+    segment: &str,
+    file: &str,
+) -> Vec<(LedgerName, Vec<u8>)> {
+    let mut files = Vec::new();
+    for (label, copies) in entries {
+        if let Some((s, name)) = label.split_once('/')
+            && s == segment
+            && let Ok(name) = LedgerName::parse(name)
+            && name.file == file
+        {
+            files.extend(copies.iter().map(|copy| (name.clone(), copy.bytes.clone())));
+        }
+    }
+    files
+}
+
+/// The generation and kind of every import-ledger name of `file` in
+/// `segment`, over hot and the targets.
+fn names_of(
+    entries: &BTreeMap<String, Vec<EntryCopy>>,
+    segment: &str,
+    file: &str,
+) -> Vec<(u32, LedgerKind)> {
+    entries
+        .keys()
+        .filter_map(|label| {
+            let (s, name) = label.split_once('/')?;
+            let name = LedgerName::parse(name).ok()?;
+            (s == segment && name.file == file).then_some((name.generation, name.kind))
+        })
+        .collect()
 }

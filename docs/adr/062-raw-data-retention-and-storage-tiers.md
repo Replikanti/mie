@@ -217,9 +217,11 @@ live in more than one root (approved as written at STOP 1).
   <sha256>` lines). Its bytes, its manifest and its relative path never
   change, and it is never removed from the union of the roots. The one
   exception is the *replace* resolution of a held archive part (D11): the
-  part moves to a quarantine directory, is never deleted, and every
-  selection that covers it fails until the re-import's entry replaces it,
-  so no selection silently loses it.
+  held part and every other part of the import entry it supersedes (the
+  whole superseded generation, #211 RQ2) move to a quarantine directory
+  within each root, are never deleted, and every selection that covers
+  them fails until the re-import's entry replaces them, so no selection
+  silently loses them.
 - **The copy protocol.** A copy writes the data and the manifest to the
   destination under hidden temp names, fsyncs them and verifies the
   SHA-256 against the manifest. It publishes the manifest last, because "a
@@ -572,7 +574,10 @@ live in more than one root (approved as written at STOP 1).
     `hold-cleared replace` never makes a path ordinary again: a selection
     covering it fails until the `replaced` record exists (D5). **Write
     order (a precondition for #194):** `replaced` is appended only after
-    the re-import's entry and every part it lists are sealed on hot. Why:
+    the re-import's entry and every part it lists are sealed on hot. Two
+    writers append it (#211): the importer, at its start and after its
+    run (I3), and the rebuild from the import ledger it reads (Q4); the
+    latter only names an entry the importer wrote after sealing its parts. Why:
     the fold takes `replaced` as its proof that the replacement exists and
     drops the old path at once, so a `replaced` written first would let a
     crash, or a `select` running in between, answer without either file,
@@ -719,7 +724,7 @@ live in more than one root (approved as written at STOP 1).
 
     | Kind | Fields after `<kind> <at_ms>` | First written by |
     |---|---|---|
-    | `manifest` | the escaped manifest text | the first verified copy; the adoption before its first copy (D10) |
+    | `manifest` | the escaped manifest text | the first verified copy; the adoption before its first copy (D10); the replace and the rebuild for a quarantined path without one (#211 W2, Q4) |
     | `copy` | data path, root id | each verified copy; the repair, for a copy it re-verified or replaced (D11) |
     | `removed` | partition directory | hot removal (D6) |
     | `returned` | partition directory | the recall (D6), the hot restore (D11) |
@@ -728,9 +733,9 @@ live in more than one root (approved as written at STOP 1).
     | `verify` | root id, ledger prefix length covered, finding count | the verification |
     | `lost` | data path, origin, SHA-256 or `-` | `mie store repair --record-lost` (D11, origin `verify`), the rebuild (D7 step 4) |
     | `hold` | data path, reason | the hot restore, the rebuild (D11) |
-    | `hold-cleared` | data path, resolution | the hold resolution (D11) |
-    | `quarantined` | data path, quarantine id | the *replace* resolution (D11) |
-    | `replaced` | data path, import entry | the *replace* resolution |
+    | `hold-cleared` | data path, resolution | the hold resolution (D11); the rebuild, `readmit` (B7′) and `replace` (Q4) |
+    | `quarantined` | data path, quarantine id | the *replace* resolution (D11, W2); the rebuild (Q4) |
+    | `replaced` | data path, import entry | the importer after the re-import (I3); the rebuild (Q4) |
 
   - **Field values.** A data path is a sealed data file's relative path
     exactly as the layout writes it, a partition directory is
@@ -942,7 +947,7 @@ live in more than one root (approved as written at STOP 1).
   5a. **Archive holds and quarantine are re-derived, never copied from a
      ledger.** The rebuild reads each root's `.quarantine/` directory and
      records every file in it as quarantined under the supersede record
-     that names it. It then runs the hot restore's archive checks (D11,
+     that names it (as implemented, Q1 to Q6 below, #211). It then runs the hot restore's archive checks (D11,
      step 5) against the import ledger as resolved in step 4: parts that
      no current entry lists, conflicting entry copies with no matching
      one, and archive paths with differing manifests become holds again;
@@ -1142,6 +1147,60 @@ live in more than one root (approved as written at STOP 1).
     ledger only, findings and `verify` records. Selections can differ from
     a full start only there; the first contradicts the lost-file rule's
     premise, the others are double faults, and the output names each.
+- **As implemented (#211): step 5a's quarantine part.** Numbered as in
+  the #211 plan (the tests cite them):
+  - **Q1 Read** (B1, with the layouts): every root's `.quarantine/`, hot
+    and each cold root. An id directory whose name fails
+    `validate_segment` (a look-alike hyphen, a trailing blank, a
+    zero-width character) is a `FAIL:` line and counts for nothing. Per
+    id, each part's manifest text, or its data alone; the data is never
+    read, since quarantined bytes are evidence. An I/O error, or a
+    `.quarantine` that is no directory, stops the rebuild with nothing
+    written: a skipped directory would turn its parts into lost files.
+  - **Q2 The set Q**: every `moved` path of every supersede record with a
+    quarantine, the union over hot and the targets (hot's copy when it
+    parses, else the first target copy that parses), plus every part
+    found in a root's `.quarantine/<id>/`. A moved path outside the
+    layout's grammar, or no archive part, is a `FAIL:` line and never
+    recorded; a record that does not parse (a non-ASCII byte, say) names
+    nothing. A path takes its record's id; a part found only in a
+    quarantine directory takes that directory's id and gets a `FAIL:`
+    line.
+  - **Q3** Every Q path skips B4 to B8 and B7′: no `copy` record, no
+    damage line, no lost candidate, no hold, no `removed` partition. Why:
+    a quarantined path is no file of the layout any more; taking it
+    through B6 would record it lost and fail every selection of its day
+    for good, which is the trap step 5a's *Rejected* names.
+  - **Q4 Records per Q path**: `manifest` when the start lacks a text
+    (the text rule below); `hold-cleared <path> replace` when the start
+    holds it open, a parsed record names it and it is *complete* (no
+    root's layout holds it); `quarantined <path> <id>` unless the start
+    has it pending under that id; `replaced <path> <segment>/<E_g>` when
+    it is complete, a record S_n names it, an entry of the lowest
+    generation g ≥ n exists in the union and the start has no `replaced`
+    for it.
+  - **Q5 `FAIL:` lines**, none of them derived from an absence, so the
+    ledger is still installed: an incomplete path ("the replace of F
+    stopped between renames; `mie store resolve --file F` completes it",
+    and an open start hold stays open); a path no root's quarantine or
+    layout holds ("its bytes are gone; nothing in mie deletes them"); a
+    quarantined part no record names.
+  - **Q6 Install order** (B9): after B7′'s records come `manifest`,
+    `hold-cleared … replace`, `quarantined` and `replaced`, each group in
+    path order and all with the run's `at_ms`; `records derived` counts
+    `quarantined` and `replaced`, and the report has one line per
+    quarantine id. Q2 to Q5 are one pure function shared with the hot
+    restore (#195).
+  - **The text rule** (shared with the replace's W2): the one distinct
+    text over the roots' layouts and quarantine copies; with several, the
+    one whose SHA-256 the superseded entry lists, as B5 picks for a held
+    conflict; otherwise none, and the path then covers its whole
+    stream-day in `select`, failing more selections, never fewer.
+    **Invariance limit:** a start that holds a text keeps it, so a path
+    whose quarantined copies carry two texts and whose superseded entry
+    lists neither gets a `manifest` record from a full start and none
+    from an empty one. Both fail every covering selection; the empty
+    start fails more of them (the whole stream-day).
 - **Seeds.** The capture start's seed scan (`ingest.rs` `seeds`, window
   `[now − 7 d, now + 1 d)`) calls `select` only and takes
   `max_event_time` from the manifests; it never reads a data file. With a
@@ -1758,14 +1817,19 @@ What breaks:
     so the runs that cited the parts before the loss still reproduce. Why
     first: it is the only outcome that keeps those runs EQUIVALENT.
   - **Replace**, when the rows differ (the upstream file was republished) or
-    the operator decides so. The held parts move, on every root, by a
-    rename within the root to `.quarantine/<id>/<relative path>`;
+    the operator decides so; it runs only with an explicit `--replace`
+    (as implemented, #211). The held parts and every other part of the
+    entry they supersede that a root holds (the whole superseded
+    generation, #211 RQ2) move, on every root, by a rename within the
+    root to `.quarantine/<id>/<relative path>`;
     nothing in mie ever deletes them, and the rebuild and every listing
     of the layout skip `.quarantine/` (D7, rebuild step 3). The step
     first writes a supersede record: an immutable import-ledger file
     naming the archive file, the superseded entry's SHA-256 when an
     entry exists, the quarantine id and the paths moved, replicated like
-    the entries (it never edits the old entry). The next import then
+    the entries (it never edits the old entry), then records the moved
+    paths quarantined, and only then renames, cold roots first and hot
+    last (#211 RQ6). The next import then
     reads the file as not imported (a superseded entry counts as absent,
     which is what keeps it from reporting "the ledger lists …; not
     re-imported", `import.rs`), imports it fresh and writes new parts
@@ -1773,9 +1837,11 @@ What breaks:
     covering the quarantined paths fails with `Integrity`, so no
     selection is shorter in between. The supersede record and the
     quarantine directories are what a rebuild re-derives this state from
-    (D7, step 5a). The cost, stated in the step's output: every dataset
-    version that covered the held parts changes, and warm runs that
-    cited them read `DIVERGED (warm prefix)` for good.
+    (D7, step 5a). The cost, stated in the step's output before anything
+    is written: every dataset version that covered the moved parts
+    changes, and warm runs that cited them read `DIVERGED (warm prefix)`
+    for good (#211 RQ5 lists every moved path and every journaled warm
+    run whose prefix covers one).
   - Why the importer halts instead of resolving on its own: replace
     changes recorded dataset versions, and a hold can be the trace of a
     changed upstream file (ADR-034 D4's `changed` conflict), which ADR-034
@@ -1801,7 +1867,8 @@ What breaks:
 
   - **As implemented (#210): re-admit, supersede records and `mie store
     resolve`.** The replace path, quarantine renames, the `.quarantine/`
-    part of rebuild step 5a and AW12 are #211; the hot restore is #195,
+    part of rebuild step 5a and AW12 followed in #211 (*As implemented
+    (#211)* below and in D7); the hot restore is #195,
     and it must take the archive source's writer lock too (RA1). The
     rules, as numbered in the #210 plan (the tests cite them):
     - **G1 Names.** In `<import ledger>/<raw stream>/`, with F the archive
@@ -1866,12 +1933,14 @@ What breaks:
       Refused: none; a `manifest-conflict` hold (operator, #210 STOP 1
       decision 1: re-admit never chooses between two sealed files under
       one path; with the wrong copy on hot every `select` would keep
-      failing with D5 after the clearing); a part without a manifest;
+      failing with D5 after the clearing; the replace resolves it, #211
+      RQ2); a part without a manifest;
       hot's text differing from the ledger's; a `PENDING` naming F.
     - **RA5 The plan**, over F's files on hot and the targets: (a) none,
       write `F.import`; (b) a supersede generation m above every entry, an
       interrupted re-admit: write E_m (a record with a quarantine id is a
-      pending replace, #211); (c) the latest entry, in one variant, lists
+      pending replace, which the resume completes, #211 RQ7); (c) the
+      latest entry, in one variant, lists
       every held part with its manifest's rows and SHA-256 and every other
       path it lists is ordinary: write nothing but the clearing; (d)
       otherwise write S_n naming every variant of the latest entry, then
@@ -1925,7 +1994,177 @@ What breaks:
       in every state a `select` covering a still-held part fails, never
       shorter.
     - **RA8** A difference names the first differing row, writes nothing
-      and keeps the hold.
+      and keeps the hold; since #211 it also prints the replace's cost
+      (RQ5) and names the `--replace` command.
+
+  - **As implemented (#211): the replace, its resume and the importer's
+    side.** The ledger grammar does not change (`quarantined`, `replaced`
+    and `hold-cleared … replace` exist in `mie-copy-ledger 1`, and the
+    supersede record already parses the replace's form, G2). The rules,
+    as numbered in the #211 plan (the tests cite them):
+    - **RQ0 Usage.** `mie store resolve --config <ingest config>
+      [--archive-config <path>] [--file <archive path>] [--replace]`;
+      `--replace` without `--file` is a usage error before anything is
+      read. The replace makes no network request. Why a flag and no
+      automatic replace on a difference (operator, #211 STOP 1 decision
+      1): the replace changes recorded dataset versions irreversibly, and
+      #193 and #209 put every irreversible record behind an explicit
+      flag; the difference run prints the cost and the command instead.
+    - **RQ1 Refusals**, nothing written: everything RA1 refuses; a
+      configured cold root, copy target or read-only, without a readable
+      marker (B0: the renames must reach every root that holds a moved
+      path, and an unmounted root reads as empty); a `<root>/.quarantine`
+      that exists and is no directory, a symlink included, on any root
+      (a link could take the renames off the root's filesystem); the pass
+      lock `replicate.lock` held. It is taken after the writer lock,
+      without waiting, for the whole run. Why: a pass that planned a copy
+      of a moved part before S_n existed could put that part back into a
+      target's layout after its rename. The replace downloads nothing,
+      so the pause it causes is short.
+    - **RQ2 The moved set M** of a new replace is parts(F) (attributed as
+      RA4, but a `manifest-conflict` part and hot's text differing from
+      the ledger's are allowed: the replace moves every copy and chooses
+      none) plus F's *siblings*: every path a variant of F's latest entry
+      lists, not in parts(F), that some root's layout holds. Why the whole
+      generation (operator, #211 STOP 1 decision 2): after S_n the
+      importer counts the superseded entry as absent, so a sibling left in
+      the layout would be an orphan that stops the re-import (ADR-034 D4)
+      or duplicates its rows, and a `manifest-conflict` on one part of a
+      multi-part file could never be resolved. The cost: the dataset
+      versions covering the siblings change too. Rejected, the held parts
+      only with a refusal when a sibling exists: that leaves exactly
+      those holds unresolvable. Refused, nothing written: a part or
+      sibling no root holds; a sibling the copy ledger records whose
+      verdict is not ordinary (lost, a conflict, held, pending,
+      replaced, no manifest); a moved path with two manifest texts in the
+      copy ledger (its D5 conflict outranks `replaced` in the fold, so it
+      would fail every selection for good); a read-only root holding a
+      moved path (D4: only the replicator writes cold roots, and never a
+      read-only one); a `PENDING` naming F. A listed path no root holds
+      and the ledger does not record is named and not moved, as in RA5.
+    - **RQ3 The quarantine id** is `q-<at_ms>`, at_ms the run's single
+      clock read, which stamps every record of the run. Refused when a
+      supersede record of any archive file on hot or a target names it,
+      or `<root>/.quarantine/<id>` exists on any root. Why a time and not
+      a counter: an id has to be unique across roots and across rebuilds
+      that lost the copy ledger, and the clock needs no state; the only
+      collision, two replaces in one millisecond, is refused and a re-run
+      takes the next millisecond.
+    - **RQ4 S_n**: n = 1 + the highest generation of F over hot and the
+      targets, never past 4 294 967 295 (`u32::MAX`, G1's range; a wrap to
+      0 would name the first entry); one `entry` line per variant of the
+      latest entry, none when F has no entry; `quarantine <id>` and M as
+      sorted `moved` lines. RA5's read and binding rules apply unchanged.
+    - **RQ5 The cost**, printed before the first write; a re-admit run
+      that finds a difference prints it too and names the `--replace`
+      command. One line per moved path (stream, date, event-time range in
+      ms, rows, SHA-256; a `manifest-conflict` part one per distinct
+      text), stating that every dataset version of a selection
+      overlapping it changes; one line per journaled warm run (a
+      `warm_start` with `warm: true` in the ingest configuration's
+      journal, streamed line by line) whose prefix window `[origin_ms,
+      cutover_ms)` overlaps a moved part's `[min, max]`, with its run id
+      and `prefix_dataset`; a count line; "no journal: no warm run
+      recorded" without a journal. An unreadable journal refuses the
+      replace. Why this definition (operator, #211 STOP 1 decision 3): the
+      journal's `warm_start` lines are the only place mie records dataset
+      versions, and any other version is a function of a window mie cannot
+      enumerate, so the moved paths with their event ranges are what lets
+      a reader decide which of their own recorded versions change; the
+      list is a superset, since an old run's chain streams are not
+      journaled. A moved path without a manifest covers its whole
+      stream-day, as `select` fails it, so every warm run whose prefix
+      overlaps that day is listed (review of #215, finding 2). Rejected, printing each moved stream-day's union
+      version before the hold: it needs an "as if ordinary" select path
+      and names a version no report printed.
+    - **RQ6 Writes**, in order: **W1** S_n (`write_supersede`, durable);
+      **W2** per moved path in path order, `manifest <text>` when the
+      copy ledger has none (the text rule, D7 *As implemented (#211)*),
+      then `quarantined <path> <id>`; **W3** the renames, the cold roots
+      in configuration order and hot last, each root's marker re-read
+      first (gone or another id stops the run), each path moved by a
+      no-replace rename of its data, manifest and seal temp names within
+      the root, the directories fsynced; **W4** `hold-cleared <path>
+      replace` per moved path with an open hold. Why this order and not
+      the issue's literal "renames, then records": a moved part the copy
+      ledger does not know (a sibling only hot holds, not yet replicated)
+      would drop out of every `select` without an error between its
+      rename and its record. With the records first, every intermediate
+      state fails a covering selection instead of shortening it; hot last
+      keeps hot's copy, which every `select` lists, until every cold copy
+      has moved; the holds cleared last
+      keep the importer halted by its hold check until then, and I1 keeps
+      it halted after a rebuild that has no hold.
+    - **RQ7 Resume.** With `--file F` whose highest supersede generation m
+      is above every entry generation and whose S_m carries a quarantine,
+      or with a record of F carrying a quarantine whose moved paths some
+      root's layout still holds although F's replacement entry exists (a
+      store from before I1's every-root rule, or a root restored from an
+      old backup; review of #215, finding 1):
+      no new record and no attribution; M is S_m's `moved` and RQ1
+      applies; W2 writes what the ledger lacks (a path pending under
+      another id is refused); W3 is idempotent (a name already moved is
+      skipped, a name in both the layout and the quarantine is
+      `Integrity` and the run stops, nothing overwritten); W4 for the
+      open holds. `--replace` is not needed, since S_m records the
+      decision. With nothing missing it prints that the replace is
+      complete and the re-import pending, and passes. An S_m with
+      `quarantine -` keeps RA5 (b) unless `--replace` is given; then a
+      new replace S_{m+1} runs.
+    - **RQ8 Proposals** (no `--file`): besides the open holds, one line
+      per supersede record on hot with a quarantine; an incomplete
+      replace (a moved path in any root's layout, a cold root without a
+      readable marker, a path not recorded quarantined, or still held) is
+      a `FAIL:` line naming `--file F`; a complete one
+      without its replacement entry gets an info line.
+    - **I1 The importer's gate.** `mie archive-import`, its dry runs too,
+      refuses after its hold check and from the same ledger read while a
+      supersede record on hot with a quarantine has a moved path whose
+      data or manifest is in the layout of any root, hot or a configured
+      cold root, or whose verdict is neither pending nor replaced; and,
+      while a moved path is not yet replaced, while a configured cold root
+      presents no readable marker (an unmounted root reads as empty). The
+      message names F and `mie store resolve --file F`. Why every root and
+      not hot alone (review of #215, finding 1): the parts of a day already
+      removed from hot (D6) live on cold roots only, so a replace that
+      stopped between two cold roots leaves hot's layout empty; after a
+      rebuild from an empty start, which has no hold record, a hot-only
+      gate let the import write `replaced` for paths a cold root still
+      held, the resume could no longer reach them, and a full and an empty
+      rebuild start then disagreed. Every root's layout is the commit
+      point, and the gate stays exact without a hold record. The cost is
+      one stat per moved path and root per import run. A record that
+      does not parse is skipped here: F's own import fails closed on it
+      (C1).
+    - **I2 The import view.** The importer reads the store through an
+      import view whose `select` treats a path as absent, instead of
+      failing, when it is pending under a `quarantined` record (no open
+      hold, not lost, no conflict, no `replaced`) and hot does not list
+      it; a quarantined path still on hot stays `Integrity`, and so does
+      `hold-cleared replace` without `quarantined`. Why: the orphan check
+      (ADR-034 D4) selects F's window `[first day − 1, last day + 1]`,
+      which covers the quarantined parts, so without the view the
+      re-import the replace waits for could never run. Every other
+      reader keeps the strict rule and fails until `replaced` exists.
+    - **I3 Replacement records**, at the importer's start (after I1) and
+      after its run, never in a dry run: for each supersede record S_n on
+      hot with a quarantine, E_g is F's entry of the lowest generation
+      g ≥ n on hot. Once E_g parses and every file it lists is sealed on
+      hot with the listed SHA-256 (hot's manifest, else an ordinary
+      ledger text), one `replaced <path> <segment>/<E_g>` per moved path
+      still pending is appended, one `at_ms` per sweep; otherwise the
+      missing file is named and nothing is appended (D7 *Write order*);
+      nothing is appended either while the replace is unfinished on a root
+      by I1's rule, since a rebuild re-derives `replaced` only for a path
+      no root's layout holds (Q4), so an empty start agrees with a full
+      one. A
+      crash between the entry and its records is completed by the next
+      import run or by a rebuild (Q4). The re-import numbers its parts
+      from the union (D6), which counts the quarantined paths through
+      their `quarantined` records, so no path is reused.
+    - **Residual:** a verification running beside a replace can record
+      `missing` findings for the moved paths; they are harmless, because
+      repair, removal and verification skip pending and replaced paths.
 
   Why a restore and not "the capture continues": on an empty hot the
   writer numbers new parts from `part-00000` under paths that cold
@@ -2245,6 +2484,7 @@ What breaks:
 | O (cold-outage days) | Operator input at provisioning | lower bound: the longest cold outage the operator expects to repair (a NAS reboot, a disk swap); upper bound: what hot can hold, (hot − reserve − (Σ r_s + a) × H − J × t) / (Σ r_s + a) | Too small: an outage longer than O fills hot and stops the capture (D10). Larger: more hot disk, and O is also the longest single-copy window (D11) |
 | P (verification period) | Operator input at provisioning | lower bound: bytes on the largest copy device / slowest root's measured read throughput | Below the lower bound a pass cannot finish. Larger: a damaged copy stays unnoticed longer, a window with one good copy at k = 2 (D11) |
 | Generation 1 … 4 294 967 295 (`u32`) | #210 G1 | the generation's range; each superseding resolve of a file adds one generation, so a file would need 4 294 967 295 resolves to reach it | Below 1: `F.0.import` would alias `F.import`. Wrapping past the bound would name the first entry again, so the next generation is refused instead |
+| Quarantine id `q-<at_ms>`, 1 ms apart | #211 RQ3 | the replace's one clock read; ids must be unique over every root and over rebuilds that lost the copy ledger, and a clock needs no stored counter | Two replaces in one millisecond would share an id: the second is refused (a supersede record or a `.quarantine/<id>` directory already names it) and a re-run takes the next millisecond; a coarser clock only widens that refusal window |
 | `metrics` proposal shift 300 000 ms | ADR-034 D3 (`METRICS_RESOLUTION_MS`) | ordering = `create_time` + 300 000 ms, so t − 300 000 ms recovers the create time's day | 0: the 23:55 sample, ordered at the next midnight, is proposed for the next day's file and its re-admit fails. Another value misattributes other boundary samples; a wrong proposal only fails the check |
 | Supersede records exempt for G = 600 000 ms on hot | V8: 2 × `seal_interval_secs` (300 s) | a record has no part to age, so its own mtime on hot gives the replicator the same two intervals a part gets | Shorter: a record written just before a pass is checked before the pass copied it, a false `missing`. Longer: a damaged copy stays unnoticed for longer. A future mtime is never exempt |
 | ≤ 3 parts in memory during a re-admit | `RotationPolicy` defaults (1 000 000 rows, 128 MiB payload per part); the importer's orphan window | one part per day cursor; a daily file touches its day ± 1 | More days per file (a monthly `fundingRate` file, ≤ 33 days of a few rows each) stay small; a larger part limit raises the memory bound linearly |

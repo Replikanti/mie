@@ -510,6 +510,45 @@ pub fn warm_start_from_json(line: &Value) -> Result<WarmStart, String> {
     }))
 }
 
+/// Every warm run's handoff in the journal at `path`, as (run id,
+/// handoff), in journal order (ADR-062 D11, the replace's cost, #211
+/// RQ5). The journal is streamed line by line with bounded memory; only
+/// `warm_start` lines with `warm: true` are parsed, and a line that is no
+/// JSON or no complete warm handoff is skipped, as `read_runs` skips it.
+/// `None` when the journal does not exist.
+///
+/// # Errors
+///
+/// The I/O error when the journal exists and cannot be read.
+pub fn warm_handoffs(path: &Path) -> std::io::Result<Option<Vec<(String, WarmHandoff)>>> {
+    use std::io::BufRead;
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let mut reader = std::io::BufReader::new(file);
+    let mut runs = Vec::new();
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        if reader.read_until(b'\n', &mut line)? == 0 {
+            break;
+        }
+        let Ok(value) = serde_json::from_slice::<Value>(&line) else {
+            continue;
+        };
+        if value["type"].as_str() != Some("warm_start") {
+            continue;
+        }
+        if let Ok(WarmStart::Warm(handoff)) = warm_start_from_json(&value) {
+            let run_id = value["run_id"].as_str().unwrap_or("?").to_owned();
+            runs.push((run_id, handoff));
+        }
+    }
+    Ok(Some(runs))
+}
+
 /// Reads a `state_checkpoint` journal line.
 ///
 /// # Errors

@@ -180,10 +180,46 @@ pub fn import_with(
     let ledger = crate::store::check_copy_ledger(&config.paths.raw_root, &config.paths.cold_roots)?;
     // Dry runs too, from that same read: an open hold halts the importer
     // until it is resolved (ADR-062 D11, #193 H1).
+    // Dry runs too, from that same read: a replace that stopped between
+    // its renames halts the importer until it is completed (ADR-062 D11,
+    // #211 I1).
+    let ledgers = LedgerDir::new(&config.paths.import_ledger);
+    let replace_roots = crate::store::quarantine::ReplaceRoots::read(
+        &config.paths.raw_root,
+        &config.paths.cold_roots,
+    );
     if let Some(ledger) = &ledger {
         crate::store::check_holds(ledger)?;
+        let state = mie_adapter_parquet::verification::CopyState::fold(ledger)
+            .map_err(|error| format!("the copy ledger cannot be folded: {error}"))?;
+        crate::store::quarantine::check_replaces(&replace_roots, &ledgers, &state)?;
     }
+    let has_ledger = ledger.is_some();
     let store = crate::store::raw_store(&config.paths.raw_root, &config.paths.cold_roots)?;
+    // The importer reads through the import view: a quarantined part off
+    // hot is absent there, so the re-import a replace waits for passes its
+    // orphan check (#211 I2).
+    let source = store.import_view();
+    let now_ms = || transports.clock.now_utc_ns().div_euclid(1_000_000);
+    // #211 I3, never in a dry run: the `replaced` records of an entry a
+    // crash left without them.
+    let replacements = |out: &mut dyn Write| -> Result<(), String> {
+        // The markers are read again: a root unmounted meanwhile holds it
+        // back (I1's rule).
+        let roots = crate::store::quarantine::ReplaceRoots::read(
+            &config.paths.raw_root,
+            &config.paths.cold_roots,
+        );
+        for line in crate::store::quarantine::record_replacements(
+            &config.paths.raw_root,
+            &roots,
+            &ledgers,
+            &now_ms,
+        )? {
+            let _ = writeln!(out, "{line}");
+        }
+        Ok(())
+    };
     let options = import_options(config, request)?;
     let fetcher = Fetcher::new(
         transports.http.as_ref(),
@@ -193,13 +229,16 @@ pub fn import_with(
     );
     if request.dry_run {
         let mut sink = NoWrites;
-        let summary = Importer::new(&mut sink, &store, fetcher, options, shutdown)
+        let summary = Importer::new(&mut sink, &source, fetcher, options, shutdown)
             .run(&mut |report| {
                 let _ = writeln!(out, "{report}");
             })
             .map_err(|e| e.to_string())?;
         let _ = writeln!(out, "{summary}");
         return Ok(summary);
+    }
+    if has_ledger {
+        replacements(out)?;
     }
     let events: Arc<Mutex<Vec<RecallEvent>>> = Arc::default();
     let mut writer = if store.is_tiered() {
@@ -271,7 +310,7 @@ pub fn import_with(
         );
     }
     let result =
-        Importer::new(&mut writer, &store, fetcher, options, shutdown).run(&mut |report| {
+        Importer::new(&mut writer, &source, fetcher, options, shutdown).run(&mut |report| {
             print_recalls(out);
             let _ = writeln!(out, "{report}");
         });
@@ -279,6 +318,9 @@ pub fn import_with(
     print_recalls(out);
     let summary = result.map_err(|e| e.to_string())?;
     closed.map_err(|e| format!("close the raw store: {e}"))?;
+    if has_ledger {
+        replacements(out)?;
+    }
     let _ = writeln!(out, "{summary}");
     Ok(summary)
 }

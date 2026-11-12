@@ -1,12 +1,13 @@
-//! The hold resolution's re-admit (ADR-062 D11, proposed; #210): `mie
-//! store resolve`.
+//! The hold resolution (ADR-062 D11, proposed; #210 re-admit, #211
+//! replace): `mie store resolve`.
 //!
 //! A held archive part fails every selection that covers it and halts the
 //! importer. This command re-admits the held parts of one archive file
 //! when they equal its published rows: it writes the missing entry, or a
 //! supersede record and a superseding entry when a conflicting one exists,
 //! and clears the holds. Bytes, paths and dataset versions stay as they
-//! were. The replace path (`--replace`, quarantine) is #211. Built like the
+//! were. With `--replace` it instead moves the archive file's superseded
+//! generation into quarantine ([`replace`], RQ0 to RQ8 below). Built like the
 //! other `mie store` verbs: refusals and one lock, then reads, then a pure
 //! [`plan`], then the row check, then writes in a fixed order; a re-run
 //! completes an interrupted run. The rules, as numbered in the plan of
@@ -38,13 +39,13 @@
 //!   to two files gets no proposal. Without `--file`: one line per open
 //!   hold, then `PASS` with none open, or `FAIL` naming the count.
 //! - **RA4 Attribution.** parts(F): the open holds proposing F, in path
-//!   order. Refused: none; a `manifest-conflict` hold (#211); a part with
+//!   order. Refused: none; a `manifest-conflict` hold (re-admit only; RQ2); a part with
 //!   no manifest; hot's text differing from the ledger's (D5); a `PENDING`
 //!   naming F (its resume owns those parts).
 //! - **RA5 Plan** ([`plan`], pure), over F's files on hot and the targets:
 //!   (a) none: write `F.import`; (b) a supersede generation above every
 //!   entry: an interrupted re-admit, write that generation's entry (a
-//!   pending replace, `quarantine <id>`, is #211); (c) the latest entry,
+//!   pending replace, `quarantine <id>`, resumes, RQ7); (c) the latest entry,
 //!   one variant, lists every held part with its manifest's rows and
 //!   SHA-256 and every other path it lists is ordinary: nothing to write
 //!   but the clearing; (d) otherwise supersede: a record of generation n
@@ -75,10 +76,62 @@
 //! - **RA8 Output**: F's files per root, the file and its parts, the
 //!   published SHA-256 and row count, `rows match`, `wrote …`, one
 //!   `hold-cleared` line per record and every truncation; then `PASS`, or
-//!   `FAIL:` with nothing written for a difference.
+//!   `FAIL:` with nothing written for a difference, which also prints the
+//!   cost of a replace (RQ5) and names `--replace`.
+//!
+//! The replace (#211), numbered as in its plan:
+//!
+//! - **RQ0 Usage.** `--replace` needs `--file` (a usage error before
+//!   anything is read) and makes no network request. A replace happens
+//!   only with the flag (operator, #211 STOP 1 decision 1).
+//! - **RQ1 Refusals**, nothing written: everything RA1 refuses; a
+//!   configured cold root, copy target or read-only, without a readable
+//!   marker; a `.quarantine` that is no directory (a symlink included) on
+//!   any root; the pass lock held (taken after the writer lock, without
+//!   waiting, for the whole run: a pass that planned a copy of a moved part
+//!   could put it back into a layout after its rename).
+//! - **RQ2 Moved set M**: parts(F) (RA4, a `manifest-conflict` part and
+//!   hot's text differing from the ledger's allowed) plus every path a
+//!   variant of F's latest entry lists that some root's layout holds, the
+//!   whole superseded generation (operator, #211 STOP 1 decision 2: a
+//!   sibling left in the layout would be an orphan that stops the
+//!   re-import). Refused: a part or a recorded sibling no root holds, a
+//!   sibling that is not ordinary or unrecorded, two ledger texts for a
+//!   moved path, a read-only root holding one, a `PENDING` naming F. A
+//!   listed path no root holds and the ledger does not record is named.
+//! - **RQ3 Quarantine id** `q-<at_ms>`, the run's one clock read; refused
+//!   when any supersede record on hot or a target names it, or any root
+//!   has `.quarantine/<id>`.
+//! - **RQ4 S_n**: n = 1 + F's highest generation, never wrapping; one
+//!   `entry` line per variant of the latest entry; `quarantine <id>` and M
+//!   as `moved` lines.
+//! - **RQ5 Cost**, printed before the first write: one line per moved
+//!   path and distinct manifest (stream, date, event range, rows,
+//!   SHA-256), one per journaled warm run whose prefix `[origin, cutover)`
+//!   overlaps a moved part (run id, `prefix_dataset`), a count line, `no
+//!   journal` without one; an unreadable journal is refused (operator,
+//!   #211 STOP 1 decision 3).
+//! - **RQ6 Writes**: W1 S_n; W2 per moved path `manifest` when the ledger
+//!   has none (the text rule) then `quarantined`; W3 the renames, cold
+//!   roots in configuration order, hot last, each root's marker re-read
+//!   first; W4 `hold-cleared <path> replace` per open hold. Every
+//!   intermediate state fails a covering selection instead of shortening
+//!   it, and the importer stays halted until every root's renames (I1).
+//! - **RQ7 Resume.** With `--file F` whose highest supersede generation is
+//!   above every entry and carries a quarantine, or with a supersede
+//!   record of F whose moved paths some root's layout still holds (review
+//!   of #215, finding 1): no new record, M from
+//!   S_m, W2 for what the ledger lacks (a path pending under another id is
+//!   refused), W3 idempotent (a name in both places is `Integrity`, never
+//!   overwritten), W4; `--replace` is not needed.
+//! - **RQ8 Proposals**: without `--file`, one line per supersede record
+//!   on hot with a quarantine; an incomplete replace fails, naming `--file
+//!   F` ([`quarantine::replace_lines`]).
 
 use super::replicate::{self, IMPORT_LEDGER_DIR, META_DIR};
-use super::{DeviceProbe, check_copy_ledger, check_devices, check_hot, truncation_line};
+use super::{
+    DeviceProbe, check_copy_ledger, check_devices, check_hot, quarantine, truncation_line,
+};
 use crate::archive::{ArchiveTransports, fetch_policy};
 use crate::config::IngestConfig;
 use mie_adapter_binance::archive::ARCHIVE_SOURCE;
@@ -98,6 +151,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+
+pub mod replace;
 
 #[cfg(test)]
 mod tests;
@@ -199,6 +254,23 @@ pub fn attribute(
     holds: &[HeldPart],
     pending: Option<&str>,
 ) -> Result<Vec<SealedFile>, String> {
+    attribute_with(symbol, file, holds, pending, false)
+}
+
+/// RA4 for a re-admit, or with `replace` for a replace (RQ2): a replace
+/// accepts a `manifest-conflict` part and hot's text differing from the
+/// ledger's, since it moves every copy and chooses none.
+///
+/// # Errors
+///
+/// The refusal.
+pub fn attribute_with(
+    symbol: &str,
+    file: &str,
+    holds: &[HeldPart],
+    pending: Option<&str>,
+    replace: bool,
+) -> Result<Vec<SealedFile>, String> {
     let mut parts = Vec::new();
     let mut proposed: BTreeSet<String> = BTreeSet::new();
     let mut unproposed = Vec::new();
@@ -231,16 +303,17 @@ pub fn attribute(
     }
     let mut manifests = Vec::new();
     for held in parts {
-        if held.reason == HoldReason::ManifestConflict {
+        if held.reason == HoldReason::ManifestConflict && !replace {
             return Err(format!(
                 "{} is held as manifest-conflict: two roots hold different sealed files under its \
-                 path, and re-admit never chooses between them; its resolution is the replace \
-                 path (#211)",
+                 path, and re-admit never chooses between them; its resolution is the replace, \
+                 `--replace` (ADR-062 D11)",
                 held.path
             ));
         }
         if let (Some(hot), Some(ledger)) = (&held.hot_text, &held.ledger_text)
             && hot != ledger
+            && !replace
         {
             return Err(format!(
                 "{}: hot's manifest differs from the copy ledger's manifest record (ADR-062 D5); \
@@ -348,20 +421,72 @@ fn variants<'a>(files: &[&'a FileOf]) -> Vec<(&'a [u8], Vec<&'a str>)> {
     variants
 }
 
-/// RA5 (module docs), pure.
-///
-/// # Errors
-///
-/// The refusal; nothing may be written.
-pub fn plan(inputs: &PlanInputs) -> Result<Planned, String> {
-    let repair = "run `mie store verify`, then `mie store repair` (or the hot restore, #195)";
+/// What [`survey`] read of F's files (RA5's read and binding rules).
+struct Survey<'a> {
+    /// Every name with its copies.
+    by_name: BTreeMap<&'a LedgerName, Vec<&'a FileOf>>,
+    /// Every entry name with its byte variants and their parses.
+    parsed: BTreeMap<&'a LedgerName, Vec<Variant<'a>>>,
+    /// Every supersede record by generation.
+    records: BTreeMap<u32, SupersedeRecord>,
+    /// Entry variants on the targets only that cannot be read or bound:
+    /// (generation, bytes, the refusal or note naming it).
+    unreadable: Vec<(u32, &'a [u8], String)>,
+    /// Notes on malformed names on a copy target only.
+    notes: Vec<String>,
+}
+
+/// The remedy RA5 names for a file that does not read.
+const REPAIR: &str = "run `mie store verify`, then `mie store repair` (or the hot restore, #195)";
+
+impl Survey<'_> {
+    /// The entry copies the case decides on (`decides`) must read; any
+    /// other is superseded and only named.
+    fn decided(&self, decides: &dyn Fn(u32, &[u8]) -> bool) -> Result<Vec<String>, String> {
+        let mut lines = self.notes.clone();
+        for (generation, bytes, why) in &self.unreadable {
+            if decides(*generation, bytes) {
+                return Err(format!("{why}: {REPAIR}"));
+            }
+            lines.push(format!(
+                "{why}: a superseded entry copy, which decides nothing here and which no \
+                 verification or repair reaches (ADR-062 D11)"
+            ));
+        }
+        Ok(lines)
+    }
+
+    /// The highest entry generation.
+    fn highest_entry(&self) -> Option<u32> {
+        self.parsed.keys().map(|name| name.generation).max()
+    }
+
+    /// The highest generation of any file of F.
+    fn highest(&self) -> Option<u32> {
+        self.by_name.keys().map(|name| name.generation).max()
+    }
+
+    /// The variants of the entry of generation `g`.
+    fn variants_of(&self, g: u32) -> Option<(&LedgerName, &Vec<Variant<'_>>)> {
+        self.parsed
+            .iter()
+            .find(|(name, _)| name.generation == g)
+            .map(|(name, list)| (*name, list))
+    }
+}
+
+/// RA5's read and binding rules over F's files (module docs): a malformed
+/// name on hot, a name on the targets only, differing record copies and a
+/// file on hot that does not read are refused; a malformed name or an
+/// unreadable entry copy on a target only is kept for [`Survey::decided`].
+fn survey(inputs: &PlanInputs) -> Result<Survey<'_>, String> {
     // A malformed name on hot fails the importer and the replication of F
     // closed; on a copy target only it counts for nothing anywhere.
     let mut notes = Vec::new();
     for (root, name) in &inputs.malformed {
         if root == HOT_ID {
             return Err(format!(
-                "{name} on {root} is a malformed import-ledger name of this archive file: {repair}"
+                "{name} on {root} is a malformed import-ledger name of this archive file: {REPAIR}"
             ));
         }
         notes.push(format!(
@@ -377,14 +502,12 @@ pub fn plan(inputs: &PlanInputs) -> Result<Planned, String> {
     }
     let mut parsed: BTreeMap<&LedgerName, Vec<Variant<'_>>> = BTreeMap::new();
     let mut records: BTreeMap<u32, SupersedeRecord> = BTreeMap::new();
-    // Entry variants that cannot be read or bound: (generation, bytes,
-    // the refusal or note naming it).
     let mut unreadable: Vec<(u32, &[u8], String)> = Vec::new();
     for (name, copies) in &by_name {
         let label = format!("{}/{}", inputs.segment, name.render());
         if !copies.iter().any(|copy| copy.root == HOT_ID) {
             return Err(format!(
-                "{label} is on {} only, not on hot: {repair}",
+                "{label} is on {} only, not on hot: {REPAIR}",
                 copies
                     .iter()
                     .map(|c| c.root.as_str())
@@ -395,7 +518,7 @@ pub fn plan(inputs: &PlanInputs) -> Result<Planned, String> {
         let found = variants(copies);
         if name.kind == LedgerKind::Supersede && found.len() > 1 {
             return Err(format!(
-                "the copies of supersede record {label} differ: {repair}"
+                "the copies of supersede record {label} differ: {REPAIR}"
             ));
         }
         for (bytes, roots) in &found {
@@ -416,7 +539,7 @@ pub fn plan(inputs: &PlanInputs) -> Result<Planned, String> {
                     LedgerKind::Entry if !roots.contains(&HOT_ID) => {
                         unreadable.push((name.generation, bytes, why));
                     }
-                    _ => return Err(format!("{why}: {repair}")),
+                    _ => return Err(format!("{why}: {REPAIR}")),
                 }
             }
         }
@@ -440,9 +563,32 @@ pub fn plan(inputs: &PlanInputs) -> Result<Planned, String> {
             }
         }
     }
-    let highest_entry = parsed.keys().map(|name| name.generation).max();
+    Ok(Survey {
+        by_name,
+        parsed,
+        records,
+        unreadable,
+        notes,
+    })
+}
+
+/// RA5 (module docs), pure.
+///
+/// # Errors
+///
+/// The refusal; nothing may be written.
+pub fn plan(inputs: &PlanInputs) -> Result<Planned, String> {
+    let survey = survey(inputs)?;
+    let Survey {
+        by_name,
+        parsed,
+        records,
+        notes,
+        ..
+    } = &survey;
+    let highest_entry = survey.highest_entry();
     let m = records.keys().copied().max();
-    let highest = by_name.keys().map(|name| name.generation).max();
+    let highest = survey.highest();
     let held: BTreeSet<&str> = inputs
         .parts
         .iter()
@@ -454,13 +600,6 @@ pub fn plan(inputs: &PlanInputs) -> Result<Planned, String> {
         .map(|p| p.relative_path.clone())
         .collect();
 
-    // The variants of the entry of generation `g`.
-    let variants_of = |g: u32| {
-        parsed
-            .iter()
-            .find(|(name, _)| name.generation == g)
-            .map(|(name, list)| (*name, list))
-    };
     // No orphan left behind (b, d).
     let no_orphan = |superseded: &[Variant<'_>]| {
         let mut lines = Vec::new();
@@ -489,22 +628,9 @@ pub fn plan(inputs: &PlanInputs) -> Result<Planned, String> {
         }
         Ok(lines)
     };
-
-    // The entry copies the case decides on must read; any other is
-    // superseded and only named.
-    let decided = |decides: &dyn Fn(u32, &[u8]) -> bool| {
-        let mut lines = notes.clone();
-        for (generation, bytes, why) in &unreadable {
-            if decides(*generation, bytes) {
-                return Err(format!("{why}: {repair}"));
-            }
-            lines.push(format!(
-                "{why}: a superseded entry copy, which decides nothing here and which no \
-                 verification or repair reaches (ADR-062 D11)"
-            ));
-        }
-        Ok(lines)
-    };
+    let decided = |decides: &dyn Fn(u32, &[u8]) -> bool| survey.decided(decides);
+    let notes = notes.clone();
+    let variants_of = |g: u32| survey.variants_of(g);
 
     // (a)
     if by_name.is_empty() && !inputs.entry_conflict {
@@ -522,8 +648,8 @@ pub fn plan(inputs: &PlanInputs) -> Result<Planned, String> {
     {
         if let Some(quarantine) = &records[&m].quarantine {
             return Err(format!(
-                "supersede record {}/{} names quarantine {}: a replace is pending, which this \
-                 command does not resolve (#211)",
+                "supersede record {}/{} names quarantine {}: a replace is pending; `mie store \
+                 resolve --file` resumes it (RQ7)",
                 inputs.segment,
                 LedgerName::supersede(&archive_file(&inputs.archive), m).render(),
                 quarantine.id
@@ -650,21 +776,31 @@ fn archive_file(archive: &str) -> String {
 /// Why the run stops: a refusal, nothing written by it.
 struct Stop(String);
 
-/// Runs one resolve (module docs). `file` is `--file`; `now_ms` stamps the
-/// `hold-cleared` records, read once.
+/// Runs one resolve (module docs). `file` is `--file`, `replace` is
+/// `--replace`; `now_ms` stamps the records, read once.
 pub fn run(
     config: &IngestConfig,
     archive: Option<&Path>,
     file: Option<&str>,
+    replace: bool,
     transports: &ArchiveTransports,
     probe: &dyn DeviceProbe,
     now_ms: &dyn Fn() -> i64,
 ) -> ResolveReport {
     let mut report = ResolveReport::default();
+    if replace && file.is_none() {
+        report.problems.push(
+            "--replace needs --file: a replace moves the superseded generation of one archive \
+             file (ADR-062 D11)"
+                .to_owned(),
+        );
+        return report;
+    }
     if let Err(Stop(why)) = resolve(
         config,
         archive,
         file,
+        replace,
         transports,
         probe,
         now_ms,
@@ -731,11 +867,12 @@ fn files_in(
     Ok((files, malformed))
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn resolve(
     config: &IngestConfig,
     archive: Option<&Path>,
     file: Option<&str>,
+    replace: bool,
     transports: &ArchiveTransports,
     probe: &dyn DeviceProbe,
     now_ms: &dyn Fn() -> i64,
@@ -841,8 +978,9 @@ fn resolve(
         });
     }
     let symbol = archive.instrument.symbol.clone();
+    let ledgers = LedgerDir::new(&archive.paths.import_ledger);
 
-    // RA3.
+    // RA3, RQ8.
     let Some(file) = file else {
         let (lines, none) = proposals(&symbol, &holds);
         report.lines.extend(lines);
@@ -852,6 +990,11 @@ fn resolve(
                 holds.len()
             ));
         }
+        let roots = quarantine::ReplaceRoots::read(hot, cold_roots);
+        let (lines, problems) =
+            quarantine::replace_lines(&roots, &ledgers, &state).map_err(Stop)?;
+        report.lines.extend(lines);
+        report.problems.extend(problems);
         return Ok(());
     };
     let (stream, period) = parse_archive_path(&symbol, file).ok_or_else(|| {
@@ -862,7 +1005,6 @@ fn resolve(
              proposals without --file print it"
         ))
     })?;
-    let ledgers = LedgerDir::new(&archive.paths.import_ledger);
     let pending = match ledgers.pending() {
         Ok(pending) => pending.map(|p| p.archive),
         Err(error) => {
@@ -871,11 +1013,6 @@ fn resolve(
             )));
         }
     };
-    let parts = attribute(&symbol, file, &holds, pending.as_deref()).map_err(Stop)?;
-    let entry_conflict = holds.iter().any(|held| {
-        held.reason == HoldReason::EntryConflict
-            && parts.iter().any(|part| part.relative_path == held.path)
-    });
     let segment = stream.raw_name().to_owned();
     let file_name = stream.file_name(&symbol, period);
     let mut files = Vec::new();
@@ -905,6 +1042,49 @@ fn resolve(
         files.extend(found);
         malformed.extend(bad);
     }
+
+    // RQ7 (a pending replace resumes), RQ0 (`--replace`), else re-admit.
+    let layouts = quarantine::ReplaceRoots::read(hot, cold_roots);
+    let resume = replace::pending_replace(&files, &|record| {
+        !matches!(layouts.unfinished(record, false), Ok(None))
+    });
+    let replacing = resume.is_some() || replace;
+    let mut roots = replace::marked_roots(cold_roots);
+    let _pass = if replacing {
+        roots = replace::check_roots(hot, cold_roots).map_err(Stop)?;
+        Some(replica::try_replication_lock(hot).map_err(|error| {
+            Stop(format!(
+                "the pass lock: {error}; the replace takes it without waiting and holds it for \
+                 its whole run, so no pass copies a moved part back into a layout (ADR-062 D11)"
+            ))
+        })?)
+    } else {
+        None
+    };
+    let ctx = replace::Context {
+        hot,
+        roots: &roots,
+        state: &state,
+        ledgers: &ledgers,
+        stream,
+        file_name: &file_name,
+        archive: file,
+        journal: &config.paths.journal,
+        now_ms,
+    };
+    if let Some((generation, record)) = &resume {
+        if pending.as_deref() == Some(file) {
+            return Err(Stop(format!(
+                "the import PENDING names {file}: its resume owns those parts (ADR-034 D4)"
+            )));
+        }
+        return replace::run_resume(&ctx, *generation, record, &files, report);
+    }
+    let parts = attribute_with(&symbol, file, &holds, pending.as_deref(), replace).map_err(Stop)?;
+    let entry_conflict = holds.iter().any(|held| {
+        held.reason == HoldReason::EntryConflict
+            && parts.iter().any(|part| part.relative_path == held.path)
+    });
     report
         .lines
         .push(format!("file {file}: {} held part(s)", parts.len()));
@@ -951,7 +1131,12 @@ fn resolve(
     }
     let key = RawStreamKey::new(ARCHIVE_SOURCE, &symbol, &segment)
         .map_err(|error| Stop(error.to_string()))?;
-    let planned = plan(&PlanInputs {
+    for part in &parts {
+        if let Some(verdict) = state.verdict(&part.relative_path) {
+            verdicts.insert(part.relative_path.clone(), verdict);
+        }
+    }
+    let inputs = PlanInputs {
         segment: segment.clone(),
         archive: file.to_owned(),
         stream: key,
@@ -962,8 +1147,11 @@ fn resolve(
         entry_conflict,
         verdicts,
         located,
-    })
-    .map_err(Stop)?;
+    };
+    if replace {
+        return replace::run_replace(&ctx, &inputs, report);
+    }
+    let planned = plan(&inputs).map_err(Stop)?;
     report.lines.extend(planned.lines.iter().cloned());
 
     // RA6.
@@ -1014,11 +1202,29 @@ fn resolve(
         "published sha256 {}, {} rows",
         checked.published, checked.rows
     ));
-    let entry = checked.outcome.map_err(|difference| {
-        Stop(format!(
-            "{difference}; nothing written; the hold stays; the replace resolution is #211"
-        ))
-    })?;
+    let entry = match checked.outcome {
+        Ok(entry) => entry,
+        Err(difference) => {
+            // RQ5: the difference prints what a replace would cost; it
+            // still writes nothing.
+            let preview = replace::holders_of(&ctx, &inputs)
+                .and_then(|holders| {
+                    replace::plan_replace(&inputs, &holders, "q-preview").map_err(Stop)
+                })
+                .and_then(|plan| ctx.cost_lines(plan.moved(), &|_| Vec::new()));
+            match preview {
+                Ok(lines) => report.lines.extend(lines),
+                Err(Stop(why)) => report
+                    .lines
+                    .push(format!("cost: a replace would be refused: {why}")),
+            }
+            return Err(Stop(format!(
+                "{difference}; nothing written; the hold stays; `mie store resolve --config \
+                 <ingest config> --file {file} --replace` moves the superseded generation into \
+                 quarantine at the cost above (ADR-062 D11)"
+            )));
+        }
+    };
     report.lines.push(format!(
         "rows match ({} parts, {} rows)",
         check_set.len(),

@@ -34,6 +34,16 @@
 //! replace` never makes a path ordinary again: the selection fails until
 //! the re-import's `replaced` record exists (D5).
 //!
+//! **The import view** ([`Mode::Import`], #211 I2) differs in one rule:
+//! a path whose replacement is pending under a `quarantined` record (no
+//! open hold, not lost, no conflict, no `replaced` record) and that hot
+//! does not list is absent instead of failing. Only the importer reads
+//! through it: the orphan check of the re-import a replace waits for
+//! selects the archive file's window, which covers the quarantined parts.
+//! A quarantined path still on hot, and a `hold-cleared replace` without a
+//! `quarantined` record, still fail there. Every other reader keeps the
+//! strict rule and fails until the `replaced` record exists.
+//!
 //! A non-ordinary path fails a selection that covers it. With a manifest
 //! (from hot or the ledger) it is covered by the same event-time overlap as
 //! an ordinary file; without one (a `lost` record of journal or import
@@ -223,6 +233,26 @@ impl LedgerView {
             .map(|manifest| manifest.text.as_str())
     }
 
+    /// The quarantine id of `path`'s pending replacement, whatever its
+    /// verdict: the latest `quarantined` record (#211).
+    pub(crate) fn quarantine(&self, path: &str) -> Option<&str> {
+        match self
+            .entries
+            .get(path)
+            .and_then(|entry| entry.pending.as_ref())
+        {
+            Some(Pending::Quarantined(id)) => Some(id),
+            _ => None,
+        }
+    }
+
+    /// The import entry of `path`'s `replaced` record, whatever its verdict.
+    pub(crate) fn replaced(&self, path: &str) -> Option<&str> {
+        self.entries
+            .get(path)
+            .and_then(|entry| entry.replaced.as_deref())
+    }
+
     /// The open hold of `path`, whatever its verdict: the last `hold`
     /// record not cleared after it.
     pub(crate) fn hold_reason(&self, path: &str) -> Option<HoldReason> {
@@ -366,9 +396,27 @@ struct HotListing {
     vanished_files: Vec<String>,
 }
 
+/// Which rule a pending, quarantined path follows (module docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Mode {
+    /// Every reader but the importer: it fails.
+    Strict,
+    /// The importer's view (#211 I2): absent when hot does not list it.
+    Import,
+}
+
 /// The union `select` of the tiered store with hot at `hot` (module docs).
 /// It never touches a cold root.
 pub(crate) fn select(hot: &Path, selection: &RawSelection) -> Result<RawDataset, RawStoreError> {
+    select_with(hot, selection, Mode::Strict)
+}
+
+/// [`select`] under `mode` (module docs, *The import view*).
+pub(crate) fn select_with(
+    hot: &Path,
+    selection: &RawSelection,
+    mode: Mode,
+) -> Result<RawDataset, RawStoreError> {
     let window = selection.window();
     let (start, end) = (window.start.as_millis(), window.end.as_millis());
     // Only the date partitions the window touches, clamped to the supported
@@ -406,7 +454,14 @@ pub(crate) fn select(hot: &Path, selection: &RawSelection) -> Result<RawDataset,
 
     // c.–f. Merge, check, filter.
     let mut files = match &dates {
-        Some(dates) => merge(&listing, &view, selection.streams(), dates, start, end)?,
+        Some(dates) => merge(
+            &listing,
+            &view,
+            selection.streams(),
+            dates,
+            (start, end),
+            mode,
+        )?,
         None => Vec::new(),
     };
     files.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
@@ -496,8 +551,8 @@ fn merge(
     view: &LedgerView,
     streams: &BTreeSet<RawStreamKey>,
     (first_date, last_date): &(String, String),
-    start: i64,
-    end: i64,
+    (start, end): (i64, i64),
+    mode: Mode,
 ) -> Result<Vec<SealedFile>, RawStoreError> {
     let in_range = |path: &str| {
         layout::parse_data_path(path).is_ok_and(|(stream, date, _)| {
@@ -578,6 +633,9 @@ fn merge(
             continue;
         }
         if let Some(pending) = &entry.pending {
+            if mode == Mode::Import && hot.is_none() && matches!(pending, Pending::Quarantined(_)) {
+                continue;
+            }
             if covered {
                 let state = match pending {
                     Pending::Cleared => "its hold was resolved by replace".to_owned(),

@@ -77,6 +77,7 @@ use std::path::Path;
 
 pub mod adopt;
 pub mod archive_checks;
+pub mod quarantine;
 pub mod rebuild;
 pub mod repair;
 pub mod replicate;
@@ -567,10 +568,11 @@ pub fn rebuild(
 }
 
 /// `mie store resolve`: proposes the archive file of every open hold, or
-/// with `file` (`--file`) re-admits that file's held parts (ADR-062 D11,
-/// the module [`resolve`](mod@resolve)), with the archive configuration
-/// `archive`, else `[history] archive_config`. `transports` fetch the
-/// file; `now_ms` stamps the `hold-cleared` records.
+/// with `file` (`--file`) re-admits that file's held parts, or with
+/// `replace` (`--replace`) moves its superseded generation into quarantine
+/// (ADR-062 D11, the module [`resolve`](mod@resolve)), with the archive
+/// configuration `archive`, else `[history] archive_config`. `transports`
+/// fetch the file (never for a replace); `now_ms` stamps the records.
 ///
 /// It prints what it read, checked and wrote, then `PASS` (returns
 /// `true`) or one `FAIL: <problem>` line per problem (returns `false`).
@@ -578,16 +580,18 @@ pub fn rebuild(
 /// # Errors
 ///
 /// A description when the report cannot be written.
+#[allow(clippy::too_many_arguments)]
 pub fn resolve(
     config: &IngestConfig,
     archive: Option<&Path>,
     file: Option<&str>,
+    replace: bool,
     transports: &crate::archive::ArchiveTransports,
     probe: &dyn DeviceProbe,
     now_ms: &dyn Fn() -> i64,
     out: &mut dyn Write,
 ) -> Result<bool, String> {
-    let report = resolve::run(config, archive, file, transports, probe, now_ms);
+    let report = resolve::run(config, archive, file, replace, transports, probe, now_ms);
     print_report(report.lines, &report.problems, out)
 }
 

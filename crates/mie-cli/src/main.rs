@@ -402,7 +402,9 @@ USAGE:
         hot's journal and the import ledger (the archive configuration:
         --archive-config, else [history] archive_config): it records every
         verified copy, every partition with cold copies and no directory
-        on hot as removed, and the archive holds it re-derives. A file a
+        on hot as removed, the archive holds it re-derives, and every part
+        in a root's .quarantine/ or moved by a replace as quarantined (and
+        replaced once its re-import's entry exists). A file a
         record names that no root holds is reported lost; --record-lost
         records it, after which every replay that covers it fails, so pass
         it only after a run without it reported the file. An archive part
@@ -426,9 +428,9 @@ USAGE:
         problem and exits 1.
 
     mie store resolve --config <path> [--archive-config <path>]
-                      [--file <archive path>]
+                      [--file <archive path> [--replace]]
         Resolve the held archive parts of a tiered raw store (ADR-062 D11)
-        by re-admitting them. Without --file it prints, for every open
+        by re-admitting or replacing them. Without --file it prints, for every open
         hold, the archive file its stream and ordering times propose by the
         catalog's period rules (a metrics 23:55 row belongs to the previous
         day's file, fundingRate files are monthly), writes nothing, and
@@ -439,13 +441,28 @@ USAGE:
         record and a superseding entry when a conflicting one exists, then
         clears the holds; bytes, paths and dataset versions stay as they
         were, and the importer runs again. When a row differs it names the
-        first difference, writes nothing and keeps the hold (the replace
-        resolution is a later step). A part held because two roots hold
-        different files under its path is refused. It takes the archive
-        source's writer lock without waiting, so it refuses while an import
-        or a rebuild runs. Every copy target must carry its marker. Prints
-        what it read, checked and wrote, then PASS and exits 0, or one
-        FAIL: <reason> line and exits 1.
+        first difference, prints what a replace would cost, writes nothing
+        and keeps the hold. A part held because two roots hold different
+        files under its path is refused. With --replace (it needs --file)
+        it downloads nothing: it writes a supersede record naming a new
+        quarantine id and the paths it moves, records them quarantined,
+        then renames on every root (cold roots first, hot last) the held
+        parts and every other part of the superseded entry into
+        .quarantine/<id>/, where nothing ever deletes them, and clears the
+        holds. It first prints the cost: every moved path with its stream,
+        date and event range (every dataset version of a selection over it
+        changes) and every journaled warm run whose prefix covers one,
+        whose prefix_dataset reads DIVERGED (warm prefix) for good. Until
+        the next mie archive-import writes the file's new entry, every
+        selection covering the moved paths fails; the import writes new
+        part numbers and records the replacement. A replace that stopped
+        is completed by running the same command again, --replace not
+        needed. Without --file it also names every incomplete replace. It
+        takes the archive source's writer lock without waiting, so it
+        refuses while an import or a rebuild runs; a replace also takes the
+        pass lock and needs every cold root's marker. Every copy target
+        must carry its marker. Prints what it read, checked and wrote,
+        then PASS and exits 0, or one FAIL: <reason> line and exits 1.
 
     mie --help
 ";
@@ -974,12 +991,23 @@ fn dispatch(args: &[String]) -> Result<ExitCode, String> {
                 Ok(exit(pass))
             }
             Some("resolve") => {
-                let options =
-                    Options::parse(&args[2..], &["--config", "--archive-config", "--file"], &[])?;
+                let options = Options::parse(
+                    &args[2..],
+                    &["--config", "--archive-config", "--file"],
+                    &["--replace"],
+                )?;
+                let replace = options.flag("--replace");
+                let file = options.optional("--file").map(str::to_owned);
+                if replace && file.is_none() {
+                    return Err(
+                        "--replace needs --file <archive path>: a replace moves the \
+                                superseded generation of one archive file"
+                            .to_owned(),
+                    );
+                }
                 let config =
                     IngestConfig::load(&options.path("--config")?).map_err(|e| e.to_string())?;
                 let archive = options.optional("--archive-config").map(PathBuf::from);
-                let file = options.optional("--file").map(str::to_owned);
                 let probe = store::device_probe()?;
                 let client = Arc::new(UreqDownload::new(DownloadTimeouts::default())?);
                 let transports = ArchiveTransports {
@@ -993,6 +1021,7 @@ fn dispatch(args: &[String]) -> Result<ExitCode, String> {
                     &config,
                     archive.as_deref(),
                     file.as_deref(),
+                    replace,
                     &transports,
                     probe.as_ref(),
                     &now_ms,
@@ -1010,7 +1039,7 @@ fn dispatch(args: &[String]) -> Result<ExitCode, String> {
                  <path>] [--record-lost]`, `mie store rebuild --config <path> \
                  [--archive-config <path>] [--record-lost] [--record-unlisted] \
                  [--replace-hot-ledger]` or `mie store resolve --config <path> \
-                 [--archive-config <path>] [--file <archive path>]`"
+                 [--archive-config <path>] [--file <archive path> [--replace]]`"
                     .to_owned(),
             ),
         },
