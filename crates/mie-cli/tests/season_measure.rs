@@ -2182,10 +2182,10 @@ fn a_planted_hour_of_week_profile_is_recovered_within_its_bootstrap_se() {
 fn a_flat_profile_has_no_mechanism_and_a_daily_one_none_at_1d() {
     let first = bounds(DESIGN).0 / MINUTE_MS;
     let flat = mechanism(&[1.0; WEEK_HOURS], first, 21 * MINUTES_PER_DAY as usize);
-    for h in 0..5 {
-        assert_eq!(flat.ln_s[h].len(), 21 * 1_440);
-        assert!(flat.ln_s[h].iter().all(|v| *v == 0.0), "{h}");
-        assert_eq!(mean_sd(&flat.ln_s[h]).1, 0.0);
+    for (h, ln_s) in flat.ln_s.iter().enumerate().take(5) {
+        assert_eq!(ln_s.len(), 21 * 1_440);
+        assert!(ln_s.iter().all(|v| *v == 0.0), "{h}");
+        assert_eq!(mean_sd(ln_s).1, 0.0);
     }
     // A pure hour-of-day profile: every whole UTC day holds each hour once,
     // so F_1d and every 1d bar's factor are 1.

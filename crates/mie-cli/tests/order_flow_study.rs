@@ -2478,8 +2478,8 @@ fn random_recs(days: i64, seed: u64) -> Vec<Rec> {
         }
         rec.regime = (lcg.below(50) != 0).then_some(regime);
         rec.levels = (lcg.below(10) != 0).then(|| levels[lcg.below(5) as usize]);
-        for w in 0..WINDOWS.len() {
-            rec.effort[w] = match lcg.below(40) {
+        for effort in rec.effort.iter_mut().take(WINDOWS.len()) {
+            *effort = match lcg.below(40) {
                 0..=3 => FlowSpec::Warming,
                 4 => FlowSpec::Unavailable,
                 _ => FlowSpec::Ready {

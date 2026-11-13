@@ -692,8 +692,8 @@ fn measure_profile() {
         .unwrap();
     println!("Recorded at @1 (bin 10 USDT, t5, 10 %, 70 %, 5 days), per profile and half:");
     for (kind, profile) in profiles.iter().enumerate() {
-        for half in 0..2 {
-            let line = rows[v1_row].cells[kind][half].line();
+        for (half, cell) in rows[v1_row].cells[kind].iter().enumerate().take(2) {
+            let line = cell.line();
             println!("  {profile} {}: {line}", half_label(half));
         }
     }
@@ -707,8 +707,8 @@ fn measure_profile() {
             row.resolution * row.bin_units() / SCALE
         );
         for (kind, profile) in profiles.iter().enumerate() {
-            for half in 0..2 {
-                let line = row.cells[kind][half].line();
+            for (half, cell) in row.cells[kind].iter().enumerate().take(2) {
+                let line = cell.line();
                 println!("    {profile} {}: {line}", half_label(half));
             }
         }
@@ -749,8 +749,8 @@ fn measure_profile() {
     let mut a3 = Vec::new();
     let mut a4 = Vec::new();
     for (kind, profile) in profiles.iter().enumerate() {
-        for half in 0..2 {
-            let mut cell = v1.cells[kind][half].clone();
+        for (half, cell) in v1.cells[kind].iter().enumerate().take(2) {
+            let mut cell = cell.clone();
             let median = quantile(&mut cell.lvn, 0.5);
             a3.push((
                 format!("{profile} {}", half_label(half)),
