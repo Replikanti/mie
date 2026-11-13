@@ -57,9 +57,17 @@
 //!   first target copy that parses and binds. Hot's `PENDING` is left and
 //!   named; the checks get none.
 //! - **H5 The copy ledger**: [`rebuild::derive`] in [`Mode::Restore`]
-//!   (its differences (a) to (g) are documented there), then the rebuild's
+//!   (its differences (a) to (h) are documented there), then the rebuild's
 //!   install (B9). Lost candidates are recorded only with `--record-lost`;
 //!   without it the run stops before any write (#195 STOP 1 decision 3).
+//!   (h): a path cold roots hold only as debris (data without its
+//!   manifest, a manifest that does not parse) that no start record names
+//!   is a lost candidate, and an unrecorded sealed copy on any cold root
+//!   gets its `manifest` record, so the writer's numbering counts every
+//!   path a cold root holds (D5, D6). When hot's surviving ledger already
+//!   equals the derived one (a re-run), only the replace is skipped: the
+//!   markers are re-read and non-prefix target copies moved aside as in
+//!   an uncrashed run.
 //! - **H6 Copy-back** ([`plan_copy_back`]): every partition dated in the
 //!   hot window or not recorded removed by the start; per partition, every
 //!   path whose verdict in the installed ledger is ordinary, from the cold
@@ -116,6 +124,9 @@ pub(crate) enum Step {
     Journal,
     /// The import ledger is written.
     ImportLedger,
+    /// Hot's copy ledger is replaced (or was already the derived one); the
+    /// targets' non-prefix copies are not moved aside yet.
+    Replace,
     /// The copy ledger is installed.
     Install,
     /// The first file is copied back.
@@ -128,9 +139,10 @@ pub(crate) enum Step {
 
 #[cfg(test)]
 impl Step {
-    pub(crate) const ALL: [Self; 6] = [
+    pub(crate) const ALL: [Self; 7] = [
         Self::Journal,
         Self::ImportLedger,
+        Self::Replace,
         Self::Install,
         Self::FirstCopy,
         Self::Returned,
@@ -1067,24 +1079,24 @@ fn restore(
     }
     reached(Step::ImportLedger)?;
 
-    // H7 3: the install (H5, B9).
-    let installed = if hot_ledger.as_deref() == Some(derived.ledger.as_slice()) {
-        report.lines.push(format!(
-            "hot's copy ledger {} already holds the derived ledger; it is kept",
-            hot_ledger_path.display()
-        ));
-        derived.ledger.clone()
-    } else {
-        for root in &marked {
-            if let Some(why) = rebuild::marker_gone(root) {
-                return Err(Stop(format!(
-                    "{} ({}): {why} since the run started; a mount lost during the listing reads \
-                     as absent files, so the restore stops before the install (ADR-062 D7 step 2)",
-                    root.path.display(),
-                    root.id
-                )));
-            }
+    // H7 3: the install (H5, B9). A hot ledger that already equals the
+    // derived one (a re-run after the replace) skips only the replace, so
+    // no identical ledger is linked into a new `damaged/<at_ms>/`; the
+    // markers are re-read and the targets' non-prefix copies moved aside
+    // either way, so a resumed restore leaves the same files as an
+    // uncrashed one (review of #218, finding 2).
+    for root in &marked {
+        if let Some(why) = rebuild::marker_gone(root) {
+            return Err(Stop(format!(
+                "{} ({}): {why} since the run started; a mount lost during the listing reads \
+                 as absent files, so the restore stops before the install (ADR-062 D7 step 2)",
+                root.path.display(),
+                root.id
+            )));
         }
+    }
+    let replace = hot_ledger.as_deref() != Some(derived.ledger.as_slice());
+    if replace {
         let hot_aside = hot_damaged.join("copy-ledger");
         hold.replace(&derived.ledger, Some(&hot_aside))
             .map_err(|error| Stop(format!("the install failed: {error}")))?;
@@ -1100,24 +1112,32 @@ fn restore(
             mie_adapter_parquet::rebuilt::gate_path(hot).display(),
             derived.ledger.len()
         ));
-        let mut moved = RebuildReport::default();
-        for (target, aside) in targets.iter().zip(&target_asides) {
-            rebuild::move_copy_aside(hot, target, aside, &mut moved);
-        }
-        report.lines.extend(moved.lines);
-        report.problems.extend(moved.problems);
+    } else {
+        report.lines.push(format!(
+            "hot's copy ledger {} already holds the derived ledger; it is kept",
+            hot_ledger_path.display()
+        ));
+    }
+    reached(Step::Replace)?;
+    let mut moved = RebuildReport::default();
+    for (target, aside) in targets.iter().zip(&target_asides) {
+        rebuild::move_copy_aside(hot, target, aside, &mut moved);
+    }
+    report.lines.extend(moved.lines);
+    report.problems.extend(moved.problems);
+    if replace {
         report.lines.push(format!(
             "wrote {} ({} bytes, {} records added)",
             hot_ledger_path.display(),
             derived.ledger.len(),
             derived.added.len()
         ));
-        derived.ledger.clone()
-    };
+    }
+    let installed = &derived.ledger;
     reached(Step::Install)?;
 
     // H7 4: the copy-back (H6).
-    let ledger = copy_ledger::parse(&hot_ledger_path, &installed)
+    let ledger = copy_ledger::parse(&hot_ledger_path, installed)
         .map_err(|error| Stop(format!("the installed ledger does not parse: {error}")))?;
     let state = CopyState::fold(&ledger)
         .map_err(|error| Stop(format!("the installed ledger cannot be folded: {error}")))?;

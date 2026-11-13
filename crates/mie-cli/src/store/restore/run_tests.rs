@@ -4,7 +4,7 @@
 //! edge cases.
 
 use super::*;
-use crate::store::replicate::tests::{D0, Fixture};
+use crate::store::replicate::tests::{D0, Fixture, manifest_of};
 use crate::store::replicate::{CRASH_AT, PassStep};
 use mie_adapter_parquet::copy_ledger::LedgerCopyCheck;
 use mie_adapter_parquet::{ParquetRawStore, rebuilt};
@@ -943,7 +943,10 @@ fn c_select_during_copy_back_holds_every_file() {
 
 /// A crash after each write step: `mie ingest` and the importer refuse,
 /// naming the restore and its re-run, and a re-run passes with the same
-/// files, entries and ledger records as an uncrashed run (`at_ms` aside).
+/// files, entries and ledger records as an uncrashed run (`at_ms` aside),
+/// and leaves the targets' ledger copies as it does: cold-a's non-prefix
+/// copy moved aside, also after a crash between the replace and that
+/// move (review of #218, finding 2).
 #[test]
 fn m_crash_at_every_step_resumes() {
     let prepare = |tag: &str| {
@@ -956,11 +959,35 @@ fn m_crash_at_every_step_resumes() {
         );
         assert_eq!(fixture.pass().problems, Vec::<String>::new());
         lose_hot(&fixture);
+        // A non-prefix ledger copy on cold-a, which the install moves
+        // aside (review of #218, finding 2).
+        let copy = copy_ledger::ledger_path(&fixture.cold[0]);
+        let mut bytes = fs::read(&copy).unwrap();
+        bytes[copy_ledger::HEADER.len() + 3] ^= 0x01;
+        fs::set_permissions(&copy, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::write(&copy, &bytes).unwrap();
         fixture
+    };
+    // `hot_state` leaves every copy ledger out, so the targets' copies are
+    // compared by their check against hot's ledger.
+    let copies = |fixture: &Fixture| -> Vec<LedgerCopyCheck> {
+        fixture
+            .cold
+            .iter()
+            .map(|cold| copy_ledger::check_copy(&fixture.hot, cold).unwrap())
+            .collect()
     };
     let reference = prepare("restore-m-reference");
     assert_restored(&restore(&reference));
-    let expected = (hot_state(&reference), records_without_time(&reference));
+    let expected = (
+        hot_state(&reference),
+        records_without_time(&reference),
+        copies(&reference),
+    );
+    assert_eq!(
+        expected.2,
+        vec![LedgerCopyCheck::Absent, LedgerCopyCheck::Good]
+    );
     for step in Step::ALL {
         let fixture = prepare(&format!("restore-m-{step:?}"));
         AFTER_STEP.with(|crash| crash.set(Some(step)));
@@ -975,7 +1002,11 @@ fn m_crash_at_every_step_resumes() {
         let report = restore_at(&fixture, Flags::default(), FIRST_HOT, AT + 1);
         assert_restored(&report);
         assert_eq!(
-            (hot_state(&fixture), records_without_time(&fixture)),
+            (
+                hot_state(&fixture),
+                records_without_time(&fixture),
+                copies(&fixture)
+            ),
             expected,
             "{step:?}"
         );
@@ -1176,4 +1207,186 @@ fn i_surviving_losing_entry_is_set_aside() {
         .join(ENTRY);
     assert_eq!(fs::read_to_string(aside).unwrap(), losing);
     assert!(crate::store::check_holds(&copy_ledger::read(&fixture.hot).unwrap().unwrap()).is_ok());
+}
+
+// ------------------------------------- paths a cold root holds (review of #218)
+
+/// One capture of two rows on the live date after the restore, by the
+/// tiered writer `mie ingest` opens; returns hot's live data paths.
+fn capture_after_restore(fixture: &Fixture) -> Vec<String> {
+    use mie_adapter_parquet::{RotationPolicy, TierContext};
+    use mie_ports::raw::{RawRecord, RawRecordSink};
+    let key = RawStreamKey::new("binance-um", "BTCUSDT", "aggTrade").unwrap();
+    let policy = RotationPolicy {
+        max_rows: 2,
+        ..RotationPolicy::default()
+    };
+    let ctx = TierContext {
+        first_hot_date: FIRST_HOT.to_owned(),
+        now_ms: std::sync::Arc::new(|| AT + 10),
+        on_recall: None,
+    };
+    let mut writer = tiered(fixture)
+        .tiered_writer("binance-um", policy, ctx)
+        .unwrap();
+    for i in 0..2 {
+        writer
+            .append(
+                &key,
+                RawRecord {
+                    event_time: EventTime::from_millis(D0 + 50_000 + i * 1_000),
+                    capture: None,
+                    payload: format!("new-{i}").into_bytes(),
+                },
+            )
+            .unwrap();
+    }
+    writer.close().unwrap();
+    replica::list_sealed(&fixture.hot)
+        .unwrap()
+        .into_iter()
+        .filter(|path| path.starts_with(LIVE))
+        .collect()
+}
+
+/// A fixture whose hot sealed `live(3)` after the pass, then lost hot;
+/// `place` puts what a cold root holds of `live(3)` before the loss.
+fn sealed_then_lost(tag: &str, place: &dyn Fn(&Fixture)) -> Fixture {
+    let fixture = replicated(tag);
+    assert_eq!(
+        fixture.seal("binance-um", "aggTrade", D0 + 6_000, 2),
+        vec![live(3)]
+    );
+    place(&fixture);
+    lose_hot(&fixture);
+    fixture
+}
+
+/// The data of `live(3)` copied from hot to `root`, without its manifest.
+fn data_only(fixture: &Fixture, root: &Path) {
+    fs::copy(fixture.hot.join(live(3)), root.join(live(3))).unwrap();
+}
+
+/// Review of #218, finding 1: a replication copy that crashed between its
+/// data and its manifest rename, then the hot loss. cold-a holds
+/// `live(3)`'s data without a manifest, and no record names it. No root
+/// holds a sealed copy and nothing can complete this one, so it is a lost
+/// candidate: without `--record-lost` the restore stops before any write;
+/// with it the path is recorded lost (origin `verify`), the data stays
+/// where it is, and the next capture does not reuse the path (D5, D6).
+#[test]
+fn d_cold_orphan_data_is_a_lost_candidate() {
+    let fixture = sealed_then_lost("restore-d-orphan", &|f| data_only(f, &f.cold[0]));
+    let old = fs::read(fixture.cold[0].join(live(3))).unwrap();
+    let report = restore(&fixture);
+    assert_not_restored(&report, &[&live(3), "--record-lost", "before any write"]);
+    assert_problem(
+        &report,
+        &[&live(3), "data file without its manifest on cold-a"],
+    );
+    assert!(!copy_ledger::ledger_path(&fixture.hot).exists());
+
+    let report = restore_at(&fixture, Flags { record_lost: true }, FIRST_HOT, AT);
+    assert!(report.restored, "{report:#?}");
+    assert!(
+        records_without_time(&fixture).contains(&Kind::Lost {
+            path: live(3),
+            origin: copy_ledger::LostOrigin::Verify,
+            sha256: None,
+        }),
+        "{report:#?}"
+    );
+    let parts = capture_after_restore(&fixture);
+    assert!(parts.contains(&live(4)), "{parts:?}");
+    assert!(!parts.contains(&live(3)), "{parts:?}");
+    assert_eq!(fs::read(fixture.cold[0].join(live(3))).unwrap(), old);
+    assert_eq!(fixture.pass().problems, Vec::<String>::new());
+}
+
+/// Finding 1's second case: cold-a holds `live(3)` with a manifest that
+/// does not parse, and no other root or record has its text. A lost
+/// candidate as above; its copy is also named as damaged.
+#[test]
+fn d_cold_bad_manifest_is_a_lost_candidate() {
+    let fixture = sealed_then_lost("restore-d-badtext", &|f| {
+        data_only(f, &f.cold[0]);
+        fs::write(f.cold[0].join(manifest_of(&live(3))), "no manifest\n").unwrap();
+    });
+    let report = restore(&fixture);
+    assert_not_restored(&report, &[&live(3), "--record-lost"]);
+    assert_problem(
+        &report,
+        &[&live(3), "manifest on cold-a that does not parse"],
+    );
+
+    let report = restore_at(&fixture, Flags { record_lost: true }, FIRST_HOT, AT);
+    assert!(report.restored, "{report:#?}");
+    assert_problem(&report, &[&live(3), "on cold-a", "does not verify"]);
+    let parts = capture_after_restore(&fixture);
+    assert!(parts.contains(&live(4)), "{parts:?}");
+    assert!(!parts.contains(&live(3)), "{parts:?}");
+}
+
+/// The same class on a read-only root: a sealed `live(3)` that only the
+/// read-only root holds and no record names gets its `manifest` record and
+/// is copied back, so the numbering counts it and hot holds it again.
+#[test]
+fn c_unrecorded_read_only_copy_is_recorded_and_copied_back() {
+    let mut fixture = replicated("restore-c-readonly");
+    let read_only = with_read_only_root(&mut fixture);
+    assert_eq!(
+        fixture.seal("binance-um", "aggTrade", D0 + 6_000, 2),
+        vec![live(3)]
+    );
+    let data = fs::read(fixture.hot.join(live(3))).unwrap();
+    let text = fs::read_to_string(fixture.hot.join(manifest_of(&live(3)))).unwrap();
+    fs::write(read_only.join(live(3)), &data).unwrap();
+    fs::write(read_only.join(manifest_of(&live(3))), &text).unwrap();
+    lose_hot(&fixture);
+    let report = restore(&fixture);
+    assert_restored(&report);
+    assert!(records_without_time(&fixture).contains(&Kind::Manifest { text }));
+    assert_eq!(fs::read(fixture.hot.join(live(3))).unwrap(), data);
+    let parts = capture_after_restore(&fixture);
+    assert!(parts.contains(&live(4)), "{parts:?}");
+    assert_eq!(fs::read(fixture.hot.join(live(3))).unwrap(), data);
+}
+
+/// Review of #218, finding 2: a crash after the install's replace and
+/// before the target copies are moved aside. The re-run keeps hot's
+/// ledger (deviation 4) and still moves the non-prefix copy aside, as an
+/// uncrashed run does.
+#[test]
+fn l_resume_after_replace_moves_non_prefix_copy_aside() {
+    let fixture = replicated("restore-l-resume");
+    lose_hot(&fixture);
+    let copy = copy_ledger::ledger_path(&fixture.cold[0]);
+    let mut bytes = fs::read(&copy).unwrap();
+    let at = copy_ledger::HEADER.len() + 3;
+    bytes[at] ^= 0x01;
+    fs::set_permissions(&copy, fs::Permissions::from_mode(0o644)).ok();
+    fs::write(&copy, &bytes).unwrap();
+    AFTER_STEP.with(|crash| crash.set(Some(Step::Install)));
+    let report = restore(&fixture);
+    AFTER_STEP.with(|crash| crash.set(None));
+    assert!(!report.restored, "{report:#?}");
+    // Undo the move-aside rename: the state of a crash between
+    // `hold.replace` and the move-aside.
+    let aside = replica::damaged_dir(&fixture.cold[0], AT).join("copy-ledger");
+    fs::rename(&aside, &copy).unwrap();
+    let report = restore_at(&fixture, Flags::default(), FIRST_HOT, AT + 1);
+    assert_restored(&report);
+    assert!(
+        report
+            .lines
+            .iter()
+            .any(|line| line.contains("already holds the derived ledger")),
+        "{report:#?}"
+    );
+    let aside = replica::damaged_dir(&fixture.cold[0], AT + 1).join("copy-ledger");
+    assert_eq!(fs::read(&aside).unwrap(), bytes);
+    assert_eq!(
+        copy_ledger::check_copy(&fixture.hot, &fixture.cold[0]).unwrap(),
+        LedgerCopyCheck::Absent
+    );
 }

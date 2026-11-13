@@ -30,7 +30,11 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   file: a damaged copy is passed over and named for `mie store verify`,
   then `mie store repair`, and a file with no good copy stays recorded so
   every read of it fails. A file a record names that no root holds stops
-  the restore before any write unless `--record-lost`. Hot's marker is
+  the restore before any write unless `--record-lost`, and so does a path
+  that cold roots hold only as debris (data without its manifest, or a
+  manifest that does not parse) and no record names; an unrecorded copy
+  on a read-only root is recorded and copied back. So a new capture never
+  reuses a path a cold root holds. Hot's marker is
   written last, so running the command again completes a restore that
   stopped or crashed; `mie ingest`, the importer and `mie store init` name
   that re-run when `.mie/` exists without a marker. Data of a cold copy is

@@ -1397,3 +1397,109 @@ fn a_missing_hot_import_ledger_does_not_stop_the_restore() {
     );
     assert!(derived.holds.is_empty(), "{:?}", derived.holds);
 }
+
+/// H5 h (review of #218): a path cold roots hold only as debris (data
+/// without its manifest on cold-a, a manifest that does not parse on
+/// cold-b) and no record names is a lost candidate, origin `verify`, in
+/// the restore only; the rebuild keeps counting debris as held, since its
+/// hot holds the part.
+#[test]
+fn h_cold_debris_is_a_lost_candidate_only_in_the_restore() {
+    let orphan = live("2026-10-06", 3);
+    let bad = live("2026-10-06", 4);
+    let mut inputs = inputs();
+    inputs.roots[0].orphan_data.insert(orphan.clone());
+    on(
+        &mut inputs,
+        1,
+        &bad,
+        RootCopy::BadText("the manifest does not parse: x".to_owned()),
+    );
+    let derived = derive_ok(&inputs);
+    assert_eq!(derived.lost, Vec::<LostFile>::new());
+    restoring(&mut inputs, None, &[]);
+    let derived = derive_ok(&inputs);
+    let lost: Vec<(&str, LostOrigin, bool)> = derived
+        .lost
+        .iter()
+        .map(|file| (file.path.as_str(), file.origin, file.recorded))
+        .collect();
+    assert_eq!(
+        lost,
+        vec![
+            (orphan.as_str(), LostOrigin::Verify, false),
+            (bad.as_str(), LostOrigin::Verify, false),
+        ]
+    );
+    assert!(
+        derived
+            .problems
+            .iter()
+            .any(|p| p.contains(&orphan) && p.contains("only debris")),
+        "{:?}",
+        derived.problems
+    );
+    inputs.record_lost = true;
+    let derived = derive_ok(&inputs);
+    assert!(derived.added.iter().any(|record| record.kind
+        == Kind::Lost {
+            path: orphan.clone(),
+            origin: LostOrigin::Verify,
+            sha256: None,
+        }));
+}
+
+/// H5 h: debris beside a sealed copy, or under a path a start record
+/// names, is no lost candidate: the copy or the record keeps the path
+/// counted.
+#[test]
+fn h_debris_beside_a_copy_or_a_record_is_no_candidate() {
+    let path = live("2026-10-06", 3);
+    let mut beside = inputs();
+    beside.roots[0].orphan_data.insert(path.clone());
+    on(&mut beside, 1, &path, good(&text(&path, &sha("a"))));
+    restoring(&mut beside, None, &[]);
+    assert_eq!(derive_ok(&beside).lost, Vec::<LostFile>::new());
+
+    let mut inputs = inputs();
+    inputs.roots[0].orphan_data.insert(path.clone());
+    start_on(
+        &mut inputs,
+        1,
+        ledger(&[Kind::Manifest {
+            text: text(&path, &sha("a")),
+        }]),
+    );
+    restoring(&mut inputs, None, &[]);
+    assert_eq!(derive_ok(&inputs).lost, Vec::<LostFile>::new());
+}
+
+/// H5 h: an unrecorded sealed copy on a read-only root gets its
+/// `manifest` record in the restore (so the copy-back brings it to hot),
+/// never in the rebuild.
+#[test]
+fn h_unrecorded_read_only_copy_gets_its_manifest_in_the_restore() {
+    let path = live("2026-10-06", 3);
+    let manifest = text(&path, &sha("a"));
+    let mut inputs = inputs();
+    inputs.roots[0].copy_target = false;
+    on(
+        &mut inputs,
+        0,
+        &path,
+        RootCopy::Text {
+            text: manifest.clone(),
+            data: DataCheck::NotChecked,
+        },
+    );
+    on_hot(&mut inputs, &path, &manifest);
+    assert_eq!(derive_ok(&inputs).added, Vec::<Record>::new());
+    inputs.hot = HotRead::default();
+    restoring(&mut inputs, None, &[&partition(&path)]);
+    let added: Vec<Kind> = derive_ok(&inputs)
+        .added
+        .into_iter()
+        .map(|record| record.kind)
+        .collect();
+    assert_eq!(added, vec![Kind::Manifest { text: manifest }]);
+}

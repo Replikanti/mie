@@ -1883,7 +1883,7 @@ What breaks:
     the import ledger as H4 leaves it, so its findings describe the
     restored store.
   - **H5 The copy ledger** (steps 2 and 4): the rebuild's derivation in a
-    restore mode, which differs in seven points: (a) hot's own ledger is
+    restore mode, which differs in eight points: (a) hot's own ledger is
     the first start candidate (on a tie hot wins, then configuration
     order), since it holds every record the copies hold; (b) a live path
     with two texts stops the run only when the start has no `manifest`
@@ -1901,9 +1901,28 @@ What breaks:
     removed-partition rule counts every partition step 3 copies back as
     on hot; (f) a missing hot import ledger does not stop it, since H4
     restores it; (g) findings are `FAIL:` lines naming verify, then
-    repair, never `finding` records, which belong to a verification pass.
-    The install is the rebuild's (B9), skipped when hot's surviving ledger
-    already equals the derived one (a re-run).
+    repair, never `finding` records, which belong to a verification pass;
+    (h) every path a cold root holds reaches the restored ledger's part
+    numbering (review of #218). A path that no start record names and
+    that a cold root holds as a sealed copy gets its `manifest` record
+    even without a verified copy on a copy target (a read-only root's
+    copy), so the copy-back brings it to hot. A path that no start record
+    names and that cold roots hold only as debris (a data file without its
+    manifest, as a copy that crashed between its two renames leaves, or a
+    manifest that does not parse or names another location) is a lost
+    candidate under (d), origin `verify` when nothing else names it. Why:
+    with hot gone, no root holds the sealed file and nothing can complete
+    the debris (the D5 copy completes it only from a source manifest), and
+    a path without a record and absent from hot is invisible to the D6
+    union, so the next capture would seal other bytes under it. The debris
+    stays where it is. Rejected, a record without the flag: every `lost`
+    record sits behind `--record-lost` (d). The rebuild keeps counting
+    debris as held, since there hot still holds the part. The install is
+    the rebuild's (B9). When hot's surviving ledger already equals the
+    derived one (a re-run after the replace), only the replace and its
+    link into `.mie/damaged/<at_ms>/` are skipped: the markers are re-read
+    and every target copy that is no prefix is moved aside, so a resumed
+    restore leaves the same files as an uncrashed one (review of #218).
   - **H6 Copy-back** (step 3): every partition, named by the start or any
     root's layout, dated on or after the first hot date, or that the start
     does not record as removed. Per partition in path order, every path

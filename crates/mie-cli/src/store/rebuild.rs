@@ -256,8 +256,11 @@ pub struct JournalRead {
 }
 
 /// What runs the derivation: the rebuild, or the hot restore (#195 H5),
-/// which reuses it with seven differences, (a) to (g) of its plan. Only
-/// [`Mode::Restore`] changes anything; [`run`] always passes
+/// which reuses it with eight differences: (a) to (g) of its plan, and (h)
+/// from the review of #218, which brings every path a cold root holds and
+/// no start record names into the restored ledger's numbering (a
+/// `manifest` record for an unrecorded sealed copy, a lost candidate for
+/// debris). Only [`Mode::Restore`] changes anything; [`run`] always passes
 /// [`Mode::Rebuild`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
@@ -399,6 +402,10 @@ enum Source {
     Journal(u64, String),
     /// A journal `recovery` line.
     Recovery(u64, String),
+    /// In the restore, debris on a cold root: a data file without its
+    /// manifest (`None`), or a manifest that does not parse or names
+    /// another location (`Some(why)`).
+    Debris(String, Option<String>),
 }
 
 impl Source {
@@ -410,6 +417,10 @@ impl Source {
             Self::Recovery(line, run) => {
                 format!("journal line {line} (run {run}, `recovery` rolled_forward)")
             }
+            Self::Debris(root, None) => format!("the data file without its manifest on {root}"),
+            Self::Debris(root, Some(why)) => format!(
+                "a manifest on {root} that does not parse or names another location ({why})"
+            ),
         }
     }
 }
@@ -605,7 +616,17 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
         .map_err(|error| Stop(format!("the start copy cannot be folded: {error}")))?;
     let mut start_texts: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut sources: BTreeMap<String, BTreeSet<Source>> = BTreeMap::new();
+    // The paths a start record other than `finding` and `lost` names: the
+    // installed ledger keeps them, so the writer's numbering counts them
+    // (D6). The restore's rules for unrecorded cold copies (B4, B6) skip
+    // them.
+    let mut start_named: BTreeSet<String> = BTreeSet::new();
     for record in &start_ledger.records {
+        if !matches!(record.kind, Kind::Finding { .. } | Kind::Lost { .. })
+            && let Some(path) = named_path(&record.kind)
+        {
+            start_named.insert(path);
+        }
         if let Kind::Manifest { text } = &record.kind
             && let Ok(file) = replica::parse_manifest(text)
         {
@@ -954,7 +975,19 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
             .filter(|root| root.copy_target && verified.contains(&root.id.as_str()))
             .map(|root| root.id.as_str())
             .collect();
-        if !start_texts.contains_key(path) && (!targets.is_empty() || damaged_cold) {
+        // H5 (h): in the restore, a path no start record names that a cold
+        // root holds with this text gets its `manifest` record even without
+        // a verified copy on a copy target (a read-only root's copy): hot is
+        // gone, so without the record the copy-back skips the path and the
+        // writer's numbering does not count it (D5, D6; review of #218).
+        let unrecorded_cold_text = restore.is_some()
+            && !start_named.contains(path)
+            && inputs.roots.iter().any(|root| {
+                matches!(root.files.get(path), Some(RootCopy::Text { text: own, .. }) if own == text)
+            });
+        if !start_texts.contains_key(path)
+            && (!targets.is_empty() || damaged_cold || unrecorded_cold_text)
+        {
             records.push(Kind::Manifest {
                 text: text.to_owned(),
             });
@@ -969,6 +1002,49 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
                     root: id.to_owned(),
                 });
             }
+        }
+    }
+
+    // H5 (h): in the restore, a path that cold roots hold only as debris (a
+    // data file without its manifest, or a manifest that does not parse)
+    // and no start record names has no sealed copy anywhere, and nothing
+    // completes the debris once hot is lost. It is a lost candidate, named
+    // by its debris: without a record the writer's numbering would not
+    // count it and the next capture would reuse its path (D5, D6). The
+    // rebuild keeps counting debris as held, since its hot still holds the
+    // part.
+    let mut debris: BTreeMap<String, Vec<Source>> = BTreeMap::new();
+    if restore.is_some() {
+        for root in &inputs.roots {
+            for path in &root.orphan_data {
+                debris
+                    .entry(path.clone())
+                    .or_default()
+                    .push(Source::Debris(root.id.clone(), None));
+            }
+            for (path, copy) in &root.files {
+                if let RootCopy::BadText(why) = copy {
+                    debris
+                        .entry(path.clone())
+                        .or_default()
+                        .push(Source::Debris(root.id.clone(), Some(why.clone())));
+                }
+            }
+        }
+        debris.retain(|path, _| {
+            !start_named.contains(path)
+                && !inputs.hot.files.contains_key(path)
+                && !inputs.hot.orphan_data.contains(path)
+                && !inputs
+                    .roots
+                    .iter()
+                    .any(|root| matches!(root.files.get(path), Some(RootCopy::Text { .. })))
+        });
+        for (path, found) in &debris {
+            sources
+                .entry(path.clone())
+                .or_default()
+                .extend(found.iter().cloned());
         }
     }
 
@@ -995,7 +1071,7 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
             ));
             continue;
         }
-        let held = held_anywhere(path);
+        let held = held_anywhere(path) && !debris.contains_key(path);
         if state.verdict(path) == Some(PathVerdict::Lost) {
             if held {
                 problems.push(format!(
@@ -1025,6 +1101,10 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
             (LostOrigin::Journal, None)
         } else if has(|s| matches!(s, Source::Recovery(..))) {
             (LostOrigin::Recovery, None)
+        } else if has(|s| matches!(s, Source::Debris(..))) {
+            // Only the restore's own read of the roots names it: a copy
+            // that does not verify, as the repair's lost-file rule.
+            (LostOrigin::Verify, None)
         } else {
             (LostOrigin::Ledger, None)
         };
@@ -1059,9 +1139,14 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
                  it lost"
             }
         };
+        let absent = if debris.contains_key(path) {
+            "no root holds a sealed copy, only debris that nothing completes without hot, and the \
+             path must stay counted, or the next capture reuses it (ADR-062 D5, D6);"
+        } else {
+            "no root holds it (no data file and no manifest on hot or on any cold root), and"
+        };
         problems.push(format!(
-            "{path}: no root holds it (no data file and no manifest on hot or on any cold root), \
-             and {} names it; {what} (ADR-062 D7 step 4, D11)",
+            "{path}: {absent} {} names it; {what} (ADR-062 D7 step 4, D11)",
             described.join(", ")
         ));
         lost.push(LostFile {
