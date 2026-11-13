@@ -87,7 +87,12 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   rebuild` reads every root's `.quarantine/` and re-derives the
   `quarantined`, `hold-cleared … replace` and `replaced` records, so a
   rebuild from a full, a stale or an empty start gives the same
-  selections (AW12).
+  selections (AW12). A read-only cold root does not count toward a
+  replace's completion: one whose layout still holds a moved path, for
+  example a disk configured after the replace, halts no import, and `mie
+  store resolve` and `mie store rebuild` name it in an info line. A new
+  replace no longer refuses when a read-only root holds the file, unless
+  only read-only roots hold a moved path (#216).
 - **Storage tiers, step 8a: `mie store resolve` (#210, ADR-062 D11,
   proposed).** `mie store resolve --config <ingest config>
   [--archive-config <path>] [--file <archive path>]` resolves held

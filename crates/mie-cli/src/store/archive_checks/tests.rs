@@ -567,11 +567,13 @@ fn run_quarantine(
     roots: &[RootQuarantine],
     layout: &BTreeMap<String, Vec<(String, Option<String>)>>,
     start: &CopyState,
+    read_only: &BTreeSet<String>,
 ) -> QuarantineFindings {
     quarantine(&QuarantineInputs {
         entries,
         roots,
         layout,
+        read_only,
         start,
     })
 }
@@ -610,6 +612,7 @@ fn quarantine_names_outside_the_id_grammar_are_named_not_recorded() {
         &[root],
         &BTreeMap::new(),
         &start(Vec::new()),
+        &BTreeSet::new(),
     );
     assert_eq!(found.problems.len(), 3, "{found:#?}");
     assert!(found.records.is_empty() && found.paths.is_empty());
@@ -636,7 +639,13 @@ fn moved_paths_outside_the_layout_are_named_never_recorded() {
             copies(&[("hot", &moving(&[&wide], Vec::new()))]),
         ),
     ]);
-    let found = run_quarantine(&entries, &[], &BTreeMap::new(), &start(Vec::new()));
+    let found = run_quarantine(
+        &entries,
+        &[],
+        &BTreeMap::new(),
+        &start(Vec::new()),
+        &BTreeSet::new(),
+    );
     assert_eq!(found.paths.keys().collect::<Vec<_>>(), vec![&good]);
     has_problem(&found, &[odd, "never recorded"]);
     has_problem(&found, &[live, "never recorded"]);
@@ -656,6 +665,7 @@ fn a_quarantined_path_gone_from_every_root_is_still_quarantined() {
         &[],
         &BTreeMap::new(),
         &start(Vec::new()),
+        &BTreeSet::new(),
     );
     assert_eq!(
         found.records,
@@ -678,6 +688,7 @@ fn an_unnamed_quarantine_file_is_quarantined_and_named() {
         &[quarantined_on("cold-a", &[(&p, Some(&t))])],
         &BTreeMap::new(),
         &start(Vec::new()),
+        &BTreeSet::new(),
     );
     assert_eq!(found.paths[&p].record, None);
     assert_eq!(
@@ -730,6 +741,7 @@ fn start_holds_on_quarantined_paths() {
         &[quarantined_on("hot", &[(&done, None)])],
         &layout,
         &start(holds),
+        &BTreeSet::new(),
     );
     assert_eq!(
         found.records,
@@ -781,6 +793,7 @@ fn the_quarantine_manifest_text_follows_the_superseded_entry() {
             ],
             &BTreeMap::new(),
             &start(Vec::new()),
+            &BTreeSet::new(),
         );
         assert_eq!(
             found.records[0],
@@ -798,6 +811,7 @@ fn the_quarantine_manifest_text_follows_the_superseded_entry() {
         ],
         &BTreeMap::new(),
         &start(Vec::new()),
+        &BTreeSet::new(),
     );
     assert!(
         found
@@ -805,4 +819,167 @@ fn the_quarantine_manifest_text_follows_the_superseded_entry() {
             .iter()
             .all(|kind| !matches!(kind, Kind::Manifest { .. }))
     );
+}
+
+/// `{cold-r}`, the read-only root of the #216 tests.
+fn read_only_r() -> BTreeSet<String> {
+    BTreeSet::from(["cold-r".to_owned()])
+}
+
+/// Q4 (#216): a moved path only a read-only root's layout holds is
+/// complete: its open hold is cleared and `replaced` follows the entry, and
+/// the root gets an info line, no problem. Counted as a copy target, the
+/// same layout keeps it incomplete.
+#[test]
+fn q4_a_path_only_a_read_only_root_holds_is_complete() {
+    let p = part("aggTrades", "2026-10-01", 0);
+    let t = text(&p, &sha("p"));
+    let mut entries = record_of(moving(&[&p], Vec::new()));
+    entries.insert(E1.to_owned(), copies(&[("hot", &entry(&[]))]));
+    let layout = BTreeMap::from([(p.clone(), vec![("cold-r".to_owned(), Some(t.clone()))])]);
+    let holds = || {
+        start(vec![
+            Kind::Hold {
+                path: p.clone(),
+                reason: HoldReason::Unlisted,
+            },
+            Kind::Manifest { text: t.clone() },
+        ])
+    };
+    let roots = [quarantined_on("hot", &[(&p, Some(&t))])];
+    let found = run_quarantine(&entries, &roots, &layout, &holds(), &read_only_r());
+    assert!(found.paths[&p].complete, "{found:#?}");
+    assert_eq!(
+        found.records,
+        vec![
+            Kind::HoldCleared {
+                path: p.clone(),
+                resolution: Resolution::Replace
+            },
+            Kind::Quarantined {
+                path: p.clone(),
+                quarantine: QID.to_owned()
+            },
+            Kind::Replaced {
+                path: p.clone(),
+                entry: E1.to_owned()
+            },
+        ]
+    );
+    assert!(found.problems.is_empty(), "{found:#?}");
+    assert_eq!(found.lines[0], read_only_line(&p, "cold-r", QID));
+    assert!(found.lines[1].contains("1 complete, 0 incomplete"));
+
+    let found = run_quarantine(&entries, &roots, &layout, &holds(), &BTreeSet::new());
+    assert!(!found.paths[&p].complete);
+    has_problem(
+        &found,
+        &[&p, "stopped between renames (cold-r still hold it)"],
+    );
+}
+
+/// Q4/Q5 (#216): a copy target beside a read-only root keeps the path
+/// incomplete; the problem names the copy target only, and the read-only
+/// root gets its info line. No hold is cleared, no `replaced` derived.
+#[test]
+fn q4_a_copy_target_beside_a_read_only_root_keeps_it_incomplete() {
+    let p = part("aggTrades", "2026-10-01", 0);
+    let t = text(&p, &sha("p"));
+    let mut entries = record_of(moving(&[&p], Vec::new()));
+    entries.insert(E1.to_owned(), copies(&[("hot", &entry(&[]))]));
+    let layout = BTreeMap::from([(
+        p.clone(),
+        vec![
+            ("cold-a".to_owned(), Some(t.clone())),
+            ("cold-r".to_owned(), Some(t.clone())),
+        ],
+    )]);
+    let found = run_quarantine(
+        &entries,
+        &[],
+        &layout,
+        &start(vec![
+            Kind::Hold {
+                path: p.clone(),
+                reason: HoldReason::Unlisted,
+            },
+            Kind::Manifest { text: t.clone() },
+        ]),
+        &read_only_r(),
+    );
+    assert!(!found.paths[&p].complete);
+    has_problem(
+        &found,
+        &[&p, "stopped between renames (cold-a still hold it)"],
+    );
+    assert_eq!(found.problems.len(), 1, "{found:#?}");
+    assert_eq!(found.lines[0], read_only_line(&p, "cold-r", QID));
+    assert_eq!(
+        found.records,
+        vec![Kind::Quarantined {
+            path: p.clone(),
+            quarantine: QID.to_owned()
+        }]
+    );
+}
+
+/// Q5 (#216): a path only a read-only layout holds, with no quarantine
+/// copy, is not gone: no problem, an info line. Without that layout its
+/// bytes are gone, as before.
+#[test]
+fn q5_a_read_only_copy_is_not_gone() {
+    let p = part("aggTrades", "2026-10-01", 0);
+    let entries = record_of(moving(&[&p], Vec::new()));
+    let layout = BTreeMap::from([(p.clone(), vec![("cold-r".to_owned(), None)])]);
+    let found = run_quarantine(&entries, &[], &layout, &start(Vec::new()), &read_only_r());
+    assert!(found.paths[&p].complete);
+    assert!(found.problems.is_empty(), "{found:#?}");
+    assert_eq!(found.lines[0], read_only_line(&p, "cold-r", QID));
+    let found = run_quarantine(
+        &entries,
+        &[],
+        &BTreeMap::new(),
+        &start(Vec::new()),
+        &read_only_r(),
+    );
+    has_problem(&found, &[&p, "bytes are gone"]);
+}
+
+/// Q4, the text rule (#216): a read-only layout still feeds it, so the
+/// only text, on a read-only root, gives the `manifest` record W2 derives.
+#[test]
+fn q4_the_text_rule_still_reads_read_only_layouts() {
+    let p = part("aggTrades", "2026-10-01", 0);
+    let t = text(&p, &sha("p"));
+    let layout = BTreeMap::from([(p.clone(), vec![("cold-r".to_owned(), Some(t.clone()))])]);
+    let found = run_quarantine(
+        &record_of(moving(&[&p], Vec::new())),
+        &[],
+        &layout,
+        &start(Vec::new()),
+        &read_only_r(),
+    );
+    assert_eq!(found.records[0], Kind::Manifest { text: t });
+}
+
+/// Q4 (#216): the read-only set is matched exactly. A look-alike hyphen, a
+/// trailing blank or a zero-width character leaves cold-r counted (fail
+/// closed), and `hot` in the set is ignored: hot always counts.
+#[test]
+fn q4_read_only_membership_is_exact() {
+    let p = part("aggTrades", "2026-10-01", 0);
+    let entries = record_of(moving(&[&p], Vec::new()));
+    let look_alikes: BTreeSet<String> = ["cold\u{2010}r", "cold-r ", "cold-r\u{200b}", "hot"]
+        .map(str::to_owned)
+        .into();
+    for root in ["cold-r", "hot"] {
+        let layout = BTreeMap::from([(p.clone(), vec![(root.to_owned(), None)])]);
+        let found = run_quarantine(&entries, &[], &layout, &start(Vec::new()), &look_alikes);
+        assert!(!found.paths[&p].complete, "{root}");
+        has_problem(&found, &[&p, "stopped between renames"]);
+        assert!(
+            found.lines.iter().all(|l| !l.contains("read-only")),
+            "{root}"
+        );
+    }
 }

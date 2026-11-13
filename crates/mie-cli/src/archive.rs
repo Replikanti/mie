@@ -181,8 +181,8 @@ pub fn import_with(
     // Dry runs too, from that same read: an open hold halts the importer
     // until it is resolved (ADR-062 D11, #193 H1).
     // Dry runs too, from that same read: a replace that stopped between
-    // its renames halts the importer until it is completed (ADR-062 D11,
-    // #211 I1).
+    // its renames on hot or a copy target halts the importer until it is
+    // completed; a read-only root never does (ADR-062 D11, #211 I1, #216).
     let ledgers = LedgerDir::new(&config.paths.import_ledger);
     let replace_roots = crate::store::quarantine::ReplaceRoots::read(
         &config.paths.raw_root,
@@ -204,8 +204,8 @@ pub fn import_with(
     // #211 I3, never in a dry run: the `replaced` records of an entry a
     // crash left without them.
     let replacements = |out: &mut dyn Write| -> Result<(), String> {
-        // The markers are read again: a root unmounted meanwhile holds it
-        // back (I1's rule).
+        // The markers are read again: a copy target unmounted meanwhile
+        // holds it back (I1's rule).
         let roots = crate::store::quarantine::ReplaceRoots::read(
             &config.paths.raw_root,
             &config.paths.cold_roots,

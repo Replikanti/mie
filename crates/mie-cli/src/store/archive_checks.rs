@@ -52,20 +52,22 @@
 //!   no damage line, no lost candidate, no hold, no `removed` partition.
 //! - **Q4 Records per Q path**: `manifest` when the start lacks a text
 //!   (the text rule over the layouts' and the quarantines' texts, the
-//!   superseded entry breaking a tie); `hold-cleared <path> replace` when
-//!   the start holds it open, a record names it and it is complete (no
-//!   root's layout holds it); `quarantined <path> <id>` unless the start
-//!   has it pending under that id; `replaced <path> <segment>/<E_g>` when
-//!   it is complete, a record S_n names it, an entry of the lowest
-//!   generation g ≥ n exists in the union and the start has no `replaced`
-//!   for it.
+//!   superseded entry breaking a tie, read-only layouts included);
+//!   `hold-cleared <path> replace` when the start holds it open, a record
+//!   names it and it is complete (no layout of hot or of a copy target
+//!   holds it; a read-only root never counts, #216); `quarantined <path>
+//!   <id>` unless the start has it pending under that id; `replaced
+//!   <path> <segment>/<E_g>` when it is complete, a record S_n names it,
+//!   an entry of the lowest generation g ≥ n exists in the union and the
+//!   start has no `replaced` for it.
 //! - **Q5 Problems**, none derived from an absence, so the ledger is
 //!   still installed: an incomplete path (the replace stopped between
-//!   renames; an open start hold stays open), a path no root's layout or
-//!   quarantine holds (its bytes are gone), a quarantined path no record
-//!   names.
+//!   renames on hot or a copy target, which are named; an open start hold
+//!   stays open), a path no root's layout or quarantine holds (its bytes
+//!   are gone), a quarantined path no record names. A read-only root whose
+//!   layout holds a Q path gets an info line instead.
 
-use super::quarantine::{superseded_shas, text_rule};
+use super::quarantine::{read_only_line, superseded_shas, text_rule};
 use super::replicate::is_archive_part;
 use mie_adapter_binance::archive::catalog::parse_day;
 use mie_adapter_binance::archive::import::orphan_days;
@@ -429,6 +431,10 @@ pub struct QuarantineInputs<'a> {
     /// data file), with the text when the manifest parses and describes
     /// the path.
     pub layout: &'a BTreeMap<String, Vec<(String, Option<String>)>>,
+    /// The marker ids of the configured read-only roots: their layouts
+    /// feed the text rule but never the commit point (#216). Matched
+    /// exactly; `hot` always counts.
+    pub read_only: &'a BTreeSet<String>,
     /// The starting ledger, folded.
     pub start: &'a CopyState,
 }
@@ -441,7 +447,7 @@ pub struct QuarantinedPath {
     /// The supersede record naming it, `<segment>/<name>`; `None` when
     /// only a quarantine directory holds it.
     pub record: Option<String>,
-    /// No root's layout holds it.
+    /// No layout of hot or of a copy target holds it.
     pub complete: bool,
 }
 
@@ -453,7 +459,9 @@ pub struct QuarantineFindings {
     /// The records to add, in Q6's order: `manifest`, `hold-cleared`,
     /// `quarantined`, `replaced`, each group in path order.
     pub records: Vec<Kind>,
-    /// One report line per quarantine id.
+    /// One info line per (Q path, read-only root whose layout holds it),
+    /// in path order, then layout order; then one report line per
+    /// quarantine id.
     pub lines: Vec<String>,
     /// Every Q5 problem.
     pub problems: Vec<String>,
@@ -550,7 +558,13 @@ pub fn quarantine(inputs: &QuarantineInputs<'_>) -> QuarantineFindings {
     for (path, (id, record)) in &by_path {
         let layout: Vec<&(String, Option<String>)> =
             inputs.layout.get(path).into_iter().flatten().collect();
-        let complete = layout.is_empty();
+        // Hot and the copy targets are the commit point; a read-only root
+        // is never written, so its copy can never move (#216).
+        let (counted, read_only): (Vec<&str>, Vec<&str>) = layout
+            .iter()
+            .map(|(root, _)| root.as_str())
+            .partition(|root| *root == "hot" || !inputs.read_only.contains(*root));
+        let complete = counted.is_empty();
         let quarantined: Vec<(&str, Option<&str>)> = inputs
             .roots
             .iter()
@@ -623,19 +637,21 @@ pub fn quarantine(inputs: &QuarantineInputs<'_>) -> QuarantineFindings {
                 replica::QUARANTINE_DIR
             )),
             Some(moving) if !complete => {
-                let roots: Vec<&str> = layout.iter().map(|(root, _)| root.as_str()).collect();
                 found.problems.push(format!(
                     "{path}: the replace of {} under {id} stopped between renames ({} still \
                      hold it); `mie store resolve --file {}` completes it, and its hold stays \
                      open until then (ADR-062 D11)",
                     moving.record.archive,
-                    roots.join(", "),
+                    counted.join(", "),
                     moving.record.archive
                 ));
             }
             Some(_) => {}
         }
-        if complete && quarantined.is_empty() {
+        for root in &read_only {
+            found.lines.push(read_only_line(path, root, id));
+        }
+        if complete && quarantined.is_empty() && read_only.is_empty() {
             found.problems.push(format!(
                 "{path}: quarantined under {id}, and no root's layout or quarantine holds it: its \
                  bytes are gone; nothing in mie deletes them (ADR-062 D5)"

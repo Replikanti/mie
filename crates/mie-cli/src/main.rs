@@ -489,10 +489,11 @@ USAGE:
         files under its path is refused. With --replace (it needs --file)
         it downloads nothing: it writes a supersede record naming a new
         quarantine id and the paths it moves, records them quarantined,
-        then renames on every root (cold roots first, hot last) the held
-        parts and every other part of the superseded entry into
-        .quarantine/<id>/, where nothing ever deletes them, and clears the
-        holds. It first prints the cost: every moved path with its stream,
+        then renames on hot and every copy target (copy targets first, hot
+        last; a read-only root is never written) the held parts and every
+        other part of the superseded entry into .quarantine/<id>/, where
+        nothing ever deletes them, and clears the holds. A replace is
+        refused when only read-only roots hold a moved path. It first prints the cost: every moved path with its stream,
         date and event range (every dataset version of a selection over it
         changes) and every journaled warm run whose prefix covers one,
         whose prefix_dataset reads DIVERGED (warm prefix) for good. Until
@@ -500,7 +501,8 @@ USAGE:
         selection covering the moved paths fails; the import writes new
         part numbers and records the replacement. A replace that stopped
         is completed by running the same command again, --replace not
-        needed. Without --file it also names every incomplete replace. It
+        needed. Without --file it also names every incomplete replace and
+        every read-only root that still holds a moved path. It
         takes the archive source's writer lock without waiting, so it
         refuses while an import or a rebuild runs; a replace also takes the
         pass lock and needs every cold root's marker. Every copy target

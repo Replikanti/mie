@@ -645,55 +645,196 @@ fn a_held_part_no_root_holds_is_refused() {
     assert_eq!(files(&fixture.dir), before);
 }
 
-/// RQ1: a read-only root that holds a moved path refuses the replace: D4
-/// never writes a read-only root.
-#[test]
-fn a_read_only_root_holding_a_moved_path_is_refused() {
-    let (_dir, fixture) = adopted("replace-read-only");
-    let (_, parts, _) = missing_entry(&fixture);
-    let c = fixture.dir.join("cold-c");
-    fs::create_dir_all(&c).unwrap();
-    root_marker::create_meta(&c, "cold-c", false).unwrap();
-    for file in [parts[0].clone(), manifest_of(&parts[0])] {
-        let to = c.join(&file);
-        fs::create_dir_all(to.parent().unwrap()).unwrap();
-        fs::copy(fixture.hot().join(&file), to).unwrap();
+/// The info line of a read-only root that still holds a moved path names
+/// it with this text (ADR-062 D11 *As amended (#216)*).
+const READ_ONLY: &str = "still in the layout of read-only root cold-c";
+
+/// The lines of `out` that name cold-c as a read-only holder; none of them
+/// is a `FAIL:` line.
+#[track_caller]
+fn read_only_lines(out: &str) -> Vec<&str> {
+    let lines: Vec<&str> = out.lines().filter(|l| l.contains(READ_ONLY)).collect();
+    assert!(lines.iter().all(|l| !l.starts_with("FAIL")), "{out}");
+    lines
+}
+
+/// `dir/cold-c`, marked `cold-c` and otherwise empty, appended to the
+/// fixture's cold roots, a copy target with `copy_target`; its
+/// configurations are tagged `tag`.
+fn with_cold_c(fixture: &Fixture, copy_target: bool, tag: &str) -> Fixture {
+    let c = cold(fixture, "cold-c");
+    if !c.exists() {
+        fs::create_dir_all(&c).unwrap();
+        root_marker::create_meta(&c, "cold-c", false).unwrap();
     }
     let mut cold_roots = cold_roots(&fixture.dir);
     cold_roots.push(mie_cli::config::ColdRoot {
-        path: c.clone(),
-        copy_target: false,
+        path: c,
+        copy_target,
     });
-    let with_c = fixture_with(&fixture, &cold_roots);
-    let before = files(&fixture.dir);
-    let (pass, out) = replace(&with_c, RESOLVED);
-    assert!(!pass, "{out}");
-    assert_fail_line(&out, &[&parts[0], "read-only root cold-c"]);
-    assert_eq!(files(&fixture.dir), before);
+    fixture_with(fixture, &cold_roots, tag)
 }
 
-/// The fixture with another `cold_roots` list in both configurations.
-fn fixture_with(fixture: &Fixture, cold_roots: &[mie_cli::config::ColdRoot]) -> Fixture {
+/// The fixture's probe with cold-c on a fourth device, for cold-c as a
+/// copy target.
+fn probe_with_c(fixture: &Fixture) -> MapProbe {
+    let mut probe = fixture.probe();
+    probe.0.push((cold(fixture, "cold-c"), 4));
+    probe
+}
+
+/// Copies the data file and the manifest of `path` below `from` to the
+/// same names below `to`.
+fn copy_part(from: &Path, to: &Path, path: &str) {
+    for file in [path.to_owned(), manifest_of(path)] {
+        let dest = to.join(&file);
+        fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        fs::copy(from.join(&file), dest).unwrap();
+    }
+}
+
+/// Every name below `root`, directories included, with its mode and, for
+/// a file, its bytes, sorted: what "never written" compares.
+fn tree(root: &Path) -> Vec<(String, u32, Vec<u8>)> {
+    fn walk(dir: &Path, base: &Path, out: &mut Vec<(String, u32, Vec<u8>)>) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            let metadata = fs::symlink_metadata(&path).unwrap();
+            let name = path.strip_prefix(base).unwrap().display().to_string();
+            let mode = metadata.permissions().mode();
+            if metadata.is_dir() {
+                out.push((name, mode, Vec::new()));
+                walk(&path, base, out);
+            } else {
+                out.push((name, mode, fs::read(&path).unwrap()));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out.sort();
+    out
+}
+
+/// The paths of hot's `replaced` records.
+fn replaced_paths(fixture: &Fixture) -> BTreeSet<String> {
+    replaced(fixture)
+        .into_iter()
+        .map(|(path, _)| path)
+        .collect()
+}
+
+/// A rebuild beside cold-c: `n` info lines naming it, no stop between
+/// renames, no bytes gone and no lost file.
+#[track_caller]
+fn assert_rebuilt_beside_cold_c(out: &str, start: &str, n: usize) {
+    assert_eq!(read_only_lines(out).len(), n, "{start}: {out}");
+    assert!(
+        !out.contains("stopped between renames")
+            && !out.contains("bytes are gone")
+            && !out.contains("lost candidate")
+            && out.contains(", lost 0,"),
+        "{start}: {out}"
+    );
+}
+
+/// #216: a read-only root that holds a moved path keeps its copy and halts
+/// nothing. The replace moves every copy on hot and the copy targets,
+/// names cold-c's in one info line and never writes cold-c; a second run
+/// finds the replace complete, and the re-import runs.
+#[test]
+fn a_read_only_root_holding_a_moved_path_keeps_its_copy_and_halts_nothing() {
+    let (_dir, fixture) = adopted("replace-read-only");
+    let (_, parts) = conflict(&fixture);
+    republish(&fixture);
+    let with_c = with_cold_c(&fixture, false, "c");
+    let c = cold(&fixture, "cold-c");
+    copy_part(&fixture.hot(), &c, &parts[0]);
+    let c_before = tree(&c);
+    let layout_bytes = bytes_of(&fixture, &parts, &|root| root.to_owned());
+    assert_eq!(
+        layout_bytes.len(),
+        12,
+        "two parts, data and manifest, three roots"
+    );
+
+    let (pass, out) = replace(&with_c, RESOLVED);
+    assert!(pass && out.ends_with("PASS\n"), "{out}");
+    let lines = read_only_lines(&out);
+    assert_eq!(lines.len(), 1, "{out}");
+    assert!(
+        lines[0].contains(&parts[0]) && lines[0].contains(&id()),
+        "{out}"
+    );
+    for (_, root) in roots(&fixture) {
+        for part in &parts {
+            assert!(!root.join(part).exists() && !root.join(manifest_of(part)).exists());
+        }
+    }
+    let quarantine_bytes = bytes_of(&fixture, &parts, &|root| {
+        replica::quarantine_dir(root, &id())
+    });
+    assert_eq!(quarantine_bytes, layout_bytes);
+    assert_eq!(tree(&c), c_before);
+    assert!(!c.join(replica::QUARANTINE_DIR).exists());
+
+    // A second run: complete, the info line, nothing written.
+    let before = files(&fixture.dir);
+    let (pass, out) = resolve(&with_c, Some(&metrics_file()), RESOLVED + 1);
+    assert!(
+        pass && out.contains("is complete; the re-import is pending"),
+        "{out}"
+    );
+    assert_eq!(read_only_lines(&out).len(), 1, "{out}");
+    assert_eq!(files(&fixture.dir), before);
+    let (pass, out) = resolve(&with_c, None, RESOLVED + 2);
+    assert!(pass, "{out}");
+    assert_eq!(read_only_lines(&out).len(), 1, "{out}");
+
+    // The re-import.
+    let before = replica::list_sealed(&fixture.hot()).unwrap();
+    run_import(&with_c, &metrics_day(day(), true)).unwrap();
+    assert!(replaced(&fixture).is_empty());
+    let out = run_import(&with_c, &metrics_day(day(), false)).unwrap();
+    let e1 = format!("{}.1.import", metrics_name());
+    assert!(ledger_file(&fixture, &e1).exists(), "{out}");
+    let fresh = new_parts(&fixture, &before);
+    assert_eq!(fresh.len(), 2, "{fresh:?}");
+    assert_eq!(replaced_paths(&fixture), parts.iter().cloned().collect());
+    let after = selected(&with_c);
+    assert!(after.iter().all(|s| !s.starts_with("error")), "{after:?}");
+    let all = after.join("\n");
+    for part in &parts {
+        assert!(!all.contains(part.as_str()), "{all}");
+    }
+    for part in &fresh {
+        assert!(all.contains(part.as_str()), "{all}");
+    }
+    assert_eq!(tree(&c), c_before);
+}
+
+/// The fixture with another `cold_roots` list in both configurations,
+/// written as `ingest-<tag>.toml` and `archive-<tag>.toml`.
+fn fixture_with(fixture: &Fixture, cold_roots: &[mie_cli::config::ColdRoot], tag: &str) -> Fixture {
     let dst = fixture.dir.join("dst");
+    let (ingest, archive) = (
+        dst.join(format!("ingest-{tag}.toml")),
+        dst.join(format!("archive-{tag}.toml")),
+    );
     let config = ingest_toml(
-        &dst.join("ingest-c.toml"),
+        &ingest,
         &fixture.hot(),
         &fixture.config.paths.journal,
         cold_roots,
     );
-    let archive_config = archive_toml(
-        &dst.join("archive-c.toml"),
-        &dst,
-        &fixture.hot(),
-        cold_roots,
-    );
+    let archive_config = archive_toml(&archive, &dst, &fixture.hot(), cold_roots);
     Fixture {
         dir: fixture.dir.clone(),
         archive: fixture.archive.clone(),
         src_ingest: fixture.src_ingest.clone(),
         src_archive: fixture.src_archive.clone(),
-        dst_ingest: dst.join("ingest-c.toml"),
-        dst_archive: dst.join("archive-c.toml"),
+        dst_ingest: ingest,
+        dst_archive: archive,
         config,
         archive_config,
     }
@@ -1142,6 +1283,391 @@ fn aw12_an_unresolved_hold_beside_a_replace_stays_held_in_every_rebuild() {
         match &expected {
             None => expected = Some(rebuilt),
             Some(expected) => assert_eq!(&rebuilt, expected, "{start}"),
+        }
+    }
+}
+
+/// #216 criterion 1: a read-only root configured after a completed
+/// replace, holding both moved paths, halts no import, gets one info line
+/// per path from the proposals and from every rebuild start, and changes no
+/// selection; a full, a stale and an empty start agree (AW12).
+#[test]
+fn a_read_only_root_added_after_a_completed_replace_halts_nothing() {
+    let mut expected: Option<Vec<String>> = None;
+    for start in ["full", "stale", "empty"] {
+        let (_dir, fixture) = adopted(&format!("replace-ro-after-{start}"));
+        let (_, parts, _) = missing_entry(&fixture);
+        assert_pass(&replace(&fixture, RESOLVED));
+        run_import(&fixture, &metrics_day(day(), false)).unwrap();
+        assert_eq!(replaced(&fixture).len(), 2);
+        replicate(&fixture, RESOLVED + 1);
+        let live = selected(&fixture);
+        let with_c = with_cold_c(&fixture, false, "c");
+        let c = cold(&fixture, "cold-c");
+        let q = replica::quarantine_dir(&fixture.hot(), &id());
+        for part in &parts {
+            copy_part(&q, &c, part);
+        }
+        let c_before = tree(&c);
+
+        // The imports, dry and real, of another day and of F.
+        let other = day_index("2026-10-02");
+        for (period, dry_run) in [(other, true), (other, false), (day(), true), (day(), false)] {
+            run_import(&with_c, &metrics_day(period, dry_run)).unwrap();
+        }
+        assert_eq!(replaced(&fixture).len(), 2, "none appended twice");
+
+        // The proposals: PASS, one info line per moved path.
+        let (pass, out) = resolve(&with_c, None, RESOLVED + 2);
+        assert!(pass && !out.contains("FAIL"), "{out}");
+        let lines = read_only_lines(&out);
+        assert_eq!(lines.len(), 2, "{out}");
+        for (line, part) in lines.iter().zip(&parts) {
+            assert!(line.contains(part.as_str()), "{out}");
+        }
+        assert_eq!(selected(&with_c), live);
+        for dataset in live.iter().filter(|s| !s.starts_with("error")) {
+            for part in &parts {
+                assert!(!dataset.contains(part.as_str()), "{dataset}");
+            }
+        }
+
+        // The rebuild.
+        let (_, out) = rebuild_from(&with_c, start, Flags::default(), RESOLVED + HOUR);
+        assert_rebuilt_beside_cold_c(&out, start, 2);
+        assert_eq!(
+            replaced_paths(&fixture),
+            parts.iter().cloned().collect(),
+            "{start}: {out}"
+        );
+        let rebuilt = selected(&with_c);
+        assert_eq!(rebuilt, live, "{start}: {out}");
+        assert_eq!(tree(&c), c_before, "{start}");
+        match &expected {
+            None => expected = Some(rebuilt),
+            Some(expected) => assert_eq!(&rebuilt, expected, "{start}"),
+        }
+    }
+}
+
+/// #216 criterion 2: a read-only root holding a moved path while the
+/// re-import is pending. The resume passes, names it and writes nothing
+/// on it; the dry-run import appends nothing, the import writes the new
+/// entry and both `replaced` records.
+#[test]
+fn a_read_only_root_holding_a_pending_path_does_not_block_the_reimport() {
+    let (_dir, fixture) = adopted("replace-ro-pending");
+    let (_, parts, _) = missing_entry(&fixture);
+    assert_pass(&replace(&fixture, RESOLVED));
+    let with_c = with_cold_c(&fixture, false, "c");
+    let c = cold(&fixture, "cold-c");
+    copy_part(
+        &replica::quarantine_dir(&fixture.hot(), &id()),
+        &c,
+        &parts[0],
+    );
+    let c_before = tree(&c);
+
+    let (pass, out) = resolve(&with_c, Some(&metrics_file()), RESOLVED + 1);
+    assert!(pass && out.contains("resume:"), "{out}");
+    let lines = read_only_lines(&out);
+    assert!(lines.len() == 1 && lines[0].contains(&parts[0]), "{out}");
+    assert_eq!(tree(&c), c_before);
+
+    let records_before = records(&fixture);
+    run_import(&with_c, &metrics_day(day(), true)).unwrap();
+    assert_eq!(records(&fixture), records_before);
+    let before = replica::list_sealed(&fixture.hot()).unwrap();
+    let out = run_import(&with_c, &metrics_day(day(), false)).unwrap();
+    assert!(
+        ledger_file(&fixture, &format!("{}.1.import", metrics_name())).exists(),
+        "{out}"
+    );
+    assert_eq!(replaced_paths(&fixture), parts.iter().cloned().collect());
+    let fresh = new_parts(&fixture, &before);
+    assert_eq!(fresh.len(), 2, "{fresh:?}");
+    let after = selected(&with_c);
+    assert!(after.iter().all(|s| !s.starts_with("error")), "{after:?}");
+    let all = after.join("\n");
+    for part in &parts {
+        assert!(!all.contains(part.as_str()), "{all}");
+    }
+    for part in &fresh {
+        assert!(all.contains(part.as_str()), "{all}");
+    }
+    assert_eq!(tree(&c), c_before);
+}
+
+/// #216: the replace stops between cold-a and cold-b (the parts on cold
+/// roots only), and cold-c, read-only, holds cold-b's copy of the first
+/// part, as a copy target reconfigured read-only would. After an empty
+/// rebuild start the importer stays halted by cold-b alone; the resume
+/// moves cold-b's copies, leaves cold-c's and names it, and the import
+/// then runs.
+#[test]
+fn a_resume_completes_past_a_read_only_holder() {
+    let (_dir, fixture) = adopted("replace-ro-resume");
+    if !permissions_bind(&fixture.dir) {
+        return;
+    }
+    let (_, parts) = conflict(&fixture);
+    // The D6 hot removal of both partitions, simulated.
+    let aside = fixture.dir.join("hot-aside");
+    for part in &parts {
+        let from = fixture.hot().join(partition_of(part));
+        let to = aside.join(partition_of(part));
+        fs::create_dir_all(to.parent().unwrap()).unwrap();
+        fs::rename(&from, &to).unwrap();
+    }
+    replicate(&fixture, RESOLVED - 10);
+    rebuild_from(&fixture, "full", Flags::default(), RESOLVED - 5);
+    assert_eq!(held(&fixture), parts.iter().cloned().collect());
+
+    // The replace stops between cold-a and cold-b.
+    let b = cold(&fixture, "cold-b");
+    let partition = b.join(partition_of(&parts[0]));
+    chmod(&partition, 0o555);
+    let (pass, out) = replace(&fixture, RESOLVED);
+    chmod(&partition, 0o755);
+    assert!(!pass, "{out}");
+    let with_c = with_cold_c(&fixture, false, "c");
+    let c = cold(&fixture, "cold-c");
+    copy_part(&b, &c, &parts[0]);
+    let c_before = tree(&c);
+
+    // An empty start: no hold; cold-b alone halts the importer.
+    replicate(&with_c, RESOLVED + 1);
+    let (_, out) = rebuild_from(&with_c, "empty", Flags::default(), RESOLVED + HOUR);
+    assert!(held(&fixture).is_empty(), "{out}");
+    for dry_run in [true, false] {
+        let error = run_import(&with_c, &metrics_day(day(), dry_run)).unwrap_err();
+        assert!(
+            error.contains("incomplete")
+                && error.contains("cold-b's layout")
+                && !error.contains("cold-c"),
+            "{error}"
+        );
+    }
+
+    // The resume.
+    let (pass, out) = resolve(&with_c, Some(&metrics_file()), RESOLVED + 2 * HOUR);
+    assert!(pass && out.contains("resume:"), "{out}");
+    let lines = read_only_lines(&out);
+    assert!(lines.len() == 1 && lines[0].contains(&parts[0]), "{out}");
+    for part in &parts {
+        assert!(!b.join(part).exists(), "{out}");
+        assert!(
+            replica::quarantine_dir(&b, &id()).join(part).exists(),
+            "{out}"
+        );
+    }
+    assert_eq!(tree(&c), c_before);
+    run_import(&with_c, &metrics_day(day(), false)).unwrap();
+    assert_eq!(replaced_paths(&fixture), parts.iter().cloned().collect());
+}
+
+/// #216 criterion 3, a regression guard: a root holding the moved paths
+/// as a copy target is in the commit point. The importer refuses naming
+/// it, the proposals fail naming it, and the resume moves its copies into
+/// its quarantine; the import then runs.
+#[test]
+fn a_read_only_root_turned_copy_target_rejoins_the_commit_point() {
+    let (_dir, fixture) = adopted("replace-ro-to-target");
+    let (_, parts, _) = missing_entry(&fixture);
+    assert_pass(&replace(&fixture, RESOLVED));
+    run_import(&fixture, &metrics_day(day(), false)).unwrap();
+    assert_eq!(replaced(&fixture).len(), 2);
+    replicate(&fixture, RESOLVED + 1);
+    let with_target = with_cold_c(&fixture, true, "c-target");
+    let c = cold(&fixture, "cold-c");
+    let q = replica::quarantine_dir(&fixture.hot(), &id());
+    for part in &parts {
+        copy_part(&q, &c, part);
+    }
+    let probe = probe_with_c(&fixture);
+    for dry_run in [true, false] {
+        let error = run_import(&with_target, &metrics_day(day(), dry_run)).unwrap_err();
+        assert!(
+            error.contains("incomplete") && error.contains("cold-c's layout"),
+            "{error}"
+        );
+    }
+    let archive = Some(with_target.dst_archive.as_path());
+    let (pass, out) = resolve_with(&with_target, None, &probe, archive, RESOLVED + 2);
+    assert!(!pass, "{out}");
+    assert_fail_line(&out, &["incomplete", "cold-c's layout", &metrics_file()]);
+    let file = metrics_file();
+    let (pass, out) = resolve_with(&with_target, Some(&file), &probe, archive, RESOLVED + 3);
+    assert!(pass && out.contains("resume:"), "{out}");
+    let cq = replica::quarantine_dir(&c, &id());
+    for part in &parts {
+        for name in [part.clone(), manifest_of(part)] {
+            assert!(
+                !c.join(&name).exists() && cq.join(&name).exists(),
+                "{name}: {out}"
+            );
+        }
+    }
+    run_import(&with_target, &metrics_day(day(), false)).unwrap();
+    assert_eq!(replaced(&fixture).len(), 2);
+}
+
+/// #216: an empty read-only root without its marker (it reads as
+/// unmounted). The proposals pass and name nothing, the resume needs every
+/// root's marker (RQ1) and writes nothing, and the importer appends both
+/// `replaced` records.
+#[test]
+fn an_unmarked_read_only_root_halts_no_import_but_the_resume_needs_its_marker() {
+    let (_dir, fixture) = adopted("replace-ro-unmarked");
+    missing_entry(&fixture);
+    assert_pass(&replace(&fixture, RESOLVED));
+    let u = fixture.dir.join("cold-u");
+    fs::create_dir_all(&u).unwrap();
+    let mut cold_roots = cold_roots(&fixture.dir);
+    cold_roots.push(mie_cli::config::ColdRoot {
+        path: u.clone(),
+        copy_target: false,
+    });
+    let with_u = fixture_with(&fixture, &cold_roots, "u");
+
+    let (pass, out) = resolve(&with_u, None, RESOLVED + 1);
+    assert!(pass, "{out}");
+    assert!(!out.contains("cold-u") && !out.contains("marker"), "{out}");
+
+    let before = files(&fixture.dir);
+    let (pass, out) = resolve(&with_u, Some(&metrics_file()), RESOLVED + 2);
+    assert!(!pass, "{out}");
+    assert_fail_line(&out, &["read-only root", "cold-u", "no root marker"]);
+    assert_eq!(files(&fixture.dir), before);
+
+    run_import(&with_u, &metrics_day(day(), false)).unwrap();
+    assert_eq!(replaced(&fixture).len(), 2);
+}
+
+/// #216, RQ2's sole-holder refusal: a moved path that only a read-only
+/// root holds refuses the replace with nothing written, naming both
+/// remedies; the first, cold-c as a copy target, lets the replace move
+/// cold-c's copy into its quarantine with its bytes.
+#[test]
+fn a_path_only_read_only_roots_hold_refuses_the_replace() {
+    let (_dir, fixture) = adopted("replace-ro-sole");
+    let (_, parts) = conflict(&fixture);
+    let with_c = with_cold_c(&fixture, false, "c");
+    let c = cold(&fixture, "cold-c");
+    copy_part(&fixture.hot(), &c, &parts[0]);
+    let names = [parts[0].clone(), manifest_of(&parts[0])];
+    let bytes: Vec<Vec<u8>> = names.iter().map(|n| fs::read(c.join(n)).unwrap()).collect();
+    for (_, root) in roots(&fixture) {
+        for name in &names {
+            fs::remove_file(root.join(name)).unwrap();
+        }
+    }
+
+    let before = files(&fixture.dir);
+    let (pass, out) = replace(&with_c, RESOLVED);
+    assert!(!pass, "{out}");
+    assert_eq!(
+        out.lines().filter(|l| l.starts_with("FAIL: ")).count(),
+        1,
+        "{out}"
+    );
+    assert_fail_line(
+        &out,
+        &[
+            &parts[0],
+            "cold-c",
+            "only",
+            "copy_target = true",
+            "mie store verify",
+            "mie store repair",
+        ],
+    );
+    assert_eq!(files(&fixture.dir), before);
+    assert!(!ledger_file(&fixture, &format!("{}.1.supersede.import", metrics_name())).exists());
+
+    // The first remedy: cold-c as a copy target.
+    let with_target = with_cold_c(&fixture, true, "c-target");
+    let (pass, out) = replace_with(
+        &with_target,
+        Some(&metrics_file()),
+        &probe_with_c(&fixture),
+        RESOLVED,
+    );
+    assert!(pass, "{out}");
+    let q = replica::quarantine_dir(&c, &id());
+    for (name, bytes) in names.iter().zip(&bytes) {
+        assert!(!c.join(name).exists(), "{out}");
+        assert_eq!(&fs::read(q.join(name)).unwrap(), bytes, "{out}");
+    }
+}
+
+/// #216, AW12: a read-only root holds both parts before the replace. The
+/// replace passes with one info line per path and leaves cold-c's copies;
+/// the rebuilds from a full, a stale and an empty start, after the replace
+/// and after the re-import, name them the same way, derive the same
+/// records and selections, and agree.
+#[test]
+fn aw12_a_replace_beside_a_read_only_holder_agrees_in_every_rebuild() {
+    let mut expected: Option<(Vec<String>, Vec<String>)> = None;
+    for start in ["full", "stale", "empty"] {
+        let (_dir, fixture) = adopted(&format!("replace-aw12-ro-{start}"));
+        let (_, parts, _) = missing_entry(&fixture);
+        let with_c = with_cold_c(&fixture, false, "c");
+        let c = cold(&fixture, "cold-c");
+        for part in &parts {
+            copy_part(&fixture.hot(), &c, part);
+        }
+        let c_before = tree(&c);
+
+        // Phase A.
+        let (pass, out) = replace(&with_c, RESOLVED);
+        assert!(pass && out.ends_with("PASS\n"), "{out}");
+        assert!(!out.contains("FAIL"), "{out}");
+        assert_eq!(read_only_lines(&out).len(), 2, "{out}");
+        replicate(&with_c, RESOLVED + 1);
+        let after_replace = selected(&with_c);
+        for part in &parts {
+            assert!(
+                after_replace
+                    .iter()
+                    .any(|s| s.contains(&format!("{part}: it is quarantined under {}", id()))),
+                "{after_replace:?}"
+            );
+        }
+        let (_, out) = rebuild_from(&with_c, start, Flags::default(), RESOLVED + HOUR);
+        assert_rebuilt_beside_cold_c(&out, start, 2);
+        assert_eq!(selected(&with_c), after_replace, "{start} A: {out}");
+        assert_eq!(quarantined(&fixture), parts.iter().cloned().collect());
+        assert!(held(&fixture).is_empty(), "{start}: {out}");
+
+        // Phase B.
+        let before = replica::list_sealed(&fixture.hot()).unwrap();
+        run_import(&with_c, &metrics_day(day(), false)).unwrap();
+        let fresh = new_parts(&fixture, &before);
+        assert_eq!(fresh.len(), 2, "{start}");
+        assert_eq!(replaced_paths(&fixture), parts.iter().cloned().collect());
+        replicate(&with_c, RESOLVED + 2 * HOUR);
+        let after_import = selected(&with_c);
+        let (_, out) = rebuild_from(&with_c, start, Flags::default(), RESOLVED + 3 * HOUR);
+        assert_rebuilt_beside_cold_c(&out, start, 2);
+        assert_eq!(
+            replaced_paths(&fixture),
+            parts.iter().cloned().collect(),
+            "{start}: {out}"
+        );
+        let rebuilt = selected(&with_c);
+        assert_eq!(rebuilt, after_import, "{start} B: {out}");
+        for dataset in &rebuilt {
+            assert!(!dataset.starts_with("error"), "{start}: {rebuilt:?}");
+            for part in &parts {
+                assert!(!dataset.contains(part.as_str()), "{start}: {dataset}");
+            }
+        }
+        assert_eq!(tree(&c), c_before, "{start}");
+        let outcome = (after_replace, rebuilt);
+        match &expected {
+            None => expected = Some(outcome),
+            Some(expected) => assert_eq!(&outcome, expected, "{start}"),
         }
     }
 }

@@ -105,7 +105,9 @@
 //! - **Q1–Q6 Quarantine** (step 5a, #211). Q1: each root's `.quarantine/`
 //!   is read with the layouts (an I/O error stops the run). Q2–Q5 are
 //!   [`archive_checks::quarantine`]: the set Q of moved and quarantined
-//!   paths and their records. Q3: every Q path skips B4 to B8. Q6: their
+//!   paths and their records; a Q path is complete when no layout of hot
+//!   or of a copy target holds it, and a read-only root that holds it gets
+//!   an info line (#216). Q3: every Q path skips B4 to B8. Q6: their
 //!   records follow B7′'s, as `manifest`, `hold-cleared … replace`,
 //!   `quarantined` and `replaced`, each in path order; `records derived`
 //!   counts them, and the report has one line per quarantine id.
@@ -1087,10 +1089,19 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
         listing: root.quarantine.clone(),
     }))
     .collect();
+    // A read-only root's layout feeds the text rule, never the commit
+    // point (#216).
+    let read_only: BTreeSet<String> = inputs
+        .roots
+        .iter()
+        .filter(|root| !root.copy_target)
+        .map(|root| root.id.clone())
+        .collect();
     let quarantine = archive_checks::quarantine(&QuarantineInputs {
         entries: &inputs.entries,
         roots: &quarantines,
         layout: &layout,
+        read_only: &read_only,
         start: &state,
     });
     let in_q = |path: &str| quarantine.paths.contains_key(path);
