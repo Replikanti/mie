@@ -6,20 +6,66 @@ use super::*;
 use crate::store::archive_checks::tests::{NAME, S1, entry, part, sha, supersede, text};
 use crate::store::archive_checks::{ArchiveInputs, PartTexts, check};
 
-/// H3 over in-memory candidates: `(label, bytes)`.
+/// H3 over in-memory candidates: `(label, bytes)`, every one readable.
 fn choose(candidates: &[(&str, &[u8])]) -> Result<Option<usize>, String> {
+    let read: Vec<(&str, Option<&[u8]>)> = candidates
+        .iter()
+        .map(|(label, bytes)| (*label, Some(*bytes)))
+        .collect();
+    choose_with(&read, false)
+        .map(|choice| choice.chosen)
+        .map_err(|lines| lines.join("\n"))
+}
+
+/// H3′ over in-memory candidates: `(label, bytes)`, `None` for one whose
+/// read fails, with or without `--skip-unreadable-journal`.
+fn choose_with(
+    candidates: &[(&str, Option<&[u8]>)],
+    skip: bool,
+) -> Result<JournalChoice, Vec<String>> {
+    choose_sized(
+        &candidates
+            .iter()
+            .map(|(label, bytes)| (*label, bytes.map_or(0, <[u8]>::len) as u64, *bytes))
+            .collect::<Vec<_>>(),
+        skip,
+        &[],
+    )
+}
+
+/// H3′ over `(label, len, bytes)`: `None` bytes fail to read; `fail_compare`
+/// lists the candidates whose read fails only in the comparison with C.
+fn choose_sized(
+    candidates: &[(&str, u64, Option<&[u8]>)],
+    skip: bool,
+    fail_compare: &[usize],
+) -> Result<JournalChoice, Vec<String>> {
     let list: Vec<JournalCandidate> = candidates
         .iter()
-        .map(|(label, bytes)| JournalCandidate {
+        .map(|(label, len, _)| JournalCandidate {
             label: (*label).to_owned(),
-            len: bytes.len() as u64,
+            len: *len,
         })
         .collect();
-    choose_journal(&list, &mut |i, j, len| {
-        let (a, b) = (candidates[i].1, candidates[j].1);
-        Ok((0..len as usize).find(|&k| a[k] != b[k]).map(|k| k as u64))
-    })
-    .map_err(|Stop(why)| why)
+    choose_journal(
+        &list,
+        skip,
+        &mut |i| {
+            candidates[i]
+                .2
+                .filter(|_| !fail_compare.contains(&i))
+                .map(<[u8]>::to_vec)
+                .ok_or_else(|| "Permission denied (os error 13)".to_owned())
+        },
+        &mut |i, c, len| {
+            if fail_compare.contains(&i) {
+                return Err("Input/output error (os error 5)".to_owned());
+            }
+            let a = candidates[i].2.ok_or("Permission denied (os error 13)")?;
+            Ok((0..len as usize).find(|&k| a[k] != c[k]).map(|k| k as u64))
+        },
+        &|i| format!("aside-{i}"),
+    )
 }
 
 /// A journal of `n` bytes of complete JSON lines and padding.
@@ -333,4 +379,294 @@ fn c_unremoved_old_partition_is_copied_back() {
         plan_copy_back([old], "2026-10-05", &|_| false),
         BTreeSet::from([old.to_owned()])
     );
+}
+
+// ------------------------------------------------- H3′ (amendment 2)
+
+/// H3′ over unreadable candidates. C is a readable copy of 900 bytes
+/// unless a case says otherwise; each case without the flag, then with it.
+#[test]
+fn j_unreadable_candidates() {
+    let c = journal(1_000);
+    let read = |len: usize| Some(&c[..len]);
+    let left = |choice: &JournalChoice| -> Vec<(usize, bool)> {
+        choice
+            .left_out
+            .iter()
+            .map(|out| (out.index, out.by_flag))
+            .collect()
+    };
+    // 900 bytes, unreadable: left out (U), flag or no flag.
+    for skip in [false, true] {
+        let choice = choose_sized(
+            &[("cold-a", 900, None), ("cold-b", 900, read(900))],
+            skip,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(choice.chosen, Some(1));
+        assert_eq!(left(&choice), vec![(0, false)]);
+        assert_eq!(choice.bytes, c[..900]);
+    }
+    // 901 bytes: a stop; with the flag left out, "its last 1 byte(s)".
+    let cands = [("cold-a", 901, None), ("cold-b", 900, read(900))];
+    let stop = choose_sized(&cands, false, &[]).unwrap_err();
+    assert_eq!(stop.len(), 1, "{stop:?}");
+    assert!(
+        stop[0].contains("cold-a")
+            && stop[0].contains("901 bytes")
+            && stop[0].contains("its last 1 byte(s)")
+            && stop[0].contains("--skip-unreadable-journal"),
+        "{stop:?}"
+    );
+    let choice = choose_sized(&cands, true, &[]).unwrap();
+    assert_eq!(choice.chosen, Some(1));
+    assert_eq!(left(&choice), vec![(0, true)]);
+    // Two, of 1 000 and 950 bytes: a stop naming both; with the flag both
+    // left out.
+    let cands = [
+        ("cold-a", 1_000, None),
+        ("cold-b", 950, None),
+        ("hot", 900, read(900)),
+    ];
+    let stop = choose_sized(&cands, false, &[]).unwrap_err();
+    assert_eq!(stop.len(), 2, "{stop:?}");
+    assert!(
+        stop[0].contains("cold-a") && stop[1].contains("cold-b"),
+        "{stop:?}"
+    );
+    assert!(stop[0].contains("its last 100 byte(s)"), "{stop:?}");
+    let choice = choose_sized(&cands, true, &[]).unwrap();
+    assert_eq!(choice.chosen, Some(2));
+    assert_eq!(left(&choice), vec![(0, true), (1, true)]);
+    // Hot's journal, 1 000 bytes, tied with a readable target copy (C):
+    // hot's left out (U), flag or no flag.
+    for skip in [false, true] {
+        let choice = choose_sized(
+            &[("hot", 1_000, None), ("cold-a", 1_000, read(1_000))],
+            skip,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(choice.chosen, Some(1));
+        assert_eq!(left(&choice), vec![(0, false)]);
+    }
+    // A 600-byte one whose read fails in the comparison with C: left out
+    // (U).
+    for skip in [false, true] {
+        let choice = choose_sized(
+            &[("cold-a", 600, read(600)), ("cold-b", 900, read(900))],
+            skip,
+            &[0],
+        )
+        .unwrap();
+        assert_eq!(choice.chosen, Some(1));
+        assert_eq!(left(&choice), vec![(0, false)]);
+    }
+    // The only candidate, 0 bytes: left out (U); no C, the journal stays
+    // absent.
+    for skip in [false, true] {
+        let choice = choose_sized(&[("cold-a", 0, None)], skip, &[]).unwrap();
+        assert_eq!(choice.chosen, None);
+        assert_eq!(left(&choice), vec![(0, false)]);
+        assert!(choice.bytes.is_empty());
+    }
+    // The only candidate, 1 byte: a stop (L = 0, "none reads"); with the
+    // flag left out, no C.
+    let stop = choose_sized(&[("cold-a", 1, None)], false, &[]).unwrap_err();
+    assert!(
+        stop[0].contains("none reads") && stop[0].contains("its last 1 byte(s)"),
+        "{stop:?}"
+    );
+    let choice = choose_sized(&[("cold-a", 1, None)], true, &[]).unwrap();
+    assert_eq!(choice.chosen, None);
+    assert_eq!(left(&choice), vec![(0, true)]);
+    // N = 5 000, L = 4 200: "its last 800 byte(s)".
+    let long = journal(5_000);
+    let stop = choose_sized(
+        &[
+            ("cold-a", 5_000, None),
+            ("cold-b", 4_200, Some(&long[..4_200])),
+        ],
+        false,
+        &[],
+    )
+    .unwrap_err();
+    assert!(stop[0].contains("its last 800 byte(s)"), "{stop:?}");
+}
+
+// --------------------------------------------------- H6 J (amendment 2)
+
+/// The live path `n` of 2026-10-06.
+fn j_path(date: &str, n: u32) -> String {
+    format!("source=binance-um/instrument=BTCUSDT/stream=aggTrade/date={date}/part-{n:05}.parquet")
+}
+
+/// The copy state of a ledger of `kinds`.
+fn state_of(kinds: &[Kind]) -> CopyState {
+    let mut builder = copy_ledger::LedgerBuilder::empty();
+    for kind in kinds {
+        builder
+            .push(&Record {
+                at_ms: 1,
+                kind: kind.clone(),
+            })
+            .unwrap();
+    }
+    let ledger = copy_ledger::parse(Path::new("l"), &builder.finish()).unwrap();
+    CopyState::fold(&ledger).unwrap()
+}
+
+/// J over the installed ledger and a names oracle: P lies in a partition
+/// recorded removed and dated before the window (first hot date
+/// 2026-10-07), unless a case says otherwise.
+#[test]
+fn j_plan_from_the_installed_ledger() {
+    use mie_adapter_parquet::copy_ledger::{HoldReason, LostOrigin};
+    let first_hot = "2026-10-07";
+    let p = j_path("2026-10-06", 3);
+    let partition = partition_of(&p).to_owned();
+    let t = text(&p, &sha("a"));
+    let manifest = Kind::Manifest { text: t.clone() };
+    let copy = |root: &str| Kind::Copy {
+        path: p.clone(),
+        root: root.to_owned(),
+    };
+    let removed = Kind::Removed {
+        partition: partition.clone(),
+    };
+    use Held::{Data, Manifest, PendingManifest};
+    type Case<'a> = (&'a str, Vec<Kind>, Vec<Held>, bool);
+    let cases: Vec<Case> = vec![
+        (
+            "no copy; M~ (+ D~) on cold-a",
+            vec![manifest.clone(), removed.clone()],
+            vec![PendingManifest],
+            true,
+        ),
+        (
+            "no copy; M + D~ (row 3)",
+            vec![manifest.clone(), removed.clone()],
+            vec![Manifest],
+            true,
+        ),
+        (
+            "no copy; M + D on a read-only root",
+            vec![manifest.clone(), removed.clone()],
+            vec![Manifest, Data],
+            true,
+        ),
+        (
+            "copy on cold-b; M + D on cold-b",
+            vec![manifest.clone(), copy("cold-b"), removed.clone()],
+            vec![Manifest, Data],
+            false,
+        ),
+        (
+            "copy on both; no D anywhere; M~ on cold-a",
+            vec![
+                manifest.clone(),
+                copy("cold-a"),
+                copy("cold-b"),
+                removed.clone(),
+            ],
+            vec![PendingManifest],
+            true,
+        ),
+        (
+            "copy on both; D on cold-b",
+            vec![
+                manifest.clone(),
+                copy("cold-a"),
+                copy("cold-b"),
+                removed.clone(),
+            ],
+            vec![Manifest, Data],
+            false,
+        ),
+        (
+            "no M and no M~ on any root",
+            vec![manifest.clone(), removed.clone()],
+            vec![Data],
+            false,
+        ),
+        (
+            "verdict lost",
+            vec![
+                removed.clone(),
+                Kind::Lost {
+                    path: p.clone(),
+                    origin: LostOrigin::Verify,
+                    sha256: None,
+                },
+            ],
+            vec![Manifest, PendingManifest],
+            false,
+        ),
+        (
+            "verdict held",
+            vec![
+                manifest.clone(),
+                removed.clone(),
+                Kind::Hold {
+                    path: p.clone(),
+                    reason: HoldReason::Unlisted,
+                },
+            ],
+            vec![Manifest, PendingManifest],
+            false,
+        ),
+        (
+            "partition returned",
+            vec![
+                manifest.clone(),
+                removed.clone(),
+                Kind::Returned {
+                    partition: partition.clone(),
+                },
+            ],
+            vec![PendingManifest],
+            false,
+        ),
+    ];
+    for (case, kinds, held, expected) in cases {
+        let state = state_of(&kinds);
+        let plan = plan_copy_back([partition.as_str()], first_hot, &|part| {
+            state.is_removed(part)
+        });
+        let found = plan_unreplicated(&state, &plan, &|path, form| {
+            path == p && held.contains(&form)
+        });
+        assert_eq!(found == vec![p.clone()], expected, "{case}: {found:?}");
+        assert!(expected || found.is_empty(), "{case}: {found:?}");
+    }
+    // Verdict replaced: no.
+    let replaced = state_of(&[
+        manifest.clone(),
+        removed.clone(),
+        Kind::Replaced {
+            path: p.clone(),
+            entry: "aggTrades/x.1.import".to_owned(),
+        },
+    ]);
+    if replaced.verdict(&p) == Some(PathVerdict::Replaced) {
+        let plan = BTreeSet::new();
+        assert!(plan_unreplicated(&replaced, &plan, &|_, _| true).is_empty());
+    }
+    // Dated 2026-10-07 with first hot date 2026-10-07: the whole partition
+    // is in the plan (the bound is inclusive), so not in J.
+    let q = j_path("2026-10-07", 0);
+    let state = state_of(&[
+        Kind::Manifest {
+            text: text(&q, &sha("a")),
+        },
+        Kind::Removed {
+            partition: partition_of(&q).to_owned(),
+        },
+    ]);
+    let plan = plan_copy_back([partition_of(&q)], first_hot, &|part| {
+        state.is_removed(part)
+    });
+    assert!(plan.contains(partition_of(&q)));
+    assert!(plan_unreplicated(&state, &plan, &|_, _| true).is_empty());
 }

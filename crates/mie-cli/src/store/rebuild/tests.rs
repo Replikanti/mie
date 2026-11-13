@@ -31,10 +31,12 @@ fn inputs() -> RebuildInputs {
             LedgerCopyRead {
                 id: "cold-a".to_owned(),
                 bytes: None,
+                error: None,
             },
             LedgerCopyRead {
                 id: "cold-b".to_owned(),
                 bytes: None,
+                error: None,
             },
         ],
         journal: JournalRead::default(),
@@ -1018,6 +1020,7 @@ fn equal_inputs_give_byte_identical_ledgers_with_quarantine() {
     let quarantined = QuarantinedCopy {
         text: Some(t.clone()),
         data: true,
+        unreadable: None,
     };
     for listing in std::iter::once(&mut inputs.hot.quarantine)
         .chain(std::iter::once(&mut inputs.roots[0].quarantine))
@@ -1175,7 +1178,7 @@ fn d_live_conflict_with_record_uses_it() {
             &path,
             "cold-b",
             "differs from the copy ledger's manifest record",
-            "mie store repair",
+            "another self-consistent file under the path (D5)",
         ],
     );
 }
@@ -1247,7 +1250,15 @@ fn d_unrecorded_damaged_copy() {
         added(&derived),
         vec![manifest(&sealed), copy(&path, "cold-a")]
     );
-    assert_problem(&derived, &[&path, "cold-b", "sha256", "mie store repair"]);
+    assert_problem(
+        &derived,
+        &[
+            &path,
+            "cold-b",
+            "sha256",
+            "does not check this unrecorded copy",
+        ],
+    );
 }
 
 /// H5 c: in the restore an `unlisted` hold is written without the flag,
@@ -1696,7 +1707,14 @@ fn b6a_02_sealed_text_without_good_data() {
                 "{setting} {why}"
             );
             assert!(derived.lost.is_empty(), "{setting} {why}");
-            assert_problem(&derived, &[&p, "on cold-a", why, "mie store repair"]);
+            // Round 3: in the restore an unrecorded copy's remedy is the
+            // set-aside, not the repair.
+            let remedy = if setting == "restore" {
+                "does not check this unrecorded copy"
+            } else {
+                "mie store repair"
+            };
+            assert_problem(&derived, &[&p, "on cold-a", why, remedy]);
             if setting == "hot holds it" {
                 assert_hot_unchanged(&inputs);
             }
@@ -1726,7 +1744,14 @@ fn b6a_03_manifest_with_temp_data() {
         let derived = derive_ok(&inputs);
         assert_eq!(records_of(&derived, &p), vec![manifest(&t)], "{setting}");
         assert!(derived.lost.is_empty(), "{setting}");
-        assert_problem(&derived, &[&p, "on cold-a", "missing", "mie store repair"]);
+        // Round 3: the repair cannot fix this unrecorded copy; in the
+        // restore H6 k1 sets it aside.
+        let remedy = if setting == "restore" {
+            "does not check this unrecorded copy"
+        } else {
+            "mie store repair"
+        };
+        assert_problem(&derived, &[&p, "on cold-a", "missing", remedy]);
         if setting == "hot holds it" {
             assert_hot_unchanged(&inputs);
         }
@@ -1778,8 +1803,8 @@ fn b6a_04_bad_manifest() {
 
 /// Row 5: `D` with a verified pending manifest (a copy crashed after
 /// `PublishData`): rolled forward, the `manifest` record with `M~`'s text
-/// and no `copy` record, in both modes; the rebuild names the record
-/// that only a pending manifest gives.
+/// and no `copy` record, in both modes; no "only a pending manifest"
+/// line, since a cold root holds `D` (rule 6, amendment 2).
 #[test]
 fn b6a_05_data_with_pending_manifest() {
     let (p, t) = (p3(), text(&p3(), &sha("a")));
@@ -1797,15 +1822,13 @@ fn b6a_05_data_with_pending_manifest() {
             }
             "restore" => {
                 assert_eq!(records_of(&derived, &p), vec![manifest(&t)]);
-                assert_eq!(derived.cold_recorded, BTreeSet::from([p.clone()]));
                 assert_no_problem(&derived, &[&p]);
             }
             _ => {
+                // Rule 6 (amendment 2): the tiered `read` serves cold-a's
+                // `D`, so no "only a pending manifest" line.
                 assert_eq!(records_of(&derived, &p), vec![manifest(&t)]);
-                assert_problem(
-                    &derived,
-                    &[&p, "from the pending manifest", "no root holds it sealed"],
-                );
+                assert_no_problem(&derived, &[&p, "from the pending manifest"]);
             }
         }
     }
@@ -1832,8 +1855,10 @@ fn b6a_06_verified_temps() {
     }
 }
 
-/// Row 7: a parseable `M~` whose data (`D`, else `D~`) fails: held with
-/// its text as row 2, the pending copy named for verify, then repair.
+/// Row 7 (amendment 2, rule 1′): a parseable `M~` whose data (`D`, else
+/// `D~`) fails gives no text, so the path is a lost candidate, origin
+/// `verify`, its line naming the form and the failure; with hot holding
+/// the path nothing changes.
 #[test]
 fn b6a_07_pending_text_without_good_data() {
     let (p, t) = (p3(), text(&p3(), &sha("a")));
@@ -1849,20 +1874,21 @@ fn b6a_07_pending_text_without_good_data() {
         }
         for (setting, inputs) in settings(&base, &p, &t) {
             let derived = derive_ok(&inputs);
-            assert!(
-                derived.lost.is_empty(),
-                "{setting} {data:?}: {:?}",
-                derived.lost
-            );
             if setting == "hot holds it" {
+                assert!(derived.lost.is_empty());
                 assert_eq!(records_of(&derived, &p), vec![]);
                 assert_eq!(derived.problems, Vec::<String>::new());
                 assert_hot_unchanged(&inputs);
             } else {
-                assert_eq!(records_of(&derived, &p), vec![manifest(&t)], "{setting}");
+                assert_eq!(
+                    lost_of(&derived),
+                    vec![(p.clone(), LostOrigin::Verify)],
+                    "{setting} {data:?}"
+                );
+                assert_eq!(records_of(&derived, &p), vec![], "{setting}");
                 assert_problem(
                     &derived,
-                    &[&p, "on cold-a (its pending manifest)", "mie store repair"],
+                    &[&p, "pending manifest on cold-a whose data does not verify"],
                 );
             }
         }
@@ -2084,6 +2110,7 @@ fn b6a_15_half_moved_quarantine_part() {
             QuarantinedCopy {
                 text: None,
                 data: true,
+                unreadable: None,
             },
         )]),
     );
@@ -2147,24 +2174,156 @@ fn b6a_16_damaged_evidence() {
     }
 }
 
-/// Rule 4: a path the start records whose cold roots hold only crash
-/// forms is held, never a ledger-origin candidate.
+/// Rule 4′ (amendment 2): a path the start records, which hot lacks, is
+/// held by a crash form only when it is a verified crash copy: on a root
+/// without `M`, an `M~` byte-equal to the start's text whose data
+/// verifies, a read-only root's included. In the rebuild it then gets
+/// rule 6's "only a pending manifest" line. A `D~` alone, even one that
+/// verifies, holds nothing: a lost candidate, origin `ledger`.
 #[test]
-fn b6a_recorded_path_with_only_crash_forms_is_held() {
+fn b6a_recorded_path_is_held_only_by_a_verified_crash_copy() {
     let (p, t) = (p3(), text(&p3(), &sha("a")));
-    let mut base = inputs();
-    start_on(&mut base, 1, ledger(&[manifest(&t)]));
-    temps(&mut base, 0, &p, true, pending(&t, DataCheck::NotChecked));
-    for (setting, inputs) in settings(&base, &p, &t) {
-        let derived = derive_ok(&inputs);
-        assert!(derived.lost.is_empty(), "{setting}: {:?}", derived.lost);
-        assert_eq!(records_of(&derived, &p), vec![], "{setting}");
+    for read_only in [false, true] {
+        let mut base = inputs();
+        base.roots[0].copy_target = !read_only;
+        start_on(&mut base, 1, ledger(&[manifest(&t)]));
+        temps(&mut base, 0, &p, true, pending(&t, DataCheck::Good));
+        for (setting, inputs) in settings(&base, &p, &t) {
+            let derived = derive_ok(&inputs);
+            assert!(derived.lost.is_empty(), "{setting}: {:?}", derived.lost);
+            assert_eq!(records_of(&derived, &p), vec![], "{setting}");
+            if setting == "rebuild" {
+                assert_problem(&derived, &[&p, "from the pending manifest"]);
+            } else {
+                assert_no_problem(&derived, &[&p, "from the pending manifest"]);
+            }
+        }
     }
     let mut base = inputs();
     start_on(&mut base, 1, ledger(&[manifest(&t)]));
     temps(&mut base, 0, &p, true, None);
     for (setting, inputs) in settings(&base, &p, &t) {
-        assert!(derive_ok(&inputs).lost.is_empty(), "{setting}: D~ alone");
+        let derived = derive_ok(&inputs);
+        if setting == "hot holds it" {
+            assert!(derived.lost.is_empty(), "{setting}");
+        } else {
+            assert_eq!(
+                lost_of(&derived),
+                vec![(p.clone(), LostOrigin::Ledger)],
+                "{setting}: D~ alone"
+            );
+        }
+    }
+}
+
+/// Review round 3, finding 2 (rule 4′): a recorded path that hot lacks,
+/// in a removed partition outside the copy-back plan, whose cold roots
+/// hold only one unverified crash form, (a) a half `D~`, (b) a torn `M~`,
+/// (c) an `M~` with another text, (d) an unreadable `M~`, (e) a `D~` alone
+/// that verifies, (f) an `M~` equal to the text whose `D~` is one byte
+/// short: a lost candidate, origin `ledger`, whose line names the forms;
+/// apart from the lines naming the path, the output equals main's (the
+/// derivation without the B6a reads). (g) an `M~` equal to the text with a
+/// verifying `D~` holds it, and the rebuild names it.
+#[test]
+fn rule4_unverified_crash_forms_never_hold() {
+    let (p, t) = (p3(), text(&p3(), &sha("a")));
+    let other = text(&p, &sha("b"));
+    let start = ledger(&[
+        manifest(&t),
+        copy(&p, "cold-a"),
+        copy(&p, "cold-b"),
+        removed(&partition(&p)),
+    ]);
+    let cases: [(&str, bool, Option<RootCopy>, &str); 6] = [
+        ("(a) a half D~", true, None, "the data temp file on cold-a"),
+        (
+            "(b) a torn M~",
+            false,
+            Some(RootCopy::BadText(
+                "the pending manifest does not parse: torn".to_owned(),
+            )),
+            "pending manifest on cold-a that does not parse",
+        ),
+        (
+            "(c) an M~ with another text",
+            false,
+            pending(&other, DataCheck::Good),
+            "a pending manifest on cold-a",
+        ),
+        (
+            "(d) an unreadable M~",
+            false,
+            Some(RootCopy::BadText(
+                "the pending manifest cannot be read: Permission denied".to_owned(),
+            )),
+            "cannot be read",
+        ),
+        (
+            "(e) a D~ alone that verifies",
+            true,
+            None,
+            "the data temp file on cold-a",
+        ),
+        (
+            "(f) an M~ equal to the text, its D~ one byte short",
+            true,
+            pending(&t, DataCheck::Size),
+            "whose data does not verify",
+        ),
+    ];
+    let without_path = |lines: &[String]| -> Vec<String> {
+        lines.iter().filter(|l| !l.contains(&p)).cloned().collect()
+    };
+    for (case, data_tmp, pending_form, named) in cases {
+        let mut base = inputs();
+        start_on(&mut base, 1, start.clone());
+        temps(&mut base, 0, &p, data_tmp, pending_form);
+        let mut restore = base.clone();
+        restoring(&mut restore, None, &[]);
+        for (setting, inputs) in [("restore", restore), ("rebuild", base)] {
+            let derived = derive_ok(&inputs);
+            let main = derive_ok(&without_b6a_reads(&inputs));
+            assert_eq!(
+                lost_of(&derived),
+                vec![(p.clone(), LostOrigin::Ledger)],
+                "{case} {setting}"
+            );
+            assert_eq!(lost_of(&derived), lost_of(&main), "{case} {setting}");
+            assert!(
+                derived.lines.iter().any(|l| l
+                    .starts_with(&format!("lost candidate: {p}: origin ledger"))
+                    && l.contains(named)),
+                "{case} {setting}: {:#?}",
+                derived.lines
+            );
+            assert_eq!(derived.ledger, main.ledger, "{case} {setting}");
+            assert_eq!(derived.added, main.added, "{case} {setting}");
+            assert_eq!(derived.holds, main.holds, "{case} {setting}");
+            assert_eq!(
+                without_path(&derived.lines),
+                without_path(&main.lines),
+                "{case} {setting}"
+            );
+            assert_eq!(
+                without_path(&derived.problems),
+                without_path(&main.problems),
+                "{case} {setting}"
+            );
+        }
+    }
+    // (g) a verified crash copy holds it.
+    let mut base = inputs();
+    start_on(&mut base, 1, start.clone());
+    temps(&mut base, 0, &p, true, pending(&t, DataCheck::Good));
+    let mut restore = base.clone();
+    restoring(&mut restore, None, &[]);
+    for (setting, inputs) in [("restore", restore), ("rebuild", base)] {
+        let derived = derive_ok(&inputs);
+        assert!(derived.lost.is_empty(), "(g) {setting}: {:?}", derived.lost);
+        if setting == "rebuild" {
+            assert_problem(&derived, &[&p, "from the pending manifest"]);
+        }
     }
 }
 
@@ -2217,5 +2376,169 @@ fn b6a_lost_path_with_crash_forms_is_a_line() {
     for (setting, inputs) in settings(&sealed, &p, &t) {
         assert_problem(&derive_ok(&inputs), &[&p, "holds it again"]);
         let _ = setting;
+    }
+}
+
+/// The inputs of state-table row `row` (1 to 16; 14, an empty `date=`
+/// directory, has none) for the path `p3()`.
+fn row_inputs(row: u32) -> Option<RebuildInputs> {
+    let (p, t) = (p3(), text(&p3(), &sha("a")));
+    let other = text(&p, &sha("b"));
+    let mut base = inputs();
+    match row {
+        1 => on(&mut base, 0, &p, good(&t)),
+        2 => on(
+            &mut base,
+            0,
+            &p,
+            RootCopy::Text {
+                text: t.clone(),
+                data: DataCheck::Sha256,
+            },
+        ),
+        3 => {
+            on(
+                &mut base,
+                0,
+                &p,
+                RootCopy::Text {
+                    text: t.clone(),
+                    data: DataCheck::Missing,
+                },
+            );
+            temps(&mut base, 0, &p, true, None);
+        }
+        4 => {
+            on(&mut base, 0, &p, RootCopy::BadText("x".to_owned()));
+            base.roots[0].orphan_data.insert(p.clone());
+        }
+        5 => {
+            base.roots[0].orphan_data.insert(p.clone());
+            temps(&mut base, 0, &p, false, pending(&t, DataCheck::Good));
+        }
+        6 => temps(&mut base, 0, &p, true, pending(&t, DataCheck::Good)),
+        7 => temps(&mut base, 0, &p, true, pending(&t, DataCheck::Sha256)),
+        8 => {
+            base.roots[0].orphan_data.insert(p.clone());
+        }
+        9 => temps(&mut base, 0, &p, true, None),
+        10 => temps(
+            &mut base,
+            0,
+            &p,
+            false,
+            Some(RootCopy::BadText("torn".to_owned())),
+        ),
+        11 => {
+            temps(&mut base, 0, &p, true, pending(&t, DataCheck::Good));
+            temps(&mut base, 1, &p, true, pending(&other, DataCheck::Good));
+        }
+        12 => {
+            on(&mut base, 0, &p, good(&t));
+            temps(&mut base, 1, &p, true, pending(&other, DataCheck::Good));
+        }
+        13 => {
+            on(&mut base, 0, &p, good(&t));
+            temps(&mut base, 0, &p, true, pending(&t, DataCheck::NotChecked));
+        }
+        15 => {
+            use mie_adapter_parquet::replica::QuarantinedCopy;
+            let a = part("aggTrades", "2026-10-01", 3);
+            let ta = text(&a, &sha("a"));
+            base.roots[0].quarantine.ids.insert(
+                "q-1".to_owned(),
+                BTreeMap::from([(
+                    a.clone(),
+                    QuarantinedCopy {
+                        text: None,
+                        data: true,
+                        unreadable: None,
+                    },
+                )]),
+            );
+            on(
+                &mut base,
+                0,
+                &a,
+                RootCopy::Text {
+                    text: ta,
+                    data: DataCheck::Missing,
+                },
+            );
+            temps(&mut base, 1, &a, true, None);
+        }
+        16 => {
+            base.roots[0]
+                .evidence
+                .insert(p.clone(), BTreeSet::from(["111".to_owned()]));
+        }
+        _ => return None,
+    }
+    Some(base)
+}
+
+/// Rule 6 (amendment 2): for every row in both modes (with
+/// `--record-lost`, so a row with a candidate installs), a second
+/// derivation that starts from the first one's ledger (the restore: as
+/// hot's ledger; the rebuild: as a ledger copy) adds no record, has no
+/// lost candidate, names the same paths in `FAIL:` lines (apart from the
+/// first run's lost candidates, now report lines under rule 5) and, in
+/// the restore, copies back the same paths.
+#[test]
+fn b6a_every_row_rederives_after_its_install() {
+    for row in 1..=16 {
+        let Some(mut base) = row_inputs(row) else {
+            continue;
+        };
+        base.record_lost = true;
+        let paths = [p3(), part("aggTrades", "2026-10-01", 3)];
+        let mut restore = base.clone();
+        restoring(&mut restore, None, &[&partition(&p3())]);
+        for (setting, first_inputs) in [("restore", restore), ("rebuild", base)] {
+            let first = derive_ok(&first_inputs);
+            let mut again = first_inputs.clone();
+            match &mut again.mode {
+                Mode::Restore(mode) => mode.hot_ledger = Some(first.ledger.clone()),
+                Mode::Rebuild => again.ledger_copies[0].bytes = Some(first.ledger.clone()),
+            }
+            let second = derive_ok(&again);
+            assert_eq!(added(&second), vec![], "row {row} {setting}");
+            assert!(second.lost.is_empty(), "row {row} {setting}");
+            let lost: BTreeSet<&str> = first.lost.iter().map(|f| f.path.as_str()).collect();
+            let failing = |derived: &Derived, skip_lost: bool| -> BTreeSet<String> {
+                paths
+                    .iter()
+                    .filter(|path| !(skip_lost && lost.contains(path.as_str())))
+                    .filter(|path| derived.problems.iter().any(|l| l.contains(path.as_str())))
+                    .cloned()
+                    .collect()
+            };
+            assert_eq!(
+                failing(&second, true),
+                failing(&first, true),
+                "row {row} {setting}: {:#?} {:#?}",
+                first.problems,
+                second.problems
+            );
+            if setting == "restore" {
+                let ordinary = |ledger: &[u8]| -> BTreeSet<String> {
+                    let parsed = copy_ledger::parse(Path::new("l"), ledger).unwrap();
+                    let state = CopyState::fold(&parsed).unwrap();
+                    state
+                        .paths()
+                        .filter(|(path, verdict)| {
+                            *verdict == PathVerdict::Ordinary
+                                && partition_of(path) == partition(&p3())
+                        })
+                        .map(|(path, _)| path.to_owned())
+                        .collect()
+                };
+                assert_eq!(
+                    ordinary(&second.ledger),
+                    ordinary(&first.ledger),
+                    "row {row}"
+                );
+            }
+        }
     }
 }

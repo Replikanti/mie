@@ -303,9 +303,13 @@ pub fn temp_path(root: &Path, data_path: &str, name: TempName) -> Result<PathBuf
 pub struct TempFiles {
     /// Whether its data temp file (`D~`) exists.
     pub data: bool,
-    /// Its pending manifest (`M~`): `None` when there is none, `Some(None)`
-    /// when its bytes are not UTF-8, otherwise its text, not parsed here.
+    /// Its pending manifest (`M~`): `None` when there is none or it cannot
+    /// be read, `Some(None)` when its bytes are not UTF-8, otherwise its
+    /// text, not parsed here.
     pub manifest: Option<Option<String>>,
+    /// The read error of a pending manifest that exists and cannot be read
+    /// (#195 amendment 2, U): the name stays counted, never an absence.
+    pub unreadable: Option<String>,
 }
 
 /// The seal temp names in the layout of `root` by data path, sorted: per
@@ -314,10 +318,13 @@ pub struct TempFiles {
 /// The walk is [`list_sealed`]'s; a name outside the layout (a look-alike
 /// hyphen, a trailing blank, a zero-width character) is no temp name.
 ///
+/// A pending manifest that cannot be read is listed with its error
+/// ([`TempFiles::unreadable`]), never skipped and never an error: a
+/// listing error hides a name, a read error does not (#195 amendment 2).
+///
 /// # Errors
 ///
-/// [`RawStoreError::Io`] when a directory or a pending manifest cannot be
-/// read.
+/// [`RawStoreError::Io`] when a directory cannot be listed.
 pub fn list_temps(
     root: &Path,
 ) -> Result<std::collections::BTreeMap<String, TempFiles>, RawStoreError> {
@@ -350,7 +357,12 @@ pub fn list_temps(
                     .manifest = Some(String::from_utf8(bytes).ok());
             }
             Err(error) if error.kind() == ErrorKind::NotFound => {}
-            Err(error) => return Err(io_error("read", &file)(error)),
+            Err(error) => {
+                temps
+                    .entry(path)
+                    .or_insert_with(TempFiles::default)
+                    .unreadable = Some(error.to_string());
+            }
         }
     }
     Ok(temps)
@@ -1617,6 +1629,10 @@ pub struct QuarantinedCopy {
     /// Whether its data file is there. The data is never read: quarantined
     /// bytes are evidence.
     pub data: bool,
+    /// The read error of a manifest that is there and cannot be read
+    /// (`text` is then `None`): the rebuild stops on it, the hot restore
+    /// counts the part without text (#195 amendment 2, U).
+    pub unreadable: Option<String>,
 }
 
 /// A root's `.quarantine/` directory (ADR-062 D7 step 5a, #211 Q1).
@@ -1637,12 +1653,14 @@ pub struct QuarantineListing {
 /// data alone. A missing `.quarantine/` is empty. Seal temp names and
 /// names outside the layout are skipped.
 ///
+/// A manifest that cannot be read is listed with its error
+/// ([`QuarantinedCopy::unreadable`]); the caller decides.
+///
 /// # Errors
 ///
 /// [`RawStoreError::Integrity`] when `.quarantine` exists and is no
 /// directory (a symlink included); [`RawStoreError::Io`] when a directory
-/// or a manifest cannot be read: a skipped directory would read as parts
-/// gone.
+/// cannot be listed: a skipped directory would read as parts gone.
 pub fn list_quarantine(root: &Path) -> Result<QuarantineListing, RawStoreError> {
     let dir = root.join(QUARANTINE_DIR);
     match fs::symlink_metadata(&dir) {
@@ -1686,8 +1704,12 @@ pub fn list_quarantine(root: &Path) -> Result<QuarantineListing, RawStoreError> 
                         &id_dir,
                         &layout::file_path(&key, &date, PartFile::Manifest, part),
                     );
-                    let bytes = fs::read(&manifest).map_err(io_error("read", &manifest))?;
-                    copy.text = String::from_utf8(bytes).ok();
+                    match fs::read(&manifest) {
+                        Ok(bytes) => copy.text = String::from_utf8(bytes).ok(),
+                        Err(error) => {
+                            copy.unreadable = Some(io_error("read", &manifest)(error).to_string());
+                        }
+                    }
                 }
             }
         }

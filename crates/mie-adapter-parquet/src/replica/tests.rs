@@ -738,7 +738,8 @@ fn quarantine_moves_and_listing() {
         listing.ids["q-7"][&path],
         QuarantinedCopy {
             text: None,
-            data: true
+            data: true,
+            unreadable: None,
         }
     );
     // The resume completes it.
@@ -752,7 +753,8 @@ fn quarantine_moves_and_listing() {
         listing.ids["q-7"][&path],
         QuarantinedCopy {
             text: Some(text),
-            data: true
+            data: true,
+            unreadable: None,
         }
     );
     // A name in both places: `Integrity`, nothing overwritten.
@@ -1183,6 +1185,7 @@ fn list_temps_and_evidence_classify_every_name() {
             TempFiles {
                 data: true,
                 manifest: None,
+                unreadable: None,
             },
         ),
         (
@@ -1190,6 +1193,7 @@ fn list_temps_and_evidence_classify_every_name() {
             TempFiles {
                 data: false,
                 manifest: Some(Some("text 43".to_owned())),
+                unreadable: None,
             },
         ),
         (
@@ -1197,6 +1201,7 @@ fn list_temps_and_evidence_classify_every_name() {
             TempFiles {
                 data: false,
                 manifest: Some(None),
+                unreadable: None,
             },
         ),
         (
@@ -1204,6 +1209,7 @@ fn list_temps_and_evidence_classify_every_name() {
             TempFiles {
                 data: true,
                 manifest: Some(Some("text 45".to_owned())),
+                unreadable: None,
             },
         ),
     ]
