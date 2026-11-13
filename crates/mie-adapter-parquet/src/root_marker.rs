@@ -16,6 +16,7 @@
 //! from an unmounted mount point, which is an ordinary empty directory.
 
 use crate::layout::{COPY_LEDGER, META_DIR, ROOT_MARKER};
+use crate::recovery::rename_no_replace;
 use crate::{copy_ledger, io_error, sync_dir};
 use mie_ports::raw::{RawStoreError, validate_segment};
 use std::fs::{self, OpenOptions};
@@ -159,7 +160,7 @@ pub fn create_meta(root: &Path, id: &str, with_ledger: bool) -> Result<(), RawSt
     }
     let staging = root.join(unique_staging_name());
     fs::create_dir(&staging).map_err(io_error("create", &staging))?;
-    let published = publish(root, &staging, &meta, marker, with_ledger);
+    let published = publish_staging(root, &staging, &meta, marker, with_ledger);
     if published.is_err() {
         // Best effort: the error that matters is the one returned.
         let _ = fs::remove_dir_all(&staging);
@@ -176,8 +177,53 @@ pub fn create_meta(root: &Path, id: &str, with_ledger: bool) -> Result<(), RawSt
     Ok(())
 }
 
+/// Writes the marker of `id` into the existing `<root>/.mie/`, the commit
+/// point of the hot restore (ADR-062 D11 step 1, #195 H7): the text goes to
+/// `.mie/.root.tmp` (a stale one is removed first), is fsynced, renamed to
+/// `.mie/root` without replacing, and `.mie` is fsynced. A crash leaves no
+/// marker or a whole one, never a partial marker: the temp name is no
+/// marker, and the rename is atomic.
+///
+/// # Errors
+///
+/// [`RawStoreError::Integrity`] when the marker exists (whatever it holds:
+/// a marker is written once); [`RawStoreError::Invalid`] for an invalid id;
+/// [`RawStoreError::Io`] on I/O failure, `.mie` missing included.
+pub fn publish(root: &Path, id: &str) -> Result<(), RawStoreError> {
+    let marker = render(id)?;
+    let meta = meta_dir(root);
+    let path = marker_path(root);
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {
+            return Err(RawStoreError::Integrity(format!(
+                "{} exists: a root marker is written once",
+                path.display()
+            )));
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(io_error("inspect", &path)(error)),
+    }
+    let tmp = meta.join(format!(".{ROOT_MARKER}.tmp"));
+    match fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(io_error("remove", &tmp)(error)),
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .map_err(io_error("create", &tmp))?;
+    file.write_all(marker.as_bytes())
+        .and_then(|()| file.sync_all())
+        .map_err(io_error("write", &tmp))?;
+    drop(file);
+    rename_no_replace(&tmp, &path)?;
+    sync_dir(&meta)
+}
+
 /// Fills `staging`, fsyncs it and renames it to `meta`.
-fn publish(
+fn publish_staging(
     root: &Path,
     staging: &Path,
     meta: &Path,
@@ -330,6 +376,35 @@ mod tests {
                 .collect();
             assert_eq!(names, [".mie"], "race {i}");
         }
+    }
+
+    /// #195 H7, `m_round_trips`: the published marker renders and parses
+    /// back to its id; an existing marker is refused and left alone; a
+    /// stale temp name of a crashed publish is replaced.
+    #[test]
+    fn publish_writes_the_marker_once() {
+        let dir = TempDir::new("marker-publish");
+        let root = dir.path();
+        // `.mie` must exist: the restore creates it first (H1).
+        assert!(matches!(publish(root, HOT_ID), Err(RawStoreError::Io(_))));
+        fs::create_dir(meta_dir(root)).unwrap();
+        fs::write(meta_dir(root).join(".root.tmp"), b"mie-root 1\nid ho").unwrap();
+        publish(root, HOT_ID).unwrap();
+        assert_eq!(read(root).unwrap().as_deref(), Some(HOT_ID));
+        assert_eq!(
+            fs::read_to_string(marker_path(root)).unwrap(),
+            render(HOT_ID).unwrap()
+        );
+        assert!(!meta_dir(root).join(".root.tmp").exists());
+        assert!(matches!(
+            publish(root, "cold-a"),
+            Err(RawStoreError::Integrity(_))
+        ));
+        assert_eq!(read(root).unwrap().as_deref(), Some(HOT_ID));
+        assert!(matches!(
+            publish(root, "a/b"),
+            Err(RawStoreError::Invalid(_))
+        ));
     }
 
     #[test]

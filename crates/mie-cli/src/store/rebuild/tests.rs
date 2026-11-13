@@ -19,6 +19,7 @@ fn partition(path: &str) -> String {
 /// Inputs over hot and two copy targets, all empty, no ledger copy.
 fn inputs() -> RebuildInputs {
     RebuildInputs {
+        mode: Mode::Rebuild,
         at_ms: AT,
         first_hot_date: "2026-10-05".to_owned(),
         record_lost: false,
@@ -1069,4 +1070,330 @@ fn equal_inputs_give_byte_identical_ledgers_with_quarantine() {
             .any(|l| l == "quarantine q-1: 1 path(s), 1 complete, 0 incomplete")
     );
     assert_eq!(derive_ok(&inputs).ledger, derived.ledger);
+}
+
+// ------------------------------------------- the hot restore's mode (#195)
+
+/// `inputs` in the hot restore's mode with hot's ledger `hot_ledger` and
+/// the copy-back plan `copy_back`.
+fn restoring(inputs: &mut RebuildInputs, hot_ledger: Option<Vec<u8>>, copy_back: &[&str]) {
+    inputs.mode = Mode::Restore(RestoreMode {
+        hot_ledger,
+        copy_back: copy_back.iter().map(|p| (*p).to_owned()).collect(),
+    });
+}
+
+/// H5 a: hot's surviving ledger is a start candidate, and the longest
+/// verified prefix wins: hot's 15 records against the targets' 10 and 12.
+#[test]
+fn l_surviving_hot_ledger_is_a_candidate() {
+    let mut inputs = inputs();
+    start_on(&mut inputs, 0, ledger(&filler(10)));
+    start_on(&mut inputs, 1, ledger(&filler(12)));
+    let hot = ledger(&filler(15));
+    // The rebuild never reads hot's ledger as a candidate.
+    assert_eq!(derive_ok(&inputs).start.root.as_deref(), Some("cold-b"));
+    restoring(&mut inputs, Some(hot.clone()), &[]);
+    let derived = derive_ok(&inputs);
+    assert_eq!(derived.start.root.as_deref(), Some("hot"));
+    assert_eq!(derived.start.len, hot.len() as u64);
+    assert_eq!(derived.ledger, hot);
+}
+
+/// H5 a: on equal verified lengths hot wins, then configuration order.
+#[test]
+fn l_tie_order() {
+    let same = ledger(&filler(12));
+    let mut inputs = inputs();
+    start_on(&mut inputs, 0, same.clone());
+    start_on(&mut inputs, 1, same.clone());
+    restoring(&mut inputs, Some(same.clone()), &[]);
+    assert_eq!(derive_ok(&inputs).start.root.as_deref(), Some("hot"));
+    restoring(&mut inputs, None, &[]);
+    assert_eq!(derive_ok(&inputs).start.root.as_deref(), Some("cold-a"));
+}
+
+/// H5 a: a torn trailing record on the longest copy (hot's) counts with
+/// its verified prefix, which then ties with a target's and wins as hot.
+#[test]
+fn l_torn_trailing_record() {
+    let complete = ledger(&filler(12));
+    let mut torn = complete.clone();
+    torn.extend_from_slice(&b"verify 1 cold-a 18 0 0123456789abcdef0123"[..37]);
+    let mut inputs = inputs();
+    start_on(&mut inputs, 1, complete.clone());
+    restoring(&mut inputs, Some(torn), &[]);
+    let derived = derive_ok(&inputs);
+    assert_eq!(derived.start.root.as_deref(), Some("hot"));
+    assert_eq!(derived.start.len, complete.len() as u64);
+    assert_eq!(derived.ledger, complete);
+}
+
+/// H5 a: no candidate verifies: the start is the header alone, said so.
+#[test]
+fn l_empty_start() {
+    let mut inputs = inputs();
+    start_on(&mut inputs, 0, b"mie-copy-ledger 9\n".to_vec());
+    restoring(&mut inputs, Some(b"not a ledger".to_vec()), &[]);
+    let derived = derive_ok(&inputs);
+    assert_eq!(derived.start.root, None);
+    assert!(
+        derived.lines[0].starts_with("started empty"),
+        "{derived:#?}"
+    );
+    assert!(
+        derived.rejected.iter().any(|r| r.contains("on hot")),
+        "{:?}",
+        derived.rejected
+    );
+}
+
+/// H5 b: a live path with two texts and a start record: the start's text
+/// wins, the other copy is a damaged copy with a `FAIL:` line and no
+/// record. The rebuild stops on the same inputs.
+#[test]
+fn d_live_conflict_with_record_uses_it() {
+    let path = live("2026-10-06", 0);
+    let (sealed, other) = (text(&path, &sha("a")), text(&path, &sha("b")));
+    let mut inputs = inputs();
+    start_on(
+        &mut inputs,
+        0,
+        ledger(&[manifest(&sealed), copy(&path, "cold-a")]),
+    );
+    on(&mut inputs, 0, &path, good(&sealed));
+    on(&mut inputs, 1, &path, good(&other));
+    assert!(derive(&inputs).is_err(), "the rebuild stops");
+    restoring(&mut inputs, None, &[&partition(&path)]);
+    let derived = derive_ok(&inputs);
+    assert_eq!(added(&derived), Vec::<Kind>::new());
+    assert_problem(
+        &derived,
+        &[
+            &path,
+            "cold-b",
+            "differs from the copy ledger's manifest record",
+            "mie store repair",
+        ],
+    );
+}
+
+/// H5 b: without a start record a live path with two texts stops the
+/// restore, nothing derived.
+#[test]
+fn d_live_conflict_without_record_stops() {
+    let path = live("2026-10-06", 0);
+    let mut inputs = inputs();
+    on(&mut inputs, 0, &path, good(&text(&path, &sha("a"))));
+    on(&mut inputs, 1, &path, good(&text(&path, &sha("b"))));
+    restoring(&mut inputs, None, &[&partition(&path)]);
+    let Err(Stop(why)) = derive(&inputs) else {
+        panic!("no stop");
+    };
+    assert!(
+        why.contains(&path) && why.contains("different manifest texts"),
+        "{why}"
+    );
+}
+
+/// H5 b leaves archive paths alone: two texts and a start record are a
+/// `manifest-conflict` hold, both copies left, nothing recorded for them.
+#[test]
+fn d_archive_conflict_is_held_not_copied() {
+    let path = part("aggTrades", "2026-10-06", 0);
+    let (sealed, other) = (text(&path, &sha("a")), text(&path, &sha("b")));
+    let mut inputs = inputs();
+    start_on(&mut inputs, 0, ledger(&[manifest(&sealed)]));
+    on(&mut inputs, 0, &path, good(&sealed));
+    on(&mut inputs, 1, &path, good(&other));
+    restoring(&mut inputs, None, &[&partition(&path)]);
+    let derived = derive_ok(&inputs);
+    assert_eq!(
+        derived.holds,
+        vec![(path.clone(), HoldReason::ManifestConflict)]
+    );
+    assert!(
+        !derived
+            .problems
+            .iter()
+            .any(|p| p.contains("differs from the copy ledger's manifest record")),
+        "{:#?}",
+        derived.problems
+    );
+}
+
+/// An unrecorded cold copy with a bad SHA-256: no `copy` record, a `FAIL:`
+/// line; the good one is recorded.
+#[test]
+fn d_unrecorded_damaged_copy() {
+    let path = live("2026-10-06", 0);
+    let sealed = text(&path, &sha("a"));
+    let mut inputs = inputs();
+    on(&mut inputs, 0, &path, good(&sealed));
+    on(
+        &mut inputs,
+        1,
+        &path,
+        RootCopy::Text {
+            text: sealed.clone(),
+            data: DataCheck::Sha256,
+        },
+    );
+    restoring(&mut inputs, None, &[&partition(&path)]);
+    let derived = derive_ok(&inputs);
+    assert_eq!(
+        added(&derived),
+        vec![manifest(&sealed), copy(&path, "cold-a")]
+    );
+    assert_problem(&derived, &[&path, "cold-b", "sha256", "mie store repair"]);
+}
+
+/// H5 c: in the restore an `unlisted` hold is written without the flag,
+/// and the rebuild's import-ledger evidence line is not printed: the
+/// restore restores that ledger itself.
+#[test]
+fn d_unlisted_parts_are_held() {
+    let path = part("aggTrades", "2026-10-06", 0);
+    let mut inputs = inputs();
+    on(&mut inputs, 0, &path, good(&text(&path, &sha("a"))));
+    restoring(&mut inputs, None, &[&partition(&path)]);
+    let derived = derive_ok(&inputs);
+    assert!(derived.unrecorded_unlisted.is_empty());
+    assert!(added(&derived).contains(&Kind::Hold {
+        path: path.clone(),
+        reason: HoldReason::Unlisted
+    }));
+    assert!(
+        !derived
+            .problems
+            .iter()
+            .any(|p| p.contains("--record-unlisted")),
+        "{:#?}",
+        derived.problems
+    );
+}
+
+/// H5 d: a journal-named path no root holds is a lost candidate, recorded
+/// only with `--record-lost`; the restore's text names its own flag.
+#[test]
+fn d_lost_needs_the_flag() {
+    let path = live("2026-10-06", 4);
+    let mut inputs = inputs();
+    inputs.journal.names = vec![JournalName {
+        path: path.clone(),
+        line: 3,
+        run_id: "r1".to_owned(),
+        recovery: false,
+    }];
+    restoring(&mut inputs, None, &[]);
+    let derived = derive_ok(&inputs);
+    assert_eq!(derived.lost.len(), 1);
+    assert!(!derived.lost[0].recorded);
+    assert!(added(&derived).is_empty());
+    assert_problem(&derived, &[&path, "`mie store restore --record-lost`"]);
+    inputs.record_lost = true;
+    let derived = derive_ok(&inputs);
+    assert!(derived.lost[0].recorded);
+    assert!(matches!(&added(&derived)[..], [Kind::Lost { path: p, .. }] if *p == path));
+}
+
+/// B6 in the restore: a journal path with a look-alike hyphen, `..` or an
+/// absolute path is reported, never recorded.
+#[test]
+fn d_names_outside_the_layout() {
+    let mut inputs = inputs();
+    inputs.record_lost = true;
+    let bad = [
+        "source=binance\u{2010}um/instrument=BTCUSDT/stream=aggTrade/date=2026-10-06/part-00000.parquet",
+        "source=binance-um/instrument=BTCUSDT/stream=aggTrade/date=2026-10-06/../part-00000.parquet",
+        "/source=binance-um/instrument=BTCUSDT/stream=aggTrade/date=2026-10-06/part-00000.parquet",
+    ];
+    inputs.journal.names = bad
+        .iter()
+        .enumerate()
+        .map(|(i, path)| JournalName {
+            path: (*path).to_owned(),
+            line: i as u64 + 1,
+            run_id: "r1".to_owned(),
+            recovery: false,
+        })
+        .collect();
+    restoring(&mut inputs, None, &[]);
+    let derived = derive_ok(&inputs);
+    assert!(added(&derived).is_empty(), "{:?}", derived.added);
+    for path in bad {
+        assert_problem(
+            &derived,
+            &[&format!("{path:?}"), "no data path of the layout"],
+        );
+    }
+}
+
+/// H5 e: a partition the copy-back plans to bring back counts as on hot,
+/// so it gets no `removed` record and no hot-damage line; without it (the
+/// rebuild) it does. A recorded copy the restore did not read counts as
+/// verified for B8.
+#[test]
+fn b8_counts_the_copy_back_as_on_hot() {
+    let (window, old) = (live("2026-10-06", 0), live("2026-10-01", 0));
+    let mut inputs = inputs();
+    for path in [&window, &old] {
+        on(&mut inputs, 0, path, good(&text(path, &sha(path))));
+    }
+    let derived = derive_ok(&inputs);
+    assert!(added(&derived).contains(&removed(&partition(&window))));
+    assert!(added(&derived).contains(&removed(&partition(&old))));
+    restoring(&mut inputs, None, &[&partition(&window)]);
+    let derived = derive_ok(&inputs);
+    assert!(!added(&derived).contains(&removed(&partition(&window))));
+    assert!(added(&derived).contains(&removed(&partition(&old))));
+    assert!(
+        !derived.problems.iter().any(|p| p.contains("hot damage")),
+        "{:#?}",
+        derived.problems
+    );
+    // A recorded, unread copy of the old partition.
+    let old_text = text(&old, &sha(&old));
+    start_on(
+        &mut inputs,
+        0,
+        ledger(&[manifest(&old_text), copy(&old, "cold-a")]),
+    );
+    on(
+        &mut inputs,
+        0,
+        &old,
+        RootCopy::Text {
+            text: old_text,
+            data: DataCheck::NotChecked,
+        },
+    );
+    let derived = derive_ok(&inputs);
+    assert!(added(&derived).contains(&removed(&partition(&old))));
+}
+
+/// H5 f: a missing hot import ledger stops the rebuild while the targets
+/// hold entries, never the restore, which restores it.
+#[test]
+fn a_missing_hot_import_ledger_does_not_stop_the_restore() {
+    let path = part("aggTrades", "2026-10-06", 0);
+    let sealed = text(&path, &sha("a"));
+    let mut inputs = inputs();
+    inputs.missing_import_ledger = Some("the import ledger".to_owned());
+    inputs.entries.insert(
+        NAME.to_owned(),
+        vec![EntryCopy {
+            root: "cold-a".to_owned(),
+            bytes: entry(&[(&path, &sha("a"))]),
+        }],
+    );
+    on(&mut inputs, 0, &path, good(&sealed));
+    assert!(derive(&inputs).is_err());
+    restoring(&mut inputs, None, &[&partition(&path)]);
+    let derived = derive_ok(&inputs);
+    assert_eq!(
+        derived.chosen_entries.get(NAME),
+        Some(&entry(&[(&path, &sha("a"))]))
+    );
+    assert!(derived.holds.is_empty(), "{:?}", derived.holds);
 }

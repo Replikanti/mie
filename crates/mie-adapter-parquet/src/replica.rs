@@ -634,6 +634,19 @@ pub struct CopiedBack {
     pub damaged: Vec<DamagedCopy>,
 }
 
+/// What [`copy_back`] does with a cold copy whose manifest text differs
+/// from the copy ledger's (#195 H6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OtherText {
+    /// Two versions of one path (D5): [`RawStoreError::Integrity`], and no
+    /// other root is tried. The recall and the repair.
+    Stop,
+    /// A damaged copy, handed to `observe`, and the next root is tried. The
+    /// hot restore, whose copy ledger already decided the path's text (D11
+    /// step 5): the restore never stops on a copy a good one covers.
+    PassOver,
+}
+
 /// Copies the sealed file `data_path` back onto `hot` by the D5 copy
 /// ([`copy_sealed`]), from the first cold root in `cold_roots` (read order)
 /// that holds a verified copy: the recall of ADR-062 D6, and the hot
@@ -644,8 +657,10 @@ pub struct CopiedBack {
 ///
 /// - no manifest there: the copy is absent, and the next root is tried, as
 ///   in the tiered `read`;
-/// - a manifest whose text differs from `ledger_text`: two versions of one
-///   path (D5), [`RawStoreError::Integrity`], and no other root is tried;
+/// - a manifest whose text differs from `ledger_text`: with
+///   [`OtherText::Stop`], two versions of one path (D5),
+///   [`RawStoreError::Integrity`], and no other root is tried; with
+///   [`OtherText::PassOver`], a damaged copy, as below;
 /// - data that fails its manifest, or a copy that cannot be read: a damaged
 ///   copy. It is handed to `observe` at once and the next root is tried
 ///   (#191 STOP 1 decision 1: a late import never stops on a fault a good
@@ -663,6 +678,7 @@ pub fn copy_back(
     hot: &Path,
     data_path: &str,
     ledger_text: &str,
+    other_text: OtherText,
     observe: &mut dyn FnMut(&DamagedCopy),
 ) -> Result<CopiedBack, RawStoreError> {
     let (key, date, part) = layout::parse_data_path(data_path)?;
@@ -685,6 +701,17 @@ pub fn copy_back(
                 continue;
             }
             Ok(text) if text != ledger_text.as_bytes() => {
+                if other_text == OtherText::PassOver {
+                    damage(
+                        RawStoreError::Integrity(format!(
+                            "{data_path} on {}: its manifest differs from the copy ledger's \
+                             manifest record, so it is a damaged copy (ADR-062 D5, D11)",
+                            root.display()
+                        )),
+                        &mut damaged,
+                    );
+                    continue;
+                }
                 return Err(RawStoreError::Integrity(format!(
                     "{data_path} on {}: its manifest differs from the copy ledger's manifest \
                      record; the same path must be byte-identical on every root (ADR-062 D5), \

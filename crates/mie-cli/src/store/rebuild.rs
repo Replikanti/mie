@@ -255,9 +255,45 @@ pub struct JournalRead {
     pub names: Vec<JournalName>,
 }
 
+/// What runs the derivation: the rebuild, or the hot restore (#195 H5),
+/// which reuses it with seven differences, (a) to (g) of its plan. Only
+/// [`Mode::Restore`] changes anything; [`run`] always passes
+/// [`Mode::Rebuild`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Mode {
+    /// `mie store rebuild`: B0 to B11 as above.
+    Rebuild,
+    /// `mie store restore` (the module [`restore`](super::restore)).
+    Restore(RestoreMode),
+}
+
+/// What the hot restore adds to the derivation's inputs (#195 H5).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RestoreMode {
+    /// Hot's own copy ledger when it survived, the first start candidate
+    /// (a): it holds every record the copies hold. On a tie it wins, then
+    /// configuration order.
+    pub hot_ledger: Option<Vec<u8>>,
+    /// The partitions the copy-back plans to bring back (H6): B8 counts
+    /// them as on hot (e), since they are on hot once the restore commits.
+    pub copy_back: BTreeSet<String>,
+}
+
+impl Mode {
+    /// The restore's additions, `None` for the rebuild.
+    fn restore(&self) -> Option<&RestoreMode> {
+        match self {
+            Self::Rebuild => None,
+            Self::Restore(restore) => Some(restore),
+        }
+    }
+}
+
 /// Everything [`derive`] reads (B1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RebuildInputs {
+    /// The rebuild or the hot restore.
+    pub mode: Mode,
     /// The run's `at_ms`, read once: every record carries it.
     pub at_ms: i64,
     /// The first date of the hot window.
@@ -342,6 +378,10 @@ pub struct Derived {
     pub lines: Vec<String>,
     /// Every `FAIL:` finding.
     pub problems: Vec<String>,
+    /// The bytes of each current import entry the archive checks decided
+    /// on ([`archive_checks::ArchiveFindings::chosen`]): what the hot
+    /// restore writes to hot (#195 H4).
+    pub chosen_entries: BTreeMap<String, Vec<u8>>,
 }
 
 /// Why the rebuild stops with nothing written.
@@ -457,18 +497,40 @@ fn date_of(partition: &str) -> &str {
     partition.rsplit_once("/date=").map_or("", |(_, date)| date)
 }
 
+/// One start candidate of B2: a root's id and its ledger copy's bytes.
+pub(super) type Candidate<'a> = (&'a str, Option<&'a [u8]>);
+
+/// The start candidates of B2 in their order: the copy targets' ledger
+/// copies, and in [`Mode::Restore`] hot's own ledger first (H5 a).
+pub(super) fn start_candidates<'a>(
+    mode: &'a Mode,
+    copies: &'a [LedgerCopyRead],
+) -> Vec<Candidate<'a>> {
+    let hot = mode
+        .restore()
+        .and_then(|restore| restore.hot_ledger.as_deref())
+        .map(|bytes| (HOT_ID, Some(bytes)));
+    hot.into_iter()
+        .chain(
+            copies
+                .iter()
+                .map(|copy| (copy.id.as_str(), copy.bytes.as_deref())),
+        )
+        .collect()
+}
+
 /// B2: the start among the ledger copies, its builder and its ledger.
-fn choose_start(
-    copies: &[LedgerCopyRead],
+pub(super) fn choose_start(
+    copies: &[Candidate<'_>],
 ) -> (Start, LedgerBuilder, copy_ledger::Ledger, Vec<String>) {
     let mut rejected = Vec::new();
     let mut best: Option<(usize, copy_ledger::Ledger)> = None;
-    for (i, copy) in copies.iter().enumerate() {
-        let Some(bytes) = &copy.bytes else {
-            rejected.push(format!("the ledger copy on {}: rejected: absent", copy.id));
+    for (i, &(id, bytes)) in copies.iter().enumerate() {
+        let Some(bytes) = bytes else {
+            rejected.push(format!("the ledger copy on {id}: rejected: absent"));
             continue;
         };
-        let name = PathBuf::from(format!("{}:.mie/copy-ledger", copy.id));
+        let name = PathBuf::from(format!("{id}:.mie/copy-ledger"));
         match copy_ledger::parse(&name, bytes) {
             Ok(ledger) => {
                 if best
@@ -478,18 +540,16 @@ fn choose_start(
                     best = Some((i, ledger));
                 }
             }
-            Err(error) => {
-                rejected.push(format!("the ledger copy on {}: rejected: {error}", copy.id))
-            }
+            Err(error) => rejected.push(format!("the ledger copy on {id}: rejected: {error}")),
         }
     }
     match best {
         Some((i, ledger)) => {
-            let bytes = copies[i].bytes.as_deref().unwrap_or_default();
+            let bytes = copies[i].1.unwrap_or_default();
             let builder = LedgerBuilder::from_prefix(Path::new("start"), bytes)
                 .unwrap_or_else(|_| LedgerBuilder::empty());
             let start = Start {
-                root: Some(copies[i].id.clone()),
+                root: Some(copies[i].0.to_owned()),
                 len: builder.len(),
                 records: ledger.records.len(),
             };
@@ -536,9 +596,11 @@ fn named_path(kind: &Kind) -> Option<String> {
 pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
     let mut lines = Vec::new();
     let mut problems = Vec::new();
+    let restore = inputs.mode.restore();
 
-    // B2.
-    let (start, mut builder, start_ledger, rejected) = choose_start(&inputs.ledger_copies);
+    // B2 (in the restore, hot's own ledger first: H5 a).
+    let (start, mut builder, start_ledger, rejected) =
+        choose_start(&start_candidates(&inputs.mode, &inputs.ledger_copies));
     let state = CopyState::fold(&start_ledger)
         .map_err(|error| Stop(format!("the start copy cannot be folded: {error}")))?;
     let mut start_texts: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -605,8 +667,13 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
     // archive part only hot holds would become an `unlisted` hold that only
     // `mie store resolve` clears (review of #209, finding 2). It
     // stops the rebuild wherever it could hide an entry: an archive part
-    // on a root or in the start, or a copy target holding entries.
-    if let Some(dir) = &inputs.missing_import_ledger {
+    // on a root or in the start, or a copy target holding entries. The
+    // restore restores hot's import ledger itself (H5 f).
+    if let Some(dir) = inputs
+        .missing_import_ledger
+        .as_ref()
+        .filter(|_| restore.is_none())
+    {
         let part = inputs
             .hot
             .files
@@ -669,10 +736,20 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
         texts.dedup();
         texts
     };
+    // In the restore, a live path's one `manifest` record in the start
+    // decides its text, and a copy with another text is a damaged copy (H5
+    // b, ADR-062 D11 step 5).
+    let recorded_text = |path: &str| -> Option<&str> {
+        restore?;
+        match start_texts.get(path).map(Vec::as_slice) {
+            Some([only]) => Some(only.as_str()),
+            _ => None,
+        }
+    };
     let mut conflicts = Vec::new();
     for (path, held) in &holders {
         let texts = distinct(path);
-        if texts.len() > 1 && !is_archive_part(path) {
+        if texts.len() > 1 && !is_archive_part(path) && recorded_text(path).is_none() {
             let groups: Vec<String> = texts
                 .iter()
                 .map(|text| {
@@ -792,6 +869,7 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
         let text: Option<&str> = match texts[..] {
             [only] => Some(only),
             [] => None,
+            _ if !is_archive_part(path) && recorded_text(path).is_some() => recorded_text(path),
             _ => {
                 let listed: BTreeSet<&str> = findings
                     .current
@@ -849,6 +927,18 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
                         damage(root, format!("its data cannot be read ({error})"), true);
                     }
                 },
+                // H5 b: another text than the start's on a live path.
+                RootCopy::Text { .. }
+                    if !is_archive_part(path)
+                        && text.is_some()
+                        && recorded_text(path).is_some() =>
+                {
+                    damage(
+                        root,
+                        "its manifest differs from the copy ledger's manifest record".to_owned(),
+                        is_cold,
+                    );
+                }
                 RootCopy::Text { .. } => {}
             }
         }
@@ -947,13 +1037,27 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
         // The derivation states what the rebuilt ledger holds, never that
         // it was written: the install comes later and may not happen
         // (re-review 2 of #209, finding 2).
-        let what = if inputs.record_lost {
-            "with --record-lost its `lost` record is derived into the rebuilt ledger, and it \
-             takes effect only if this run installs it (`wrote …` below): then every selection \
-             that covers it fails"
-        } else {
-            "nothing is written; after checking for a shared cause (an unmounted root, roots \
-             restored from an old backup), `mie store rebuild --record-lost` records it lost"
+        let what = match (inputs.record_lost, restore.is_some()) {
+            (true, false) => {
+                "with --record-lost its `lost` record is derived into the rebuilt ledger, and it \
+                 takes effect only if this run installs it (`wrote …` below): then every \
+                 selection that covers it fails"
+            }
+            (false, false) => {
+                "nothing is written; after checking for a shared cause (an unmounted root, \
+                 roots restored from an old backup), `mie store rebuild --record-lost` records \
+                 it lost"
+            }
+            (true, true) => {
+                "with --record-lost its `lost` record is derived into the restored ledger, and \
+                 it takes effect only once the restore installs it: then every selection that \
+                 covers it fails"
+            }
+            (false, true) => {
+                "nothing is written; after checking for a shared cause (an unmounted root, \
+                 roots restored from an old backup), `mie store restore --record-lost` records \
+                 it lost"
+            }
         };
         problems.push(format!(
             "{path}: no root holds it (no data file and no manifest on hot or on any cold root), \
@@ -979,13 +1083,17 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
     let mut hold_records = Vec::new();
     let mut unrecorded_unlisted = Vec::new();
     let mut new_unlisted = 0usize;
+    // The restore writes them without a flag (H5 c): it must complete
+    // before `mie ingest` may start, and D11's replication order limits them
+    // to the one archive file whose parts and entry a loss separated.
+    let record_unlisted = inputs.record_unlisted || restore.is_some();
     for (path, reason) in &findings.holds {
         holds.push((path.clone(), *reason));
         let new = state.hold_reason(path).is_none();
         if new && *reason == HoldReason::Unlisted {
             new_unlisted += 1;
         }
-        if new && *reason == HoldReason::Unlisted && !inputs.record_unlisted {
+        if new && *reason == HoldReason::Unlisted && !record_unlisted {
             lines.push(format!("unlisted: {path} (not recorded)"));
             problems.push(format!(
                 "{path}: no current import entry lists it, so it would be held (unlisted); \
@@ -1012,7 +1120,7 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
     // the flagged run included: an import-ledger disk that became an empty
     // mount point between two runs must show in the run that writes the
     // holds (re-review 2 of #209, finding 1).
-    if new_unlisted > 0 {
+    if new_unlisted > 0 && restore.is_none() {
         let what = if inputs.record_unlisted {
             "With --record-unlisted their holds are derived into the rebuilt ledger, and only \
              the hold resolution clears them once it is installed; if these counts show an empty \
@@ -1107,26 +1215,35 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
     lines.extend(quarantine.lines.iter().cloned());
     problems.extend(quarantine.problems.iter().cloned());
 
-    // B8: removed.
+    // B8: removed. In the restore a copy the start records is not read
+    // (H2, decision 4) and counts as verified, and every partition the
+    // copy-back brings back counts as on hot (H5 e).
     let partitions: BTreeSet<&str> = inputs
         .roots
         .iter()
         .flat_map(|root| &root.files)
         .filter(|(path, copy)| {
             !in_q(path)
-                && matches!(
-                    copy,
+                && match copy {
                     RootCopy::Text {
                         data: DataCheck::Good,
                         ..
-                    }
-                )
+                    } => true,
+                    RootCopy::Text {
+                        data: DataCheck::NotChecked,
+                        ..
+                    } => restore.is_some(),
+                    _ => false,
+                }
         })
         .map(|(path, _)| partition_of(path))
         .collect();
     let mut removed = Vec::new();
     for partition in partitions {
-        if inputs.hot.partitions.contains(partition) || state.is_removed(partition) {
+        if inputs.hot.partitions.contains(partition)
+            || state.is_removed(partition)
+            || restore.is_some_and(|restore| restore.copy_back.contains(partition))
+        {
             continue;
         }
         if date_of(partition) >= inputs.first_hot_date.as_str() {
@@ -1199,16 +1316,17 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
         unrecorded_unlisted,
         lines,
         problems,
+        chosen_entries: findings.chosen,
     })
 }
 
 // ------------------------------------------------------------- the run
 
 /// A cold root that presented its marker.
-struct Marked {
-    path: PathBuf,
-    id: String,
-    copy_target: bool,
+pub(super) struct Marked {
+    pub(super) path: PathBuf,
+    pub(super) id: String,
+    pub(super) copy_target: bool,
 }
 
 /// Runs one rebuild (module docs). `now_ms` is read once: every record and
@@ -1482,6 +1600,7 @@ fn rebuild(
         });
     }
     let inputs = RebuildInputs {
+        mode: Mode::Rebuild,
         at_ms,
         first_hot_date: first_hot_date.to_owned(),
         record_lost: flags.record_lost,
@@ -1564,7 +1683,7 @@ fn rebuild(
 }
 
 /// Why the marker of `root` no longer names it, if it does not.
-fn marker_gone(root: &Marked) -> Option<String> {
+pub(super) fn marker_gone(root: &Marked) -> Option<String> {
     match root_marker::read(&root.path) {
         Ok(Some(id)) if id == root.id => None,
         Ok(Some(other)) => Some(format!("its marker now carries the id {other:?}")),
@@ -1576,7 +1695,12 @@ fn marker_gone(root: &Marked) -> Option<String> {
 /// B9 step 6 for one copy target: a ledger copy that is no prefix of the
 /// installed ledger is moved aside; the next pass copies the rebuilt one
 /// from byte 0.
-fn move_copy_aside(hot: &Path, target: &Marked, aside: &Path, report: &mut RebuildReport) {
+pub(super) fn move_copy_aside(
+    hot: &Path,
+    target: &Marked,
+    aside: &Path,
+    report: &mut RebuildReport,
+) {
     let name = format!("{} ({})", target.path.display(), target.id);
     let check = match copy_ledger::check_copy(hot, &target.path) {
         Ok(LedgerCopyCheck::Good | LedgerCopyCheck::Absent) => return,
@@ -1608,7 +1732,7 @@ fn move_copy_aside(hot: &Path, target: &Marked, aside: &Path, report: &mut Rebui
 
 /// Reads hot's journal up to the length read now (B1); no journal is an
 /// empty one.
-fn read_journal(path: &Path) -> std::io::Result<JournalRead> {
+pub(super) fn read_journal(path: &Path) -> std::io::Result<JournalRead> {
     let mut file = match fs::File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(JournalRead::default()),
@@ -1622,7 +1746,7 @@ fn read_journal(path: &Path) -> std::io::Result<JournalRead> {
 
 /// The copy of the sealed part `path` on `root` (B1): its manifest
 /// classified and, with `check`, its data against that root's own text.
-fn read_copy(root: &Path, path: &str, check: bool) -> Result<RootCopy, Stop> {
+pub(super) fn read_copy(root: &Path, path: &str, check: bool) -> Result<RootCopy, Stop> {
     let manifest = format!("{}.manifest", path.strip_suffix(".parquet").unwrap_or(path));
     let file = root.join(&manifest);
     let bytes = fs::read(&file).map_err(|error| {
@@ -1655,7 +1779,7 @@ fn read_copy(root: &Path, path: &str, check: bool) -> Result<RootCopy, Stop> {
 }
 
 /// The data files without their manifest in the layout of `root`.
-fn orphan_data(root: &Path) -> Result<BTreeSet<String>, RawStoreError> {
+pub(super) fn orphan_data(root: &Path) -> Result<BTreeSet<String>, RawStoreError> {
     Ok(replica::list_unsealed(root)?
         .into_iter()
         .filter(|path| {

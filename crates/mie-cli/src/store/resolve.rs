@@ -436,8 +436,13 @@ struct Survey<'a> {
     notes: Vec<String>,
 }
 
-/// The remedy RA5 names for a file that does not read.
-const REPAIR: &str = "run `mie store verify`, then `mie store repair` (or the hot restore, #195)";
+/// The remedy RA5 names for a file that does not read. A copy target's
+/// file is repaired from hot; hot's own file on an intact hot is #217,
+/// since the repair never rewrites hot and `mie store restore` is for a
+/// lost hot only (#195 STOP 1 decision 2).
+const REPAIR: &str = "for a copy target's file, run `mie store verify`, then `mie store repair`; \
+                      the repair never rewrites hot, and `mie store restore` is for a lost hot \
+                      only: damage to hot's own file on an intact hot is #217";
 
 impl Survey<'_> {
     /// The entry copies the case decides on (`decides`) must read; any

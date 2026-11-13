@@ -62,8 +62,9 @@
 //!   the line that holds d, and the closing pass extends it under its usual
 //!   journal hold. Otherwise refused: the journal has no chain, so one copy
 //!   against hot cannot be attributed; when every other copy agrees with
-//!   this one against hot, hot's journal is named as the suspect, for the
-//!   hot restore (#195).
+//!   this one against hot, hot's journal is named as the suspect. The
+//!   repair never rewrites hot, and `mie store restore` is for a lost hot
+//!   only: damage to hot's own journal on an intact hot is #217.
 //! - **R8 Entry copies with an open entry finding:** replaced from hot only
 //!   when hot's entry lists every file with the SHA-256 of the ledger's
 //!   `manifest` record (else hot's manifest); otherwise refused as an entry
@@ -950,6 +951,7 @@ impl Repair<'_> {
             self.hot,
             path,
             text,
+            replica::OtherText::Stop,
             &mut |_| {},
         ) {
             Ok(_) => self.line(format!(
@@ -1154,7 +1156,8 @@ impl Repair<'_> {
                 && mine != theirs;
             let tail = if suspect {
                 " Every other copy agrees with this one against hot, so hot's journal is the \
-                 suspect: the hot restore (#195) restores it from the copies, never this repair"
+                 suspect. The repair never rewrites hot, and `mie store restore` is for a lost \
+                 hot only: damage to hot's own journal on an intact hot is #217"
             } else {
                 " No other copy agrees with hot over [0, d], and the journal has no hash chain, \
                  so the difference cannot be attributed"

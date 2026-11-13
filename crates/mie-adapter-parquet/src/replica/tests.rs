@@ -855,3 +855,76 @@ fn the_verify_lock_refuses_a_second_holder() {
     drop(held);
     try_verify_lock(dir.path()).unwrap();
 }
+
+/// #195 H6: a cold copy whose manifest text differs from the ledger's
+/// stops the copy back with [`OtherText::Stop`] (the recall, the repair),
+/// and with [`OtherText::PassOver`] (the hot restore) it is a damaged copy
+/// handed to `observe`, the next root supplying the file.
+#[test]
+fn copy_back_stops_or_passes_over_another_text() {
+    let fixture = TieredFixture::new("replica-copy-back-text");
+    let (path, partition) = first_part(&fixture);
+    let text = fs::read_to_string(layout::resolve(
+        &fixture.hot,
+        &TieredFixture::manifest_of(&path),
+    ))
+    .unwrap();
+    for root in &fixture.cold {
+        copy_sealed(&fixture.hot, root, &path).unwrap();
+    }
+    // cold-a's manifest carries another text (one byte of its rows).
+    let other = text.replacen("rows 2", "rows 3", 1);
+    assert_ne!(other, text);
+    let manifest = layout::resolve(&fixture.cold[0], &TieredFixture::manifest_of(&path));
+    writable(&manifest);
+    fs::write(&manifest, &other).unwrap();
+    let hot = TempDir::new("replica-copy-back-text-hot");
+    let roots = fixture.cold.to_vec();
+
+    let mut seen = Vec::new();
+    let error = copy_back(
+        &roots,
+        hot.path(),
+        &path,
+        &text,
+        OtherText::Stop,
+        &mut |d| seen.push(d.clone()),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&error, RawStoreError::Integrity(m) if m.contains("the recall stops")),
+        "{error}"
+    );
+    assert!(seen.is_empty());
+    assert!(!layout::resolve(hot.path(), &partition).exists());
+
+    let copied = copy_back(
+        &roots,
+        hot.path(),
+        &path,
+        &text,
+        OtherText::PassOver,
+        &mut |d| seen.push(d.clone()),
+    )
+    .unwrap();
+    assert_eq!(
+        (copied.root.as_path(), copied.outcome),
+        (fixture.cold[1].as_path(), CopyOutcome::Copied)
+    );
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].root, fixture.cold[0]);
+    assert!(
+        matches!(&seen[0].error, RawStoreError::Integrity(m) if m.contains("damaged copy")),
+        "{:?}",
+        seen[0]
+    );
+    assert_eq!(copied.damaged, seen);
+    assert_eq!(
+        fs::read_to_string(layout::resolve(
+            hot.path(),
+            &TieredFixture::manifest_of(&path)
+        ))
+        .unwrap(),
+        text
+    );
+}

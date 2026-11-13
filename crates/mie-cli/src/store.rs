@@ -38,6 +38,11 @@
 //!   aside into `.mie/damaged/`, fills a target that lacks the files that
 //!   left hot, and ends with one replication pass
 //!   ([`repair`](mod@repair) holds the rules, #192, ADR-062 D11).
+//! - [`restore`] (`mie store restore`) restores a lost hot from the copy
+//!   targets: the journal, the import ledger, the copy ledger by the
+//!   rebuild's derivation, every partition hot must hold, and hot's marker
+//!   last, the commit point; until then every command refuses the hot
+//!   ([`restore`](mod@restore) holds the rules, #195, ADR-062 D11).
 //! - [`resolve`] (`mie store resolve`) proposes the archive file of every
 //!   open hold, and with `--file` re-admits the held parts of that file
 //!   when they equal its published rows: it writes the missing or a
@@ -82,6 +87,7 @@ pub mod rebuild;
 pub mod repair;
 pub mod replicate;
 pub mod resolve;
+pub mod restore;
 pub mod verify;
 
 pub use adopt::{AdoptReport, AdoptRequest};
@@ -227,9 +233,10 @@ pub fn device_probe() -> Result<Box<dyn DeviceProbe>, String> {
 ///
 /// # Errors
 ///
-/// A description naming `mie store init` and the hot restore when hot has
-/// no marker, or naming the cold root whose marker `raw_root` carries, or
-/// the read failure.
+/// A description naming `mie store init` and the hot restore (`mie store
+/// restore`, and its re-run when `.mie/` exists without a marker: an
+/// interrupted restore) when hot has no marker, or naming the cold root
+/// whose marker `raw_root` carries, or the read failure.
 pub fn check_hot(raw_root: &Path, cold_roots: &[ColdRoot]) -> Result<(), String> {
     if cold_roots.is_empty() {
         return Ok(());
@@ -241,13 +248,24 @@ pub fn check_hot(raw_root: &Path, cold_roots: &[ColdRoot]) -> Result<(), String>
              the hot root (ADR-062 D4)",
             raw_root.display()
         )),
-        Ok(None) => Err(format!(
-            "raw_root {} has no root marker although paths.cold_roots is configured. A new \
-             tiered store starts with `mie store init --config <ingest config>`; a lost hot is \
-             restored from the copy targets by the hot restore (ADR-062 D11), never \
-             re-initialized",
-            raw_root.display()
-        )),
+        Ok(None) => {
+            let interrupted = if fs::symlink_metadata(root_marker::meta_dir(raw_root)).is_ok() {
+                format!(
+                    " {} exists without the marker: an interrupted restore, which running `mie \
+                     store restore --config <ingest config>` again completes",
+                    root_marker::meta_dir(raw_root).display()
+                )
+            } else {
+                String::new()
+            };
+            Err(format!(
+                "raw_root {} has no root marker although paths.cold_roots is configured. A new \
+                 tiered store starts with `mie store init --config <ingest config>`; a lost hot \
+                 is restored from the copy targets by the hot restore, `mie store restore \
+                 --config <ingest config>` (ADR-062 D11), never re-initialized.{interrupted}",
+                raw_root.display()
+            ))
+        }
         Err(error) => Err(format!(
             "raw_root {}: cannot read hot's root marker: {error}",
             raw_root.display()
@@ -567,6 +585,36 @@ pub fn rebuild(
     print_report(report.lines, &report.problems, out)
 }
 
+/// `mie store restore`: one hot restore of the store of `config` (ADR-062
+/// D11, the module [`restore`](mod@restore)), with the archive
+/// configuration `archive`, else `[history] archive_config`, else none,
+/// and the hot window starting on `first_hot_date`
+/// ([`crate::ingest::first_hot_date`] in production). `now_ms` is read once:
+/// it stamps every record and names the run's `.mie/damaged/` directories.
+///
+/// It prints the journal candidates and the choice, the import ledger, the
+/// derivation's lines, the install and the copy-back, then `restored: …` or
+/// `not restored: …`, then `PASS` (returns `true`) only when hot's marker
+/// was written and nothing failed, otherwise one `FAIL: <problem>` line per
+/// problem (returns `false`).
+///
+/// # Errors
+///
+/// A description when the report cannot be written.
+pub fn restore(
+    config: &IngestConfig,
+    archive: Option<&Path>,
+    flags: restore::Flags,
+    first_hot_date: &str,
+    probe: &dyn DeviceProbe,
+    now_ms: &dyn Fn() -> i64,
+    out: &mut dyn Write,
+) -> Result<bool, String> {
+    let report = restore::run(config, archive, flags, first_hot_date, probe, now_ms);
+    let pass = print_report(report.lines, &report.problems, out)?;
+    Ok(pass && report.restored)
+}
+
 /// `mie store resolve`: proposes the archive file of every open hold, or
 /// with `file` (`--file`) re-admits that file's held parts, or with
 /// `replace` (`--replace`) moves its superseded generation into quarantine
@@ -676,6 +724,17 @@ fn run_init(config: &IngestConfig) -> Result<Vec<String>, String> {
     }
     let meta = root_marker::meta_dir(raw_root);
     if exists(&meta)? {
+        let marked = root_marker::read(raw_root)
+            .map_err(|e| format!("raw_root {}: {e}", raw_root.display()))?
+            .is_some();
+        if !marked {
+            return Err(format!(
+                "{} already exists without hot's marker: an interrupted restore, which running \
+                 `mie store restore --config <ingest config>` again completes; never \
+                 re-initialize it (ADR-062 D11)",
+                meta.display()
+            ));
+        }
         return Err(format!(
             "{} already exists: the store is initialized (ADR-062 D7)",
             meta.display()
@@ -693,8 +752,8 @@ fn run_init(config: &IngestConfig) -> Result<Vec<String>, String> {
         })? {
             return Err(format!(
                 "cold root {} carries the marker of root {id:?}, so this hot was initialized \
-                 before and is lost: restore it by the hot restore (ADR-062 D11), never \
-                 re-initialize it",
+                 before and is lost: restore it by the hot restore, `mie store restore --config \
+                 <ingest config>` (ADR-062 D11), never re-initialize it",
                 cold.path.display()
             ));
         }
@@ -702,7 +761,8 @@ fn run_init(config: &IngestConfig) -> Result<Vec<String>, String> {
         if exists(&ledger).map_err(|e| format!("cold root {}: {e}", cold.path.display()))? {
             return Err(format!(
                 "cold root {} holds a copy-ledger copy {}, so this hot is lost: restore it by \
-                 the hot restore (ADR-062 D11), never re-initialize it",
+                 the hot restore, `mie store restore --config <ingest config>` (ADR-062 D11), \
+                 never re-initialize it",
                 cold.path.display(),
                 ledger.display()
             ));

@@ -12,6 +12,32 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
 
 ### Added
 
+- **Storage tiers, step 9: the hot restore (#195, ADR-062 D7, D11,
+  proposed).** `mie store restore --config <ingest config>
+  [--archive-config <path>] [--record-lost]` restores a lost hot disk from
+  the copy targets before `mie ingest` or the importer may start. It
+  refuses an intact hot (damage on an intact hot is #217), a missing
+  `raw_root`, a root without its marker and roots on one device, and takes
+  the copy-ledger, pass and verify locks and every source's writer lock
+  without waiting. It restores the journal from the longest copy (copies
+  that differ beyond their common prefix stop it; a cut last line gets its
+  `\n`), the import ledger from the targets (differing entries decided by
+  the manifests, else held; a surviving hot copy of another variant moved
+  into `.mie/damaged/`), and the copy ledger by the rebuild's derivation,
+  with hot's surviving ledger as the first start candidate and `unlisted`
+  holds written without a flag. It then copies back every hot-window
+  partition and every partition not recorded removed, verifying each
+  file: a damaged copy is passed over and named for `mie store verify`,
+  then `mie store repair`, and a file with no good copy stays recorded so
+  every read of it fails. A file a record names that no root holds stops
+  the restore before any write unless `--record-lost`. Hot's marker is
+  written last, so running the command again completes a restore that
+  stopped or crashed; `mie ingest`, the importer and `mie store init` name
+  that re-run when `.mie/` exists without a marker. Data of a cold copy is
+  read only when the ledger does not record it. `mie store repair` and
+  `mie store resolve` no longer offer the restore for damage on an intact
+  hot and name #217 instead.
+
 - **Storage tiers, step 8b: the replace into quarantine (#211, ADR-062
   D5, D7, D11, proposed).** `mie store resolve --file <archive path>
   --replace` resolves held archive parts whose rows differ from the
