@@ -2566,6 +2566,69 @@ fn j_crash_after_row_3_set_aside_still_reaches_every_target() {
     }
 }
 
+/// Review round 5 (U, a hot-side error stops): the state of
+/// [`j_crash_after_row_3_set_aside_still_reaches_every_target`] with a
+/// truncated `D` on cold-b, crashed at `Step::SetAside`, then hot's data
+/// file of `live(3)` unreadable (mode 000). For a J path (LIVE before the
+/// window) and a planned one (LIVE inside it), the re-run stops before
+/// hot's marker and names the path and hot's read error, never "no cold
+/// root holds a verified copy". Once hot reads it again, a re-run commits
+/// and ends as the uncrashed run: cold-b's `D` kept below `.mie/damaged/`,
+/// 2 of 2 copies after the next pass.
+#[test]
+fn u_unreadable_hot_copy_after_set_aside_crash_stops() {
+    for (label, first_hot) in [("J", J_FIRST_HOT), ("planned", FIRST_HOT)] {
+        let (fixture, data, bytes) =
+            j_row3_beside(&format!("restore-u-hot-copy-{label}"), |fixture, data| {
+                let file = fixture.cold[1].join(live(3));
+                fs::write(&file, &data[..data.len() - 1]).unwrap();
+                file
+            });
+        if reads_mode_000(&fixture.dir.0) {
+            return;
+        }
+        AFTER_STEP.with(|crash| crash.set(Some(Step::SetAside)));
+        let first = restore_at(&fixture, Flags::default(), first_hot, AT);
+        assert!(AFTER_STEP.with(std::cell::Cell::get).is_none(), "{label}");
+        AFTER_STEP.with(|crash| crash.set(None));
+        assert_not_restored(&first, &["simulated crash"]);
+        let hot_data = fixture.hot.join(live(3));
+        let mode = fs::metadata(&hot_data).unwrap().permissions();
+        unreadable(&hot_data);
+        let stopped = restore_at(&fixture, Flags::default(), first_hot, AT + 1);
+        assert_not_restored(
+            &stopped,
+            &[&live(3), "Permission denied", "completes once hot reads it"],
+        );
+        assert!(
+            !stopped
+                .problems
+                .iter()
+                .any(|p| p.contains("no cold root holds a verified copy")),
+            "{label}: {stopped:#?}"
+        );
+        assert!(!root_marker::marker_path(&fixture.hot).exists(), "{label}");
+        fs::set_permissions(&hot_data, mode).unwrap();
+        let report = restore_at(&fixture, Flags::default(), first_hot, AT + 2);
+        assert!(report.restored, "{label}: {report:#?}");
+        assert_eq!(fs::read(&hot_data).unwrap(), data, "{label}");
+        assert!(!fixture.cold[1].join(live(3)).exists(), "{label}");
+        let damaged = fixture.cold[1].join(".mie").join("damaged");
+        let kept = snapshot(&fixture)
+            .into_iter()
+            .filter(|(path, held)| path.starts_with(&damaged) && *held == bytes)
+            .count();
+        assert_eq!(kept, 1, "{label}");
+        assert_eq!(fixture.pass().problems, Vec::<String>::new(), "{label}");
+        assert_eq!(
+            copies(&fixture, &live(3)),
+            vec!["cold-a", "cold-b"],
+            "{label}"
+        );
+        assert_eq!(fixture.pass().problems, Vec::<String>::new(), "{label}");
+    }
+}
+
 /// The reviewer's state of round 3, finding 2: LIVE replicated and removed
 /// from hot, then part 1 gone from both cold roots; with `garbage` a
 /// half-written `D~` of part 1 on cold-a (a crashed re-copy). Hot's ledger

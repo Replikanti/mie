@@ -2080,7 +2080,10 @@ What breaks:
     record of a copy on any root or with no cold root holding its data
     file, and of which some cold root holds the manifest or the pending
     manifest by name (an error other than not-found counts as present),
-    or hot holds a copy that verifies against the installed text.
+    or hot holds a copy that verifies against the installed text (a
+    read error on hot's copy counts as held, and the copy-back's check of
+    hot's copy then stops the run: an error on hot's side, never the
+    lost-file rule's line; review 5 of #218).
     No `returned` is written: the hot removal finishes the old removal
     once the path's k `copy` records lie inside the verified ledger-copy
     prefixes (rules (e), (f)), and until then rule (e) keeps it on hot.

@@ -747,6 +747,15 @@ fn move_stop(what: &str, root: &Path, error: &RawStoreError) -> Stop {
     Stop(format!("{what}: {error}; {then} (ADR-062 D11)"))
 }
 
+/// The stop for a read error on hot's copy of `path` (H6, U): an error on
+/// hot's side stops the run before hot's marker.
+fn hot_unreadable(path: &str, error: &RawStoreError) -> Stop {
+    Stop(format!(
+        "{path}: hot's copy cannot be read ({error}); the restore stops before hot's marker and \
+         completes once hot reads it (ADR-062 D11)"
+    ))
+}
+
 /// The stop for a root whose marker is gone or names another id.
 fn marker_stop(root: &Marked, why: &str) -> Stop {
     Stop(format!(
@@ -1098,11 +1107,12 @@ impl CopyBack<'_> {
                 }
                 // A re-run after (k) moved the only cold source aside: hot
                 // already holds the path, verified against the installed
-                // text, as an uncrashed run left it.
-                if matches!(
-                    replica::check_sealed_copy(self.hot, path, text),
-                    Ok(CopyCheck::Good)
-                ) {
+                // text, as an uncrashed run left it. A read error on hot's
+                // copy is hot's side, a stop (U, round 5): hot may hold the
+                // path, so the lost-file rule's line would be false.
+                let on_hot = replica::check_sealed_copy(self.hot, path, text)
+                    .map_err(|error| hot_unreadable(path, &error))?;
+                if on_hot == CopyCheck::Good {
                     set_aside(
                         self.targets,
                         self.state,
@@ -2064,10 +2074,12 @@ fn restore(
             })
         };
         match form {
+            // A read error counts as held, as on a cold root: the
+            // copy-back's check of hot's copy then stops (round 5).
             Held::VerifiedOnHot => state.ledger_text(path).is_some_and(|text| {
                 matches!(
                     replica::check_sealed_copy(hot, path, text),
-                    Ok(CopyCheck::Good)
+                    Ok(CopyCheck::Good) | Err(_)
                 )
             }),
             _ => cold_paths.iter().any(cold),
