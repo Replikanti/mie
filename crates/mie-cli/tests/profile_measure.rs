@@ -692,7 +692,7 @@ fn measure_profile() {
         .unwrap();
     println!("Recorded at @1 (bin 10 USDT, t5, 10 %, 70 %, 5 days), per profile and half:");
     for (kind, profile) in profiles.iter().enumerate() {
-        for (half, cell) in rows[v1_row].cells[kind].iter().enumerate().take(2) {
+        for (half, cell) in rows[v1_row].cells[kind].iter_mut().enumerate().take(2) {
             let line = cell.line();
             println!("  {profile} {}: {line}", half_label(half));
         }
@@ -707,7 +707,7 @@ fn measure_profile() {
             row.resolution * row.bin_units() / SCALE
         );
         for (kind, profile) in profiles.iter().enumerate() {
-            for (half, cell) in row.cells[kind].iter().enumerate().take(2) {
+            for (half, cell) in row.cells[kind].iter_mut().enumerate().take(2) {
                 let line = cell.line();
                 println!("    {profile} {}: {line}", half_label(half));
             }
