@@ -2180,10 +2180,10 @@ fn report_divergences(run: &Run) {
         for half in [Some(0), Some(1), None] {
             for side in [Some(0), Some(1), None] {
                 let mut stats = PairStats::default();
-                for h in 0..2 {
-                    for s in 0..2 {
+                for (h, by_side) in model.stats.iter().enumerate() {
+                    for (s, cell) in by_side.iter().enumerate() {
                         if half.is_none_or(|half| half == h) && side.is_none_or(|side| side == s) {
-                            stats.add(&model.stats[h][s]);
+                            stats.add(cell);
                         }
                     }
                 }
@@ -2492,13 +2492,13 @@ fn report_r1(flow: &FlowModel) {
 
 fn report_exhaustion(flow: &FlowModel) {
     for (b, baseline) in BASELINES.iter().enumerate() {
-        for half in 0..2 {
+        for (half, by_q) in flow.exhausted[b].iter().enumerate() {
             println!(
                 "exhaustion B={} {}: {}",
                 baseline,
                 half_label(Some(half)),
                 (0..Q)
-                    .map(|q| format!("q={} {}", q_label(q), flow.exhausted[b][half][q]))
+                    .map(|q| format!("q={} {}", q_label(q), by_q[q]))
                     .collect::<Vec<_>>()
                     .join(", ")
             );
