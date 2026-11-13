@@ -47,6 +47,8 @@ fn inputs() -> RebuildInputs {
                 copy_target: true,
                 files: BTreeMap::new(),
                 orphan_data: BTreeSet::new(),
+                temps: BTreeMap::new(),
+                evidence: BTreeMap::new(),
                 quarantine: QuarantineListing::default(),
             })
             .into(),
@@ -1398,13 +1400,12 @@ fn a_missing_hot_import_ledger_does_not_stop_the_restore() {
     assert!(derived.holds.is_empty(), "{:?}", derived.holds);
 }
 
-/// H5 h (review of #218): a path cold roots hold only as debris (data
-/// without its manifest on cold-a, a manifest that does not parse on
-/// cold-b) and no record names is a lost candidate, origin `verify`, in
-/// the restore only; the rebuild keeps counting debris as held, since its
-/// hot holds the part.
+/// B6a (formerly H5 h, review of #218): a path cold roots hold only as
+/// debris (data without its manifest on cold-a, a manifest that does not
+/// parse on cold-b) and no record names is a lost candidate, origin
+/// `verify`, in both modes; with hot holding both paths, none.
 #[test]
-fn h_cold_debris_is_a_lost_candidate_only_in_the_restore() {
+fn h_cold_debris_is_a_lost_candidate_when_hot_lacks_the_path() {
     let orphan = live("2026-10-06", 3);
     let bad = live("2026-10-06", 4);
     let mut inputs = inputs();
@@ -1415,30 +1416,37 @@ fn h_cold_debris_is_a_lost_candidate_only_in_the_restore() {
         &bad,
         RootCopy::BadText("the manifest does not parse: x".to_owned()),
     );
-    let derived = derive_ok(&inputs);
-    assert_eq!(derived.lost, Vec::<LostFile>::new());
-    restoring(&mut inputs, None, &[]);
-    let derived = derive_ok(&inputs);
-    let lost: Vec<(&str, LostOrigin, bool)> = derived
-        .lost
-        .iter()
-        .map(|file| (file.path.as_str(), file.origin, file.recorded))
-        .collect();
-    assert_eq!(
-        lost,
-        vec![
-            (orphan.as_str(), LostOrigin::Verify, false),
-            (bad.as_str(), LostOrigin::Verify, false),
-        ]
-    );
-    assert!(
-        derived
-            .problems
+    let mut held = inputs.clone();
+    on_hot(&mut held, &orphan, &text(&orphan, &sha("a")));
+    on_hot(&mut held, &bad, &text(&bad, &sha("b")));
+    assert_eq!(derive_ok(&held).lost, Vec::<LostFile>::new());
+    for restore in [false, true] {
+        if restore {
+            restoring(&mut inputs, None, &[]);
+        }
+        let derived = derive_ok(&inputs);
+        let lost: Vec<(&str, LostOrigin, bool)> = derived
+            .lost
             .iter()
-            .any(|p| p.contains(&orphan) && p.contains("only debris")),
-        "{:?}",
-        derived.problems
-    );
+            .map(|file| (file.path.as_str(), file.origin, file.recorded))
+            .collect();
+        assert_eq!(
+            lost,
+            vec![
+                (orphan.as_str(), LostOrigin::Verify, false),
+                (bad.as_str(), LostOrigin::Verify, false),
+            ],
+            "restore {restore}"
+        );
+        assert!(
+            derived
+                .problems
+                .iter()
+                .any(|p| p.contains(&orphan) && p.contains("the path must stay counted")),
+            "{:?}",
+            derived.problems
+        );
+    }
     inputs.record_lost = true;
     let derived = derive_ok(&inputs);
     assert!(derived.added.iter().any(|record| record.kind
@@ -1449,7 +1457,7 @@ fn h_cold_debris_is_a_lost_candidate_only_in_the_restore() {
         }));
 }
 
-/// H5 h: debris beside a sealed copy, or under a path a start record
+/// B6a: debris beside a sealed copy, or under a path a start record
 /// names, is no lost candidate: the copy or the record keeps the path
 /// counted.
 #[test]
@@ -1474,11 +1482,12 @@ fn h_debris_beside_a_copy_or_a_record_is_no_candidate() {
     assert_eq!(derive_ok(&inputs).lost, Vec::<LostFile>::new());
 }
 
-/// H5 h: an unrecorded sealed copy on a read-only root gets its
-/// `manifest` record in the restore (so the copy-back brings it to hot),
-/// never in the rebuild.
+/// B6a rule 2 (formerly H5 h): an unrecorded sealed copy on a read-only
+/// root gets its `manifest` record when hot lacks the path, in both modes
+/// (so the restore's copy-back brings it to hot), never while hot holds
+/// it.
 #[test]
-fn h_unrecorded_read_only_copy_gets_its_manifest_in_the_restore() {
+fn h_unrecorded_read_only_copy_gets_its_manifest_when_hot_lacks_it() {
     let path = live("2026-10-06", 3);
     let manifest = text(&path, &sha("a"));
     let mut inputs = inputs();
@@ -1492,14 +1501,721 @@ fn h_unrecorded_read_only_copy_gets_its_manifest_in_the_restore() {
             data: DataCheck::NotChecked,
         },
     );
-    on_hot(&mut inputs, &path, &manifest);
-    assert_eq!(derive_ok(&inputs).added, Vec::<Record>::new());
-    inputs.hot = HotRead::default();
-    restoring(&mut inputs, None, &[&partition(&path)]);
-    let added: Vec<Kind> = derive_ok(&inputs)
-        .added
+    let mut held = inputs.clone();
+    on_hot(&mut held, &path, &manifest);
+    assert_eq!(derive_ok(&held).added, Vec::<Record>::new());
+    for restore in [false, true] {
+        if restore {
+            restoring(&mut inputs, None, &[&partition(&path)]);
+        }
+        let added: Vec<Kind> = derive_ok(&inputs)
+            .added
+            .into_iter()
+            .map(|record| record.kind)
+            .collect();
+        assert_eq!(
+            added,
+            vec![Kind::Manifest {
+                text: manifest.clone()
+            }],
+            "restore {restore}"
+        );
+    }
+}
+
+// ------------------------------------- B6a: cold-only paths (#195 amendment)
+
+/// The part path of the B6a cases: `part-00003` of the live date.
+fn p3() -> String {
+    live("2026-10-06", 3)
+}
+
+/// Gives cold root `root` the temp forms of `path`: `D~` with `data_tmp`,
+/// and the pending manifest `pending`.
+fn temps(
+    inputs: &mut RebuildInputs,
+    root: usize,
+    path: &str,
+    data_tmp: bool,
+    pending: Option<RootCopy>,
+) {
+    inputs.roots[root]
+        .temps
+        .insert(path.to_owned(), TempForms { data_tmp, pending });
+}
+
+/// A pending manifest with `text` whose data checked `data`.
+fn pending(text: &str, data: DataCheck) -> Option<RootCopy> {
+    Some(RootCopy::Text {
+        text: text.to_owned(),
+        data,
+    })
+}
+
+/// The three settings every `b6a_*` case runs in: the restore, the
+/// rebuild with an empty hot, and the rebuild with hot holding `path`
+/// with `hot_text` (which must give today's output).
+fn settings(
+    base: &RebuildInputs,
+    path: &str,
+    hot_text: &str,
+) -> [(&'static str, RebuildInputs); 3] {
+    let mut restore = base.clone();
+    restoring(&mut restore, None, &[&partition(path)]);
+    let rebuild = base.clone();
+    let mut hot = base.clone();
+    on_hot(&mut hot, path, hot_text);
+    [
+        ("restore", restore),
+        ("rebuild", rebuild),
+        ("hot holds it", hot),
+    ]
+}
+
+/// `inputs` without the B6a reads (temps and evidence): what the
+/// derivation saw before B6a.
+fn without_b6a_reads(inputs: &RebuildInputs) -> RebuildInputs {
+    let mut inputs = inputs.clone();
+    inputs.hot.evidence.clear();
+    for root in &mut inputs.roots {
+        root.temps.clear();
+        root.evidence.clear();
+    }
+    inputs
+}
+
+/// The records added for `path` (manifest, copy, lost), in order.
+fn records_of(derived: &Derived, path: &str) -> Vec<Kind> {
+    added(derived)
         .into_iter()
-        .map(|record| record.kind)
-        .collect();
-    assert_eq!(added, vec![Kind::Manifest { text: manifest }]);
+        .filter(|kind| named_path(kind).as_deref() == Some(path))
+        .collect()
+}
+
+/// The lost candidates as `(path, origin)`.
+fn lost_of(derived: &Derived) -> Vec<(String, LostOrigin)> {
+    derived
+        .lost
+        .iter()
+        .map(|file| (file.path.clone(), file.origin))
+        .collect()
+}
+
+#[track_caller]
+fn assert_no_problem(derived: &Derived, needles: &[&str]) {
+    assert!(
+        !derived
+            .problems
+            .iter()
+            .any(|p| needles.iter().all(|n| p.contains(n))),
+        "a problem with {needles:?} in {:#?}",
+        derived.problems
+    );
+}
+
+/// With hot holding the path, the B6a reads change nothing: the output
+/// equals the derivation over the same inputs without them.
+#[track_caller]
+fn assert_hot_unchanged(hot: &RebuildInputs) {
+    assert_eq!(derive_ok(hot), derive_ok(&without_b6a_reads(hot)));
+}
+
+/// Row 1: a sealed copy, `D`+`M`, the data verified on a copy target:
+/// `manifest` and `copy`, in every setting; on a read-only root (data not
+/// checked in the restore) `manifest` alone, which only hot's copy
+/// replaced before B6a.
+#[test]
+fn b6a_01_sealed_copy() {
+    let (p, t) = (p3(), text(&p3(), &sha("a")));
+    let mut base = inputs();
+    on(&mut base, 0, &p, good(&t));
+    for (setting, inputs) in settings(&base, &p, &t) {
+        let derived = derive_ok(&inputs);
+        assert_eq!(
+            records_of(&derived, &p),
+            vec![manifest(&t), copy(&p, "cold-a")],
+            "{setting}"
+        );
+        assert!(derived.lost.is_empty(), "{setting}");
+    }
+    let mut base = inputs();
+    base.roots[1].copy_target = false;
+    on(&mut base, 1, &p, good(&t));
+    for (setting, mut inputs) in settings(&base, &p, &t) {
+        if setting == "restore" {
+            on(
+                &mut inputs,
+                1,
+                &p,
+                RootCopy::Text {
+                    text: t.clone(),
+                    data: DataCheck::NotChecked,
+                },
+            );
+        }
+        let derived = derive_ok(&inputs);
+        let expected = if setting == "hot holds it" {
+            vec![]
+        } else {
+            vec![manifest(&t)]
+        };
+        assert_eq!(records_of(&derived, &p), expected, "{setting}");
+        assert!(derived.lost.is_empty(), "{setting}");
+        if setting == "hot holds it" {
+            assert_hot_unchanged(&inputs);
+        }
+    }
+}
+
+/// Row 2: a parseable `M` whose data fails (here its SHA-256), and an
+/// absent `D` beside a `D~` that does not verify: held with its text, a
+/// `FAIL:` naming verify, then repair; never a lost candidate.
+#[test]
+fn b6a_02_sealed_text_without_good_data() {
+    let (p, t) = (p3(), text(&p3(), &sha("a")));
+    for (data, why, data_tmp) in [
+        (DataCheck::Sha256, "sha256", false),
+        (DataCheck::Missing, "missing", true),
+    ] {
+        let mut base = inputs();
+        on(
+            &mut base,
+            0,
+            &p,
+            RootCopy::Text {
+                text: t.clone(),
+                data: data.clone(),
+            },
+        );
+        temps(&mut base, 0, &p, data_tmp, None);
+        for (setting, inputs) in settings(&base, &p, &t) {
+            let derived = derive_ok(&inputs);
+            assert_eq!(
+                records_of(&derived, &p),
+                vec![manifest(&t)],
+                "{setting} {why}"
+            );
+            assert!(derived.lost.is_empty(), "{setting} {why}");
+            assert_problem(&derived, &[&p, "on cold-a", why, "mie store repair"]);
+            if setting == "hot holds it" {
+                assert_hot_unchanged(&inputs);
+            }
+        }
+    }
+}
+
+/// Row 3: `M` with its data only under `D~` (a power loss kept the
+/// manifest's rename and lost the data's): the `manifest` record, the
+/// copy named `missing` for the repair; the restore's copy-back reads
+/// `D~` (run level).
+#[test]
+fn b6a_03_manifest_with_temp_data() {
+    let (p, t) = (p3(), text(&p3(), &sha("a")));
+    let mut base = inputs();
+    on(
+        &mut base,
+        0,
+        &p,
+        RootCopy::Text {
+            text: t.clone(),
+            data: DataCheck::Missing,
+        },
+    );
+    temps(&mut base, 0, &p, true, None);
+    for (setting, inputs) in settings(&base, &p, &t) {
+        let derived = derive_ok(&inputs);
+        assert_eq!(records_of(&derived, &p), vec![manifest(&t)], "{setting}");
+        assert!(derived.lost.is_empty(), "{setting}");
+        assert_problem(&derived, &[&p, "on cold-a", "missing", "mie store repair"]);
+        if setting == "hot holds it" {
+            assert_hot_unchanged(&inputs);
+        }
+    }
+}
+
+/// Row 4: a manifest that does not parse, any data: a lost candidate,
+/// origin `verify`, plus the damaged copy's `FAIL:`, in both modes; with
+/// hot holding the path only the damaged copy.
+#[test]
+fn b6a_04_bad_manifest() {
+    let (p, t) = (p3(), text(&p3(), &sha("a")));
+    let mut base = inputs();
+    on(
+        &mut base,
+        0,
+        &p,
+        RootCopy::BadText("the manifest does not parse: x".to_owned()),
+    );
+    base.roots[0].orphan_data.insert(p.clone());
+    for (setting, inputs) in settings(&base, &p, &t) {
+        let derived = derive_ok(&inputs);
+        assert_problem(
+            &derived,
+            &[&p, "on cold-a", "does not parse", "does not verify"],
+        );
+        if setting == "hot holds it" {
+            assert!(derived.lost.is_empty());
+            assert_eq!(records_of(&derived, &p), vec![manifest(&t)]);
+            assert_hot_unchanged(&inputs);
+        } else {
+            assert_eq!(
+                lost_of(&derived),
+                vec![(p.clone(), LostOrigin::Verify)],
+                "{setting}"
+            );
+            assert_eq!(records_of(&derived, &p), vec![], "{setting}");
+            assert_problem(
+                &derived,
+                &[
+                    &p,
+                    "manifest on cold-a that does not parse",
+                    "--record-lost",
+                ],
+            );
+        }
+    }
+}
+
+/// Row 5: `D` with a verified pending manifest (a copy crashed after
+/// `PublishData`): rolled forward, the `manifest` record with `M~`'s text
+/// and no `copy` record, in both modes; the rebuild names the record
+/// that only a pending manifest gives.
+#[test]
+fn b6a_05_data_with_pending_manifest() {
+    let (p, t) = (p3(), text(&p3(), &sha("a")));
+    let mut base = inputs();
+    base.roots[0].orphan_data.insert(p.clone());
+    temps(&mut base, 0, &p, false, pending(&t, DataCheck::Good));
+    for (setting, inputs) in settings(&base, &p, &t) {
+        let derived = derive_ok(&inputs);
+        assert!(derived.lost.is_empty(), "{setting}: {:?}", derived.lost);
+        match setting {
+            "hot holds it" => {
+                assert_eq!(records_of(&derived, &p), vec![]);
+                assert_eq!(derived.problems, Vec::<String>::new());
+                assert_hot_unchanged(&inputs);
+            }
+            "restore" => {
+                assert_eq!(records_of(&derived, &p), vec![manifest(&t)]);
+                assert_eq!(derived.cold_recorded, BTreeSet::from([p.clone()]));
+                assert_no_problem(&derived, &[&p]);
+            }
+            _ => {
+                assert_eq!(records_of(&derived, &p), vec![manifest(&t)]);
+                assert_problem(
+                    &derived,
+                    &[&p, "from the pending manifest", "no root holds it sealed"],
+                );
+            }
+        }
+    }
+}
+
+/// Row 6: `D~` and `M~`, both verified (a copy crashed after `Verify` or
+/// `MarkReadOnly`): rolled forward as row 5.
+#[test]
+fn b6a_06_verified_temps() {
+    let (p, t) = (p3(), text(&p3(), &sha("a")));
+    let mut base = inputs();
+    temps(&mut base, 0, &p, true, pending(&t, DataCheck::Good));
+    for (setting, inputs) in settings(&base, &p, &t) {
+        let derived = derive_ok(&inputs);
+        assert!(derived.lost.is_empty(), "{setting}: {:?}", derived.lost);
+        if setting == "hot holds it" {
+            assert_eq!(records_of(&derived, &p), vec![]);
+            assert_eq!(derived.problems, Vec::<String>::new());
+            assert_hot_unchanged(&inputs);
+        } else {
+            assert_eq!(records_of(&derived, &p), vec![manifest(&t)], "{setting}");
+            assert_no_problem(&derived, &[&p, "--record-lost"]);
+        }
+    }
+}
+
+/// Row 7: a parseable `M~` whose data (`D`, else `D~`) fails: held with
+/// its text as row 2, the pending copy named for verify, then repair.
+#[test]
+fn b6a_07_pending_text_without_good_data() {
+    let (p, t) = (p3(), text(&p3(), &sha("a")));
+    for (data, data_tmp, orphan) in [
+        (DataCheck::Sha256, true, false),
+        (DataCheck::Size, false, true),
+        (DataCheck::Missing, false, false),
+    ] {
+        let mut base = inputs();
+        temps(&mut base, 0, &p, data_tmp, pending(&t, data.clone()));
+        if orphan {
+            base.roots[0].orphan_data.insert(p.clone());
+        }
+        for (setting, inputs) in settings(&base, &p, &t) {
+            let derived = derive_ok(&inputs);
+            assert!(
+                derived.lost.is_empty(),
+                "{setting} {data:?}: {:?}",
+                derived.lost
+            );
+            if setting == "hot holds it" {
+                assert_eq!(records_of(&derived, &p), vec![]);
+                assert_eq!(derived.problems, Vec::<String>::new());
+                assert_hot_unchanged(&inputs);
+            } else {
+                assert_eq!(records_of(&derived, &p), vec![manifest(&t)], "{setting}");
+                assert_problem(
+                    &derived,
+                    &[&p, "on cold-a (its pending manifest)", "mie store repair"],
+                );
+            }
+        }
+    }
+}
+
+/// Row 8: `D` alone: a lost candidate, origin `verify`, in both modes.
+#[test]
+fn b6a_08_data_alone() {
+    let (p, t) = (p3(), text(&p3(), &sha("a")));
+    let mut base = inputs();
+    base.roots[0].orphan_data.insert(p.clone());
+    for (setting, inputs) in settings(&base, &p, &t) {
+        let derived = derive_ok(&inputs);
+        if setting == "hot holds it" {
+            assert!(derived.lost.is_empty());
+            assert_hot_unchanged(&inputs);
+        } else {
+            assert_eq!(
+                lost_of(&derived),
+                vec![(p.clone(), LostOrigin::Verify)],
+                "{setting}"
+            );
+            assert_problem(
+                &derived,
+                &[
+                    &p,
+                    "data file without its manifest on cold-a",
+                    "--record-lost",
+                ],
+            );
+        }
+    }
+}
+
+/// Row 9: `D~` alone: a lost candidate, origin `verify`, in both modes.
+#[test]
+fn b6a_09_temp_data_alone() {
+    let (p, t) = (p3(), text(&p3(), &sha("a")));
+    let mut base = inputs();
+    temps(&mut base, 1, &p, true, None);
+    for (setting, inputs) in settings(&base, &p, &t) {
+        let derived = derive_ok(&inputs);
+        if setting == "hot holds it" {
+            assert!(derived.lost.is_empty());
+            assert_hot_unchanged(&inputs);
+        } else {
+            assert_eq!(
+                lost_of(&derived),
+                vec![(p.clone(), LostOrigin::Verify)],
+                "{setting}"
+            );
+            assert_problem(
+                &derived,
+                &[&p, "the data temp file on cold-b", "--record-lost"],
+            );
+        }
+    }
+}
+
+/// Row 10: a pending manifest that does not parse, alone or beside `D` or
+/// `D~`: a lost candidate. Its text equal to the path's except for the
+/// final `\n` does not parse.
+#[test]
+fn b6a_10_torn_pending_manifest() {
+    let (p, t) = (p3(), text(&p3(), &sha("a")));
+    let torn = classify_text(&p, t.strip_suffix('\n').unwrap().as_bytes());
+    assert!(matches!(torn, RootCopy::BadText(_)), "{torn:?}");
+    for (data_tmp, orphan) in [(false, false), (true, false), (false, true)] {
+        let mut base = inputs();
+        temps(&mut base, 0, &p, data_tmp, Some(torn.clone()));
+        if orphan {
+            base.roots[0].orphan_data.insert(p.clone());
+        }
+        for (setting, inputs) in settings(&base, &p, &t) {
+            let derived = derive_ok(&inputs);
+            if setting == "hot holds it" {
+                assert!(derived.lost.is_empty());
+                assert_hot_unchanged(&inputs);
+            } else {
+                assert_eq!(
+                    lost_of(&derived),
+                    vec![(p.clone(), LostOrigin::Verify)],
+                    "{setting}"
+                );
+                assert_eq!(records_of(&derived, &p), vec![], "{setting}");
+                assert_problem(
+                    &derived,
+                    &[&p, "pending manifest on cold-a that does not parse"],
+                );
+            }
+        }
+    }
+}
+
+/// Row 11: parseable pending texts that differ across roots, no `M` and no
+/// start text: never B3's stop. A live path is a lost candidate; an
+/// archive path takes the text whose SHA-256 the current entry lists, and
+/// the other pending copy is named.
+#[test]
+fn b6a_11_disagreeing_pending_texts() {
+    let p = p3();
+    let (ta, tb) = (text(&p, &sha("a")), text(&p, &sha("b")));
+    let mut base = inputs();
+    temps(&mut base, 0, &p, true, pending(&ta, DataCheck::Good));
+    temps(&mut base, 1, &p, true, pending(&tb, DataCheck::Good));
+    for (setting, inputs) in settings(&base, &p, &ta) {
+        let derived = derive_ok(&inputs);
+        if setting == "hot holds it" {
+            assert!(derived.lost.is_empty());
+            assert_hot_unchanged(&inputs);
+        } else {
+            assert_eq!(
+                lost_of(&derived),
+                vec![(p.clone(), LostOrigin::Verify)],
+                "{setting}"
+            );
+            assert_eq!(records_of(&derived, &p), vec![], "{setting}");
+        }
+    }
+    let a = part("aggTrades", "2026-10-01", 3);
+    let (ta, tb) = (text(&a, &sha("a")), text(&a, &sha("b")));
+    let mut base = inputs();
+    temps(&mut base, 0, &a, true, pending(&ta, DataCheck::Good));
+    temps(&mut base, 1, &a, true, pending(&tb, DataCheck::Good));
+    base.entries.insert(
+        NAME.to_owned(),
+        vec![EntryCopy {
+            root: "hot".to_owned(),
+            bytes: entry(&[(&a, &sha("b"))]),
+        }],
+    );
+    for (setting, inputs) in settings(&base, &a, &tb) {
+        let derived = derive_ok(&inputs);
+        assert!(derived.lost.is_empty(), "{setting}: {:?}", derived.lost);
+        assert!(derived.holds.is_empty(), "{setting}: {:?}", derived.holds);
+        if setting == "hot holds it" {
+            assert_eq!(records_of(&derived, &a), vec![]);
+            assert_hot_unchanged(&inputs);
+        } else {
+            assert_eq!(records_of(&derived, &a), vec![manifest(&tb)], "{setting}");
+            assert_problem(
+                &derived,
+                &[&a, "on cold-a (its pending manifest)", "differs"],
+            );
+        }
+    }
+}
+
+/// Row 12: a parseable pending manifest whose text differs from the
+/// path's decided text (an `M` on another root): the decided text wins,
+/// the pending form is a damaged copy named in both modes; with hot
+/// holding the path nothing changes.
+#[test]
+fn b6a_12_pending_text_against_decided_text() {
+    let p = p3();
+    let (t, other) = (text(&p, &sha("a")), text(&p, &sha("b")));
+    let mut base = inputs();
+    on(&mut base, 0, &p, good(&t));
+    temps(&mut base, 1, &p, true, pending(&other, DataCheck::Good));
+    for (setting, inputs) in settings(&base, &p, &t) {
+        let derived = derive_ok(&inputs);
+        assert!(derived.lost.is_empty(), "{setting}");
+        assert_eq!(
+            records_of(&derived, &p),
+            vec![manifest(&t), copy(&p, "cold-a")],
+            "{setting}"
+        );
+        if setting == "hot holds it" {
+            assert_no_problem(&derived, &["pending manifest"]);
+            assert_hot_unchanged(&inputs);
+        } else {
+            assert_problem(
+                &derived,
+                &[&p, "on cold-b (its pending manifest)", "differs"],
+            );
+        }
+    }
+}
+
+/// Row 13: `D`+`M` with leftover temp names, the pending text equal to
+/// the manifest's: `M` decides, the temp names add nothing.
+#[test]
+fn b6a_13_temps_beside_a_sealed_copy() {
+    let (p, t) = (p3(), text(&p3(), &sha("a")));
+    let mut base = inputs();
+    on(&mut base, 0, &p, good(&t));
+    temps(&mut base, 0, &p, true, pending(&t, DataCheck::NotChecked));
+    for (setting, inputs) in settings(&base, &p, &t) {
+        let derived = derive_ok(&inputs);
+        assert_eq!(
+            records_of(&derived, &p),
+            vec![manifest(&t), copy(&p, "cold-a")],
+            "{setting}"
+        );
+        assert!(derived.lost.is_empty(), "{setting}");
+        assert_no_problem(&derived, &[&p, "pending manifest"]);
+        assert_eq!(
+            derive_ok(&inputs),
+            derive_ok(&without_b6a_reads(&inputs)),
+            "{setting}"
+        );
+    }
+}
+
+/// Row 15: a part half moved into `.quarantine/<id>/` (its manifest left
+/// in the layout) with leftover temp names and evidence: Q's rules decide
+/// it, and the B6a reads change nothing.
+#[test]
+fn b6a_15_half_moved_quarantine_part() {
+    use mie_adapter_parquet::replica::QuarantinedCopy;
+    let a = part("aggTrades", "2026-10-01", 3);
+    let t = text(&a, &sha("a"));
+    let mut base = inputs();
+    base.roots[0].quarantine.ids.insert(
+        "q-1".to_owned(),
+        BTreeMap::from([(
+            a.clone(),
+            QuarantinedCopy {
+                text: None,
+                data: true,
+            },
+        )]),
+    );
+    on(
+        &mut base,
+        0,
+        &a,
+        RootCopy::Text {
+            text: t.clone(),
+            data: DataCheck::Missing,
+        },
+    );
+    temps(&mut base, 0, &a, true, pending(&t, DataCheck::NotChecked));
+    temps(&mut base, 1, &a, true, None);
+    base.roots[1]
+        .evidence
+        .insert(a.clone(), BTreeSet::from(["7".to_owned()]));
+    for (setting, inputs) in settings(&base, &a, &t) {
+        let derived = derive_ok(&inputs);
+        assert!(derived.lost.is_empty(), "{setting}: {:?}", derived.lost);
+        assert_eq!(derived, derive_ok(&without_b6a_reads(&inputs)), "{setting}");
+    }
+}
+
+/// Row 16: part names below `.mie/damaged/<dir>/` name the path but never
+/// hold it: an unrecorded path with nothing else is a lost candidate,
+/// origin `verify`, one source per directory.
+#[test]
+fn b6a_16_damaged_evidence() {
+    let (p, t) = (p3(), text(&p3(), &sha("a")));
+    let mut base = inputs();
+    base.roots[0].evidence.insert(
+        p.clone(),
+        BTreeSet::from(["111".to_owned(), "222".to_owned()]),
+    );
+    base.hot
+        .evidence
+        .insert(p.clone(), BTreeSet::from(["333".to_owned()]));
+    for (setting, inputs) in settings(&base, &p, &t) {
+        let derived = derive_ok(&inputs);
+        if setting == "hot holds it" {
+            assert!(derived.lost.is_empty());
+            assert_hot_unchanged(&inputs);
+            continue;
+        }
+        assert_eq!(
+            lost_of(&derived),
+            vec![(p.clone(), LostOrigin::Verify)],
+            "{setting}"
+        );
+        let sources = &derived.lost[0].sources;
+        assert_eq!(sources.len(), 3, "{sources:?}");
+        for (dir, root) in [("111", "cold-a"), ("222", "cold-a"), ("333", "hot")] {
+            assert!(
+                sources
+                    .iter()
+                    .any(|s| s.contains(&format!(".mie/damaged/{dir}/ on {root}"))),
+                "{sources:?}"
+            );
+        }
+    }
+}
+
+/// Rule 4: a path the start records whose cold roots hold only crash
+/// forms is held, never a ledger-origin candidate.
+#[test]
+fn b6a_recorded_path_with_only_crash_forms_is_held() {
+    let (p, t) = (p3(), text(&p3(), &sha("a")));
+    let mut base = inputs();
+    start_on(&mut base, 1, ledger(&[manifest(&t)]));
+    temps(&mut base, 0, &p, true, pending(&t, DataCheck::NotChecked));
+    for (setting, inputs) in settings(&base, &p, &t) {
+        let derived = derive_ok(&inputs);
+        assert!(derived.lost.is_empty(), "{setting}: {:?}", derived.lost);
+        assert_eq!(records_of(&derived, &p), vec![], "{setting}");
+    }
+    let mut base = inputs();
+    start_on(&mut base, 1, ledger(&[manifest(&t)]));
+    temps(&mut base, 0, &p, true, None);
+    for (setting, inputs) in settings(&base, &p, &t) {
+        assert!(derive_ok(&inputs).lost.is_empty(), "{setting}: D~ alone");
+    }
+}
+
+/// Rule 5: a path the start records lost whose roots hold only crash
+/// forms is a report line, not a `FAIL:`; a parseable `M` on a cold root,
+/// or hot holding it, still gives the `FAIL:`.
+#[test]
+fn b6a_lost_path_with_crash_forms_is_a_line() {
+    let (p, t) = (p3(), text(&p3(), &sha("a")));
+    let lost = Kind::Lost {
+        path: p.clone(),
+        origin: LostOrigin::Verify,
+        sha256: None,
+    };
+    let mut base = inputs();
+    start_on(&mut base, 1, ledger(std::slice::from_ref(&lost)));
+    temps(&mut base, 0, &p, true, pending(&t, DataCheck::NotChecked));
+    base.roots[1].orphan_data.insert(p.clone());
+    for (setting, inputs) in settings(&base, &p, &t) {
+        let derived = derive_ok(&inputs);
+        assert!(derived.lost.is_empty(), "{setting}");
+        assert_eq!(records_of(&derived, &p), vec![], "{setting}");
+        if setting == "hot holds it" {
+            assert_problem(&derived, &[&p, "holds it again"]);
+            assert_hot_unchanged(&inputs);
+        } else {
+            assert_no_problem(&derived, &[&p, "holds it again"]);
+            assert!(
+                derived
+                    .lines
+                    .iter()
+                    .any(|l| l.starts_with(&format!("{p}: recorded lost;"))
+                        && l.contains("left in place")),
+                "{setting}: {:#?}",
+                derived.lines
+            );
+        }
+    }
+    let mut sealed = base.clone();
+    sealed.roots[1].copy_target = false;
+    on(
+        &mut sealed,
+        1,
+        &p,
+        RootCopy::Text {
+            text: t.clone(),
+            data: DataCheck::NotChecked,
+        },
+    );
+    for (setting, inputs) in settings(&sealed, &p, &t) {
+        assert_problem(&derive_ok(&inputs), &[&p, "holds it again"]);
+        let _ = setting;
+    }
 }

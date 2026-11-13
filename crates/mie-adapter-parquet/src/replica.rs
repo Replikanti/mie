@@ -8,7 +8,11 @@
 //! - [`list_unsealed`]: the seal debris of a root's layout;
 //! - [`copy_sealed`]: the D5 copy of one sealed part;
 //! - [`copy_back`]: the copy of one sealed part from the first cold root
-//!   with a verified copy back onto hot (the recall, the hot restore);
+//!   with a verified copy back onto hot (the recall, the hot restore; the
+//!   restore also reads the crash forms of a copy, [`SourceForms`]);
+//! - [`list_temps`], [`list_evidence`]: the seal temp names of a root's
+//!   layout and the part names below its `.mie/damaged/`, as the rebuild's
+//!   rule B6a reads them (#195);
 //! - [`copy_immutable`]: the copy of an immutable small file (an
 //!   import-ledger entry);
 //! - [`extend_prefix`]: the D11 tail append of a line-structured,
@@ -268,6 +272,126 @@ pub fn list_unsealed(root: &Path) -> Result<Vec<String>, RawStoreError> {
     Ok(paths)
 }
 
+/// A seal temp name of a part: the writer's, which the D5 copy reuses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TempName {
+    /// `.part-NNNNN.parquet.tmp`, the data temp file (`D~`).
+    Data,
+    /// `.part-NNNNN.manifest.tmp`, the pending manifest (`M~`).
+    Manifest,
+}
+
+/// The path of the temp name `name` of the part `data_path` on `root`.
+///
+/// # Errors
+///
+/// [`RawStoreError::Invalid`] for a path outside the layout.
+pub fn temp_path(root: &Path, data_path: &str, name: TempName) -> Result<PathBuf, RawStoreError> {
+    let (key, date, part) = layout::parse_data_path(data_path)?;
+    let kind = match name {
+        TempName::Data => PartFile::DataTmp,
+        TempName::Manifest => PartFile::ManifestTmp,
+    };
+    Ok(layout::resolve(
+        root,
+        &layout::file_path(&key, &date, kind, part),
+    ))
+}
+
+/// The temp names one part has in a root's layout ([`list_temps`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TempFiles {
+    /// Whether its data temp file (`D~`) exists.
+    pub data: bool,
+    /// Its pending manifest (`M~`): `None` when there is none, `Some(None)`
+    /// when its bytes are not UTF-8, otherwise its text, not parsed here.
+    pub manifest: Option<Option<String>>,
+}
+
+/// The seal temp names in the layout of `root` by data path, sorted: per
+/// part with a data temp file or a pending manifest, which of them exist
+/// and the pending manifest's text (#195, the rule B6a of the rebuild).
+/// The walk is [`list_sealed`]'s; a name outside the layout (a look-alike
+/// hyphen, a trailing blank, a zero-width character) is no temp name.
+///
+/// # Errors
+///
+/// [`RawStoreError::Io`] when a directory or a pending manifest cannot be
+/// read.
+pub fn list_temps(
+    root: &Path,
+) -> Result<std::collections::BTreeMap<String, TempFiles>, RawStoreError> {
+    let mut found: Vec<(String, PartFile, PathBuf)> = Vec::new();
+    for_each_partition(root, |key, date, names| {
+        for name in names {
+            if let Some((kind @ (PartFile::DataTmp | PartFile::ManifestTmp), part)) =
+                PartFile::classify(name)
+            {
+                let file = layout::resolve(root, &layout::file_path(key, date, kind, part));
+                found.push((
+                    layout::file_path(key, date, PartFile::Data, part),
+                    kind,
+                    file,
+                ));
+            }
+        }
+    })?;
+    let mut temps = std::collections::BTreeMap::new();
+    for (path, kind, file) in found {
+        if kind == PartFile::DataTmp {
+            temps.entry(path).or_insert_with(TempFiles::default).data = true;
+            continue;
+        }
+        match fs::read(&file) {
+            Ok(bytes) => {
+                temps
+                    .entry(path)
+                    .or_insert_with(TempFiles::default)
+                    .manifest = Some(String::from_utf8(bytes).ok());
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(io_error("read", &file)(error)),
+        }
+    }
+    Ok(temps)
+}
+
+/// The evidence below `<root>/.mie/damaged/`: per data path, the names of
+/// the `damaged/<dir>/` directories that hold any part name of it (data,
+/// manifest or a temp name) under its layout path (#195, row 16 of the
+/// rule B6a). Names only: nothing is read. A missing directory is empty.
+///
+/// # Errors
+///
+/// [`RawStoreError::Io`] when a directory cannot be listed.
+pub fn list_evidence(
+    root: &Path,
+) -> Result<std::collections::BTreeMap<String, std::collections::BTreeSet<String>>, RawStoreError> {
+    let dir = root.join(META_DIR).join(DAMAGED_DIR);
+    let mut evidence: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+        std::collections::BTreeMap::new();
+    for name in list_entries(&dir)?.unwrap_or_default() {
+        let at = dir.join(&name);
+        match fs::symlink_metadata(&at) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => continue,
+            Err(error) if error.kind() == ErrorKind::NotFound => continue,
+            Err(error) => return Err(io_error("inspect", &at)(error)),
+        }
+        for_each_partition(&at, |key, date, names| {
+            for entry in names {
+                if let Some((_, part)) = PartFile::classify(entry) {
+                    evidence
+                        .entry(layout::file_path(key, date, PartFile::Data, part))
+                        .or_default()
+                        .insert(name.clone());
+                }
+            }
+        })?;
+    }
+    Ok(evidence)
+}
+
 /// Calls `visit` with the stream, the date and the sorted entry names of
 /// every partition in the layout of `root` (the walk of [`list_sealed`]).
 fn for_each_partition(
@@ -519,7 +643,7 @@ pub fn copy_sealed(
     dest_root: &Path,
     data_path: &str,
 ) -> Result<(CopyOutcome, String), CopyError> {
-    let (key, date, part) = layout::parse_data_path(data_path).map_err(CopyError::source)?;
+    layout::parse_data_path(data_path).map_err(CopyError::source)?;
     let (text, file) = sealed_manifest(source_root, data_path)
         .map_err(CopyError::source)?
         .ok_or_else(|| {
@@ -529,6 +653,24 @@ pub fn copy_sealed(
             )))
         })?;
     let source_data = layout::resolve(source_root, data_path);
+    copy_from(source_root, &source_data, text, &file, dest_root, data_path)
+}
+
+/// The destination half of [`copy_sealed`]: the D5 copy of `data_path`
+/// onto `dest_root` from the explicit source `source_data` (on
+/// `source_root`, named in errors) and its manifest `text`, parsed as
+/// `file`. [`copy_back`] with [`SourceForms::CrashForms`] passes a pending
+/// manifest's text and a data temp file here; the destination behaviour
+/// is [`copy_sealed`]'s.
+fn copy_from(
+    source_root: &Path,
+    source_data: &Path,
+    text: String,
+    file: &SealedFile,
+    dest_root: &Path,
+    data_path: &str,
+) -> Result<(CopyOutcome, String), CopyError> {
+    let (key, date, part) = layout::parse_data_path(data_path).map_err(CopyError::source)?;
     let partition = layout::resolve(dest_root, &layout::partition_dir(&key, &date));
     let data_final = partition.join(PartFile::Data.name(part));
     let manifest_final = partition.join(PartFile::Manifest.name(part));
@@ -541,7 +683,7 @@ pub fn copy_sealed(
             dest_root.display()
         ))
     };
-    let verify_dest_data = || match matches_manifest(&data_final, &file) {
+    let verify_dest_data = || match matches_manifest(&data_final, file) {
         Ok(true) => Ok(()),
         Ok(false) => Err(differs("its data does not match the manifest")),
         Err(error) if error.kind() == ErrorKind::NotFound => {
@@ -576,14 +718,14 @@ pub fn copy_sealed(
     remove_if_present(&manifest_tmp)?;
     ensure_dir(&partition)?;
 
-    stream_copy(&source_data, &data_tmp, &file, source_root, data_path)?;
+    stream_copy(source_data, &data_tmp, file, source_root, data_path)?;
     reached(CopyStep::WriteData)?;
 
     write_new(&manifest_tmp, text.as_bytes())?;
     sync_dir(&partition)?;
     reached(CopyStep::WriteManifest)?;
 
-    let data_ok = matches_manifest(&data_tmp, &file).map_err(io_error("read", &data_tmp))?;
+    let data_ok = matches_manifest(&data_tmp, file).map_err(io_error("read", &data_tmp))?;
     let manifest_ok =
         fs::read(&manifest_tmp).map_err(io_error("read", &manifest_tmp))? == text.as_bytes();
     if !data_ok || !manifest_ok {
@@ -647,6 +789,20 @@ pub enum OtherText {
     PassOver,
 }
 
+/// Which forms of a cold copy [`copy_back`] reads (#195 H6 i).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceForms {
+    /// The sealed copy only: the manifest and the data under their final
+    /// names. The recall and the repair.
+    Sealed,
+    /// The hot restore: a root's text is its manifest, else its pending
+    /// manifest, and its data is the data file, else the data temp file;
+    /// the stream copy verifies that data against the text. These are the
+    /// states a crashed D5 copy leaves on a cold root (the rule B6a of the
+    /// rebuild). Nothing is written on the cold root.
+    CrashForms,
+}
+
 /// Copies the sealed file `data_path` back onto `hot` by the D5 copy
 /// ([`copy_sealed`]), from the first cold root in `cold_roots` (read order)
 /// that holds a verified copy: the recall of ADR-062 D6, and the hot
@@ -668,6 +824,12 @@ pub enum OtherText {
 /// - otherwise the copy onto hot. A copy hot already holds (a crashed
 ///   recall) is [`CopyOutcome::AlreadyPresent`].
 ///
+/// With [`SourceForms::CrashForms`] (the hot restore, #195 H6 i) a root
+/// without the manifest offers its pending manifest as its text, and a
+/// root without the data file offers its data temp file as its data; the
+/// rules above apply to them unchanged. [`SourceForms::Sealed`] reads
+/// neither. Nothing is written on a cold root either way.
+///
 /// # Errors
 ///
 /// [`RawStoreError::Integrity`] for a differing manifest, and when no root
@@ -679,10 +841,13 @@ pub fn copy_back(
     data_path: &str,
     ledger_text: &str,
     other_text: OtherText,
+    forms: SourceForms,
     observe: &mut dyn FnMut(&DamagedCopy),
 ) -> Result<CopiedBack, RawStoreError> {
     let (key, date, part) = layout::parse_data_path(data_path)?;
     let manifest_rel = layout::file_path(&key, &date, PartFile::Manifest, part);
+    let pending_rel = layout::file_path(&key, &date, PartFile::ManifestTmp, part);
+    let data_tmp_rel = layout::file_path(&key, &date, PartFile::DataTmp, part);
     let mut damaged = Vec::new();
     for root in cold_roots {
         let path = layout::resolve(root, &manifest_rel);
@@ -694,10 +859,26 @@ pub fn copy_back(
             observe(&copy);
             damaged.push(copy);
         };
-        match fs::read(&path) {
-            Err(error) if error.kind() == ErrorKind::NotFound => continue,
+        // The root's text: its manifest, else (crash forms) its pending
+        // manifest.
+        let read = match fs::read(&path) {
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                if forms == SourceForms::Sealed {
+                    continue;
+                }
+                let pending = layout::resolve(root, &pending_rel);
+                match fs::read(&pending) {
+                    Err(error) if error.kind() == ErrorKind::NotFound => continue,
+                    Err(error) => Err(io_error("read", &pending)(error)),
+                    Ok(text) => Ok(text),
+                }
+            }
+            Err(error) => Err(io_error("read", &path)(error)),
+            Ok(text) => Ok(text),
+        };
+        match read {
             Err(error) => {
-                damage(io_error("read", &path)(error), &mut damaged);
+                damage(error, &mut damaged);
                 continue;
             }
             Ok(text) if text != ledger_text.as_bytes() => {
@@ -721,7 +902,27 @@ pub fn copy_back(
             }
             Ok(_) => {}
         }
-        match copy_sealed(root, hot, data_path) {
+        let copied = match forms {
+            SourceForms::Sealed => copy_sealed(root, hot, data_path),
+            // The root's data: its data file, else its data temp file,
+            // verified against the text by the stream copy.
+            SourceForms::CrashForms => {
+                let file = manifest::parse(ledger_text)?;
+                let data = layout::resolve(root, data_path);
+                match exists(&data) {
+                    Ok(present) => {
+                        let source = if present {
+                            data
+                        } else {
+                            layout::resolve(root, &data_tmp_rel)
+                        };
+                        copy_from(root, &source, ledger_text.to_owned(), &file, hot, data_path)
+                    }
+                    Err(error) => Err(CopyError::source(error)),
+                }
+            }
+        };
+        match copied {
             Ok((outcome, _)) => {
                 return Ok(CopiedBack {
                     root: root.clone(),
@@ -1256,6 +1457,41 @@ pub fn check_sealed_copy(
         return Ok(CopyCheck::Size);
     }
     Ok(if hash_open(&mut file, &data)? == expected.sha256 {
+        CopyCheck::Good
+    } else {
+        CopyCheck::Sha256
+    })
+}
+
+/// Checks the file `path` against the manifest `text`, size before
+/// SHA-256, streamed: [`CopyCheck::Missing`] when it does not exist, else
+/// [`CopyCheck::Size`], [`CopyCheck::Sha256`] or [`CopyCheck::Good`]. The
+/// rebuild checks a crash form's data with it (#195, the rule B6a), and the
+/// restore a data temp file before it keeps it (H6 k).
+///
+/// # Errors
+///
+/// [`RawStoreError::Corrupt`] for a text that does not parse;
+/// [`RawStoreError::Io`] for any I/O failure other than an absent file,
+/// and for a path that is no regular file.
+pub fn check_file(path: &Path, text: &str) -> Result<CopyCheck, RawStoreError> {
+    let expected = manifest::parse(text)?;
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(CopyCheck::Missing),
+        Err(error) => return Err(io_error("open", path)(error)),
+    };
+    let metadata = file.metadata().map_err(io_error("inspect", path))?;
+    if !metadata.is_file() {
+        return Err(RawStoreError::Io(format!(
+            "{} is not a regular file",
+            path.display()
+        )));
+    }
+    if metadata.len() != expected.bytes {
+        return Ok(CopyCheck::Size);
+    }
+    Ok(if hash_open(&mut file, path)? == expected.sha256 {
         CopyCheck::Good
     } else {
         CopyCheck::Sha256

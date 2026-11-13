@@ -952,6 +952,7 @@ impl Repair<'_> {
             path,
             text,
             replica::OtherText::Stop,
+            replica::SourceForms::Sealed,
             &mut |_| {},
         ) {
             Ok(_) => self.line(format!(

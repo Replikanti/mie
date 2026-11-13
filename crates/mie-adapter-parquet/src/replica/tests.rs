@@ -888,6 +888,7 @@ fn copy_back_stops_or_passes_over_another_text() {
         &path,
         &text,
         OtherText::Stop,
+        SourceForms::Sealed,
         &mut |d| seen.push(d.clone()),
     )
     .unwrap_err();
@@ -904,6 +905,7 @@ fn copy_back_stops_or_passes_over_another_text() {
         &path,
         &text,
         OtherText::PassOver,
+        SourceForms::Sealed,
         &mut |d| seen.push(d.clone()),
     )
     .unwrap();
@@ -927,4 +929,325 @@ fn copy_back_stops_or_passes_over_another_text() {
         .unwrap(),
         text
     );
+}
+
+// ------------------------------- crash forms as copy-back sources (#195 B6a)
+
+/// Every file and directory below `root` with its bytes and its mode bits.
+fn snapshot_modes(root: &Path) -> Vec<(String, Option<Vec<u8>>, u32)> {
+    use std::os::unix::fs::PermissionsExt;
+    snapshot(root)
+        .into_iter()
+        .map(|(rel, bytes)| {
+            let mode = fs::metadata(layout::resolve(root, &rel))
+                .unwrap()
+                .permissions()
+                .mode();
+            (rel, bytes, mode)
+        })
+        .collect()
+}
+
+/// The sealed data and manifest of `path` on the fixture's hot, by name.
+fn sealed_pair(fixture: &TieredFixture, path: &str, partition: &str) -> Vec<(String, Vec<u8>)> {
+    let (_, _, part) = layout::parse_data_path(path).unwrap();
+    partition_files(&fixture.hot, partition)
+        .into_iter()
+        .filter(|(name, _)| {
+            *name == PartFile::Data.name(part) || *name == PartFile::Manifest.name(part)
+        })
+        .collect()
+}
+
+/// One `copy_back` of `path` from `cold` onto a new, empty hot with
+/// `forms`; asserts that `cold` is unchanged (names, bytes, modes) and
+/// returns whether it copied the sealed pair byte-identically.
+fn roll_forward(
+    fixture: &TieredFixture,
+    cold: &Path,
+    path: &str,
+    partition: &str,
+    forms: SourceForms,
+    case: &str,
+) -> bool {
+    let text = fs::read_to_string(layout::resolve(
+        &fixture.hot,
+        &TieredFixture::manifest_of(path),
+    ))
+    .unwrap();
+    let before = snapshot_modes(cold);
+    let hot = TempDir::new("replica-roll-forward-hot");
+    let result = copy_back(
+        &[cold.to_path_buf()],
+        hot.path(),
+        path,
+        &text,
+        OtherText::PassOver,
+        forms,
+        &mut |_| {},
+    );
+    assert_eq!(snapshot_modes(cold), before, "{case} {forms:?}");
+    match result {
+        Ok(copied) => {
+            assert_eq!(copied.outcome, CopyOutcome::Copied, "{case} {forms:?}");
+            assert_eq!(
+                partition_files(hot.path(), partition),
+                sealed_pair(fixture, path, partition),
+                "{case} {forms:?}"
+            );
+            true
+        }
+        Err(error) => {
+            assert!(
+                matches!(&error, RawStoreError::Integrity(m) if m.contains("no cold root holds a verified copy")),
+                "{case} {forms:?}: {error}"
+            );
+            let dir = layout::resolve(hot.path(), partition);
+            assert!(
+                !dir.exists() || partition_files(hot.path(), partition).is_empty(),
+                "{case} {forms:?}"
+            );
+            false
+        }
+    }
+}
+
+/// #195 H6 i: a D5 copy to cold crashed after each of its steps, then a
+/// copy back. `CrashForms` rolls every state forward that holds a text and
+/// verified data (`M`, else `M~`; `D`, else `D~`); `Sealed` keeps today's
+/// behaviour and copies only a published manifest with its data. The same
+/// for the copy's data-present path and for the reordered state `M` +
+/// `D~` that a power loss can leave.
+#[test]
+fn copy_back_rolls_forward_from_every_copy_step() {
+    for step in CopyStep::ALL {
+        for forms in [SourceForms::Sealed, SourceForms::CrashForms] {
+            let fixture = TieredFixture::new("replica-roll-forward");
+            let (path, partition) = first_part(&fixture);
+            let cold = fixture.cold[0].clone();
+            CRASH_AFTER.with(|crash| crash.set(Some(step)));
+            assert!(copy_sealed(&fixture.hot, &cold, &path).is_err(), "{step:?}");
+            let expected = match step {
+                CopyStep::WriteData => false,
+                CopyStep::PublishManifest | CopyStep::SyncDir => true,
+                _ => forms == SourceForms::CrashForms,
+            };
+            let case = format!("fresh path, {step:?}");
+            assert_eq!(
+                roll_forward(&fixture, &cold, &path, &partition, forms, &case),
+                expected,
+                "{case} {forms:?}"
+            );
+        }
+    }
+    // The data-present path: the data is in place, the manifest is
+    // published through its temp name.
+    for step in [
+        CopyStep::WriteManifest,
+        CopyStep::Verify,
+        CopyStep::MarkReadOnly,
+        CopyStep::PublishManifest,
+    ] {
+        for forms in [SourceForms::Sealed, SourceForms::CrashForms] {
+            let fixture = TieredFixture::new("replica-roll-forward-present");
+            let (path, partition) = first_part(&fixture);
+            let cold = fixture.cold[0].clone();
+            fs::create_dir_all(layout::resolve(&cold, &partition)).unwrap();
+            fs::copy(
+                layout::resolve(&fixture.hot, &path),
+                layout::resolve(&cold, &path),
+            )
+            .unwrap();
+            CRASH_AFTER.with(|crash| crash.set(Some(step)));
+            assert!(copy_sealed(&fixture.hot, &cold, &path).is_err(), "{step:?}");
+            let expected = step == CopyStep::PublishManifest || forms == SourceForms::CrashForms;
+            let case = format!("data present, {step:?}");
+            assert_eq!(
+                roll_forward(&fixture, &cold, &path, &partition, forms, &case),
+                expected,
+                "{case} {forms:?}"
+            );
+        }
+    }
+    // The reordered state: the manifest's rename survived, the data's did
+    // not.
+    for forms in [SourceForms::Sealed, SourceForms::CrashForms] {
+        let fixture = TieredFixture::new("replica-roll-forward-reordered");
+        let (path, partition) = first_part(&fixture);
+        let cold = fixture.cold[0].clone();
+        fs::create_dir_all(layout::resolve(&cold, &partition)).unwrap();
+        fs::copy(
+            layout::resolve(&fixture.hot, &path),
+            temp_path(&cold, &path, TempName::Data).unwrap(),
+        )
+        .unwrap();
+        fs::copy(
+            layout::resolve(&fixture.hot, &TieredFixture::manifest_of(&path)),
+            layout::resolve(&cold, &TieredFixture::manifest_of(&path)),
+        )
+        .unwrap();
+        assert_eq!(
+            roll_forward(&fixture, &cold, &path, &partition, forms, "reordered"),
+            forms == SourceForms::CrashForms,
+            "reordered {forms:?}"
+        );
+    }
+}
+
+/// #195 H6 i: the copy back never writes a cold root, whichever forms it
+/// reads and whether it copies, passes a root over or fails: names, bytes
+/// and modes stay equal on every root.
+#[test]
+fn copy_back_never_writes_a_cold_root() {
+    let fixture = TieredFixture::new("replica-copy-back-read-only");
+    let paths = list_sealed(&fixture.hot).unwrap();
+    let (cold_a, cold_b) = (&fixture.cold[0], &fixture.cold[1]);
+    // cold-a: the first part as `D~` + `M~` (a copy crashed after
+    // `MarkReadOnly`), the second with flipped data; cold-b: the second
+    // sealed, the third as `D~` one byte short beside its `M~`.
+    CRASH_AFTER.with(|crash| crash.set(Some(CopyStep::MarkReadOnly)));
+    assert!(copy_sealed(&fixture.hot, cold_a, &paths[0]).is_err());
+    copy_sealed(&fixture.hot, cold_a, &paths[1]).unwrap();
+    flip_file(&layout::resolve(cold_a, &paths[1]), 0);
+    copy_sealed(&fixture.hot, cold_b, &paths[1]).unwrap();
+    CRASH_AFTER.with(|crash| crash.set(Some(CopyStep::MarkReadOnly)));
+    assert!(copy_sealed(&fixture.hot, cold_b, &paths[2]).is_err());
+    let short = temp_path(cold_b, &paths[2], TempName::Data).unwrap();
+    writable(&short);
+    let bytes = fs::read(&short).unwrap();
+    fs::write(&short, &bytes[..bytes.len() - 1]).unwrap();
+    let roots = vec![cold_a.clone(), cold_b.clone()];
+    let before = (snapshot_modes(cold_a), snapshot_modes(cold_b));
+    for forms in [SourceForms::Sealed, SourceForms::CrashForms] {
+        for path in &paths[..3] {
+            let text = fs::read_to_string(layout::resolve(
+                &fixture.hot,
+                &TieredFixture::manifest_of(path),
+            ))
+            .unwrap();
+            let hot = TempDir::new("replica-copy-back-read-only-hot");
+            let _ = copy_back(
+                &roots,
+                hot.path(),
+                path,
+                &text,
+                OtherText::PassOver,
+                forms,
+                &mut |_| {},
+            );
+            assert_eq!(
+                (snapshot_modes(cold_a), snapshot_modes(cold_b)),
+                before,
+                "{path} {forms:?}"
+            );
+        }
+    }
+}
+
+/// #195 B6a inputs: `list_temps` names each part with a data temp file
+/// or a pending manifest (its text, `Some(None)` when it is not UTF-8),
+/// `list_evidence` each part a name below `.mie/damaged/<dir>/` names, by
+/// directory; look-alike names, an empty `date=` directory (row 14) and
+/// everything outside the layout count for nothing.
+#[test]
+fn list_temps_and_evidence_classify_every_name() {
+    let root = TempDir::new("replica-temps");
+    let root = root.path();
+    let partition = "source=binance-um/instrument=BTCUSDT/stream=aggTrade/date=2026-10-06";
+    let path = |n: u32| format!("{partition}/part-{n:05}.parquet");
+    let dir = layout::resolve(root, partition);
+    fs::create_dir_all(&dir).unwrap();
+    for (name, bytes) in [
+        (".part-00042.parquet.tmp", b"d".to_vec()),
+        (".part-00043.manifest.tmp", b"text 43".to_vec()),
+        (".part-00044.manifest.tmp", vec![0xff, 0xfe]),
+        (".part-00045.parquet.tmp", b"d".to_vec()),
+        (".part-00045.manifest.tmp", b"text 45".to_vec()),
+        ("part-00049.parquet", b"d".to_vec()),
+        ("part-00049.manifest", b"m".to_vec()),
+        (".part\u{2010}00046.parquet.tmp", b"d".to_vec()),
+        (".part-00047.parquet.tmp ", b"d".to_vec()),
+        (".part-000\u{200B}48.manifest.tmp", b"d".to_vec()),
+    ] {
+        fs::write(dir.join(name), bytes).unwrap();
+    }
+    fs::create_dir_all(layout::resolve(
+        root,
+        "source=binance-um/instrument=BTCUSDT/stream=aggTrade/date=2026-10-09",
+    ))
+    .unwrap();
+    let temps = list_temps(root).unwrap();
+    let expected: std::collections::BTreeMap<String, TempFiles> = [
+        (
+            path(42),
+            TempFiles {
+                data: true,
+                manifest: None,
+            },
+        ),
+        (
+            path(43),
+            TempFiles {
+                data: false,
+                manifest: Some(Some("text 43".to_owned())),
+            },
+        ),
+        (
+            path(44),
+            TempFiles {
+                data: false,
+                manifest: Some(None),
+            },
+        ),
+        (
+            path(45),
+            TempFiles {
+                data: true,
+                manifest: Some(Some("text 45".to_owned())),
+            },
+        ),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(temps, expected);
+    assert_eq!(
+        temp_path(root, &path(45), TempName::Manifest).unwrap(),
+        dir.join(".part-00045.manifest.tmp")
+    );
+    assert_eq!(
+        temp_path(root, &path(45), TempName::Data).unwrap(),
+        dir.join(".part-00045.parquet.tmp")
+    );
+
+    // Evidence.
+    assert!(list_evidence(root).unwrap().is_empty());
+    let damaged = root.join(META_DIR).join(DAMAGED_DIR);
+    for (at, name) in [
+        ("111", "part-00003.parquet"),
+        ("222", ".part-00003.manifest.tmp"),
+        ("222", "part-00004.manifest"),
+        ("222", ".part\u{2010}00005.parquet.tmp"),
+        ("333", "README"),
+    ] {
+        let at_dir = layout::resolve(&damaged.join(at), partition);
+        fs::create_dir_all(&at_dir).unwrap();
+        fs::write(at_dir.join(name), b"x").unwrap();
+    }
+    fs::write(damaged.join("333").join("copy-ledger"), b"x").unwrap();
+    fs::create_dir_all(damaged.join("444/import-ledger/aggTrades")).unwrap();
+    fs::write(
+        damaged.join("444/import-ledger/aggTrades/BTCUSDT-aggTrades-2026-10-05.zip.import"),
+        b"x",
+    )
+    .unwrap();
+    fs::write(damaged.join("555"), b"a file, no directory").unwrap();
+    let evidence = list_evidence(root).unwrap();
+    let set = |dirs: &[&str]| dirs.iter().map(|d| (*d).to_owned()).collect();
+    let expected: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+        [(path(3), set(&["111", "222"])), (path(4), set(&["222"]))]
+            .into_iter()
+            .collect();
+    assert_eq!(evidence, expected);
+    // Evidence is no temp name, and no temp name is evidence.
+    assert_eq!(list_temps(root).unwrap(), temps);
 }

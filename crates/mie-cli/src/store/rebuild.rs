@@ -30,7 +30,10 @@
 //!   hot's journal up to the length J read now (a line cut at J is not
 //!   parsed); every import entry on hot and on the targets, and hot's
 //!   `PENDING`; hot's layout; each cold root's layout with every copy's
-//!   data checked against that root's own manifest. The journal and the
+//!   data checked against that root's own manifest, and its temp names (a
+//!   pending manifest's data checked against its text where the root
+//!   lacks the manifest); the part names below each root's
+//!   `.mie/damaged/` (B6a). The journal and the
 //!   entries come first: a part is sealed before its `sealed` line or its
 //!   entry, so a "no root holds it" verdict never comes from a listing
 //!   that ran ahead of the record. An I/O error on a listing, a manifest,
@@ -50,7 +53,29 @@
 //! - **B6 Lost:** a path named by the start, hot's journal or a current
 //!   import entry that no root holds is a candidate, recorded `lost` only
 //!   with `--record-lost`; a name outside the layout is reported, never
-//!   recorded; a path the start records lost stays lost.
+//!   recorded; a path the start records lost stays lost. A root holds a
+//!   path in any layout form: its manifest, its data, its temp names
+//!   (`D~`, `M~`). A path the start records lost is a `FAIL:` ("a root
+//!   holds it again") only when hot holds it or a cold root holds a
+//!   parseable manifest of it; any other form is a report line, left in
+//!   place.
+//! - **B6a Cold-only paths** (#195, shared by both modes). A path no start
+//!   record other than `finding` and `lost` names, that hot lacks (neither
+//!   its manifest nor its data) and that a cold root holds in any form or
+//!   whose part name sits below a root's `.mie/damaged/<dir>/`: (1) its
+//!   text comes from B3/B4 over the roots' manifests; without one, from the
+//!   parseable pending manifests (`M~`) of the roots without the manifest,
+//!   one distinct text, or for an archive path the one a current entry
+//!   lists; `M~` never enters B3's conflict check. (2) With a text it gets
+//!   its `manifest` record, its data verified or not, on a copy target or
+//!   a read-only root (`copy` only for a verified `D`+`M` on a copy
+//!   target); the rebuild names a record that only a pending manifest
+//!   gives. A pending form with another text, or with the same text and
+//!   data that does not verify, is a damaged copy. (3) Without a text it is
+//!   a lost candidate, origin `verify` unless a higher source names it,
+//!   named by every form (B6's flag). Evidence names a path, never holds
+//!   it. Every B6a branch needs hot to lack the path, so an intact hot's
+//!   paths keep the derivation they had.
 //! - **B7 Archive holds**, re-derived ([`archive_checks`]). A new
 //!   `unlisted` hold comes from an absence, so it is written only with
 //!   `--record-unlisted`; without it the rebuild reports the candidates,
@@ -193,6 +218,21 @@ pub enum RootCopy {
     BadText(String),
 }
 
+/// The seal temp names one cold root holds of a part (B6a): the states a
+/// crashed D5 copy leaves (`D~` = `.part-N.parquet.tmp`, `M~` =
+/// `.part-N.manifest.tmp`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TempForms {
+    /// Whether its data temp file `D~` exists.
+    pub data_tmp: bool,
+    /// Its pending manifest `M~`, classified as [`classify_text`] does;
+    /// `None` when there is none. On a root without the part's manifest,
+    /// and where the root's data is checked, a text's data is its data
+    /// file `D`, else `D~`, checked against that text; otherwise
+    /// [`DataCheck::NotChecked`].
+    pub pending: Option<RootCopy>,
+}
+
 /// One cold root's layout, in configuration order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RootRead {
@@ -204,6 +244,11 @@ pub struct RootRead {
     pub files: BTreeMap<String, RootCopy>,
     /// The data files it holds without their manifest.
     pub orphan_data: BTreeSet<String>,
+    /// Every part it holds a seal temp name of (B6a).
+    pub temps: BTreeMap<String, TempForms>,
+    /// Every part a name below its `.mie/damaged/<dir>/` names, with those
+    /// directories (B6a row 16): evidence, never a source.
+    pub evidence: BTreeMap<String, BTreeSet<String>>,
     /// Its `.quarantine/` directory (Q1).
     pub quarantine: QuarantineListing,
 }
@@ -218,6 +263,9 @@ pub struct HotRead {
     /// Its `date=` partition directories (a removal's hidden leftover is
     /// none).
     pub partitions: BTreeSet<String>,
+    /// Every part a name below its `.mie/damaged/<dir>/` names (B6a row
+    /// 16).
+    pub evidence: BTreeMap<String, BTreeSet<String>>,
     /// Its `.quarantine/` directory (Q1).
     pub quarantine: QuarantineListing,
 }
@@ -256,12 +304,10 @@ pub struct JournalRead {
 }
 
 /// What runs the derivation: the rebuild, or the hot restore (#195 H5),
-/// which reuses it with eight differences: (a) to (g) of its plan, and (h)
-/// from the review of #218, which brings every path a cold root holds and
-/// no start record names into the restored ledger's numbering (a
-/// `manifest` record for an unrecorded sealed copy, a lost candidate for
-/// debris). Only [`Mode::Restore`] changes anything; [`run`] always passes
-/// [`Mode::Rebuild`].
+/// which reuses it with seven differences, (a) to (g) of its plan. B6a,
+/// which brings every path a cold root holds into the ledger's numbering,
+/// is no difference: both modes apply it. Only [`Mode::Restore`] changes
+/// anything; [`run`] always passes [`Mode::Rebuild`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
     /// `mie store rebuild`: B0 to B11 as above.
@@ -385,6 +431,10 @@ pub struct Derived {
     /// on ([`archive_checks::ArchiveFindings::chosen`]): what the hot
     /// restore writes to hot (#195 H4).
     pub chosen_entries: BTreeMap<String, Vec<u8>>,
+    /// The paths no start record named that hot lacks and that got their
+    /// `manifest` record from a cold root's text (B6a rule 2): the hot
+    /// restore copies their partitions back (#195 H6 j).
+    pub cold_recorded: BTreeSet<String>,
 }
 
 /// Why the rebuild stops with nothing written.
@@ -402,10 +452,22 @@ enum Source {
     Journal(u64, String),
     /// A journal `recovery` line.
     Recovery(u64, String),
-    /// In the restore, debris on a cold root: a data file without its
-    /// manifest (`None`), or a manifest that does not parse or names
-    /// another location (`Some(why)`).
-    Debris(String, Option<String>),
+    /// B6a: a cold root's data file without its manifest.
+    Data(String),
+    /// B6a: a cold root's manifest that does not parse or names another
+    /// location, with why.
+    BadManifest(String, String),
+    /// B6a: a cold root's data temp file.
+    DataTmp(String),
+    /// B6a: a cold root's pending manifest that does not parse or names
+    /// another location, with why.
+    BadPending(String, String),
+    /// B6a: a cold root's parseable pending manifest (row 11: with no
+    /// decided text).
+    Pending(String),
+    /// B6a row 16: a part name below `.mie/damaged/<dir>/` of a root
+    /// (`hot` or a cold root's id), with `<dir>`.
+    Evidence(String, String),
 }
 
 impl Source {
@@ -417,11 +479,33 @@ impl Source {
             Self::Recovery(line, run) => {
                 format!("journal line {line} (run {run}, `recovery` rolled_forward)")
             }
-            Self::Debris(root, None) => format!("the data file without its manifest on {root}"),
-            Self::Debris(root, Some(why)) => format!(
+            Self::Data(root) => format!("the data file without its manifest on {root}"),
+            Self::BadManifest(root, why) => format!(
                 "a manifest on {root} that does not parse or names another location ({why})"
             ),
+            Self::DataTmp(root) => format!("the data temp file on {root}"),
+            Self::BadPending(root, why) => format!(
+                "a pending manifest on {root} that does not parse or names another location \
+                 ({why})"
+            ),
+            Self::Pending(root) => format!("a pending manifest on {root}"),
+            Self::Evidence(root, dir) => format!(
+                "a part name below .mie/damaged/{dir}/ on {root} (evidence, never a source)"
+            ),
         }
+    }
+
+    /// Whether it is a form a root holds (B6a), not a record or a line.
+    fn is_cold_form(&self) -> bool {
+        matches!(
+            self,
+            Self::Data(_)
+                | Self::BadManifest(..)
+                | Self::DataTmp(_)
+                | Self::BadPending(..)
+                | Self::Pending(_)
+                | Self::Evidence(..)
+        )
     }
 }
 
@@ -598,6 +682,79 @@ fn named_path(kind: &Kind) -> Option<String> {
     }
 }
 
+/// Every data path a root's layout or `.mie/damaged/` names: hot's and
+/// the cold roots' manifests, data files, temp names and evidence (B0).
+fn layout_paths(inputs: &RebuildInputs) -> impl Iterator<Item = &String> {
+    inputs
+        .hot
+        .files
+        .keys()
+        .chain(&inputs.hot.orphan_data)
+        .chain(inputs.hot.evidence.keys())
+        .chain(inputs.roots.iter().flat_map(|root| {
+            root.files
+                .keys()
+                .chain(&root.orphan_data)
+                .chain(root.temps.keys())
+                .chain(root.evidence.keys())
+        }))
+}
+
+/// B6a rule 1 for a path without a manifest text: the parseable pending
+/// texts of the roots without the path's manifest, as `(root, text)` in
+/// configuration order.
+fn pending_texts<'a>(inputs: &'a RebuildInputs, path: &str) -> Vec<(&'a str, &'a str)> {
+    inputs
+        .roots
+        .iter()
+        .filter(|root| !root.files.contains_key(path))
+        .filter_map(|root| match root.temps.get(path)?.pending.as_ref()? {
+            RootCopy::Text { text, .. } => Some((root.id.as_str(), text.as_str())),
+            RootCopy::BadText(_) => None,
+        })
+        .collect()
+}
+
+/// B6a: the forms the roots hold of `path` other than a parseable
+/// manifest (rows 4, 8 to 11, 16), in root order: every cold root's layout
+/// forms, then the evidence of hot and of each cold root.
+fn cold_forms(inputs: &RebuildInputs, path: &str) -> Vec<Source> {
+    let mut forms = Vec::new();
+    for root in &inputs.roots {
+        let id = &root.id;
+        if let Some(RootCopy::BadText(why)) = root.files.get(path) {
+            forms.push(Source::BadManifest(id.clone(), why.clone()));
+        }
+        if root.orphan_data.contains(path) {
+            forms.push(Source::Data(id.clone()));
+        }
+        if let Some(temps) = root.temps.get(path) {
+            if temps.data_tmp {
+                forms.push(Source::DataTmp(id.clone()));
+            }
+            match &temps.pending {
+                Some(RootCopy::BadText(why)) => {
+                    forms.push(Source::BadPending(id.clone(), why.clone()));
+                }
+                Some(RootCopy::Text { .. }) => forms.push(Source::Pending(id.clone())),
+                None => {}
+            }
+        }
+    }
+    let evidence = std::iter::once(("hot", &inputs.hot.evidence)).chain(
+        inputs
+            .roots
+            .iter()
+            .map(|root| (root.id.as_str(), &root.evidence)),
+    );
+    for (id, evidence) in evidence {
+        for dir in evidence.get(path).into_iter().flatten() {
+            forms.push(Source::Evidence(id.to_owned(), dir.clone()));
+        }
+    }
+    forms
+}
+
 /// The derivation of B2 to B8 over what B1 read: pure.
 ///
 /// # Errors
@@ -661,17 +818,7 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
 
     // B0, last refusal: archive paths need the archive configuration.
     if !inputs.archive_configured {
-        let held = inputs
-            .hot
-            .files
-            .keys()
-            .chain(&inputs.hot.orphan_data)
-            .chain(
-                inputs
-                    .roots
-                    .iter()
-                    .flat_map(|root| root.files.keys().chain(&root.orphan_data)),
-            )
+        let held = layout_paths(inputs)
             .chain(sources.keys())
             .find(|path| is_archive_part(path));
         if let Some(path) = held {
@@ -695,17 +842,7 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
         .as_ref()
         .filter(|_| restore.is_none())
     {
-        let part = inputs
-            .hot
-            .files
-            .keys()
-            .chain(&inputs.hot.orphan_data)
-            .chain(
-                inputs
-                    .roots
-                    .iter()
-                    .flat_map(|root| root.files.keys().chain(&root.orphan_data)),
-            )
+        let part = layout_paths(inputs)
             .chain(sources.keys())
             .find(|path| is_archive_part(path));
         let why = match (part, inputs.entries.keys().next()) {
@@ -723,6 +860,47 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
             )));
         }
     }
+
+    // B6a: the paths no start record other than `finding` and `lost` names
+    // and hot lacks (neither its manifest nor its data), that a cold root
+    // holds in any form or a root's evidence names. Every B6a branch is
+    // limited to them, so the paths an intact hot holds keep today's
+    // derivation in both modes.
+    let hot_holds =
+        |path: &str| inputs.hot.files.contains_key(path) || inputs.hot.orphan_data.contains(path);
+    let cold_only: BTreeSet<&str> = inputs
+        .roots
+        .iter()
+        .flat_map(|root| {
+            root.files
+                .keys()
+                .chain(&root.orphan_data)
+                .chain(root.temps.keys())
+                .chain(root.evidence.keys())
+        })
+        .chain(inputs.hot.evidence.keys())
+        .map(String::as_str)
+        .filter(|path| !start_named.contains(*path) && !hot_holds(path))
+        .collect();
+    let has_m_text = |path: &str| {
+        inputs
+            .roots
+            .iter()
+            .any(|root| matches!(root.files.get(path), Some(RootCopy::Text { .. })))
+    };
+    // B6a rule 1 for the archive checks: a path whose only text is one
+    // distinct pending text counts that text as its roots' text.
+    let pending_single: BTreeMap<&str, Vec<(&str, &str)>> = cold_only
+        .iter()
+        .filter(|path| !has_m_text(path) && state.verdict(path) != Some(PathVerdict::Lost))
+        .filter_map(|path| {
+            let found = pending_texts(inputs, path);
+            let mut texts: Vec<&str> = found.iter().map(|(_, text)| *text).collect();
+            texts.sort_unstable();
+            texts.dedup();
+            (texts.len() == 1).then_some((*path, found))
+        })
+        .collect();
 
     // B3: the texts of every path any root or the start holds.
     let mut holders: BTreeMap<&str, Vec<(&str, &str)>> = BTreeMap::new();
@@ -845,15 +1023,24 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
         .keys()
         .copied()
         .chain(sources.keys().map(String::as_str))
+        .chain(pending_single.keys().copied())
         .filter(|path| is_archive_part(path) && !in_q(path))
         .map(|path| {
-            let roots = holders
+            let mut roots: Vec<(String, String)> = holders
                 .get(path)
                 .into_iter()
                 .flatten()
                 .filter(|(root, _)| *root != "the start copy")
                 .map(|(root, text)| ((*root).to_owned(), (*text).to_owned()))
                 .collect();
+            if roots.is_empty()
+                && let Some(found) = pending_single.get(path)
+            {
+                roots = found
+                    .iter()
+                    .map(|(root, text)| ((*root).to_owned(), (*text).to_owned()))
+                    .collect();
+            }
             let start = start_texts.get(path).cloned().unwrap_or_default();
             (path.to_owned(), PartTexts { roots, start })
         })
@@ -880,38 +1067,68 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
         sources.entry(name.path.clone()).or_default().insert(source);
     }
 
-    // B4, B5: per path in path order.
+    // B4, B5: per path in path order, every path any root or the start
+    // holds a manifest of and every B6a path.
+    // B4's tie rule: the one text whose SHA-256 a current entry lists.
+    let listed_one = |path: &str, texts: &[&'_ str]| -> Option<usize> {
+        let listed: BTreeSet<&str> = findings
+            .current
+            .values()
+            .flatten()
+            .filter(|(listed, _)| listed == path)
+            .map(|(_, sha)| sha.as_str())
+            .collect();
+        let matching: Vec<usize> = (0..texts.len())
+            .filter(|&i| {
+                replica::parse_manifest(texts[i])
+                    .is_ok_and(|file| listed.contains(file.sha256.as_str()))
+            })
+            .collect();
+        match matching[..] {
+            [only] => Some(only),
+            _ => None,
+        }
+    };
     let mut records: Vec<Kind> = Vec::new();
-    for path in holders.keys().copied() {
+    let mut cold_recorded: BTreeSet<String> = BTreeSet::new();
+    let paths: BTreeSet<&str> = holders
+        .keys()
+        .copied()
+        .chain(cold_only.iter().copied())
+        .collect();
+    for path in paths {
         if in_q(path) {
             continue;
         }
+        let b6a = cold_only.contains(path) && state.verdict(path) != Some(PathVerdict::Lost);
         let texts = distinct(path);
         let text: Option<&str> = match texts[..] {
             [only] => Some(only),
             [] => None,
             _ if !is_archive_part(path) && recorded_text(path).is_some() => recorded_text(path),
-            _ => {
-                let listed: BTreeSet<&str> = findings
-                    .current
-                    .values()
-                    .flatten()
-                    .filter(|(listed, _)| listed == path)
-                    .map(|(_, sha)| sha.as_str())
-                    .collect();
-                let matching: Vec<&str> = texts
-                    .iter()
-                    .copied()
-                    .filter(|text| {
-                        replica::parse_manifest(text)
-                            .is_ok_and(|file| listed.contains(file.sha256.as_str()))
-                    })
-                    .collect();
-                match matching[..] {
-                    [only] => Some(only),
-                    _ => None,
-                }
-            }
+            _ => listed_one(path, &texts).map(|i| texts[i]),
+        };
+        // B6a rule 1: with no manifest text anywhere, the parseable pending
+        // texts of the roots without the manifest decide, by B4's
+        // selection; they never enter B3's conflict check.
+        let mut from_pending = false;
+        let text = if texts.is_empty() && b6a {
+            let mut pending: Vec<&str> = pending_texts(inputs, path)
+                .into_iter()
+                .map(|(_, text)| text)
+                .collect();
+            pending.sort_unstable();
+            pending.dedup();
+            let chosen = match pending[..] {
+                [only] => Some(only),
+                [] => None,
+                _ if is_archive_part(path) => listed_one(path, &pending).map(|i| pending[i]),
+                _ => None,
+            };
+            from_pending = chosen.is_some();
+            chosen
+        } else {
+            text
         };
         // B5: copies that hold the path and do not verify.
         let mut damaged_cold = false;
@@ -963,6 +1180,42 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
                 RootCopy::Text { .. } => {}
             }
         }
+        // B6a: a cold root's pending form of a B6a path with a decided
+        // text: another text is a damaged copy (row 12), the same text
+        // whose data does not verify on a root without the manifest too
+        // (row 7).
+        if b6a && let Some(text) = text {
+            for root in &inputs.roots {
+                let Some(RootCopy::Text { text: own, data }) = root
+                    .temps
+                    .get(path)
+                    .and_then(|temps| temps.pending.as_ref())
+                else {
+                    continue;
+                };
+                let label = format!("{} (its pending manifest)", root.id);
+                let why = if own != text {
+                    "its text differs from the path's manifest text, a remnant of an earlier \
+                     use of the path"
+                        .to_owned()
+                } else if root.files.contains_key(path) {
+                    continue;
+                } else {
+                    match data {
+                        DataCheck::Good | DataCheck::NotChecked => continue,
+                        DataCheck::Missing => {
+                            "missing: neither its data file nor its data temp file".to_owned()
+                        }
+                        DataCheck::Size => "size".to_owned(),
+                        DataCheck::Sha256 => "sha256".to_owned(),
+                        DataCheck::Unreadable(error) => {
+                            format!("its data cannot be read ({error})")
+                        }
+                    }
+                };
+                damage(&label, why, true);
+            }
+        }
         let Some(text) = text else {
             continue;
         };
@@ -975,22 +1228,30 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
             .filter(|root| root.copy_target && verified.contains(&root.id.as_str()))
             .map(|root| root.id.as_str())
             .collect();
-        // H5 (h): in the restore, a path no start record names that a cold
-        // root holds with this text gets its `manifest` record even without
-        // a verified copy on a copy target (a read-only root's copy): hot is
-        // gone, so without the record the copy-back skips the path and the
-        // writer's numbering does not count it (D5, D6; review of #218).
-        let unrecorded_cold_text = restore.is_some()
-            && !start_named.contains(path)
-            && inputs.roots.iter().any(|root| {
-                matches!(root.files.get(path), Some(RootCopy::Text { text: own, .. }) if own == text)
-            });
-        if !start_texts.contains_key(path)
-            && (!targets.is_empty() || damaged_cold || unrecorded_cold_text)
-        {
+        // B6a rule 2: a B6a path with a text gets its `manifest` record, on
+        // a copy target or a read-only root, its data verified or not: hot
+        // lacks it, so without the record the writer's numbering would not
+        // count it (D5, D6) and the restore's copy-back would skip it.
+        if !start_texts.contains_key(path) && (!targets.is_empty() || damaged_cold || b6a) {
             records.push(Kind::Manifest {
                 text: text.to_owned(),
             });
+            if b6a {
+                cold_recorded.insert(path.to_owned());
+            }
+        }
+        if from_pending && restore.is_none() {
+            let on: Vec<&str> = pending_texts(inputs, path)
+                .into_iter()
+                .filter(|(_, own)| *own == text)
+                .map(|(root, _)| root)
+                .collect();
+            problems.push(format!(
+                "{path}: its `manifest` record comes from the pending manifest on {} alone: no \
+                 root holds it sealed and hot lacks it, so every selection that covers it fails \
+                 until a sealed copy exists (ADR-062 D5, D7)",
+                on.join(", ")
+            ));
         }
         for id in targets {
             if state
@@ -1005,57 +1266,38 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
         }
     }
 
-    // H5 (h): in the restore, a path that cold roots hold only as debris (a
-    // data file without its manifest, or a manifest that does not parse)
-    // and no start record names has no sealed copy anywhere, and nothing
-    // completes the debris once hot is lost. It is a lost candidate, named
-    // by its debris: without a record the writer's numbering would not
-    // count it and the next capture would reuse its path (D5, D6). The
-    // rebuild keeps counting debris as held, since its hot still holds the
-    // part.
-    let mut debris: BTreeMap<String, Vec<Source>> = BTreeMap::new();
-    if restore.is_some() {
-        for root in &inputs.roots {
-            for path in &root.orphan_data {
-                debris
-                    .entry(path.clone())
-                    .or_default()
-                    .push(Source::Debris(root.id.clone(), None));
-            }
-            for (path, copy) in &root.files {
-                if let RootCopy::BadText(why) = copy {
-                    debris
-                        .entry(path.clone())
-                        .or_default()
-                        .push(Source::Debris(root.id.clone(), Some(why.clone())));
-                }
-            }
+    // B6a rule 3: a B6a path without a text is a lost candidate (H5 d in
+    // the restore, `--record-lost` in the rebuild), named by every form
+    // found. A path with a manifest text and no record (an archive
+    // conflict without a listed text) stays held by its manifests, as
+    // before B6a.
+    for path in &cold_only {
+        if in_q(path)
+            || state.verdict(path) == Some(PathVerdict::Lost)
+            || cold_recorded.contains(*path)
+            || has_m_text(path)
+        {
+            continue;
         }
-        debris.retain(|path, _| {
-            !start_named.contains(path)
-                && !inputs.hot.files.contains_key(path)
-                && !inputs.hot.orphan_data.contains(path)
-                && !inputs
-                    .roots
-                    .iter()
-                    .any(|root| matches!(root.files.get(path), Some(RootCopy::Text { .. })))
-        });
-        for (path, found) in &debris {
-            sources
-                .entry(path.clone())
-                .or_default()
-                .extend(found.iter().cloned());
-        }
+        sources
+            .entry((*path).to_owned())
+            .or_default()
+            .extend(cold_forms(inputs, path));
     }
 
-    // B6: lost.
+    // B6: lost. B6a rule 4: a B6a path is held only through its record
+    // (rule 2); any other path when hot holds it or a cold root holds any
+    // layout form of it, its temp names included.
     let held_anywhere = |path: &str| {
-        inputs.hot.files.contains_key(path)
-            || inputs.hot.orphan_data.contains(path)
-            || inputs
-                .roots
-                .iter()
-                .any(|root| root.files.contains_key(path) || root.orphan_data.contains(path))
+        if cold_only.contains(path) {
+            return cold_recorded.contains(path) || has_m_text(path);
+        }
+        hot_holds(path)
+            || inputs.roots.iter().any(|root| {
+                root.files.contains_key(path)
+                    || root.orphan_data.contains(path)
+                    || root.temps.contains_key(path)
+            })
     };
     let mut lost = Vec::new();
     for (path, named) in &sources {
@@ -1071,13 +1313,27 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
             ));
             continue;
         }
-        let held = held_anywhere(path) && !debris.contains_key(path);
+        let held = held_anywhere(path);
         if state.verdict(path) == Some(PathVerdict::Lost) {
-            if held {
+            // B6a rule 5: only hot or a parseable manifest on a cold root
+            // holds it again; any other form is left in place and named.
+            if hot_holds(path) || has_m_text(path) {
                 problems.push(format!(
                     "{path}: the start copy records it lost, and a root holds it again; it stays \
                      lost, since recovering a lost file needs a new ADR (ADR-062 D11)"
                 ));
+            } else {
+                let forms: Vec<String> = cold_forms(inputs, path)
+                    .iter()
+                    .filter(|form| !matches!(form, Source::Evidence(..)))
+                    .map(Source::describe)
+                    .collect();
+                if !forms.is_empty() {
+                    lines.push(format!(
+                        "{path}: recorded lost; {} left in place (ADR-062 D11)",
+                        forms.join(", ")
+                    ));
+                }
             }
             continue;
         }
@@ -1101,9 +1357,9 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
             (LostOrigin::Journal, None)
         } else if has(|s| matches!(s, Source::Recovery(..))) {
             (LostOrigin::Recovery, None)
-        } else if has(|s| matches!(s, Source::Debris(..))) {
-            // Only the restore's own read of the roots names it: a copy
-            // that does not verify, as the repair's lost-file rule.
+        } else if has(Source::is_cold_form) {
+            // Only the roots' forms name it (B6a rule 3): a copy that does
+            // not verify, as the repair's lost-file rule.
             (LostOrigin::Verify, None)
         } else {
             (LostOrigin::Ledger, None)
@@ -1139,9 +1395,9 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
                  it lost"
             }
         };
-        let absent = if debris.contains_key(path) {
-            "no root holds a sealed copy, only debris that nothing completes without hot, and the \
-             path must stay counted, or the next capture reuses it (ADR-062 D5, D6);"
+        let absent = if cold_only.contains(path.as_str()) {
+            "no root holds a sealed copy or a pending manifest that decides its text, hot lacks \
+             it, and the path must stay counted, or the next capture reuses it (ADR-062 D5, D6);"
         } else {
             "no root holds it (no data file and no manifest on hot or on any cold root), and"
         };
@@ -1402,6 +1658,7 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
         lines,
         problems,
         chosen_entries: findings.chosen,
+        cold_recorded,
     })
 }
 
@@ -1663,6 +1920,7 @@ fn rebuild(
         hot_read.files.insert(path, copy);
     }
     hot_read.orphan_data = orphan_data(hot).map_err(|e| listing(hot, e))?;
+    hot_read.evidence = replica::list_evidence(hot).map_err(|e| listing(hot, e))?;
     hot_read.partitions = removal::scan_hot(hot, "")
         .map_err(|e| listing(hot, e))?
         .partitions
@@ -1675,11 +1933,14 @@ fn rebuild(
             let copy = read_copy(&root.path, &path, true)?;
             files.insert(path, copy);
         }
+        let temps = read_temps(&root.path, &files, &|_| true)?;
         roots.push(RootRead {
             id: root.id.clone(),
             copy_target: root.copy_target,
             files,
             orphan_data: orphan_data(&root.path).map_err(|e| listing(&root.path, e))?,
+            temps,
+            evidence: replica::list_evidence(&root.path).map_err(|e| listing(&root.path, e))?,
             quarantine: replica::list_quarantine(&root.path)
                 .map_err(|e| quarantine(&root.path, e))?,
         });
@@ -1861,6 +2122,69 @@ pub(super) fn read_copy(root: &Path, path: &str, check: bool) -> Result<RootCopy
         text: text.clone(),
         data,
     })
+}
+
+/// The seal temp names of the layout of `root` (B6a), each pending
+/// manifest classified. Where `root` lacks the part's manifest and
+/// `check(path)` holds, a pending text's data (`D`, else `D~`) is checked
+/// against it.
+pub(super) fn read_temps(
+    root: &Path,
+    files: &BTreeMap<String, RootCopy>,
+    check: &dyn Fn(&str) -> bool,
+) -> Result<BTreeMap<String, TempForms>, Stop> {
+    let listed = replica::list_temps(root).map_err(|error| {
+        Stop(format!(
+            "cannot list the seal temp names of {} ({error}); a skipped directory would turn \
+             its files into lost candidates, so nothing is written (ADR-062 D7)",
+            root.display()
+        ))
+    })?;
+    let mut temps = BTreeMap::new();
+    for (path, found) in listed {
+        let pending = found.manifest.map(|text| {
+            let copy = match text {
+                None => RootCopy::BadText("the pending manifest is not UTF-8".to_owned()),
+                Some(text) => classify_text(&path, text.as_bytes()),
+            };
+            match copy {
+                RootCopy::Text { text, .. } if !files.contains_key(&path) && check(&path) => {
+                    let data = pending_data(root, &path, &text);
+                    RootCopy::Text { text, data }
+                }
+                other => other,
+            }
+        });
+        temps.insert(
+            path,
+            TempForms {
+                data_tmp: found.data,
+                pending,
+            },
+        );
+    }
+    Ok(temps)
+}
+
+/// The data of a pending manifest's text on `root`: the data file, else
+/// the data temp file, against the text (B6a).
+fn pending_data(root: &Path, path: &str, text: &str) -> DataCheck {
+    let checked = replica::check_file(&root.join(path), text).and_then(|check| {
+        if check == CopyCheck::Missing {
+            replica::temp_path(root, path, replica::TempName::Data)
+                .and_then(|tmp| replica::check_file(&tmp, text))
+        } else {
+            Ok(check)
+        }
+    });
+    match checked {
+        Ok(CopyCheck::Good) => DataCheck::Good,
+        Ok(CopyCheck::Missing) => DataCheck::Missing,
+        Ok(CopyCheck::Size) => DataCheck::Size,
+        Ok(CopyCheck::Sha256) => DataCheck::Sha256,
+        Ok(CopyCheck::Manifest { .. }) => DataCheck::Unreadable("its manifest changed".to_owned()),
+        Err(error) => DataCheck::Unreadable(error.to_string()),
+    }
 }
 
 /// The data files without their manifest in the layout of `root`.

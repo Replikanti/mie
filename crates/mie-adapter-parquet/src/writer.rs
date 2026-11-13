@@ -626,6 +626,7 @@ impl RawWriter {
                 &path,
                 &text,
                 replica::OtherText::Stop,
+                replica::SourceForms::Sealed,
                 &mut |damaged| {
                     emit(RecallEvent::Damaged {
                         partition: partition.to_owned(),

@@ -966,7 +966,29 @@ fn m_crash_at_every_step_resumes() {
         bytes[copy_ledger::HEADER.len() + 3] ^= 0x01;
         fs::set_permissions(&copy, fs::Permissions::from_mode(0o644)).unwrap();
         fs::write(&copy, &bytes).unwrap();
+        // A partial `D~` of the replicated window path `live(0)` on cold-a,
+        // which the set-aside moves into `.mie/damaged/` (H6 k).
+        let data = fs::read(fixture.cold[0].join(live(0))).unwrap();
+        fs::write(
+            replica::temp_path(&fixture.cold[0], &live(0), replica::TempName::Data).unwrap(),
+            &data[..data.len() / 2],
+        )
+        .unwrap();
         fixture
+    };
+    // The partial `D~` is gone from cold-a's layout and kept, byte for
+    // byte, below exactly one `.mie/damaged/<at_ms>/`.
+    let set_aside = |fixture: &Fixture, step: &str| {
+        let partial =
+            replica::temp_path(&fixture.cold[0], &live(0), replica::TempName::Data).unwrap();
+        assert!(!partial.exists(), "{step}");
+        let rel = partial.strip_prefix(&fixture.cold[0]).unwrap().to_owned();
+        let found: Vec<Vec<u8>> = [AT, AT + 1]
+            .iter()
+            .filter_map(|at| fs::read(replica::damaged_dir(&fixture.cold[0], *at).join(&rel)).ok())
+            .collect();
+        let data = fs::read(fixture.cold[0].join(live(0))).unwrap();
+        assert_eq!(found, vec![data[..data.len() / 2].to_vec()], "{step}");
     };
     // `hot_state` leaves every copy ledger out, so the targets' copies are
     // compared by their check against hot's ledger.
@@ -979,6 +1001,7 @@ fn m_crash_at_every_step_resumes() {
     };
     let reference = prepare("restore-m-reference");
     assert_restored(&restore(&reference));
+    set_aside(&reference, "reference");
     let expected = (
         hot_state(&reference),
         records_without_time(&reference),
@@ -1010,6 +1033,7 @@ fn m_crash_at_every_step_resumes() {
             expected,
             "{step:?}"
         );
+        set_aside(&fixture, &format!("{step:?}"));
     }
 }
 
@@ -1389,4 +1413,644 @@ fn l_resume_after_replace_moves_non_prefix_copy_aside() {
         copy_ledger::check_copy(&fixture.hot, &fixture.cold[0]).unwrap(),
         LedgerCopyCheck::Absent
     );
+}
+
+// --------------------------- crash debris on cold roots (#195 amendment, B6a)
+
+/// The temp name `name` of `live(n)` on `root`.
+fn tmp(root: &Path, n: u32, name: replica::TempName) -> PathBuf {
+    replica::temp_path(root, &live(n), name).unwrap()
+}
+
+/// The sealed data and manifest text of `live(n)` on the fixture's hot.
+fn sealed_of(fixture: &Fixture, n: u32) -> (Vec<u8>, String) {
+    (
+        fs::read(fixture.hot.join(live(n))).unwrap(),
+        fs::read_to_string(fixture.hot.join(manifest_of(&live(n)))).unwrap(),
+    )
+}
+
+/// Row 5: the state of a D5 copy that crashed after `PublishData`: the
+/// final data and its verified pending manifest.
+fn publish_data_crash(fixture: &Fixture, root: &Path) {
+    let (data, text) = sealed_of(fixture, 3);
+    fs::write(root.join(live(3)), &data).unwrap();
+    fs::write(tmp(root, 3, replica::TempName::Manifest), &text).unwrap();
+}
+
+/// Row 6: the state after `Verify` or `MarkReadOnly`: both temp names,
+/// verified, nothing published.
+fn verified_temps(fixture: &Fixture, root: &Path) {
+    let (data, text) = sealed_of(fixture, 3);
+    fs::write(tmp(root, 3, replica::TempName::Data), &data).unwrap();
+    fs::write(tmp(root, 3, replica::TempName::Manifest), &text).unwrap();
+}
+
+/// A tiered `select` of the live day.
+fn select_live_day(fixture: &Fixture) -> Result<String, RawStoreError> {
+    tiered(fixture)
+        .select(&window(D0, D0 + 86_400_000))
+        .map(|dataset| format!("{dataset:?}"))
+}
+
+/// Round 2 finding 1 (row 6): `D~` and `M~` on cold-a, both verified, no
+/// record. The restore passes without `--record-lost`, records `M~`'s
+/// text and copies the part back from `D~`; the next capture seals
+/// `part-00004`; the next pass is clean and seals cold-a's copy with the
+/// same bytes. Hot or cold-a holds the old bytes at every point.
+#[test]
+fn x_verified_temps_roll_forward() {
+    let fixture = sealed_then_lost("restore-x-temps", &|f| verified_temps(f, &f.cold[0]));
+    let data = fs::read(tmp(&fixture.cold[0], 3, replica::TempName::Data)).unwrap();
+    let text = fs::read_to_string(tmp(&fixture.cold[0], 3, replica::TempName::Manifest)).unwrap();
+    let report = restore(&fixture);
+    assert_restored(&report);
+    assert!(
+        records_without_time(&fixture).contains(&Kind::Manifest { text: text.clone() }),
+        "{report:#?}"
+    );
+    assert_eq!(fs::read(fixture.hot.join(live(3))).unwrap(), data);
+    assert_eq!(
+        fs::read_to_string(fixture.hot.join(manifest_of(&live(3)))).unwrap(),
+        text
+    );
+    assert!(select_live_day(&fixture).is_ok());
+    let parts = capture_after_restore(&fixture);
+    assert!(parts.contains(&live(4)), "{parts:?}");
+    assert_eq!(fs::read(fixture.hot.join(live(3))).unwrap(), data);
+    assert_eq!(fixture.pass().problems, Vec::<String>::new());
+    assert_eq!(fs::read(fixture.cold[0].join(live(3))).unwrap(), data);
+    assert_eq!(
+        fs::read_to_string(fixture.cold[0].join(manifest_of(&live(3)))).unwrap(),
+        text
+    );
+}
+
+/// Round 2 finding 2 (row 5): `D` and a verified `M~` on cold-a, the
+/// state a copy that crashed after `PublishData` leaves. Rolled forward:
+/// no `lost` record, the day selects, the next capture seals
+/// `part-00004`, and the next pass publishes cold-a's manifest.
+#[test]
+fn x_publish_data_crash_rolls_forward() {
+    let fixture = sealed_then_lost("restore-x-publish", &|f| publish_data_crash(f, &f.cold[0]));
+    let (data, text) = (
+        fs::read(fixture.cold[0].join(live(3))).unwrap(),
+        fs::read_to_string(tmp(&fixture.cold[0], 3, replica::TempName::Manifest)).unwrap(),
+    );
+    let report = restore(&fixture);
+    assert_restored(&report);
+    let records = records_without_time(&fixture);
+    assert!(records.contains(&Kind::Manifest { text: text.clone() }));
+    assert!(
+        !records
+            .iter()
+            .any(|k| matches!(k, Kind::Lost { path, .. } if *path == live(3))),
+        "{records:?}"
+    );
+    assert_eq!(fs::read(fixture.hot.join(live(3))).unwrap(), data);
+    assert!(select_live_day(&fixture).is_ok());
+    let parts = capture_after_restore(&fixture);
+    assert!(parts.contains(&live(4)), "{parts:?}");
+    assert_eq!(fixture.pass().problems, Vec::<String>::new());
+    assert_eq!(fs::read(fixture.cold[0].join(live(3))).unwrap(), data);
+    assert_eq!(
+        fs::read_to_string(fixture.cold[0].join(manifest_of(&live(3)))).unwrap(),
+        text
+    );
+}
+
+/// `mie store rebuild --replace-hot-ledger` over the fixture at `at`.
+fn rebuild_at(fixture: &Fixture, record_lost: bool, at: i64) -> RebuildReport {
+    rebuild::run(
+        &fixture.config,
+        Some(&fixture.archive()),
+        rebuild::Flags {
+            record_lost,
+            replace_hot_ledger: true,
+            ..rebuild::Flags::default()
+        },
+        FIRST_HOT,
+        &fixture.probe,
+        &|| at,
+    )
+}
+
+/// Whether hot's ledger records `live(n)` lost.
+fn recorded_lost(fixture: &Fixture, n: u32) -> bool {
+    records_without_time(fixture)
+        .iter()
+        .any(|k| matches!(k, Kind::Lost { path, .. } if *path == live(n)))
+}
+
+/// Round 2 finding 3a: row 8 restored with `--record-lost`, then a
+/// rebuild before any pass has replicated the `lost` record. The rebuild
+/// finds the path again: without `--record-lost` it writes nothing and
+/// names the path and the flag; with it, it installs `lost`, the next
+/// capture seals `part-00004` and the pass is clean.
+#[test]
+fn x_rebuild_before_the_first_pass_keeps_the_path_counted() {
+    let fixture = sealed_then_lost("restore-x-3a", &|f| data_only(f, &f.cold[0]));
+    let report = restore_at(&fixture, Flags { record_lost: true }, FIRST_HOT, AT);
+    assert!(report.restored, "{report:#?}");
+    let ledger = fs::read(copy_ledger::ledger_path(&fixture.hot)).unwrap();
+    let rebuilt = rebuild_at(&fixture, false, AT + 100);
+    assert!(
+        rebuilt.lines.iter().any(|l| l == "nothing written"),
+        "{rebuilt:#?}"
+    );
+    assert!(
+        rebuilt
+            .problems
+            .iter()
+            .any(|p| p.contains(&live(3)) && p.contains("--record-lost")),
+        "{rebuilt:#?}"
+    );
+    assert_eq!(
+        fs::read(copy_ledger::ledger_path(&fixture.hot)).unwrap(),
+        ledger
+    );
+    let rebuilt = rebuild_at(&fixture, true, AT + 200);
+    assert!(
+        rebuilt.lines.iter().any(|l| l.starts_with("wrote ")),
+        "{rebuilt:#?}"
+    );
+    assert!(recorded_lost(&fixture, 3), "{rebuilt:#?}");
+    let parts = capture_after_restore(&fixture);
+    assert!(parts.contains(&live(4)), "{parts:?}");
+    assert!(!parts.contains(&live(3)), "{parts:?}");
+    assert_eq!(fixture.pass().problems, Vec::<String>::new());
+}
+
+/// Round 2 finding 3b: row 8 restored with `--record-lost`, a pass that
+/// replicates the `lost` record, then a rebuild: it passes, with no
+/// "holds it again", a report line naming the debris left in place, and
+/// cold-a's data unchanged.
+#[test]
+fn x_rebuild_after_a_pass_passes_with_debris_left() {
+    let fixture = sealed_then_lost("restore-x-3b", &|f| data_only(f, &f.cold[0]));
+    let old = fs::read(fixture.cold[0].join(live(3))).unwrap();
+    let report = restore_at(&fixture, Flags { record_lost: true }, FIRST_HOT, AT);
+    assert!(report.restored, "{report:#?}");
+    assert_eq!(fixture.pass().problems, Vec::<String>::new());
+    let rebuilt = rebuild_at(&fixture, false, AT + 100);
+    assert_eq!(rebuilt.problems, Vec::<String>::new(), "{rebuilt:#?}");
+    assert!(
+        rebuilt
+            .lines
+            .iter()
+            .any(|l| l.starts_with(&format!("{}: recorded lost;", live(3)))
+                && l.contains("left in place")),
+        "{rebuilt:#?}"
+    );
+    assert!(recorded_lost(&fixture, 3));
+    assert_eq!(fs::read(fixture.cold[0].join(live(3))).unwrap(), old);
+}
+
+/// Row 3: `M` with its data only under `D~` (a power loss undid the data's
+/// rename). The restore copies the part back from `D~` and names cold-a's
+/// copy `missing`; the next capture seals `part-00004`. (The table's
+/// "which the repair fixes" does not hold for this unrecorded copy: see
+/// the PR's returned row 3.)
+#[test]
+fn x_reordered_renames_roll_forward_from_the_temp_data() {
+    let fixture = sealed_then_lost("restore-x-reordered", &|f| {
+        let (data, text) = sealed_of(f, 3);
+        fs::write(tmp(&f.cold[0], 3, replica::TempName::Data), &data).unwrap();
+        fs::write(f.cold[0].join(manifest_of(&live(3))), &text).unwrap();
+    });
+    let data = fs::read(tmp(&fixture.cold[0], 3, replica::TempName::Data)).unwrap();
+    let text = fs::read_to_string(fixture.cold[0].join(manifest_of(&live(3)))).unwrap();
+    let report = restore(&fixture);
+    assert!(report.restored, "{report:#?}");
+    assert_problem(&report, &[&live(3), "on cold-a", "missing"]);
+    assert!(records_without_time(&fixture).contains(&Kind::Manifest { text }));
+    assert_eq!(fs::read(fixture.hot.join(live(3))).unwrap(), data);
+    let parts = capture_after_restore(&fixture);
+    assert!(parts.contains(&live(4)), "{parts:?}");
+    assert_eq!(fs::read(fixture.hot.join(live(3))).unwrap(), data);
+    // Nothing on cold-a was written: its `D~` stays (it verifies).
+    assert_eq!(
+        fs::read(tmp(&fixture.cold[0], 3, replica::TempName::Data)).unwrap(),
+        data
+    );
+}
+
+/// Row 7: a parseable `M~` whose data `D~` does not verify. Held with its
+/// text: the restore commits with the lost-file `FAIL:` (exit 1); a
+/// `select` of the day lists the part and reading it fails with
+/// `Integrity` naming it (the lost-file rule, as
+/// `c_no_good_copy_follows_the_lost_file_rule`); the next capture seals
+/// `part-00004`.
+#[test]
+fn x_pending_text_without_good_data_is_counted() {
+    let fixture = sealed_then_lost("restore-x-pending-bad", &|f| {
+        verified_temps(f, &f.cold[0]);
+        let data = tmp(&f.cold[0], 3, replica::TempName::Data);
+        let mut bytes = fs::read(&data).unwrap();
+        bytes[0] ^= 0x01;
+        fs::write(&data, bytes).unwrap();
+    });
+    let report = restore(&fixture);
+    assert!(report.restored, "{report:#?}");
+    assert_problem(&report, &[&live(3), "no cold root holds a verified copy"]);
+    let store = tiered(&fixture);
+    let dataset = store.select(&window(D0, D0 + 86_400_000)).unwrap();
+    let file = dataset
+        .files
+        .iter()
+        .find(|file| file.relative_path == live(3))
+        .unwrap();
+    match store.read(file) {
+        Err(RawStoreError::Integrity(why)) => assert!(why.contains(&live(3)), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    let parts = capture_after_restore(&fixture);
+    assert!(parts.contains(&live(4)), "{parts:?}");
+    assert!(!parts.contains(&live(3)), "{parts:?}");
+}
+
+/// Restores row 9 or 10 (`place` on cold-a): without `--record-lost` the
+/// restore stops before any write naming the form; with it the part is
+/// recorded lost, the debris stays byte-identical and the next capture
+/// seals `part-00004`.
+fn debris_is_a_lost_candidate(tag: &str, place: &dyn Fn(&Fixture), form: &str) {
+    let fixture = sealed_then_lost(tag, place);
+    let before = snapshot(&fixture)
+        .into_iter()
+        .filter(|(path, _)| path.starts_with(&fixture.cold[0]))
+        .collect::<Vec<_>>();
+    let report = restore(&fixture);
+    assert_not_restored(&report, &[&live(3), "--record-lost", "before any write"]);
+    assert_problem(&report, &[&live(3), form]);
+    assert!(!copy_ledger::ledger_path(&fixture.hot).exists());
+    let report = restore_at(&fixture, Flags { record_lost: true }, FIRST_HOT, AT);
+    assert!(report.restored, "{report:#?}");
+    assert!(recorded_lost(&fixture, 3), "{report:#?}");
+    let parts = capture_after_restore(&fixture);
+    assert!(parts.contains(&live(4)), "{parts:?}");
+    assert!(!parts.contains(&live(3)), "{parts:?}");
+    for (path, bytes) in before {
+        if path.starts_with(fixture.cold[0].join(LIVE)) {
+            assert_eq!(fs::read(&path).unwrap(), bytes, "{}", path.display());
+        }
+    }
+}
+
+/// Row 9: `D~` alone on cold-a: a lost candidate.
+#[test]
+fn x_temp_data_alone_is_a_lost_candidate() {
+    debris_is_a_lost_candidate(
+        "restore-x-temp-data",
+        &|f| {
+            let (data, _) = sealed_of(f, 3);
+            fs::write(tmp(&f.cold[0], 3, replica::TempName::Data), data).unwrap();
+        },
+        "the data temp file on cold-a",
+    );
+}
+
+/// Row 10: `D~` with a pending manifest that does not parse (its final
+/// `\n` missing): a lost candidate.
+#[test]
+fn x_torn_pending_manifest_is_debris() {
+    debris_is_a_lost_candidate(
+        "restore-x-torn",
+        &|f| {
+            let (data, text) = sealed_of(f, 3);
+            fs::write(tmp(&f.cold[0], 3, replica::TempName::Data), data).unwrap();
+            fs::write(
+                tmp(&f.cold[0], 3, replica::TempName::Manifest),
+                text.strip_suffix('\n').unwrap(),
+            )
+            .unwrap();
+        },
+        "pending manifest on cold-a that does not parse",
+    );
+}
+
+/// Row 16: a repair's evidence of the part below cold-a's
+/// `.mie/damaged/<dir>/`, nothing else: a lost candidate named by it; the
+/// evidence stays byte-identical.
+#[test]
+fn x_damaged_evidence_names_the_path() {
+    let fixture = sealed_then_lost("restore-x-evidence", &|f| {
+        let (data, text) = sealed_of(f, 3);
+        let aside = replica::damaged_dir(&f.cold[0], 123).join(LIVE);
+        fs::create_dir_all(&aside).unwrap();
+        fs::write(aside.join("part-00003.parquet"), data).unwrap();
+        fs::write(aside.join("part-00003.manifest"), text).unwrap();
+    });
+    let aside = replica::damaged_dir(&fixture.cold[0], 123);
+    let evidence = snapshot(&fixture)
+        .into_iter()
+        .filter(|(path, _)| path.starts_with(&aside))
+        .collect::<Vec<_>>();
+    assert_eq!(evidence.len(), 2);
+    let report = restore(&fixture);
+    assert_not_restored(&report, &[&live(3), "--record-lost"]);
+    assert_problem(&report, &[&live(3), ".mie/damaged/123/ on cold-a"]);
+    let report = restore_at(&fixture, Flags { record_lost: true }, FIRST_HOT, AT);
+    assert!(report.restored, "{report:#?}");
+    assert!(recorded_lost(&fixture, 3));
+    let parts = capture_after_restore(&fixture);
+    assert!(parts.contains(&live(4)), "{parts:?}");
+    for (path, bytes) in evidence {
+        assert_eq!(fs::read(&path).unwrap(), bytes, "{}", path.display());
+    }
+}
+
+/// The files of `root`'s live partition by name.
+fn live_files(root: &Path) -> BTreeMap<String, Vec<u8>> {
+    sorted_names(&root.join(LIVE))
+        .unwrap()
+        .into_iter()
+        .map(|name| {
+            let bytes = fs::read(root.join(LIVE).join(&name)).unwrap();
+            (name, bytes)
+        })
+        .collect()
+}
+
+/// H6 k with rows 12 and 13 and a partial `D~` beside a replicated path.
+/// cold-a holds `live(3)` sealed plus verifiable temp names (row 13);
+/// cold-b a pending manifest with another text beside a partial `D~` (row
+/// 12); cold-a a partial `D~` of the replicated `live(0)`. After the
+/// copy-back the unverifiable temp names are moved into
+/// `.mie/damaged/<at_ms>/` with their bytes, the other text named, the
+/// verifiable ones kept; the next pass is clean.
+#[test]
+fn x_set_aside_keeps_unverifiable_temps() {
+    let fixture = sealed_then_lost("restore-x-set-aside", &|f| {
+        let (data, text) = sealed_of(f, 3);
+        let (a, b) = (&f.cold[0], &f.cold[1]);
+        fs::write(a.join(live(3)), &data).unwrap();
+        fs::write(a.join(manifest_of(&live(3))), &text).unwrap();
+        fs::write(tmp(a, 3, replica::TempName::Data), &data).unwrap();
+        fs::write(tmp(a, 3, replica::TempName::Manifest), &text).unwrap();
+        fs::write(
+            tmp(b, 3, replica::TempName::Manifest),
+            text.replacen("rows ", "rows 9", 1),
+        )
+        .unwrap();
+        fs::write(tmp(b, 3, replica::TempName::Data), &data[..data.len() - 1]).unwrap();
+        let (zero, _) = sealed_of(f, 0);
+        fs::write(tmp(a, 0, replica::TempName::Data), &zero[..zero.len() / 2]).unwrap();
+    });
+    let (a, b) = (fixture.cold[0].clone(), fixture.cold[1].clone());
+    let (before_a, before_b) = (live_files(&a), live_files(&b));
+    let report = restore(&fixture);
+    assert!(report.restored, "{report:#?}");
+    assert_problem(
+        &report,
+        &[&live(3), "on cold-b (its pending manifest)", "differs"],
+    );
+    let moved = |root: &Path, n: u32, name: replica::TempName| {
+        let file = tmp(root, n, name);
+        let rel = file.strip_prefix(root).unwrap().to_owned();
+        (file, replica::damaged_dir(root, AT).join(rel))
+    };
+    // Kept: cold-a's verifiable temp names of live(3).
+    for name in [replica::TempName::Data, replica::TempName::Manifest] {
+        let (file, aside) = moved(&a, 3, name);
+        assert!(file.exists() && !aside.exists(), "{}", file.display());
+    }
+    // Moved, bytes unchanged.
+    for (root, n, name, before) in [
+        (&b, 3, replica::TempName::Manifest, &before_b),
+        (&b, 3, replica::TempName::Data, &before_b),
+        (&a, 0, replica::TempName::Data, &before_a),
+    ] {
+        let (file, aside) = moved(root, n, name);
+        assert!(!file.exists(), "{}", file.display());
+        let name = file.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(
+            fs::read(&aside).unwrap(),
+            before[&name],
+            "{}",
+            aside.display()
+        );
+    }
+    assert!(
+        report
+            .lines
+            .iter()
+            .any(|l| l.contains(".part-00000.parquet.tmp") && l.contains("moved")),
+        "{report:#?}"
+    );
+    assert_problem(&report, &[".part-00003.manifest.tmp", "another text"]);
+    assert_eq!(fixture.pass().problems, Vec::<String>::new());
+}
+
+/// Rows 5 and 6 on a read-only root, which no other root holds: both
+/// parts are recorded and copied back from its crash forms, and the root's
+/// names, bytes and modes stay unchanged.
+#[test]
+fn x_read_only_crash_forms_are_read_never_written() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut fixture = replicated("restore-x-read-only");
+    let read_only = with_read_only_root(&mut fixture);
+    assert_eq!(
+        fixture.seal("binance-um", "aggTrade", D0 + 6_000, 2),
+        vec![live(3)]
+    );
+    assert_eq!(
+        fixture.seal("binance-um", "aggTrade", D0 + 9_000, 2),
+        vec![live(4)]
+    );
+    let (data3, text3) = sealed_of(&fixture, 3);
+    let (data4, text4) = sealed_of(&fixture, 4);
+    fs::write(read_only.join(live(3)), &data3).unwrap();
+    fs::write(tmp(&read_only, 3, replica::TempName::Manifest), &text3).unwrap();
+    fs::write(tmp(&read_only, 4, replica::TempName::Data), &data4).unwrap();
+    fs::write(tmp(&read_only, 4, replica::TempName::Manifest), &text4).unwrap();
+    let modes = |root: &Path| -> Vec<(String, Vec<u8>, u32)> {
+        live_files(root)
+            .into_iter()
+            .map(|(name, bytes)| {
+                let mode = fs::metadata(root.join(LIVE).join(&name))
+                    .unwrap()
+                    .permissions()
+                    .mode();
+                (name, bytes, mode)
+            })
+            .collect()
+    };
+    let before = modes(&read_only);
+    lose_hot(&fixture);
+    let report = restore(&fixture);
+    assert_restored(&report);
+    let records = records_without_time(&fixture);
+    for (text, data, n) in [(&text3, &data3, 3), (&text4, &data4, 4)] {
+        assert!(
+            records.contains(&Kind::Manifest { text: text.clone() }),
+            "{n}"
+        );
+        assert_eq!(&fs::read(fixture.hot.join(live(n))).unwrap(), data, "{n}");
+    }
+    assert_eq!(modes(&read_only), before);
+}
+
+/// H6 j: an unrecorded path recorded from a cold text in a partition the
+/// start records removed and that lies before the hot window: the
+/// partition is copied back with it, then `returned`.
+#[test]
+fn x_removed_partition_with_an_unrecorded_path_is_copied_back() {
+    let fixture = replicated("restore-x-removed");
+    append(
+        &fixture,
+        Kind::Removed {
+            partition: LIVE.to_owned(),
+        },
+    );
+    assert_eq!(fixture.pass().problems, Vec::<String>::new());
+    assert_eq!(
+        fixture.seal("binance-um", "aggTrade", D0 + 6_000, 2),
+        vec![live(3)]
+    );
+    verified_temps(&fixture, &fixture.cold[0]);
+    let (data, _) = sealed_of(&fixture, 3);
+    lose_hot(&fixture);
+    let report = restore_at(&fixture, Flags::default(), "2026-10-07", AT);
+    assert_restored(&report);
+    assert_eq!(fs::read(fixture.hot.join(live(3))).unwrap(), data);
+    for n in 0..3 {
+        assert!(fixture.hot.join(live(n)).exists(), "part {n}");
+    }
+    assert!(
+        records_without_time(&fixture).contains(&Kind::Returned {
+            partition: LIVE.to_owned()
+        }),
+        "{report:#?}"
+    );
+}
+
+/// The live partition of day `day` (0 = the fixture's live date).
+fn live_on(day: i64) -> String {
+    let date = ["2026-10-06", "2026-10-07", "2026-10-08", "2026-10-09"][day as usize];
+    format!("source=binance-um/instrument=BTCUSDT/stream=aggTrade/date={date}")
+}
+
+/// One capture of two rows on each day of `days`, by the tiered writer;
+/// returns hot's live data paths.
+fn capture_on(fixture: &Fixture, days: &[i64]) -> Vec<String> {
+    use mie_adapter_parquet::{RotationPolicy, TierContext};
+    use mie_ports::raw::{RawRecord, RawRecordSink};
+    let key = RawStreamKey::new("binance-um", "BTCUSDT", "aggTrade").unwrap();
+    let policy = RotationPolicy {
+        max_rows: 2,
+        ..RotationPolicy::default()
+    };
+    let ctx = TierContext {
+        first_hot_date: FIRST_HOT.to_owned(),
+        now_ms: std::sync::Arc::new(|| AT + 10),
+        on_recall: None,
+    };
+    let mut writer = tiered(fixture)
+        .tiered_writer("binance-um", policy, ctx)
+        .unwrap();
+    for day in days {
+        for i in 0..2 {
+            writer
+                .append(
+                    &key,
+                    RawRecord {
+                        event_time: EventTime::from_millis(
+                            D0 + day * 86_400_000 + 50_000 + i * 1_000,
+                        ),
+                        capture: None,
+                        payload: format!("new-{day}-{i}").into_bytes(),
+                    },
+                )
+                .unwrap();
+        }
+    }
+    writer.close().unwrap();
+    replica::list_sealed(&fixture.hot)
+        .unwrap()
+        .into_iter()
+        .filter(|path| path.starts_with("source=binance-um/"))
+        .collect()
+}
+
+/// Both modes agree (round 2 finding 3): rows 1, 5, 6 and 8 in four
+/// partitions, then the restore and a capture; the restore, a rebuild
+/// before any pass and a capture; the restore, a pass, a rebuild and a
+/// capture. Every capture takes the same next part numbers, and none
+/// reuses a path a cold root holds.
+#[test]
+fn x_rebuild_agrees_with_the_restore() {
+    let prepare = |tag: &str| {
+        let fixture = replicated(tag);
+        let mut placed = Vec::new();
+        for (day, row) in [(1, 1), (2, 5), (3, 6), (0, 8)] {
+            let paths = fixture.seal("binance-um", "aggTrade", D0 + day * 86_400_000 + 6_000, 2);
+            let [path] = &paths[..] else {
+                panic!("{paths:?}");
+            };
+            let data = fs::read(fixture.hot.join(path)).unwrap();
+            let text = fs::read_to_string(fixture.hot.join(manifest_of(path))).unwrap();
+            let a = &fixture.cold[0];
+            let d_tmp = replica::temp_path(a, path, replica::TempName::Data).unwrap();
+            let m_tmp = replica::temp_path(a, path, replica::TempName::Manifest).unwrap();
+            fs::create_dir_all(a.join(path).parent().unwrap()).unwrap();
+            match row {
+                1 => {
+                    fs::write(a.join(path), &data).unwrap();
+                    fs::write(a.join(manifest_of(path)), &text).unwrap();
+                }
+                5 => {
+                    fs::write(a.join(path), &data).unwrap();
+                    fs::write(&m_tmp, &text).unwrap();
+                }
+                6 => {
+                    fs::write(&d_tmp, &data).unwrap();
+                    fs::write(&m_tmp, &text).unwrap();
+                }
+                _ => fs::write(a.join(path), &data).unwrap(),
+            }
+            placed.push(path.clone());
+        }
+        lose_hot(&fixture);
+        let report = restore_at(&fixture, Flags { record_lost: true }, FIRST_HOT, AT);
+        assert!(report.restored, "{tag}: {report:#?}");
+        (fixture, placed)
+    };
+    let next = |fixture: &Fixture, placed: &[String], tag: &str| -> Vec<String> {
+        let before = replica::list_sealed(&fixture.hot).unwrap();
+        let after = capture_on(fixture, &[0, 1, 2, 3]);
+        let new: Vec<String> = after.into_iter().filter(|p| !before.contains(p)).collect();
+        for path in placed {
+            assert!(!new.contains(path), "{tag}: {path} reused: {new:?}");
+        }
+        new
+    };
+    let (alone, placed) = prepare("restore-x-agree-alone");
+    let expected = next(&alone, &placed, "restore");
+    assert_eq!(
+        expected,
+        vec![
+            format!("{}/part-00004.parquet", live_on(0)),
+            format!("{}/part-00001.parquet", live_on(1)),
+            format!("{}/part-00001.parquet", live_on(2)),
+            format!("{}/part-00001.parquet", live_on(3)),
+        ]
+    );
+    let (before_pass, placed) = prepare("restore-x-agree-before");
+    let rebuilt = rebuild_at(&before_pass, true, AT + 100);
+    assert!(
+        rebuilt.lines.iter().any(|l| l.starts_with("wrote ")),
+        "{rebuilt:#?}"
+    );
+    assert_eq!(
+        next(&before_pass, &placed, "rebuild before a pass"),
+        expected
+    );
+    let (after_pass, placed) = prepare("restore-x-agree-after");
+    assert_eq!(after_pass.pass().problems, Vec::<String>::new());
+    let rebuilt = rebuild_at(&after_pass, false, AT + 100);
+    assert!(
+        rebuilt.lines.iter().any(|l| l.starts_with("wrote ")),
+        "{rebuilt:#?}"
+    );
+    assert_eq!(next(&after_pass, &placed, "rebuild after a pass"), expected);
 }

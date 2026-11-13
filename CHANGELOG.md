@@ -30,14 +30,22 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   file: a damaged copy is passed over and named for `mie store verify`,
   then `mie store repair`, and a file with no good copy stays recorded so
   every read of it fails. A file a record names that no root holds stops
-  the restore before any write unless `--record-lost`, and so does a path
-  that cold roots hold only as debris (data without its manifest, or a
-  manifest that does not parse) and no record names; an unrecorded copy
-  on a read-only root is recorded and copied back. So a new capture never
-  reuses a path a cold root holds. Hot's marker is
-  written last, so running the command again completes a restore that
-  stopped or crashed; `mie ingest`, the importer and `mie store init` name
-  that re-run when `.mie/` exists without a marker. Data of a cold copy is
+  the restore before any write unless `--record-lost`. A path that no
+  record names and that cold roots hold in any form is counted: a sealed
+  copy (a read-only root's too) or the verified pending manifest and data
+  a crashed copy leaves is recorded and copied back from those forms, and
+  debris with no text (data or a data temp file alone, a manifest or
+  pending manifest that does not parse, a repair's evidence) is a lost
+  candidate behind `--record-lost`; after the copy-back, temp names on a
+  copy target that are no verifiable copy are moved into `.mie/damaged/`,
+  never deleted. So a new capture never reuses a path a cold root holds.
+  `mie store rebuild` applies the same rule to every path hot lacks, so a
+  rebuild after a restore keeps it counted, and a path recorded lost
+  whose roots hold only debris is a report line, no longer a failure on
+  every rebuild. Hot's marker is written last, so running the command
+  again completes a restore that stopped or crashed; `mie ingest`, the
+  importer and `mie store init` name that re-run when `.mie/` exists
+  without a marker. Data of a cold copy is
   read only when the ledger does not record it. `mie store repair` and
   `mie store resolve` no longer offer the restore for damage on an intact
   hot and name #217 instead.

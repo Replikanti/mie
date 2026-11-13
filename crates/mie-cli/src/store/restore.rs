@@ -57,27 +57,32 @@
 //!   first target copy that parses and binds. Hot's `PENDING` is left and
 //!   named; the checks get none.
 //! - **H5 The copy ledger**: [`rebuild::derive`] in [`Mode::Restore`]
-//!   (its differences (a) to (h) are documented there), then the rebuild's
+//!   (its differences (a) to (g) are documented there), then the rebuild's
 //!   install (B9). Lost candidates are recorded only with `--record-lost`;
 //!   without it the run stops before any write (#195 STOP 1 decision 3).
-//!   (h): a path cold roots hold only as debris (data without its
-//!   manifest, a manifest that does not parse) that no start record names
-//!   is a lost candidate, and an unrecorded sealed copy on any cold root
-//!   gets its `manifest` record, so the writer's numbering counts every
-//!   path a cold root holds (D5, D6). When hot's surviving ledger already
-//!   equals the derived one (a re-run), only the replace is skipped: the
-//!   markers are re-read and non-prefix target copies moved aside as in
-//!   an uncrashed run.
+//!   The rebuild's rule B6a, shared by both modes, brings every path a cold
+//!   root holds and no start record names into the restored ledger's
+//!   numbering: a `manifest` record from a cold text (a manifest, else a
+//!   pending manifest), else a lost candidate. When hot's surviving ledger
+//!   already equals the derived one (a re-run), only the replace is
+//!   skipped: the markers are re-read and non-prefix target copies moved
+//!   aside as in an uncrashed run.
 //! - **H6 Copy-back** ([`plan_copy_back`]): every partition dated in the
-//!   hot window or not recorded removed by the start; per partition, every
-//!   path whose verdict in the installed ledger is ordinary, from the cold
-//!   roots in configuration order with the installed text
-//!   ([`replica::copy_back`], [`OtherText::PassOver`]). A damaged copy
-//!   passed over, and a path with no verified copy left (the lost-file
-//!   rule: it stays recorded, every read of it is `Integrity`), are `FAIL:`
-//!   lines and do not stop the restore; an error on hot's side does. A
-//!   window partition the start records removed gets `returned` once all
-//!   its paths are back.
+//!   hot window or not recorded removed by the start, plus (j) the
+//!   partition of every path B6a recorded from a cold text; per partition,
+//!   every path whose verdict in the installed ledger is ordinary, from the
+//!   cold roots in configuration order with the installed text
+//!   ([`replica::copy_back`], [`OtherText::PassOver`]), (i) reading a
+//!   root's crash forms too ([`SourceForms::CrashForms`]: its manifest,
+//!   else its pending manifest; its data, else its data temp file). A
+//!   damaged copy passed over, and a path with no verified copy left (the
+//!   lost-file rule: it stays recorded, every read of it is `Integrity`),
+//!   are `FAIL:` lines and do not stop the restore; an error on hot's side
+//!   does. (k) After each path's copy-back, every temp name of it on a copy
+//!   target that is no verifiable copy of the installed text is moved to
+//!   `.mie/damaged/<at_ms>/` ([`set_aside`]), since the next pass removes
+//!   both temp names of a path it copies. A window partition the start
+//!   records removed gets `returned` once all its paths are back.
 //! - **H7 Write order and commit**: H3, H4, the install, the copy-back and
 //!   its `returned` records; every root's marker re-read; hot's marker
 //!   last ([`root_marker::publish`]). Why last: a marker written first and
@@ -101,7 +106,9 @@ use mie_adapter_binance::archive::ARCHIVE_SOURCE;
 use mie_adapter_binance::archive::ledger::{LedgerKind, LedgerName, PENDING_FILE, classify};
 use mie_adapter_parquet::copy_ledger::{self, CopyLedger, Kind, Record};
 use mie_adapter_parquet::removal;
-use mie_adapter_parquet::replica::{self, CopyOutcome, OtherText, TailSource};
+use mie_adapter_parquet::replica::{
+    self, CopyCheck, CopyOutcome, OtherText, SourceForms, TailSource, TempName,
+};
 use mie_adapter_parquet::root_marker::{self, HOT_ID};
 use mie_adapter_parquet::verification::{CopyState, PathVerdict};
 use mie_ports::raw::{RawStoreError, validate_segment};
@@ -131,6 +138,8 @@ pub(crate) enum Step {
     Install,
     /// The first file is copied back.
     FirstCopy,
+    /// The first temp name is set aside after its path's copy-back (H6 k).
+    SetAside,
     /// Every partition is copied back and every `returned` appended.
     Returned,
     /// Every marker is re-read; hot's is not written yet.
@@ -139,12 +148,13 @@ pub(crate) enum Step {
 
 #[cfg(test)]
 impl Step {
-    pub(crate) const ALL: [Self; 7] = [
+    pub(crate) const ALL: [Self; 8] = [
         Self::Journal,
         Self::ImportLedger,
         Self::Replace,
         Self::Install,
         Self::FirstCopy,
+        Self::SetAside,
         Self::Returned,
         Self::BeforeMarker,
     ];
@@ -526,6 +536,105 @@ fn list_ledger(dir: &Path) -> std::io::Result<LedgerListing> {
     Ok(listing)
 }
 
+/// H6 k for `path`, right after its copy-back: on every copy target, a
+/// temp name of the path that is no verifiable copy of the installed
+/// `text` (an `M~` with other bytes, a `D~` that does not verify) is moved
+/// to `<target>/.mie/damaged/<at_ms>/<partition>/<name>`, since the next
+/// pass's D5 copy of the path to that target removes both temp names
+/// before it copies. `D` and `M` never move; read-only roots are never
+/// written. A moved `M~` that parses with another text is a `FAIL:` (row
+/// 12 of B6a); every other move is a report line.
+fn set_aside(
+    targets: &[&Marked],
+    path: &str,
+    text: &str,
+    at_ms: i64,
+    report: &mut RestoreReport,
+    first_move: &mut bool,
+) -> Result<(), Stop> {
+    for target in targets {
+        for name in [TempName::Data, TempName::Manifest] {
+            let file = replica::temp_path(&target.path, path, name)
+                .map_err(|error| Stop(format!("{path}: {error}")))?;
+            let read = |error: std::io::Error| {
+                Stop(format!(
+                    "read {}: {error}; the restore stops before hot's marker, and running it \
+                     again completes it (ADR-062 D11)",
+                    file.display()
+                ))
+            };
+            let other_text = match name {
+                TempName::Manifest => match fs::read(&file) {
+                    Err(error) if error.kind() == ErrorKind::NotFound => continue,
+                    Err(error) => return Err(read(error)),
+                    Ok(bytes) if bytes == text.as_bytes() => continue,
+                    Ok(bytes) => matches!(
+                        rebuild::classify_text(path, &bytes),
+                        rebuild::RootCopy::Text { .. }
+                    ),
+                },
+                TempName::Data => match replica::check_file(&file, text) {
+                    Ok(CopyCheck::Missing) | Ok(CopyCheck::Good) => continue,
+                    Ok(_) => false,
+                    Err(error) => {
+                        return Err(Stop(format!(
+                            "check {}: {error}; the restore stops before hot's marker, and \
+                             running it again completes it (ADR-062 D11)",
+                            file.display()
+                        )));
+                    }
+                },
+            };
+            if let Some(why) = rebuild::marker_gone(target) {
+                return Err(Stop(format!(
+                    "{} ({}): {why} since the run started; the restore stops before hot's \
+                     marker, and running it again completes it (ADR-062 D11)",
+                    target.path.display(),
+                    target.id
+                )));
+            }
+            let rel = file
+                .strip_prefix(&target.path)
+                .map_err(|error| Stop(format!("{}: {error}", file.display())))?;
+            let aside = replica::damaged_dir(&target.path, at_ms).join(rel);
+            replica::move_file_aside(&file, &aside).map_err(|error| {
+                Stop(format!(
+                    "move {} aside to {}: {error}; evidence is never overwritten, so the restore \
+                     stops before hot's marker, and running it again (a new `at_ms`) completes it \
+                     (ADR-062 D11)",
+                    file.display(),
+                    aside.display()
+                ))
+            })?;
+            if other_text {
+                report.problems.push(format!(
+                    "{} on {} ({}): a pending manifest with another text than the installed one, \
+                     a remnant of an earlier use of {path}: moved aside to {}; the next pass \
+                     copies the path from hot (ADR-062 D5, D11)",
+                    file.display(),
+                    target.path.display(),
+                    target.id,
+                    aside.display()
+                ));
+            } else {
+                report.lines.push(format!(
+                    "{} on {} ({}): no verifiable copy of {path}: moved aside to {}, since the \
+                     next pass removes the temp names of a path it copies (ADR-062 D5)",
+                    file.display(),
+                    target.path.display(),
+                    target.id,
+                    aside.display()
+                ));
+            }
+            if *first_move {
+                *first_move = false;
+                reached(Step::SetAside)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The restore; a [`Stop`] means no marker was written.
 #[allow(clippy::too_many_lines)]
 fn restore(
@@ -831,6 +940,7 @@ fn restore(
         hot_read.files.insert(path, copy);
     }
     hot_read.orphan_data = rebuild::orphan_data(hot).map_err(|e| listing(hot, e))?;
+    hot_read.evidence = replica::list_evidence(hot).map_err(|e| listing(hot, e))?;
     hot_read.partitions = removal::scan_hot(hot, "")
         .map_err(|e| listing(hot, e))?
         .partitions
@@ -842,19 +952,24 @@ fn restore(
     let mut roots = Vec::new();
     for root in &marked {
         let mut root_files = BTreeMap::new();
+        let check = |path: &str| {
+            root.copy_target
+                && !start
+                    .copy(path, &root.id)
+                    .is_some_and(|copy| copy.latest.is_some())
+        };
         for path in replica::list_sealed(&root.path).map_err(|e| listing(&root.path, e))? {
-            let recorded = start
-                .copy(&path, &root.id)
-                .is_some_and(|copy| copy.latest.is_some());
-            let check = root.copy_target && !recorded;
-            let copy = rebuild::read_copy(&root.path, &path, check)?;
+            let copy = rebuild::read_copy(&root.path, &path, check(&path))?;
             root_files.insert(path, copy);
         }
+        let temps = rebuild::read_temps(&root.path, &root_files, &check)?;
         roots.push(RootRead {
             id: root.id.clone(),
             copy_target: root.copy_target,
             files: root_files,
             orphan_data: rebuild::orphan_data(&root.path).map_err(|e| listing(&root.path, e))?,
+            temps,
+            evidence: replica::list_evidence(&root.path).map_err(|e| listing(&root.path, e))?,
             quarantine: replica::list_quarantine(&root.path)
                 .map_err(|e| quarantine(&root.path, e))?,
         });
@@ -869,7 +984,12 @@ fn restore(
         .chain(
             roots
                 .iter()
-                .flat_map(|root| root.files.keys().chain(&root.orphan_data))
+                .flat_map(|root| {
+                    root.files
+                        .keys()
+                        .chain(&root.orphan_data)
+                        .chain(root.temps.keys())
+                })
                 .map(String::as_str),
         )
         .filter(|path| copy_ledger::is_data_path(path))
@@ -964,6 +1084,17 @@ fn restore(
         );
     }
     let derived = rebuild::derive(&inputs)?;
+    // H6 j: the partition of every path recorded from a cold text (B6a
+    // rule 2) is copied back, even one the start records removed: hot
+    // sealed that path, so its partition was on hot. Adding it after the
+    // derivation changes nothing there: B8 already skips a partition the
+    // start records removed, and every other one is in P.
+    mode.copy_back.extend(
+        derived
+            .cold_recorded
+            .iter()
+            .map(|path| partition_of(path).to_owned()),
+    );
     if let Some((dir, exists, on_hot)) = &hot_ledger_dir {
         report.lines.push(format!(
             "import ledger {}: {}, {on_hot} file(s) on hot, {} to write, {} hot cop{} to set \
@@ -1155,6 +1286,7 @@ fn restore(
     }
     let cold_paths: Vec<PathBuf> = cold_roots.iter().map(|root| root.path.clone()).collect();
     let mut first = true;
+    let mut first_move = true;
     for (partition, paths) in &by_partition {
         let (mut copied, mut present, mut failed) = (0usize, 0usize, 0usize);
         for (i, (path, text)) in paths.iter().enumerate() {
@@ -1165,6 +1297,7 @@ fn restore(
                 path,
                 text,
                 OtherText::PassOver,
+                SourceForms::CrashForms,
                 &mut |copy| damaged.push(copy.clone()),
             );
             for copy in &damaged {
@@ -1176,14 +1309,26 @@ fn restore(
                 ));
             }
             match outcome {
-                Ok(back) if back.outcome == CopyOutcome::AlreadyPresent => present += 1,
-                Ok(_) => copied += 1,
+                Ok(back) => {
+                    if back.outcome == CopyOutcome::AlreadyPresent {
+                        present += 1;
+                    } else {
+                        copied += 1;
+                    }
+                    set_aside(&targets, path, text, at_ms, report, &mut first_move)?;
+                }
                 Err(error) => {
+                    // A root holds the path when it has its manifest or
+                    // its pending manifest (H6 i).
                     let manifest =
                         format!("{}.manifest", path.strip_suffix(".parquet").unwrap_or(path));
                     let holders: Vec<&PathBuf> = cold_paths
                         .iter()
-                        .filter(|root| fs::symlink_metadata(root.join(&manifest)).is_ok())
+                        .filter(|root| {
+                            fs::symlink_metadata(root.join(&manifest)).is_ok()
+                                || replica::temp_path(root, path, TempName::Manifest)
+                                    .is_ok_and(|pending| fs::symlink_metadata(pending).is_ok())
+                        })
                         .collect();
                     let no_good_copy = holders
                         .iter()
