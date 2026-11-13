@@ -535,7 +535,7 @@ fn j_plan_from_the_installed_ledger() {
     let removed = Kind::Removed {
         partition: partition.clone(),
     };
-    use Held::{Data, Manifest, PendingManifest};
+    use Held::{Data, Manifest, PendingManifest, VerifiedOnHot};
     type Case<'a> = (&'a str, Vec<Kind>, Vec<Held>, bool);
     let cases: Vec<Case> = vec![
         (
@@ -588,6 +588,29 @@ fn j_plan_from_the_installed_ledger() {
             "no M and no M~ on any root",
             vec![manifest.clone(), removed.clone()],
             vec![Data],
+            false,
+        ),
+        (
+            "no copy; no M or M~ on any cold root; hot's copy verifies (review round 4)",
+            vec![manifest.clone(), removed.clone()],
+            vec![VerifiedOnHot],
+            true,
+        ),
+        (
+            "no copy; truncated D on cold-b; hot's copy verifies (review round 4)",
+            vec![manifest.clone(), removed.clone()],
+            vec![Data, VerifiedOnHot],
+            true,
+        ),
+        (
+            "copy on both; D on cold-b; hot's copy verifies (a pass recorded it)",
+            vec![
+                manifest.clone(),
+                copy("cold-a"),
+                copy("cold-b"),
+                removed.clone(),
+            ],
+            vec![Manifest, Data, VerifiedOnHot],
             false,
         ),
         (

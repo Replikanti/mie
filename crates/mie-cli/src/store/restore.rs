@@ -97,7 +97,9 @@
 //!   one by one in path order, every path of a removed partition outside
 //!   the plan that the installed ledger records ordinary, with no `copy`
 //!   record or no cold data file, and of which a cold root holds a text
-//!   form ([`plan_unreplicated`]); no `returned` is written, so a re-run
+//!   form or hot a verified copy ([`plan_unreplicated`], round 4: a crash
+//!   after (k) moved the only cold text form keeps the path in J, so (k)
+//!   still reaches every target); no `returned` is written, so a re-run
 //!   lists the same paths. (k) After each path's copy-back ([`set_aside`]),
 //!   on every copy target: k1 moves an unrecorded `M`/`D` copy the next
 //!   pass's D5 copy would refuse into `.mie/damaged/<at_ms>/` (never a
@@ -494,7 +496,8 @@ fn partition_of(path: &str) -> &str {
         .map_or(path, |(partition, _)| partition)
 }
 
-/// A form a cold root holds of a path, by name (H6 J).
+/// A form of a path that J asks about (H6 J): the first three are held by
+/// a cold root, by name; the last by hot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Held {
     /// The manifest `M`.
@@ -503,6 +506,9 @@ pub enum Held {
     PendingManifest,
     /// The data file `D`.
     Data,
+    /// Hot's sealed copy, verified against the installed text
+    /// ([`replica::check_sealed_copy`] is `Good`; review round 4).
+    VerifiedOnHot,
 }
 
 /// H6 J (#195 amendment 2): the paths the restore copies back one by one
@@ -511,12 +517,16 @@ pub enum Held {
 /// copy-back plan `plan`, whose verdict is ordinary, that has no `copy`
 /// record with a copy on any root or whose data file no cold root holds,
 /// and of which some cold root holds the manifest or the pending manifest
-/// (`holds`, over every cold root). Why: removal rule (e) needs a `copy`
-/// record on all k targets, so such a path was sealed after a recall
-/// whose `returned` sat in hot's lost tail, or recorded from a cold copy
-/// by a rebuild or a restore; a path no root holds as `D` cannot be read;
-/// without a text form there is nothing to copy back from. J reads only
-/// the installed ledger and names, so a re-run lists the same paths. Pure.
+/// (`holds`, over every cold root), or hot a verified copy. Why: removal
+/// rule (e) needs a `copy` record on all k targets, so such a path was
+/// sealed after a recall whose `returned` sat in hot's lost tail, or
+/// recorded from a cold copy by a rebuild or a restore; a path no root
+/// holds as `D` cannot be read; without a text form there is nothing to
+/// copy back from, unless hot already holds the path: then the copy-back's
+/// branch for a path hot holds still runs (k). That keeps a path
+/// whose only cold text form (k) moved before a crash in the re-run's J
+/// (review round 4, rule 6). J reads only the installed ledger, names and
+/// hot's copy, so a re-run lists the same paths. Pure.
 pub fn plan_unreplicated(
     state: &CopyState,
     plan: &BTreeSet<String>,
@@ -533,7 +543,11 @@ pub fn plan_unreplicated(
         .filter(|(path, _)| {
             state.copies_of(path).all(|(_, copy)| copy.latest.is_none()) || !holds(path, Held::Data)
         })
-        .filter(|(path, _)| holds(path, Held::Manifest) || holds(path, Held::PendingManifest))
+        .filter(|(path, _)| {
+            holds(path, Held::Manifest)
+                || holds(path, Held::PendingManifest)
+                || holds(path, Held::VerifiedOnHot)
+        })
         .map(|(path, _)| path.to_owned())
         .collect();
     paths.sort();
@@ -2035,18 +2049,29 @@ fn restore(
     // `returned`: the hot removal finishes the old removal once each path's
     // k copies are recorded and verified (removal rules (e), (f)). A name
     // check error other than not-found counts as present, so the copy-back
-    // tries that root and reports what it finds.
+    // tries that root and reports what it finds. Hot's copy counts only
+    // when it verifies: the copy-back then finds no cold source and takes
+    // its branch for a path hot already holds, which runs (k) (round 4).
     let holds = |path: &str, form: Held| {
-        cold_paths.iter().any(|root| {
+        let cold = |root: &PathBuf| {
             let file = match form {
                 Held::Manifest => Ok(root.join(manifest_name(path))),
                 Held::PendingManifest => replica::temp_path(root, path, TempName::Manifest),
-                Held::Data => Ok(root.join(path)),
+                Held::Data | Held::VerifiedOnHot => Ok(root.join(path)),
             };
             file.is_ok_and(|file| {
                 !matches!(fs::symlink_metadata(file), Err(e) if e.kind() == ErrorKind::NotFound)
             })
-        })
+        };
+        match form {
+            Held::VerifiedOnHot => state.ledger_text(path).is_some_and(|text| {
+                matches!(
+                    replica::check_sealed_copy(hot, path, text),
+                    Ok(CopyCheck::Good)
+                )
+            }),
+            _ => cold_paths.iter().any(cold),
+        }
     };
     for path in plan_unreplicated(&state, &mode.copy_back, &holds) {
         let Some(text) = state.ledger_text(&path) else {

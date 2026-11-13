@@ -2471,6 +2471,101 @@ fn j_path_recorded_by_an_earlier_rebuild_is_copied_back() {
     );
 }
 
+/// The J state with row 3 on cold-a (`M` + a verifying `D~`, the only
+/// text form of `live(3)`) and the damaged form `damage` puts on cold-b,
+/// which holds no text form of it. Returns the fixture, the sealed data
+/// and the bytes of cold-b's damaged form.
+fn j_row3_beside(tag: &str, damage: fn(&Fixture, &[u8]) -> PathBuf) -> (Fixture, Vec<u8>, Vec<u8>) {
+    let fixture = replicated(tag);
+    append(
+        &fixture,
+        Kind::Removed {
+            partition: LIVE.to_owned(),
+        },
+    );
+    assert_eq!(fixture.pass().problems, Vec::<String>::new());
+    assert_eq!(
+        fixture.seal("binance-um", "aggTrade", D0 + 6_000, 2),
+        vec![live(3)]
+    );
+    let (data, text) = sealed_of(&fixture, 3);
+    fs::write(tmp(&fixture.cold[0], 3, replica::TempName::Data), &data).unwrap();
+    fs::write(fixture.cold[0].join(manifest_of(&live(3))), &text).unwrap();
+    let file = damage(&fixture, &data);
+    let bytes = fs::read(file).unwrap();
+    lose_hot(&fixture);
+    (fixture, data, bytes)
+}
+
+/// Review round 4 (rule 6): a J path whose only text form is row 3 on
+/// cold-a, and cold-b holds a truncated `D` with no `M`, or a half-written
+/// `D~`. A crash at any step, the set-aside after (k) moved cold-a's forms
+/// included, and a re-run end as the uncrashed run does: hot holds
+/// `live(3)`, cold-b's damaged form is gone from its layout and kept byte
+/// for byte below exactly one `.mie/damaged/<at_ms>/`, and the next pass
+/// records the path on cold-a and cold-b (2 of 2), a second pass clean.
+#[test]
+fn j_crash_after_row_3_set_aside_still_reaches_every_target() {
+    type Damage = fn(&Fixture, &[u8]) -> PathBuf;
+    let damages: [(&str, Damage); 2] = [
+        ("truncated D", |fixture, data| {
+            let file = fixture.cold[1].join(live(3));
+            fs::write(&file, &data[..data.len() - 1]).unwrap();
+            file
+        }),
+        ("half D~", |fixture, data| {
+            let file = tmp(&fixture.cold[1], 3, replica::TempName::Data);
+            fs::write(&file, &data[..data.len() / 2]).unwrap();
+            file
+        }),
+    ];
+    for (i, (name, damage)) in damages.into_iter().enumerate() {
+        for step in [None].into_iter().chain(Step::ALL.map(Some)) {
+            let case = format!("{name}, crash at {step:?}");
+            let (fixture, data, bytes) =
+                j_row3_beside(&format!("restore-j-row3-{i}-{step:?}"), damage);
+            let mut at = AT;
+            if let Some(step) = step {
+                AFTER_STEP.with(|crash| crash.set(Some(step)));
+                let first = restore_at(&fixture, Flags::default(), J_FIRST_HOT, at);
+                let reached = AFTER_STEP.with(std::cell::Cell::get).is_none();
+                AFTER_STEP.with(|crash| crash.set(None));
+                if reached {
+                    assert_not_restored(&first, &["simulated crash"]);
+                    at += 1;
+                } else {
+                    assert!(first.restored, "{case}: {first:#?}");
+                }
+            }
+            if at != AT || step.is_none() {
+                let report = restore_at(&fixture, Flags::default(), J_FIRST_HOT, at);
+                assert!(report.restored, "{case}: {report:#?}");
+            }
+            assert_eq!(fs::read(fixture.hot.join(live(3))).unwrap(), data, "{case}");
+            let b = &fixture.cold[1];
+            let in_layout: Vec<String> = fs::read_dir(b.join(LIVE))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|name| name.contains("part-00003"))
+                .collect();
+            assert_eq!(in_layout, Vec::<String>::new(), "{case}");
+            let damaged = b.join(".mie").join("damaged");
+            let kept = snapshot(&fixture)
+                .into_iter()
+                .filter(|(path, held)| path.starts_with(&damaged) && *held == bytes)
+                .count();
+            assert_eq!(kept, 1, "{case}");
+            assert_eq!(fixture.pass().problems, Vec::<String>::new(), "{case}");
+            assert_eq!(
+                copies(&fixture, &live(3)),
+                vec!["cold-a", "cold-b"],
+                "{case}"
+            );
+            assert_eq!(fixture.pass().problems, Vec::<String>::new(), "{case}");
+        }
+    }
+}
+
 /// The reviewer's state of round 3, finding 2: LIVE replicated and removed
 /// from hot, then part 1 gone from both cold roots; with `garbage` a
 /// half-written `D~` of part 1 on cold-a (a crashed re-copy). Hot's ledger

@@ -2079,7 +2079,8 @@ What breaks:
     partition recorded removed and outside the plan, with no `copy`
     record of a copy on any root or with no cold root holding its data
     file, and of which some cold root holds the manifest or the pending
-    manifest by name (an error other than not-found counts as present).
+    manifest by name (an error other than not-found counts as present),
+    or hot holds a copy that verifies against the installed text.
     No `returned` is written: the hot removal finishes the old removal
     once the path's k `copy` records lie inside the verified ledger-copy
     prefixes (rules (e), (f)), and until then rule (e) keeps it on hot.
@@ -2087,9 +2088,13 @@ What breaks:
     all k targets, so such a path was sealed after a recall whose
     `returned` sat in hot's lost tail, or recorded from a cold copy by a
     rebuild or a restore; a path no cold root holds as a data file cannot
-    be read; without a text form there is nothing to copy back. J reads
-    only the installed ledger and names, so every re-run, and every later
-    restore, lists the same paths. Rejected: the whole partition plus
+    be read; without a text form there is nothing to copy back, unless
+    hot already holds a verified copy: a crash after (k) moved the only
+    cold text form aside leaves exactly that, and the path must stay in
+    J so that (k) still reaches the later copy targets, as in the
+    uncrashed run (review 4 of #218). J reads only the installed ledger,
+    names and hot's copy, so every re-run, and every later restore, lists
+    the same paths. Rejected: the whole partition plus
     `returned`, as the first version derived it from this run's B6a
     records (`cold_recorded`): after a crash at the install the re-run
     starts from hot's installed ledger, which names the path, so the set
