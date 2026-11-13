@@ -596,7 +596,13 @@ fn a_journal_copy_is_repaired_by_majority_and_refused_against_hot() {
     for root in ["cold-a", "cold-b"] {
         assert_fail_line(
             &out,
-            &[root, "refused", "byte 10", "hot's journal is the suspect"],
+            &[
+                root,
+                "refused",
+                "byte 10",
+                "hot's journal is the suspect",
+                "#217",
+            ],
         );
     }
     for (root, before) in ["cold-a", "cold-b"].iter().zip(copies) {

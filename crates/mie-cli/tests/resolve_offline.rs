@@ -421,7 +421,7 @@ fn a_rotten_superseded_copy_on_hot_still_refuses() {
     assert!(!pass, "{out}");
     assert_fail_line(
         &out,
-        &[&format!("metrics/{e0}"), "on hot", "cannot be read", "#195"],
+        &[&format!("metrics/{e0}"), "on hot", "cannot be read", "#217"],
     );
     assert_eq!(files(&fixture.dir), before, "{out}");
     assert_eq!(held(&fixture), held_before, "{out}");

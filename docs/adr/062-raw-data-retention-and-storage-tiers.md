@@ -889,7 +889,9 @@ live in more than one root (approved as written at STOP 1).
   - **Hot lost** (no marker, `cold_roots` configured): `mie ingest` and
     the importer, its dry run included, refuse to start before they open
     anything, and name `mie store init` (a new store) and the hot restore
-    (D11, a lost hot). The check reads hot's marker only; with
+    (D11, a lost hot: `mie store restore`, and its re-run when `.mie/`
+    exists without the marker, an interrupted restore, #195). The check
+    reads hot's marker only; with
     `cold_roots` empty it makes no filesystem call. A `raw_root` that
     carries a cold root's marker is refused too. Why: on
     an empty hot the writer would number new parts from zero, the journal
@@ -1054,7 +1056,108 @@ live in more than one root (approved as written at STOP 1).
     the grammar (look-alike characters, a trailing blank, `..`, an
     absolute path) is reported and never recorded. A path the start
     records lost that a root holds again stays lost. The lines of an
-    entry held as `entry-conflict` are no source.
+    entry held as `entry-conflict` are no source. A recorded path is held
+    when hot holds it, a cold root holds its manifest or its data file, or
+    a root without the manifest holds a *verified crash copy*: a pending
+    manifest (`.part-N.manifest.tmp`, `M~`) byte-equal to the start's
+    `manifest` text whose data (the data file, else `.part-N.parquet.tmp`,
+    `D~`) verifies against it (#195 rule 4′). Nothing else holds it: not a
+    `D~` alone, even one that verifies, not an `M~` with other bytes, a
+    torn or unreadable `M~`, an `M~` whose data fails, or evidence. Such a
+    path is a `ledger`-origin candidate as before #195, and its line names
+    every form, all left in place. Why: held-ness only decides whether a
+    good copy exists; the numbering counts every recorded path by its
+    record anyway (D6). A lone `D~` cannot be served (the restore's
+    copy-back needs a text form on the root, and the tiered `read` reads
+    only the data file), and counting any crash form as held turned a
+    lost candidate into a clean install (review 3 of #218, finding 2). A
+    path the start records lost is a `FAIL:` ("a root holds it again")
+    only when hot holds it or a cold root holds a parseable manifest of
+    it; any other form is the report line `<path>: recorded lost; <forms>
+    left in place`. Why: the repair's lost-file rule and the restore leave
+    such debris in place on purpose and no mie command removes it, so
+    counting it as held again failed every later rebuild (review 2 of
+    #218, finding 3b).
+  - **B6a Cold-only paths (#195, both modes).** A path is *cold-only*
+    when no start record other than `finding` and `lost` names it, hot
+    holds neither its manifest nor its data, and a cold root holds a form
+    of it or a part name below a root's `.mie/damaged/<dir>/` names it.
+    The forms are those a D5 copy leaves when it crashes after any step
+    (`WriteData` leaves `D~`; `WriteManifest`, `Verify` and `MarkReadOnly`
+    leave `D~`+`M~`; `PublishData` leaves `D`+`M~`; a power loss can undo a
+    rename the directory fsync does not yet cover, leaving `M`+`D~`), plus
+    `move_aside` and outside damage. Read-only roots hold whatever they
+    held as copy targets, so the rule covers them as well. For a cold-only
+    path:
+    1. *Text.* B3/B4 decide over the roots' manifests as before; two
+       manifest texts on a live path still stop. Without a manifest text,
+       the parseable `M~` texts of the roots without the manifest decide,
+       only those whose data (`D`, else `D~`) verifies against them (rule
+       1′): one distinct text wins; with several, an archive path takes
+       the one its current entry lists (B4's tie rule), otherwise there is
+       none. Why 1′: the D5 copy writes `M~` before its `Verify` step and
+       renames `M` only after it, so an `M` is a seal while an `M~` becomes
+       one only through verified data; an `M~` whose data fails is a lost
+       candidate under 3, not a record (review 3 of #218).
+       `M~` never enters B3's conflict check: crash forms never outrank
+       each other. An archive path whose one text comes from `M~` goes
+       through B7 as one with a manifest, so a missing entry still gives
+       its `unlisted` hold.
+    2. *With a text* the path gets its `manifest` record, on a copy target
+       or a read-only root, its data verified or not; `copy` stays B4's,
+       for a verified `D`+`M` on a copy target only. A pending form with
+       the text and data that does not verify is a damaged copy (`FAIL:`).
+    3. *Without a text* the path is a lost candidate (B6's flag; in the
+       restore, D11's H5 d), origin `verify` unless a higher source names
+       it, its line naming every form. A data file or data temp file alone
+       gets no text derived from its bytes: the manifest is the seal's own
+       statement, and the journal's `sealed` line has no SHA-256 to check
+       against, so a re-derived manifest would vouch for the bytes with
+       themselves. Evidence below `.mie/damaged/` names a path but never
+       holds it: it failed verification, yet the repair's re-copy may have
+       crashed while its good source was the lost hot.
+    6. *Outcomes re-derive* (#195 amendment 2). A later run that finds the
+       path recorded by an earlier install derives the same lost
+       candidates and the same paths in `FAIL:` lines. So the rebuild's
+       `FAIL:` "only a pending manifest holds it" covers every ordinary
+       path hot lacks that no cold root holds as a data file and that a
+       verified crash copy holds (a selection covering it fails until a
+       sealed copy exists), whoever recorded it; and a pending form with
+       another text than a path's decided text is a damaged copy for
+       every path hot lacks, not only cold-only ones.
+
+    A pending manifest that cannot be read counts as one that does not
+    parse (a lost candidate under 3 when nothing else gives a text, never
+    holding under 4′) and never stops the rebuild; before #195 the rebuild
+    did not read it.
+
+    Why: the restore (D11 H5) first counted only sealed cold copies and
+    a data file without its manifest. Its re-review found that verified
+    temp copies were not counted, so the path was reused and the next
+    pass deleted them; that a verifiable crash state (`D`+`M~`) became
+    `lost`; and that the rebuild still counted cold debris as held after
+    a restore, although hot no longer held the part (review 2 of #218,
+    findings 1 to 3). B6a depends on the roots, not on the targets' ledger
+    copies, so a rebuild at any time after a restore derives what the
+    restore derived for every path, whether or not a pass has replicated
+    the restore's records: a path copied back is on hot and hot counts it;
+    a path recorded from a cold text gets the same record; a path recorded
+    lost from debris is found again before the pass (the rebuild stops
+    without `--record-lost`) and is the start's `lost` record after it.
+    Every branch needs hot to lack the path, so the derivation of every
+    path an intact hot holds is unchanged. Rejected: rolling the forms
+    forward in place on the cold roots, as ADR-030 recovery does on hot
+    (mie never writes a read-only root, and the next pass completes the
+    copy targets from hot anyway); the restore extending the targets'
+    ledger copies before its marker (it helps only until a rebuild picks
+    an older copy, and it adds a second writer of `ledger-copy` records
+    outside the pass). Weak spots: a lone `D`, `D~`, or `D` with a torn
+    `M~` ends `lost` behind the flag although the data was probably
+    verified before its rename; reaching it needs a crash between two
+    syscalls, then the hot loss before the next pass, and the bytes stay
+    in place for a future ADR. In the rebuild, a path known only from a
+    pending manifest (an adoption whose copies crashed, then hot's ledger
+    replaced) is recorded but unreadable until the adoption runs again.
   - **B7 Archive holds (step 5a)** are one pure function shared with the
     hot restore's step 5, which passes no `PENDING`: entry resolution as
     in that step, `unlisted` for an archive part no current entry lists
@@ -1724,7 +1827,15 @@ What breaks:
   hot without its marker (D7). It holds the copy-ledger lock (D7)
   throughout:
   1. Every configured copy target must present its marker, as in the
-     rebuild. A new hot marker is written.
+     rebuild. A new hot marker is written **last**, after steps 2 to 5,
+     as the restore's commit point (#195). Why last: until the marker
+     exists, `mie ingest`, the importer and every other `mie store`
+     command refuse the hot, so a crash leaves a hot that nothing writes
+     to and that running the restore again completes. A marker written
+     first and a crash after it would let `mie ingest` start a degraded
+     capture on a half-restored hot, whose writer numbers hot-window parts
+     from hot alone and can reuse a path cold holds (D5), the failure the
+     restore exists to prevent.
   2. **The journal** is restored from the longest copy whose other copies
      are byte prefixes of it. Two copies that differ beyond their common
      prefix stop the restore (damage, explicit repair). **The import
@@ -1742,7 +1853,19 @@ What breaks:
   4. The D7 rebuild steps 2–6 then run against the restored ledger: the
      root listing and the cross-check with the restored journals and import
      ledger add the records lost with the ledger tail, and step 5 marks only
-     the partitions that are still off hot after step 3.
+     the partitions that are still off hot after step 3. The data of a
+     cold copy is read here only when the starting ledger has no `copy`
+     record for it; everything step 3 copies back is verified by the copy
+     itself (#195 STOP 1 decision 4). Why: after one year the copy targets
+     hold about 0.7–1.0 TB (274–411 GB of live growth per copy × 2, plus
+     about 67 GB of archive × 2, D10). At an assumed 150 MB/s, not
+     measured, re-reading all of it adds about 1.3–1.8 h of capture
+     downtime per year of store age, against about 1 min for the 6.35–9.36
+     GB of step 3. Correctness does not depend on the re-read: the copy
+     back verifies what it copies, an unrecorded copy is verified before
+     it gets its record, and `read` never serves a copy that fails its
+     manifest (D5). Damage on a recorded copy outside step 3 is found by
+     the next verification, as between two verification passes today.
   5. **Archive findings never stop the restore; copy damage is repaired,
      not quarantined.**
      - A copy that does not match its manifest's size and SHA-256 (live or
@@ -1796,6 +1919,272 @@ What breaks:
      ledger, so its resume carries the `Disconnected` gap over the whole
      outage, the restore included. Part numbers continue from the union
      (D6), so no path is reused even if step 3 missed a partition.
+
+  **As implemented (#195): `mie store restore --config <ingest config>
+  [--archive-config <path>] [--record-lost] [--skip-unreadable-journal]`.** Numbered as in the plan
+  of #195; the tests cite the numbers. It is built like the rebuild (D7
+  *As implemented (#193)*): refusals and whole-run locks, then every
+  read, then the pure derivation, then the writes, each idempotent, so
+  running the command again completes a restore that crashed or stopped.
+  - **H0 Refusals, nothing written.** An empty `cold_roots`. A `raw_root`
+    that does not exist: the operator mounts or creates the replacement
+    directory, since a directory mie created could put hot on the wrong
+    filesystem. A `raw_root` with hot's marker (STOP 1 decision 2): the
+    restore is for a lost hot only; damage to hot's own journal or
+    import-ledger files on an intact hot is #217, and its texts in R7 and
+    RA5 name it. A `raw_root` with a cold root's marker. An archive
+    configuration of another store. A configured root, copy target or
+    read-only, without a readable marker: the restore lists every root's
+    layout, and an unmounted root reads as empty (D7 step 2). A cold
+    marker with hot's id, one id on two roots, hot and the copy targets
+    not on pairwise distinct devices. A `paths.journal` without a file
+    name, and an import-ledger path that is a dangling link (an unmounted
+    disk).
+  - **H1 Locks**, each without waiting, for the whole run: `.mie/` is
+    created when absent (no marker), then the copy-ledger hold, the pass
+    lock, the verify lock and the writer lock of every source in name
+    order (`instrument.source`, the archive source with an archive
+    configuration, and every `source=` at the top of any root's layout).
+    Why the live source too: if hot's marker was deleted under a running
+    `mie ingest`, the restore must not copy into partitions that writer
+    appends to. Nothing but `.mie/` and the lock files is written before
+    H7.
+  - **H2 Reads**, in this order: every copy target's ledger copy and hot's
+    surviving ledger, which choose the start; the journal candidates
+    (hot's `paths.journal` and each target's `.mie/journal/<its file
+    name>`); every import-ledger file on hot and on the targets; hot's
+    layout, its data not read; each cold root's layout, data read only
+    for an unrecorded copy on a copy target (step 4 above) and for every
+    crash form on a root without the manifest (B6a rule 1′). A listing
+    error stops the run: a skipped directory would turn its files into
+    lost candidates. **U**: a read error on a name the listing found never
+    stops it, and no byte is deleted; the name stays counted, its content
+    a damaged copy. A cold manifest that cannot be read is a manifest that
+    does not parse (a `FAIL:`, passed over by the copy-back); an
+    unreadable pending manifest one that does not parse (never holding);
+    a target's ledger copy that cannot be read is rejected as a start, with
+    a `FAIL:`, and left in place; an unreadable import-ledger file is no
+    source, the readable copies decide, hot's is moved aside and a
+    target's named for verify, then repair (R8), and with no readable copy
+    left its parts are held `unlisted` and the `FAIL:` names `mie store
+    resolve`; a quarantined manifest that cannot be read is counted
+    without its text. Hot's layout and hot's ledger are hot's side and
+    still stop the run. Why: one unreadable leftover stopped every
+    restore, and the stop promised that a re-run would complete it
+    (review 3 of #218, finding 3). The `FAIL:` of an unreadable file says
+    that a read error can mean a failing disk, and to run `mie store
+    verify`, then `mie store repair`, for what verify finds on that
+    target.
+  - **H3 The journal** (step 2): C is the longest candidate that reads in
+    full (hot's own on a tie), and every other must equal C's prefix of
+    its own length, equal lengths included; otherwise the run stops naming
+    both candidates and the first differing byte. A candidate that cannot
+    be read is left out with a `FAIL:` when it is at most the length of C,
+    the longest candidate that reads in full. A longer one stops the
+    restore with nothing written, since nothing can tell what its tail
+    holds; `--skip-unreadable-journal` leaves it out instead, moved to its
+    target's `.mie/damaged/<at_ms>/.mie/journal/`, with a `FAIL:` naming
+    what hot's journal lacks. Hot's own journal, when left out, goes to
+    `<paths.journal>.unreadable-<at_ms>`. Nothing is deleted. Why a flag:
+    a permanent read error must not leave the operator without a mie
+    command, and no run leaves the journal unless a human asks for it, as
+    `--record-lost` gates `lost` records. These moves are the restore's
+    first writes: a candidate that has left the set never meets hot's
+    written journal again, so a re-run needs no flag. A target `.mie/journal/` that holds files but none
+    under the configured name stops the run: a renamed `paths.journal`
+    would drop every pre-loss run. Hot's journal is created or extended
+    to C, never rewritten. When C ends inside a line, one `\n` is
+    appended. Why: the next `mie ingest` appends its `run_start` straight
+    after the cut line, the two would read as one non-JSON line, and the
+    new run would drop out of `read_runs`. Every copy stays a byte prefix
+    of hot's journal, so the next pass extends them.
+  - **H4 The import ledger** (step 2): a malformed name (G1, a look-alike
+    or invisible character, a trailing blank, a leading `.`) on any root
+    is named and never written. Byte-identical copies are written to hot
+    when hot lacks the name (the immutable copy: temp name, fsync,
+    read-back, read-only, rename). Differing copies of the current entry
+    follow step 5's entry resolution: its one current variant is written,
+    a surviving hot copy of another variant first moved to
+    `.mie/damaged/<at_ms>/import-ledger/`, never deleted; with no current
+    variant the parts are held `entry-conflict` and nothing is written.
+    Differing supersede-record copies: hot keeps its own when it parses,
+    otherwise the first target copy in configuration order that parses
+    and names its own file (G3). Hot's surviving `PENDING` is left in
+    place and named; the checks get none. The derivation then runs over
+    the import ledger as H4 leaves it, so its findings describe the
+    restored store.
+  - **H5 The copy ledger** (steps 2 and 4): the rebuild's derivation in a
+    restore mode, which differs in seven points: (a) hot's own ledger is
+    the first start candidate (on a tie hot wins, then configuration
+    order), since it holds every record the copies hold; (b) a live path
+    with two texts stops the run only when the start has no `manifest`
+    record for it, otherwise the start's text is the path's text and a
+    copy with another text is a damaged copy (a `FAIL:` line naming
+    verify, then repair, never copied back); archive paths keep their
+    holds; (c) `unlisted` holds are written without a flag, since the
+    restore must complete before `mie ingest` starts, and the replication
+    order limits them to the one archive file whose parts and entry a
+    loss separated; (d) lost candidates are recorded only with
+    `--record-lost`, and without it the run stops before any write (STOP
+    1 decision 3): in the default layout the restored journal names only
+    files already on its copy, so a candidate means a second fault, and
+    #192 and #193 put every `lost` record behind the same flag; (e) the
+    removed-partition rule counts every partition step 3 copies back as
+    on hot; (f) a missing hot import ledger does not stop it, since H4
+    restores it; (g) findings are `FAIL:` lines naming verify, then
+    repair, never `finding` records, which belong to a verification pass.
+    The rule B6a of the rebuild (D7 *As implemented (#193)*) applies in
+    both modes, so it is no difference: every path a cold root holds and
+    no start record names reaches the restored ledger's part numbering, as
+    a `manifest` record from a cold text (a manifest, else a pending
+    manifest) or as a lost candidate under (d). It replaces a restore-only
+    rule (h) of the first review round of #218, which counted only sealed
+    cold copies and data files without their manifest. B6a's rules 1′,
+    4′ and 6 (amendment 2) apply in both modes too: a pending manifest
+    gives a text only through verified data, a recorded path that hot
+    lacks is held by a crash form only when it is a verified crash copy,
+    and a later run derives the same outcomes. The install is the
+    rebuild's (B9). When hot's surviving ledger already equals the
+    derived one (a re-run after the replace), only the replace and its
+    link into `.mie/damaged/<at_ms>/` are skipped: the markers are re-read
+    and every target copy that is no prefix is moved aside, so a resumed
+    restore leaves the same files as an uncrashed one (review of #218).
+  - **H6 Copy-back** (step 3): every partition, named by the start or any
+    root's layout (temp names included), dated on or after the first hot
+    date, or that the start does not record as removed. Per partition in
+    path order, every path whose verdict in the installed
+    ledger is ordinary is copied by the D5 copy from the cold roots in
+    configuration order (read-only roots included) with the installed
+    text; a copy with another text is passed over (`OtherText::PassOver`;
+    the recall and the repair keep stopping on it). (i) The restore also
+    reads a root's crash forms (`SourceForms::CrashForms`): its text is
+    its manifest, else its pending manifest, and its data its data file,
+    else its data temp file, which the stream copy verifies against that
+    text; nothing is written on a cold root, and the recall and the
+    repair read sealed copies only. Held, lost, pending, replaced,
+    quarantined and manifest-less paths are never copied. A copy passed
+    over as damaged, and a path with no verified copy left (the lost-file
+    rule: it stays recorded, every read of it is `Integrity`; a root with
+    a manifest or a pending manifest counts as holding it), are `FAIL:`
+    lines and do not stop the restore; an error on hot's side does,
+    before the marker. A damaged copy's `FAIL:` (the copy-back's, and B5's
+    in the restore) names `mie store verify`, then `mie store repair`
+    (R1) only for a copy with a `copy` record on a copy target: verify
+    checks data only for those (V4). For an unrecorded copy on a copy
+    target it says that verify does not check it and that (k) sets it
+    aside after the path's copy-back; for a read-only root it says the
+    root is never written and names no command. The rebuild keeps its
+    text. **J** (amendment 2): after the planned partitions, one by one
+    in path order, every path the installed ledger records ordinary in a
+    partition recorded removed and outside the plan, with no `copy`
+    record of a copy on any root or with no cold root holding its data
+    file, and of which some cold root holds the manifest or the pending
+    manifest by name (an error other than not-found counts as present),
+    or hot holds a copy that verifies against the installed text (a
+    read error on hot's copy counts as held, and the copy-back's check of
+    hot's copy then stops the run: an error on hot's side, never the
+    lost-file rule's line; review 5 of #218).
+    No `returned` is written: the hot removal finishes the old removal
+    once the path's k `copy` records lie inside the verified ledger-copy
+    prefixes (rules (e), (f)), and until then rule (e) keeps it on hot.
+    Why each condition: rule (e) needs a `copy` record of every file on
+    all k targets, so such a path was sealed after a recall whose
+    `returned` sat in hot's lost tail, or recorded from a cold copy by a
+    rebuild or a restore; a path no cold root holds as a data file cannot
+    be read; without a text form there is nothing to copy back, unless
+    hot already holds a verified copy: a crash after (k) moved the only
+    cold text form aside leaves exactly that, and the path must stay in
+    J so that (k) still reaches the later copy targets, as in the
+    uncrashed run (review 4 of #218). J reads only the installed ledger,
+    names and hot's copy, so every re-run, and every later restore, lists
+    the same paths. Rejected: the whole partition plus
+    `returned`, as the first version derived it from this run's B6a
+    records (`cold_recorded`): after a crash at the install the re-run
+    starts from hot's installed ledger, which names the path, so the set
+    was empty, the path stayed off hot and every read of it failed
+    (review 3 of #218, finding 1); and a path the copy-back cannot bring
+    back would leave the partition's other files on hot, recorded
+    removed, never taken again. (k) Right after a path's copy-back
+    succeeds (also `AlreadyPresent` on a re-run), on every copy target in
+    configuration order: **k1** (round 3), when the installed ledger has
+    no `copy` record of the path on the target and the target holds its
+    `M` or `D`, that copy is judged by the test the next pass's D5 copy
+    from hot applies (`check_sealed_copy` with `M`, else `check_file` on
+    `D`): a good copy stays, and the pass records or publishes it; a
+    self-consistent other file (its own `M` with another text and data
+    that matches it) stays with a `FAIL:` naming D5 (#219, case 2);
+    everything else (missing data, a manifest that is not the text,
+    size, SHA-256, an unreadable file) is moved by R5's own `move_aside`
+    (`D`, `M`, `D~`, `M~`) into `<target>/.mie/damaged/<at_ms>/`, never
+    replacing, and the next pass copies the path from hot. Why k1: the
+    pass refuses every other `M`/`D` form, verify sees only an unrecorded
+    `copies` gap (V7), and the repair leaves a file on hot to that same
+    pass, so nothing else clears it. **k2**, when k1 moved nothing: every
+    temp name of the path that is no verifiable copy of the installed
+    text (an `M~` with other bytes, a `D~` that does not verify, either one
+    unreadable) is moved to `<target>/.mie/damaged/<at_ms>/<partition>/
+    <name>`, never replacing; a moved `M~` that parses with another text
+    and an unreadable one are `FAIL:` lines. Why: the next pass's D5 copy
+    of the path to that target removes both temp names before it copies,
+    in each of its branches, so a partial copy or a second version under
+    the path would be deleted; a verifiable `M~` or `D~` is kept, since the
+    pass removes only bytes identical to its copy. A recorded copy is
+    never moved (its damage is R1's, once verify records the finding),
+    and read-only roots are never written. Invariant: after (k), the next
+    pass's D5 copy of the path to every copy target succeeds, unless a
+    target holds a self-consistent other file. Why only after a
+    successful copy-back: the pass copies a path only from hot, so moving
+    the last remnant of a path the copy-back could not bring back would
+    turn a re-run's held path into a lost candidate. A taken aside name
+    stops the run before the marker, nothing overwritten, and a re-run
+    gets a new `at_ms`. The states a cold root can hold of a cold-only
+    path, and the result:
+    - `D`+`M`, or `M` whose data fails or is absent: the manifest's text;
+      copied back from another root's good copy, else the lost-file rule;
+      on a copy target k1 moves the damaged copy once the path is back;
+    - `M`+`D~` (a power loss kept the manifest's rename and lost the
+      data's): the manifest's text, copied back from `D~`, named `missing`
+      for cold's copy; on a copy target k1 then moves `M` and `D~`, and
+      the next pass copies the path from hot; a read-only root keeps both;
+    - `D`+`M~` or `D~`+`M~`, `M~` verified: rolled forward from `M~`, the
+      next pass publishes the target's copy;
+    - `M~` whose data fails or is absent, a manifest that does not parse,
+      `D` alone, `D~` alone, a torn or unreadable `M~`, differing `M~`
+      texts with no listed one, evidence alone: a lost candidate;
+    - temp names beside a sealed copy, or an `M~` with another text than
+      the decided one: the sealed copy decides, the others are set aside
+      by (k) on a copy target;
+    - an empty `date=` directory: nothing; a quarantined part: Q1–Q6.
+    A window partition the start records removed gets `returned` once all
+    its paths are back, so the hot removal does not finish the old
+    removal.
+  - **H7 Write order**: H3's moves of the journal candidates it leaves
+    out, H3, H4, the install, the copy-back and its `returned` records,
+    every root's marker re-read, hot's marker (temp name, fsync,
+    no-replace rename, fsync of `.mie`). A stop names what completes it
+    and promises no more: a taken aside name completes on a re-run with a
+    new `at_ms`, any other refused write once that root accepts it, a
+    marker that is gone once the root presents it. The stops that remain
+    are environmental (a listing, a marker, a refused write) and the
+    approved conflicts (B3's live text conflict, H3's journal
+    divergence); every data state has a mie command (`--record-lost`,
+    `mie store resolve`, verify then repair, a re-run,
+    `--skip-unreadable-journal`), except a self-consistent other file on
+    a copy target, which stays one copy short until #219. The refusals of
+    `mie ingest`, the importer and `mie store init` name `mie store
+    restore`, and its re-run when `.mie/` exists without a marker.
+  - **H8 Report**: the journal candidates and the choice, the
+    import-ledger counts, the derivation's lines, the install, the
+    copy-back per partition, then `restored: hot marker written; mie
+    ingest may start` or `not restored: no hot marker written`. `PASS`
+    only with the marker written and no `FAIL:` line; a `FAIL:` line
+    (holds, damaged copies, entry copies to repair, files with no good
+    copy) does not undo the commit.
+  - **H9 Cost**: the capture's downtime is the copy-back, (Σ_s r_s + a) ×
+    H = 6.35–9.36 GB (D10), plus a manifest listing of every root and the
+    data of the unrecorded copies. Each D9 store is restored by its own
+    `mie store restore --config`. The read-only-root criterion of a
+    replace is #216.
 
   **Held archive parts and their resolution.** A held part stays where
   it is, with its bytes, path and manifest; the copy ledger records the
@@ -1966,7 +2355,9 @@ What breaks:
       of #212, finding 3): the importer and the replication read them all
       and fail F closed on one that does not read, so a re-admit past it
       would clear the holds while F stays unimportable and its new files
-      never replicate; the remedy is the hot restore (#195). Why (review of #212,
+      never replicate. The repair never rewrites hot, and `mie store
+      restore` is for a lost hot only (#195 STOP 1 decision 2): damage to
+      hot's own file on an intact hot is #217. Why (review of #212,
       finding 2): refusing on them named `mie store verify` and `mie store
       repair` as the remedy, and neither touches them, so the hold could
       only be cleared by hand. A malformed name or an unreadable file on
@@ -2414,7 +2805,12 @@ What breaks:
       up to the start of the line holding d. Otherwise it is refused: the
       journal has no chain, so one copy against hot cannot be attributed.
       When every copy agrees against hot, hot's journal is named as the
-      suspect; the hot restore restores it, never the repair.
+      suspect. The repair never rewrites hot, and `mie store restore` is
+      for a lost hot only (#195 STOP 1 decision 2): damage to hot's own
+      journal on an intact hot is #217. Why not the restore: a file that
+      survived on hot is a candidate and is never overwritten blindly, and
+      preferring the copies over hot's live journal is the guess step 5
+      rejects.
     - **R8** An entry copy with an open entry finding is replaced from hot
       only when hot's entry lists every file with the SHA-256 of the
       ledger's `manifest` record (else hot's manifest); otherwise it is an

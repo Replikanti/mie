@@ -550,6 +550,7 @@ fn quarantined_on(root: &str, parts: &[(&str, Option<&str>)]) -> RootQuarantine 
                     QuarantinedCopy {
                         text: text.map(str::to_owned),
                         data: true,
+                        unreadable: None,
                     },
                 )
             })

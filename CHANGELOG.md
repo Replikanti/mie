@@ -12,6 +12,54 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
 
 ### Added
 
+- **Storage tiers, step 9: the hot restore (#195, ADR-062 D7, D11,
+  proposed).** `mie store restore --config <ingest config>
+  [--archive-config <path>] [--record-lost] [--skip-unreadable-journal]`
+  restores a lost hot disk from
+  the copy targets before `mie ingest` or the importer may start. It
+  refuses an intact hot (damage on an intact hot is #217), a missing
+  `raw_root`, a root without its marker and roots on one device, and takes
+  the copy-ledger, pass and verify locks and every source's writer lock
+  without waiting. It restores the journal from the longest copy (copies
+  that differ beyond their common prefix stop it; a cut last line gets its
+  `\n`; a journal copy that cannot be read and is longer than every
+  readable one stops it; `--skip-unreadable-journal` leaves that copy
+  out, moved aside and never deleted, with a `FAIL:` line), the import
+  ledger from the targets (differing entries decided by
+  the manifests, else held; a surviving hot copy of another variant moved
+  into `.mie/damaged/`), and the copy ledger by the rebuild's derivation,
+  with hot's surviving ledger as the first start candidate and `unlisted`
+  holds written without a flag. It then copies back every hot-window
+  partition and every partition not recorded removed, then each path of a
+  removed partition that no copy target recorded, verifying each file: a
+  damaged copy is passed over and named (for `mie store verify`, then
+  `mie store repair` when it is a recorded copy on a copy target), and a
+  file with no good copy stays recorded so every read of it fails. A file a record names that no root holds stops
+  the restore before any write unless `--record-lost`. A path that no
+  record names and that cold roots hold in any form is counted: a sealed
+  copy (a read-only root's too) or the verified pending manifest and data
+  a crashed copy leaves is recorded and copied back from those forms, and
+  debris with no text (data or a data temp file alone, a manifest or
+  pending manifest that does not parse or cannot be read, a pending
+  manifest whose data fails, a repair's evidence) is a lost candidate
+  behind `--record-lost`; after a path's copy-back, an unrecorded copy on
+  a copy target that the next pass would refuse, and temp names that are
+  no verifiable copy, are moved into `.mie/damaged/`, never deleted, so
+  the next pass copies the path from hot. A file that cannot be read never
+  stops it: it is a damaged copy, named with a `FAIL:` line. So a new
+  capture never reuses a path a cold root holds.
+  `mie store rebuild` applies the same rule to every path hot lacks, so a
+  rebuild after a restore keeps it counted, a recorded path whose roots
+  hold only unverified debris stays a lost candidate, and a path recorded
+  lost whose roots hold only debris is a report line, no longer a failure
+  on every rebuild. Hot's marker is written last, so running the command
+  again completes a restore that stopped or crashed; `mie ingest`, the
+  importer and `mie store init` name that re-run when `.mie/` exists
+  without a marker. Data of a cold copy is
+  read only when the ledger does not record it. `mie store repair` and
+  `mie store resolve` no longer offer the restore for damage on an intact
+  hot and name #217 instead.
+
 - **Storage tiers, step 8b: the replace into quarantine (#211, ADR-062
   D5, D7, D11, proposed).** `mie store resolve --file <archive path>
   --replace` resolves held archive parts whose rows differ from the

@@ -129,6 +129,11 @@ pub struct ArchiveFindings {
     /// targets only, conflicting entries, unparseable entries and
     /// `PENDING`.
     pub problems: Vec<String>,
+    /// Per current entry name that entry resolution decided, the bytes of
+    /// its current variant: the only one, or the one whose files match the
+    /// manifests. The hot restore writes them to hot (#195 H4); an entry
+    /// held `entry-conflict` has none.
+    pub chosen: BTreeMap<String, Vec<u8>>,
 }
 
 /// The archive checks (module docs).
@@ -313,6 +318,7 @@ fn resolve(
         .collect();
     let roots_of = |i: usize| variants[i].1.join(", ");
     if variants.len() == 1 {
+        found.chosen.insert(name.to_owned(), variants[0].0.to_vec());
         match &parsed[0] {
             Some(files) => {
                 found.current.insert(name.to_owned(), files.clone());
@@ -337,6 +343,9 @@ fn resolve(
         found
             .current
             .insert(name.to_owned(), parsed[only].clone().unwrap_or_default());
+        found
+            .chosen
+            .insert(name.to_owned(), variants[only].0.to_vec());
         for i in (0..variants.len()).filter(|&i| i != only) {
             found.problems.push(format!(
                 "import entry {name} on {}: it differs from the copy on {}, whose files match the \

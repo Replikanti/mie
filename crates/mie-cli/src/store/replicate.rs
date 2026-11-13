@@ -194,6 +194,11 @@ pub(crate) enum PassStep {
     AfterEntryCopy,
     /// A ledger copy was extended, before its `ledger-copy` record.
     AfterLedgerExtend,
+    /// Step 1 is done, before the first entry copy: a crash here leaves an
+    /// archive file's parts on the targets without its entry (#195, the
+    /// held variant of the hot restore). Not in [`PassStep::ALL`].
+    #[cfg(test)]
+    BeforeEntries,
 }
 
 #[cfg(test)]
@@ -1202,6 +1207,8 @@ impl Pass<'_> {
         for path in &paths {
             copied += self.copy_file(path, &entries)?;
         }
+        #[cfg(test)]
+        reached(PassStep::BeforeEntries)?;
         let mut entries_copied = 0usize;
         for entry in &entries {
             entries_copied += self.copy_entry(entry)?;

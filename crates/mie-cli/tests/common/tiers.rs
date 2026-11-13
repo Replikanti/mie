@@ -571,3 +571,19 @@ pub fn interrupted_import_saving(fixture: &Fixture, pending: bool) -> (i64, Vec<
     }
     (day, parts, bytes)
 }
+
+// ------------------------------------------------------- the hot restore
+
+/// The hot disk lost (#195): `raw_root` emptied, the directory kept (the
+/// replacement is mounted there), the journal and the import-ledger
+/// directory deleted: in the default layout all three share the hot disk.
+pub fn lose_hot(fixture: &Fixture) {
+    let hot = fixture.hot();
+    fs::remove_dir_all(&hot).unwrap();
+    fs::create_dir(&hot).unwrap();
+    fs::remove_file(&fixture.config.paths.journal).unwrap();
+    let ledger = &fixture.archive_config.paths.import_ledger;
+    if ledger.exists() {
+        fs::remove_dir_all(ledger).unwrap();
+    }
+}

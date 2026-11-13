@@ -30,12 +30,17 @@
 //!   hot's journal up to the length J read now (a line cut at J is not
 //!   parsed); every import entry on hot and on the targets, and hot's
 //!   `PENDING`; hot's layout; each cold root's layout with every copy's
-//!   data checked against that root's own manifest. The journal and the
+//!   data checked against that root's own manifest, and its temp names (a
+//!   pending manifest's data checked against its text where the root
+//!   lacks the manifest); the part names below each root's
+//!   `.mie/damaged/` (B6a). The journal and the
 //!   entries come first: a part is sealed before its `sealed` line or its
 //!   entry, so a "no root holds it" verdict never comes from a listing
 //!   that ran ahead of the record. An I/O error on a listing, a manifest,
-//!   the journal, an entry or a ledger copy stops the run; unreadable data
-//!   is a damaged copy (B5), never an absence.
+//!   the journal, an entry, a ledger copy or a quarantined manifest stops
+//!   the run; unreadable data is a damaged copy (B5), never an absence, and
+//!   so is an unreadable pending manifest (row 10 of B6a; #195 amendment 2,
+//!   U), which the rebuild did not read before #195.
 //! - **B2 Start:** the longest verified prefix among the targets' ledger
 //!   copies, configuration order on a tie, the header alone without one.
 //! - **B3 Texts:** a root holds a path when it has its manifest. The
@@ -50,7 +55,37 @@
 //! - **B6 Lost:** a path named by the start, hot's journal or a current
 //!   import entry that no root holds is a candidate, recorded `lost` only
 //!   with `--record-lost`; a name outside the layout is reported, never
-//!   recorded; a path the start records lost stays lost.
+//!   recorded; a path the start records lost stays lost. Rule 4′ (#195
+//!   amendment 2): a recorded path is held when hot holds it, a cold root
+//!   holds its manifest (any) or its data file, or a root without the
+//!   manifest holds a verified crash copy (a pending manifest byte-equal
+//!   to the start's text whose data verifies); no other temp name or
+//!   evidence holds it, and its candidate line names every form, all left
+//!   in place. A path the start records lost is a `FAIL:` ("a root holds
+//!   it again") only when hot holds it or a cold root holds a parseable
+//!   manifest of it; any other form is a report line, left in place.
+//! - **B6a Cold-only paths** (#195, shared by both modes). A path no start
+//!   record other than `finding` and `lost` names, that hot lacks (neither
+//!   its manifest nor its data) and that a cold root holds in any form or
+//!   whose part name sits below a root's `.mie/damaged/<dir>/`: (1) its
+//!   text comes from B3/B4 over the roots' manifests; without one (1′),
+//!   from the parseable pending manifests (`M~`) whose data (`D`, else
+//!   `D~`) verifies, of the roots without the manifest, one distinct text,
+//!   or for an archive path the one a current entry lists; `M~` never
+//!   enters B3's conflict check. (2) With a text it gets its `manifest`
+//!   record, its data verified or not, on a copy target or a read-only
+//!   root (`copy` only for a verified `D`+`M` on a copy target). A pending
+//!   form with the same text and data that does not verify is a damaged
+//!   copy. (3) Without a text it is a lost candidate, origin `verify`
+//!   unless a higher source names it, named by every form (B6's flag).
+//!   Evidence names a path, never holds it. (6) Outcomes re-derive (#195
+//!   amendment 2): a later run that finds the path recorded derives the
+//!   same lost candidates and the same `FAIL:` paths. So the rebuild names
+//!   every ordinary path hot lacks that no cold root holds as a data file
+//!   and that only a verified crash copy holds, and a pending form with
+//!   another text than a path's decided text is a damaged copy for every
+//!   path hot lacks. Every branch needs hot to lack the path, so an intact
+//!   hot's paths keep the derivation they had.
 //! - **B7 Archive holds**, re-derived ([`archive_checks`]). A new
 //!   `unlisted` hold comes from an absence, so it is written only with
 //!   `--record-unlisted`; without it the rebuild reports the candidates,
@@ -193,6 +228,21 @@ pub enum RootCopy {
     BadText(String),
 }
 
+/// The seal temp names one cold root holds of a part (B6a): the states a
+/// crashed D5 copy leaves (`D~` = `.part-N.parquet.tmp`, `M~` =
+/// `.part-N.manifest.tmp`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TempForms {
+    /// Whether its data temp file `D~` exists.
+    pub data_tmp: bool,
+    /// Its pending manifest `M~`, classified as [`classify_text`] does;
+    /// `None` when there is none. On a root without the part's manifest,
+    /// and where the root's data is checked, a text's data is its data
+    /// file `D`, else `D~`, checked against that text; otherwise
+    /// [`DataCheck::NotChecked`].
+    pub pending: Option<RootCopy>,
+}
+
 /// One cold root's layout, in configuration order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RootRead {
@@ -204,6 +254,11 @@ pub struct RootRead {
     pub files: BTreeMap<String, RootCopy>,
     /// The data files it holds without their manifest.
     pub orphan_data: BTreeSet<String>,
+    /// Every part it holds a seal temp name of (B6a).
+    pub temps: BTreeMap<String, TempForms>,
+    /// Every part a name below its `.mie/damaged/<dir>/` names, with those
+    /// directories (B6a row 16): evidence, never a source.
+    pub evidence: BTreeMap<String, BTreeSet<String>>,
     /// Its `.quarantine/` directory (Q1).
     pub quarantine: QuarantineListing,
 }
@@ -218,6 +273,9 @@ pub struct HotRead {
     /// Its `date=` partition directories (a removal's hidden leftover is
     /// none).
     pub partitions: BTreeSet<String>,
+    /// Every part a name below its `.mie/damaged/<dir>/` names (B6a row
+    /// 16).
+    pub evidence: BTreeMap<String, BTreeSet<String>>,
     /// Its `.quarantine/` directory (Q1).
     pub quarantine: QuarantineListing,
 }
@@ -227,8 +285,12 @@ pub struct HotRead {
 pub struct LedgerCopyRead {
     /// The target's id.
     pub id: String,
-    /// Its bytes, `None` when it holds none.
+    /// Its bytes, `None` when it holds none or it cannot be read.
     pub bytes: Option<Vec<u8>>,
+    /// Its read error: B2 rejects it as a copy that does not parse. Only
+    /// the hot restore passes one (#195 amendment 2, U); the rebuild stops
+    /// on it.
+    pub error: Option<String>,
 }
 
 /// A data path named by hot's journal.
@@ -255,9 +317,46 @@ pub struct JournalRead {
     pub names: Vec<JournalName>,
 }
 
+/// What runs the derivation: the rebuild, or the hot restore (#195 H5),
+/// which reuses it with seven differences, (a) to (g) of its plan. B6a,
+/// which brings every path a cold root holds into the ledger's numbering,
+/// is no difference: both modes apply it. Only [`Mode::Restore`] changes
+/// anything; [`run`] always passes [`Mode::Rebuild`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Mode {
+    /// `mie store rebuild`: B0 to B11 as above.
+    Rebuild,
+    /// `mie store restore` (the module [`restore`](super::restore)).
+    Restore(RestoreMode),
+}
+
+/// What the hot restore adds to the derivation's inputs (#195 H5).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RestoreMode {
+    /// Hot's own copy ledger when it survived, the first start candidate
+    /// (a): it holds every record the copies hold. On a tie it wins, then
+    /// configuration order.
+    pub hot_ledger: Option<Vec<u8>>,
+    /// The partitions the copy-back plans to bring back (H6): B8 counts
+    /// them as on hot (e), since they are on hot once the restore commits.
+    pub copy_back: BTreeSet<String>,
+}
+
+impl Mode {
+    /// The restore's additions, `None` for the rebuild.
+    fn restore(&self) -> Option<&RestoreMode> {
+        match self {
+            Self::Rebuild => None,
+            Self::Restore(restore) => Some(restore),
+        }
+    }
+}
+
 /// Everything [`derive`] reads (B1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RebuildInputs {
+    /// The rebuild or the hot restore.
+    pub mode: Mode,
     /// The run's `at_ms`, read once: every record carries it.
     pub at_ms: i64,
     /// The first date of the hot window.
@@ -342,6 +441,10 @@ pub struct Derived {
     pub lines: Vec<String>,
     /// Every `FAIL:` finding.
     pub problems: Vec<String>,
+    /// The bytes of each current import entry the archive checks decided
+    /// on ([`archive_checks::ArchiveFindings::chosen`]): what the hot
+    /// restore writes to hot (#195 H4).
+    pub chosen_entries: BTreeMap<String, Vec<u8>>,
 }
 
 /// Why the rebuild stops with nothing written.
@@ -359,6 +462,25 @@ enum Source {
     Journal(u64, String),
     /// A journal `recovery` line.
     Recovery(u64, String),
+    /// B6a: a cold root's data file without its manifest.
+    Data(String),
+    /// B6a: a cold root's manifest that does not parse or names another
+    /// location, with why.
+    BadManifest(String, String),
+    /// B6a: a cold root's data temp file.
+    DataTmp(String),
+    /// B6a: a cold root's pending manifest that does not parse or names
+    /// another location, with why.
+    BadPending(String, String),
+    /// B6a: a cold root's parseable pending manifest whose data verifies
+    /// (row 11: with no decided text).
+    Pending(String),
+    /// B6a rule 1′: a cold root's parseable pending manifest whose data
+    /// (`D`, else `D~`) does not verify against it, with why (row 7).
+    PendingBadData(String, String),
+    /// B6a row 16: a part name below `.mie/damaged/<dir>/` of a root
+    /// (`hot` or a cold root's id), with `<dir>`.
+    Evidence(String, String),
 }
 
 impl Source {
@@ -370,7 +492,37 @@ impl Source {
             Self::Recovery(line, run) => {
                 format!("journal line {line} (run {run}, `recovery` rolled_forward)")
             }
+            Self::Data(root) => format!("the data file without its manifest on {root}"),
+            Self::BadManifest(root, why) => format!(
+                "a manifest on {root} that does not parse or names another location ({why})"
+            ),
+            Self::DataTmp(root) => format!("the data temp file on {root}"),
+            Self::BadPending(root, why) => format!(
+                "a pending manifest on {root} that does not parse or names another location \
+                 ({why})"
+            ),
+            Self::Pending(root) => format!("a pending manifest on {root}"),
+            Self::PendingBadData(root, why) => {
+                format!("a pending manifest on {root} whose data does not verify ({why})")
+            }
+            Self::Evidence(root, dir) => format!(
+                "a part name below .mie/damaged/{dir}/ on {root} (evidence, never a source)"
+            ),
         }
+    }
+
+    /// Whether it is a form a root holds (B6a), not a record or a line.
+    fn is_cold_form(&self) -> bool {
+        matches!(
+            self,
+            Self::Data(_)
+                | Self::BadManifest(..)
+                | Self::DataTmp(_)
+                | Self::BadPending(..)
+                | Self::Pending(_)
+                | Self::PendingBadData(..)
+                | Self::Evidence(..)
+        )
     }
 }
 
@@ -457,18 +609,49 @@ fn date_of(partition: &str) -> &str {
     partition.rsplit_once("/date=").map_or("", |(_, date)| date)
 }
 
+/// One start candidate of B2: a root's id, its ledger copy's bytes, and
+/// the read error of a copy that cannot be read (the hot restore only).
+pub(super) type Candidate<'a> = (&'a str, Option<&'a [u8]>, Option<&'a str>);
+
+/// The start candidates of B2 in their order: the copy targets' ledger
+/// copies, and in [`Mode::Restore`] hot's own ledger first (H5 a).
+pub(super) fn start_candidates<'a>(
+    mode: &'a Mode,
+    copies: &'a [LedgerCopyRead],
+) -> Vec<Candidate<'a>> {
+    let hot = mode
+        .restore()
+        .and_then(|restore| restore.hot_ledger.as_deref())
+        .map(|bytes| (HOT_ID, Some(bytes), None));
+    hot.into_iter()
+        .chain(copies.iter().map(|copy| {
+            (
+                copy.id.as_str(),
+                copy.bytes.as_deref(),
+                copy.error.as_deref(),
+            )
+        }))
+        .collect()
+}
+
 /// B2: the start among the ledger copies, its builder and its ledger.
-fn choose_start(
-    copies: &[LedgerCopyRead],
+pub(super) fn choose_start(
+    copies: &[Candidate<'_>],
 ) -> (Start, LedgerBuilder, copy_ledger::Ledger, Vec<String>) {
     let mut rejected = Vec::new();
     let mut best: Option<(usize, copy_ledger::Ledger)> = None;
-    for (i, copy) in copies.iter().enumerate() {
-        let Some(bytes) = &copy.bytes else {
-            rejected.push(format!("the ledger copy on {}: rejected: absent", copy.id));
+    for (i, &(id, bytes, error)) in copies.iter().enumerate() {
+        if let Some(error) = error {
+            rejected.push(format!(
+                "the ledger copy on {id}: rejected: cannot be read ({error})"
+            ));
+            continue;
+        }
+        let Some(bytes) = bytes else {
+            rejected.push(format!("the ledger copy on {id}: rejected: absent"));
             continue;
         };
-        let name = PathBuf::from(format!("{}:.mie/copy-ledger", copy.id));
+        let name = PathBuf::from(format!("{id}:.mie/copy-ledger"));
         match copy_ledger::parse(&name, bytes) {
             Ok(ledger) => {
                 if best
@@ -478,18 +661,16 @@ fn choose_start(
                     best = Some((i, ledger));
                 }
             }
-            Err(error) => {
-                rejected.push(format!("the ledger copy on {}: rejected: {error}", copy.id))
-            }
+            Err(error) => rejected.push(format!("the ledger copy on {id}: rejected: {error}")),
         }
     }
     match best {
         Some((i, ledger)) => {
-            let bytes = copies[i].bytes.as_deref().unwrap_or_default();
+            let bytes = copies[i].1.unwrap_or_default();
             let builder = LedgerBuilder::from_prefix(Path::new("start"), bytes)
                 .unwrap_or_else(|_| LedgerBuilder::empty());
             let start = Start {
-                root: Some(copies[i].id.clone()),
+                root: Some(copies[i].0.to_owned()),
                 len: builder.len(),
                 records: ledger.records.len(),
             };
@@ -527,6 +708,117 @@ fn named_path(kind: &Kind) -> Option<String> {
     }
 }
 
+/// Every data path a root's layout or `.mie/damaged/` names: hot's and
+/// the cold roots' manifests, data files, temp names and evidence (B0).
+fn layout_paths(inputs: &RebuildInputs) -> impl Iterator<Item = &String> {
+    inputs
+        .hot
+        .files
+        .keys()
+        .chain(&inputs.hot.orphan_data)
+        .chain(inputs.hot.evidence.keys())
+        .chain(inputs.roots.iter().flat_map(|root| {
+            root.files
+                .keys()
+                .chain(&root.orphan_data)
+                .chain(root.temps.keys())
+                .chain(root.evidence.keys())
+        }))
+}
+
+/// B6a rule 1′ for a path without a manifest text: the parseable pending
+/// texts of the roots without the path's manifest whose data (`D`, else
+/// `D~`) verifies against them, as `(root, text)` in configuration order.
+/// Why only those: the D5 copy writes `M~` before its `Verify` step and
+/// renames `M` only after it, so an `M` is a seal and an `M~` becomes one
+/// only through verified data (#195 amendment 2).
+fn pending_texts<'a>(inputs: &'a RebuildInputs, path: &str) -> Vec<(&'a str, &'a str)> {
+    inputs
+        .roots
+        .iter()
+        .filter(|root| !root.files.contains_key(path))
+        .filter_map(|root| match root.temps.get(path)?.pending.as_ref()? {
+            RootCopy::Text {
+                text,
+                data: DataCheck::Good,
+            } => Some((root.id.as_str(), text.as_str())),
+            RootCopy::Text { .. } | RootCopy::BadText(_) => None,
+        })
+        .collect()
+}
+
+/// Rule 4′: whether `root` holds a verified crash copy of `path` with one
+/// of `texts`: no manifest there, and a pending manifest byte-equal to
+/// one of them whose data verifies against it (#195 amendment 2).
+fn verified_crash_copy(root: &RootRead, path: &str, texts: &[&str]) -> bool {
+    !root.files.contains_key(path)
+        && matches!(
+            root.temps.get(path).and_then(|temps| temps.pending.as_ref()),
+            Some(RootCopy::Text { text, data: DataCheck::Good }) if texts.contains(&text.as_str())
+        )
+}
+
+/// Why a data check failed, for a report line.
+fn data_why(data: &DataCheck) -> String {
+    match data {
+        DataCheck::NotChecked => "not checked".to_owned(),
+        DataCheck::Good => "good".to_owned(),
+        DataCheck::Missing => "missing".to_owned(),
+        DataCheck::Size => "size".to_owned(),
+        DataCheck::Sha256 => "sha256".to_owned(),
+        DataCheck::Unreadable(error) => format!("its data cannot be read ({error})"),
+    }
+}
+
+/// B6a: the forms the roots hold of `path` other than a parseable
+/// manifest (rows 4, 8 to 11, 16), in root order: every cold root's layout
+/// forms, then the evidence of hot and of each cold root.
+fn cold_forms(inputs: &RebuildInputs, path: &str) -> Vec<Source> {
+    let mut forms = Vec::new();
+    for root in &inputs.roots {
+        let id = &root.id;
+        if let Some(RootCopy::BadText(why)) = root.files.get(path) {
+            forms.push(Source::BadManifest(id.clone(), why.clone()));
+        }
+        if root.orphan_data.contains(path) {
+            forms.push(Source::Data(id.clone()));
+        }
+        if let Some(temps) = root.temps.get(path) {
+            if temps.data_tmp {
+                forms.push(Source::DataTmp(id.clone()));
+            }
+            match &temps.pending {
+                Some(RootCopy::BadText(why)) => {
+                    forms.push(Source::BadPending(id.clone(), why.clone()));
+                }
+                Some(RootCopy::Text {
+                    data: DataCheck::Good,
+                    ..
+                }) => forms.push(Source::Pending(id.clone())),
+                // Rule 1′: a pending text without verified data gives no
+                // text; on a root with the manifest it is not checked.
+                Some(RootCopy::Text { data, .. }) if !root.files.contains_key(path) => {
+                    forms.push(Source::PendingBadData(id.clone(), data_why(data)));
+                }
+                Some(RootCopy::Text { .. }) => forms.push(Source::Pending(id.clone())),
+                None => {}
+            }
+        }
+    }
+    let evidence = std::iter::once(("hot", &inputs.hot.evidence)).chain(
+        inputs
+            .roots
+            .iter()
+            .map(|root| (root.id.as_str(), &root.evidence)),
+    );
+    for (id, evidence) in evidence {
+        for dir in evidence.get(path).into_iter().flatten() {
+            forms.push(Source::Evidence(id.to_owned(), dir.clone()));
+        }
+    }
+    forms
+}
+
 /// The derivation of B2 to B8 over what B1 read: pure.
 ///
 /// # Errors
@@ -536,14 +828,26 @@ fn named_path(kind: &Kind) -> Option<String> {
 pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
     let mut lines = Vec::new();
     let mut problems = Vec::new();
+    let restore = inputs.mode.restore();
 
-    // B2.
-    let (start, mut builder, start_ledger, rejected) = choose_start(&inputs.ledger_copies);
+    // B2 (in the restore, hot's own ledger first: H5 a).
+    let (start, mut builder, start_ledger, rejected) =
+        choose_start(&start_candidates(&inputs.mode, &inputs.ledger_copies));
     let state = CopyState::fold(&start_ledger)
         .map_err(|error| Stop(format!("the start copy cannot be folded: {error}")))?;
     let mut start_texts: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut sources: BTreeMap<String, BTreeSet<Source>> = BTreeMap::new();
+    // The paths a start record other than `finding` and `lost` names: the
+    // installed ledger keeps them, so the writer's numbering counts them
+    // (D6). The restore's rules for unrecorded cold copies (B4, B6) skip
+    // them.
+    let mut start_named: BTreeSet<String> = BTreeSet::new();
     for record in &start_ledger.records {
+        if !matches!(record.kind, Kind::Finding { .. } | Kind::Lost { .. })
+            && let Some(path) = named_path(&record.kind)
+        {
+            start_named.insert(path);
+        }
         if let Kind::Manifest { text } = &record.kind
             && let Ok(file) = replica::parse_manifest(text)
         {
@@ -571,6 +875,19 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
         ),
     }
     lines.extend(rejected.iter().cloned());
+    // U (#195 amendment 2): in the restore an unreadable ledger copy is a
+    // damaged copy, never a stop.
+    for copy in inputs.ledger_copies.iter().filter(|_| restore.is_some()) {
+        if let Some(error) = &copy.error {
+            problems.push(format!(
+                "the ledger copy on {} cannot be read ({error}): it is no start candidate, and \
+                 the install names it and leaves it in place. A read error can mean a failing \
+                 disk: run `mie store verify`, then `mie store repair`, for what verify finds on \
+                 that target (ADR-062 D11)",
+                copy.id
+            ));
+        }
+    }
     lines.push(format!(
         "journal: {} byte(s) read, {} complete non-JSON line(s) counted and not parsed",
         inputs.journal.bytes, inputs.journal.non_json
@@ -578,17 +895,7 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
 
     // B0, last refusal: archive paths need the archive configuration.
     if !inputs.archive_configured {
-        let held = inputs
-            .hot
-            .files
-            .keys()
-            .chain(&inputs.hot.orphan_data)
-            .chain(
-                inputs
-                    .roots
-                    .iter()
-                    .flat_map(|root| root.files.keys().chain(&root.orphan_data)),
-            )
+        let held = layout_paths(inputs)
             .chain(sources.keys())
             .find(|path| is_archive_part(path));
         if let Some(path) = held {
@@ -605,19 +912,14 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
     // archive part only hot holds would become an `unlisted` hold that only
     // `mie store resolve` clears (review of #209, finding 2). It
     // stops the rebuild wherever it could hide an entry: an archive part
-    // on a root or in the start, or a copy target holding entries.
-    if let Some(dir) = &inputs.missing_import_ledger {
-        let part = inputs
-            .hot
-            .files
-            .keys()
-            .chain(&inputs.hot.orphan_data)
-            .chain(
-                inputs
-                    .roots
-                    .iter()
-                    .flat_map(|root| root.files.keys().chain(&root.orphan_data)),
-            )
+    // on a root or in the start, or a copy target holding entries. The
+    // restore restores hot's import ledger itself (H5 f).
+    if let Some(dir) = inputs
+        .missing_import_ledger
+        .as_ref()
+        .filter(|_| restore.is_none())
+    {
+        let part = layout_paths(inputs)
             .chain(sources.keys())
             .find(|path| is_archive_part(path));
         let why = match (part, inputs.entries.keys().next()) {
@@ -635,6 +937,47 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
             )));
         }
     }
+
+    // B6a: the paths no start record other than `finding` and `lost` names
+    // and hot lacks (neither its manifest nor its data), that a cold root
+    // holds in any form or a root's evidence names. Every B6a branch is
+    // limited to them, so the paths an intact hot holds keep today's
+    // derivation in both modes.
+    let hot_holds =
+        |path: &str| inputs.hot.files.contains_key(path) || inputs.hot.orphan_data.contains(path);
+    let cold_only: BTreeSet<&str> = inputs
+        .roots
+        .iter()
+        .flat_map(|root| {
+            root.files
+                .keys()
+                .chain(&root.orphan_data)
+                .chain(root.temps.keys())
+                .chain(root.evidence.keys())
+        })
+        .chain(inputs.hot.evidence.keys())
+        .map(String::as_str)
+        .filter(|path| !start_named.contains(*path) && !hot_holds(path))
+        .collect();
+    let has_m_text = |path: &str| {
+        inputs
+            .roots
+            .iter()
+            .any(|root| matches!(root.files.get(path), Some(RootCopy::Text { .. })))
+    };
+    // B6a rule 1 for the archive checks: a path whose only text is one
+    // distinct pending text counts that text as its roots' text.
+    let pending_single: BTreeMap<&str, Vec<(&str, &str)>> = cold_only
+        .iter()
+        .filter(|path| !has_m_text(path) && state.verdict(path) != Some(PathVerdict::Lost))
+        .filter_map(|path| {
+            let found = pending_texts(inputs, path);
+            let mut texts: Vec<&str> = found.iter().map(|(_, text)| *text).collect();
+            texts.sort_unstable();
+            texts.dedup();
+            (texts.len() == 1).then_some((*path, found))
+        })
+        .collect();
 
     // B3: the texts of every path any root or the start holds.
     let mut holders: BTreeMap<&str, Vec<(&str, &str)>> = BTreeMap::new();
@@ -669,10 +1012,20 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
         texts.dedup();
         texts
     };
+    // In the restore, a live path's one `manifest` record in the start
+    // decides its text, and a copy with another text is a damaged copy (H5
+    // b, ADR-062 D11 step 5).
+    let recorded_text = |path: &str| -> Option<&str> {
+        restore?;
+        match start_texts.get(path).map(Vec::as_slice) {
+            Some([only]) => Some(only.as_str()),
+            _ => None,
+        }
+    };
     let mut conflicts = Vec::new();
     for (path, held) in &holders {
         let texts = distinct(path);
-        if texts.len() > 1 && !is_archive_part(path) {
+        if texts.len() > 1 && !is_archive_part(path) && recorded_text(path).is_none() {
             let groups: Vec<String> = texts
                 .iter()
                 .map(|text| {
@@ -747,15 +1100,24 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
         .keys()
         .copied()
         .chain(sources.keys().map(String::as_str))
+        .chain(pending_single.keys().copied())
         .filter(|path| is_archive_part(path) && !in_q(path))
         .map(|path| {
-            let roots = holders
+            let mut roots: Vec<(String, String)> = holders
                 .get(path)
                 .into_iter()
                 .flatten()
                 .filter(|(root, _)| *root != "the start copy")
                 .map(|(root, text)| ((*root).to_owned(), (*text).to_owned()))
                 .collect();
+            if roots.is_empty()
+                && let Some(found) = pending_single.get(path)
+            {
+                roots = found
+                    .iter()
+                    .map(|(root, text)| ((*root).to_owned(), (*text).to_owned()))
+                    .collect();
+            }
             let start = start_texts.get(path).cloned().unwrap_or_default();
             (path.to_owned(), PartTexts { roots, start })
         })
@@ -782,45 +1144,101 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
         sources.entry(name.path.clone()).or_default().insert(source);
     }
 
-    // B4, B5: per path in path order.
+    // B4, B5: per path in path order, every path any root or the start
+    // holds a manifest of and every B6a path.
+    // B4's tie rule: the one text whose SHA-256 a current entry lists.
+    let listed_one = |path: &str, texts: &[&'_ str]| -> Option<usize> {
+        let listed: BTreeSet<&str> = findings
+            .current
+            .values()
+            .flatten()
+            .filter(|(listed, _)| listed == path)
+            .map(|(_, sha)| sha.as_str())
+            .collect();
+        let matching: Vec<usize> = (0..texts.len())
+            .filter(|&i| {
+                replica::parse_manifest(texts[i])
+                    .is_ok_and(|file| listed.contains(file.sha256.as_str()))
+            })
+            .collect();
+        match matching[..] {
+            [only] => Some(only),
+            _ => None,
+        }
+    };
+    // The remedy a `FAIL:` line for a damaged copy names (B5). The rebuild
+    // keeps its text; in the restore it depends on the copy (#195 round 3):
+    // verify, then repair (R1) only for a copy with a `copy` record on a
+    // copy target, since verify checks only those (V4) and the repair
+    // leaves a file on hot to its closing pass, whose D5 copy refuses the
+    // damaged one. An unrecorded copy, or a temp name, on a copy target is
+    // set aside by the restore after the path's copy-back (H6 k); a
+    // read-only root is never written (D11).
+    let remedy = |path: &str, id: &str, pending: bool| -> String {
+        let repair = "run `mie store verify`, then `mie store repair`".to_owned();
+        if restore.is_none() {
+            return repair;
+        }
+        match inputs.roots.iter().find(|root| root.id == id) {
+            None => repair,
+            Some(root) if !root.copy_target => "the read-only root is never written (ADR-062 \
+                 D11), so no mie command changes this copy"
+                .to_owned(),
+            Some(_) if !pending && state.copy(path, id).is_some_and(|c| c.latest.is_some()) => {
+                repair
+            }
+            Some(_) => "`mie store verify` does not check this unrecorded copy; the restore \
+                 moves it aside once it has copied the path back (H6 k), and the next pass \
+                 copies the path from hot"
+                .to_owned(),
+        }
+    };
     let mut records: Vec<Kind> = Vec::new();
-    for path in holders.keys().copied() {
+    let mut cold_recorded: BTreeSet<String> = BTreeSet::new();
+    let paths: BTreeSet<&str> = holders
+        .keys()
+        .copied()
+        .chain(cold_only.iter().copied())
+        .collect();
+    for path in paths {
         if in_q(path) {
             continue;
         }
+        let b6a = cold_only.contains(path) && state.verdict(path) != Some(PathVerdict::Lost);
         let texts = distinct(path);
         let text: Option<&str> = match texts[..] {
             [only] => Some(only),
             [] => None,
-            _ => {
-                let listed: BTreeSet<&str> = findings
-                    .current
-                    .values()
-                    .flatten()
-                    .filter(|(listed, _)| listed == path)
-                    .map(|(_, sha)| sha.as_str())
-                    .collect();
-                let matching: Vec<&str> = texts
-                    .iter()
-                    .copied()
-                    .filter(|text| {
-                        replica::parse_manifest(text)
-                            .is_ok_and(|file| listed.contains(file.sha256.as_str()))
-                    })
-                    .collect();
-                match matching[..] {
-                    [only] => Some(only),
-                    _ => None,
-                }
+            _ if !is_archive_part(path) && recorded_text(path).is_some() => recorded_text(path),
+            _ => listed_one(path, &texts).map(|i| texts[i]),
+        };
+        // B6a rules 1 and 1′: with no manifest text anywhere, the parseable
+        // pending texts whose data verifies, of the roots without the
+        // manifest, decide by B4's selection; they never enter B3's
+        // conflict check.
+        let text = if texts.is_empty() && b6a {
+            let mut pending: Vec<&str> = pending_texts(inputs, path)
+                .into_iter()
+                .map(|(_, text)| text)
+                .collect();
+            pending.sort_unstable();
+            pending.dedup();
+            match pending[..] {
+                [only] => Some(only),
+                [] => None,
+                _ if is_archive_part(path) => listed_one(path, &pending).map(|i| pending[i]),
+                _ => None,
             }
+        } else {
+            text
         };
         // B5: copies that hold the path and do not verify.
         let mut damaged_cold = false;
-        let mut damage = |root: &str, why: String, cold: bool| {
+        let mut damage = |root: &str, why: String, cold: bool, remedy: String| {
             damaged_cold |= cold;
             problems.push(format!(
-                "{path} on {root}: {why}: the copy does not verify and gets no record; run `mie \
-                 store verify`, then `mie store repair` (ADR-062 D11)"
+                "{path} on {root}: {why}: the copy does not verify and gets no record; {remedy} \
+                 (ADR-062 D11)"
             ));
         };
         let hot = inputs.hot.files.get(path).map(|copy| ("hot", copy, false));
@@ -831,8 +1249,9 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
         });
         let mut verified: Vec<&str> = Vec::new();
         for (root, copy, is_cold) in hot.into_iter().chain(cold) {
+            let fix = remedy(path, root, false);
             match copy {
-                RootCopy::BadText(why) => damage(root, why.clone(), is_cold),
+                RootCopy::BadText(why) => damage(root, why.clone(), is_cold, fix),
                 RootCopy::Text { text: own, data } if Some(own.as_str()) == text => match data {
                     DataCheck::Good => verified.push(root),
                     DataCheck::NotChecked => {}
@@ -841,15 +1260,86 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
                             root,
                             "missing: a manifest without its data".to_owned(),
                             true,
+                            fix,
                         );
                     }
-                    DataCheck::Size => damage(root, "size".to_owned(), true),
-                    DataCheck::Sha256 => damage(root, "sha256".to_owned(), true),
+                    DataCheck::Size => damage(root, "size".to_owned(), true, fix),
+                    DataCheck::Sha256 => damage(root, "sha256".to_owned(), true, fix),
                     DataCheck::Unreadable(error) => {
-                        damage(root, format!("its data cannot be read ({error})"), true);
+                        damage(
+                            root,
+                            format!("its data cannot be read ({error})"),
+                            true,
+                            fix,
+                        );
                     }
                 },
+                // H5 b: another text than the start's on a live path. A
+                // copy whose data matches its own text is another sealed
+                // file under the path (D5), which no restore step moves
+                // (#219 case 2).
+                RootCopy::Text { data, .. }
+                    if !is_archive_part(path)
+                        && text.is_some()
+                        && recorded_text(path).is_some() =>
+                {
+                    let fix = if *data == DataCheck::Good
+                        && inputs.roots.iter().any(|r| r.id == root && r.copy_target)
+                        && state.copy(path, root).is_none_or(|c| c.latest.is_none())
+                    {
+                        "it is another self-consistent file under the path (D5): the restore \
+                         never moves it, and the path stays one copy short on this target (#219)"
+                            .to_owned()
+                    } else {
+                        fix
+                    };
+                    damage(
+                        root,
+                        "its manifest differs from the copy ledger's manifest record".to_owned(),
+                        is_cold,
+                        fix,
+                    );
+                }
                 RootCopy::Text { .. } => {}
+            }
+        }
+        // B6a: a cold root's pending form of a path hot lacks with a
+        // decided text: another text is a damaged copy (row 12; for every
+        // such path, rule 6 of #195 amendment 2), and for a B6a path the
+        // same text whose data does not verify on a root without the
+        // manifest too (row 7).
+        if !hot_holds(path)
+            && let Some(text) = text
+        {
+            for root in &inputs.roots {
+                let Some(RootCopy::Text { text: own, data }) = root
+                    .temps
+                    .get(path)
+                    .and_then(|temps| temps.pending.as_ref())
+                else {
+                    continue;
+                };
+                let label = format!("{} (its pending manifest)", root.id);
+                let why = if own != text {
+                    "its text differs from the path's manifest text, a remnant of an earlier \
+                     use of the path"
+                        .to_owned()
+                } else if !b6a || root.files.contains_key(path) {
+                    continue;
+                } else {
+                    match data {
+                        DataCheck::Good | DataCheck::NotChecked => continue,
+                        DataCheck::Missing => {
+                            "missing: neither its data file nor its data temp file".to_owned()
+                        }
+                        DataCheck::Size => "size".to_owned(),
+                        DataCheck::Sha256 => "sha256".to_owned(),
+                        DataCheck::Unreadable(error) => {
+                            format!("its data cannot be read ({error})")
+                        }
+                    }
+                };
+                damage(&label, why, true, remedy(path, &root.id, true));
             }
         }
         let Some(text) = text else {
@@ -864,10 +1354,46 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
             .filter(|root| root.copy_target && verified.contains(&root.id.as_str()))
             .map(|root| root.id.as_str())
             .collect();
-        if !start_texts.contains_key(path) && (!targets.is_empty() || damaged_cold) {
+        // B6a rule 2: a B6a path with a text gets its `manifest` record, on
+        // a copy target or a read-only root, its data verified or not: hot
+        // lacks it, so without the record the writer's numbering would not
+        // count it (D5, D6) and the restore's copy-back would skip it.
+        if !start_texts.contains_key(path) && (!targets.is_empty() || damaged_cold || b6a) {
             records.push(Kind::Manifest {
                 text: text.to_owned(),
             });
+            if b6a {
+                cold_recorded.insert(path.to_owned());
+            }
+        }
+        // Rule 6 (#195 amendment 2): every ordinary path hot lacks that no
+        // cold root holds as a data file and that a verified crash copy
+        // holds gets this line, whether this run or an earlier install
+        // recorded it, so a later rebuild names what this one names.
+        let ordinary = !findings.holds.contains_key(path)
+            && state
+                .verdict(path)
+                .is_none_or(|verdict| verdict == PathVerdict::Ordinary);
+        let cold_data = inputs.roots.iter().any(|root| {
+            root.orphan_data.contains(path)
+                || matches!(
+                    root.files.get(path),
+                    Some(RootCopy::Text { data, .. }) if *data != DataCheck::Missing
+                )
+        });
+        let on: Vec<&str> = inputs
+            .roots
+            .iter()
+            .filter(|root| verified_crash_copy(root, path, &[text]))
+            .map(|root| root.id.as_str())
+            .collect();
+        if restore.is_none() && ordinary && !hot_holds(path) && !cold_data && !on.is_empty() {
+            problems.push(format!(
+                "{path}: its `manifest` record comes from the pending manifest on {} alone: no \
+                 root holds it sealed and hot lacks it, so every selection that covers it fails \
+                 until a sealed copy exists (ADR-062 D5, D7)",
+                on.join(", ")
+            ));
         }
         for id in targets {
             if state
@@ -882,21 +1408,54 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
         }
     }
 
-    // B6: lost.
+    // B6a rule 3: a B6a path without a text is a lost candidate (H5 d in
+    // the restore, `--record-lost` in the rebuild), named by every form
+    // found. A path with a manifest text and no record (an archive
+    // conflict without a listed text) stays held by its manifests, as
+    // before B6a.
+    for path in &cold_only {
+        if in_q(path)
+            || state.verdict(path) == Some(PathVerdict::Lost)
+            || cold_recorded.contains(*path)
+            || has_m_text(path)
+        {
+            continue;
+        }
+        sources
+            .entry((*path).to_owned())
+            .or_default()
+            .extend(cold_forms(inputs, path));
+    }
+
+    // B6: lost. B6a rule 4′ (#195 amendment 2): a B6a path is held only
+    // through its record (rule 2). Any other path is held when hot holds
+    // it, a cold root holds its manifest (any) or its data file, or a root
+    // holds a verified crash copy of the start's text. Nothing else holds
+    // it: not a `D~` alone, an `M~` with other bytes, a torn or unreadable
+    // `M~`, an `M~` whose data fails, or evidence. Why a lone `D~` never
+    // holds: no mie path serves it (the copy-back needs a text form on the
+    // root, and the tiered `read` reads only `D`).
     let held_anywhere = |path: &str| {
-        inputs.hot.files.contains_key(path)
-            || inputs.hot.orphan_data.contains(path)
-            || inputs
-                .roots
-                .iter()
-                .any(|root| root.files.contains_key(path) || root.orphan_data.contains(path))
+        if cold_only.contains(path) {
+            return cold_recorded.contains(path) || has_m_text(path);
+        }
+        let texts: Vec<&str> = start_texts
+            .get(path)
+            .map(|texts| texts.iter().map(String::as_str).collect())
+            .unwrap_or_default();
+        hot_holds(path)
+            || inputs.roots.iter().any(|root| {
+                root.files.contains_key(path)
+                    || root.orphan_data.contains(path)
+                    || verified_crash_copy(root, path, &texts)
+            })
     };
     let mut lost = Vec::new();
     for (path, named) in &sources {
         if in_q(path) {
             continue;
         }
-        let described: Vec<String> = named.iter().map(Source::describe).collect();
+        let mut described: Vec<String> = named.iter().map(Source::describe).collect();
         if !copy_ledger::is_data_path(path) {
             problems.push(format!(
                 "{path:?}, named by {}, is no data path of the layout: reported, never recorded \
@@ -907,16 +1466,35 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
         }
         let held = held_anywhere(path);
         if state.verdict(path) == Some(PathVerdict::Lost) {
-            if held {
+            // B6a rule 5: only hot or a parseable manifest on a cold root
+            // holds it again; any other form is left in place and named.
+            if hot_holds(path) || has_m_text(path) {
                 problems.push(format!(
                     "{path}: the start copy records it lost, and a root holds it again; it stays \
                      lost, since recovering a lost file needs a new ADR (ADR-062 D11)"
                 ));
+            } else {
+                let forms: Vec<String> = cold_forms(inputs, path)
+                    .iter()
+                    .filter(|form| !matches!(form, Source::Evidence(..)))
+                    .map(Source::describe)
+                    .collect();
+                if !forms.is_empty() {
+                    lines.push(format!(
+                        "{path}: recorded lost; {} left in place (ADR-062 D11)",
+                        forms.join(", ")
+                    ));
+                }
             }
             continue;
         }
         if held {
             continue;
+        }
+        // Rule 4′: a recorded path's candidate line names every form the
+        // roots hold of it, all left in place.
+        if !cold_only.contains(path.as_str()) && !hot_holds(path) {
+            described.extend(cold_forms(inputs, path).iter().map(Source::describe));
         }
         let ledger_text = start_texts.get(path).and_then(|texts| texts.first());
         let import = named.iter().find_map(|source| match source {
@@ -935,6 +1513,10 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
             (LostOrigin::Journal, None)
         } else if has(|s| matches!(s, Source::Recovery(..))) {
             (LostOrigin::Recovery, None)
+        } else if has(Source::is_cold_form) {
+            // Only the roots' forms name it (B6a rule 3): a copy that does
+            // not verify, as the repair's lost-file rule.
+            (LostOrigin::Verify, None)
         } else {
             (LostOrigin::Ledger, None)
         };
@@ -947,17 +1529,36 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
         // The derivation states what the rebuilt ledger holds, never that
         // it was written: the install comes later and may not happen
         // (re-review 2 of #209, finding 2).
-        let what = if inputs.record_lost {
-            "with --record-lost its `lost` record is derived into the rebuilt ledger, and it \
-             takes effect only if this run installs it (`wrote …` below): then every selection \
-             that covers it fails"
+        let what = match (inputs.record_lost, restore.is_some()) {
+            (true, false) => {
+                "with --record-lost its `lost` record is derived into the rebuilt ledger, and it \
+                 takes effect only if this run installs it (`wrote …` below): then every \
+                 selection that covers it fails"
+            }
+            (false, false) => {
+                "nothing is written; after checking for a shared cause (an unmounted root, \
+                 roots restored from an old backup), `mie store rebuild --record-lost` records \
+                 it lost"
+            }
+            (true, true) => {
+                "with --record-lost its `lost` record is derived into the restored ledger, and \
+                 it takes effect only once the restore installs it: then every selection that \
+                 covers it fails"
+            }
+            (false, true) => {
+                "nothing is written; after checking for a shared cause (an unmounted root, \
+                 roots restored from an old backup), `mie store restore --record-lost` records \
+                 it lost"
+            }
+        };
+        let absent = if cold_only.contains(path.as_str()) {
+            "no root holds a sealed copy or a pending manifest that decides its text, hot lacks \
+             it, and the path must stay counted, or the next capture reuses it (ADR-062 D5, D6);"
         } else {
-            "nothing is written; after checking for a shared cause (an unmounted root, roots \
-             restored from an old backup), `mie store rebuild --record-lost` records it lost"
+            "no root holds it (no data file and no manifest on hot or on any cold root), and"
         };
         problems.push(format!(
-            "{path}: no root holds it (no data file and no manifest on hot or on any cold root), \
-             and {} names it; {what} (ADR-062 D7 step 4, D11)",
+            "{path}: {absent} {} names it; {what} (ADR-062 D7 step 4, D11)",
             described.join(", ")
         ));
         lost.push(LostFile {
@@ -979,13 +1580,17 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
     let mut hold_records = Vec::new();
     let mut unrecorded_unlisted = Vec::new();
     let mut new_unlisted = 0usize;
+    // The restore writes them without a flag (H5 c): it must complete
+    // before `mie ingest` may start, and D11's replication order limits them
+    // to the one archive file whose parts and entry a loss separated.
+    let record_unlisted = inputs.record_unlisted || restore.is_some();
     for (path, reason) in &findings.holds {
         holds.push((path.clone(), *reason));
         let new = state.hold_reason(path).is_none();
         if new && *reason == HoldReason::Unlisted {
             new_unlisted += 1;
         }
-        if new && *reason == HoldReason::Unlisted && !inputs.record_unlisted {
+        if new && *reason == HoldReason::Unlisted && !record_unlisted {
             lines.push(format!("unlisted: {path} (not recorded)"));
             problems.push(format!(
                 "{path}: no current import entry lists it, so it would be held (unlisted); \
@@ -1012,7 +1617,7 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
     // the flagged run included: an import-ledger disk that became an empty
     // mount point between two runs must show in the run that writes the
     // holds (re-review 2 of #209, finding 1).
-    if new_unlisted > 0 {
+    if new_unlisted > 0 && restore.is_none() {
         let what = if inputs.record_unlisted {
             "With --record-unlisted their holds are derived into the rebuilt ledger, and only \
              the hold resolution clears them once it is installed; if these counts show an empty \
@@ -1107,26 +1712,35 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
     lines.extend(quarantine.lines.iter().cloned());
     problems.extend(quarantine.problems.iter().cloned());
 
-    // B8: removed.
+    // B8: removed. In the restore a copy the start records is not read
+    // (H2, decision 4) and counts as verified, and every partition the
+    // copy-back brings back counts as on hot (H5 e).
     let partitions: BTreeSet<&str> = inputs
         .roots
         .iter()
         .flat_map(|root| &root.files)
         .filter(|(path, copy)| {
             !in_q(path)
-                && matches!(
-                    copy,
+                && match copy {
                     RootCopy::Text {
                         data: DataCheck::Good,
                         ..
-                    }
-                )
+                    } => true,
+                    RootCopy::Text {
+                        data: DataCheck::NotChecked,
+                        ..
+                    } => restore.is_some(),
+                    _ => false,
+                }
         })
         .map(|(path, _)| partition_of(path))
         .collect();
     let mut removed = Vec::new();
     for partition in partitions {
-        if inputs.hot.partitions.contains(partition) || state.is_removed(partition) {
+        if inputs.hot.partitions.contains(partition)
+            || state.is_removed(partition)
+            || restore.is_some_and(|restore| restore.copy_back.contains(partition))
+        {
             continue;
         }
         if date_of(partition) >= inputs.first_hot_date.as_str() {
@@ -1199,16 +1813,17 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
         unrecorded_unlisted,
         lines,
         problems,
+        chosen_entries: findings.chosen,
     })
 }
 
 // ------------------------------------------------------------- the run
 
 /// A cold root that presented its marker.
-struct Marked {
-    path: PathBuf,
-    id: String,
-    copy_target: bool,
+pub(super) struct Marked {
+    pub(super) path: PathBuf,
+    pub(super) id: String,
+    pub(super) copy_target: bool,
 }
 
 /// Runs one rebuild (module docs). `now_ms` is read once: every record and
@@ -1373,6 +1988,7 @@ fn rebuild(
         ledger_copies.push(LedgerCopyRead {
             id: target.id.clone(),
             bytes,
+            error: None,
         });
     }
     let journal = read_journal(&config.paths.journal).map_err(io(format!(
@@ -1451,15 +2067,30 @@ fn rebuild(
             root.display()
         ))
     };
+    // A quarantined manifest that cannot be read stops the rebuild, as
+    // before #195 (amendment 2, U: only the restore counts it).
+    let read_quarantine = |root: &Path| -> Result<QuarantineListing, Stop> {
+        let listing = replica::list_quarantine(root).map_err(|e| quarantine(root, e))?;
+        let unreadable = listing
+            .ids
+            .values()
+            .flat_map(|parts| parts.values())
+            .find_map(|copy| copy.unreadable.clone());
+        match unreadable {
+            Some(error) => Err(quarantine(root, RawStoreError::Io(error))),
+            None => Ok(listing),
+        }
+    };
     let mut hot_read = HotRead {
-        quarantine: replica::list_quarantine(hot).map_err(|e| quarantine(hot, e))?,
+        quarantine: read_quarantine(hot)?,
         ..HotRead::default()
     };
     for path in replica::list_sealed(hot).map_err(|e| listing(hot, e))? {
-        let copy = read_copy(hot, &path, false)?;
+        let copy = read_copy(hot, &path, false, false)?;
         hot_read.files.insert(path, copy);
     }
     hot_read.orphan_data = orphan_data(hot).map_err(|e| listing(hot, e))?;
+    hot_read.evidence = replica::list_evidence(hot).map_err(|e| listing(hot, e))?;
     hot_read.partitions = removal::scan_hot(hot, "")
         .map_err(|e| listing(hot, e))?
         .partitions
@@ -1469,19 +2100,22 @@ fn rebuild(
     for root in &marked {
         let mut files = BTreeMap::new();
         for path in replica::list_sealed(&root.path).map_err(|e| listing(&root.path, e))? {
-            let copy = read_copy(&root.path, &path, true)?;
+            let copy = read_copy(&root.path, &path, true, false)?;
             files.insert(path, copy);
         }
+        let temps = read_temps(&root.path, &files, &|_| true)?;
         roots.push(RootRead {
             id: root.id.clone(),
             copy_target: root.copy_target,
             files,
             orphan_data: orphan_data(&root.path).map_err(|e| listing(&root.path, e))?,
-            quarantine: replica::list_quarantine(&root.path)
-                .map_err(|e| quarantine(&root.path, e))?,
+            temps,
+            evidence: replica::list_evidence(&root.path).map_err(|e| listing(&root.path, e))?,
+            quarantine: read_quarantine(&root.path)?,
         });
     }
     let inputs = RebuildInputs {
+        mode: Mode::Rebuild,
         at_ms,
         first_hot_date: first_hot_date.to_owned(),
         record_lost: flags.record_lost,
@@ -1564,7 +2198,7 @@ fn rebuild(
 }
 
 /// Why the marker of `root` no longer names it, if it does not.
-fn marker_gone(root: &Marked) -> Option<String> {
+pub(super) fn marker_gone(root: &Marked) -> Option<String> {
     match root_marker::read(&root.path) {
         Ok(Some(id)) if id == root.id => None,
         Ok(Some(other)) => Some(format!("its marker now carries the id {other:?}")),
@@ -1576,7 +2210,12 @@ fn marker_gone(root: &Marked) -> Option<String> {
 /// B9 step 6 for one copy target: a ledger copy that is no prefix of the
 /// installed ledger is moved aside; the next pass copies the rebuilt one
 /// from byte 0.
-fn move_copy_aside(hot: &Path, target: &Marked, aside: &Path, report: &mut RebuildReport) {
+pub(super) fn move_copy_aside(
+    hot: &Path,
+    target: &Marked,
+    aside: &Path,
+    report: &mut RebuildReport,
+) {
     let name = format!("{} ({})", target.path.display(), target.id);
     let check = match copy_ledger::check_copy(hot, &target.path) {
         Ok(LedgerCopyCheck::Good | LedgerCopyCheck::Absent) => return,
@@ -1608,7 +2247,7 @@ fn move_copy_aside(hot: &Path, target: &Marked, aside: &Path, report: &mut Rebui
 
 /// Reads hot's journal up to the length read now (B1); no journal is an
 /// empty one.
-fn read_journal(path: &Path) -> std::io::Result<JournalRead> {
+pub(super) fn read_journal(path: &Path) -> std::io::Result<JournalRead> {
     let mut file = match fs::File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(JournalRead::default()),
@@ -1622,15 +2261,31 @@ fn read_journal(path: &Path) -> std::io::Result<JournalRead> {
 
 /// The copy of the sealed part `path` on `root` (B1): its manifest
 /// classified and, with `check`, its data against that root's own text.
-fn read_copy(root: &Path, path: &str, check: bool) -> Result<RootCopy, Stop> {
+/// A manifest that cannot be read stops the run, or with
+/// `unreadable_is_damage` (the hot restore's cold roots, #195 amendment
+/// 2, U) is a damaged copy: the name stays counted.
+pub(super) fn read_copy(
+    root: &Path,
+    path: &str,
+    check: bool,
+    unreadable_is_damage: bool,
+) -> Result<RootCopy, Stop> {
     let manifest = format!("{}.manifest", path.strip_suffix(".parquet").unwrap_or(path));
     let file = root.join(&manifest);
-    let bytes = fs::read(&file).map_err(|error| {
-        Stop(format!(
-            "read {}: {error}; the rebuild stops with nothing written (ADR-062 D7)",
-            file.display()
-        ))
-    })?;
+    let bytes = match fs::read(&file) {
+        Ok(bytes) => bytes,
+        Err(error) if unreadable_is_damage => {
+            return Ok(RootCopy::BadText(format!(
+                "the manifest cannot be read: {error}"
+            )));
+        }
+        Err(error) => {
+            return Err(Stop(format!(
+                "read {}: {error}; the rebuild stops with nothing written (ADR-062 D7)",
+                file.display()
+            )));
+        }
+    };
     let copy = classify_text(path, &bytes);
     let RootCopy::Text { text, .. } = &copy else {
         return Ok(copy);
@@ -1654,8 +2309,76 @@ fn read_copy(root: &Path, path: &str, check: bool) -> Result<RootCopy, Stop> {
     })
 }
 
+/// The seal temp names of the layout of `root` (B6a), each pending
+/// manifest classified. Where `root` lacks the part's manifest and
+/// `check(path)` holds, a pending text's data (`D`, else `D~`) is checked
+/// against it.
+pub(super) fn read_temps(
+    root: &Path,
+    files: &BTreeMap<String, RootCopy>,
+    check: &dyn Fn(&str) -> bool,
+) -> Result<BTreeMap<String, TempForms>, Stop> {
+    let listed = replica::list_temps(root).map_err(|error| {
+        Stop(format!(
+            "cannot list the seal temp names of {} ({error}); a skipped directory would turn \
+             its files into lost candidates, so nothing is written (ADR-062 D7)",
+            root.display()
+        ))
+    })?;
+    let mut temps = BTreeMap::new();
+    for (path, found) in listed {
+        // U (#195 amendment 2): a pending manifest that cannot be read
+        // counts as one that does not parse (row 10), never a stop.
+        let unreadable = found.unreadable.map(|error| {
+            RootCopy::BadText(format!("the pending manifest cannot be read: {error}"))
+        });
+        let pending = found.manifest.map(|text| {
+            let copy = match text {
+                None => RootCopy::BadText("the pending manifest is not UTF-8".to_owned()),
+                Some(text) => classify_text(&path, text.as_bytes()),
+            };
+            match copy {
+                RootCopy::Text { text, .. } if !files.contains_key(&path) && check(&path) => {
+                    let data = pending_data(root, &path, &text);
+                    RootCopy::Text { text, data }
+                }
+                other => other,
+            }
+        });
+        temps.insert(
+            path,
+            TempForms {
+                data_tmp: found.data,
+                pending: pending.or(unreadable),
+            },
+        );
+    }
+    Ok(temps)
+}
+
+/// The data of a pending manifest's text on `root`: the data file, else
+/// the data temp file, against the text (B6a).
+fn pending_data(root: &Path, path: &str, text: &str) -> DataCheck {
+    let checked = replica::check_file(&root.join(path), text).and_then(|check| {
+        if check == CopyCheck::Missing {
+            replica::temp_path(root, path, replica::TempName::Data)
+                .and_then(|tmp| replica::check_file(&tmp, text))
+        } else {
+            Ok(check)
+        }
+    });
+    match checked {
+        Ok(CopyCheck::Good) => DataCheck::Good,
+        Ok(CopyCheck::Missing) => DataCheck::Missing,
+        Ok(CopyCheck::Size) => DataCheck::Size,
+        Ok(CopyCheck::Sha256) => DataCheck::Sha256,
+        Ok(CopyCheck::Manifest { .. }) => DataCheck::Unreadable("its manifest changed".to_owned()),
+        Err(error) => DataCheck::Unreadable(error.to_string()),
+    }
+}
+
 /// The data files without their manifest in the layout of `root`.
-fn orphan_data(root: &Path) -> Result<BTreeSet<String>, RawStoreError> {
+pub(super) fn orphan_data(root: &Path) -> Result<BTreeSet<String>, RawStoreError> {
     Ok(replica::list_unsealed(root)?
         .into_iter()
         .filter(|path| {

@@ -270,8 +270,10 @@ USAGE:
         under the ingest config's raw_root, once. Needs paths.cold_roots.
         Refused when raw_root/.mie exists, and when a configured cold root
         already carries a marker or a copy-ledger copy: that hot was
-        initialized before and is lost, which the hot restore repairs,
-        never a new init. Prints what it wrote and what it found on each
+        initialized before and is lost, which mie store restore repairs,
+        never a new init. A raw_root/.mie without hot's marker is an
+        interrupted restore, which running mie store restore again
+        completes. Prints what it wrote and what it found on each
         cold root and exits 0, or prints FAIL: <reason> and exits 1. See
         crates/mie-cli/ingest.example.toml.
 
@@ -426,6 +428,47 @@ USAGE:
         …`) or `nothing written`; only that line says whether anything was
         written. Then PASS and exits 0, or one FAIL: <reason> line per
         problem and exits 1.
+
+    mie store restore --config <path> [--archive-config <path>]
+                      [--record-lost] [--skip-unreadable-journal]
+        Restore the hot root of a tiered raw store after its disk was lost
+        (ADR-062 D11), before mie ingest or the importer may start: both
+        refuse a hot without its marker. raw_root must exist (mount or
+        create the replacement directory first) and carry no marker: an
+        intact hot is refused. Every root, read-only roots included, must
+        carry its marker, and hot and the copy targets must be on distinct
+        devices. It takes the copy-ledger, pass and verify locks and the
+        writer lock of every source without waiting. It restores the
+        journal from the longest copy, every other copy being a byte prefix
+        of it (copies that differ beyond their common prefix stop it), and
+        ends a cut last line; the import ledger from the copies on the
+        targets (differing entries are decided by the manifests on the
+        roots, otherwise their parts are held; a surviving hot copy of
+        another variant is moved into .mie/damaged/<time>/); the copy ledger
+        from the longest copy whose hash chain verifies (hot's own first),
+        cross-checked as mie store rebuild does, with archive parts no entry
+        lists held; then it copies back from the cold roots every partition
+        of the hot window and every one not recorded as removed, verifying
+        every file. A copy that does not verify is passed over and named,
+        for mie store verify, then mie store repair when the ledger records
+        it on a copy target; an unrecorded one on a copy target is moved
+        into .mie/damaged/<time>/ once the file is back, so the next pass
+        copies it from hot. A file with no good copy stays recorded and
+        every replay that covers it fails. A file a
+        record names that no root holds stops the restore before any write;
+        --record-lost records it lost, after which every replay that covers
+        it fails, so pass it only after a run without it reported the file.
+        A journal copy that cannot be read and is longer than every
+        readable one stops the restore. After a transient read error a
+        plain re-run completes it; --skip-unreadable-journal leaves the copy
+        out, moved aside and never deleted, so the runs that only its tail
+        names are missing from hot's journal.
+        Hot's marker is written last: a restore that stopped or crashed
+        before it is completed by running the command again. Prints the
+        journal candidates and the choice, the import ledger, the derived
+        records, the install and the copy-back per partition, then
+        `restored: …` or `not restored: …`, then PASS and exits 0, or one
+        FAIL: <reason> line per problem and exits 1.
 
     mie store resolve --config <path> [--archive-config <path>]
                       [--file <archive path> [--replace]]
@@ -990,6 +1033,34 @@ fn dispatch(args: &[String]) -> Result<ExitCode, String> {
                 )?;
                 Ok(exit(pass))
             }
+            Some("restore") => {
+                let options = Options::parse(
+                    &args[2..],
+                    &["--config", "--archive-config"],
+                    &["--record-lost", "--skip-unreadable-journal"],
+                )?;
+                let config =
+                    IngestConfig::load(&options.path("--config")?).map_err(|e| e.to_string())?;
+                let archive = options.optional("--archive-config").map(PathBuf::from);
+                let flags = store::restore::Flags {
+                    record_lost: options.flag("--record-lost"),
+                    skip_unreadable_journal: options.flag("--skip-unreadable-journal"),
+                };
+                let probe = store::device_probe()?;
+                let clock = SystemClock::new();
+                let now_ms = || clock.now_utc_ns().div_euclid(1_000_000);
+                let first_hot_date = ingest::first_hot_date(now_ms());
+                let pass = store::restore(
+                    &config,
+                    archive.as_deref(),
+                    flags,
+                    &first_hot_date,
+                    probe.as_ref(),
+                    &now_ms,
+                    &mut std::io::stdout().lock(),
+                )?;
+                Ok(exit(pass))
+            }
             Some("resolve") => {
                 let options = Options::parse(
                     &args[2..],
@@ -1038,8 +1109,10 @@ fn dispatch(args: &[String]) -> Result<ExitCode, String> {
                  --period-hours <P>`, `mie store repair --config <path> [--archive-config \
                  <path>] [--record-lost]`, `mie store rebuild --config <path> \
                  [--archive-config <path>] [--record-lost] [--record-unlisted] \
-                 [--replace-hot-ledger]` or `mie store resolve --config <path> \
-                 [--archive-config <path>] [--file <archive path> [--replace]]`"
+                 [--replace-hot-ledger]`, `mie store restore --config <path> \
+                 [--archive-config <path>] [--record-lost] [--skip-unreadable-journal]` or `mie \
+                 store resolve --config \
+                 <path> [--archive-config <path>] [--file <archive path> [--replace]]`"
                     .to_owned(),
             ),
         },
