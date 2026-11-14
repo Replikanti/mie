@@ -17,9 +17,10 @@
 //! [`HeldLock`] releases explicitly instead: its drop unlocks
 //! (`flock(LOCK_UN)`, [`File::unlock`]), which frees the description's lock
 //! whatever other descriptors of it exist. The workspace's `clippy.toml`
-//! bans the direct [`File`] lock calls everywhere else, so no lock can
-//! bypass this rule; the impl blocks here are the only ones allowed to make
-//! them.
+//! bans the direct [`File`] lock calls everywhere else, and the `flock`
+//! entry points of `libc`, `rustix` and `nix` too; the impl blocks here are
+//! the only ones allowed to make them. A lock API outside that list (a raw
+//! `syscall`, another crate) is not caught and needs review.
 //!
 //! The rule is also a constraint: code must never rely on a duplicate of a
 //! lock descriptor keeping the lock after its guard dropped.

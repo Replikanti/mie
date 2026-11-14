@@ -9,4 +9,12 @@ disallowed-methods = [
     { path = "std::fs::File::lock_shared", reason = "take store locks through mie_adapter_parquet::flock::HeldLock, whose drop unlocks explicitly (#220)" },
     { path = "std::fs::File::try_lock_shared", reason = "take store locks through mie_adapter_parquet::flock::HeldLock, whose drop unlocks explicitly (#220)" },
     { path = "std::fs::File::unlock", reason = "take store locks through mie_adapter_parquet::flock::HeldLock, whose drop unlocks explicitly (#220)" },
+    # The same flock(2) through the FFI crates already in Cargo.lock. None is
+    # a direct dependency today, so the paths do not resolve yet:
+    # allow-invalid keeps clippy quiet until one becomes one, and the ban then
+    # applies without an edit here.
+    { path = "libc::flock", reason = "take store locks through mie_adapter_parquet::flock::HeldLock, whose drop unlocks explicitly (#220)", allow-invalid = true },
+    { path = "rustix::fs::flock", reason = "take store locks through mie_adapter_parquet::flock::HeldLock, whose drop unlocks explicitly (#220)", allow-invalid = true },
+    { path = "nix::fcntl::flock", reason = "take store locks through mie_adapter_parquet::flock::HeldLock, whose drop unlocks explicitly (#220)", allow-invalid = true },
+    { path = "nix::fcntl::Flock::lock", reason = "take store locks through mie_adapter_parquet::flock::HeldLock, whose drop unlocks explicitly (#220)", allow-invalid = true },
 ]
