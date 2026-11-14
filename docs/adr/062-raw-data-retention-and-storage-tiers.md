@@ -2836,10 +2836,12 @@ What breaks:
       layout, not in `.quarantine/<id>/`, whether the root held the path at
       the replace or was added after it. A replace that mie runs, a new
       one or a resume, leaves every moved path whose data any root holds
-      with a data copy in a `.quarantine/<id>/` of hot or of a copy
-      target: RQ2 and the resume refuse otherwise, and W3 moves every
-      writable copy. Configuring those roots read-only later changes
-      nothing, since a read-only root's quarantine copy counts. The state
+      with a data copy in some root's `.quarantine/<id>/`: RQ2 and the
+      resume refuse otherwise, and W3 moves every writable copy. That
+      root was hot or a copy target when W3 renamed into it; configuring
+      it read-only later, also between a stopped run and its resume
+      (review of #221, round 3), changes nothing, since a read-only
+      root's quarantine copy counts. The state
       with no data copy in any root's `.quarantine/<id>/` while a
       read-only layout holds the data (h = 0, r ≥ 1) can still arise
       outside mie: by a hand deletion of the quarantine copies, or by
