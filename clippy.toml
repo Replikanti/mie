@@ -1,0 +1,12 @@
+# Store locks are taken only through mie_adapter_parquet::flock::HeldLock,
+# whose drop unlocks explicitly: a lock released only by closing its
+# descriptor stays held while a child process started by another thread
+# holds a copy of that descriptor (#220). The impl blocks of
+# crates/mie-adapter-parquet/src/flock.rs are the only allowed callers.
+disallowed-methods = [
+    { path = "std::fs::File::lock", reason = "take store locks through mie_adapter_parquet::flock::HeldLock, whose drop unlocks explicitly (#220)" },
+    { path = "std::fs::File::try_lock", reason = "take store locks through mie_adapter_parquet::flock::HeldLock, whose drop unlocks explicitly (#220)" },
+    { path = "std::fs::File::lock_shared", reason = "take store locks through mie_adapter_parquet::flock::HeldLock, whose drop unlocks explicitly (#220)" },
+    { path = "std::fs::File::try_lock_shared", reason = "take store locks through mie_adapter_parquet::flock::HeldLock, whose drop unlocks explicitly (#220)" },
+    { path = "std::fs::File::unlock", reason = "take store locks through mie_adapter_parquet::flock::HeldLock, whose drop unlocks explicitly (#220)" },
+]

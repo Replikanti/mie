@@ -92,8 +92,13 @@
 //! context records and forward labels of one labeling run as three
 //! content-hashed Parquet tables, sealed with the same protocol and read
 //! back only after verification.
+//!
+//! [`flock`] holds every store lock, and its guard unlocks explicitly when
+//! dropped, so a child process another thread starts cannot keep a dropped
+//! lock held until its exec (#220).
 
 pub mod copy_ledger;
+pub mod flock;
 mod layout;
 mod manifest;
 pub mod outcome;

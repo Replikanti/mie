@@ -32,17 +32,6 @@ const PROCESS_ROUNDS: usize = 20;
 /// candidate, so the planned pass only copies.
 const FIRST_HOT: &str = "2000-01-01";
 
-/// Serializes the tests of this binary: a child spawned by one test
-/// inherits, between its fork and its exec, every lock descriptor open in
-/// the process (#198).
-static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-fn serial() -> std::sync::MutexGuard<'static, ()> {
-    SERIAL
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
 /// The wall clock: a part sealed in this round is within G of it, as in
 /// production.
 fn now_ms() -> i64 {
@@ -174,7 +163,6 @@ fn assert_chains(config: &IngestConfig) {
 /// beside a verification loop.
 #[test]
 fn a_replicator_thread_and_a_verification_thread_keep_every_chain_valid() {
-    let _serial = serial();
     let dir = TempDir::new("verify-threads");
     let config = store(dir.path());
     let replicator = {
@@ -212,7 +200,6 @@ fn child_verifies_once() {
 /// on one filesystem) while this process seals and replicates.
 #[test]
 fn a_verification_in_another_process_keeps_every_chain_valid() {
-    let _serial = serial();
     let dir = TempDir::new("verify-processes");
     let config = store(dir.path());
     for round in 1..=PROCESS_ROUNDS {

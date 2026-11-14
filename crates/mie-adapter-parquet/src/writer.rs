@@ -2,6 +2,7 @@
 //! (ADR-030).
 
 use crate::copy_ledger::{self, CopyLedger, Kind, Record, Truncation};
+use crate::flock::HeldLock;
 use crate::layout::{self, PartFile};
 use crate::manifest;
 use crate::recovery::{self, RecoveryReport};
@@ -210,7 +211,9 @@ struct Tiered {
 
 /// The raw-store writer of one source (ADR-030).
 ///
-/// Holds the source's lock for its lifetime. Records become visible only
+/// Holds the source's lock for its lifetime; a writer dropped without
+/// [`close`](RawWriter::close) unlocks it explicitly too ([`HeldLock`]).
+/// Records become visible only
 /// when their part is sealed: on rotation, on [`RawRecordSink::seal_all`] or
 /// on [`RawWriter::close`]. Dropping the writer seals nothing; the unsealed
 /// parts are discarded by the next writer's recovery. After any I/O failure
@@ -239,7 +242,7 @@ pub struct RawWriter {
     root: PathBuf,
     source: String,
     policy: RotationPolicy,
-    lock: File,
+    lock: HeldLock,
     /// The tier side of a tiered store.
     tiers: Option<Tiered>,
     open: BTreeMap<(RawStreamKey, String), OpenPart>,
@@ -283,7 +286,7 @@ impl RawWriter {
                 "rotation policy {policy:?}: limits must be positive and spans non-negative"
             )));
         }
-        let lock = removal::take_source_lock(root, source)?.into_file();
+        let lock = removal::take_source_lock(root, source)?.into_held();
         let recovery = recovery::recover(root, source)?;
         let tiers = match tiers {
             Some((cold_roots, ctx)) => {
@@ -327,9 +330,7 @@ impl RawWriter {
     /// between its fork and its exec (#220).
     #[cfg(test)]
     pub(crate) fn duplicate_lock(&self) -> File {
-        self.lock
-            .try_clone()
-            .expect("duplicate the lock descriptor")
+        self.lock.duplicate()
     }
 
     /// Seals every open part and releases the source lock. Returns the files
@@ -342,7 +343,7 @@ impl RawWriter {
     pub fn close(mut self) -> Result<Vec<SealedFile>, RawStoreError> {
         let sealed = self.seal_all()?;
         self.lock
-            .unlock()
+            .release()
             .map_err(|e| RawStoreError::Io(format!("unlock source {}: {e}", self.source)))?;
         Ok(sealed)
     }

@@ -29,6 +29,7 @@
 //! `returned` record leaves an incomplete partition too.
 
 use crate::copy_ledger::{CopyLedger, Kind, Ledger, Record, Subject, Truncation};
+use crate::flock::HeldLock;
 use crate::layout::{self, PartFile};
 use crate::replica::layout_values;
 use crate::tiers::Verdict;
@@ -36,7 +37,7 @@ use crate::verification::CopyState;
 use crate::{io_error, list_entries, sync_dir};
 use mie_ports::raw::RawStoreError;
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File, OpenOptions, TryLockError};
+use std::fs::{self, OpenOptions, TryLockError};
 use std::io::ErrorKind;
 use std::path::Path;
 
@@ -411,10 +412,10 @@ fn gate_waits(
 }
 
 /// The writer lock of a source, taken by the remover; dropping it releases
-/// the lock.
+/// the lock explicitly ([`HeldLock`]).
 #[derive(Debug)]
 pub struct SourceLock {
-    _file: File,
+    _lock: HeldLock,
 }
 
 /// Tries the writer lock `source=<source>/.lock` of hot, without creating
@@ -432,8 +433,8 @@ pub fn try_source_lock(hot: &Path, source: &str) -> Result<Option<SourceLock>, R
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(io_error("open", &path)(error)),
     };
-    match file.try_lock() {
-        Ok(()) => Ok(Some(SourceLock { _file: file })),
+    match HeldLock::try_take(file) {
+        Ok(lock) => Ok(Some(SourceLock { _lock: lock })),
         Err(TryLockError::WouldBlock) => Err(RawStoreError::Locked(format!(
             "a writer holds source {source} in {}",
             hot.display()
@@ -463,8 +464,8 @@ pub fn take_source_lock(root: &Path, source: &str) -> Result<SourceLock, RawStor
         .write(true)
         .open(&lock_path)
         .map_err(io_error("open", &lock_path))?;
-    match lock.try_lock() {
-        Ok(()) => Ok(SourceLock { _file: lock }),
+    match HeldLock::try_take(lock) {
+        Ok(lock) => Ok(SourceLock { _lock: lock }),
         Err(TryLockError::WouldBlock) => Err(RawStoreError::Locked(format!(
             "another writer holds source {source} in {}",
             root.display()
@@ -474,19 +475,17 @@ pub fn take_source_lock(root: &Path, source: &str) -> Result<SourceLock, RawStor
 }
 
 impl SourceLock {
-    /// The locked file, for a writer that releases it explicitly.
-    pub(crate) fn into_file(self) -> File {
-        self._file
+    /// The held lock, for a writer that keeps it for its lifetime.
+    pub(crate) fn into_held(self) -> HeldLock {
+        self._lock
     }
 
     /// A second descriptor of the held lock's open file description, as a
     /// child process started by another thread holds it between its fork
     /// and its exec (#220).
     #[cfg(test)]
-    pub(crate) fn duplicate_lock(&self) -> File {
-        self._file
-            .try_clone()
-            .expect("duplicate the lock descriptor")
+    pub(crate) fn duplicate_lock(&self) -> fs::File {
+        self._lock.duplicate()
     }
 }
 
