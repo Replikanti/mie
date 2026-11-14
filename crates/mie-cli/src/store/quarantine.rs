@@ -43,7 +43,14 @@
 //!   on hot that carries a quarantine; an incomplete replace (unfinished
 //!   on hot or a copy target, by I1's rule) is a problem naming `mie store
 //!   resolve --file F`. A marked read-only root whose layout still holds a
-//!   moved path gets an info line ([`read_only_line`]), never a problem.
+//!   moved path gets an info line ([`read_only_line`]), never a problem of
+//!   its own. A moved path whose data file no layout and no
+//!   `.quarantine/<id>/` of hot or of a copy target holds while a
+//!   read-only layout does is a problem with the remedy
+//!   ([`ReplaceRoots::read_only_alone`], the h = 0 rule of review of
+//!   #221), and its replace is never reported complete. I1 does not apply
+//!   that rule: no byte is lost in that state and the remedy works after
+//!   `replaced` (ADR-062 D11 *As amended (#216)*).
 
 use mie_adapter_binance::archive::ledger::{
     ImportLedger, LedgerDir, LedgerKind, LedgerName, SupersedeRecord, replacement_generation,
@@ -161,6 +168,126 @@ impl ReplaceRoots {
             .collect();
         read_only_lines(&read_only, &quarantine.moved, &quarantine.id)
     }
+
+    /// The h = 0 rule over `record` ([`read_only_alone`]): one problem
+    /// ([`read_only_alone_line`]) per moved path whose data file no layout
+    /// and no `.quarantine/<id>/` of hot or of a marked copy target holds
+    /// while the layout of a marked read-only root does. An unmarked root is
+    /// not inspected: an unmarked copy target already makes the replace
+    /// incomplete.
+    ///
+    /// # Errors
+    ///
+    /// An I/O error inspecting hot or a copy target.
+    pub fn read_only_alone(&self, record: &SupersedeRecord) -> Result<Vec<String>, String> {
+        let Some(quarantine) = &record.quarantine else {
+            return Ok(Vec::new());
+        };
+        let marked = |counts: bool| -> Vec<(&str, &Path)> {
+            self.roots
+                .iter()
+                .filter(|root| root.counts == counts)
+                .filter_map(|root| root.id.as_deref().map(|id| (id, root.path.as_path())))
+                .collect()
+        };
+        let (writable, read_only) = (marked(true), marked(false));
+        let mut problems = Vec::new();
+        for path in &quarantine.moved {
+            let alone = read_only_alone(&writable, &read_only, path, &quarantine.id)?;
+            if !alone.is_empty() {
+                problems.push(read_only_alone_line(
+                    path,
+                    &alone,
+                    &quarantine.id,
+                    &record.archive,
+                ));
+            }
+        }
+        Ok(problems)
+    }
+}
+
+/// The h = 0 rule of the resume (RQ7), the proposals (RQ8) and, over its
+/// own listings, the rebuild (Q5), as RQ2 applies it to a new replace
+/// (ADR-062 D11 *As amended (#216)*, review of #221): the read-only roots
+/// of `read_only` whose layout holds the data file of `path` (r), when no
+/// root of `writable` (hot and the copy targets) holds it in its
+/// `.quarantine/<id>/` or its layout (h = 0); otherwise none. A manifest
+/// alone is no holder: the superseded bytes are the data file's.
+///
+/// Cost per call: at most 1 `lstat` per writable root in its quarantine,
+/// then, only when none holds it there, at most 1 per writable root in its
+/// layout, then, only with h = 0, 1 per read-only root; it stops at the
+/// first writable hit.
+///
+/// A read-only root that cannot be inspected counts as holding the data,
+/// named with its error: with h = 0 the rule fails closed rather than read
+/// an error as an absence.
+///
+/// # Errors
+///
+/// The I/O error of an inspection of a writable root other than "not
+/// found", naming the root.
+pub fn read_only_alone(
+    writable: &[(&str, &Path)],
+    read_only: &[(&str, &Path)],
+    path: &str,
+    quarantine_id: &str,
+) -> Result<Vec<String>, String> {
+    let held = |label: &str, file: PathBuf| {
+        exists(&file).map_err(|error| format!("inspect {path} on {label}: {error}"))
+    };
+    for (label, root) in writable {
+        if held(
+            label,
+            replica::quarantine_dir(root, quarantine_id).join(path),
+        )? {
+            return Ok(Vec::new());
+        }
+    }
+    for (label, root) in writable {
+        if held(label, root.join(path))? {
+            return Ok(Vec::new());
+        }
+    }
+    let mut alone = Vec::new();
+    for (label, root) in read_only {
+        match exists(&root.join(path)) {
+            Ok(false) => {}
+            Ok(true) => alone.push((*label).to_owned()),
+            Err(error) => alone.push(format!("{label} (cannot be inspected: {error})")),
+        }
+    }
+    Ok(alone)
+}
+
+/// The problem of a moved path whose data only read-only roots hold
+/// ([`read_only_alone`]), naming them and the remedy, shared by the resume,
+/// the proposals (RQ8) and the rebuild (Q5).
+pub fn read_only_alone_line(
+    path: &str,
+    roots: &[String],
+    quarantine_id: &str,
+    archive: &str,
+) -> String {
+    format!(
+        "{path} (quarantine {quarantine_id}): its data file is held only by the read-only \
+         root(s) {}; neither hot nor a copy target holds it in its layout or in its \
+         `.quarantine/{quarantine_id}/`, so its superseded bytes would stay only on roots mie \
+         never writes (ADR-062 D4, D11). Set `copy_target = true` for one of them in \
+         `paths.cold_roots`, then run `mie store resolve --file {archive}`, which moves its \
+         copy into quarantine",
+        roots.join(", ")
+    )
+}
+
+/// Whether a name exists at `file` (`lstat`, a symlink is not followed).
+fn exists(file: &Path) -> std::io::Result<bool> {
+    match fs::symlink_metadata(file) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 /// The info line of a read-only root whose layout still holds a moved
@@ -205,15 +332,22 @@ pub fn read_only_lines(
 ///
 /// The I/O error of an inspection other than "not found".
 pub fn in_layout(root: &Path, path: &str) -> std::io::Result<bool> {
-    let manifest = format!("{}.manifest", path.strip_suffix(".parquet").unwrap_or(path));
-    for name in [path, manifest.as_str()] {
-        match fs::symlink_metadata(root.join(name)) {
-            Ok(_) => return Ok(true),
-            Err(error) if error.kind() == ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
+    Ok(layout_holds(root, path)?.is_some())
+}
+
+/// What the layout of `root` holds of `path`: `Some(true)` its data file,
+/// `Some(false)` its manifest alone, `None` neither. At most 2 `lstat`, the
+/// data file first, as [`in_layout`].
+///
+/// # Errors
+///
+/// The I/O error of an inspection other than "not found".
+pub fn layout_holds(root: &Path, path: &str) -> std::io::Result<Option<bool>> {
+    if exists(&root.join(path))? {
+        return Ok(Some(true));
     }
-    Ok(false)
+    let manifest = format!("{}.manifest", path.strip_suffix(".parquet").unwrap_or(path));
+    Ok(exists(&root.join(manifest))?.then_some(false))
 }
 
 /// The text rule (module docs): the one distinct text of `texts`; with
@@ -529,12 +663,19 @@ pub fn replace_lines(
             continue;
         };
         let read_only = roots.read_only_holders(record);
+        let alone = roots.read_only_alone(record)?;
         if let Some(why) = incomplete(roots, record, state)? {
             problems.push(format!(
                 "the replace of {} under quarantine {} ({label}) is incomplete: {why}; `mie store \
                  resolve --file {}` completes it",
                 record.archive, quarantine.id, record.archive
             ));
+            problems.extend(alone);
+            lines.extend(read_only);
+            continue;
+        }
+        if !alone.is_empty() {
+            problems.extend(alone);
             lines.extend(read_only);
             continue;
         }

@@ -493,21 +493,26 @@ USAGE:
         last; a read-only root is never written) the held parts and every
         other part of the superseded entry into .quarantine/<id>/, where
         nothing ever deletes them, and clears the holds. A replace is
-        refused when only read-only roots hold a moved path. It first prints the cost: every moved path with its stream,
-        date and event range (every dataset version of a selection over it
+        refused when only read-only roots hold a moved path's data file.
+        It first prints the cost: every moved path with its stream, date
+        and event range (every dataset version of a selection over it
         changes) and every journaled warm run whose prefix covers one,
         whose prefix_dataset reads DIVERGED (warm prefix) for good. Until
         the next mie archive-import writes the file's new entry, every
         selection covering the moved paths fails; the import writes new
         part numbers and records the replacement. A replace that stopped
         is completed by running the same command again, --replace not
-        needed. Without --file it also names every incomplete replace and
-        every read-only root that still holds a moved path. It
-        takes the archive source's writer lock without waiting, so it
-        refuses while an import or a rebuild runs; a replace also takes the
-        pass lock and needs every cold root's marker. Every copy target
-        must carry its marker. Prints what it read, checked and wrote,
-        then PASS and exits 0, or one FAIL: <reason> line and exits 1.
+        needed; it is refused, with nothing written, when only read-only
+        roots would keep a moved path's data (set copy_target = true for
+        one of them, then run it again). Without --file it also names
+        every incomplete replace and every read-only root that still holds
+        a moved path, and fails on a moved path only read-only roots would
+        keep. It takes the archive source's writer lock without waiting,
+        so it refuses while an import or a rebuild runs; a replace also
+        takes the pass lock and needs every cold root's marker. Every copy
+        target must carry its marker. Prints what it read, checked and
+        wrote, then PASS and exits 0, or one FAIL: <reason> line and exits
+        1.
 
     mie --help
 ";

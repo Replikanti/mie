@@ -97,8 +97,9 @@
 //!   sibling left in the layout would be an orphan that stops the
 //!   re-import). Refused: a part or a recorded sibling no root holds, a
 //!   sibling that is not ordinary or unrecorded, two ledger texts for a
-//!   moved path, a moved path that read-only roots alone hold (no copy of
-//!   it would move into a quarantine, #216), a `PENDING` naming F. A
+//!   moved path, a moved path whose data file read-only roots alone hold
+//!   (no copy of its data would move into a quarantine, #216; a manifest
+//!   alone is no holder, review of #221), a `PENDING` naming F. A
 //!   listed path no root holds and the ledger does not record is named.
 //! - **RQ3 Quarantine id** `q-<at_ms>`, the run's one clock read; refused
 //!   when any supersede record on hot or a target names it, or any root
@@ -127,11 +128,16 @@
 //!   W2 for what the ledger lacks (a path pending under another id is
 //!   refused), W3 idempotent (a name in both places is `Integrity`, never
 //!   overwritten), W4, then the read-only info lines; `--replace` is not
-//!   needed. A read-only root holding a moved path is no refusal (#216).
+//!   needed. A read-only root holding a moved path is no refusal by itself
+//!   (#216); before W2 the resume refuses, nothing written, a moved path
+//!   whose data file no layout and no `.quarantine/<id>/` of hot or of a
+//!   copy target holds while a read-only root's layout does (the h = 0
+//!   rule, review of #221), naming `copy_target = true` and the resume.
 //! - **RQ8 Proposals**: without `--file`, one line per supersede record
 //!   on hot with a quarantine; an incomplete replace (by I1's rule, hot
 //!   and the copy targets) fails, naming `--file F`; a marked read-only
-//!   root still holding a moved path gets an info line
+//!   root still holding a moved path gets an info line, and a moved path
+//!   under the h = 0 rule fails with the remedy, never complete
 //!   ([`quarantine::replace_lines`]).
 
 use super::replicate::{self, IMPORT_LEDGER_DIR, META_DIR};

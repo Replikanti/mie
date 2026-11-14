@@ -569,11 +569,24 @@ fn run_quarantine(
     start: &CopyState,
     read_only: &BTreeSet<String>,
 ) -> QuarantineFindings {
+    run_quarantine_without(entries, roots, layout, start, read_only, &BTreeMap::new())
+}
+
+/// [`run_quarantine`] with the layout roots known to lack the data file.
+fn run_quarantine_without(
+    entries: &BTreeMap<String, Vec<EntryCopy>>,
+    roots: &[RootQuarantine],
+    layout: &BTreeMap<String, Vec<(String, Option<String>)>>,
+    start: &CopyState,
+    read_only: &BTreeSet<String>,
+    without_data: &BTreeMap<String, BTreeSet<String>>,
+) -> QuarantineFindings {
     quarantine(&QuarantineInputs {
         entries,
         roots,
         layout,
         read_only,
+        without_data,
         start,
     })
 }
@@ -923,26 +936,110 @@ fn q4_a_copy_target_beside_a_read_only_root_keeps_it_incomplete() {
     );
 }
 
-/// Q5 (#216): a path only a read-only layout holds, with no quarantine
-/// copy, is not gone: no problem, an info line. Without that layout its
-/// bytes are gone, as before.
+/// Q5 (#216, review of #221 finding 1): a complete path whose data file
+/// only a read-only layout holds, with no data copy in a quarantine of hot
+/// or of a copy target, is not gone but fails: one problem naming the root
+/// and the remedy, beside the info line. Its records do not change, so the
+/// rebuild agrees with I3. Without that layout its bytes are gone, as
+/// before.
 #[test]
-fn q5_a_read_only_copy_is_not_gone() {
+fn q5_a_path_only_a_read_only_layout_holds_fails_with_the_remedy() {
     let p = part("aggTrades", "2026-10-01", 0);
-    let entries = record_of(moving(&[&p], Vec::new()));
+    let t = text(&p, &sha("p"));
+    let mut entries = record_of(moving(&[&p], Vec::new()));
+    entries.insert(E1.to_owned(), copies(&[("hot", &entry(&[]))]));
     let layout = BTreeMap::from([(p.clone(), vec![("cold-r".to_owned(), None)])]);
-    let found = run_quarantine(&entries, &[], &layout, &start(Vec::new()), &read_only_r());
+    let with_text = || start(vec![Kind::Manifest { text: t.clone() }]);
+    let found = run_quarantine(&entries, &[], &layout, &with_text(), &read_only_r());
     assert!(found.paths[&p].complete);
-    assert!(found.problems.is_empty(), "{found:#?}");
+    assert_eq!(found.problems.len(), 1, "{found:#?}");
+    let archive = SupersedeRecord::parse(std::str::from_utf8(&entries[S1][0].bytes).unwrap())
+        .unwrap()
+        .archive;
+    assert_eq!(
+        found.problems[0],
+        read_only_alone_line(&p, &["cold-r".to_owned()], QID, &archive)
+    );
     assert_eq!(found.lines[0], read_only_line(&p, "cold-r", QID));
+    let records = found.records.clone();
+    assert!(
+        records.contains(&Kind::Replaced {
+            path: p.clone(),
+            entry: E1.to_owned()
+        }),
+        "{records:?}"
+    );
+
+    // A manifest alone in hot's or a copy target's quarantine is no data
+    // copy; a read-only root's quarantine counts for nothing either.
+    let manifest_only = |root: &str| {
+        let mut q = quarantined_on(root, &[(&p, Some(&t))]);
+        q.listing
+            .ids
+            .get_mut(QID)
+            .unwrap()
+            .get_mut(&p)
+            .unwrap()
+            .data = false;
+        q
+    };
+    for roots in [
+        vec![manifest_only("hot")],
+        vec![manifest_only("cold-a")],
+        vec![quarantined_on("cold-r", &[(&p, Some(&t))])],
+    ] {
+        let found = run_quarantine(&entries, &roots, &layout, &with_text(), &read_only_r());
+        assert_eq!(found.problems.len(), 1, "{roots:?}: {found:#?}");
+        assert!(found.problems[0].contains("held only by"), "{found:#?}");
+        assert_eq!(found.records, records);
+    }
+    // A data copy in a copy target's quarantine: no problem.
+    let roots = [quarantined_on("cold-a", &[(&p, Some(&t))])];
+    let found = run_quarantine(&entries, &roots, &layout, &with_text(), &read_only_r());
+    assert!(found.problems.is_empty(), "{found:#?}");
+
+    // Without the read-only layout the bytes are gone.
     let found = run_quarantine(
         &entries,
         &[],
         &BTreeMap::new(),
-        &start(Vec::new()),
+        &with_text(),
         &read_only_r(),
     );
     has_problem(&found, &[&p, "bytes are gone"]);
+}
+
+/// Q5 (review of #221, finding 2): a read-only layout known to hold the
+/// manifest alone (its data checked and missing) is no data holder: h = 0
+/// and r = 0, so the path keeps the behaviour before the review, an info
+/// line and no problem. A root of another path's set does not count.
+#[test]
+fn q5_a_read_only_manifest_alone_is_no_data_holder() {
+    let p = part("aggTrades", "2026-10-01", 0);
+    let entries = record_of(moving(&[&p], Vec::new()));
+    let layout = BTreeMap::from([(p.clone(), vec![("cold-r".to_owned(), None)])]);
+    let without = BTreeMap::from([(p.clone(), read_only_r())]);
+    let found = run_quarantine_without(
+        &entries,
+        &[],
+        &layout,
+        &start(Vec::new()),
+        &read_only_r(),
+        &without,
+    );
+    assert!(found.paths[&p].complete);
+    assert!(found.problems.is_empty(), "{found:#?}");
+    assert_eq!(found.lines[0], read_only_line(&p, "cold-r", QID));
+    let other = BTreeMap::from([(part("aggTrades", "2026-10-01", 1), read_only_r())]);
+    let found = run_quarantine_without(
+        &entries,
+        &[],
+        &layout,
+        &start(Vec::new()),
+        &read_only_r(),
+        &other,
+    );
+    assert_eq!(found.problems.len(), 1, "{found:#?}");
 }
 
 /// Q4, the text rule (#216): a read-only layout still feeds it, so the

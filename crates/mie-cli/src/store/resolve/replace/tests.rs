@@ -19,10 +19,12 @@ use std::sync::Arc;
 
 const ID: &str = "q-1791259200000";
 
+/// A copy target or hot whose layout holds the data file.
 fn holder(root: &str) -> Holder {
     Holder {
         root: root.to_owned(),
         read_only: false,
+        data: true,
         text: None,
     }
 }
@@ -129,10 +131,12 @@ fn replace_plan_table() {
 }
 
 /// RQ2 as amended (#216): with h the holders of a moved path that are hot
-/// or a copy target and r its read-only holders, (h, r) = (0, 1) and
-/// (0, 2) refuse the whole replace, naming the path and every read-only
-/// root in holder order; (1, 1), (2, 1) and (1, 0) plan; (0, 0) is a part
-/// no root holds, as before.
+/// or a copy target and r its read-only holders, each counted only when
+/// its layout holds the data file (review of #221, finding 2), (h, r) =
+/// (0, 1) and (0, 2) refuse the whole replace, naming the path and every
+/// read-only data holder in holder order; (1, 1), (2, 1) and (1, 0) plan;
+/// (0, 0) is a part no root holds, as before, or, with manifests alone,
+/// the rule before the review.
 #[test]
 fn rq2_refuses_only_a_path_read_only_roots_alone_hold() {
     let (a, b) = (
@@ -209,10 +213,54 @@ fn rq2_refuses_only_a_path_read_only_roots_alone_hold() {
     );
     // (0, 0): a part no root holds.
     refused(
-        &inputs(files, &[&a]),
+        &inputs(files.clone(), &[&a]),
         &with(Vec::new(), vec![holder("hot")]),
         &[&a, "no root holds it"],
     );
+
+    // Review of #221, finding 2: only a data file counts. A copy target
+    // or hot holding the manifest alone is no writable holder: (0, 1).
+    let manifest = |holder: Holder| Holder {
+        data: false,
+        ..holder
+    };
+    for writable in ["hot", "cold-a"] {
+        refused(
+            &inputs(files.clone(), &[&a]),
+            &with(
+                vec![holder("hot")],
+                vec![manifest(holder(writable)), read_only("cold-r")],
+            ),
+            &[&b, "read-only root(s) cold-r;", "data file"],
+        );
+    }
+    // A read-only root holding the manifest alone is no r: the data on a
+    // copy target plans, and among two read-only roots only the data
+    // holder is named.
+    planned(&with(
+        vec![holder("hot")],
+        vec![holder("cold-a"), manifest(read_only("cold-r"))],
+    ));
+    refused(
+        &inputs(files.clone(), &[&a]),
+        &with(
+            vec![holder("hot")],
+            vec![manifest(read_only("cold-r")), read_only("cold-s")],
+        ),
+        &[&b, "read-only root(s) cold-s;"],
+    );
+    // No holder has the data file (h = 0, r = 0): the rule before the
+    // review stands. Manifests on read-only roots alone are refused, a
+    // manifest on hot or a copy target plans.
+    refused(
+        &inputs(files.clone(), &[&a]),
+        &with(vec![holder("hot")], vec![manifest(read_only("cold-r"))]),
+        &[&b, "read-only root(s) cold-r;"],
+    );
+    planned(&with(
+        vec![holder("hot")],
+        vec![manifest(holder("cold-a")), manifest(read_only("cold-r"))],
+    ));
 }
 
 /// A part of `rows` events in `[min, max]` ms.

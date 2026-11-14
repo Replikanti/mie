@@ -1671,3 +1671,180 @@ fn aw12_a_replace_beside_a_read_only_holder_agrees_in_every_rebuild() {
         }
     }
 }
+
+/// The fixture's probe with cold-c and cold-d on their own devices, for
+/// either as a copy target.
+fn probe_with_c_d(fixture: &Fixture) -> MapProbe {
+    let mut probe = probe_with_c(fixture);
+    probe.0.push((cold(fixture, "cold-d"), 5));
+    probe
+}
+
+/// `fixture` with the cold roots `layout` as (name, copy target), each
+/// created and marked when it does not exist yet; its configurations are
+/// tagged `tag`.
+fn reconfigured(fixture: &Fixture, layout: &[(&str, bool)], tag: &str) -> Fixture {
+    let mut cold_roots = Vec::new();
+    for (name, copy_target) in layout {
+        let path = cold(fixture, name);
+        if !path.exists() {
+            fs::create_dir_all(&path).unwrap();
+            root_marker::create_meta(&path, name, false).unwrap();
+        }
+        cold_roots.push(mie_cli::config::ColdRoot {
+            path,
+            copy_target: *copy_target,
+        });
+    }
+    fixture_with(fixture, &cold_roots, tag)
+}
+
+/// How many copies of the data files of `parts` the `.quarantine/<id>/`
+/// directories of hot and of cold-a to cold-d hold.
+fn quarantined_data(fixture: &Fixture, parts: &[String]) -> usize {
+    let mut roots = vec![fixture.hot()];
+    roots.extend(["cold-a", "cold-b", "cold-c", "cold-d"].map(|name| cold(fixture, name)));
+    roots
+        .iter()
+        .map(|root| {
+            let q = replica::quarantine_dir(root, &id());
+            parts.iter().filter(|part| q.join(part).exists()).count()
+        })
+        .sum()
+}
+
+/// Review of #221, finding 1: a replace stops before its first rename (W1
+/// and W2 written, the parts on cold roots only), a rebuild from an empty
+/// start leaves no hold, then cold-a and cold-b, the only holders, are
+/// reconfigured read-only beside two empty copy targets. The resume
+/// refuses with nothing written, naming the first path, both roots and the
+/// remedy, and the proposals fail with the same remedy, also after the
+/// import wrote `replaced` (I1 does not apply the rule). cold-a set back
+/// to `copy_target = true` and a resume move its copies into its
+/// quarantine; the proposals then pass.
+#[test]
+fn a_resume_refuses_when_only_read_only_roots_would_keep_a_moved_path() {
+    let (_dir, fixture) = adopted("replace-ro-none-quarantined");
+    if !permissions_bind(&fixture.dir) {
+        return;
+    }
+    let (_, parts) = conflict(&fixture);
+    // The D6 hot removal of both partitions, simulated.
+    let aside = fixture.dir.join("hot-aside");
+    for part in &parts {
+        let from = fixture.hot().join(partition_of(part));
+        let to = aside.join(partition_of(part));
+        fs::create_dir_all(to.parent().unwrap()).unwrap();
+        fs::rename(&from, &to).unwrap();
+    }
+    replicate(&fixture, RESOLVED - 10);
+    rebuild_from(&fixture, "full", Flags::default(), RESOLVED - 5);
+    assert_eq!(held(&fixture), parts.iter().cloned().collect());
+
+    // The replace stops on cold-a, the first root, before any rename.
+    let a = cold(&fixture, "cold-a");
+    let partitions: BTreeSet<PathBuf> = parts.iter().map(|p| a.join(partition_of(p))).collect();
+    for partition in &partitions {
+        chmod(partition, 0o555);
+    }
+    let (pass, out) = replace(&fixture, RESOLVED);
+    for partition in &partitions {
+        chmod(partition, 0o755);
+    }
+    assert!(!pass, "{out}");
+    assert_eq!(quarantined_data(&fixture, &parts), 0);
+    // An empty start: no hold, so only I1 can halt the importer.
+    replicate(&fixture, RESOLVED + 1);
+    let (_, out) = rebuild_from(&fixture, "empty", Flags::default(), RESOLVED + 2);
+    assert!(held(&fixture).is_empty(), "{out}");
+
+    // cold-a and cold-b read-only, cold-c and cold-d empty copy targets.
+    let probe = probe_with_c_d(&fixture);
+    let layout = [
+        ("cold-a", false),
+        ("cold-b", false),
+        ("cold-c", true),
+        ("cold-d", true),
+    ];
+    let re = reconfigured(&fixture, &layout, "ro");
+    let archive = Some(re.dst_archive.as_path());
+    let file = metrics_file();
+    let remedy = ["cold-a, cold-b", "copy_target = true", file.as_str()];
+    let before = files(&fixture.dir);
+    let (pass, out) = resolve_with(&re, Some(&file), &probe, archive, RESOLVED + HOUR);
+    assert!(!pass, "{out}");
+    assert_fail_line(
+        &out,
+        &[
+            &[parts[0].as_str(), "only", "nothing is written"],
+            &remedy[..],
+        ]
+        .concat(),
+    );
+    assert_eq!(files(&fixture.dir), before);
+    let (pass, out) = resolve_with(&re, None, &probe, archive, RESOLVED + HOUR + 1);
+    assert!(!pass && !out.contains(": complete"), "{out}");
+    for part in &parts {
+        assert_fail_line(&out, &[&[part.as_str(), "only"], &remedy[..]].concat());
+    }
+
+    // I1 lets the import run, and it writes `replaced`; the proposals
+    // still fail.
+    run_import(&re, &metrics_day(day(), false)).unwrap();
+    assert_eq!(replaced_paths(&fixture), parts.iter().cloned().collect());
+    assert_eq!(quarantined_data(&fixture, &parts), 0);
+    let (pass, out) = resolve_with(&re, None, &probe, archive, RESOLVED + 2 * HOUR);
+    assert!(!pass && !out.contains(": complete"), "{out}");
+    assert_fail_line(&out, &[&[parts[0].as_str(), "only"], &remedy[..]].concat());
+
+    // The remedy: cold-a a copy target again, then a resume.
+    let layout = [
+        ("cold-a", true),
+        ("cold-b", false),
+        ("cold-c", true),
+        ("cold-d", true),
+    ];
+    let back = reconfigured(&fixture, &layout, "a-target");
+    let archive = Some(back.dst_archive.as_path());
+    let (pass, out) = resolve_with(&back, Some(&file), &probe, archive, RESOLVED + 3 * HOUR);
+    assert!(pass && out.contains("resume:"), "{out}");
+    let qa = replica::quarantine_dir(&a, &id());
+    for part in &parts {
+        assert!(!a.join(part).exists() && qa.join(part).exists(), "{out}");
+    }
+    let (pass, out) = resolve_with(&back, None, &probe, archive, RESOLVED + 3 * HOUR + 1);
+    assert!(pass && !out.contains("FAIL"), "{out}");
+    run_import(&back, &metrics_day(day(), true)).unwrap();
+}
+
+/// Review of #221, finding 2: a copy target whose layout holds only the
+/// manifest of a moved path is no writable holder. With the data on a
+/// read-only root only, the replace is refused with nothing written.
+#[test]
+fn a_manifest_alone_on_a_copy_target_does_not_count_as_a_holder() {
+    let (_dir, fixture) = adopted("replace-ro-manifest-only");
+    let (_, parts) = conflict(&fixture);
+    let with_c = with_cold_c(&fixture, false, "c");
+    let c = cold(&fixture, "cold-c");
+    copy_part(&fixture.hot(), &c, &parts[0]);
+    for (name, root) in roots(&fixture) {
+        fs::remove_file(root.join(&parts[0])).unwrap();
+        if name != "cold-a" {
+            fs::remove_file(root.join(manifest_of(&parts[0]))).unwrap();
+        }
+    }
+    let before = files(&fixture.dir);
+    let (pass, out) = replace(&with_c, RESOLVED);
+    assert!(!pass, "{out}");
+    assert_fail_line(
+        &out,
+        &[
+            &parts[0],
+            "only",
+            "read-only root(s) cold-c;",
+            "copy_target = true",
+        ],
+    );
+    assert_eq!(files(&fixture.dir), before);
+    assert!(!ledger_file(&fixture, &format!("{}.1.supersede.import", metrics_name())).exists());
+}

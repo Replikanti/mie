@@ -269,3 +269,93 @@ fn read_only_holders_report_an_inspection_error_as_a_line() {
     let error = roots.unfinished(&record(&[&p]), true).unwrap_err();
     assert!(error.contains(&format!("inspect {p} on cold-r")), "{error}");
 }
+
+/// The h = 0 rule of the resume and RQ8 (review of #221, finding 1): a
+/// moved path whose data file no layout and no `.quarantine/<id>/` of hot
+/// or of a copy target holds, while read-only layouts do, gets one problem
+/// naming them in configuration order and the remedy. A writable data
+/// copy in a layout or in the quarantine, or no read-only data file (a
+/// manifest alone, finding 2), gives none.
+#[test]
+fn read_only_alone_needs_a_writable_data_copy() {
+    let (p0, p1) = (
+        part("aggTrades", "2026-10-01", 0),
+        part("aggTrades", "2026-10-01", 1),
+    );
+    let dir = Dir::new("quarantine-ro-alone");
+    let hot = root(&dir, "hot", false);
+    let a = root(&dir, "cold-a", true);
+    let r = root(&dir, "cold-r", true);
+    let s = root(&dir, "cold-s", true);
+    let roots = ReplaceRoots::read(&hot, &[cold(&r, false), cold(&a, true), cold(&s, false)]);
+    let moved = record(&[&p0, &p1]);
+    let mut plain = moved.clone();
+    plain.quarantine = None;
+
+    // Nothing anywhere (h = 0, r = 0): no problem.
+    assert_eq!(roots.read_only_alone(&moved), Ok(Vec::new()));
+    // Manifests alone on the read-only roots: r = 0.
+    put(&r, &p0, Form::Manifest);
+    put(&s, &p0, Form::Manifest);
+    assert_eq!(roots.read_only_alone(&moved), Ok(Vec::new()));
+    // Data on both read-only roots, the last path too.
+    put(&r, &p0, Form::Data);
+    put(&s, &p0, Form::Data);
+    put(&s, &p1, Form::Both);
+    let archive = moved.archive.clone();
+    let both = vec!["cold-r".to_owned(), "cold-s".to_owned()];
+    assert_eq!(
+        roots.read_only_alone(&moved),
+        Ok(vec![
+            read_only_alone_line(&p0, &both, ID, &archive),
+            read_only_alone_line(&p1, &["cold-s".to_owned()], ID, &archive),
+        ])
+    );
+    assert_eq!(roots.read_only_alone(&plain), Ok(Vec::new()));
+    let line = read_only_alone_line(&p0, &both, ID, &archive);
+    assert!(
+        line.contains("held only by the read-only root(s) cold-r, cold-s;")
+            && line.contains("`copy_target = true`")
+            && line.contains(&format!("mie store resolve --file {archive}")),
+        "{line}"
+    );
+    // A manifest alone on a copy target and in hot's quarantine is no h.
+    put(&a, &p0, Form::Manifest);
+    put(&replica::quarantine_dir(&hot, ID), &p0, Form::Manifest);
+    assert_eq!(roots.read_only_alone(&moved).unwrap().len(), 2);
+    // A data file in hot's quarantine, or in a copy target's layout, is.
+    for (base, path) in [(replica::quarantine_dir(&hot, ID), &p0), (a.clone(), &p1)] {
+        put(&base, path, Form::Data);
+    }
+    assert_eq!(roots.read_only_alone(&moved), Ok(Vec::new()));
+    // A copy target's quarantine counts as well, a read-only root's not.
+    fs::remove_file(replica::quarantine_dir(&hot, ID).join(&p0)).unwrap();
+    put(&replica::quarantine_dir(&r, ID), &p0, Form::Data);
+    assert_eq!(roots.read_only_alone(&moved).unwrap().len(), 1);
+    put(&replica::quarantine_dir(&a, ID), &p0, Form::Data);
+    assert_eq!(roots.read_only_alone(&moved), Ok(Vec::new()));
+}
+
+/// The h = 0 rule fails closed: a read-only root that cannot be inspected
+/// counts as holding the data, named with its error; the same error on a
+/// copy target is an error, as in `unfinished`.
+#[test]
+fn read_only_alone_counts_an_uninspectable_read_only_root() {
+    let p = part("aggTrades", "2026-10-01", 0);
+    let dir = Dir::new("quarantine-ro-alone-error");
+    let hot = root(&dir, "hot", false);
+    let r = root(&dir, "cold-r", true);
+    fs::write(r.join("source=binance-archive"), b"no directory").unwrap();
+    let problems = ReplaceRoots::read(&hot, &[cold(&r, false)])
+        .read_only_alone(&record(&[&p]))
+        .unwrap();
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert!(
+        problems[0].contains("read-only root(s) cold-r (cannot be inspected: "),
+        "{problems:?}"
+    );
+    let error = ReplaceRoots::read(&hot, &[cold(&r, true)])
+        .read_only_alone(&record(&[&p]))
+        .unwrap_err();
+    assert!(error.contains(&format!("inspect {p} on cold-r")), "{error}");
+}

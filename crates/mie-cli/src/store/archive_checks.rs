@@ -64,10 +64,16 @@
 //!   still installed: an incomplete path (the replace stopped between
 //!   renames on hot or a copy target, which are named; an open start hold
 //!   stays open), a path no root's layout or quarantine holds (its bytes
-//!   are gone), a quarantined path no record names. A read-only root whose
-//!   layout holds a Q path gets an info line instead.
+//!   are gone), a quarantined path no record names, and a complete path
+//!   whose data file no quarantine of hot or of a copy target holds while
+//!   a read-only root's layout does (h = 0, r ≥ 1, review of #221: the
+//!   superseded bytes would stay only on roots mie never writes; the
+//!   problem names `copy_target = true` and the resume). A read-only root
+//!   whose layout holds a Q path gets an info line besides. Q4's records do
+//!   not change with that problem: `complete` stays the commit point of
+//!   I1 and I3, so a rebuild derives what the importer wrote (AW12).
 
-use super::quarantine::{read_only_line, superseded_shas, text_rule};
+use super::quarantine::{read_only_alone_line, read_only_line, superseded_shas, text_rule};
 use super::replicate::is_archive_part;
 use mie_adapter_binance::archive::catalog::parse_day;
 use mie_adapter_binance::archive::import::orphan_days;
@@ -435,6 +441,11 @@ pub struct QuarantineInputs<'a> {
     /// feed the text rule but never the commit point (#216). Matched
     /// exactly; `hot` always counts.
     pub read_only: &'a BTreeSet<String>,
+    /// Per data path, the roots of `layout` known to hold its manifest
+    /// without its data file (the data checked and missing). Every other
+    /// root of `layout` counts as holding the data, so an unchecked copy
+    /// fails closed in Q5's h = 0 rule (review of #221).
+    pub without_data: &'a BTreeMap<String, BTreeSet<String>>,
     /// The starting ledger, folded.
     pub start: &'a CopyState,
 }
@@ -650,6 +661,37 @@ pub fn quarantine(inputs: &QuarantineInputs<'_>) -> QuarantineFindings {
         }
         for root in &read_only {
             found.lines.push(read_only_line(path, root, id));
+        }
+        // The h = 0 rule (review of #221, finding 1): a complete path whose
+        // data file no quarantine of hot or of a copy target holds, while a
+        // read-only layout does. An incomplete one already has its problem,
+        // and the resume it names applies the rule.
+        let without_data = inputs.without_data.get(path);
+        let read_only_data: Vec<String> = read_only
+            .iter()
+            .filter(|root| without_data.is_none_or(|roots| !roots.contains(**root)))
+            .map(|root| (*root).to_owned())
+            .collect();
+        let writable_data = inputs.roots.iter().any(|root| {
+            (root.root == "hot" || !inputs.read_only.contains(&root.root))
+                && root
+                    .listing
+                    .ids
+                    .get(id)
+                    .and_then(|parts| parts.get(path))
+                    .is_some_and(|copy| copy.data)
+        });
+        if let Some(moving) = moving
+            && complete
+            && !writable_data
+            && !read_only_data.is_empty()
+        {
+            found.problems.push(read_only_alone_line(
+                path,
+                &read_only_data,
+                id,
+                &moving.record.archive,
+            ));
         }
         if complete && quarantined.is_empty() && read_only.is_empty() {
             found.problems.push(format!(

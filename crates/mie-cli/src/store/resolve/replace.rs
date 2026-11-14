@@ -7,7 +7,9 @@
 
 use super::{FileOf, PlanInputs, ResolveReport, Stop, Survey, Variant, survey};
 use crate::journal::WarmHandoff;
-use crate::store::quarantine::{in_layout, superseded_shas, text_rule};
+use crate::store::quarantine::{
+    layout_holds, read_only_alone, read_only_alone_line, superseded_shas, text_rule,
+};
 use crate::store::truncation_line;
 use mie_adapter_binance::archive::catalog::ArchiveStream;
 use mie_adapter_binance::archive::ledger::{
@@ -45,9 +47,13 @@ pub struct Holder {
     /// `hot`, or a cold root's id.
     pub root: String,
     /// A read-only cold root (no copy target): D4 never writes it, so W3
-    /// skips it; RQ2 refuses a moved path only such roots hold, and after
-    /// W4 each one still holding a moved path gets an info line (#216).
+    /// skips it; RQ2 refuses a moved path whose data file only such roots
+    /// hold, and after W4 each one still holding a moved path gets an info
+    /// line (#216).
     pub read_only: bool,
+    /// Its layout holds the data file, not the manifest alone: only a
+    /// data holder counts for RQ2's h and r (review of #221, finding 2).
+    pub data: bool,
     /// Its manifest text, when it parses and describes the path.
     pub text: Option<String>,
 }
@@ -194,16 +200,15 @@ pub fn plan_replace(
                  nothing is written (ADR-062 D5, D11)"
             ));
         }
-        // Read-only roots alone: no copy of the path would move into a
-        // quarantine (#216). Every path of M has a holder (above).
-        let held: &[Holder] = holders.get(path).map_or(&[], Vec::as_slice);
-        if !held.is_empty() && held.iter().all(|holder| holder.read_only) {
-            let roots: Vec<&str> = held.iter().map(|holder| holder.root.as_str()).collect();
+        // Read-only roots alone: no copy of the path's data would move
+        // into a quarantine (#216). Every path of M has a holder (above).
+        let roots = sole_read_only(holders.get(path).map_or(&[], Vec::as_slice));
+        if !roots.is_empty() {
             return Err(format!(
                 "{path} is held only by the read-only root(s) {}; neither hot nor a copy target \
-                 holds it, so the replace would move no copy of it into quarantine and its \
-                 superseded bytes would stay only on roots mie never writes (ADR-062 D4); \
-                 nothing is written. Set `copy_target = true` for one of them in \
+                 holds its data file, so the replace would move no copy of its data into \
+                 quarantine and its superseded bytes would stay only on roots mie never writes \
+                 (ADR-062 D4); nothing is written. Set `copy_target = true` for one of them in \
                  `paths.cold_roots`, or, when the copy ledger records a copy of it on a copy \
                  target, run `mie store verify`, then `mie store repair`, which copies it there \
                  from the read-only root; then run the replace again",
@@ -231,6 +236,27 @@ pub fn plan_replace(
         listed,
         lines,
     })
+}
+
+/// RQ2's sole-holder rule over one path's `held`: with h the holders on
+/// hot or a copy target whose layout holds the data file and r the
+/// read-only ones that do, the r roots when h = 0 and r ≥ 1, in holder
+/// order (review of #221, finding 2: a manifest alone is no holder). When
+/// no holder has the data file (h = 0, r = 0), the rule before that
+/// review stands: every holder when all of them are read-only. Otherwise
+/// none.
+fn sole_read_only(held: &[Holder]) -> Vec<&str> {
+    let any_data = held.iter().any(|holder| holder.data);
+    if held
+        .iter()
+        .any(|holder| !holder.read_only && (holder.data || !any_data))
+    {
+        return Vec::new();
+    }
+    held.iter()
+        .filter(|holder| holder.data || !any_data)
+        .map(|holder| holder.root.as_str())
+        .collect()
 }
 
 /// One moved path with every distinct manifest the roots or the copy
@@ -472,12 +498,13 @@ impl Context<'_> {
                 .iter()
                 .map(|root| (root.id.as_str(), root.path.as_path(), !root.copy_target)),
         ) {
-            let held = in_layout(root, path)
+            let held = layout_holds(root, path)
                 .map_err(|e| Stop(format!("inspect {path} on {id}: {e}; nothing is written")))?;
-            if held {
+            if let Some(data) = held {
                 holders.push(Holder {
                     root: id.to_owned(),
                     read_only,
+                    data,
                     text: replica::sealed_manifest(root, path)
                         .ok()
                         .flatten()
@@ -499,6 +526,33 @@ impl Context<'_> {
             .map(|root| (root.id.as_str(), root.path.as_path()))
             .collect();
         crate::store::quarantine::read_only_lines(&read_only, moved, id)
+    }
+
+    /// RQ7's h = 0 rule, before anything is written: the first moved path
+    /// whose data file no layout and no `.quarantine/<id>/` of hot or of a
+    /// copy target holds while a read-only root's layout does
+    /// ([`read_only_alone`]) refuses the resume (review of #221, finding 1).
+    fn check_read_only_alone(&self, moved: &[String], id: &str) -> Result<(), Stop> {
+        let mut writable: Vec<(&str, &Path)> = Vec::new();
+        let mut read_only: Vec<(&str, &Path)> = Vec::new();
+        for (root_id, root, is_read_only) in self.rename_order() {
+            if is_read_only {
+                read_only.push((root_id, root));
+            } else {
+                writable.push((root_id, root));
+            }
+        }
+        for path in moved {
+            let alone = read_only_alone(&writable, &read_only, path, id)
+                .map_err(|why| Stop(format!("{why}; nothing is written")))?;
+            if !alone.is_empty() {
+                return Err(Stop(format!(
+                    "{}; nothing is written",
+                    read_only_alone_line(path, &alone, id, self.archive)
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// The manifest texts of `path` in the quarantine `id` of every root.
@@ -854,10 +908,12 @@ pub(super) fn run_replace(
 }
 
 /// RQ7: the resume of the replace S_m records (`generation` m). A
-/// read-only root holding a moved path is no refusal (#216): after W3 a
-/// moved path such a root holds is held by read-only roots alone, the end
-/// state, so RQ2's sole-holder refusal never applies here; it gets an info
-/// line after W4.
+/// read-only root holding a moved path is no refusal by itself (#216): it
+/// gets an info line after W4. The resume refuses, with nothing written,
+/// only a moved path whose data file no layout and no `.quarantine/<id>/`
+/// of hot or of a copy target holds while a read-only root's layout does
+/// (h = 0, r ≥ 1), RQ2's rule with the quarantine counted, since W3 may
+/// already have moved the writable copies (review of #221, finding 1).
 ///
 /// # Errors
 ///
@@ -889,6 +945,7 @@ pub(super) fn run_resume(
             )));
         }
     }
+    ctx.check_read_only_alone(moved, id)?;
     let at_ms = (ctx.now_ms)();
     let pairs: Vec<(LedgerName, Vec<u8>)> = files
         .iter()

@@ -92,7 +92,10 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   example a disk configured after the replace, halts no import, and `mie
   store resolve` and `mie store rebuild` name it in an info line. A new
   replace no longer refuses when a read-only root holds the file, unless
-  only read-only roots hold a moved path (#216).
+  only read-only roots hold a moved path's data file; the resume refuses,
+  and `mie store resolve` and `mie store rebuild` fail, when only
+  read-only roots would keep a moved path's data outside quarantine
+  (#216).
 - **Storage tiers, step 8a: `mie store resolve` (#210, ADR-062 D11,
   proposed).** `mie store resolve --config <ingest config>
   [--archive-config <path>] [--file <archive path>]` resolves held
