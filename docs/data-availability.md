@@ -69,3 +69,46 @@ Live aggregates can omit trades without an id break (2026-10-08 12:50–15:43 UT
 | Candidate triggers (#24, ADR-053): `trigger.cvd_divergence.<15m\|1h\|4h\|1d>@1`, `trigger.effort_result.<5m\|15m\|1h>@1`, `trigger.exhaustion@1` (on the order-flow candidates of ADR-051, at a defined location) | trades; the candidate, location and bias features | yes, from aggTrades | yes | A candidate is a trigger only if the context the rule reads is ready and lists a level of an admitted kind (`poc`, `vah`, `val`, `hvn`, `lvn`, `structural_high`, `structural_low`, `sfp_zone`, `vwap`). A CVD divergence's gate reads the registry at its current swing without every level of either swing of its pair; the others read the candidate's own context. The gate reads the selected registry and never a cluster level, so it means the same in archive replays and live. Each value warms up with its candidate (the effort ids over 1 440 evaluations) |
 | Absorption triggers (#24, ADR-053): `trigger.absorption.<5m\|15m\|1h>@1` (absorption at a defined location) | order book, trades; the candidate, location and bias features | **no** | **from the start of live depth capture (#10) only** | Live only, as its candidate: it stays warming up in archive replays. The gate is that of the other candidate triggers on the candidate's own context: admitted kinds only, never a cluster level |
 | OI-expansion triggers (#24, ADR-053): `trigger.oi_expansion_rejection.<15m\|1h\|4h\|1d>@1` (on the SFP of that timeframe) and `trigger.oi_expansion_rejection.prior_day@1` (on the failed auction) | trades, open interest; the structure, auction, OI-grid, location and bias features | yes, from aggTrades and `metrics` | yes | A rejection is a trigger if the `derivatives.oi.5m@1` point at it lies on a later boundary than the point at the excursion's start, with the same resolution and strictly higher open interest. The point at an event is that of the boundary 25 s before it, so the archive (which closes a boundary at itself) and a continuous live feed (which closes it at its first poll after it) select the same boundaries; their values keep their own `resolution_ms`, and no comparison crosses an archive/live seam. An open-interest hole leaves the boundaries it covers without a point. Each value follows its rejection's fact input |
+
+## Where raw data lives (storage tiers, ADR-062)
+
+Raw data is immutable wherever it lives: a sealed file keeps its relative
+path, bytes and manifest on every root (ADR-062 D5).
+
+- **A single-root store** (`paths.cold_roots` absent or empty) holds
+  everything under `raw_root`, as before ADR-062.
+- **A tiered store.** Hot is `raw_root` on a local filesystem. It holds
+  every date from today − 7 (UTC) onward (D8), every file with fewer than
+  2 verified copies, the capture journal, the import ledger and the copy
+  ledger. Older partitions leave hot once each of their files has 2
+  verified copies (D6); a late archive import into such a day recalls its
+  partition to hot first.
+- **Copy targets** (`cold_roots` entries with `copy_target = true`, at
+  least 2) receive every sealed file under the same relative path, plus
+  copies of hot's `.mie/` files (journal, import ledger, copy ledger).
+  Files sealed since the last replication pass (every 300 s, longer while
+  a target is unreachable) are on hot only. Read-only roots
+  (`copy_target = false`) are read and never written.
+- **The copy ledger**, `<raw_root>/.mie/copy-ledger`, is an append-only,
+  hash-chained text file that records each sealed file's manifest, each
+  verified copy, each partition removed from or returned to hot, and the
+  verification's records (D7). `select` lists hot and the copy ledger,
+  never a cold root, and reads each file from hot, else from the cold
+  roots in configuration order. A lost copy ledger is restored by
+  `mie store rebuild`.
+- **Ad-hoc DuckDB.** A glob over hot misses the partitions that left it,
+  so glob a copy target `<target>`, which holds every replicated file:
+
+  ```sql
+  read_parquet('<target>/source=binance-um/instrument=BTCUSDT/stream=aggTrade/date=*/part-*.parquet')
+  ```
+
+  This is for research only: it has no manifest check, no copy ledger and
+  no dataset version; it misses the files sealed since the last
+  replication pass; and it reads held archive parts like ordinary files,
+  where `select` fails with `Integrity`. `.mie/` and `.quarantine/` lie
+  outside the layout, so a `source=…` glob never reads a quarantined part
+  or a damaged copy moved aside.
+- **What a cold root must provide**, as the POSIX behaviour mie relies
+  on, naming no filesystem or product:
+  [ADR-062 D4](adr/062-raw-data-retention-and-storage-tiers.md#d4-two-tiers-hot-and-cold).

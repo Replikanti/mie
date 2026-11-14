@@ -12,6 +12,18 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
 
 ### Added
 
+- **ADR-062 accepted: the tiered model documented (#196, #184 T10).** The
+  copy-ledger growth is now estimated from measured records (the #190
+  adoption ledger and the #191 tiered capture): about 1.65 MB per day of
+  capture plus 0.012 MB per imported day, 0.61 GB after a year, replacing
+  the earlier estimate in D1, D6, D7, D10 and D11 and in the Numbers table
+  (J: 2.65 and 6.12 GB per year on hot; the copy-device sizes are
+  unchanged). D4 lists what a cold root must provide as the POSIX behaviour
+  mie relies on, each entry tied to the code that relies on it. D11 *What
+  mie can check* is corrected: `st_dev` identifies a filesystem, not a disk,
+  so two filesystems on one disk pass the device check. CLAUDE.md invariant
+  4 and `docs/data-availability.md` describe the tiered model, and ADR-062
+  gains its `## Acceptance` section, status `accepted`. Docs only.
 - **Storage tiers, step 9: the hot restore (#195, ADR-062 D7, D11,
   proposed).** `mie store restore --config <ingest config>
   [--archive-config <path>] [--record-lost] [--skip-unreadable-journal]`
