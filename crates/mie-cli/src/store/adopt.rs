@@ -84,6 +84,7 @@ use mie_adapter_binance::archive::ARCHIVE_SOURCE;
 use mie_adapter_binance::archive::ledger::LedgerKind;
 use mie_adapter_binance::archive::ledger::PENDING_FILE;
 use mie_adapter_parquet::copy_ledger::{self, AppendError, CopyLedger, Kind, Record, Truncation};
+use mie_adapter_parquet::flock::HeldLock;
 use mie_adapter_parquet::replica::{self, CopyError, CopyOutcome, Side, TailSource};
 use mie_adapter_parquet::root_marker::{self, HOT_ID};
 use mie_adapter_parquet::{RawWriter, RotationPolicy, TierContext};
@@ -478,8 +479,8 @@ impl Run<'_> {
                     return Err(self.fail(format!("--from: open {}: {error}", path.display())));
                 }
             };
-            match file.try_lock() {
-                Ok(()) => drop(file),
+            match HeldLock::try_take(file) {
+                Ok(lock) => drop(lock),
                 Err(TryLockError::WouldBlock) => {
                     return Err(self.fail(format!(
                         "a writer holds source {source} of --from ({}): only a closed store is \

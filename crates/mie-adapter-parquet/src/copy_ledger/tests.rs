@@ -765,6 +765,24 @@ fn a_whole_run_hold_excludes_other_holders_in_the_same_process() {
     assert_eq!(read(dir.path()).unwrap().unwrap().records.len(), 2);
 }
 
+/// #220: a whole-run hold dropped while another descriptor of its open
+/// file description is open (a child process started by another thread,
+/// between its fork and its exec) is free at once; while the hold lives,
+/// the lock stays held after that descriptor closes.
+#[test]
+fn a_ledger_hold_is_free_after_its_drop_beside_a_duplicate() {
+    let dir = store("ledger-hold-duplicate");
+    let ledger = CopyLedger::at(dir.path());
+    let hold = ledger.try_hold().unwrap();
+    drop(hold.duplicate_lock());
+    assert!(matches!(ledger.try_hold(), Err(RawStoreError::Locked(_))));
+    let child = hold.duplicate_lock();
+    drop(hold);
+    let again = ledger.try_hold();
+    assert!(again.is_ok(), "{again:?}");
+    drop(child);
+}
+
 #[test]
 fn a_failure_after_a_truncation_carries_the_truncation() {
     // Review of #197, finding 5: the truncation must reach the caller as

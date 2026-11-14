@@ -65,6 +65,7 @@
 //! ([`LedgerBuilder`]) and installs it under its whole-run hold
 //! ([`LedgerHold::replace`]): the only writer that replaces the file.
 
+use crate::flock::HeldLock;
 use crate::io_error;
 use crate::layout::{self, COPY_LEDGER, COPY_LEDGER_LOCK, META_DIR, PartFile};
 use crate::manifest::{self, hex, sha256_hex};
@@ -1303,8 +1304,7 @@ impl CopyLedger {
             Err(error) => return Err(io_error("inspect", &self.ledger)(error).into()),
             Ok(_) => {}
         }
-        let lock = open_lock(&self.lock)?;
-        lock.lock().map_err(io_error("lock", &self.lock))?;
+        let lock = HeldLock::take(open_lock(&self.lock)?).map_err(io_error("lock", &self.lock))?;
         // The ledger is opened only under the lock: a holder (the rebuild)
         // may have replaced it by rename while this append waited, and a
         // descriptor opened before would write into the replaced file.
@@ -1323,9 +1323,8 @@ impl CopyLedger {
     /// [`RawStoreError::Locked`] when another holder has it;
     /// [`RawStoreError::Io`] when the lock file cannot be opened.
     pub fn try_hold(&self) -> Result<LedgerHold, RawStoreError> {
-        let lock = open_lock(&self.lock)?;
-        match lock.try_lock() {
-            Ok(()) => Ok(LedgerHold {
+        match HeldLock::try_take(open_lock(&self.lock)?) {
+            Ok(lock) => Ok(LedgerHold {
                 ledger: self.ledger.clone(),
                 _lock: lock,
             }),
@@ -1365,8 +1364,7 @@ impl CopyLedger {
             Err(error) => return Err(io_error("inspect", &self.ledger)(error).into()),
             Ok(_) => {}
         }
-        let lock = open_lock(&self.lock)?;
-        lock.lock().map_err(io_error("lock", &self.lock))?;
+        let lock = HeldLock::take(open_lock(&self.lock)?).map_err(io_error("lock", &self.lock))?;
         let hold = LedgerHold {
             ledger: self.ledger.clone(),
             _lock: lock,
@@ -1388,14 +1386,22 @@ pub enum Guarded {
 }
 
 /// The copy-ledger lock held for a whole run; dropping it releases the
-/// lock.
+/// lock explicitly ([`HeldLock`]).
 #[derive(Debug)]
 pub struct LedgerHold {
     ledger: PathBuf,
-    _lock: File,
+    _lock: HeldLock,
 }
 
 impl LedgerHold {
+    /// A second descriptor of the held lock's open file description, as a
+    /// child process started by another thread holds it between its fork
+    /// and its exec (#220).
+    #[cfg(test)]
+    pub(crate) fn duplicate_lock(&self) -> File {
+        self._lock.duplicate()
+    }
+
     /// Appends `record` under the held lock, as [`CopyLedger::append`] does.
     ///
     /// # Errors

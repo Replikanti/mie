@@ -14,7 +14,7 @@ use crate::testutil::{FIXTURE_D0 as D0, TieredFixture, record, stream};
 use crate::writer::RotationPolicy;
 use mie_domain::time::EventTime;
 use mie_ports::outbound::ReplayWindow;
-use mie_ports::raw::{RawRecordSink, RawRecordSource, RawSelection, RawStreamKey};
+use mie_ports::raw::{RawRecordSink, RawRecordSource, RawSelection, RawStoreError, RawStreamKey};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
@@ -777,4 +777,35 @@ fn a_second_rebuild_of_the_same_length_drops_the_plan() {
     let report = remove(&fx, &covered);
     assert!(report.removed.is_empty(), "{report:?}");
     assert!(layout::resolve(&fx.hot, &partition()).exists());
+}
+
+/// #220: a source lock dropped while another descriptor of its open file
+/// description is open (a child process started by another thread, between
+/// its fork and its exec) is free at once, for the writer's take and the
+/// remover's try alike; while the guard lives, the lock stays held after
+/// that descriptor closes.
+#[test]
+fn a_source_lock_is_free_after_its_drop_beside_a_duplicate() {
+    let dir = crate::testutil::TempDir::new("removal-lock-duplicate");
+    let root = dir.path();
+    let take = || super::take_source_lock(root, SOURCE).map(Some);
+    let try_take = || super::try_source_lock(root, SOURCE);
+    for lock in [&take as &dyn Fn() -> _, &try_take] {
+        // The lock file exists from here on, so the try never answers
+        // `None`.
+        drop(take().unwrap());
+        let held = lock().unwrap().unwrap();
+        drop(held.duplicate_lock());
+        assert!(matches!(take(), Err(RawStoreError::Locked(_))));
+        assert!(matches!(try_take(), Err(RawStoreError::Locked(_))));
+        let child = held.duplicate_lock();
+        drop(held);
+        let again = take();
+        assert!(again.is_ok(), "{again:?}");
+        drop(again);
+        let again = try_take();
+        assert!(matches!(again, Ok(Some(_))), "{again:?}");
+        drop(again);
+        drop(child);
+    }
 }

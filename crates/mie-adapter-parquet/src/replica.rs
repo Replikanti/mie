@@ -51,6 +51,7 @@
 //! The bytes are streamed verbatim through a bounded buffer: a copy never
 //! recompresses, merges parts or re-encodes (D5).
 
+use crate::flock::HeldLock;
 use crate::layout::{self, DAMAGED_DIR, META_DIR, PartFile, REPLICATE_LOCK, VERIFY_LOCK};
 use crate::manifest::{self, hex};
 use crate::recovery::{mark_read_only, rename_no_replace};
@@ -1311,10 +1312,21 @@ fn append_range(
     Ok(())
 }
 
-/// The replication pass lock on hot; dropping it releases the lock.
+/// The replication pass lock on hot; dropping it releases the lock
+/// explicitly ([`HeldLock`]).
 #[derive(Debug)]
 pub struct ReplicationLock {
-    _file: File,
+    _lock: HeldLock,
+}
+
+impl ReplicationLock {
+    /// A second descriptor of the held lock's open file description, as a
+    /// child process started by another thread holds it between its fork
+    /// and its exec (#220).
+    #[cfg(test)]
+    pub(crate) fn duplicate_lock(&self) -> File {
+        self._lock.duplicate()
+    }
 }
 
 /// The pass lock's path on the store rooted at `raw_root`.
@@ -1339,8 +1351,8 @@ pub fn try_replication_lock(raw_root: &Path) -> Result<ReplicationLock, RawStore
         .write(true)
         .open(&path)
         .map_err(io_error("open", &path))?;
-    match file.try_lock() {
-        Ok(()) => Ok(ReplicationLock { _file: file }),
+    match HeldLock::try_take(file) {
+        Ok(lock) => Ok(ReplicationLock { _lock: lock }),
         Err(TryLockError::WouldBlock) => Err(RawStoreError::Locked(format!(
             "another replication pass holds {}",
             path.display()
@@ -1349,10 +1361,21 @@ pub fn try_replication_lock(raw_root: &Path) -> Result<ReplicationLock, RawStore
     }
 }
 
-/// The verification lock on hot; dropping it releases the lock.
+/// The verification lock on hot; dropping it releases the lock explicitly
+/// ([`HeldLock`]).
 #[derive(Debug)]
 pub struct VerifyLock {
-    _file: File,
+    _lock: HeldLock,
+}
+
+impl VerifyLock {
+    /// A second descriptor of the held lock's open file description, as a
+    /// child process started by another thread holds it between its fork
+    /// and its exec (#220).
+    #[cfg(test)]
+    pub(crate) fn duplicate_lock(&self) -> File {
+        self._lock.duplicate()
+    }
 }
 
 /// The verification lock's path on the store rooted at `raw_root`.
@@ -1377,8 +1400,8 @@ pub fn try_verify_lock(raw_root: &Path) -> Result<VerifyLock, RawStoreError> {
         .write(true)
         .open(&path)
         .map_err(io_error("open", &path))?;
-    match file.try_lock() {
-        Ok(()) => Ok(VerifyLock { _file: file }),
+    match HeldLock::try_take(file) {
+        Ok(lock) => Ok(VerifyLock { _lock: lock }),
         Err(TryLockError::WouldBlock) => Err(RawStoreError::Locked(format!(
             "another mie store verify or mie store repair holds {}",
             path.display()

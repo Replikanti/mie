@@ -1044,6 +1044,12 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
 
 ### Fixed
 
+- **Store locks are released explicitly (#220).** Dropping a pass,
+  verify, writer or copy-ledger lock now unlocks it instead of only closing
+  its descriptor, so a child process started by another thread can no
+  longer keep it held until its exec. The `mie` binary starts no
+  processes; the test suite does and saw spurious `locked` refusals.
+  `clippy.toml` bans the direct `File` lock calls outside the new guard.
 - **`archive-kline-check --trade-source trades` compared almost no bars
   (#85, ADR-045).** The archive `trades` id space is sparse by design (the
   exchange skips ids its klines do not count), so an id jump in that

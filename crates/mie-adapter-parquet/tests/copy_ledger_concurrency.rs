@@ -27,23 +27,6 @@ const APPENDS: i64 = 200;
 const PATH: &str =
     "source=binance-um/instrument=BTCUSDT/stream=aggTrade/date=2026-10-06/part-00000.parquet";
 
-/// Serializes the tests of this binary. A `flock` belongs to the open file
-/// description, and a child spawned by one test inherits, between its fork
-/// and its exec, every descriptor open in the process at that instant: a
-/// lock another test holds at that moment stays held after that test
-/// closes its descriptor, until the child execs, and the other test's next
-/// `try_hold` sees `Locked` (seen as a flake of
-/// `an_append_waiting_behind_a_hold_writes_the_replacing_ledger`, #198).
-static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// Takes [`SERIAL`]; a test that failed while holding it does not poison
-/// the others.
-fn serial() -> std::sync::MutexGuard<'static, ()> {
-    SERIAL
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
 /// Appender `who`'s record number `i`: its root id names the appender, its
 /// time the position in that appender's sequence.
 fn nth(who: &str, i: i64) -> Record {
@@ -106,7 +89,6 @@ fn spawn(test: &str, root: &Path) -> Child {
 
 #[test]
 fn concurrent_threads_leave_a_valid_chain_and_readers_never_fail() {
-    let _serial = serial();
     let dir = hot("ledger-threads");
     let root = dir.path().to_path_buf();
     let done = Arc::new(AtomicBool::new(false));
@@ -167,7 +149,6 @@ fn child_appender() {
 
 #[test]
 fn concurrent_processes_leave_a_valid_chain() {
-    let _serial = serial();
     let dir = hot("ledger-processes");
     let root = dir.path();
     let mut child = spawn("child_appender", root);
@@ -201,7 +182,6 @@ fn child_holder() {
 
 #[test]
 fn the_whole_run_hold_refuses_while_another_process_holds_it() {
-    let _serial = serial();
     let dir = hot("ledger-hold");
     let root = dir.path();
     let mut child = spawn("child_holder", root);
@@ -233,7 +213,6 @@ fn the_whole_run_hold_refuses_while_another_process_holds_it() {
 /// record into the replaced file.
 #[test]
 fn an_append_waiting_behind_a_hold_writes_the_replacing_ledger() {
-    let _serial = serial();
     let dir = hot("ledger-replaced");
     let root = dir.path().to_path_buf();
     let ledger = CopyLedger::at(&root);

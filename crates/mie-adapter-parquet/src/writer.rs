@@ -2,6 +2,7 @@
 //! (ADR-030).
 
 use crate::copy_ledger::{self, CopyLedger, Kind, Record, Truncation};
+use crate::flock::HeldLock;
 use crate::layout::{self, PartFile};
 use crate::manifest;
 use crate::recovery::{self, RecoveryReport};
@@ -210,7 +211,9 @@ struct Tiered {
 
 /// The raw-store writer of one source (ADR-030).
 ///
-/// Holds the source's lock for its lifetime. Records become visible only
+/// Holds the source's lock for its lifetime; a writer dropped without
+/// [`close`](RawWriter::close) unlocks it explicitly too ([`HeldLock`]).
+/// Records become visible only
 /// when their part is sealed: on rotation, on [`RawRecordSink::seal_all`] or
 /// on [`RawWriter::close`]. Dropping the writer seals nothing; the unsealed
 /// parts are discarded by the next writer's recovery. After any I/O failure
@@ -239,7 +242,7 @@ pub struct RawWriter {
     root: PathBuf,
     source: String,
     policy: RotationPolicy,
-    lock: File,
+    lock: HeldLock,
     /// The tier side of a tiered store.
     tiers: Option<Tiered>,
     open: BTreeMap<(RawStreamKey, String), OpenPart>,
@@ -283,7 +286,7 @@ impl RawWriter {
                 "rotation policy {policy:?}: limits must be positive and spans non-negative"
             )));
         }
-        let lock = removal::take_source_lock(root, source)?.into_file();
+        let lock = removal::take_source_lock(root, source)?.into_held();
         let recovery = recovery::recover(root, source)?;
         let tiers = match tiers {
             Some((cold_roots, ctx)) => {
@@ -322,6 +325,14 @@ impl RawWriter {
         &self.recovery
     }
 
+    /// A second descriptor of the held source lock's open file
+    /// description, as a child process started by another thread holds it
+    /// between its fork and its exec (#220).
+    #[cfg(test)]
+    pub(crate) fn duplicate_lock(&self) -> File {
+        self.lock.duplicate()
+    }
+
     /// Seals every open part and releases the source lock. Returns the files
     /// sealed since the previous [`RawRecordSink::seal_all`].
     ///
@@ -332,7 +343,7 @@ impl RawWriter {
     pub fn close(mut self) -> Result<Vec<SealedFile>, RawStoreError> {
         let sealed = self.seal_all()?;
         self.lock
-            .unlock()
+            .release()
             .map_err(|e| RawStoreError::Io(format!("unlock source {}: {e}", self.source)))?;
         Ok(sealed)
     }
@@ -1142,6 +1153,47 @@ mod tests {
         store
             .writer("binance-um", RotationPolicy::default())
             .unwrap();
+    }
+
+    /// #220, the shape of the `aw10` flake: a writer dropped without
+    /// `close` while another descriptor of its lock's open file description
+    /// is open (a child process started by another thread, between its fork
+    /// and its exec) frees its source at once; while the writer lives, the
+    /// source stays locked after that descriptor closes.
+    #[test]
+    fn a_dropped_writer_frees_its_source_beside_a_duplicate() {
+        let dir = TempDir::new("lock-duplicate-drop");
+        let store = ParquetRawStore::new(dir.path());
+        let writer = store
+            .writer("binance-um", RotationPolicy::default())
+            .unwrap();
+        drop(writer.duplicate_lock());
+        assert!(matches!(
+            store.writer("binance-um", RotationPolicy::default()),
+            Err(RawStoreError::Locked(_))
+        ));
+        let child = writer.duplicate_lock();
+        drop(writer);
+        let again = store.writer("binance-um", RotationPolicy::default());
+        assert!(again.is_ok(), "{again:?}");
+        drop(child);
+    }
+
+    /// #220: `close` releases the source explicitly, so a closed writer
+    /// frees it beside an open duplicate too (it did before #220; this
+    /// pins that `close` keeps its explicit release).
+    #[test]
+    fn a_closed_writer_frees_its_source_beside_a_duplicate() {
+        let dir = TempDir::new("lock-duplicate-close");
+        let store = ParquetRawStore::new(dir.path());
+        let writer = store
+            .writer("binance-um", RotationPolicy::default())
+            .unwrap();
+        let child = writer.duplicate_lock();
+        writer.close().unwrap();
+        let again = store.writer("binance-um", RotationPolicy::default());
+        assert!(again.is_ok(), "{again:?}");
+        drop(child);
     }
 
     #[test]
