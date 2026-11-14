@@ -1317,6 +1317,18 @@ pub struct ReplicationLock {
     _file: File,
 }
 
+impl ReplicationLock {
+    /// A second descriptor of the held lock's open file description, as a
+    /// child process started by another thread holds it between its fork
+    /// and its exec (#220).
+    #[cfg(test)]
+    pub(crate) fn duplicate_lock(&self) -> File {
+        self._file
+            .try_clone()
+            .expect("duplicate the lock descriptor")
+    }
+}
+
 /// The pass lock's path on the store rooted at `raw_root`.
 pub fn replication_lock_path(raw_root: &Path) -> PathBuf {
     raw_root.join(META_DIR).join(REPLICATE_LOCK)
@@ -1353,6 +1365,18 @@ pub fn try_replication_lock(raw_root: &Path) -> Result<ReplicationLock, RawStore
 #[derive(Debug)]
 pub struct VerifyLock {
     _file: File,
+}
+
+impl VerifyLock {
+    /// A second descriptor of the held lock's open file description, as a
+    /// child process started by another thread holds it between its fork
+    /// and its exec (#220).
+    #[cfg(test)]
+    pub(crate) fn duplicate_lock(&self) -> File {
+        self._file
+            .try_clone()
+            .expect("duplicate the lock descriptor")
+    }
 }
 
 /// The verification lock's path on the store rooted at `raw_root`.

@@ -556,6 +556,27 @@ fn the_replication_lock_refuses_a_second_holder() {
     assert!(replication_lock_path(&fixture.hot).exists());
 }
 
+/// #220: a pass lock dropped while another descriptor of its open file
+/// description is open (a child process started by another thread, between
+/// its fork and its exec) is free at once; while the guard lives, the lock
+/// stays held after that descriptor closes.
+#[test]
+fn the_replication_lock_is_free_after_its_drop_beside_a_duplicate() {
+    let dir = TempDir::new("replica-lock-duplicate");
+    fs::create_dir(dir.path().join(META_DIR)).unwrap();
+    let held = try_replication_lock(dir.path()).unwrap();
+    drop(held.duplicate_lock());
+    assert!(matches!(
+        try_replication_lock(dir.path()),
+        Err(RawStoreError::Locked(_))
+    ));
+    let child = held.duplicate_lock();
+    drop(held);
+    let again = try_replication_lock(dir.path());
+    assert!(again.is_ok(), "{again:?}");
+    drop(child);
+}
+
 /// Review of #199, finding 2: a failure names the side it happened on, so
 /// the pass can tell one unreadable hot file from a failing target.
 #[test]
@@ -856,6 +877,25 @@ fn the_verify_lock_refuses_a_second_holder() {
     ));
     drop(held);
     try_verify_lock(dir.path()).unwrap();
+}
+
+/// #220: the verification lock, as
+/// `the_replication_lock_is_free_after_its_drop_beside_a_duplicate`.
+#[test]
+fn the_verify_lock_is_free_after_its_drop_beside_a_duplicate() {
+    let dir = TempDir::new("replica-verify-lock-duplicate");
+    fs::create_dir(dir.path().join(META_DIR)).unwrap();
+    let held = try_verify_lock(dir.path()).unwrap();
+    drop(held.duplicate_lock());
+    assert!(matches!(
+        try_verify_lock(dir.path()),
+        Err(RawStoreError::Locked(_))
+    ));
+    let child = held.duplicate_lock();
+    drop(held);
+    let again = try_verify_lock(dir.path());
+    assert!(again.is_ok(), "{again:?}");
+    drop(child);
 }
 
 /// #195 H6: a cold copy whose manifest text differs from the ledger's

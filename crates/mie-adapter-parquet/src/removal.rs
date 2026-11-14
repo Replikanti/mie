@@ -478,6 +478,16 @@ impl SourceLock {
     pub(crate) fn into_file(self) -> File {
         self._file
     }
+
+    /// A second descriptor of the held lock's open file description, as a
+    /// child process started by another thread holds it between its fork
+    /// and its exec (#220).
+    #[cfg(test)]
+    pub(crate) fn duplicate_lock(&self) -> File {
+        self._file
+            .try_clone()
+            .expect("duplicate the lock descriptor")
+    }
 }
 
 /// What one remove pass over one source did.

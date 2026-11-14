@@ -1396,6 +1396,16 @@ pub struct LedgerHold {
 }
 
 impl LedgerHold {
+    /// A second descriptor of the held lock's open file description, as a
+    /// child process started by another thread holds it between its fork
+    /// and its exec (#220).
+    #[cfg(test)]
+    pub(crate) fn duplicate_lock(&self) -> File {
+        self._lock
+            .try_clone()
+            .expect("duplicate the lock descriptor")
+    }
+
     /// Appends `record` under the held lock, as [`CopyLedger::append`] does.
     ///
     /// # Errors
