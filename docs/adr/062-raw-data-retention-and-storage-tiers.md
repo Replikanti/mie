@@ -291,7 +291,9 @@ the D2 consequence.
     only), modification times (V8's `within_grace` reads hot only) and
     exclusive create (`create_new` in `write_new`, `stream_copy`,
     `extend_prefix` and `rebuild_prefix` is used, but the pass lock on
-    hot already excludes a second writer).
+    hot already excludes a second writer; in the root marker's staging
+    directory, T2's directory rename decides between two `init-root`
+    calls).
 - **Option 1 (everything on the local disk)** is the configuration with
   no cold root, and it stays valid while the hot formula (D10) fits the
   disk. It loses as the policy because the fast local disk would have to
