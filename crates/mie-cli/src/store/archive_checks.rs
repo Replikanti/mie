@@ -52,20 +52,29 @@
 //!   no damage line, no lost candidate, no hold, no `removed` partition.
 //! - **Q4 Records per Q path**: `manifest` when the start lacks a text
 //!   (the text rule over the layouts' and the quarantines' texts, the
-//!   superseded entry breaking a tie); `hold-cleared <path> replace` when
-//!   the start holds it open, a record names it and it is complete (no
-//!   root's layout holds it); `quarantined <path> <id>` unless the start
-//!   has it pending under that id; `replaced <path> <segment>/<E_g>` when
-//!   it is complete, a record S_n names it, an entry of the lowest
-//!   generation g ≥ n exists in the union and the start has no `replaced`
-//!   for it.
+//!   superseded entry breaking a tie, read-only layouts included);
+//!   `hold-cleared <path> replace` when the start holds it open, a record
+//!   names it and it is complete (no layout of hot or of a copy target
+//!   holds it; a read-only root never counts, #216); `quarantined <path>
+//!   <id>` unless the start has it pending under that id; `replaced
+//!   <path> <segment>/<E_g>` when it is complete, a record S_n names it,
+//!   an entry of the lowest generation g ≥ n exists in the union and the
+//!   start has no `replaced` for it.
 //! - **Q5 Problems**, none derived from an absence, so the ledger is
 //!   still installed: an incomplete path (the replace stopped between
-//!   renames; an open start hold stays open), a path no root's layout or
-//!   quarantine holds (its bytes are gone), a quarantined path no record
-//!   names.
+//!   renames on hot or a copy target, which are named; an open start hold
+//!   stays open), a path no root's layout or quarantine holds (its bytes
+//!   are gone), a quarantined path no record names, and a complete path
+//!   whose data file no root's quarantine holds, a read-only root's
+//!   included, while a read-only root's layout does (h = 0, r ≥ 1, review
+//!   of #221 and its re-review, finding 3: the superseded bytes would stay
+//!   only on roots mie never writes, outside every quarantine; the problem
+//!   names `copy_target = true` and the resume). A read-only root
+//!   whose layout holds a Q path gets an info line besides. Q4's records do
+//!   not change with that problem: `complete` stays the commit point of
+//!   I1 and I3, so a rebuild derives what the importer wrote (AW12).
 
-use super::quarantine::{superseded_shas, text_rule};
+use super::quarantine::{h_zero, read_only_alone_line, read_only_line, superseded_shas, text_rule};
 use super::replicate::is_archive_part;
 use mie_adapter_binance::archive::catalog::parse_day;
 use mie_adapter_binance::archive::import::orphan_days;
@@ -429,6 +438,15 @@ pub struct QuarantineInputs<'a> {
     /// data file), with the text when the manifest parses and describes
     /// the path.
     pub layout: &'a BTreeMap<String, Vec<(String, Option<String>)>>,
+    /// The marker ids of the configured read-only roots: their layouts
+    /// feed the text rule but never the commit point (#216). Matched
+    /// exactly; `hot` always counts.
+    pub read_only: &'a BTreeSet<String>,
+    /// Per data path, the roots of `layout` known to hold its manifest
+    /// without its data file (the data checked and missing). Every other
+    /// root of `layout` counts as holding the data, so an unchecked copy
+    /// fails closed in Q5's h = 0 rule (review of #221).
+    pub without_data: &'a BTreeMap<String, BTreeSet<String>>,
     /// The starting ledger, folded.
     pub start: &'a CopyState,
 }
@@ -441,7 +459,7 @@ pub struct QuarantinedPath {
     /// The supersede record naming it, `<segment>/<name>`; `None` when
     /// only a quarantine directory holds it.
     pub record: Option<String>,
-    /// No root's layout holds it.
+    /// No layout of hot or of a copy target holds it.
     pub complete: bool,
 }
 
@@ -453,7 +471,9 @@ pub struct QuarantineFindings {
     /// The records to add, in Q6's order: `manifest`, `hold-cleared`,
     /// `quarantined`, `replaced`, each group in path order.
     pub records: Vec<Kind>,
-    /// One report line per quarantine id.
+    /// One info line per (Q path, read-only root whose layout holds it),
+    /// in path order, then layout order; then one report line per
+    /// quarantine id.
     pub lines: Vec<String>,
     /// Every Q5 problem.
     pub problems: Vec<String>,
@@ -550,7 +570,13 @@ pub fn quarantine(inputs: &QuarantineInputs<'_>) -> QuarantineFindings {
     for (path, (id, record)) in &by_path {
         let layout: Vec<&(String, Option<String>)> =
             inputs.layout.get(path).into_iter().flatten().collect();
-        let complete = layout.is_empty();
+        // Hot and the copy targets are the commit point; a read-only root
+        // is never written, so its copy can never move (#216).
+        let (counted, read_only): (Vec<&str>, Vec<&str>) = layout
+            .iter()
+            .map(|(root, _)| root.as_str())
+            .partition(|root| *root == "hot" || !inputs.read_only.contains(*root));
+        let complete = counted.is_empty();
         let quarantined: Vec<(&str, Option<&str>)> = inputs
             .roots
             .iter()
@@ -623,19 +649,62 @@ pub fn quarantine(inputs: &QuarantineInputs<'_>) -> QuarantineFindings {
                 replica::QUARANTINE_DIR
             )),
             Some(moving) if !complete => {
-                let roots: Vec<&str> = layout.iter().map(|(root, _)| root.as_str()).collect();
                 found.problems.push(format!(
                     "{path}: the replace of {} under {id} stopped between renames ({} still \
                      hold it); `mie store resolve --file {}` completes it, and its hold stays \
                      open until then (ADR-062 D11)",
                     moving.record.archive,
-                    roots.join(", "),
+                    counted.join(", "),
                     moving.record.archive
                 ));
             }
             Some(_) => {}
         }
-        if complete && quarantined.is_empty() {
+        for root in &read_only {
+            found.lines.push(read_only_line(path, root, id));
+        }
+        // The h = 0 rule ([`h_zero`], review of #221): a complete path whose
+        // data file no root's quarantine holds, a read-only root's included
+        // (re-review, finding 3), while a read-only layout does. A complete
+        // path has no writable layout copy, so h is the quarantine copies
+        // alone. An incomplete one already has its problem, and the resume
+        // it names applies the rule.
+        if let Some(moving) = moving
+            && complete
+        {
+            let without_data = inputs.without_data.get(path);
+            let in_quarantine = |read_only: bool| {
+                inputs.roots.iter().any(|root| {
+                    (root.root != "hot" && inputs.read_only.contains(&root.root)) == read_only
+                        && root
+                            .listing
+                            .ids
+                            .get(id)
+                            .and_then(|parts| parts.get(path))
+                            .is_some_and(|copy| copy.data)
+                })
+            };
+            let Ok(alone) = h_zero::<std::convert::Infallible>(
+                || Ok(in_quarantine(false)),
+                || Ok(in_quarantine(true)),
+                || {
+                    Ok(read_only
+                        .iter()
+                        .filter(|root| without_data.is_none_or(|roots| !roots.contains(**root)))
+                        .map(|root| (*root).to_owned())
+                        .collect())
+                },
+            );
+            if !alone.is_empty() {
+                found.problems.push(read_only_alone_line(
+                    path,
+                    &alone,
+                    id,
+                    &moving.record.archive,
+                ));
+            }
+        }
+        if complete && quarantined.is_empty() && read_only.is_empty() {
             found.problems.push(format!(
                 "{path}: quarantined under {id}, and no root's layout or quarantine holds it: its \
                  bytes are gone; nothing in mie deletes them (ADR-062 D5)"

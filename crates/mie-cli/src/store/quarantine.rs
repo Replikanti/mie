@@ -3,16 +3,19 @@
 //!
 //! - **I1 Gate** ([`check_replaces`]). `mie archive-import`, its dry runs
 //!   too, refuses while a supersede record on hot with a quarantine has a
-//!   moved path whose data or manifest is in the layout of any root, hot
-//!   or a configured cold root, or whose copy-ledger verdict is neither
+//!   moved path whose data or manifest is in the layout of hot or of a
+//!   configured copy target, or whose copy-ledger verdict is neither
 //!   pending nor replaced; and, while a moved path is not yet replaced,
-//!   while a configured cold root presents no readable marker (an
-//!   unmounted root reads as empty, so its layout cannot be confirmed
-//!   free). Every root's layout, not hot's alone, is the commit point: the
-//!   parts of a day already taken off hot live on cold roots only, and a
-//!   replace that stopped between two of them must keep the importer
+//!   while a copy target presents no readable marker (an unmounted root
+//!   reads as empty, so its layout cannot be confirmed free). The layouts
+//!   of hot and every copy target, not hot's alone, are the commit point:
+//!   the parts of a day already taken off hot live on cold roots only, and
+//!   a replace that stopped between two of them must keep the importer
 //!   halted after a rebuild from an empty start too, which has no hold
-//!   record (review of #215, finding 1). A record that does not parse is
+//!   record (review of #215, finding 1). A read-only root is skipped, its
+//!   marker and its layout: mie never writes it (D4), so a copy there can
+//!   never move, and the copy ledger keeps the path pending or replaced,
+//!   so no `select` lists it (#216). A record that does not parse is
 //!   skipped here: the import of its own archive file fails closed on it
 //!   (#210 C1).
 //! - **I3 Replacement records** ([`record_replacements`]). For each such
@@ -24,20 +27,32 @@
 //!   pending, all with one `at_ms`; otherwise the missing file is named and
 //!   nothing is appended (D7 *Write order*: `replaced` only after the
 //!   entry and its parts are sealed). It also waits while the replace is
-//!   unfinished on any root (I1's rule), so a `replaced` record never
-//!   names a path some root's layout still holds, which a rebuild from
-//!   an empty start could not re-derive (Q4). The importer runs it at its start and
-//!   after its run, never in a dry run, so a crash between the entry and
-//!   the records is completed by the next import (or by a rebuild, Q4).
+//!   unfinished on hot or a copy target (I1's rule), so a `replaced`
+//!   record never names a path such a layout still holds, which a rebuild
+//!   from an empty start could not re-derive (Q4). The importer runs it at
+//!   its start and after its run, never in a dry run, so a crash between
+//!   the entry and the records is completed by the next import (or by a
+//!   rebuild, Q4).
 //! - **The text rule** ([`text_rule`]), shared by the replace (W2) and the
-//!   rebuild (Q4): the one distinct manifest text over the roots' layouts
-//!   and quarantine copies; with several, the one whose SHA-256 the
-//!   superseded entry lists; otherwise none, and the path then covers its
-//!   whole stream-day in `select`, failing more selections, never fewer.
+//!   rebuild (Q4): the one distinct manifest text over the roots' layouts,
+//!   read-only roots included, and quarantine copies; with several, the
+//!   one whose SHA-256 the superseded entry lists; otherwise none, and the
+//!   path then covers its whole stream-day in `select`, failing more
+//!   selections, never fewer.
 //! - **RQ8 proposals** ([`replace_lines`]): one line per supersede record
 //!   on hot that carries a quarantine; an incomplete replace (unfinished
-//!   on any root, by I1's rule) is a problem naming `mie store resolve
-//!   --file F`.
+//!   on hot or a copy target, by I1's rule) is a problem naming `mie store
+//!   resolve --file F`. A marked read-only root whose layout still holds a
+//!   moved path gets an info line ([`read_only_line`]), never a problem of
+//!   its own. A moved path whose data file no root holds in its
+//!   `.quarantine/<id>/`, a read-only root included, and no layout of hot
+//!   or of a copy target holds, while a read-only layout does or a
+//!   read-only root presents no readable marker, is a problem with the
+//!   remedy ([`ReplaceRoots::read_only_alone`], the h = 0 rule of review
+//!   of #221 and its re-review, findings 3 and 4, decided by [`h_zero`]),
+//!   and its replace is never reported complete. I1 does not apply that
+//!   rule: no byte is lost in that state and the remedy works after
+//!   `replaced` (ADR-062 D11 *As amended (#216)*).
 
 use mie_adapter_binance::archive::ledger::{
     ImportLedger, LedgerDir, LedgerKind, LedgerName, SupersedeRecord, replacement_generation,
@@ -50,17 +65,39 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
-/// Every root a replace renames on: hot, then each configured cold root
-/// with its marker's id as read now (`None` without a readable marker).
+#[cfg(test)]
+mod tests;
+
+/// Every root a replace may find a moved path on: hot, then each
+/// configured cold root with its marker's id as read now (`None` without a
+/// readable marker) and whether it counts toward the replace's commit
+/// point (hot and the copy targets; a read-only root never does, #216).
 #[derive(Debug, Clone)]
 pub struct ReplaceRoots {
-    roots: Vec<(String, PathBuf, Option<String>)>,
+    roots: Vec<ReplaceRoot>,
+}
+
+/// One root of [`ReplaceRoots`].
+#[derive(Debug, Clone)]
+struct ReplaceRoot {
+    /// Its marker's id, else its path.
+    label: String,
+    path: PathBuf,
+    /// Its marker's id as read now.
+    id: Option<String>,
+    /// Hot or a copy target: the commit point.
+    counts: bool,
 }
 
 impl ReplaceRoots {
     /// Hot at `hot` and the configured `cold` roots, markers read now.
     pub fn read(hot: &Path, cold: &[crate::config::ColdRoot]) -> Self {
-        let mut roots = vec![("hot".to_owned(), hot.to_owned(), Some("hot".to_owned()))];
+        let mut roots = vec![ReplaceRoot {
+            label: "hot".to_owned(),
+            path: hot.to_owned(),
+            id: Some("hot".to_owned()),
+            counts: true,
+        }];
         for root in cold {
             let id = mie_adapter_parquet::root_marker::read(&root.path)
                 .ok()
@@ -68,19 +105,26 @@ impl ReplaceRoots {
             let label = id
                 .clone()
                 .unwrap_or_else(|| root.path.display().to_string());
-            roots.push((label, root.path.clone(), id));
+            roots.push(ReplaceRoot {
+                label,
+                path: root.path.clone(),
+                id,
+                counts: root.copy_target,
+            });
         }
         Self { roots }
     }
 
-    /// Why the replace of `record` is unfinished on the roots, if it is: a
-    /// root whose layout still holds a moved path, or, with
-    /// `require_markers`, a cold root without a readable marker, whose
-    /// layout cannot be confirmed free.
+    /// Why the replace of `record` is unfinished on hot and the copy
+    /// targets, if it is: one whose layout still holds a moved path, or,
+    /// with `require_markers`, a copy target without a readable marker,
+    /// whose layout cannot be confirmed free. A read-only root is skipped,
+    /// marker and layout: mie never writes it (ADR-062 D4), so its copy can
+    /// never move and must not hold the replace back (#216).
     ///
     /// # Errors
     ///
-    /// An I/O error inspecting a root.
+    /// An I/O error inspecting hot or a copy target.
     pub fn unfinished(
         &self,
         record: &SupersedeRecord,
@@ -89,24 +133,265 @@ impl ReplaceRoots {
         let Some(quarantine) = &record.quarantine else {
             return Ok(None);
         };
-        for (label, root, id) in &self.roots {
-            if id.is_none() {
+        for root in self.roots.iter().filter(|root| root.counts) {
+            let label = &root.label;
+            if root.id.is_none() {
                 if require_markers {
                     return Ok(Some(format!(
-                        "cold root {label} presents no readable marker, so its layout cannot be \
-                         confirmed free of the moved paths (an unmounted root reads as empty)"
+                        "copy target {label} presents no readable marker, so its layout cannot \
+                         be confirmed free of the moved paths (an unmounted root reads as empty)"
                     )));
                 }
                 continue;
             }
             for path in &quarantine.moved {
-                if in_layout(root, path).map_err(|e| format!("inspect {path} on {label}: {e}"))? {
+                if in_layout(&root.path, path)
+                    .map_err(|e| format!("inspect {path} on {label}: {e}"))?
+                {
                     return Ok(Some(format!("{path} is still in {label}'s layout")));
                 }
             }
         }
         Ok(None)
     }
+
+    /// The info lines of `record` ([`read_only_lines`]) over the read-only
+    /// roots that present a marker; an unmarked one is neither inspected
+    /// nor named.
+    pub fn read_only_holders(&self, record: &SupersedeRecord) -> Vec<String> {
+        let Some(quarantine) = &record.quarantine else {
+            return Vec::new();
+        };
+        let read_only: Vec<(&str, &Path)> = self
+            .roots
+            .iter()
+            .filter(|root| !root.counts)
+            .filter_map(|root| root.id.as_deref().map(|id| (id, root.path.as_path())))
+            .collect();
+        read_only_lines(&read_only, &quarantine.moved, &quarantine.id)
+    }
+
+    /// The h = 0 rule over `record` ([`read_only_alone`]): one problem
+    /// ([`read_only_alone_line`]) per moved path whose data file no root
+    /// holds in its `.quarantine/<id>/`, and no layout of hot or of a marked
+    /// copy target, while the layout of a read-only root does or a
+    /// read-only root presents no readable marker. An unmarked read-only
+    /// root counts as a possible holder only then (fail closed: an
+    /// unmounted root reads as empty; re-review of #221, finding 4); an
+    /// unmarked copy target is not inspected, since it already makes the
+    /// replace incomplete.
+    ///
+    /// # Errors
+    ///
+    /// An I/O error inspecting hot or a copy target.
+    pub fn read_only_alone(&self, record: &SupersedeRecord) -> Result<Vec<String>, String> {
+        let Some(quarantine) = &record.quarantine else {
+            return Ok(Vec::new());
+        };
+        let writable: Vec<(&str, &Path)> = self
+            .roots
+            .iter()
+            .filter(|root| root.counts)
+            .filter_map(|root| root.id.as_deref().map(|id| (id, root.path.as_path())))
+            .collect();
+        let read_only: Vec<(&str, Option<&Path>)> = self
+            .roots
+            .iter()
+            .filter(|root| !root.counts)
+            .map(|root| {
+                let marked = root.id.is_some().then_some(root.path.as_path());
+                (root.label.as_str(), marked)
+            })
+            .collect();
+        let mut problems = Vec::new();
+        for path in &quarantine.moved {
+            let alone = read_only_alone(&writable, &read_only, path, &quarantine.id)?;
+            if !alone.is_empty() {
+                problems.push(read_only_alone_line(
+                    path,
+                    &alone,
+                    &quarantine.id,
+                    &record.archive,
+                ));
+            }
+        }
+        Ok(problems)
+    }
+}
+
+/// The h = 0 rule (ADR-062 D11 *As amended (#216)*), the one predicate
+/// RQ2, the resume (RQ7), the proposals (RQ8) and the rebuild and the
+/// restore (Q5) decide it with, so they cannot drift. For one moved path,
+/// h counts the roots holding its data file in their `.quarantine/<id>/`,
+/// any root, a read-only one included (D5 never deletes a quarantine
+/// copy), and hot and the copy targets whose layout holds it; r names the
+/// read-only roots whose layout holds it or that cannot be confirmed not
+/// to. The path fails, and r is returned, when h = 0 and r ≥ 1; otherwise
+/// nothing is.
+///
+/// Each caller supplies the three lookups; they run in this order and stop
+/// at the first that makes h ≥ 1, so a read-only root is looked at only
+/// when no writable root counts: `writable`, whether hot or a copy target
+/// holds the data file in its quarantine or its layout; then
+/// `read_only_quarantined`, whether a read-only root holds it in its
+/// quarantine; then `read_only_layout`, r.
+///
+/// # Errors
+///
+/// The first error of a lookup.
+pub fn h_zero<E>(
+    writable: impl FnOnce() -> Result<bool, E>,
+    read_only_quarantined: impl FnOnce() -> Result<bool, E>,
+    read_only_layout: impl FnOnce() -> Result<Vec<String>, E>,
+) -> Result<Vec<String>, E> {
+    if writable()? || read_only_quarantined()? {
+        return Ok(Vec::new());
+    }
+    read_only_layout()
+}
+
+/// The h = 0 rule ([`h_zero`]) of the resume (RQ7) and the proposals (RQ8)
+/// over the roots themselves: `writable` (hot and the copy targets) and
+/// `read_only`, each read-only root with its path when it presents a
+/// readable marker. A manifest alone is no holder: the superseded bytes
+/// are the data file's.
+///
+/// Cost per call: at most 1 `lstat` per writable root in its quarantine,
+/// then, only when none holds it there, at most 1 per writable root in its
+/// layout, then, only when none holds it there either, at most 1 per
+/// marked read-only root in its quarantine, then, only with h = 0, 1 per
+/// marked read-only root in its layout; it stops at the first hit that
+/// makes h ≥ 1. An unmarked read-only root costs nothing.
+///
+/// With h = 0 the rule fails closed: a read-only root without a readable
+/// marker (an unmounted root reads as empty) and one whose layout cannot
+/// be inspected count in r, named with the reason. An error inspecting a
+/// read-only root's quarantine counts as no copy there, which can only
+/// lower h.
+///
+/// # Errors
+///
+/// The I/O error of an inspection of a writable root other than "not
+/// found", naming the root.
+pub fn read_only_alone(
+    writable: &[(&str, &Path)],
+    read_only: &[(&str, Option<&Path>)],
+    path: &str,
+    quarantine_id: &str,
+) -> Result<Vec<String>, String> {
+    let held = |label: &str, file: PathBuf| {
+        exists(&file).map_err(|error| format!("inspect {path} on {label}: {error}"))
+    };
+    let marked = || {
+        read_only
+            .iter()
+            .filter_map(|(label, root)| root.map(|root| (*label, root)))
+    };
+    h_zero(
+        || {
+            for (label, root) in writable {
+                if held(
+                    label,
+                    replica::quarantine_dir(root, quarantine_id).join(path),
+                )? {
+                    return Ok(true);
+                }
+            }
+            for (label, root) in writable {
+                if held(label, root.join(path))? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        },
+        || {
+            Ok(marked().any(|(_, root)| {
+                exists(&replica::quarantine_dir(root, quarantine_id).join(path)).unwrap_or(false)
+            }))
+        },
+        || {
+            let mut alone = Vec::new();
+            for (label, root) in read_only {
+                let Some(root) = root else {
+                    alone.push(format!(
+                        "{label} (no readable marker: an unmounted root reads as empty, so it \
+                         cannot be confirmed free of the data file; mount it)"
+                    ));
+                    continue;
+                };
+                match exists(&root.join(path)) {
+                    Ok(false) => {}
+                    Ok(true) => alone.push((*label).to_owned()),
+                    Err(error) => alone.push(format!("{label} (cannot be inspected: {error})")),
+                }
+            }
+            Ok(alone)
+        },
+    )
+}
+
+/// The problem of a moved path whose data only read-only roots hold
+/// ([`read_only_alone`]), naming them and the remedy, shared by the resume,
+/// the proposals (RQ8) and the rebuild (Q5).
+pub fn read_only_alone_line(
+    path: &str,
+    roots: &[String],
+    quarantine_id: &str,
+    archive: &str,
+) -> String {
+    format!(
+        "{path} (quarantine {quarantine_id}): its data file is held only by the read-only \
+         root(s) {}; neither hot nor a copy target holds it in its layout or in its \
+         `.quarantine/{quarantine_id}/`, so its superseded bytes would stay only on roots mie \
+         never writes (ADR-062 D4, D11). Set `copy_target = true` for one of them in \
+         `paths.cold_roots`, then run `mie store resolve --file {archive}`, which moves its \
+         copy into quarantine",
+        roots.join(", ")
+    )
+}
+
+/// Whether a name exists at `file` (`lstat`, a symlink is not followed).
+fn exists(file: &Path) -> std::io::Result<bool> {
+    match fs::symlink_metadata(file) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+/// The info line of a read-only root whose layout still holds a moved
+/// path (ADR-062 D11 *As amended (#216)*), shared by the replace, its
+/// resume, the proposals (RQ8) and the rebuild (Q5).
+pub fn read_only_line(path: &str, root: &str, quarantine_id: &str) -> String {
+    format!(
+        "{path} (quarantine {quarantine_id}): still in the layout of read-only root {root}; mie \
+         never writes a read-only root and the copy ledger keeps the path pending or replaced, \
+         so no `select` lists it; the replace does not wait for it (ADR-062 D4, D11)"
+    )
+}
+
+/// One [`read_only_line`] per (moved path, read-only root whose layout
+/// holds it): `moved` in its order, then `read_only` (id, path) in its
+/// order. An inspection error is a line too, never an error: the root
+/// counts for nothing, so it stops nothing.
+pub fn read_only_lines(
+    read_only: &[(&str, &Path)],
+    moved: &[String],
+    quarantine_id: &str,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    for path in moved {
+        for (root, dir) in read_only {
+            match in_layout(dir, path) {
+                Ok(true) => lines.push(read_only_line(path, root, quarantine_id)),
+                Ok(false) => {}
+                Err(error) => lines.push(format!(
+                    "{path} on read-only root {root} cannot be inspected ({error})"
+                )),
+            }
+        }
+    }
+    lines
 }
 
 /// Whether the layout of `root` holds `path`: its data file or its
@@ -116,15 +401,22 @@ impl ReplaceRoots {
 ///
 /// The I/O error of an inspection other than "not found".
 pub fn in_layout(root: &Path, path: &str) -> std::io::Result<bool> {
-    let manifest = format!("{}.manifest", path.strip_suffix(".parquet").unwrap_or(path));
-    for name in [path, manifest.as_str()] {
-        match fs::symlink_metadata(root.join(name)) {
-            Ok(_) => return Ok(true),
-            Err(error) if error.kind() == ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
+    Ok(layout_holds(root, path)?.is_some())
+}
+
+/// What the layout of `root` holds of `path`: `Some(true)` its data file,
+/// `Some(false)` its manifest alone, `None` neither. At most 2 `lstat`, the
+/// data file first, as [`in_layout`].
+///
+/// # Errors
+///
+/// The I/O error of an inspection other than "not found".
+pub fn layout_holds(root: &Path, path: &str) -> std::io::Result<Option<bool>> {
+    if exists(&root.join(path))? {
+        return Ok(Some(true));
     }
-    Ok(false)
+    let manifest = format!("{}.manifest", path.strip_suffix(".parquet").unwrap_or(path));
+    Ok(exists(&root.join(manifest))?.then_some(false))
 }
 
 /// The text rule (module docs): the one distinct text of `texts`; with
@@ -191,12 +483,13 @@ pub fn superseded_shas(
 }
 
 /// Why the replace of `record` is not complete (RQ8, I1), if it is not:
-/// unfinished on a root ([`ReplaceRoots::unfinished`]), a moved path not
+/// unfinished on hot or a copy target ([`ReplaceRoots::unfinished`]), a
+/// moved path not
 /// recorded `quarantined` under its id, or still held.
 ///
 /// # Errors
 ///
-/// An I/O error inspecting hot.
+/// An I/O error inspecting hot or a copy target.
 fn incomplete(
     roots: &ReplaceRoots,
     record: &SupersedeRecord,
@@ -409,7 +702,8 @@ pub fn record_replacements(
 }
 
 /// RQ8 (module docs): one line per supersede record on hot with a
-/// quarantine, and a problem per incomplete replace.
+/// quarantine, a problem per incomplete replace, and the info lines of the
+/// read-only roots that still hold a moved path.
 ///
 /// # Errors
 ///
@@ -437,12 +731,21 @@ pub fn replace_lines(
         let Some(quarantine) = &record.quarantine else {
             continue;
         };
+        let read_only = roots.read_only_holders(record);
+        let alone = roots.read_only_alone(record)?;
         if let Some(why) = incomplete(roots, record, state)? {
             problems.push(format!(
                 "the replace of {} under quarantine {} ({label}) is incomplete: {why}; `mie store \
                  resolve --file {}` completes it",
                 record.archive, quarantine.id, record.archive
             ));
+            problems.extend(alone);
+            lines.extend(read_only);
+            continue;
+        }
+        if !alone.is_empty() {
+            problems.extend(alone);
+            lines.extend(read_only);
             continue;
         }
         let files = ledgers
@@ -466,6 +769,7 @@ pub fn replace_lines(
                 record.archive, quarantine.id
             )),
         }
+        lines.extend(read_only);
     }
     Ok((lines, problems))
 }

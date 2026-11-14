@@ -19,10 +19,12 @@ use std::sync::Arc;
 
 const ID: &str = "q-1791259200000";
 
+/// A copy target or hot whose layout holds the data file.
 fn holder(root: &str) -> Holder {
     Holder {
         root: root.to_owned(),
         read_only: false,
+        data: true,
         text: None,
     }
 }
@@ -43,8 +45,9 @@ fn refused(inputs: &PlanInputs, holders: &BTreeMap<String, Vec<Holder>>, needles
     }
 }
 
-/// RQ2 to RQ4 as a table: no entry, the generation arithmetic, siblings,
-/// two ledger texts and a read-only holder.
+/// RQ2 to RQ4 as a table: no entry, the generation arithmetic, siblings
+/// and two ledger texts (read-only holders:
+/// [`rq2_refuses_only_a_path_read_only_roots_alone_hold`]).
 #[test]
 fn replace_plan_table() {
     let (a, b, c) = (
@@ -118,17 +121,6 @@ fn replace_plan_table() {
     let mut two = inputs(files.clone(), &[&a]);
     two.verdicts.insert(a.clone(), PathVerdict::Conflict);
     refused(&two, &on_hot(&[&a, &b]), &[&a, "two manifest texts"]);
-    // A read-only root holding a moved path: refused.
-    let mut holders = on_hot(&[&a, &b]);
-    holders.get_mut(&b).unwrap().push(Holder {
-        read_only: true,
-        ..holder("cold-r")
-    });
-    refused(
-        &inputs(files.clone(), &[&a]),
-        &holders,
-        &[&b, "read-only root cold-r"],
-    );
     // A part no root holds: refused.
     refused(
         &inputs(files, &[&a, &c]),
@@ -136,6 +128,139 @@ fn replace_plan_table() {
         &[&c, "no root holds it"],
     );
     let _ = ARCHIVE;
+}
+
+/// RQ2 as amended (#216): with h the holders of a moved path that are hot
+/// or a copy target and r its read-only holders, each counted only when
+/// its layout holds the data file (review of #221, finding 2), (h, r) =
+/// (0, 1) and (0, 2) refuse the whole replace, naming the path and every
+/// read-only data holder in holder order; (1, 1), (2, 1) and (1, 0) plan;
+/// (0, 0) is a part no root holds, as before, or, with manifests alone,
+/// the rule before the review.
+#[test]
+fn rq2_refuses_only_a_path_read_only_roots_alone_hold() {
+    let (a, b) = (
+        part("aggTrades", "2026-10-01", 0),
+        part("aggTrades", "2026-10-01", 1),
+    );
+    let e0 = format!("{F}.import");
+    let entry = listing("zip", &[&a, &b]);
+    let files = vec![file("hot", &e0, &entry), file("cold-a", &e0, &entry)];
+    let read_only = |root: &str| Holder {
+        read_only: true,
+        ..holder(root)
+    };
+    let with = |held_a: Vec<Holder>, held_b: Vec<Holder>| {
+        BTreeMap::from([(a.clone(), held_a), (b.clone(), held_b)])
+    };
+    let planned = |holders: &BTreeMap<String, Vec<Holder>>| {
+        let plan = plan_replace(&inputs(files.clone(), &[&a]), holders, ID)
+            .unwrap_or_else(|why| panic!("{why}"));
+        assert_eq!(plan.moved(), &[a.clone(), b.clone()]);
+    };
+
+    // (1, 0), (1, 1) with hot, (1, 1) with a copy target, (2, 1).
+    planned(&with(vec![holder("hot")], vec![holder("hot")]));
+    planned(&with(
+        vec![holder("hot")],
+        vec![holder("hot"), read_only("cold-r")],
+    ));
+    planned(&with(
+        vec![holder("hot")],
+        vec![holder("cold-a"), read_only("cold-r")],
+    ));
+    planned(&with(
+        vec![holder("hot")],
+        vec![holder("hot"), holder("cold-a"), read_only("cold-r")],
+    ));
+    // One directory under two spellings, once a copy target, once
+    // read-only: h = 1.
+    planned(&with(
+        vec![holder("hot")],
+        vec![holder("cold-c"), read_only("cold-c")],
+    ));
+    // Hot and a read-only root hold both paths.
+    planned(&with(
+        vec![holder("hot"), read_only("cold-r")],
+        vec![holder("hot"), read_only("cold-r")],
+    ));
+
+    // (0, 1): the sibling b, the last path of M, while hot holds a.
+    refused(
+        &inputs(files.clone(), &[&a]),
+        &with(vec![holder("hot")], vec![read_only("cold-r")]),
+        &[
+            &b,
+            "only",
+            "read-only root(s) cold-r;",
+            "copy_target = true",
+        ],
+    );
+    // (0, 1): the part a.
+    refused(
+        &inputs(files.clone(), &[&a]),
+        &with(vec![read_only("cold-r")], vec![holder("hot")]),
+        &[&a, "only", "read-only root(s) cold-r;", "mie store repair"],
+    );
+    // (0, 2): both named in holder order.
+    refused(
+        &inputs(files.clone(), &[&a]),
+        &with(
+            vec![holder("hot")],
+            vec![read_only("cold-r"), read_only("cold-s")],
+        ),
+        &[&b, "read-only root(s) cold-r, cold-s;"],
+    );
+    // (0, 0): a part no root holds.
+    refused(
+        &inputs(files.clone(), &[&a]),
+        &with(Vec::new(), vec![holder("hot")]),
+        &[&a, "no root holds it"],
+    );
+
+    // Review of #221, finding 2: only a data file counts. A copy target
+    // or hot holding the manifest alone is no writable holder: (0, 1).
+    let manifest = |holder: Holder| Holder {
+        data: false,
+        ..holder
+    };
+    for writable in ["hot", "cold-a"] {
+        refused(
+            &inputs(files.clone(), &[&a]),
+            &with(
+                vec![holder("hot")],
+                vec![manifest(holder(writable)), read_only("cold-r")],
+            ),
+            &[&b, "read-only root(s) cold-r;", "data file"],
+        );
+    }
+    // A read-only root holding the manifest alone is no r: the data on a
+    // copy target plans, and among two read-only roots only the data
+    // holder is named.
+    planned(&with(
+        vec![holder("hot")],
+        vec![holder("cold-a"), manifest(read_only("cold-r"))],
+    ));
+    refused(
+        &inputs(files.clone(), &[&a]),
+        &with(
+            vec![holder("hot")],
+            vec![manifest(read_only("cold-r")), read_only("cold-s")],
+        ),
+        &[&b, "read-only root(s) cold-s;"],
+    );
+    // No holder has the data file (h = 0, r = 0): the rule before the
+    // review stands. Manifests on read-only roots alone are refused, a
+    // manifest on hot or a copy target plans.
+    refused(
+        &inputs(files.clone(), &[&a]),
+        &with(vec![holder("hot")], vec![manifest(read_only("cold-r"))]),
+        &[&b, "read-only root(s) cold-r;"],
+    );
+    planned(&with(
+        vec![holder("hot")],
+        vec![manifest(holder("cold-a")), manifest(read_only("cold-r"))],
+    ));
 }
 
 /// A part of `rows` events in `[min, max]` ms.
