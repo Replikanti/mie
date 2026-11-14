@@ -506,8 +506,9 @@ USAGE:
         roots would keep a moved path's data (set copy_target = true for
         one of them, then run it again). Without --file it also names
         every incomplete replace and every read-only root that still holds
-        a moved path, and fails on a moved path only read-only roots would
-        keep. It takes the archive source's writer lock without waiting,
+        a moved path, and fails on a moved path whose data only read-only
+        roots would keep, outside every quarantine (an unmounted read-only
+        root counts as one). It takes the archive source's writer lock without waiting,
         so it refuses while an import or a rebuild runs; a replace also
         takes the pass lock and needs every cold root's marker. Every copy
         target must carry its marker. Prints what it read, checked and

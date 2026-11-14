@@ -328,12 +328,111 @@ fn read_only_alone_needs_a_writable_data_copy() {
         put(&base, path, Form::Data);
     }
     assert_eq!(roots.read_only_alone(&moved), Ok(Vec::new()));
-    // A copy target's quarantine counts as well, a read-only root's not.
+    // A copy target's quarantine counts as well.
     fs::remove_file(replica::quarantine_dir(&hot, ID).join(&p0)).unwrap();
-    put(&replica::quarantine_dir(&r, ID), &p0, Form::Data);
     assert_eq!(roots.read_only_alone(&moved).unwrap().len(), 1);
     put(&replica::quarantine_dir(&a, ID), &p0, Form::Data);
     assert_eq!(roots.read_only_alone(&moved), Ok(Vec::new()));
+}
+
+/// Re-review of #221, finding 3: a data file in a read-only root's
+/// `.quarantine/<id>/` counts for h like any quarantine copy (D5 never
+/// deletes it), whether or not that root's layout or another read-only
+/// root's layout also holds the path; its manifest alone there does not.
+#[test]
+fn read_only_alone_counts_a_read_only_quarantine_copy() {
+    let p = part("aggTrades", "2026-10-01", 0);
+    let dir = Dir::new("quarantine-ro-alone-roq");
+    let hot = root(&dir, "hot", false);
+    let r = root(&dir, "cold-r", true);
+    let s = root(&dir, "cold-s", true);
+    let roots = ReplaceRoots::read(&hot, &[cold(&r, false), cold(&s, false)]);
+    let moved = record(&[&p]);
+    put(&s, &p, Form::Both);
+    assert_eq!(roots.read_only_alone(&moved).unwrap().len(), 1);
+    // Its manifest alone in cold-r's quarantine: still h = 0.
+    put(&replica::quarantine_dir(&r, ID), &p, Form::Manifest);
+    assert_eq!(roots.read_only_alone(&moved).unwrap().len(), 1);
+    // The data file there: h = 1, cold-s's layout copy is no problem.
+    put(&replica::quarantine_dir(&r, ID), &p, Form::Data);
+    assert_eq!(roots.read_only_alone(&moved), Ok(Vec::new()));
+    // Also in cold-s's own quarantine beside its layout copy.
+    fs::remove_file(replica::quarantine_dir(&r, ID).join(&p)).unwrap();
+    put(&replica::quarantine_dir(&s, ID), &p, Form::Data);
+    assert_eq!(roots.read_only_alone(&moved), Ok(Vec::new()));
+}
+
+/// Re-review of #221, finding 4: with h = 0, a read-only root without a
+/// readable marker (an unmounted root reads as empty) counts as a possible
+/// holder in the proposals, named by its path with the remedy to mount it,
+/// beside the marked holders in configuration order; with h ≥ 1 it is
+/// neither inspected nor named.
+#[test]
+fn read_only_alone_counts_an_unmarked_read_only_root_only_with_h_zero() {
+    let p = part("aggTrades", "2026-10-01", 0);
+    let dir = Dir::new("quarantine-ro-alone-unmarked");
+    let hot = root(&dir, "hot", false);
+    let u = root(&dir, "cold-u", false);
+    let r = root(&dir, "cold-r", true);
+    let roots = ReplaceRoots::read(&hot, &[cold(&u, false), cold(&r, false)]);
+    let moved = record(&[&p]);
+    let unmarked = format!(
+        "{} (no readable marker: an unmounted root reads as empty, so it cannot be confirmed \
+         free of the data file; mount it)",
+        u.display()
+    );
+    // h = 0, r = 0 apart from the unmarked root: it alone fails the path.
+    assert_eq!(
+        roots.read_only_alone(&moved),
+        Ok(vec![read_only_alone_line(
+            &p,
+            std::slice::from_ref(&unmarked),
+            ID,
+            &moved.archive
+        )])
+    );
+    // Beside a marked holder, in configuration order.
+    put(&r, &p, Form::Data);
+    assert_eq!(
+        roots.read_only_alone(&moved),
+        Ok(vec![read_only_alone_line(
+            &p,
+            &[unmarked, "cold-r".to_owned()],
+            ID,
+            &moved.archive
+        )])
+    );
+    // h ≥ 1, from hot's quarantine or from a read-only root's: no line.
+    put(&replica::quarantine_dir(&hot, ID), &p, Form::Data);
+    assert_eq!(roots.read_only_alone(&moved), Ok(Vec::new()));
+    fs::remove_file(replica::quarantine_dir(&hot, ID).join(&p)).unwrap();
+    put(&replica::quarantine_dir(&r, ID), &p, Form::Data);
+    assert_eq!(roots.read_only_alone(&moved), Ok(Vec::new()));
+    // An unmarked copy target is not inspected here: it makes the replace
+    // incomplete instead.
+    let roots = ReplaceRoots::read(&hot, &[cold(&u, true)]);
+    assert_eq!(roots.read_only_alone(&moved), Ok(Vec::new()));
+    assert!(roots.unfinished(&moved, true).unwrap().is_some());
+}
+
+/// The shared predicate's order: a later lookup runs only while every
+/// earlier one finds h = 0, so a read-only root is looked at only when no
+/// writable root counts; an error stops it.
+#[test]
+fn h_zero_short_circuits_in_cost_order() {
+    let never = || -> Result<bool, String> { panic!("looked up after h >= 1") };
+    let never_r = || -> Result<Vec<String>, String> { panic!("r looked up after h >= 1") };
+    assert_eq!(h_zero(|| Ok(true), never, never_r), Ok(Vec::new()));
+    assert_eq!(h_zero(|| Ok(false), || Ok(true), never_r), Ok(Vec::new()));
+    let r = || Ok::<_, String>(vec!["cold-r".to_owned()]);
+    assert_eq!(
+        h_zero(|| Ok(false), || Ok(false), r),
+        Ok(vec!["cold-r".to_owned()])
+    );
+    assert_eq!(
+        h_zero(|| Err("hot".to_owned()), never, never_r),
+        Err("hot".to_owned())
+    );
 }
 
 /// The h = 0 rule fails closed: a read-only root that cannot be inspected

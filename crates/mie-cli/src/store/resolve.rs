@@ -130,15 +130,17 @@
 //!   overwritten), W4, then the read-only info lines; `--replace` is not
 //!   needed. A read-only root holding a moved path is no refusal by itself
 //!   (#216); before W2 the resume refuses, nothing written, a moved path
-//!   whose data file no layout and no `.quarantine/<id>/` of hot or of a
-//!   copy target holds while a read-only root's layout does (the h = 0
-//!   rule, review of #221), naming `copy_target = true` and the resume.
+//!   whose data file no root's `.quarantine/<id>/`, a read-only root's
+//!   included, and no layout of hot or of a copy target holds while a
+//!   read-only root's layout does (the h = 0 rule, review of #221 and its
+//!   re-review), naming `copy_target = true` and the resume.
 //! - **RQ8 Proposals**: without `--file`, one line per supersede record
 //!   on hot with a quarantine; an incomplete replace (by I1's rule, hot
 //!   and the copy targets) fails, naming `--file F`; a marked read-only
 //!   root still holding a moved path gets an info line, and a moved path
-//!   under the h = 0 rule fails with the remedy, never complete
-//!   ([`quarantine::replace_lines`]).
+//!   under the h = 0 rule fails with the remedy, never complete, a
+//!   read-only root without a readable marker counting as a possible
+//!   holder there ([`quarantine::replace_lines`]).
 
 use super::replicate::{self, IMPORT_LEDGER_DIR, META_DIR};
 use super::{

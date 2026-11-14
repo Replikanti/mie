@@ -937,8 +937,8 @@ fn q4_a_copy_target_beside_a_read_only_root_keeps_it_incomplete() {
 }
 
 /// Q5 (#216, review of #221 finding 1): a complete path whose data file
-/// only a read-only layout holds, with no data copy in a quarantine of hot
-/// or of a copy target, is not gone but fails: one problem naming the root
+/// only a read-only layout holds, with no data copy in any root's
+/// quarantine (re-review, finding 3), is not gone but fails: one problem naming the root
 /// and the remedy, beside the info line. Its records do not change, so the
 /// rebuild agrees with I3. Without that layout its bytes are gone, as
 /// before.
@@ -970,8 +970,7 @@ fn q5_a_path_only_a_read_only_layout_holds_fails_with_the_remedy() {
         "{records:?}"
     );
 
-    // A manifest alone in hot's or a copy target's quarantine is no data
-    // copy; a read-only root's quarantine counts for nothing either.
+    // A manifest alone in any root's quarantine is no data copy.
     let manifest_only = |root: &str| {
         let mut q = quarantined_on(root, &[(&p, Some(&t))]);
         q.listing
@@ -986,17 +985,24 @@ fn q5_a_path_only_a_read_only_layout_holds_fails_with_the_remedy() {
     for roots in [
         vec![manifest_only("hot")],
         vec![manifest_only("cold-a")],
-        vec![quarantined_on("cold-r", &[(&p, Some(&t))])],
+        vec![manifest_only("cold-r")],
     ] {
         let found = run_quarantine(&entries, &roots, &layout, &with_text(), &read_only_r());
         assert_eq!(found.problems.len(), 1, "{roots:?}: {found:#?}");
         assert!(found.problems[0].contains("held only by"), "{found:#?}");
         assert_eq!(found.records, records);
     }
-    // A data copy in a copy target's quarantine: no problem.
-    let roots = [quarantined_on("cold-a", &[(&p, Some(&t))])];
-    let found = run_quarantine(&entries, &roots, &layout, &with_text(), &read_only_r());
-    assert!(found.problems.is_empty(), "{found:#?}");
+    // A data copy in a copy target's quarantine, or in a read-only root's
+    // (re-review of #221, finding 3), the read-only layout's own root
+    // included: no problem, the info line stays.
+    for root in ["cold-a", "cold-r", "cold-s"] {
+        let roots = [quarantined_on(root, &[(&p, Some(&t))])];
+        let read_only = BTreeSet::from(["cold-r".to_owned(), "cold-s".to_owned()]);
+        let found = run_quarantine(&entries, &roots, &layout, &with_text(), &read_only);
+        assert!(found.problems.is_empty(), "{root}: {found:#?}");
+        assert_eq!(found.lines[0], read_only_line(&p, "cold-r", QID));
+        assert_eq!(found.records, records);
+    }
 
     // Without the read-only layout the bytes are gone.
     let found = run_quarantine(

@@ -8,7 +8,7 @@
 use super::{FileOf, PlanInputs, ResolveReport, Stop, Survey, Variant, survey};
 use crate::journal::WarmHandoff;
 use crate::store::quarantine::{
-    layout_holds, read_only_alone, read_only_alone_line, superseded_shas, text_rule,
+    h_zero, layout_holds, read_only_alone, read_only_alone_line, superseded_shas, text_rule,
 };
 use crate::store::truncation_line;
 use mie_adapter_binance::archive::catalog::ArchiveStream;
@@ -238,25 +238,30 @@ pub fn plan_replace(
     })
 }
 
-/// RQ2's sole-holder rule over one path's `held`: with h the holders on
-/// hot or a copy target whose layout holds the data file and r the
-/// read-only ones that do, the r roots when h = 0 and r ≥ 1, in holder
-/// order (review of #221, finding 2: a manifest alone is no holder). When
-/// no holder has the data file (h = 0, r = 0), the rule before that
-/// review stands: every holder when all of them are read-only. Otherwise
-/// none.
-fn sole_read_only(held: &[Holder]) -> Vec<&str> {
+/// RQ2's sole-holder rule over one path's `held`, the h = 0 rule
+/// ([`h_zero`]): h counts the holders on hot or a copy target whose layout
+/// holds the data file, r the read-only ones that do, and the r roots are
+/// returned when h = 0 and r ≥ 1, in holder order (review of #221, finding
+/// 2: a manifest alone is no holder). No root holds a data copy in the new
+/// replace's `.quarantine/<id>/`: RQ3 refuses an id whose directory exists
+/// on any root. When no holder has the data file (h = 0, r = 0), the rule
+/// before that review stands: every holder when all of them are read-only.
+/// Otherwise none.
+fn sole_read_only(held: &[Holder]) -> Vec<String> {
     let any_data = held.iter().any(|holder| holder.data);
-    if held
-        .iter()
-        .any(|holder| !holder.read_only && (holder.data || !any_data))
-    {
-        return Vec::new();
-    }
-    held.iter()
-        .filter(|holder| holder.data || !any_data)
-        .map(|holder| holder.root.as_str())
-        .collect()
+    let counted = |holder: &&Holder| holder.data || !any_data;
+    let Ok(roots) = h_zero::<std::convert::Infallible>(
+        || Ok(held.iter().filter(counted).any(|holder| !holder.read_only)),
+        || Ok(false),
+        || {
+            Ok(held
+                .iter()
+                .filter(counted)
+                .map(|holder| holder.root.clone())
+                .collect())
+        },
+    );
+    roots
 }
 
 /// One moved path with every distinct manifest the roots or the copy
@@ -529,15 +534,17 @@ impl Context<'_> {
     }
 
     /// RQ7's h = 0 rule, before anything is written: the first moved path
-    /// whose data file no layout and no `.quarantine/<id>/` of hot or of a
-    /// copy target holds while a read-only root's layout does
-    /// ([`read_only_alone`]) refuses the resume (review of #221, finding 1).
+    /// whose data file no root's `.quarantine/<id>/` and no layout of hot or
+    /// of a copy target holds while a read-only root's layout does
+    /// ([`read_only_alone`]) refuses the resume (review of #221, finding 1,
+    /// and its re-review, finding 3).
     fn check_read_only_alone(&self, moved: &[String], id: &str) -> Result<(), Stop> {
         let mut writable: Vec<(&str, &Path)> = Vec::new();
-        let mut read_only: Vec<(&str, &Path)> = Vec::new();
+        let mut read_only: Vec<(&str, Option<&Path>)> = Vec::new();
         for (root_id, root, is_read_only) in self.rename_order() {
             if is_read_only {
-                read_only.push((root_id, root));
+                // Marked: `check_roots` refused an unmarked root already.
+                read_only.push((root_id, Some(root)));
             } else {
                 writable.push((root_id, root));
             }
@@ -910,10 +917,12 @@ pub(super) fn run_replace(
 /// RQ7: the resume of the replace S_m records (`generation` m). A
 /// read-only root holding a moved path is no refusal by itself (#216): it
 /// gets an info line after W4. The resume refuses, with nothing written,
-/// only a moved path whose data file no layout and no `.quarantine/<id>/`
-/// of hot or of a copy target holds while a read-only root's layout does
-/// (h = 0, r ≥ 1), RQ2's rule with the quarantine counted, since W3 may
-/// already have moved the writable copies (review of #221, finding 1).
+/// only a moved path whose data file no root's `.quarantine/<id>/`, a
+/// read-only root's included, and no layout of hot or of a copy target
+/// holds while a read-only root's layout does (h = 0, r ≥ 1), RQ2's rule
+/// ([`h_zero`]) with the quarantine counted, since W3 may already have
+/// moved the writable copies (review of #221, finding 1, and its
+/// re-review, finding 3).
 ///
 /// # Errors
 ///

@@ -1848,3 +1848,247 @@ fn a_manifest_alone_on_a_copy_target_does_not_count_as_a_holder() {
     assert_eq!(files(&fixture.dir), before);
     assert!(!ledger_file(&fixture, &format!("{}.1.supersede.import", metrics_name())).exists());
 }
+
+/// Removes hot's ledger and rebuilds from the full start with `probe`.
+fn rebuild_probed(fixture: &Fixture, probe: &MapProbe, now: i64) -> (bool, String) {
+    fs::remove_file(hot_ledger(fixture)).unwrap();
+    let mut out = Vec::new();
+    let pass = store::rebuild(
+        &fixture.config,
+        Some(&fixture.dst_archive),
+        Flags::default(),
+        FIRST_HOT,
+        probe,
+        &|| now,
+        &mut out,
+    )
+    .unwrap();
+    let out = String::from_utf8(out).unwrap();
+    assert!(out.contains("wrote "), "{out}");
+    (pass, out)
+}
+
+/// A replace completed while the hot partitions were gone (D6), so its
+/// data copies sit in cold-a's and cold-b's `.quarantine/<id>/` only; with
+/// `c_holds`, a read-only cold-c's layout holds the parts too. Then cold-a,
+/// cold-b and cold-c are read-only beside the empty copy targets cold-d
+/// and cold-e. Returns the parts, that configuration and its probe.
+fn quarantined_then_read_only(
+    fixture: &Fixture,
+    c_holds: bool,
+) -> (Vec<String>, Fixture, MapProbe) {
+    let (_, parts) = conflict(fixture);
+    let aside = fixture.dir.join("hot-aside");
+    for part in &parts {
+        let from = fixture.hot().join(partition_of(part));
+        let to = aside.join(partition_of(part));
+        if from.exists() {
+            fs::create_dir_all(to.parent().unwrap()).unwrap();
+            fs::rename(&from, &to).unwrap();
+        }
+    }
+    replicate(fixture, RESOLVED - 10);
+    rebuild_from(fixture, "full", Flags::default(), RESOLVED - 5);
+    let with_c = with_cold_c(fixture, false, "c");
+    if c_holds {
+        for part in &parts {
+            copy_part(&cold(fixture, "cold-a"), &cold(fixture, "cold-c"), part);
+        }
+    }
+    let (pass, out) = replace(&with_c, RESOLVED);
+    assert!(pass, "{out}");
+    assert_eq!(quarantined_data(fixture, &parts), 4, "{out}");
+    let layout = [
+        ("cold-a", false),
+        ("cold-b", false),
+        ("cold-c", false),
+        ("cold-d", true),
+        ("cold-e", true),
+    ];
+    let re = reconfigured(fixture, &layout, "ro");
+    let mut probe = probe_with_c_d(fixture);
+    probe.0.push((cold(fixture, "cold-e"), 6));
+    (parts, re, probe)
+}
+
+/// Re-review of #221, finding 3: a data copy in a read-only root's
+/// `.quarantine/<id>/` counts for the h = 0 rule (D5 never deletes it). The
+/// replace's quarantine copies on cold-a and cold-b stay counted after
+/// both are reconfigured read-only, so the proposals call the replace
+/// complete and the rebuild passes, with no `FAIL:` line, whether or not a
+/// read-only cold-c's layout also holds the parts (then it gets its info
+/// lines only).
+#[test]
+fn quarantine_copies_on_roots_later_read_only_still_count() {
+    for c_holds in [false, true] {
+        let (_dir, fixture) = adopted(&format!("replace-ro-quarantine-{c_holds}"));
+        let (parts, re, probe) = quarantined_then_read_only(&fixture, c_holds);
+        let archive = Some(re.dst_archive.as_path());
+        let info = if c_holds { parts.len() } else { 0 };
+
+        let (pass, out) = resolve_with(&re, None, &probe, archive, RESOLVED + HOUR);
+        assert!(pass && !out.contains("FAIL"), "{c_holds}: {out}");
+        assert!(out.contains(": complete"), "{c_holds}: {out}");
+        assert_eq!(read_only_lines(&out).len(), info, "{c_holds}: {out}");
+
+        let (pass, out) = rebuild_probed(&re, &probe, RESOLVED + 2 * HOUR);
+        assert!(pass && !out.contains("FAIL"), "{c_holds}: {out}");
+        assert_rebuilt_beside_cold_c(&out, "full", info);
+        assert_eq!(quarantined_data(&fixture, &parts), 4);
+    }
+}
+
+/// Re-review of #221, QA gap: the rebuild (Q5) prints the h = 0 `FAIL:`
+/// line. One data copy in a read-only root's quarantine is enough (h = 1,
+/// no line); once only its manifest is left there (a hand deletion of the
+/// data file), no quarantine holds a data copy while read-only cold-c's
+/// layout does, and the rebuild fails each path with the remedy, as RQ8
+/// does.
+#[test]
+fn the_rebuild_fails_a_path_no_quarantine_holds_the_data_of() {
+    let (_dir, fixture) = adopted("replace-ro-q5-fail");
+    let (parts, re, probe) = quarantined_then_read_only(&fixture, true);
+    let archive = Some(re.dst_archive.as_path());
+    let (qa, qb) = (
+        replica::quarantine_dir(&cold(&fixture, "cold-a"), &id()),
+        replica::quarantine_dir(&cold(&fixture, "cold-b"), &id()),
+    );
+    for part in &parts {
+        fs::remove_file(qb.join(part)).unwrap();
+    }
+    let (pass, out) = rebuild_probed(&re, &probe, RESOLVED + HOUR);
+    assert!(pass && !out.contains("FAIL"), "{out}");
+    assert_rebuilt_beside_cold_c(&out, "full", parts.len());
+
+    for part in &parts {
+        fs::remove_file(qa.join(part)).unwrap();
+    }
+    assert_eq!(quarantined_data(&fixture, &parts), 0);
+    let remedy = [
+        "read-only root(s) cold-c;",
+        "copy_target = true",
+        "mie store resolve --file",
+    ];
+    let (pass, out) = rebuild_probed(&re, &probe, RESOLVED + 2 * HOUR);
+    assert!(!pass, "{out}");
+    for part in &parts {
+        assert_fail_line(&out, &[&[part.as_str(), "only"], &remedy[..]].concat());
+    }
+    assert!(!out.contains("bytes are gone"), "{out}");
+    let (pass, out) = resolve_with(&re, None, &probe, archive, RESOLVED + 3 * HOUR);
+    assert!(!pass && !out.contains(": complete"), "{out}");
+    assert_fail_line(&out, &[&[parts[0].as_str(), "only"], &remedy[..]].concat());
+}
+
+/// Moves `root` aside and leaves an empty directory in its place, as an
+/// unmounted mount point reads; returns where it went.
+fn unmount(root: &Path) -> PathBuf {
+    let aside = root.with_extension("off");
+    fs::rename(root, &aside).unwrap();
+    fs::create_dir_all(root).unwrap();
+    aside
+}
+
+/// Undoes [`unmount`].
+fn remount(root: &Path, aside: &Path) {
+    fs::remove_dir(root).unwrap();
+    fs::rename(aside, root).unwrap();
+}
+
+/// Re-review of #221, finding 4: with h = 0 the proposals count an unmarked
+/// read-only root as a possible data holder (fail closed): finding 1's
+/// state with cold-a and cold-b, the only holders, unmounted still fails,
+/// naming each root and that it must be mounted, and never calls the
+/// replace complete. With h ≥ 1 (after the remedy) an unmounted read-only
+/// root is neither inspected nor named, so a healthy store with an
+/// unmounted old disk stays clean.
+#[test]
+fn an_unmounted_read_only_root_counts_as_a_holder_only_with_h_zero() {
+    let (_dir, fixture) = adopted("replace-ro-unmounted");
+    if !permissions_bind(&fixture.dir) {
+        return;
+    }
+    let (_, parts) = conflict(&fixture);
+    let aside = fixture.dir.join("hot-aside");
+    for part in &parts {
+        let from = fixture.hot().join(partition_of(part));
+        let to = aside.join(partition_of(part));
+        fs::create_dir_all(to.parent().unwrap()).unwrap();
+        fs::rename(&from, &to).unwrap();
+    }
+    replicate(&fixture, RESOLVED - 10);
+    rebuild_from(&fixture, "full", Flags::default(), RESOLVED - 5);
+    // The replace stops on cold-a before any rename; an empty start.
+    let a = cold(&fixture, "cold-a");
+    let partitions: BTreeSet<PathBuf> = parts.iter().map(|p| a.join(partition_of(p))).collect();
+    for partition in &partitions {
+        chmod(partition, 0o555);
+    }
+    let (pass, _) = replace(&fixture, RESOLVED);
+    for partition in &partitions {
+        chmod(partition, 0o755);
+    }
+    assert!(!pass);
+    replicate(&fixture, RESOLVED + 1);
+    rebuild_from(&fixture, "empty", Flags::default(), RESOLVED + 2);
+    assert!(held(&fixture).is_empty());
+
+    let probe = probe_with_c_d(&fixture);
+    let layout = [
+        ("cold-a", false),
+        ("cold-b", false),
+        ("cold-c", true),
+        ("cold-d", true),
+    ];
+    let re = reconfigured(&fixture, &layout, "ro");
+    let archive = Some(re.dst_archive.as_path());
+    let (pass, out) = resolve_with(&re, None, &probe, archive, RESOLVED + HOUR);
+    assert!(!pass && !out.contains(": complete"), "{out}");
+    assert_fail_line(&out, &[parts[0].as_str(), "only", "cold-a, cold-b"]);
+
+    // Both holders unmounted: still a FAIL per path, naming both by path.
+    let b = cold(&fixture, "cold-b");
+    let (a_off, b_off) = (unmount(&a), unmount(&b));
+    let (pass, out) = resolve_with(&re, None, &probe, archive, RESOLVED + HOUR + 1);
+    assert!(!pass && !out.contains(": complete"), "{out}");
+    for part in &parts {
+        for root in [&a, &b] {
+            assert_fail_line(
+                &out,
+                &[
+                    part.as_str(),
+                    &format!("{} (no readable marker", root.display()),
+                    "mount it",
+                ],
+            );
+        }
+    }
+    remount(&a, &a_off);
+    remount(&b, &b_off);
+
+    // The remedy: cold-a a copy target, a resume; then cold-b, read-only
+    // and still holding the parts, unmounted: no line names it.
+    let layout = [
+        ("cold-a", true),
+        ("cold-b", false),
+        ("cold-c", true),
+        ("cold-d", true),
+    ];
+    let back = reconfigured(&fixture, &layout, "a-target");
+    let archive = Some(back.dst_archive.as_path());
+    let (pass, out) = resolve_with(
+        &back,
+        Some(&metrics_file()),
+        &probe,
+        archive,
+        RESOLVED + 2 * HOUR,
+    );
+    assert!(pass && out.contains("resume:"), "{out}");
+    let _b_off = unmount(&b);
+    let (pass, out) = resolve_with(&back, None, &probe, archive, RESOLVED + 2 * HOUR + 1);
+    assert!(pass && !out.contains("FAIL"), "{out}");
+    assert!(
+        out.contains(": complete") && !out.contains("cold-b"),
+        "{out}"
+    );
+}

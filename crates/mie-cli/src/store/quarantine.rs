@@ -44,12 +44,14 @@
 //!   on hot or a copy target, by I1's rule) is a problem naming `mie store
 //!   resolve --file F`. A marked read-only root whose layout still holds a
 //!   moved path gets an info line ([`read_only_line`]), never a problem of
-//!   its own. A moved path whose data file no layout and no
-//!   `.quarantine/<id>/` of hot or of a copy target holds while a
-//!   read-only layout does is a problem with the remedy
-//!   ([`ReplaceRoots::read_only_alone`], the h = 0 rule of review of
-//!   #221), and its replace is never reported complete. I1 does not apply
-//!   that rule: no byte is lost in that state and the remedy works after
+//!   its own. A moved path whose data file no root holds in its
+//!   `.quarantine/<id>/`, a read-only root included, and no layout of hot
+//!   or of a copy target holds, while a read-only layout does or a
+//!   read-only root presents no readable marker, is a problem with the
+//!   remedy ([`ReplaceRoots::read_only_alone`], the h = 0 rule of review
+//!   of #221 and its re-review, findings 3 and 4, decided by [`h_zero`]),
+//!   and its replace is never reported complete. I1 does not apply that
+//!   rule: no byte is lost in that state and the remedy works after
 //!   `replaced` (ADR-062 D11 *As amended (#216)*).
 
 use mie_adapter_binance::archive::ledger::{
@@ -170,11 +172,14 @@ impl ReplaceRoots {
     }
 
     /// The h = 0 rule over `record` ([`read_only_alone`]): one problem
-    /// ([`read_only_alone_line`]) per moved path whose data file no layout
-    /// and no `.quarantine/<id>/` of hot or of a marked copy target holds
-    /// while the layout of a marked read-only root does. An unmarked root is
-    /// not inspected: an unmarked copy target already makes the replace
-    /// incomplete.
+    /// ([`read_only_alone_line`]) per moved path whose data file no root
+    /// holds in its `.quarantine/<id>/`, and no layout of hot or of a marked
+    /// copy target, while the layout of a read-only root does or a
+    /// read-only root presents no readable marker. An unmarked read-only
+    /// root counts as a possible holder only then (fail closed: an
+    /// unmounted root reads as empty; re-review of #221, finding 4); an
+    /// unmarked copy target is not inspected, since it already makes the
+    /// replace incomplete.
     ///
     /// # Errors
     ///
@@ -183,14 +188,21 @@ impl ReplaceRoots {
         let Some(quarantine) = &record.quarantine else {
             return Ok(Vec::new());
         };
-        let marked = |counts: bool| -> Vec<(&str, &Path)> {
-            self.roots
-                .iter()
-                .filter(|root| root.counts == counts)
-                .filter_map(|root| root.id.as_deref().map(|id| (id, root.path.as_path())))
-                .collect()
-        };
-        let (writable, read_only) = (marked(true), marked(false));
+        let writable: Vec<(&str, &Path)> = self
+            .roots
+            .iter()
+            .filter(|root| root.counts)
+            .filter_map(|root| root.id.as_deref().map(|id| (id, root.path.as_path())))
+            .collect();
+        let read_only: Vec<(&str, Option<&Path>)> = self
+            .roots
+            .iter()
+            .filter(|root| !root.counts)
+            .map(|root| {
+                let marked = root.id.is_some().then_some(root.path.as_path());
+                (root.label.as_str(), marked)
+            })
+            .collect();
         let mut problems = Vec::new();
         for path in &quarantine.moved {
             let alone = read_only_alone(&writable, &read_only, path, &quarantine.id)?;
@@ -207,22 +219,55 @@ impl ReplaceRoots {
     }
 }
 
-/// The h = 0 rule of the resume (RQ7), the proposals (RQ8) and, over its
-/// own listings, the rebuild (Q5), as RQ2 applies it to a new replace
-/// (ADR-062 D11 *As amended (#216)*, review of #221): the read-only roots
-/// of `read_only` whose layout holds the data file of `path` (r), when no
-/// root of `writable` (hot and the copy targets) holds it in its
-/// `.quarantine/<id>/` or its layout (h = 0); otherwise none. A manifest
-/// alone is no holder: the superseded bytes are the data file's.
+/// The h = 0 rule (ADR-062 D11 *As amended (#216)*), the one predicate
+/// RQ2, the resume (RQ7), the proposals (RQ8) and the rebuild and the
+/// restore (Q5) decide it with, so they cannot drift. For one moved path,
+/// h counts the roots holding its data file in their `.quarantine/<id>/`,
+/// any root, a read-only one included (D5 never deletes a quarantine
+/// copy), and hot and the copy targets whose layout holds it; r names the
+/// read-only roots whose layout holds it or that cannot be confirmed not
+/// to. The path fails, and r is returned, when h = 0 and r ≥ 1; otherwise
+/// nothing is.
+///
+/// Each caller supplies the three lookups; they run in this order and stop
+/// at the first that makes h ≥ 1, so a read-only root is looked at only
+/// when no writable root counts: `writable`, whether hot or a copy target
+/// holds the data file in its quarantine or its layout; then
+/// `read_only_quarantined`, whether a read-only root holds it in its
+/// quarantine; then `read_only_layout`, r.
+///
+/// # Errors
+///
+/// The first error of a lookup.
+pub fn h_zero<E>(
+    writable: impl FnOnce() -> Result<bool, E>,
+    read_only_quarantined: impl FnOnce() -> Result<bool, E>,
+    read_only_layout: impl FnOnce() -> Result<Vec<String>, E>,
+) -> Result<Vec<String>, E> {
+    if writable()? || read_only_quarantined()? {
+        return Ok(Vec::new());
+    }
+    read_only_layout()
+}
+
+/// The h = 0 rule ([`h_zero`]) of the resume (RQ7) and the proposals (RQ8)
+/// over the roots themselves: `writable` (hot and the copy targets) and
+/// `read_only`, each read-only root with its path when it presents a
+/// readable marker. A manifest alone is no holder: the superseded bytes
+/// are the data file's.
 ///
 /// Cost per call: at most 1 `lstat` per writable root in its quarantine,
 /// then, only when none holds it there, at most 1 per writable root in its
-/// layout, then, only with h = 0, 1 per read-only root; it stops at the
-/// first writable hit.
+/// layout, then, only when none holds it there either, at most 1 per
+/// marked read-only root in its quarantine, then, only with h = 0, 1 per
+/// marked read-only root in its layout; it stops at the first hit that
+/// makes h ≥ 1. An unmarked read-only root costs nothing.
 ///
-/// A read-only root that cannot be inspected counts as holding the data,
-/// named with its error: with h = 0 the rule fails closed rather than read
-/// an error as an absence.
+/// With h = 0 the rule fails closed: a read-only root without a readable
+/// marker (an unmounted root reads as empty) and one whose layout cannot
+/// be inspected count in r, named with the reason. An error inspecting a
+/// read-only root's quarantine counts as no copy there, which can only
+/// lower h.
 ///
 /// # Errors
 ///
@@ -230,35 +275,59 @@ impl ReplaceRoots {
 /// found", naming the root.
 pub fn read_only_alone(
     writable: &[(&str, &Path)],
-    read_only: &[(&str, &Path)],
+    read_only: &[(&str, Option<&Path>)],
     path: &str,
     quarantine_id: &str,
 ) -> Result<Vec<String>, String> {
     let held = |label: &str, file: PathBuf| {
         exists(&file).map_err(|error| format!("inspect {path} on {label}: {error}"))
     };
-    for (label, root) in writable {
-        if held(
-            label,
-            replica::quarantine_dir(root, quarantine_id).join(path),
-        )? {
-            return Ok(Vec::new());
-        }
-    }
-    for (label, root) in writable {
-        if held(label, root.join(path))? {
-            return Ok(Vec::new());
-        }
-    }
-    let mut alone = Vec::new();
-    for (label, root) in read_only {
-        match exists(&root.join(path)) {
-            Ok(false) => {}
-            Ok(true) => alone.push((*label).to_owned()),
-            Err(error) => alone.push(format!("{label} (cannot be inspected: {error})")),
-        }
-    }
-    Ok(alone)
+    let marked = || {
+        read_only
+            .iter()
+            .filter_map(|(label, root)| root.map(|root| (*label, root)))
+    };
+    h_zero(
+        || {
+            for (label, root) in writable {
+                if held(
+                    label,
+                    replica::quarantine_dir(root, quarantine_id).join(path),
+                )? {
+                    return Ok(true);
+                }
+            }
+            for (label, root) in writable {
+                if held(label, root.join(path))? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        },
+        || {
+            Ok(marked().any(|(_, root)| {
+                exists(&replica::quarantine_dir(root, quarantine_id).join(path)).unwrap_or(false)
+            }))
+        },
+        || {
+            let mut alone = Vec::new();
+            for (label, root) in read_only {
+                let Some(root) = root else {
+                    alone.push(format!(
+                        "{label} (no readable marker: an unmounted root reads as empty, so it \
+                         cannot be confirmed free of the data file; mount it)"
+                    ));
+                    continue;
+                };
+                match exists(&root.join(path)) {
+                    Ok(false) => {}
+                    Ok(true) => alone.push((*label).to_owned()),
+                    Err(error) => alone.push(format!("{label} (cannot be inspected: {error})")),
+                }
+            }
+            Ok(alone)
+        },
+    )
 }
 
 /// The problem of a moved path whose data only read-only roots hold

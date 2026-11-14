@@ -1289,9 +1289,10 @@ live in more than one root (approved as written at STOP 1).
     naming the holders that are hot or a copy target, and an open start
     hold stays open); a path no root's quarantine or layout holds ("its
     bytes are gone; nothing in mie deletes them"); a quarantined part no
-    record names; a complete path whose data file no `.quarantine/<id>/`
-    of hot or of a copy target holds while a read-only root's layout does
-    (D11 *As amended (#216)*, the h = 0 rule of review of #221), naming
+    record names; a complete path whose data file no root's
+    `.quarantine/<id>/`, a read-only root's included, holds while a
+    read-only root's layout does (D11 *As amended (#216)*, the h = 0 rule
+    of review of #221 and its re-review), naming
     those roots and the remedy, with Q4's records unchanged so the rebuild
     still derives what I3 wrote. A read-only root whose layout holds a Q
     path gets an info line besides, never a `FAIL:` line of its own, and a
@@ -2516,10 +2517,11 @@ What breaks:
       open holds; then an info line per read-only root whose layout still
       holds a moved path. A read-only holder is no refusal by itself (*As
       amended (#216)*), but before W2 the resume refuses, nothing written,
-      a moved path whose data file no layout and no `.quarantine/<id>/` of
-      hot or of a copy target holds while a read-only root's layout does
-      (the h = 0 rule, review of #221), naming the path, those roots and
-      the remedy. `--replace` is not needed, since S_m records the
+      a moved path whose data file no root's `.quarantine/<id>/`, a
+      read-only root's included, and no layout of hot or of a copy target
+      holds while a read-only root's layout does (the h = 0 rule, review
+      of #221 and its re-review), naming the path, those roots and the
+      remedy. `--replace` is not needed, since S_m records the
       decision. With nothing missing it prints that the replace is
       complete and the re-import pending, and passes. An S_m with
       `quarantine -` keeps RA5 (b) unless `--replace` is given; then a
@@ -2533,7 +2535,9 @@ What breaks:
       so does each marked read-only root whose layout still holds a moved
       path (*As amended (#216)*). A moved path under the h = 0 rule is a
       `FAIL:` line with the remedy, and its replace is never reported
-      complete (review of #221).
+      complete (review of #221); there a read-only root without a readable
+      marker counts as a possible data holder, named by its path with
+      "mount it" (re-review of #221, finding 4).
     - **I1 The importer's gate.** `mie archive-import`, its dry runs too,
       refuses after its hold check and from the same ledger read while a
       supersede record on hot with a quarantine has a moved path whose
@@ -2627,19 +2631,33 @@ What breaks:
 
       The resume (RQ7), the proposals (RQ8) and the rebuild and the
       restore (Q5) apply the same h = 0 rule, with h also counting a data
-      file in the `.quarantine/<id>/` of hot or of a copy target, since W3
-      may already have moved the writable copies (review of #221, finding
-      1). On h = 0 and r ≥ 1 the resume refuses with nothing written,
+      file in the `.quarantine/<id>/` of any root, a read-only root
+      included, since W3 may already have moved the writable copies
+      (review of #221, finding 1) and a root holding them may since have
+      been configured read-only (re-review, finding 3). For RQ2 that term
+      is always 0: RQ3 refuses an id whose directory exists on any root.
+      One predicate (`h_zero`) decides the rule for all four, so they
+      cannot drift: it looks up the writable roots (quarantines, then
+      layouts) first, then the read-only quarantines, then r, and stops at
+      the first lookup that makes h ≥ 1, so a read-only root is looked at
+      only when no writable root counts. On h = 0 and r ≥ 1 the resume
+      refuses with nothing written,
       naming the path, the read-only roots in configuration order and the
       remedy: `copy_target = true` for one of them, then `mie store resolve
       --file F`, which moves its copy into quarantine. RQ8 and Q5 print a
       `FAIL:` line with the same remedy, and RQ8 never calls such a
       replace complete. Q5 keeps Q4's records and its *complete*, which
       is I1's and I3's commit point, so the rebuild still derives what the
-      importer wrote (AW12). In the resume and RQ8 a read-only root that
-      cannot be inspected counts as a data holder, named with its error
-      (fail closed); in Q5 a cold copy counts unless its data was checked
-      and is missing. I1 does not apply the rule (below).
+      importer wrote (AW12). With h = 0 the rule fails closed: in the
+      resume and RQ8 a read-only root whose layout cannot be inspected
+      counts in r, named with its error, and in RQ8 so does a read-only
+      root without a readable marker, named by its path with "mount it"
+      (re-review, finding 4; the resume and the rebuild refuse such a root
+      before they get there); an error inspecting a read-only root's
+      quarantine counts as no copy there, which can only lower h; in Q5 a
+      cold copy counts unless its data was checked and is missing. With
+      h ≥ 1 no read-only root is inspected, so an unmounted one fails
+      nothing. I1 does not apply the rule (below).
 
       RQ1 is unchanged, and the text rule (W2, Q4) still reads read-only
       layouts, so a full and an empty rebuild start derive the same text.
@@ -2722,6 +2740,28 @@ What breaks:
       condition picks the replace although its entry exists, I1 halts the
       importer until the resume has moved the copy, and the resume finds
       h ≥ 1.
+    - **Why a read-only root's quarantine copy counts** (re-review of
+      #221, finding 3). The rule exists so that the superseded data does
+      not end up only in a read-only root's layout, outside every
+      quarantine. A data file in a read-only root's `.quarantine/<id>/` is
+      inside a quarantine: D5 never deletes it, `select` never lists it,
+      and no command moves it. Counting only the quarantines of hot and of
+      the copy targets made the rule depend on configuration rather than
+      on where the bytes are: after a completed replace whose quarantine
+      copies sit on cold-a and cold-b, configuring both read-only beside
+      empty copy targets passed with no other copy, and failed once a
+      read-only cold-c's layout also held the parts, telling the operator
+      to make cold-c a copy target, a write no rule needed, while the
+      quarantine copies went unmentioned.
+    - **Why an unmarked read-only root counts in RQ8 with h = 0**
+      (re-review of #221, finding 4). An unmounted root reads as empty, so
+      skipping it read the commonest root that cannot be inspected as an
+      absence: finding 1's state with its read-only holders unmounted was
+      called complete, and failed again once they were back. The resume
+      and the rebuild already refuse a root without its marker; RQ8 now
+      fails the path instead, naming the root and "mount it". It counts
+      only with h = 0, so a healthy store with an unmounted old disk stays
+      clean.
     - **Why I1 does not apply it.** I1 is the write commit point and runs
       on every import, dry runs included, over every supersede record
       ever written. The h = 0 state is about quarantine completeness, not
@@ -2741,16 +2781,22 @@ What breaks:
       and RQ8 (`read_only_alone`) costs per moved path: 1 `lstat` per
       writable root in its `.quarantine/<id>/` until the first hit, then,
       with none there, 1 per writable root in its layout until the first
-      hit, then, only with h = 0, 1 per marked read-only root. With k = 2
-      the writable roots are hot and 2 targets, so: 1 when hot's
-      quarantine holds the data (the normal end state of a replace made
-      while hot held the part), 2 or 3 when only a target's quarantine
-      does (hot's partition removed before the replace, D6), at most
-      3 + 3 = 6 with h ≥ 1, and 6 + R with h = 0. RQ8 pays it once per
-      moved path per run beside `unfinished`'s 6, the resume once before
-      W2. Q5 adds no I/O: it reads the quarantine listings (with their
-      `data` flag) and the layout listings the rebuild and the restore
-      already read.
+      hit, then, with none there either, 1 per marked read-only root in
+      its `.quarantine/<id>/` until the first hit, then, only with h = 0,
+      1 per marked read-only root in its layout; an unmarked one costs
+      nothing. With k = 2 the writable roots are hot and 2 targets, and
+      with R marked read-only roots: 1 when hot's quarantine holds the
+      data (the normal end state of a replace made while hot held the
+      part), 2 or 3 when only a target's quarantine does (hot's partition
+      removed before the replace, D6), at most 3 + 3 = 6 with h ≥ 1 from a
+      writable root, 6 + 1 to 6 + R when only a read-only root's
+      quarantine holds it (finding 3's state), and 6 + 2R with h = 0. The
+      read-only lookups never run in the first three cases, so the normal
+      end state costs what it did before the re-review. RQ8 pays it once
+      per moved path per run beside `unfinished`'s 6, the resume once
+      before W2. Q5 adds no I/O: it reads the quarantine listings (with
+      their `data` flag) and the layout listings the rebuild and the
+      restore already read.
     - **Rejected:**
       - a refusal scoped to the affected file with a command that releases
         it (#195 STOP 1 decision 1): the release needs the record kind
@@ -2772,20 +2818,41 @@ What breaks:
         the resume (review of #221, finding 1);
       - the h = 0 rule in I1: the cost and the reason in *Why I1 does not
         apply it*;
-      - counting a manifest alone as a holder: finding 2 above.
+      - counting a manifest alone as a holder: finding 2 above;
+      - counting only the quarantines of hot and of the copy targets in h
+        (the review round of #221): finding 3 above;
+      - counting a read-only root's quarantine copy in r instead, so that
+        finding 3's state fails without cold-c too: the bytes are in a
+        quarantine, which is all the rule asks, and the remedy would demand
+        a configuration change and a resume that move nothing of the data
+        into a quarantine it is not already in;
+      - skipping an unmarked read-only root in RQ8 (the review round of
+        #221): finding 4 above;
+      - counting an unmarked read-only root also with h ≥ 1: an unmounted
+        old disk would fail every replace in RQ8, since mie cannot tell
+        which paths it holds, although a quarantine already holds a data
+        copy of each.
     - **Residual:** the superseded bytes on a read-only root stay in its
       layout, not in `.quarantine/<id>/`, whether the root held the path at
       the replace or was added after it. A replace that mie runs, a new
       one or a resume, leaves every moved path whose data any root holds
       with a data copy in a `.quarantine/<id>/` of hot or of a copy
       target: RQ2 and the resume refuse otherwise, and W3 moves every
-      writable copy. That state can still arise outside mie, by
-      reconfiguring the roots holding the quarantine copies read-only or
-      by a hand deletion. mie never reports it complete: RQ8 and Q5 print
-      a `FAIL:` line with the remedy, and the resume refuses until the
-      remedy is applied. I1 does not check it, so the import can write
-      `replaced` meanwhile; the remedy still works then (*Why the resume,
-      RQ8 and Q5 apply it too*). A moved path no root holds the data file
+      writable copy. Configuring those roots read-only later changes
+      nothing, since a read-only root's quarantine copy counts. The state
+      with no data copy in any root's `.quarantine/<id>/` while a
+      read-only layout holds the data (h = 0, r ≥ 1) can still arise
+      outside mie: by a hand deletion of the quarantine copies, or by
+      taking the roots that hold them out of `cold_roots`. Then the resume
+      refuses until the remedy is applied; RQ8 prints a `FAIL:` line with
+      the remedy and does not call the replace complete, also when a
+      read-only root presents no readable marker (it is named, with
+      "mount it"); and Q5 prints the same `FAIL:` line for a path Q4 finds
+      complete, while an incomplete one already fails as stopped between
+      renames, naming the resume, which refuses with the remedy. I1 does
+      not check it, so the import can write `replaced` meanwhile; the
+      remedy still works then (*Why the resume, RQ8 and Q5 apply it
+      too*). A moved path no root holds the data file
       of (h = 0, r = 0) keeps the rules before review of #221: Q5 names its
       bytes gone when neither a layout nor a quarantine holds anything of
       it, and a read-only layout holding its manifest alone gets the info
