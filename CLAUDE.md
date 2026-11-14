@@ -24,6 +24,12 @@ architecture. Public repository (MIT).
 3. **One domain path** for live and replay (ADR-019). Replay is an adapter,
    never a second implementation of market logic.
 4. **Raw data is immutable** and the source of truth (ADR-003, ADR-022).
+   A sealed file keeps its relative path, bytes and manifest wherever it
+   lives (hot or a cold root, ADR-062 D4) and is never removed from the
+   union of the roots. The one exception is the *replace* resolution of a
+   held archive part: the superseded generation moves into a quarantine
+   directory within each root, is never deleted, and every selection
+   covering it fails until the re-import's entry replaces it (ADR-062 D5).
    Every derived feature is reproducible from versioned raw data plus a
    versioned feature definition.
 5. **LLMs are research operators**, never numerical authority (ADR-011,

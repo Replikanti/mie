@@ -1,6 +1,6 @@
 # ADR-062: Raw-data retention and storage tiers
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-11-05
 
 Relation to earlier ADRs: this ADR supersedes one point of ADR-034 D4:
@@ -11,9 +11,9 @@ since #210, the PR that changed the importer, as ADR-052 does for the ADRs
 it supersedes. It builds on ADR-030 (the immutable raw
 store and its dataset version), ADR-032 D5 and D10 (the seed lookback,
 the seal cadence), ADR-039 (replay over the raw store) and ADR-052 (the
-history chain from a fixed origin). The CLAUDE.md invariant 4,
-`docs/data-availability.md` and the other accepted ADRs stay as they are
-until the follow-up implements D5–D7 and D11.
+history chain from a fixed origin). #196 restated the CLAUDE.md
+invariant 4 and `docs/data-availability.md` for the tiered model; the
+other accepted ADRs are unchanged.
 
 The decisions record the #134 plan
 (<https://github.com/Replikanti/mie/issues/134#issuecomment-6660674077>)
@@ -97,7 +97,7 @@ data changes no dataset version.
 | `trades` (archive, opt-in) | — | the `aggTrades` fold (ADR-050), the kline cross-check | 81.5 MB/day mean, when imported | keep |
 | capture journal | — | every live replay (ADR-039 D1), the chain | 5.1–5.6 MB/24 h; 15.1 for #99 (M1-11) | keep, on hot |
 | import ledger | — | the exactly-once import (ADR-034 D4) | ≈ 6 KB per imported day (M1-15) | keep, on hot |
-| copy ledger (new, D7) | — | `select` for moved partitions, D6, D11 | ≈ 1.6 MB/day, estimated (Numbers table) | keep, on hot |
+| copy ledger (new, D7) | — | `select` for moved partitions, D6, D11 | ≈ 1.65 MB per day of capture + 0.012 MB per imported day, estimated from measured records (Numbers table) | keep, on hot |
 
 Rates: live ranges are across the stores with depth (M1 live table);
 archive rates are the mean per imported day (M1 archive table).
@@ -184,10 +184,10 @@ the D2 consequence.
      a marker written there would make it look mounted, so the replicator
      would fill the parent's disk and the real mount, once back, would
      hide the marker and the copies. The parent's filesystem is hot's only
-     when the mount points lie on hot's disk, so the hot comparison alone
-     misses mount points on another disk (the system disk, say). The
-     consequence: a cold root is the mount point itself, never a
-     subdirectory of a mounted volume. Every device check goes through one
+     when the mount points lie on hot's filesystem, so the hot comparison
+     alone misses mount points on another filesystem (the system disk's,
+     say). The consequence: a cold root is the mount point itself, never
+     a subdirectory of a mounted volume. Every device check goes through one
      probe; only the production host can show distinct devices, so this
      acceptance is verified at provisioning, where the command runs
      against the real mounts;
@@ -198,6 +198,100 @@ the D2 consequence.
   `replicate` (one replication pass, D11; #189) and `adopt` (the
   bootstrap of an existing store, D10; #190); the later steps of the
   follow-up add their verbs to it.
+- **What a cold root must provide** (#196). The POSIX behaviour mie relies
+  on, stated without naming a filesystem, product or host: the production
+  host is not chosen yet, and the host runs of #190–#195 used plain
+  directories on a development machine (#184 STOP 1 decision 1). Each
+  entry names the operations that rely on it and what fails without it.
+  Every entry was checked against the code of #187–#195.
+  - *Every cold root* (copy targets and read-only roots):
+    - **R1, byte-exact reads, coherent after a write on the same host.**
+      `select`'s ordered read hashes each file against its manifest (D7);
+      the verification reads every copy (`replica::verify_sealed`,
+      `check_sealed_copy`); `replica::copy_sealed` reads both temp files
+      back before it publishes them, and `replica::extend_prefix` compares
+      the copy's last record and reads its appends back. Without it the
+      read-back proves nothing, and the verification misses damage or
+      reports damage that is not there.
+    - **R2, names kept byte for byte.** Names are stored, listed and
+      looked up exactly as written, case included, and names that differ
+      only in case stay distinct (`validate_segment` allows such pairs,
+      and the D5 identity is the byte-exact relative path). Dot-prefixed
+      names are allowed: the seal temp names `.part-NNNNN.parquet.tmp` and
+      `.part-NNNNN.manifest.tmp`, `.<name>.tmp`
+      (`replica::copy_immutable`), `.<name>.rebuild.tmp`
+      (`replica::rebuild_prefix`), `.mie/`, `.mie-init-<pid>-<n>.tmp`
+      (`root_marker::create_meta`) and `.quarantine/`. The layout's
+      characters are `[A-Za-z0-9._=-]`. Without it two paths share one
+      file, or a copy is not found under its own path.
+    - **R3, complete directory listings** of a directory nothing writes
+      during the walk: `mie store rebuild` and `mie store restore` walk
+      every cold root (`replica::list_sealed`, `list_evidence`,
+      `list_temps`) under the pass and verification locks. A dropped entry
+      turns a present file into a lost candidate.
+    - **R4, read access for every reader:** `mie replay`, `mie
+      equivalence`, the importer's recall and every `mie store` command
+      can read and list every root.
+  - *A copy target in addition:*
+    - **T1, one filesystem per root, with no mount point inside it.**
+      Every rename mie does on a copy target stays within the root: the D5
+      publish (`copy_sealed`, `copy_immutable`), `replica::move_aside`
+      into `.quarantine/<id>/…` (the replace) and into
+      `.mie/damaged/<at_ms>/…` (the repair and the hot restore),
+      `replica::move_file_aside` and `rebuild_prefix` (the repair's and
+      the rebuild's moves of a damaged or non-prefix tail copy), and
+      `create_meta`. A rename across filesystems fails (`EXDEV`).
+    - **T2, atomic rename** of a file or a directory within the root,
+      where a directory rename onto an existing non-empty directory fails:
+      D5 publishes the data, then the manifest ("sealed iff its manifest
+      exists", ADR-030); `copy_immutable` and `rebuild_prefix` publish
+      their temp names the same way; and in `create_meta` the first of two
+      `init-root` calls wins. Without it a crash can leave a partial file
+      under its final name, which every reader takes for a sealed one.
+    - **T3, `fsync` that makes data and entries durable before it
+      returns,** for files and for directory descriptors: `write_new`,
+      `stream_copy`, `extend_prefix`, and `sync_dir` (`lib.rs`: it opens
+      the directory and fsyncs it; an error stops the copy), used by
+      `copy_sealed` and `ensure_dir`. The `copy` record is appended only
+      after these (D5), so a medium that acknowledges `fsync` early can
+      leave a copy record without its copy after a power loss.
+    - **T4, appends to an existing file followed by `fsync`, one writer at
+      a time:** `extend_prefix` for `.mie/copy-ledger` and
+      `.mie/journal/<file name>` (D11), single-writer through
+      `.mie/replicate.lock` on hot. Without it the tail copies cannot grow
+      and every pass fails.
+    - **T5, files larger than 4 GiB.** The journal copy only grows, by
+      5.1–15.1 MB a day (M1-11), and passes 4 294 967 296 B after 284 days
+      at 15.1 MB a day (842 at 5.1); the ledger copy grows about 0.61 GB a
+      year (Numbers table). Below that limit the journal's tail append
+      fails within the first year at #99's rate.
+    - **T6, permissions:** the user that runs `mie ingest` and `mie store`
+      can create, write, rename, fsync and remove files and directories in
+      every copy target, and can clear a file's write bits
+      (`recovery::mark_read_only`; its error stops the copy). A file whose
+      write bits are cleared can still be renamed or removed while its
+      directory is writable: the publish renames the read-only temp,
+      `move_aside` moves read-only copies, and `remove_if_present` removes
+      the debris of a crashed copy.
+    - **T7, a device id (`st_dev`)** distinct from hot's and from every
+      other copy target's (`store::check_devices`, on every replication
+      pass and in every other `mie store` command that uses the copy
+      targets), and from its parent directory's (`init-root` refusal 5,
+      for every root it marks). On the provisioned host, `mie store
+      init-root` and the first replication pass verify it for real,
+      without any override. Mie stores no device id, so ids need not be
+      stable across remounts. Independence of the devices behind distinct
+      ids stays a provisioning duty (D11).
+    - **T8, no locking on cold roots:** every `flock` mie takes is on hot
+      (`.mie/copy-ledger.lock`, `.mie/replicate.lock`, `.mie/verify.lock`,
+      the writer locks `source=<s>/.lock`), so hot stays a local
+      filesystem (*Hot* above) and a cold root needs no lock support.
+    - **T9, capacity** per D10.
+  - Checked and not listed: hard links (`copy_ledger::link_aside`, on hot
+    only), modification times (V8's `within_grace` reads hot only) and
+    exclusive create (`create_new` in `write_new`, `stream_copy` and
+    `extend_prefix` is used, but the pass lock on hot already excludes a
+    second writer).
 - **Option 1 (everything on the local disk)** is the configuration with
   no cold root, and it stays valid while the hot formula (D10) fits the
   disk. It loses as the policy because the fast local disk would have to
@@ -359,7 +453,7 @@ live in more than one root (approved as written at STOP 1).
     runs beside the open writer but through it, and the replicator only
     records parts hot already holds, so it never raises a partition's
     highest part above hot's. The cost: every writer open on a tiered
-    store parses the ledger and checks its chain once, about 0.58 GB after
+    store parses the ledger and checks its chain once, about 0.61 GB after
     one year (the Numbers table), once per `mie ingest` start and per
     import, never per part.
   - **The recall.** Before it opens a part in a partition the snapshot
@@ -419,7 +513,7 @@ live in more than one root (approved as written at STOP 1).
     manifest that differs from the ledger's. Why:
     the pass already folds the whole ledger every 300 s on its own thread,
     while a second full read on the capture thread would mean parsing
-    about 0.58 GB per seal pass after a year, where a multi-second stall
+    about 0.61 GB per seal pass after a year, where a multi-second stall
     costs irreplaceable live data. Both locks are taken without waiting: a
     held ledger lock skips the pass until the next seal pass.
   - **k counts the ids of the copy targets that presented their marker in
@@ -523,7 +617,7 @@ live in more than one root (approved as written at STOP 1).
     with another dataset version and no error. Every file in the ledger
     was copied to a copy target before its record (D5), so the ledger's
     file list never needs hot. The cost is reading the whole ledger per
-    `select` (about 1.6 MB per day of capture, Numbers table); an index is
+    `select` (about 1.65 MB per day of capture, Numbers table); an index is
     an implementation detail. Rejected, staging each recall or restore in
     a hidden directory renamed into place before its record: it closes the
     same race, but only as long as every path that ever writes a partition
@@ -647,10 +741,11 @@ live in more than one root (approved as written at STOP 1).
     damage in it is invisible. A byte flipped in record n fails only record
     n + 1's hash, so damage is reported one record late, and a per-copy
     report of "the first record that fails" names the wrong record. And
-    every append re-hashes the whole ledger: after one year about 0.58 GB
-    (1.6 MB per day × 365, Numbers table), about 6 100 times a day (1 835
-    files × 3 records, a manifest and k = 2 copies, plus 2 × 288 ledger-copy
-    records, Numbers table), about 3.5 TB hashed per day. With the chained
+    every append re-hashes the whole ledger: after one year about 0.61 GB
+    (1.665 MB per day × 365, Numbers table), about 6 100 times a day
+    (1 838.8 files × 3 records, a manifest and k = 2 copies, plus 2 × 288
+    ledger-copy records, plus 12.11 × 3 + 10 records per imported day,
+    Numbers table), about 3.7 TB hashed per day. With the chained
     form, a byte flipped in record n fails record n's own hash, and an
     append reads only the last three records. The intent of the approved
     decision, locating damage per copy without a majority, is unchanged.
@@ -1435,8 +1530,9 @@ Inputs:
 - A: the archive bytes, 51.0 GB on the host today (M1-12).
 - S: the pre-cutover stores, 3.7 GB (D9).
 - J: the daily growth of the journal, the import ledger and the copy
-  ledger: 5.1–15.1 MB (M1-11) + 0.006 MB (M1-15) + about 1.6 MB (copy
-  ledger, estimated in the Numbers table).
+  ledger: 5.1–15.1 MB (M1-11) + 0.006 MB (M1-15) + about 1.65 MB per day
+  of capture + 0.012 MB per imported day (copy ledger, estimated from
+  measured records, Numbers table).
 - P: the verification period (D11, operator input).
 - Z: the import staging, one archive zip at a time (ADR-034: one request
   at a time, each zip deleted once imported), so the largest zip the
@@ -1465,7 +1561,7 @@ Initial values at k = k_A = 2 (Numbers table for the arithmetic):
 
 | | Week-weighted (M1-5) | Busiest hours (M1-6) |
 |---|---|---|
-| hot, without the reserve | 6.35 GB + 0.79 GB × O + 2.6 GB per year | 9.36 GB + 1.17 GB × O + 6.1 GB per year |
+| hot, without the reserve | 6.35 GB + 0.79 GB × O + 2.65 GB per year | 9.36 GB + 1.17 GB × O + 6.12 GB per year |
 | each copy device, year 1 (live + J + S + archive) | 347 GB | 488 GB |
 | each copy device, every later year | +292 GB | +433 GB |
 
@@ -1673,10 +1769,14 @@ What breaks:
   prefix)`.
 - **What mie can check.** Mie cannot see the devices behind a mount, for
   the same reason that it does not monitor liveness, so independence is a
-  provisioning duty. The follow-up refuses a configuration in which two
-  copy targets, or a copy target and hot, report the same device id
-  (`st_dev`). That catches two copies on one local disk, but not two
-  exports of one NAS.
+  provisioning duty. Mie refuses a configuration in which two copy
+  targets, or a copy target and hot, report the same device id
+  (`st_dev`). `st_dev` identifies a mounted filesystem, not a physical
+  disk: the check catches two roots on one filesystem, including a copy
+  target left on hot's filesystem by an unmounted mount point (`mie store
+  init-root`, D4 refusal 5), but not two filesystems on one disk (two
+  partitions, logical volumes or subvolumes report distinct ids) and not
+  two exports of one NAS.
 - **Replication.** After each seal pass (300 s, ADR-032 D10), the
   replicator copies every sealed file with fewer than k copies to the copy
   targets by the D5 protocol and records each verified copy in the copy
@@ -1805,9 +1905,9 @@ What breaks:
     and that the appended bytes and the copy's last record were read back
     and match hot's. The comparison of the whole copy with hot's prefix
     belongs to the verification. Why not read the whole copy back on every
-    pass: the copy ledger grows about 1.6 MB per day (Numbers table), 0.58
-    GB after a year, and reading it back on 288 passes a day for two
-    targets would read about 334 GB a day from cold in year 1, growing
+    pass: the copy ledger grows about 1.65 MB per day (Numbers table),
+    0.61 GB after a year, and reading it back on 288 passes a day for two
+    targets would read about 350 GB a day from cold in year 1, growing
     linearly.
   - **The up-to-date rule.** A copy gets no tail and no record when every
     hot record from its length up to B is a `ledger-copy` record and the
@@ -3007,7 +3107,7 @@ What breaks:
       information, and their count scales with the store. A copy target
       added after one year lacks about 670 000 `copy` records (1 835 data
       files a day, M1-9); at about 185 bytes per `finding` record that is
-      about 124 MB per run, about 77 days of ledger growth at 1.6 MB a day
+      about 124 MB per run, about 75 days of ledger growth at 1.65 MB a day
       (Numbers table), which every later fold would read for good.
       Recorded findings are exactly those about a copy the ledger
       records, which is what the remover voids. The codes stay in grammar
@@ -3159,7 +3259,7 @@ What breaks:
 | 2.0× by hour of day, 2.4× by store | M1-7, M1-8 | max/min hourly rate; max/min store rate | Why no single "720 MB/day" is a sizing input: a rate taken from one store can be off by 2.4× |
 | 5.5× busiest archive day | M1-14 | 232.41 / 41.99 MB | Why the busiest column, not the mean, sizes provisioning |
 | 3 670 files per live day, ≈ 1.34 M/year | M1-9 | 1 835 data files + 1 835 manifests on 2026-10-17; × 365 | The cold listing load and the per-pass copy count. Fewer, larger files would need merging parts, which changes hashes (D5) |
-| Copy ledger ≈ 1.6 MB/day | Estimate from M1-9 and the golden records of grammar v1 (#187) | per file one `manifest` record (479 B in the golden ledger, a `depth` file) and k = 2 `copy` records (176 B each): 831 B × 1 835 files = 1.53 MB; plus one `ledger-copy` record (168 B) per copy target per replication pass, 2 × 288 × 168 B = 0.10 MB | An estimate until the follow-up measures it: record sizes vary by a few bytes with the stream name and the digits of `rows` and `bytes`, and verification records depend on P. Higher only adds hot bytes (D10 J); it is under 0.3 % of the data rate |
+| Copy ledger ≈ 1.65 MB per day of capture + 0.012 MB per imported day, ≈ 0.61 GB/year (an estimate) | Measured records (#196): bytes per record kind from the adoption ledger (#190, <https://github.com/Replikanti/mie/issues/190#issuecomment-6713452647>), records per seal pass from a tiered capture of 3 674 s (#191, <https://github.com/Replikanti/mie/issues/191#issuecomment-6720124934>); M1-9; the M1 archive table | Inputs: #190 `copy` 16 878 records / 3 088 828 B = 183.0 B, `manifest` 8 439 / 4 148 159 B = 491.6 B, `removed` 4 030 / 652 349 B = 161.9 B. #191: 83 files in 13 seal passes (12 periodic and the shutdown seal); live `manifest` 83 / 40 192 B and `copy` 166 / 29 916 B, so 70 108 B / 83 = 844.7 B per file at k = 2; one `ledger-copy` record of 171 B per copy target per pass (26 of the thread's / 13). Per file: files follow seal passes, so 83 / 13 × 288 passes a day (300 s, ADR-032 D10) = 1 838.8 files a day and 70 108 / 13 × 288 = 1 553 162 B. Per pass: 2 × 171 B × 288 = 98 496 B. Per removed partition: 7 live stream-dates leave the hot window a day (D6, one record each) × 161.9 B = 1 133 B. Live total 1 652 791 B ≈ 1.65 MB a day, × 365 = 0.60 GB. Per imported day of the default datasets: 12.11 files (`aggTrades` 800 / 378, `metrics` 754 / 379, the other eight datasets 1 each) and 10 partitions, 12.11 × (491.6 + 2 × 183.0) + 10 × 161.9 = 12 000 B ≈ 0.012 MB; opt-in `trades` adds 1 232 / 254 = 4.85 files, +4 321 B. With daily imports 1.665 MB a day, 0.61 GB after a year. Not in the daily rate: the verification, one `verify` record per copy target per pass (100 B in the golden text at a 4-digit prefix length, 105 B at a 9-digit one, a ledger of 100 MB to 1 GB: 210 B per pass at k = 2, plus about 186 B per recorded `finding`), 210 × 24 / P(h) B a day, since P is an operator input; the event-driven kinds, which are no steady growth (golden text, a `depth` path): `returned` 154 B (161 measured, #191), `lost` 242, `hold` 178, `hold-cleared` 185, `quarantined` 187, `replaced` 223; and the one-time adoption, 857.6 B per adopted file plus 161.9 B per stream-date (#190: 7.89 MB for 8 439 files and 4 030 stream-dates). Rejected: scaling the hour by wall time, 83 × 86 400 / 3 674 = 1 951.9 files a day (+6.4 % against M1-9), because the hour holds 13 seals, one more than a continuous run of that length. Why 1 h is enough: 12 periodic seal passes, so every per-pass record kind appears 12 times per copy target; a 24 h soak adds host time and a live connection, not a record kind (#184 STOP 1 decision 2) | Weak spots: one hour cannot show the day's activity profile, so the per-file count is cross-checked against M1-9's full live day, 1 835 data files on 2026-10-17: 1 838.8 is 0.2 % above it. Files follow seal passes, not volume, as long as no part reaches the `RotationPolicy` limits (1 000 000 rows, 128 MiB payload, `writer.rs`): #99's `depth` parts average 971 308 / 347 = 2 799 rows (M1 live table), 357× below the row limit; the payload margin is not measured, since M1 records Parquet bytes (3.6 MB per part), not payload. Even a crash day that doubled every `depth` part adds only 289 files × 844.7 B = 0.24 MB a day. Record sizes vary with the stream name and the digits of `rows` and `bytes`, and `ledger-copy` grows from 171 B (a 7-digit prefix length) to 173 B once the ledger passes 100 MB (day 60), +1 152 B a day = 0.07 %. No live `removed` record fell in the hour (the live dates were inside the window), so its size is #190's mean, dominated by archive partitions (golden live `depth`: 153 B). What breaks at another value: J feeds hot (J × t) and every copy device (J × t, D10). Each further copy target adds 180.2 B per file and 171 B per pass, +0.38 MB a day. The copy ledger is 0.14–0.21 % of the data rate (1.665 / (1 126.3 + 43.2) … 1.665 / (750.5 + 43.2)) |
 | ≥ 2 copy targets in a non-empty `cold_roots` | k = 2 (D11) | k counts copies on the copy targets, and every copy target receives every file, archive parts included, so k equals the number of copy targets and k_A = k (#189) | 1: no file ever reaches k copies, nothing ever leaves hot, and the store is the single copy D11 rejects. More than 2 is allowed: it is a larger k |
 | An append reads back the last 3 records | D7 *Formats and layout* | the trailing record and the line before it are checked; the third-last supplies the chain the second-last is computed from | Fewer: the line before the trailing record cannot be verified, so a damaged second-last record could be followed by a truncation of the last. More: only read cost, and still no full-chain check, which stays the verification's job |
 | At most 1 trailing record ignored or truncated | D7 *Formats and layout* | one append is in flight at a time under the lock, so a crash leaves at most one incomplete record | More than one: damage before the last record would be silently dropped, which is what the chain exists to report |
@@ -3180,8 +3280,8 @@ What breaks:
 | k_A = 2 | This ADR (D11) | a lost archive file changes the chain's prefix dataset; cost ≈ 67 GB in year 1 | k_A = 1: one device failure turns every warm run `DIVERGED (warm prefix)`. Higher: archive bytes only |
 | Z (staging), B (largest import run on hot) | ADR-034 (one zip at a time, deleted once imported); D6 *The source lock* | Z: the largest zip, read from the import log at provisioning. B: one day of a for a daily import; a 12-month backfill is 365 × 43.2 MB = 15.8 GB for the default datasets, + 365 × 81.5 MB = 29.7 GB with `trades`, 45.5 GB (M1-13) | Z too small: the zip being fetched fills hot, the import fails, and the capture's writer can hit `ENOSPC` too (D10 *What breaks*). B larger than hot's headroom fills hot during the import with the same result, hence the bootstrap's adoption path for large imports. Larger Z or B than needed: unused hot disk only |
 | Hot restore copies 6.35–9.36 GB | D10, D11 | (Σ_s r_s + a) × H at the two rate columns | The capture's downtime after a hot loss grows with it; a smaller H shortens the restore but weakens the degraded start (D8) |
-| Initial hot sizes | D10 | week-weighted: (750.5 + 43.2) × 8 = 6.35 GB, + 0.79 GB per outage day, J (5.6 + 1.6) × 365 = 2.6 GB per year. Busiest: (1 126.3 + 43.2) × 8 = 9.36 GB, + 1.17 GB per outage day, (15.1 + 1.6) × 365 = 6.1 GB per year | See D10 *What breaks* |
-| Initial copy-device sizes | D10 | year 1, week-weighted: 273.9 + 2.6 + 51.0 + 15.8 + 3.7 = 347 GB; busiest: 411.1 + 6.1 + 51.0 + 15.8 + 3.7 = 488 GB. Later years: 273.9 + 2.6 + 15.8 = 292 GB; 411.1 + 6.1 + 15.8 = 433 GB | See D10 *What breaks* |
+| Initial hot sizes | D10 | week-weighted: (750.5 + 43.2) × 8 = 6.35 GB, + 0.79 GB per outage day, J (5.6 + 0.006 + 1.653 + 0.012) × 365 = 7.271 MB × 365 = 2.65 GB per year. Busiest: (1 126.3 + 43.2) × 8 = 9.36 GB, + 1.17 GB per outage day, (15.1 + 0.006 + 1.653 + 0.012) × 365 = 16.771 MB × 365 = 6.12 GB per year. J holds the journal, the import ledger (0.006 MB, M1-15, which the arithmetic before #196 left out) and the copy ledger with daily imports | See D10 *What breaks* |
+| Initial copy-device sizes | D10 | year 1, week-weighted: 273.9 + 2.65 + 51.0 + 15.8 + 3.7 = 347.05 ≈ 347 GB; busiest: 411.1 + 6.12 + 51.0 + 15.8 + 3.7 = 487.72 ≈ 488 GB. Later years: 273.9 + 2.65 + 15.8 = 292.35 ≈ 292 GB; 411.1 + 6.12 + 15.8 = 433.02 ≈ 433 GB | See D10 *What breaks* |
 | O (cold-outage days) | Operator input at provisioning | lower bound: the longest cold outage the operator expects to repair (a NAS reboot, a disk swap); upper bound: what hot can hold, (hot − reserve − (Σ r_s + a) × H − J × t) / (Σ r_s + a) | Too small: an outage longer than O fills hot and stops the capture (D10). Larger: more hot disk, and O is also the longest single-copy window (D11) |
 | P (verification period) | Operator input at provisioning | lower bound: bytes on the largest copy device / slowest root's measured read throughput | Below the lower bound a pass cannot finish. Larger: a damaged copy stays unnoticed longer, a window with one good copy at k = 2 (D11) |
 | Generation 1 … 4 294 967 295 (`u32`) | #210 G1 | the generation's range; each superseding resolve of a file adds one generation, so a file would need 4 294 967 295 resolves to reach it | Below 1: `F.0.import` would alias `F.import`. Wrapping past the bound would name the first entry again, so the next generation is refused instead |
@@ -3208,11 +3308,19 @@ What breaks:
 
 - Growth is linear and unbounded: nothing can be deleted while ADR-052's
   origin holds, and moving the origin needs a new ADR. At k = 2 the copy
-  devices grow by 584–866 GB per year together (D10).
+  devices grow by 585–866 GB per year together (D10: 2 × 292.35 … 2 ×
+  433.02).
 - Each day's 3 670 files (M1-9) are copied to every copy target and
   verified within P. Merging parts to reduce that is rejected (D5).
   `select` lists no cold root (D7), so the listing cost falls on the
   verification and the rebuild only.
+- A known open gap (#219, <https://github.com/Replikanti/mie/issues/219>):
+  a copy target can stay one copy short of a path hot holds, and no mie
+  command clears it. Case 1, an unrecorded damaged copy, is a repair rule.
+  Case 2, a self-consistent other file under the path, needs an ADR. If
+  that ADR adds a second exception to D5's single exception (the *replace*
+  resolution's quarantine), D5 and CLAUDE.md invariant 4 are amended with
+  it.
 - The warm-up is slower when its prefix is on cold: after the cutover's
   first week the whole archive segment is. ADR-052 D12's trigger and D13's
   queue budget fire on measured values, so they still fire correctly. The
@@ -3408,3 +3516,27 @@ follow-up implementation:
 
 Flagged now: the warm-up cost with a live segment on cold cannot be
 reached until #106's cutover exists (Consequences).
+
+## Acceptance
+
+Accepted by #196 on 2026-11-14, closing #184. Every *Accept when* item is
+evidenced on #184 (each AW line there links its evidence):
+
+| *Accept when* item | Evidence |
+|---|---|
+| 1, 2, 4 | the #190 host run on copies of the #22 r2 and archive stores: <https://github.com/Replikanti/mie/issues/190#issuecomment-6713452647> |
+| 3, 6, 7, 11, 12 | offline tests on `main` `a08234a`, 25 of 25 named tests `ok` in CI run <https://github.com/Replikanti/mie/actions/runs/43618885841>: <https://github.com/Replikanti/mie/issues/184#issuecomment-6881819905> |
+| 5 | the #192 host run: <https://github.com/Replikanti/mie/issues/192#issuecomment-6765872868> |
+| 8 | the #193 host run: <https://github.com/Replikanti/mie/issues/193#issuecomment-6784917255> |
+| 9 | the #195 host run: <https://github.com/Replikanti/mie/issues/195#issuecomment-6862439634> |
+| 10 | the #191 host run: <https://github.com/Replikanti/mie/issues/191#issuecomment-6720124934> |
+
+- The copy-ledger estimate now comes from measured records (#190, #191;
+  Numbers table), and D1, D6, D7, D10 and D11 use it.
+- D4 gained *What a cold root must provide*, each entry checked against
+  the code of #187–#195.
+- D11 *What mie can check* is corrected: `st_dev` identifies a filesystem,
+  not a disk, and D4 refusal 5 says filesystem where it said disk.
+- Known open gap: #219 (Consequences).
+- The warm-up cost with a live segment on cold stays with #106
+  (Consequences).
