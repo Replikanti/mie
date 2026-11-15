@@ -850,17 +850,77 @@ fn marker_stop(root: &Marked, why: &str) -> Stop {
     ))
 }
 
+/// What a copy target holds of a sealed path the copy ledger records no
+/// `copy` of there, judged by [`unrecorded_copy`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum UnrecordedCopy {
+    /// Neither its data file `D` nor its manifest `M`.
+    Absent,
+    /// A copy the next pass's D5 copy accepts: it records it, or
+    /// publishes its manifest.
+    Accepted,
+    /// A self-consistent other file under the path (its own `M` with
+    /// another text and data that matches it): never moved (D5, #227).
+    OtherFile,
+    /// A form the next pass's D5 copy refuses, with why.
+    Refused(String),
+}
+
+/// The test the next pass's D5 copy from hot applies to an unrecorded
+/// copy of `path` on the copy target `root` (H6 k1 of the restore, R2b of
+/// the repair, #219), so the two commands never disagree about which forms
+/// the pass refuses: with `M`, [`replica::check_sealed_copy`] against
+/// `text`; without it, [`replica::check_file`] on `D`; neither is
+/// [`UnrecordedCopy::Absent`]. A name that cannot be inspected counts as
+/// present.
+///
+/// # Errors
+///
+/// The check's error: a copy that cannot be read, which the pass's D5
+/// copy meets as an I/O error (U).
+pub(super) fn unrecorded_copy(
+    root: &Path,
+    path: &str,
+    text: &str,
+) -> Result<UnrecordedCopy, RawStoreError> {
+    let present = |file: &Path| !matches!(fs::symlink_metadata(file), Err(e) if e.kind() == ErrorKind::NotFound);
+    let data = root.join(path);
+    let manifest = root.join(manifest_name(path));
+    let has_manifest = present(&manifest);
+    if !has_manifest && !present(&data) {
+        return Ok(UnrecordedCopy::Absent);
+    }
+    let check = if has_manifest {
+        replica::check_sealed_copy(root, path, text)
+    } else {
+        replica::check_file(&data, text)
+    }?;
+    Ok(match check {
+        CopyCheck::Good => UnrecordedCopy::Accepted,
+        CopyCheck::Manifest { other_file: true } => UnrecordedCopy::OtherFile,
+        CopyCheck::Missing => {
+            UnrecordedCopy::Refused("missing: a manifest without its data".to_owned())
+        }
+        CopyCheck::Manifest { other_file: false } => UnrecordedCopy::Refused(
+            "its manifest is not the installed text and its data does not match it".to_owned(),
+        ),
+        CopyCheck::Size => UnrecordedCopy::Refused("size".to_owned()),
+        CopyCheck::Sha256 => UnrecordedCopy::Refused("sha256".to_owned()),
+    })
+}
+
 /// H6 k1 (#195 round 3) for `path` on the copy target `target`, right
 /// after the path's copy-back: when the installed ledger (`state`) has no
 /// `copy` record of the path on the target and the target holds its data
 /// file `D` or its manifest `M`, that copy is judged by the test the next
-/// pass's D5 copy from hot applies: with `M`, [`replica::check_sealed_copy`]
-/// against the installed `text`; without it, [`replica::check_file`] on
-/// `D`. `Good` stays (the pass records or publishes it), and so does a
-/// self-consistent other file (D5, a `FAIL:`; #219 case 2). Everything
-/// else, an unreadable copy included (U), is moved by R5's own
-/// [`replica::move_aside`] into `.mie/damaged/<at_ms>/`, so the next pass
-/// copies the path from hot. Returns whether anything moved.
+/// pass's D5 copy from hot applies ([`unrecorded_copy`]): with `M`,
+/// [`replica::check_sealed_copy`] against the installed `text`; without
+/// it, [`replica::check_file`] on `D`. `Good` stays (the pass records or
+/// publishes it), and so does a self-consistent other file (D5, a
+/// `FAIL:`; #227). Everything else, an unreadable copy included (U), is
+/// moved by R5's own [`replica::move_aside`] into `.mie/damaged/<at_ms>/`,
+/// so the next pass copies the path from hot. Returns whether anything
+/// moved.
 fn sealed_aside(
     target: &Marked,
     state: &CopyState,
@@ -875,38 +935,20 @@ fn sealed_aside(
     {
         return Ok(false);
     }
-    let present = |file: &Path| !matches!(fs::symlink_metadata(file), Err(e) if e.kind() == ErrorKind::NotFound);
-    let data = target.path.join(path);
-    let manifest = target.path.join(manifest_name(path));
-    let has_manifest = present(&manifest);
-    if !has_manifest && !present(&data) {
-        return Ok(false);
-    }
-    let check = if has_manifest {
-        replica::check_sealed_copy(&target.path, path, text)
-    } else {
-        replica::check_file(&data, text)
-    };
-    let (why, error) = match check {
-        Ok(CopyCheck::Good) => return Ok(false),
-        Ok(CopyCheck::Manifest { other_file: true }) => {
+    let (why, error) = match unrecorded_copy(&target.path, path, text) {
+        Ok(UnrecordedCopy::Absent | UnrecordedCopy::Accepted) => return Ok(false),
+        Ok(UnrecordedCopy::OtherFile) => {
             report.problems.push(format!(
                 "{path} on {} ({}): another self-consistent file under the path (its own \
                  manifest with another text and data that matches it): not moved, since it may \
                  be a second sealed file (D5); the path stays one copy short on this target \
-                 until #219 decides it (ADR-062 D5, D11)",
+                 until #227 decides it (ADR-062 D5, D11)",
                 target.path.display(),
                 target.id
             ));
             return Ok(false);
         }
-        Ok(CopyCheck::Missing) => ("missing: a manifest without its data".to_owned(), None),
-        Ok(CopyCheck::Manifest { other_file: false }) => (
-            "its manifest is not the installed text and its data does not match it".to_owned(),
-            None,
-        ),
-        Ok(CopyCheck::Size) => ("size".to_owned(), None),
-        Ok(CopyCheck::Sha256) => ("sha256".to_owned(), None),
+        Ok(UnrecordedCopy::Refused(why)) => (why, None),
         Err(error) => (String::new(), Some(error.to_string())),
     };
     if let Some(why) = rebuild::marker_gone(target) {

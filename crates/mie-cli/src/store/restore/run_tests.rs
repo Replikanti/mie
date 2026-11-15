@@ -1953,7 +1953,7 @@ fn k_leaves_exactly_what_the_pass_accepts() {
 /// with another text beside a `D` that matches it. The restore commits,
 /// its `FAIL:` names D5 and says the file is not moved, cold-a stays
 /// byte-identical, and the next pass still reports cold-a's copy, 1 of 2
-/// copies (#219 case 2).
+/// copies (#227).
 #[test]
 fn k_self_consistent_other_file_is_never_moved() {
     let fixture = replicated("restore-k1-other-file");

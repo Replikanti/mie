@@ -1051,3 +1051,475 @@ fn a_ledger_copy_with_a_damaged_tail_is_rebuilt_and_extended() {
     let (pass, out) = verify(&fixture, REPAIRED + 2);
     assert!(pass, "{out}");
 }
+
+// ------------------------------------------------ R2b (#219, case 1)
+
+fn verify_with(
+    config: &IngestConfig,
+    archive: &Path,
+    probe: &dyn DeviceProbe,
+    now: i64,
+) -> (bool, String) {
+    let mut out = Vec::new();
+    let pass = store::verify(config, Some(archive), "24", probe, &|| now, &mut out).unwrap();
+    (pass, String::from_utf8(out).unwrap())
+}
+
+fn replicate_with(
+    config: &IngestConfig,
+    archive: &Path,
+    probe: &dyn DeviceProbe,
+    now: i64,
+) -> (bool, String) {
+    let mut out = Vec::new();
+    let pass = store::replicate(config, Some(archive), probe, &|| now, &mut out).unwrap();
+    (pass, String::from_utf8(out).unwrap())
+}
+
+/// R2b's store: the adopted store with the copy targets cold-a and cold-b2
+/// (k = 2), so cold-a records every file hot holds and cold-b2, new and
+/// never passed, records none: k − 1 copies of every hot file.
+struct Unrecorded {
+    _dir: TempDir,
+    fixture: Fixture,
+    config: IngestConfig,
+    archive: PathBuf,
+    probe: MapProbe,
+    /// cold-b2.
+    target: PathBuf,
+}
+
+fn unrecorded(tag: &str) -> Unrecorded {
+    let (dir, fixture) = adopted(tag);
+    let (config, archive, probe) = with_targets(&fixture, &["cold-a", "cold-b2"]);
+    let target = cold(&fixture, "cold-b2");
+    Unrecorded {
+        _dir: dir,
+        fixture,
+        config,
+        archive,
+        probe,
+        target,
+    }
+}
+
+impl Unrecorded {
+    fn repair(&self, now: i64) -> (bool, String) {
+        repair_with(&self.config, &self.archive, &self.probe, now, false)
+    }
+
+    fn replicate(&self, now: i64) -> (bool, String) {
+        replicate_with(&self.config, &self.archive, &self.probe, now)
+    }
+
+    fn verify(&self, now: i64) -> (bool, String) {
+        verify_with(&self.config, &self.archive, &self.probe, now)
+    }
+
+    /// The `copy` records of `path` on `root`.
+    fn copies(&self, path: &str, root: &str) -> usize {
+        records(&self.fixture)
+            .iter()
+            .filter(
+                |r| matches!(&r.kind, Kind::Copy { path: p, root: id } if p == path && id == root),
+            )
+            .count()
+    }
+}
+
+/// Hot's first file of `source`.
+fn hot_file(fixture: &Fixture, source: &str) -> String {
+    replica::list_sealed(&fixture.hot())
+        .unwrap()
+        .into_iter()
+        .find(|p| p.starts_with(&format!("source={source}/")))
+        .unwrap()
+}
+
+/// What one form plants under a name of the path: bytes, or a symlink.
+enum Planted {
+    Bytes(Vec<u8>),
+    Link(PathBuf),
+}
+
+/// Writes `name` (relative to `root`) as `what`, its directory created.
+fn plant(root: &Path, name: &str, what: &Planted) {
+    let file = root.join(name);
+    fs::create_dir_all(file.parent().unwrap()).unwrap();
+    match what {
+        Planted::Bytes(bytes) => fs::write(&file, bytes).unwrap(),
+        Planted::Link(to) => std::os::unix::fs::symlink(to, &file).unwrap(),
+    }
+}
+
+/// The relative name of the data temp file `D~` of `path`.
+fn data_temp(path: &str) -> String {
+    let probe = Path::new("/r");
+    replica::temp_path(probe, path, replica::TempName::Data)
+        .unwrap()
+        .strip_prefix(probe)
+        .unwrap()
+        .display()
+        .to_string()
+}
+
+/// The forms of an unrecorded damaged copy of `path` (AC 1), each a list
+/// of names with what they hold; `other` is another file's manifest text
+/// (a manifest describing another location).
+fn damaged_forms(
+    hot: &Path,
+    path: &str,
+    other: &str,
+) -> Vec<(&'static str, Vec<(String, Planted)>)> {
+    let data = fs::read(hot.join(path)).unwrap();
+    let text = fs::read_to_string(hot.join(manifest_of(path))).unwrap();
+    let m = || manifest_of(path);
+    let d = || path.to_owned();
+    let bytes = |b: &[u8]| Planted::Bytes(b.to_vec());
+    let mut flipped = data.clone();
+    flipped[40] ^= 0x01;
+    let mut long = data.clone();
+    long.push(0);
+    let short = &data[..data.len() - 1];
+    let no_sha: String = text
+        .lines()
+        .filter(|line| !line.starts_with("sha256 "))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    assert_ne!(no_sha, text);
+    vec![
+        ("manifest without data", vec![(m(), bytes(text.as_bytes()))]),
+        (
+            "data one byte short",
+            vec![(m(), bytes(text.as_bytes())), (d(), bytes(short))],
+        ),
+        (
+            "data one byte long",
+            vec![(m(), bytes(text.as_bytes())), (d(), bytes(&long))],
+        ),
+        (
+            "one flipped data byte",
+            vec![(m(), bytes(text.as_bytes())), (d(), bytes(&flipped))],
+        ),
+        (
+            "a manifest beside a verifying data temp file",
+            vec![
+                (m(), bytes(text.as_bytes())),
+                (data_temp(path), bytes(&data)),
+            ],
+        ),
+        (
+            "a manifest that does not parse",
+            vec![(m(), bytes(no_sha.as_bytes())), (d(), bytes(&data))],
+        ),
+        (
+            "a manifest that is not UTF-8",
+            vec![(m(), bytes(&[0xff, 0xfe, 0x0a])), (d(), bytes(&data))],
+        ),
+        (
+            "a manifest describing another location",
+            vec![(m(), bytes(other.as_bytes())), (d(), bytes(&data))],
+        ),
+        (
+            "data without a manifest, one byte flipped",
+            vec![(d(), bytes(&flipped))],
+        ),
+        (
+            "data without a manifest, one byte short",
+            vec![(d(), bytes(short))],
+        ),
+        (
+            "a dangling symlink at the data path",
+            vec![(d(), Planted::Link(PathBuf::from("/nonexistent/mie-r2b")))],
+        ),
+    ]
+}
+
+/// AC 1: every unrecorded damaged form of a file hot holds, on cold-b2,
+/// which records no copy of it: the repair passes, every planted name sits
+/// byte-identical under `cold-b2/.mie/damaged/<REPAIRED>/`, the closing
+/// pass copies the file from hot and records it once, and a later pass and
+/// verification with that configuration are clean (k − 1 copies → k). The
+/// flipped data byte runs on hot's listed archive part too.
+#[test]
+fn r2b_every_unrecorded_damaged_form_is_moved_aside_and_refilled() {
+    let mut rows = Vec::new();
+    {
+        let probe = unrecorded("r2b-forms-probe");
+        let live = hot_file(&probe.fixture, "binance-um");
+        let part = hot_file(&probe.fixture, ARCHIVE_SOURCE);
+        let other = fs::read_to_string(probe.fixture.hot().join(manifest_of(&part))).unwrap();
+        for (form, _) in damaged_forms(&probe.fixture.hot(), &live, &other) {
+            rows.push((form, false));
+        }
+        rows.push(("one flipped data byte", true));
+    }
+    for (n, (form, archive_part)) in rows.into_iter().enumerate() {
+        let store = unrecorded(&format!("r2b-forms-{n}"));
+        let hot = store.fixture.hot();
+        let live = hot_file(&store.fixture, "binance-um");
+        let part = hot_file(&store.fixture, ARCHIVE_SOURCE);
+        let (path, other) = if archive_part {
+            (
+                part.clone(),
+                fs::read_to_string(hot.join(manifest_of(&live))).unwrap(),
+            )
+        } else {
+            (
+                live.clone(),
+                fs::read_to_string(hot.join(manifest_of(&part))).unwrap(),
+            )
+        };
+        assert_eq!(store.copies(&path, "cold-a"), 1, "{form}");
+        let planted = damaged_forms(&hot, &path, &other)
+            .into_iter()
+            .find(|(f, _)| *f == form)
+            .unwrap()
+            .1;
+        for (name, what) in &planted {
+            plant(&store.target, name, what);
+        }
+        let (pass, out) = store.replicate(REPAIRED - 1);
+        assert!(!pass, "{form}: the pass refuses it\n{out}");
+        assert_fail_line(&out, &[&path]);
+        let (pass, out) = store.repair(REPAIRED);
+        assert!(pass && out.ends_with("PASS\n"), "{form}\n{out}");
+        let aside = replica::damaged_dir(&store.target, REPAIRED);
+        for (name, what) in &planted {
+            let moved = aside.join(name);
+            match what {
+                Planted::Bytes(bytes) => assert_eq!(&fs::read(&moved).unwrap(), bytes, "{form}"),
+                Planted::Link(to) => assert_eq!(&fs::read_link(&moved).unwrap(), to, "{form}"),
+            }
+        }
+        for file in [path.clone(), manifest_of(&path)] {
+            assert_eq!(
+                fs::read(store.target.join(&file)).unwrap(),
+                fs::read(hot.join(&file)).unwrap(),
+                "{form}: {file}"
+            );
+        }
+        assert_eq!(store.copies(&path, "cold-b2"), 1, "{form}");
+        let (pass, out) = store.replicate(REPAIRED + 1);
+        assert!(pass, "{form}\n{out}");
+        let (pass, out) = store.verify(REPAIRED + 2);
+        assert!(pass, "{form}\n{out}");
+    }
+}
+
+/// AC 2: a copy the pass accepts is never moved, sealed and verifying
+/// (the closing pass records it as already present) or verifying data
+/// without its manifest (the closing pass publishes the manifest).
+#[test]
+fn r2b_a_copy_the_pass_accepts_is_never_moved() {
+    use std::os::unix::fs::MetadataExt;
+    for (n, with_manifest) in [true, false].into_iter().enumerate() {
+        let store = unrecorded(&format!("r2b-accepted-{n}"));
+        let hot = store.fixture.hot();
+        let path = hot_file(&store.fixture, "binance-um");
+        let mut names = vec![path.clone()];
+        if with_manifest {
+            names.push(manifest_of(&path));
+        }
+        for name in &names {
+            plant(
+                &store.target,
+                name,
+                &Planted::Bytes(fs::read(hot.join(name)).unwrap()),
+            );
+        }
+        let inodes: Vec<u64> = names
+            .iter()
+            .map(|name| fs::metadata(store.target.join(name)).unwrap().ino())
+            .collect();
+        let (pass, out) = store.repair(REPAIRED);
+        assert!(pass, "{with_manifest}\n{out}");
+        let after: Vec<u64> = names
+            .iter()
+            .map(|name| fs::metadata(store.target.join(name)).unwrap().ino())
+            .collect();
+        assert_eq!(after, inodes, "{with_manifest}");
+        assert!(
+            !replica::damaged_dir(&store.target, REPAIRED).exists(),
+            "{with_manifest}"
+        );
+        let expected = if with_manifest {
+            format!("recorded {path} on cold-b2: already present")
+        } else {
+            format!("copied {path} to cold-b2")
+        };
+        assert!(out.contains(&expected), "{with_manifest}\n{out}");
+        assert_eq!(
+            fs::read(store.target.join(manifest_of(&path))).unwrap(),
+            fs::read(hot.join(manifest_of(&path))).unwrap()
+        );
+        assert_eq!(store.copies(&path, "cold-b2"), 1, "{with_manifest}");
+    }
+}
+
+/// AC 3: until the case 2 ADR (#227) is accepted, a self-consistent other
+/// file under the path (its own manifest with `rows N+1`, and data that
+/// matches it) is refused and never moved, as R1 refuses one (D5).
+#[test]
+fn r2b_a_self_consistent_other_file_is_refused_and_never_moved() {
+    use std::os::unix::fs::MetadataExt;
+    let store = unrecorded("r2b-other-file");
+    let hot = store.fixture.hot();
+    let path = hot_file(&store.fixture, "binance-um");
+    let text = fs::read_to_string(hot.join(manifest_of(&path))).unwrap();
+    let rows = text
+        .lines()
+        .find_map(|line| line.strip_prefix("rows "))
+        .unwrap()
+        .to_owned();
+    let more = rows.parse::<u64>().unwrap() + 1;
+    let other = text.replace(&format!("rows {rows}\n"), &format!("rows {more}\n"));
+    assert_ne!(other, text);
+    plant(
+        &store.target,
+        &manifest_of(&path),
+        &Planted::Bytes(other.into_bytes()),
+    );
+    plant(
+        &store.target,
+        &path,
+        &Planted::Bytes(fs::read(hot.join(&path)).unwrap()),
+    );
+    let names = [path.clone(), manifest_of(&path)];
+    let inodes: Vec<u64> = names
+        .iter()
+        .map(|name| fs::metadata(store.target.join(name)).unwrap().ino())
+        .collect();
+    let (pass, out) = store.repair(REPAIRED);
+    assert!(!pass, "{out}");
+    assert_fail_line(
+        &out,
+        &[&path, "cold-b2", "refused", "self-consistent other file"],
+    );
+    let after: Vec<u64> = names
+        .iter()
+        .map(|name| fs::metadata(store.target.join(name)).unwrap().ino())
+        .collect();
+    assert_eq!(after, inodes);
+    assert!(
+        !replica::damaged_dir(&store.target, REPAIRED)
+            .join(&path)
+            .exists()
+    );
+    assert_eq!(store.copies(&path, "cold-b2"), 0);
+}
+
+/// AC 4: with hot's copy bad, R2b moves nothing on the target and names
+/// it; R4 repairs hot from cold-a in the same run, and the next run moves
+/// the form aside and completes.
+#[test]
+fn r2b_hot_bad_moves_nothing_and_the_next_run_completes() {
+    use std::os::unix::fs::MetadataExt;
+    let store = unrecorded("r2b-hot-bad");
+    let hot = store.fixture.hot();
+    let path = hot_file(&store.fixture, "binance-um");
+    let manifest = manifest_of(&path);
+    plant(
+        &store.target,
+        &manifest,
+        &Planted::Bytes(fs::read(hot.join(&manifest)).unwrap()),
+    );
+    flip(&hot.join(&path), 40);
+    let inode = fs::metadata(store.target.join(&manifest)).unwrap().ino();
+    let (pass, out) = store.repair(REPAIRED);
+    assert!(!pass, "{out}");
+    assert_fail_line(&out, &[&path, "cold-b2", "not moved"]);
+    assert_eq!(
+        fs::metadata(store.target.join(&manifest)).unwrap().ino(),
+        inode
+    );
+    assert!(!replica::damaged_dir(&store.target, REPAIRED).exists());
+    assert_eq!(
+        fs::read(hot.join(&path)).unwrap(),
+        fs::read(cold(&store.fixture, "cold-a").join(&path)).unwrap()
+    );
+    let (pass, out) = store.repair(REPAIRED + 1);
+    assert!(pass, "{out}");
+    assert!(
+        replica::damaged_dir(&store.target, REPAIRED + 1)
+            .join(&manifest)
+            .exists()
+    );
+    assert_eq!(store.copies(&path, "cold-b2"), 1);
+}
+
+/// Decision 2 of #219: an unrecorded form that cannot be read (mode 000; a
+/// directory at the data path) is moved aside with a `FAIL:` in the read
+/// error's wording, and the next run passes. A read-only root holding a
+/// damaged copy is never written (D11).
+#[test]
+fn r2b_unreadable_forms_and_read_only_roots() {
+    for (n, form) in ["mode 000", "a directory"].into_iter().enumerate() {
+        let store = unrecorded(&format!("r2b-unreadable-{n}"));
+        let hot = store.fixture.hot();
+        let path = hot_file(&store.fixture, "binance-um");
+        let manifest = manifest_of(&path);
+        plant(
+            &store.target,
+            &manifest,
+            &Planted::Bytes(fs::read(hot.join(&manifest)).unwrap()),
+        );
+        let data = store.target.join(&path);
+        if n == 0 {
+            plant(
+                &store.target,
+                &path,
+                &Planted::Bytes(fs::read(hot.join(&path)).unwrap()),
+            );
+            fs::set_permissions(&data, fs::Permissions::from_mode(0o000)).unwrap();
+        } else {
+            fs::create_dir_all(&data).unwrap();
+        }
+        let (pass, out) = store.repair(REPAIRED);
+        assert!(!pass, "{form}\n{out}");
+        assert_fail_line(&out, &[&path, "cold-b2", "cannot be read", "moved aside"]);
+        let moved = replica::damaged_dir(&store.target, REPAIRED).join(&path);
+        assert!(fs::symlink_metadata(&moved).is_ok(), "{form}");
+        assert_eq!(
+            fs::read(&data).unwrap(),
+            fs::read(hot.join(&path)).unwrap(),
+            "{form}"
+        );
+        let (pass, out) = store.repair(REPAIRED + 1);
+        assert!(pass, "{form}\n{out}");
+        assert_eq!(store.copies(&path, "cold-b2"), 1, "{form}");
+    }
+
+    // A read-only root that holds a damaged copy of a hot file.
+    let (_dir, fixture) = adopted("r2b-read-only");
+    let path = hot_file(&fixture, "binance-um");
+    let ro = fixture.dir.join("ro");
+    fs::create_dir_all(&ro).unwrap();
+    root_marker::create_meta(&ro, "ro", false).unwrap();
+    for file in [path.clone(), manifest_of(&path)] {
+        plant(
+            &ro,
+            &file,
+            &Planted::Bytes(fs::read(fixture.hot().join(&file)).unwrap()),
+        );
+    }
+    flip(&ro.join(&path), 40);
+    let mut cold_roots = fixture.config.paths.cold_roots.clone();
+    cold_roots.push(ColdRoot {
+        path: ro.clone(),
+        copy_target: false,
+    });
+    let dst = fixture.dir.join("dst");
+    let config = ingest_toml(
+        &dst.join("ingest-ro.toml"),
+        &fixture.hot(),
+        &fixture.config.paths.journal,
+        &cold_roots,
+    );
+    let archive = dst.join("archive-ro.toml");
+    archive_toml(&archive, &dst, &fixture.hot(), &cold_roots);
+    let before = files(&ro);
+    let (pass, out) = repair_with(&config, &archive, &fixture.probe(), REPAIRED, false);
+    assert!(pass, "{out}");
+    assert_eq!(files(&ro), before);
+}
