@@ -3596,10 +3596,15 @@ as R1 refuses one (D5); every other form, an unreadable one included
 `.mie/damaged/<run at_ms>/`, only once hot's copy checks good against the
 text, and for an archive part only once a current hot import entry lists
 it with the text's SHA-256, since the closing pass copies nothing else
-(D11). R2b writes no record and copies nothing; the closing pass copies
-the path from hot and appends its records, so the D5 guard, the
-`manifest`-record order and the archive-entry gate stay in one place. No
-record kind, ledger format or `replica` function changes.
+(D11). A temp name of the path that the pass's D5 copy cannot remove (a
+directory: the copy removes both temp names by unlink before it copies,
+publishes or records, and every pass would stop the target on it) is
+moved aside alone under the same conditions when the form beside it is
+absent or a copy the pass accepts, with a `FAIL:`; the accepted copy
+stays in place. R2b writes no record and copies nothing; the closing
+pass copies the path from hot and appends its records, so the D5 guard,
+the `manifest`-record order and the archive-entry gate stay in one place.
+No record kind, ledger format or `replica` function changes.
 
 **Sentences above that now describe the state before #219.** They stay
 as written, as history:

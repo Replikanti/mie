@@ -378,16 +378,19 @@ enum Class {
     OtherFile,
     Refused,
     Unreadable,
+    Stuck,
 }
 
-/// The differential test of R2b's judgment (`restore::unrecorded_copy`,
-/// shared with the restore's H6 k1) against the closing pass's D5 copy
-/// from hot: every form is planted on two twin directories, judged on
-/// one and copied onto the other. Absent or accepted ⇔ the copy
-/// succeeds; refused ⇔ `Integrity`; a self-consistent other file ⇒
-/// `Integrity`; a judgment error ⇔ an I/O error of the copy. Look-alike
-/// names beside the temp names stay byte-identical: R2b derives every
-/// name from hot's listing.
+/// The differential test of R2b's judgment (`r2b_form`: the restore's
+/// H6 k1 test `restore::unrecorded_copy`, then the temp names the pass
+/// cannot remove) against the closing pass's D5 copy from hot: every form
+/// is planted on two twin directories, judged on one and copied onto the
+/// other. Absent or accepted ⇔ the copy succeeds; refused ⇔ `Integrity`;
+/// a self-consistent other file ⇒ `Integrity`; a judgment error ⇔ an I/O
+/// error of the copy; a temp name the pass cannot remove beside an absent
+/// or accepted form ⇔ an I/O error of the copy. Look-alike names beside
+/// the temp names stay byte-identical: R2b derives every name from hot's
+/// listing.
 #[test]
 fn r2b_moves_exactly_what_the_pass_refuses() {
     let fixture = Fixture::new("r2b-differential");
@@ -562,6 +565,59 @@ fn r2b_moves_exactly_what_the_pass_refuses() {
                 (d.clone(), Plant::Unreadable(data.clone())),
             ],
         ),
+        (
+            "a directory at the data temp name",
+            Class::Stuck,
+            vec![(dt.clone(), Plant::Dir)],
+        ),
+        (
+            "a directory at the manifest temp name beside a data temp file",
+            Class::Stuck,
+            vec![(dt.clone(), bytes(&data)), (mt.clone(), Plant::Dir)],
+        ),
+        (
+            "sealed and verifying, beside a directory at the data temp name",
+            Class::Stuck,
+            vec![
+                (m.clone(), bytes(t)),
+                (d.clone(), bytes(&data)),
+                (dt.clone(), Plant::Dir),
+            ],
+        ),
+        (
+            "verifying data without a manifest, beside a directory at the manifest temp name",
+            Class::Stuck,
+            vec![(d.clone(), bytes(&data)), (mt.clone(), Plant::Dir)],
+        ),
+        (
+            "a manifest without its data, beside a directory at the data temp name",
+            Class::Refused,
+            vec![(m.clone(), bytes(t)), (dt.clone(), Plant::Dir)],
+        ),
+        (
+            "a self-consistent other file, beside a directory at the manifest temp name",
+            Class::OtherFile,
+            vec![
+                (m.clone(), bytes(other.as_bytes())),
+                (d.clone(), bytes(&data)),
+                (mt.clone(), Plant::Dir),
+            ],
+        ),
+        (
+            "dangling symlinks at both temp names",
+            Class::Absent,
+            vec![(dt.clone(), Plant::Dangling), (mt.clone(), Plant::Dangling)],
+        ),
+        (
+            "unreadable temp files beside a verifying sealed copy",
+            Class::Accepted,
+            vec![
+                (m.clone(), bytes(t)),
+                (d.clone(), bytes(&data)),
+                (dt.clone(), Plant::Unreadable(data.clone())),
+                (mt.clone(), Plant::Unreadable(t.to_vec())),
+            ],
+        ),
     ];
     for (n, (form, class, planted)) in cases.into_iter().enumerate() {
         let judged_root = fixture.dir.0.join(format!("judged-{n}"));
@@ -572,12 +628,13 @@ fn r2b_moves_exactly_what_the_pass_refuses() {
                 plant(root, name, what);
             }
         }
-        let judged = restore::unrecorded_copy(&judged_root, &path, &text);
+        let judged = r2b_form(&judged_root, &path, &text);
         let got = match &judged {
-            Ok(UnrecordedCopy::Absent) => Class::Absent,
-            Ok(UnrecordedCopy::Accepted) => Class::Accepted,
-            Ok(UnrecordedCopy::OtherFile) => Class::OtherFile,
-            Ok(UnrecordedCopy::Refused(_)) => Class::Refused,
+            Ok(Form::Judged(UnrecordedCopy::Absent)) => Class::Absent,
+            Ok(Form::Judged(UnrecordedCopy::Accepted)) => Class::Accepted,
+            Ok(Form::Judged(UnrecordedCopy::OtherFile)) => Class::OtherFile,
+            Ok(Form::Judged(UnrecordedCopy::Refused(_))) => Class::Refused,
+            Ok(Form::Stuck { .. }) => Class::Stuck,
             Err(RawStoreError::Io(_)) => Class::Unreadable,
             Err(other) => panic!("{form}: {other:?}"),
         };
@@ -593,7 +650,7 @@ fn r2b_moves_exactly_what_the_pass_refuses() {
                 }),
             )
             | (
-                Class::Unreadable,
+                Class::Unreadable | Class::Stuck,
                 Err(CopyError {
                     side: Side::Destination,
                     error: RawStoreError::Io(_),
@@ -942,4 +999,107 @@ fn r2b_an_evidence_name_taken_at_the_same_at_ms_is_never_overwritten() {
         damaged
     );
     assert_eq!(fs::read(&taken).unwrap(), b"evidence");
+}
+
+/// A temp name of P that the closing pass's D5 copy cannot remove (a
+/// directory: the copy removes both temp names by unlink before it copies
+/// or records) is moved aside alone, with a `FAIL:` (#219 review): on
+/// cold-a beside a published, verifying copy no record covers (a pass that
+/// crashed after publishing), on cold-b with neither `D` nor `M`. The
+/// verified copy on cold-a stays in place and byte-identical, each
+/// directory moves with its content into `damaged/<at>/`, the closing pass
+/// records `copy P` on both targets, and a later pass and verification are
+/// clean. Without the move, every pass stops cold-b on EISDIR.
+#[test]
+fn r2b_a_temp_name_the_pass_cannot_remove_is_moved_aside() {
+    let fixture = Fixture::new("r2b-stuck-temp");
+    assert_eq!(fixture.pass().problems, Vec::<String>::new());
+    let new = fixture.seal("binance-um", "aggTrade", D0 + 6_000, 2);
+    assert_eq!(new.len(), 1, "{new:?}");
+    let path = new[0].clone();
+    replicate::CRASH_AT.with(|crash| crash.set(Some(replicate::PassStep::AfterPublish)));
+    fixture.pass();
+    assert!(replicate::CRASH_AT.with(std::cell::Cell::get).is_none());
+    let (cold_a, cold_b) = (&fixture.cold[0], &fixture.cold[1]);
+    assert!(cold_a.join(&path).exists() && !cold_b.join(&path).exists());
+    let published = [
+        fs::read(cold_a.join(&path)).unwrap(),
+        fs::read(cold_a.join(manifest_of(&path))).unwrap(),
+    ];
+    let stuck = [
+        (cold_a, temp_of(&path, TempName::Data)),
+        (cold_b, temp_of(&path, TempName::Manifest)),
+    ];
+    for (root, name) in &stuck {
+        plant(root, name, &Plant::Dir);
+        plant(
+            root,
+            &format!("{name}/inside"),
+            &Plant::Bytes(b"evidence".to_vec()),
+        );
+    }
+    let at = D0 + 2 * HOUR;
+    let report = repair(&fixture, at);
+    for (root, name) in &stuck {
+        let id = root.file_name().unwrap().to_str().unwrap();
+        assert!(
+            report.problems.iter().any(|p| p.contains(&path)
+                && p.contains(id)
+                && p.contains(name.as_str())
+                && p.contains("cannot remove")
+                && p.contains("moved aside")),
+            "{id}: {report:?}"
+        );
+        assert!(!root.join(name).exists(), "{id}");
+        let aside = replica::damaged_dir(root, at).join(name);
+        assert_eq!(fs::read(aside.join("inside")).unwrap(), b"evidence", "{id}");
+        assert_eq!(fs::read_dir(&aside).unwrap().count(), 1, "{id}");
+    }
+    assert_eq!(report.problems.len(), stuck.len(), "{report:?}");
+    assert_eq!(fs::read(cold_a.join(&path)).unwrap(), published[0]);
+    assert_eq!(
+        fs::read(cold_a.join(manifest_of(&path))).unwrap(),
+        published[1]
+    );
+    assert!(!replica::damaged_dir(cold_a, at).join(&path).exists());
+    assert!(
+        !replica::damaged_dir(cold_a, at)
+            .join(manifest_of(&path))
+            .exists()
+    );
+    assert_eq!(
+        fs::read(cold_b.join(&path)).unwrap(),
+        fs::read(fixture.hot.join(&path)).unwrap()
+    );
+    let (_, copies) = counts(&fixture.records());
+    for id in ["cold-a", "cold-b"] {
+        assert_eq!(copies.get(&(path.clone(), id.to_owned())), Some(&1), "{id}");
+    }
+    assert_eq!(fixture.pass().problems, Vec::<String>::new());
+    assert_eq!(repair(&fixture, at + HOUR).problems, Vec::<String>::new());
+    assert_eq!(verified(&fixture, at + 2 * HOUR), Vec::<String>::new());
+}
+
+/// R2b's gates hold for a temp name the pass cannot remove: an archive
+/// part no current import entry lists is not copied by the closing pass,
+/// so a directory at its data temp name on cold-a is named and stays.
+#[test]
+fn r2b_a_stuck_temp_name_of_an_unlisted_archive_part_stays() {
+    let fixture = Fixture::new("r2b-stuck-unlisted");
+    assert_eq!(fixture.pass().problems, Vec::<String>::new());
+    let new = fixture.seal("binance-archive", "aggTrades", D0 - 86_400_000 + 10_000, 2);
+    assert_eq!(new.len(), 1, "{new:?}");
+    let part = new[0].clone();
+    let name = temp_of(&part, TempName::Data);
+    plant(&fixture.cold[0], &name, &Plant::Dir);
+    let report = repair(&fixture, D0 + 2 * HOUR);
+    assert!(
+        report.problems.iter().any(|p| p.contains(&part)
+            && p.contains("cold-a")
+            && p.contains("cannot remove")
+            && p.contains("import entry")),
+        "{report:?}"
+    );
+    assert!(fixture.cold[0].join(&name).is_dir());
+    assert!(!replica::damaged_dir(&fixture.cold[0], D0 + 2 * HOUR).exists());
 }
