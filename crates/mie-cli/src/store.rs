@@ -43,6 +43,10 @@
 //!   rebuild's derivation, every partition hot must hold, and hot's marker
 //!   last, the commit point; until then every command refuses the hot
 //!   ([`restore`](mod@restore) holds the rules, #195, ADR-062 D11).
+//! - [`repair_hot`] (`mie store repair-hot`) repairs hot's own journal or
+//!   import-ledger files on an intact hot from the copy targets, all or
+//!   nothing, keeping every replaced file under an evidence name
+//!   ([`repair_hot`](mod@repair_hot) holds the rules, #217, ADR-065).
 //! - [`resolve`] (`mie store resolve`) proposes the archive file of every
 //!   open hold, and with `--file` re-admits the held parts of that file
 //!   when they equal its published rows: it writes the missing or a
@@ -85,6 +89,7 @@ pub mod archive_checks;
 pub mod quarantine;
 pub mod rebuild;
 pub mod repair;
+pub mod repair_hot;
 pub mod replicate;
 pub mod resolve;
 pub mod restore;
@@ -613,6 +618,33 @@ pub fn restore(
     let report = restore::run(config, archive, flags, first_hot_date, probe, now_ms);
     let pass = print_report(report.lines, &report.problems, out)?;
     Ok(pass && report.restored)
+}
+
+/// `mie store repair-hot`: one repair of hot's journal or import-ledger
+/// files (`scope`) on an intact hot from the copy targets (ADR-065, the
+/// module [`repair_hot`](mod@repair_hot)), with the archive configuration
+/// `archive`, else `[history] archive_config`. `now_ms` is read once: it
+/// names the run's evidence.
+///
+/// It prints the witnesses and the decision, the import-ledger names it
+/// acts on, the evidence paths, then `repaired: …` or `nothing written`,
+/// then `PASS` (returns `true`) or one `FAIL: <problem>` line per problem
+/// (returns `false`).
+///
+/// # Errors
+///
+/// A description when the report cannot be written.
+pub fn repair_hot(
+    config: &IngestConfig,
+    archive: Option<&Path>,
+    scope: repair_hot::Scope,
+    flags: repair_hot::Flags,
+    probe: &dyn DeviceProbe,
+    now_ms: &dyn Fn() -> i64,
+    out: &mut dyn Write,
+) -> Result<bool, String> {
+    let report = repair_hot::run(config, archive, scope, flags, probe, now_ms);
+    print_report(report.lines, &report.problems, out)
 }
 
 /// `mie store resolve`: proposes the archive file of every open hold, or

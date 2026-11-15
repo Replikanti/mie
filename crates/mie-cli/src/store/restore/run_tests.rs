@@ -307,14 +307,22 @@ fn h0_refusals_write_nothing() {
     assert!(!fixture.hot.exists());
 }
 
-/// A hot that still carries its marker is refused naming #217, nothing
+/// A hot that still carries its marker is refused naming `mie store
+/// repair-hot` (#217), nothing
 /// written; so is a second run after a commit (`m_second_run_is_refused`).
 #[test]
 fn h0_a_marked_hot_is_refused() {
     let fixture = replicated("restore-marked");
     let before = snapshot(&fixture);
     let report = restore(&fixture);
-    assert_not_restored(&report, &["carries hot's marker", "#217", "lost hot only"]);
+    assert_not_restored(
+        &report,
+        &[
+            "carries hot's marker",
+            "mie store repair-hot",
+            "lost hot only",
+        ],
+    );
     assert_eq!(snapshot(&fixture), before);
 }
 
@@ -325,7 +333,7 @@ fn m_second_run_is_refused() {
     assert_restored(&restore(&fixture));
     let before = snapshot(&fixture);
     let report = restore_at(&fixture, Flags::default(), FIRST_HOT, AT + 1);
-    assert_not_restored(&report, &["#217"]);
+    assert_not_restored(&report, &["mie store repair-hot"]);
     assert_eq!(snapshot(&fixture), before);
 }
 
@@ -383,7 +391,8 @@ fn h1_locks_are_taken_without_waiting() {
     let before = snapshot(&fixture);
     let hot = fixture.hot.clone();
     type Take<'a> = Box<dyn Fn() -> Box<dyn std::any::Any> + 'a>;
-    let cases: [(&str, Take); 5] = [
+    let journal = fixture.config.paths.journal.clone();
+    let cases: [(&str, Take); 6] = [
         (
             "copy-ledger lock",
             Box::new(|| Box::new(CopyLedger::at(&hot).try_hold().unwrap())),
@@ -403,6 +412,10 @@ fn h1_locks_are_taken_without_waiting() {
         (
             "source binance-archive",
             Box::new(|| Box::new(removal::take_source_lock(&hot, ARCHIVE_SOURCE).unwrap())),
+        ),
+        (
+            "the journal lock",
+            Box::new(|| Box::new(replica::try_journal_lock(&journal).unwrap())),
         ),
     ];
     for (what, take) in cases {

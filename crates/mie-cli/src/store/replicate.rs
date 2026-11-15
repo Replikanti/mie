@@ -40,7 +40,11 @@
 //!    that copy. The ledger's paths count because the hot removal (#191,
 //!    ADR-062 D6) takes files off hot: a target added after a removal never
 //!    gets them from hot, and its journal copy waits at the first removed
-//!    file's line until `mie store repair` fills it.
+//!    file's line until `mie store repair` fills it. A copy also stops
+//!    before the line of the first byte where a longer copy holds another
+//!    byte than hot (the pass guard, ADR-065 D9): extended over it, the
+//!    copy would vouch for hot's byte, which it only copied. Copies of one
+//!    length compare nothing.
 //!
 //! **A target with an open copy-ledger finding** (a `finding R …
 //! copy-ledger` after its latest `ledger-copy R` record) gets no ledger
@@ -227,6 +231,10 @@ thread_local! {
     /// Test hook: runs at every pass step, before a crash there.
     pub(crate) static ON_STEP: std::cell::RefCell<Option<StepHook>> =
         std::cell::RefCell::new(None);
+    /// Test counter: the journal bytes the pass guard compared (ADR-065
+    /// D9), so a test can pin that the steady state compares none.
+    pub(crate) static GUARD_COMPARED: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
 }
 
 /// What one pass did: its report lines, and every problem that makes it
@@ -1202,7 +1210,9 @@ impl Pass<'_> {
             Some(archive) => hot_entries(&archive.paths.import_ledger),
             None => HotEntries::default(),
         };
-        self.report.problems.extend(problems);
+        self.report
+            .problems
+            .extend(problems.into_iter().map(super::repair_hot::with_remedy));
         let mut copied = 0usize;
         for path in &paths {
             copied += self.copy_file(path, &entries)?;
@@ -1582,6 +1592,97 @@ impl Pass<'_> {
         Ok(appended)
     }
 
+    /// The pass guard (ADR-065 D9, review of #226 round 2): where
+    /// extending target `i`'s journal copy from `copy_len` to `end` would
+    /// write a byte that a longer copy holds differently, the extension
+    /// stops before that byte's line. Without it, a lagging copy took
+    /// hot's damaged byte from hot, and the next repair counted that copy
+    /// as a second witness for hot and rebuilt the last good copy with the
+    /// damage (D8's former residual). Compared are hot's bytes `[copy_len,
+    /// min(L_j, end))` with every other target's copy j, at the length `lens`
+    /// holds from before this pass extended any copy: a copy extended
+    /// earlier in the pass holds hot's bytes, no witness. So copies of one
+    /// length compare nothing. Returns the capped end; a contradicted byte
+    /// is a problem naming both sides and the next step, an unreadable copy
+    /// j is named and not counted, and `None` when hot's journal cannot be
+    /// read.
+    fn guard_end(
+        &mut self,
+        i: usize,
+        copy_len: u64,
+        end: u64,
+        lens: &[u64],
+        dests: &[PathBuf],
+    ) -> Option<u64> {
+        let mut first: Option<(u64, usize)> = None;
+        for j in 0..self.targets.len() {
+            if j == i || self.targets[j].stopped {
+                continue;
+            }
+            let to = first.map_or(end, |(at, _)| at).min(lens[j]);
+            if to <= copy_len {
+                continue;
+            }
+            #[cfg(test)]
+            GUARD_COMPARED.with(|bytes| bytes.set(bytes.get() + (to - copy_len)));
+            match replica::first_difference_in(
+                &dests[j],
+                TailSource::File(self.journal),
+                copy_len,
+                to,
+            ) {
+                Ok(Some(at)) => first = Some((at, j)),
+                Ok(None) => {}
+                Err(CopyError {
+                    side: Side::Source,
+                    error,
+                }) => {
+                    self.problem(format!(
+                        "the journal {} cannot be read: {error}",
+                        self.journal.display()
+                    ));
+                    return None;
+                }
+                Err(CopyError { error, .. }) => self.problem(format!(
+                    "the journal copy on {} ({}) cannot be read to guard the journal copy on \
+                     {}: {error}; it is not counted (ADR-065 D9)",
+                    self.targets[j].id,
+                    dests[j].display(),
+                    self.targets[i].id
+                )),
+            }
+        }
+        let Some((at, j)) = first else {
+            return Some(end);
+        };
+        let start = match replica::line_start(TailSource::File(self.journal), at) {
+            Ok(start) => start,
+            Err(CopyError { error, .. }) => {
+                self.problem(format!(
+                    "the journal {} cannot be read: {error}",
+                    self.journal.display()
+                ));
+                return None;
+            }
+        };
+        let capped = start.max(copy_len).min(end);
+        let (id, other) = (self.targets[i].id.clone(), self.targets[j].id.clone());
+        self.problem(format!(
+            "the journal copy on {id} stops before byte {capped} of the journal: at byte {at}, \
+             hot's journal {} holds {} and the journal copy on {other} ({}) holds {}, and a copy \
+             extended over a byte another copy contradicts would count as a second witness for \
+             hot's byte, which it only copied (ADR-065 D9). Run `mie store verify`, then `mie \
+             store repair`: R7 rebuilds the copy on {other} where hot holds a strict majority \
+             at that byte (ADR-065 D8); where it refuses, one against one, stop `mie ingest` \
+             and run `mie store repair-hot --scope journal`, which names both sides",
+            self.journal.display(),
+            super::repair_hot::byte_text(self.journal, at),
+            dests[j].display(),
+            super::repair_hot::byte_text(&dests[j], at),
+        ));
+        Some(capped)
+    }
+
     /// Step 4: returns the bytes appended to the journal copies.
     ///
     /// A `sealed` line on a copy must always name a file that copy holds
@@ -1607,17 +1708,23 @@ impl Pass<'_> {
             return 0;
         };
         let mut appended = 0;
+        // The copies' lengths before this pass extends any of them (D9).
+        let dests: Vec<PathBuf> = self
+            .targets
+            .iter()
+            .map(|target| target.path.join(META_DIR).join(JOURNAL_DIR).join(&name))
+            .collect();
+        let lens: Vec<u64> = dests
+            .iter()
+            .map(|dest| fs::metadata(dest).map_or(0, |metadata| metadata.len()))
+            .collect();
         for i in 0..self.targets.len() {
             if self.targets[i].stopped {
                 continue;
             }
-            let dest = self.targets[i]
-                .path
-                .join(META_DIR)
-                .join(JOURNAL_DIR)
-                .join(&name);
+            let dest = dests[i].clone();
             let id = self.targets[i].id.clone();
-            let copy_len = fs::metadata(&dest).map_or(0, |metadata| metadata.len());
+            let copy_len = lens[i];
             let found = {
                 let fold = &self.fold;
                 let recorded = fold
@@ -1660,9 +1767,25 @@ impl Pass<'_> {
             if !self.marker_present(i) {
                 continue;
             }
-            match replica::extend_prefix(TailSource::File(self.journal), &dest, end) {
-                Ok(0) => {}
-                Ok(bytes) => {
+            // The guard runs only for a copy the extension accepts, still
+            // before any byte is written (review of #226 round 3, finding
+            // 2): a copy whose last line is not hot's is refused anyway,
+            // and guarding it read 2× its gap on every pass until the
+            // repair.
+            let checked = replica::check_extension(TailSource::File(self.journal), &dest, end);
+            let extended = match checked {
+                Ok(()) => {
+                    let Some(end) = self.guard_end(i, copy_len, end, &lens, &dests) else {
+                        return appended;
+                    };
+                    replica::extend_prefix(TailSource::File(self.journal), &dest, end)
+                        .map(|bytes| (bytes, end))
+                }
+                Err(error) => Err(error),
+            };
+            match extended {
+                Ok((0, _)) => {}
+                Ok((bytes, end)) => {
                     appended += bytes;
                     self.line(format!(
                         "journal copy on {id}: appended {bytes} byte(s), now {end} bytes"

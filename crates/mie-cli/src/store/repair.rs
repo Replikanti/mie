@@ -56,19 +56,31 @@
 //!   refused, naming `mie store rebuild --replace-hot-ledger`, which
 //!   supersedes both chains (#193).
 //! - **R7 Journal copies with an open journal finding:** let d be the first
-//!   byte where the copy differs from hot. Repaired only when another
-//!   target's copy is longer than d and equals hot over `[0, d]` (two of
-//!   three agree): the copy is moved aside and rebuilt up to the start of
-//!   the line that holds d, and the closing pass extends it under its usual
-//!   journal hold. Otherwise refused: the journal has no chain, so one copy
-//!   against hot cannot be attributed; when every other copy agrees with
-//!   this one against hot, hot's journal is named as the suspect. The
-//!   repair never rewrites hot, and `mie store restore` is for a lost hot
-//!   only: damage to hot's own journal on an intact hot is #217.
+//!   byte where the copy differs from hot (L_h when it is longer), u the
+//!   start of hot's line that holds d. The rebuild moves the copy aside and
+//!   writes hot's bytes up to u, and the closing pass extends it from hot
+//!   to L_h under its usual journal hold, so the repair writes hot's bytes
+//!   into the copy from u on. It is done only when hot holds a strict
+//!   majority there (ADR-065 D8, [`replica::first_contested_file`]): at
+//!   every byte p ≥ u where a journal that holds a byte at p contradicts
+//!   hot (or holds one past hot's end), more than half of the journals
+//!   that hold a byte at p, hot included, hold hot's byte. The journals
+//!   are hot, this copy and every other target's copy, each as it was
+//!   before this run (a copy rebuilt earlier in the run counts by its
+//!   evidence copy); one that cannot be read refuses. Otherwise refused,
+//!   naming the byte: the journal has no chain, so one copy against hot
+//!   (one against one) cannot be attributed; when every other copy agrees
+//!   with this one against hot at d, hot's journal is named as the
+//!   suspect. The repair never rewrites hot, and `mie store restore` is for
+//!   a lost hot only: with `mie ingest` stopped, `mie store repair-hot
+//!   --scope journal` decides hot's journal (ADR-065).
 //! - **R8 Entry copies with an open entry finding:** replaced from hot only
 //!   when hot's entry lists every file with the SHA-256 of the ledger's
-//!   `manifest` record (else hot's manifest); otherwise refused as an entry
-//!   conflict, for the hold resolution (`mie store resolve`, ADR-062 D11).
+//!   `manifest` record (else hot's manifest, [`entry_mismatches`], the test
+//!   `mie store repair-hot` shares); otherwise refused, naming `mie store
+//!   repair-hot --scope import-ledger`, which restores hot's entry when a
+//!   copy target holds one that passes the test, then the hold resolution
+//!   (`mie store resolve`, ADR-062 D11).
 //!   An absent copy is left to the closing pass. A supersede record's copy
 //!   is replaced from hot when hot's record parses and names its own file
 //!   (it lists no part); a finding on a superseded entry is one line and no
@@ -229,6 +241,9 @@ struct Repair<'a> {
     cleared: BTreeSet<String>,
     /// The paths already judged by R9 in this run.
     judged: BTreeSet<String>,
+    /// Per marked root whose journal copy R7 rebuilt in this run, where
+    /// its former bytes lie: D8 counts every copy as it was before the run.
+    journal_before: BTreeMap<usize, PathBuf>,
     report: RepairReport,
 }
 
@@ -362,7 +377,12 @@ pub fn run(
     let (entries, superseded) = match &archive_config {
         Some(archive) => {
             let found = hot_entries(&archive.paths.import_ledger);
-            problems.extend(found.problems);
+            problems.extend(
+                found
+                    .problems
+                    .into_iter()
+                    .map(super::repair_hot::with_remedy),
+            );
             (found.entries, found.superseded)
         }
         None => (Vec::new(), BTreeMap::new()),
@@ -386,6 +406,7 @@ pub fn run(
         superseded,
         cleared: BTreeSet::new(),
         judged: BTreeSet::new(),
+        journal_before: BTreeMap::new(),
         report,
     };
     #[cfg(test)]
@@ -1129,39 +1150,88 @@ impl Repair<'_> {
             }
         };
         let journal = self.config.paths.journal.clone();
-        // Another target's copy longer than d that equals hot over [0, d].
-        let mut agree = false;
-        let mut others = Vec::new();
-        for &j in targets.iter().filter(|&&j| j != i) {
-            let Some(other) = self.journal_copy(j) else {
-                continue;
-            };
-            let long = fs::metadata(&other).is_ok_and(|metadata| metadata.len() > first);
-            if !long {
-                continue;
+        let hot_len = fs::metadata(&journal).map_or(0, |metadata| metadata.len());
+        let upto = match replica::line_start(TailSource::File(&journal), first) {
+            Ok(upto) => upto,
+            Err(error) => {
+                self.problem(format!("hot's journal: {error}"));
+                return Ok(());
             }
-            match replica::first_difference(&other, TailSource::File(&journal), first + 1) {
-                Ok(None) => agree = true,
-                Ok(Some(_)) => {}
-                Err(_) => continue,
+        };
+        // D8 (ADR-065): the rebuild writes hot's bytes into this copy from
+        // `upto` on (the closing pass extends it to L_h), so hot must hold
+        // a strict majority at every byte from there that a journal
+        // contradicts: hot, this copy and every other target's copy, each
+        // as it was before this run.
+        let others: Vec<PathBuf> = targets
+            .iter()
+            .filter(|&&j| j != i)
+            .filter_map(|&j| {
+                self.journal_before
+                    .get(&j)
+                    .cloned()
+                    .or_else(|| self.journal_copy(j))
+            })
+            .collect();
+        let mut witnesses: Vec<&Path> = vec![copy.as_path()];
+        witnesses.extend(others.iter().map(PathBuf::as_path));
+        let contested = match replica::first_contested_file(&journal, &witnesses, upto) {
+            Ok(contested) => contested,
+            Err(error) => {
+                self.problem(format!(
+                    "the journal on {name} ({}): refused: it differs from hot's journal at byte \
+                     {first}, and a journal the rule counts cannot be read ({error}), so hot's \
+                     majority cannot be established (ADR-065 D8)",
+                    copy.display()
+                ));
+                return Ok(());
             }
-            others.push(other);
-        }
-        if !agree {
+        };
+        if let Some(contested) = contested {
+            let at = contested.at;
             let mine = byte_at(&copy, first).ok().flatten();
             let theirs = byte_at(&journal, first).ok().flatten();
-            let suspect = !others.is_empty()
-                && others
-                    .iter()
-                    .all(|other| byte_at(other, first).ok().flatten() == mine)
+            let held: Vec<u8> = others
+                .iter()
+                .filter_map(|other| byte_at(other, first).ok().flatten())
+                .collect();
+            let suspect = at == first
+                && !held.is_empty()
+                && held.iter().all(|&byte| Some(byte) == mine)
                 && mine != theirs;
+            let repair_hot = "The repair never rewrites hot: with `mie ingest` stopped, `mie \
+                              store repair-hot --scope journal` decides hot's journal";
             let tail = if suspect {
-                " Every other copy agrees with this one against hot, so hot's journal is the \
-                 suspect. The repair never rewrites hot, and `mie store restore` is for a lost \
-                 hot only: damage to hot's own journal on an intact hot is #217"
+                format!(
+                    " Every other copy agrees with this one against hot, so hot's journal is the \
+                     suspect. {repair_hot}, and `mie store restore` is for a lost hot only \
+                     (ADR-065)"
+                )
             } else {
-                " No other copy agrees with hot over [0, d], and the journal has no hash chain, \
-                 so the difference cannot be attributed"
+                let why = if at >= hot_len {
+                    format!(
+                        "at byte {at}, past the end of hot's journal ({hot_len} bytes), {} \
+                         copies hold a byte that hot does not, and the rebuild would drop or \
+                         overwrite it",
+                        contested.covering
+                    )
+                } else if contested.covering == 2 {
+                    format!(
+                        "at byte {at} only hot and one copy hold a byte, and they differ: one \
+                         against one, which the journal, without a hash chain, cannot attribute"
+                    )
+                } else {
+                    format!(
+                        "at byte {at} hot's byte is held by {} of the {} journals that hold a \
+                         byte there, no strict majority",
+                        contested.with_hot, contested.covering
+                    )
+                };
+                format!(
+                    " The rebuild would write hot's bytes into it from byte {upto}, the start of \
+                     that line, so hot must hold a strict majority at every byte from there that \
+                     a journal contradicts; {why}. {repair_hot} (ADR-065 D8)"
+                )
             };
             self.problem(format!(
                 "the journal on {name} ({}): refused: it differs from hot's journal at byte \
@@ -1170,23 +1240,18 @@ impl Repair<'_> {
             ));
             return Ok(());
         }
-        let upto = match replica::line_start(TailSource::File(&journal), first) {
-            Ok(upto) => upto,
-            Err(error) => {
-                self.problem(format!("hot's journal: {error}"));
-                return Ok(());
-            }
-        };
         let relative = PathBuf::from(META_DIR)
             .join(JOURNAL_DIR)
             .join(copy.file_name().unwrap_or_default());
         let aside = aside_of(&self.marked[i].path, self.run_ms, &relative);
         match replica::rebuild_prefix(TailSource::File(&journal), &copy, upto, &aside) {
             Ok(()) => {
+                self.journal_before.insert(i, aside.clone());
                 self.line(format!(
-                    "the journal on {name}: it differed from hot's at byte {first}, where another \
-                     copy agrees with hot; moved aside to {} and rebuilt up to byte {upto}, the \
-                     start of that line; the closing pass extends it",
+                    "the journal on {name}: it differed from hot's at byte {first}, and hot holds \
+                     a strict majority at every contradicted byte from byte {upto}, the start of \
+                     that line (ADR-065 D8); moved aside to {} and rebuilt up to byte {upto}; the \
+                     closing pass extends it",
                     aside.display()
                 ));
                 reached(RepairStep::AfterTailRebuild)
@@ -1257,25 +1322,15 @@ impl Repair<'_> {
             }
             Ok(_) => {}
         }
-        let mut wrong = Vec::new();
-        for (file, sha) in &files {
-            let expected = match self.state.ledger_text(file) {
-                Some(text) => replica::parse_manifest(text).ok().map(|f| f.sha256),
-                None => replica::sealed_manifest(self.hot, file)
-                    .ok()
-                    .flatten()
-                    .map(|(_, f)| f.sha256),
-            };
-            if expected.as_deref() != Some(sha.as_str()) {
-                wrong.push(file.clone());
-            }
-        }
+        let wrong = entry_mismatches(&files, &self.state, self.hot);
         if !wrong.is_empty() {
             self.problem(format!(
                 "import entry {entry} on {name}: refused: hot's entry lists {} with another \
                  SHA-256 than the copy ledger's manifest record (else hot's manifest), so hot's \
-                 entry is no good source: an entry conflict, for the hold resolution (`mie store \
-                 resolve`; ADR-062 D11)",
+                 entry is no good source. When a copy target holds an entry of that name that \
+                 passes this test, `mie store repair-hot --scope import-ledger`, with the \
+                 importer stopped, restores hot's entry from it (ADR-065); otherwise it is an \
+                 entry conflict, for the hold resolution (`mie store resolve`; ADR-062 D11)",
                 wrong.join(", ")
             ));
             return Ok(());
@@ -1306,4 +1361,30 @@ impl Repair<'_> {
         }
         Ok(())
     }
+}
+
+/// R8's test, shared with `mie store repair-hot` (ADR-065 D5), so the two
+/// commands never disagree about which bytes are the entry: the files of
+/// `files` (`(path, sha256)`, as an entry lists them) whose SHA-256 is not
+/// the one of the copy ledger's `manifest` record (`state`), else of hot's
+/// sealed manifest. An entry is good when this is empty.
+pub(super) fn entry_mismatches(
+    files: &[(String, String)],
+    state: &CopyState,
+    hot: &Path,
+) -> Vec<String> {
+    let mut wrong = Vec::new();
+    for (file, sha) in files {
+        let expected = match state.ledger_text(file) {
+            Some(text) => replica::parse_manifest(text).ok().map(|f| f.sha256),
+            None => replica::sealed_manifest(hot, file)
+                .ok()
+                .flatten()
+                .map(|(_, f)| f.sha256),
+        };
+        if expected.as_deref() != Some(sha.as_str()) {
+            wrong.push(file.clone());
+        }
+    }
+    wrong
 }

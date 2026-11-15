@@ -7,7 +7,7 @@ use mie_adapter_binance::archive::ledger::ImportLedger;
 use mie_adapter_parquet::{ParquetRawStore, RotationPolicy};
 use mie_domain::time::EventTime;
 use mie_ports::raw::{RawRecord, RawRecordSink, RawStreamKey};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -634,6 +634,191 @@ fn the_journal_tail_waits_for_every_live_file_on_its_target() {
         fs::read(fixture.cold[0].join(".mie/journal/journal.jsonl")).unwrap(),
         fs::read(&fixture.config.paths.journal).unwrap()
     );
+}
+
+/// Three journal lines of run `r1`.
+fn three_lines() -> Vec<u8> {
+    b"{\"type\":\"run_start\",\"run_id\":\"r1\"}\n\
+      {\"type\":\"stats\",\"run_id\":\"r1\",\"at_ms\":1}\n\
+      {\"type\":\"run_end\",\"run_id\":\"r1\"}\n"
+        .to_vec()
+}
+
+/// The journal copies of the fixture's targets, made writable.
+fn journal_copies(fixture: &Fixture) -> [PathBuf; 2] {
+    fixture.cold.clone().map(|root| {
+        let copy = root.join(".mie/journal/journal.jsonl");
+        make_writable(&copy);
+        copy
+    })
+}
+
+/// The pass guard (ADR-065 D9, review of #226 round 2, finding 1): cold-a
+/// lags at the journal's first line, and cold-b's copy differs from hot in
+/// the second line, which the pass's last-line compare does not reach.
+/// Extended from hot, cold-a would become a second witness of hot's byte
+/// there, which it only copied. So the pass extends it only up to the
+/// start of that line and names the byte, both sides and the next step.
+/// A lagging copy that ends inside that line is only compared, and a
+/// longer copy that cannot be read is named and not counted. Once cold-b
+/// holds hot's bytes, the next pass extends cold-a.
+#[test]
+fn the_guard_holds_a_lagging_copy_before_a_byte_another_copy_contradicts() {
+    let fixture = Fixture::new("pass-journal-guard");
+    let journal = three_lines();
+    fs::write(&fixture.config.paths.journal, &journal).unwrap();
+    let report = fixture.pass();
+    assert_eq!(report.problems, Vec::<String>::new(), "{report:?}");
+    let [a, b] = journal_copies(&fixture);
+    let first = journal.iter().position(|byte| *byte == b'\n').unwrap() + 1;
+    let x = first + 5;
+    let mut damaged = journal.clone();
+    damaged[x] ^= 0x01;
+    fs::write(&a, &journal[..first]).unwrap();
+    fs::write(&b, &damaged).unwrap();
+
+    let report = fixture.pass();
+    assert_eq!(fs::read(&a).unwrap(), &journal[..first]);
+    assert_eq!(fs::read(&b).unwrap(), damaged, "cold-b is not touched");
+    let held = |report: &PassReport, at: usize| {
+        report.problems.iter().any(|p| {
+            p.starts_with(&format!(
+                "the journal copy on cold-a stops before byte {at} of the journal"
+            )) && p.contains(&format!("at byte {x}"))
+                && p.contains(&format!("0x{:02x}", journal[x]))
+                && p.contains(&format!("0x{:02x}", damaged[x]))
+                && p.contains("the journal copy on cold-b")
+                && p.contains("`mie store verify`")
+                && p.contains("`mie store repair`")
+                && p.contains("`mie store repair-hot --scope journal`")
+        })
+    };
+    assert!(held(&report, first), "{report:?}");
+
+    // Cut inside the contradicted line: compared, never extended.
+    fs::write(&a, &journal[..first + 3]).unwrap();
+    let report = fixture.pass();
+    assert_eq!(fs::read(&a).unwrap(), &journal[..first + 3]);
+    assert!(held(&report, first + 3), "{report:?}");
+
+    // A longer copy that cannot be read is named and not counted.
+    fs::write(&a, &journal[..first]).unwrap();
+    fs::set_permissions(&b, std::os::unix::fs::PermissionsExt::from_mode(0o000)).unwrap();
+    let report = fixture.pass();
+    make_writable(&b);
+    assert_eq!(fs::read(&a).unwrap(), journal);
+    assert!(
+        report
+            .problems
+            .iter()
+            .any(|p| p.starts_with("the journal copy on cold-b (",)
+                && p.contains("cannot be read to guard the journal copy on cold-a")),
+        "{report:?}"
+    );
+
+    // cold-b holds hot's bytes again (as R7's rebuild leaves it).
+    fs::write(&a, &journal[..first]).unwrap();
+    fs::write(&b, &journal).unwrap();
+    let report = fixture.pass();
+    assert_eq!(report.problems, Vec::<String>::new(), "{report:?}");
+    assert_eq!(fs::read(&a).unwrap(), journal);
+}
+
+/// The guard's cost (ADR-065 D9): copies of one length compare nothing,
+/// even behind hot and with one of them differing in an older line, and
+/// a copy extended earlier in the pass is not compared with (its new bytes
+/// are hot's). A new target compares once against the longer copy.
+#[test]
+fn the_guard_compares_nothing_at_equal_lengths() {
+    let fixture = Fixture::new("pass-journal-guard-steady");
+    let journal = three_lines();
+    fs::write(&fixture.config.paths.journal, &journal).unwrap();
+    fixture.pass();
+    let [a, b] = journal_copies(&fixture);
+    let second = journal.len() - b"{\"type\":\"run_end\",\"run_id\":\"r1\"}\n".len();
+    let mut older = journal[..second].to_vec();
+    older[3] ^= 0x01;
+    fs::write(&a, &journal[..second]).unwrap();
+    fs::write(&b, &older).unwrap();
+    GUARD_COMPARED.with(|bytes| bytes.set(0));
+    let report = fixture.pass();
+    assert_eq!(report.problems, Vec::<String>::new(), "{report:?}");
+    assert_eq!(GUARD_COMPARED.with(Cell::get), 0);
+    assert_eq!(fs::read(&a).unwrap(), journal);
+    let mut expected = older;
+    expected.extend_from_slice(&journal[second..]);
+    assert_eq!(fs::read(&b).unwrap(), expected);
+
+    // A new target: cold-a starts empty and compares hot's bytes with
+    // cold-b's once.
+    fs::write(&b, &journal).unwrap();
+    fs::remove_file(&a).unwrap();
+    let report = fixture.pass();
+    assert_eq!(report.problems, Vec::<String>::new(), "{report:?}");
+    assert_eq!(GUARD_COMPARED.with(Cell::get), journal.len() as u64);
+    assert_eq!(fs::read(&a).unwrap(), journal);
+}
+
+/// The guard's cost on a copy the extension refuses (ADR-065 D9, review
+/// of #226 round 3, finding 2): cold-a lags with its last line flipped,
+/// cold-b is current. `extend_prefix` refuses cold-a at its last line, so
+/// the guard reads nothing for it, on every pass until the repair; a copy
+/// that is no byte prefix of hot is never extended, guarded or not.
+#[test]
+fn the_guard_reads_nothing_for_a_copy_the_extension_refuses() {
+    let fixture = Fixture::new("pass-journal-guard-refused");
+    let journal = three_lines();
+    fs::write(&fixture.config.paths.journal, &journal).unwrap();
+    fixture.pass();
+    let [a, b] = journal_copies(&fixture);
+    let first = journal.iter().position(|byte| *byte == b'\n').unwrap() + 1;
+    let mut lagging = journal[..first].to_vec();
+    lagging[3] ^= 0x01;
+    fs::write(&a, &lagging).unwrap();
+    for _ in 0..2 {
+        GUARD_COMPARED.with(|bytes| bytes.set(0));
+        let report = fixture.pass();
+        assert_eq!(GUARD_COMPARED.with(Cell::get), 0, "{report:?}");
+        assert!(
+            report
+                .problems
+                .iter()
+                .any(|p| p.starts_with("the journal copy on cold-a (") && p.contains("is refused")),
+            "{report:?}"
+        );
+        assert_eq!(fs::read(&a).unwrap(), lagging);
+        assert_eq!(fs::read(&b).unwrap(), journal);
+    }
+
+    // A copy longer than hot is refused as before (never read past hot's
+    // end, which would be an error on hot's journal), and the next
+    // target's copy is still extended, guarded against it.
+    let mut longer = journal.clone();
+    longer.extend_from_slice(b"{\"type\":\"stats\",\"run_id\":\"r2\",\"at_ms\":2}\n");
+    fs::write(&a, &longer).unwrap();
+    fs::write(&b, &journal[..first]).unwrap();
+    GUARD_COMPARED.with(|bytes| bytes.set(0));
+    let report = fixture.pass();
+    assert_eq!(
+        GUARD_COMPARED.with(Cell::get),
+        (journal.len() - first) as u64,
+        "{report:?}"
+    );
+    assert!(
+        report
+            .problems
+            .iter()
+            .any(|p| p.starts_with("the journal copy on cold-a (")
+                && p.contains("is refused")
+                && p.contains("longer than the")),
+        "{report:?}"
+    );
+    assert!(
+        !report.problems.iter().any(|p| p.contains("cannot be read")),
+        "{report:?}"
+    );
+    assert_eq!(fs::read(&a).unwrap(), longer);
+    assert_eq!(fs::read(&b).unwrap(), journal);
 }
 
 /// The first live part of the fixture.

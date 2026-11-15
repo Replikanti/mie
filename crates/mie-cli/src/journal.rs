@@ -62,6 +62,7 @@ use mie_adapter_binance::{
 };
 use mie_adapter_parquet::copy_ledger::Truncation;
 use mie_adapter_parquet::removal::{RemovalPlan, RemovalReport};
+use mie_adapter_parquet::replica::{self, JournalLock};
 use mie_app::equivalence::StateCheckpoint;
 use mie_domain::book::{Invalidation, Side};
 use mie_domain::event_hash::EventStreamHash;
@@ -760,20 +761,26 @@ pub fn read_runs(path: &Path, source: &str) -> Result<Vec<JournaledRun>, String>
     Ok(runs)
 }
 
-/// An open journal for one run.
+/// An open journal for one run. It holds the journal lock
+/// ([`replica::try_journal_lock`]) for as long as it exists, so every line
+/// of the run, `run_end` and the final pass's `replication` included, is
+/// written under it, and `mie store repair-hot --scope journal` and `mie
+/// store restore` refuse while it is open (review of #226, finding 3).
 #[derive(Debug)]
 pub struct Journal {
     out: BufWriter<File>,
     run_id: String,
     write_error: Option<String>,
+    _lock: JournalLock,
 }
 
 impl Journal {
-    /// Opens `path` for appending, creating it and its directory.
+    /// Opens `path` for appending, creating it and its directory, and takes
+    /// the journal lock without waiting.
     ///
     /// # Errors
     ///
-    /// A description of the I/O failure.
+    /// A description of the I/O failure, or of the held lock.
     pub fn open(path: &Path, run_id: &str) -> Result<Self, String> {
         if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
             std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
@@ -783,10 +790,13 @@ impl Journal {
             .append(true)
             .open(path)
             .map_err(|e| format!("open journal {}: {e}", path.display()))?;
+        let lock = replica::try_journal_lock(path)
+            .map_err(|e| format!("the journal lock of {}: {e}", path.display()))?;
         Ok(Self {
             out: BufWriter::new(file),
             run_id: run_id.to_owned(),
             write_error: None,
+            _lock: lock,
         })
     }
 

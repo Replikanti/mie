@@ -12,6 +12,38 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
 
 ### Added
 
+- **Storage tiers: `mie store repair-hot` (#217, ADR-065).** Repairs hot's
+  own journal (`--scope journal`, with `mie ingest` stopped) or
+  import-ledger files (`--scope import-ledger`, beside a running capture)
+  on an intact hot from the copy targets, the case `mie store repair` and
+  `mie store restore` left open. The journal is replaced by the copies only
+  where two copies of hot's full length agree against it at every
+  differing byte and a fork guard finds no fork's shape (a torn line glued
+  to the next run's anywhere in the differing region); a hot journal the
+  copies are longer than is extended, and ended with its `\n` also when an
+  earlier run's extension stopped before it; so is one that is behind
+  while a copy is damaged, where hot holds a strict majority at every byte
+  it holds: it takes the bytes past its end only from copies with no
+  difference with hot below it, and only where no copy holds another byte
+  there and no differing copy has a fork's shape, and the damaged copy is
+  named for `mie store repair`; every
+  other state (damaged copies,
+  two faults, hot ahead of the copies, a fork, one copy against hot) stops
+  with nothing written, naming both sides and the next step.
+  `--keep-hot-journal` keeps hot's journal and rebuilds the copies that
+  are no prefix of it, for a fork or a state no copy can attribute; every
+  stop that offers it names the copy bytes it would drop. An
+  import-ledger file of hot's that does not read, does not parse, lists a
+  file with another SHA-256 than the copy ledger (R8's test, now shared)
+  or is missing is written from the single good copy on the targets; a
+  malformed `.import` name on hot moves into the evidence directory; with
+  no good copy anywhere the stop names the closure by hand. A replaced
+  file is first hard-linked to `<file>.damaged-<time>` (the journal) or
+  `<import-ledger dir>.damaged-<time>/`, never deleted, so a crash never
+  leaves hot without the file. The restore's, the repair's and resolve's
+  texts that pointed at #217 name the command. ADR-062's status line
+  points to ADR-065.
+
 - **ADR-062 accepted: the tiered model documented (#196, #184 T10).** The
   copy-ledger growth is now estimated from measured records (the #190
   adoption ledger and the #191 tiered capture): about 1.65 MB per day of
@@ -952,6 +984,46 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   (ADR-040 D4).
 
 ### Changed
+
+- **`mie store repair` R7: hot needs a strict majority at every byte the
+  rebuild writes (#217, ADR-065 D8).** The rebuild of a journal copy that
+  differs from hot at d writes hot's bytes into it from the start of d's
+  line to hot's end (the closing pass extends it). It is done only when,
+  at every one of those bytes where a journal contradicts hot, more than
+  half of the journals that hold a byte there (hot, this copy and every
+  other target's copy, as they were before the run) hold hot's byte; a
+  byte only hot and this copy hold, where they differ, is one against one
+  and refuses, and so does a copy byte past hot's end. Before, one other
+  copy equal to hot over `[0, d]` sufficed, and with hot damaged past d
+  the rebuild copied hot's damage into this copy. Two damaged copies on an
+  intact hot are both rebuilt. The refusal names the byte and `mie store
+  repair-hot --scope journal`; repair-hot's *copy-damaged* stop applies
+  the same rule.
+
+- **The journal lock (#217, review of #226).** `mie ingest` holds
+  `<paths.journal>.lock` from the journal's open until its last line
+  (`run_end`, the final pass's `replication`); `mie store repair-hot
+  --scope journal` and `mie store restore` take it without waiting, so
+  neither writes the journal under a capture that is shutting down, after
+  the source's writer lock is already released. `mie ingest` now refuses
+  to start when the lock file cannot be created (the journal's directory
+  is not writable) or is held, also by a second `mie ingest` of another
+  source that shares `paths.journal` (intended: two writers appending to
+  one file can interleave a line). A filesystem without `flock` support,
+  such as some NFS setups, fails the same way (not run).
+
+- **The replication pass guard (#217, ADR-065 D9).** A pass no longer
+  extends a journal copy over a byte that a longer copy holds differently
+  from hot: the copy stops before that byte's line, and the pass names the
+  byte, both sides and the next step (`mie store verify`, `mie store
+  repair`, then `mie store repair-hot --scope journal` where the repair
+  refuses). Before, a lagging copy took hot's damaged byte from hot, and
+  the next repair counted it as a second witness and rebuilt the last good
+  copy with the damage. Copies of one length compare nothing; a lagging
+  copy reads its overlap with each longer copy twice, a new target about
+  twice the journal once per longer copy, and a copy whose last line is
+  not hot's, which the pass refuses anyway, reads nothing for the guard.
+  A damaged copy holds a healthy lagging one back until it is healed.
 
 - **Import-ledger generations and current entries (#210, ADR-062 D11,
   proposed; ADR-034 D4 superseded at one point).** An import entry is

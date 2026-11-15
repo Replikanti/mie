@@ -1297,3 +1297,412 @@ fn list_temps_and_evidence_classify_every_name() {
     // Evidence is no temp name, and no temp name is evidence.
     assert_eq!(list_temps(root).unwrap(), temps);
 }
+
+/// The first and the last differing byte (#217): across chunks, at the
+/// first and the last byte, a single byte, and none.
+#[test]
+fn difference_bounds_first_last_and_none() {
+    let dir = TempDir::new("replica-bounds");
+    let path = dir.path().join("hot.jsonl");
+    // Longer than three chunks, so the bounds cross chunk borders.
+    let source: Vec<u8> = (0..400u32).map(|i| b'a' + (i % 26) as u8).collect();
+    let len = source.len() as u64;
+    let bounds = |copy: &[u8]| {
+        fs::write(&path, copy).unwrap();
+        difference_bounds(&path, TailSource::Bytes(&source), len).unwrap()
+    };
+    assert_eq!(bounds(&source), None);
+    assert_eq!(bounds(&flipped(&source, 10)), Some((10, 10)));
+    assert_eq!(bounds(&flipped(&flipped(&source, 0), 399)), Some((0, 399)));
+    assert_eq!(
+        bounds(&flipped(&flipped(&flipped(&source, 50), 200), 300)),
+        Some((50, 300))
+    );
+    // Only `[0, len)` counts.
+    fs::write(&path, flipped(&source, 399)).unwrap();
+    assert_eq!(
+        difference_bounds(&path, TailSource::Bytes(&source), 399).unwrap(),
+        None
+    );
+    // A missing copy is the destination's side, a short source the source's.
+    let error =
+        difference_bounds(&dir.path().join("absent"), TailSource::Bytes(&source), len).unwrap_err();
+    assert_eq!(error.side, Side::Destination);
+    fs::write(&path, &source).unwrap();
+    let error = difference_bounds(&path, TailSource::Bytes(&source[..10]), len).unwrap_err();
+    assert_eq!(error.side, Side::Source);
+}
+
+/// The replace of one of hot's files (#217, ADR-065 D6) across a crash
+/// after either step: the old file or the new one is always there, the
+/// evidence holds the old bytes, and a re-run with a new evidence name
+/// completes it.
+#[test]
+fn replace_with_evidence_crash_after_each_step() {
+    let dir = TempDir::new("replica-replace");
+    let dest = dir.path().join("journal.jsonl");
+    let old = b"{\"a\":1}\n{\"b\":2X}\n".to_vec();
+    let new = b"{\"a\":1}\n{\"b\":22}".to_vec();
+    let tmp = dir.path().join(".journal.jsonl.replace.tmp");
+    for (i, step) in [
+        Some(ReplaceEvidenceStep::Linked),
+        Some(ReplaceEvidenceStep::Temp),
+        None,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        fs::write(&dest, &old).unwrap();
+        let aside = dir.path().join(format!("journal.jsonl.damaged-{i}"));
+        let result = replace_with_evidence(
+            TailSource::Bytes(&new),
+            &dest,
+            new.len() as u64,
+            true,
+            &aside,
+            false,
+            &mut |reached| {
+                if Some(reached) == step {
+                    Err(RawStoreError::Io(format!(
+                        "simulated crash after {reached:?}"
+                    )))
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        // The evidence holds the old bytes in every case.
+        assert_eq!(fs::read(&aside).unwrap(), old, "{step:?}");
+        if step.is_some() {
+            assert!(result.is_err(), "{step:?}");
+            // Hot still holds its file: the old one.
+            assert_eq!(fs::read(&dest).unwrap(), old, "{step:?}");
+            let again = dir.path().join(format!("journal.jsonl.damaged-{i}-again"));
+            replace_with_evidence(
+                TailSource::Bytes(&new),
+                &dest,
+                new.len() as u64,
+                true,
+                &again,
+                false,
+                &mut |_| Ok(()),
+            )
+            .unwrap();
+            assert_eq!(fs::read(&again).unwrap(), old, "{step:?}");
+        } else {
+            result.unwrap();
+        }
+        let mut expected = new.clone();
+        expected.push(b'\n');
+        assert_eq!(fs::read(&dest).unwrap(), expected, "{step:?}");
+        assert!(!tmp.exists(), "{step:?}");
+        // A link, not a copy: the evidence is the old inode, linked once
+        // more by the re-run after a crash.
+        use std::os::unix::fs::MetadataExt;
+        let links = if step.is_some() { 2 } else { 1 };
+        assert_eq!(fs::metadata(&aside).unwrap().nlink(), links, "{step:?}");
+    }
+}
+
+/// An existing evidence name is refused before anything is written.
+#[test]
+fn replace_with_evidence_refuses_an_existing_aside() {
+    let dir = TempDir::new("replica-replace-aside");
+    let dest = dir.path().join("journal.jsonl");
+    fs::write(&dest, b"old\n").unwrap();
+    let aside = dir.path().join("journal.jsonl.damaged-1");
+    fs::write(&aside, b"earlier evidence\n").unwrap();
+    let before = snapshot(dir.path());
+    let error = replace_with_evidence(
+        TailSource::Bytes(b"new\n"),
+        &dest,
+        4,
+        false,
+        &aside,
+        false,
+        &mut |_| Ok(()),
+    )
+    .unwrap_err();
+    assert_eq!(error.side, Side::Destination);
+    assert!(
+        matches!(error.error, RawStoreError::Integrity(_)),
+        "{error}"
+    );
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+/// An import-ledger file ends read-only, an unreadable one is linked aside
+/// all the same, a missing `dest` is refused (the replace never creates a
+/// file), and a short source writes nothing over `dest`.
+#[test]
+fn replace_with_evidence_read_only_and_missing_dest() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new("replica-replace-ro");
+    let dest = dir.path().join("ledger/aggTrades/F.zip.import");
+    fs::create_dir_all(dest.parent().unwrap()).unwrap();
+    fs::write(&dest, b"rotten\n").unwrap();
+    fs::set_permissions(&dest, fs::Permissions::from_mode(0o000)).unwrap();
+    let aside = dir.path().join("ledger.damaged-7/aggTrades/F.zip.import");
+    let good = b"mie-archive-import 1\n".to_vec();
+    replace_with_evidence(
+        TailSource::Bytes(&good),
+        &dest,
+        good.len() as u64,
+        false,
+        &aside,
+        true,
+        &mut |_| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(fs::read(&dest).unwrap(), good);
+    assert!(fs::metadata(&dest).unwrap().permissions().readonly());
+    fs::set_permissions(&aside, fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(fs::read(&aside).unwrap(), b"rotten\n");
+
+    let missing = dir.path().join("ledger/aggTrades/G.zip.import");
+    let error = replace_with_evidence(
+        TailSource::Bytes(&good),
+        &missing,
+        good.len() as u64,
+        false,
+        &dir.path().join("ledger.damaged-8/aggTrades/G.zip.import"),
+        true,
+        &mut |_| Ok(()),
+    )
+    .unwrap_err();
+    assert!(matches!(error.error, RawStoreError::Invalid(_)), "{error}");
+    assert!(!missing.exists());
+    assert!(!dir.path().join("ledger.damaged-8").exists());
+
+    let before = fs::read(&dest).unwrap();
+    let error = replace_with_evidence(
+        TailSource::Bytes(&good[..3]),
+        &dest,
+        good.len() as u64,
+        false,
+        &dir.path().join("ledger.damaged-9/aggTrades/F.zip.import"),
+        true,
+        &mut |_| Ok(()),
+    )
+    .unwrap_err();
+    assert_eq!(error.side, Side::Source);
+    assert_eq!(fs::read(&dest).unwrap(), before);
+}
+
+/// ADR-065 D8 (review of #226, findings 1 and 2): hot needs a strict
+/// majority of the journals that hold a byte, wherever one contradicts
+/// it. Two of three hold; one against one, one of three, two of four and
+/// a byte past hot's end do not; bytes only hot holds are no contest. The
+/// file form agrees with the in-memory form across chunk boundaries (97
+/// bytes under test), skips an absent witness and names an unreadable
+/// one.
+#[test]
+fn first_contested_needs_a_strict_majority_for_hot() {
+    let hot: Vec<u8> = (0..300u32).map(|i| b'a' + (i % 26) as u8).collect();
+    let at = |bytes: &[u8], i: usize| flipped(bytes, i);
+    let (b10, b250) = (at(&hot, 10), at(&hot, 250));
+    let contested = |witnesses: &[&[u8]], from: u64| first_contested(&hot, witnesses, from);
+    assert_eq!(contested(&[&hot, &b10], 0), None);
+    assert_eq!(contested(&[&b250, &b10], 0), None);
+    assert_eq!(
+        contested(&[&hot[..100], &b250], 0),
+        Some(Contested {
+            at: 250,
+            covering: 2,
+            with_hot: 1
+        })
+    );
+    assert_eq!(
+        contested(&[&b10, &b10], 0),
+        Some(Contested {
+            at: 10,
+            covering: 3,
+            with_hot: 1
+        })
+    );
+    assert_eq!(contested(&[&b10, &b10], 11), None, "before `from`");
+    assert_eq!(
+        contested(&[&b10, &b10, &hot], 0),
+        Some(Contested {
+            at: 10,
+            covering: 4,
+            with_hot: 2
+        })
+    );
+    assert_eq!(contested(&[&hot[..100], &hot[..200]], 0), None);
+    let mut longer = hot.clone();
+    longer.push(b'\n');
+    assert_eq!(
+        contested(&[&hot, &longer], 0),
+        Some(Contested {
+            at: 300,
+            covering: 1,
+            with_hot: 0
+        })
+    );
+
+    let dir = TempDir::new("replica-contested");
+    let write = |name: &str, bytes: &[u8]| {
+        let path = dir.path().join(name);
+        fs::write(&path, bytes).unwrap();
+        path
+    };
+    let hot_path = write("hot", &hot);
+    let cases: [&[&[u8]]; 4] = [
+        &[&hot, &b10],
+        &[&hot[..100], &b250],
+        &[&b10, &b10, &hot],
+        &[&hot, &longer],
+    ];
+    for (n, witnesses) in cases.iter().enumerate() {
+        let paths: Vec<PathBuf> = witnesses
+            .iter()
+            .enumerate()
+            .map(|(w, bytes)| write(&format!("{n}-{w}"), bytes))
+            .collect();
+        let refs: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
+        for from in [0, 96, 97, 251] {
+            assert_eq!(
+                first_contested_file(&hot_path, &refs, from).unwrap(),
+                first_contested(&hot, witnesses, from),
+                "case {n} from {from}"
+            );
+        }
+    }
+    let absent = dir.path().join("absent");
+    let b250_path = write("b250", &b250);
+    assert_eq!(
+        first_contested_file(&hot_path, &[&b250_path, &absent], 0).unwrap(),
+        Some(Contested {
+            at: 250,
+            covering: 2,
+            with_hot: 1
+        })
+    );
+    let error = first_contested_file(&hot_path, &[dir.path()], 0).unwrap_err();
+    assert_eq!(error.side, Side::Destination, "{error}");
+    let error = first_contested_file(&absent, &[&b250_path], 0).unwrap_err();
+    assert_eq!(error.side, Side::Source, "{error}");
+}
+
+/// The bounded forms (ADR-065 D2, D9; review of #226 round 2): a
+/// difference is looked for in `[from, to)` only, a contest below `until`
+/// only, and a disagreement between witnesses is a byte two of them that
+/// hold it hold differently (hot takes no part). The file forms agree with
+/// the in-memory ones across chunk boundaries (97 bytes under test).
+#[test]
+fn the_bounded_difference_contest_and_disagreement() {
+    let hot: Vec<u8> = (0..300u32).map(|i| b'a' + (i % 26) as u8).collect();
+    let dir = TempDir::new("replica-bounded");
+    let write = |name: &str, bytes: &[u8]| {
+        let path = dir.path().join(name);
+        fs::write(&path, bytes).unwrap();
+        path
+    };
+    let hot_path = write("hot", &hot);
+    let b10_250 = flipped(&flipped(&hot, 10), 250);
+    let b10_250_path = write("b10-250", &b10_250);
+    let source = TailSource::File(&hot_path);
+    assert_eq!(
+        first_difference_in(&b10_250_path, source, 0, 300).unwrap(),
+        Some(10)
+    );
+    assert_eq!(
+        first_difference_in(&b10_250_path, source, 11, 300).unwrap(),
+        Some(250)
+    );
+    assert_eq!(
+        first_difference_in(&b10_250_path, source, 11, 250).unwrap(),
+        None,
+        "`to` is exclusive"
+    );
+    assert_eq!(
+        first_difference_in(&b10_250_path, source, 300, 300).unwrap(),
+        None,
+        "an empty range reads nothing"
+    );
+
+    // Hot 200 bytes long under two copies of 300: the bytes past its end
+    // are contested, the ones below are not.
+    let short_path = write("short", &hot[..200]);
+    let b10_path = write("b10", &flipped(&hot, 10));
+    let full_path = write("full", &hot);
+    let copies = [b10_path.as_path(), full_path.as_path()];
+    assert_eq!(
+        first_contested_file(&short_path, &copies, 0)
+            .unwrap()
+            .map(|c| c.at),
+        Some(200)
+    );
+    for until in [97, 194, 200] {
+        assert_eq!(
+            first_contested_file_before(&short_path, &copies, 0, until).unwrap(),
+            None,
+            "until {until}"
+        );
+    }
+    assert_eq!(
+        first_contested_file_before(&short_path, &copies, 0, 201)
+            .unwrap()
+            .map(|c| c.at),
+        Some(200)
+    );
+
+    let b250 = flipped(&hot, 250);
+    // (witnesses, from, the first disagreement)
+    type Case<'a> = (&'a [&'a [u8]], u64, Option<u64>);
+    let cases: [Case; 6] = [
+        (&[&hot, &hot], 0, None),
+        (&[&hot, &b250], 0, Some(250)),
+        (&[&hot, &b250], 251, None),
+        (&[&hot[..260], &b250], 0, Some(250)),
+        (&[&hot[..100], &b250], 0, None),
+        (&[&b250], 0, None),
+    ];
+    for (n, (witnesses, from, expected)) in cases.iter().enumerate() {
+        assert_eq!(first_disagreement(witnesses, *from), *expected, "case {n}");
+        let paths: Vec<PathBuf> = witnesses
+            .iter()
+            .enumerate()
+            .map(|(w, bytes)| write(&format!("d{n}-{w}"), bytes))
+            .collect();
+        let mut refs: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
+        let absent = dir.path().join("absent");
+        refs.push(&absent);
+        for from in [*from, from + 96, from + 97] {
+            assert_eq!(
+                first_disagreement_file(&refs, from).unwrap(),
+                first_disagreement(witnesses, from),
+                "case {n} from {from}"
+            );
+        }
+    }
+    let error = first_disagreement_file(&[dir.path()], 0).unwrap_err();
+    assert_eq!(error.side, Side::Destination, "{error}");
+}
+
+/// The journal lock (review of #226, finding 3): one holder at a time,
+/// free after its drop, beside the file a link names, and its directory
+/// created when absent.
+#[test]
+fn the_journal_lock_refuses_a_second_holder() {
+    let dir = TempDir::new("replica-journal-lock");
+    let journal = dir.path().join("logs/journal.jsonl");
+    let lock = try_journal_lock(&journal).unwrap();
+    assert!(dir.path().join("logs/journal.jsonl.lock").exists());
+    assert!(matches!(
+        try_journal_lock(&journal),
+        Err(RawStoreError::Locked(_))
+    ));
+    drop(lock);
+    fs::write(&journal, b"").unwrap();
+    let link = dir.path().join("link.jsonl");
+    std::os::unix::fs::symlink(&journal, &link).unwrap();
+    let by_link = try_journal_lock(&link).unwrap();
+    assert!(matches!(
+        try_journal_lock(&journal),
+        Err(RawStoreError::Locked(_))
+    ));
+    drop(by_link);
+    drop(try_journal_lock(&journal).unwrap());
+}

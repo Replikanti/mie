@@ -451,12 +451,15 @@ struct Survey<'a> {
 }
 
 /// The remedy RA5 names for a file that does not read. A copy target's
-/// file is repaired from hot; hot's own file on an intact hot is #217,
-/// since the repair never rewrites hot and `mie store restore` is for a
-/// lost hot only (#195 STOP 1 decision 2).
+/// file is repaired from hot; hot's own file on an intact hot by `mie store
+/// repair-hot --scope import-ledger` (ADR-065 D5), since the repair never
+/// rewrites hot and `mie store restore` is for a lost hot only (#195 STOP 1
+/// decision 2). One text for every call site.
 const REPAIR: &str = "for a copy target's file, run `mie store verify`, then `mie store repair`; \
-                      the repair never rewrites hot, and `mie store restore` is for a lost hot \
-                      only: damage to hot's own file on an intact hot is #217";
+                      for hot's own file (it does not read or parse, its name is malformed, or \
+                      hot lacks it while a target holds it), run `mie store repair-hot --scope \
+                      import-ledger` with the importer stopped, which restores it from a copy \
+                      target (ADR-065)";
 
 impl Survey<'_> {
     /// The entry copies the case decides on (`decides`) must read; any

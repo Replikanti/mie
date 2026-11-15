@@ -27,6 +27,12 @@
 //!   rebuild reads it (ADR-062 D7 step 5a, #211);
 //! - [`first_difference`], [`line_start`]: where a tail copy first differs
 //!   from hot's file, and where the line holding a byte starts;
+//!   [`difference_bounds`]: the first and the last byte where two files
+//!   differ (#217);
+//! - [`replace_with_evidence`]: the replace of one of hot's own small or
+//!   tail files (its journal, an import-ledger file) that keeps the old
+//!   bytes under an evidence name and never leaves hot without the file
+//!   (#217, ADR-065 D6);
 //! - [`try_verify_lock`]: the verification lock on hot (#192).
 //!
 //! Every primitive takes its source and destination explicitly, so the
@@ -1195,6 +1201,68 @@ fn last_line_start(file: &mut File, path: &Path, len: u64) -> Result<u64, RawSto
     Ok(0)
 }
 
+/// [`extend_prefix`]'s checks before it appends: a `dest` of `len` bytes
+/// longer than `end` is refused, then its last record (and any partial
+/// tail) is compared with the source.
+fn extension_refusal(
+    file: &mut File,
+    dest: &Path,
+    source: TailSource<'_>,
+    len: u64,
+    end: u64,
+) -> Result<(), CopyError> {
+    if len > end {
+        return Err(RawStoreError::Integrity(format!(
+            "{}: {len} bytes, longer than the {end} bytes of {} it copies; a copy is a byte \
+             prefix of hot's file (ADR-062 D11)",
+            dest.display(),
+            source.describe()
+        ))
+        .into());
+    }
+    let mut offset = last_line_start(file, dest, len)?;
+    while offset < len {
+        let n = (len - offset).min(CHUNK as u64) as usize;
+        let mine = read_at(file, dest, offset, n)?;
+        let theirs = source.read_at(offset, n)?;
+        if let Some(i) = mine.iter().zip(&theirs).position(|(a, b)| a != b) {
+            return Err(RawStoreError::Integrity(format!(
+                "{}: byte {} differs from {}; the copy's last record is not hot's record at that \
+                 offset, so it is not a byte prefix of hot's file (ADR-062 D11)",
+                dest.display(),
+                offset + i as u64,
+                source.describe()
+            ))
+            .into());
+        }
+        offset += n as u64;
+    }
+    Ok(())
+}
+
+/// The checks [`extend_prefix`] makes before it appends (`dest` no longer
+/// than `end`, its last record the source's), read only: a missing `dest`
+/// passes, as `extend_prefix` creates it. The replication pass guard
+/// (ADR-065 D9) runs only for a copy that passes, so a copy the extension
+/// refuses costs no guard reads (review of #226 round 3, finding 2).
+///
+/// # Errors
+///
+/// As [`extend_prefix`] for those checks: a [`CopyError`] on
+/// [`Side::Source`] when the source cannot be read, on
+/// [`Side::Destination`] for a `dest` longer than `end` or whose last
+/// record differs ([`RawStoreError::Integrity`]), and when `dest` cannot
+/// be read.
+pub fn check_extension(source: TailSource<'_>, dest: &Path, end: u64) -> Result<(), CopyError> {
+    let mut file = match File::open(dest) {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(io_error("open", dest)(error).into()),
+    };
+    let len = file.metadata().map_err(io_error("stat", dest))?.len();
+    extension_refusal(&mut file, dest, source, len, end)
+}
+
 /// Extends `dest` to the byte prefix `[0, end)` of `source` (the D11 tail
 /// append of a line-structured, append-only file) and returns the bytes
 /// appended.
@@ -1236,34 +1304,7 @@ pub fn extend_prefix(source: TailSource<'_>, dest: &Path, end: u64) -> Result<u6
         .open(dest)
         .map_err(io_error("open", dest))?;
     let len = file.metadata().map_err(io_error("stat", dest))?.len();
-    if len > end {
-        return Err(RawStoreError::Integrity(format!(
-            "{}: {len} bytes, longer than the {end} bytes of {} it copies; a copy is a byte \
-             prefix of hot's file (ADR-062 D11)",
-            dest.display(),
-            source.describe()
-        ))
-        .into());
-    }
-
-    // The copy's last record (and any partial tail) against the source.
-    let mut offset = last_line_start(&mut file, dest, len)?;
-    while offset < len {
-        let n = (len - offset).min(CHUNK as u64) as usize;
-        let mine = read_at(&mut file, dest, offset, n)?;
-        let theirs = source.read_at(offset, n)?;
-        if let Some(i) = mine.iter().zip(&theirs).position(|(a, b)| a != b) {
-            return Err(RawStoreError::Integrity(format!(
-                "{}: byte {} differs from {}; the copy's last record is not hot's record at that \
-                 offset, so it is not a byte prefix of hot's file (ADR-062 D11)",
-                dest.display(),
-                offset + i as u64,
-                source.describe()
-            ))
-            .into());
-        }
-        offset += n as u64;
-    }
+    extension_refusal(&mut file, dest, source, len, end)?;
     if len == end {
         return Ok(0);
     }
@@ -1404,6 +1445,59 @@ pub fn try_verify_lock(raw_root: &Path) -> Result<VerifyLock, RawStoreError> {
         Ok(lock) => Ok(VerifyLock { _lock: lock }),
         Err(TryLockError::WouldBlock) => Err(RawStoreError::Locked(format!(
             "another mie store verify or mie store repair holds {}",
+            path.display()
+        ))),
+        Err(TryLockError::Error(error)) => Err(io_error("lock", &path)(error)),
+    }
+}
+
+/// The journal lock; dropping it releases the lock explicitly
+/// ([`HeldLock`]).
+#[derive(Debug)]
+pub struct JournalLock {
+    _lock: HeldLock,
+}
+
+/// The journal lock's path for the journal `journal`: `<journal>.lock`
+/// beside the file the path names (a link is followed, so every spelling
+/// of one journal shares one lock; an absent journal is taken as given).
+pub fn journal_lock_path(journal: &Path) -> PathBuf {
+    let target = fs::canonicalize(journal).unwrap_or_else(|_| journal.to_owned());
+    let mut name = target.as_os_str().to_owned();
+    name.push(".lock");
+    PathBuf::from(name)
+}
+
+/// Takes the journal lock [`journal_lock_path`] without waiting, creating
+/// the journal's directory when it is missing (#217, review of #226,
+/// finding 3). Every writer of a capture journal holds it for as long as
+/// it may write a line: `mie ingest` from the journal's open until its
+/// last line (`run_end`, the final pass's `replication`) is written,
+/// `mie store repair-hot --scope journal` and `mie store restore` for
+/// their whole run. The raw store's writer lock of the source is no
+/// substitute: `mie ingest` releases it when the store closes, before its
+/// last journal lines.
+///
+/// # Errors
+///
+/// [`RawStoreError::Locked`] when another writer holds it;
+/// [`RawStoreError::Io`] when the lock file cannot be opened.
+pub fn try_journal_lock(journal: &Path) -> Result<JournalLock, RawStoreError> {
+    let path = journal_lock_path(journal);
+    if let Some(dir) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+        fs::create_dir_all(dir).map_err(io_error("create", dir))?;
+    }
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .map_err(io_error("open", &path))?;
+    match HeldLock::try_take(file) {
+        Ok(lock) => Ok(JournalLock { _lock: lock }),
+        Err(TryLockError::WouldBlock) => Err(RawStoreError::Locked(format!(
+            "another writer of the journal holds {} (`mie ingest` for its whole run, `mie store \
+             repair-hot --scope journal` or `mie store restore` for theirs)",
             path.display()
         ))),
         Err(TryLockError::Error(error)) => Err(io_error("lock", &path)(error)),
@@ -1755,10 +1849,27 @@ pub fn first_difference(
     source: TailSource<'_>,
     len: u64,
 ) -> Result<Option<u64>, CopyError> {
+    first_difference_in(copy, source, 0, len)
+}
+
+/// [`first_difference`] over `[from, to)` only: the replication pass's
+/// guard (ADR-065 D9) compares hot's bytes past a lagging copy's end with
+/// a longer copy's, and reads nothing before `from`. The caller makes sure
+/// both are at least `to` bytes long.
+///
+/// # Errors
+///
+/// As [`first_difference`].
+pub fn first_difference_in(
+    copy: &Path,
+    source: TailSource<'_>,
+    from: u64,
+    to: u64,
+) -> Result<Option<u64>, CopyError> {
     let mut file = File::open(copy).map_err(io_error("open", copy))?;
-    let mut offset = 0;
-    while offset < len {
-        let n = (len - offset).min(CHUNK as u64) as usize;
+    let mut offset = from;
+    while offset < to {
+        let n = (to - offset).min(CHUNK as u64) as usize;
         let mine = read_at(&mut file, copy, offset, n)?;
         let theirs = source.read_at(offset, n)?;
         if let Some(i) = mine.iter().zip(&theirs).position(|(a, b)| a != b) {
@@ -1767,6 +1878,41 @@ pub fn first_difference(
         offset += n as u64;
     }
     Ok(None)
+}
+
+/// The first and the last byte in `[0, len)` where the file `copy`
+/// differs from `source`, compared in bounded chunks as
+/// [`first_difference`] does; `None` when they agree. The caller makes sure
+/// both are at least `len` bytes long. The last byte matters to the hot
+/// repair (#217, ADR-065 D2): a difference that ends before every copy's
+/// end has two witnesses at every byte, one that runs into a copy's last
+/// line may not.
+///
+/// # Errors
+///
+/// A [`CopyError`] on [`Side::Destination`] when the copy cannot be read,
+/// on [`Side::Source`] when the source cannot.
+pub fn difference_bounds(
+    copy: &Path,
+    source: TailSource<'_>,
+    len: u64,
+) -> Result<Option<(u64, u64)>, CopyError> {
+    let mut file = File::open(copy).map_err(io_error("open", copy))?;
+    let mut bounds: Option<(u64, u64)> = None;
+    let mut offset = 0;
+    while offset < len {
+        let n = (len - offset).min(CHUNK as u64) as usize;
+        let mine = read_at(&mut file, copy, offset, n)?;
+        let theirs = source.read_at(offset, n)?;
+        let first = mine.iter().zip(&theirs).position(|(a, b)| a != b);
+        let last = mine.iter().zip(&theirs).rposition(|(a, b)| a != b);
+        if let (Some(first), Some(last)) = (first, last) {
+            let (first, last) = (offset + first as u64, offset + last as u64);
+            bounds = Some(bounds.map_or((first, last), |(d, _)| (d, last)));
+        }
+        offset += n as u64;
+    }
+    Ok(bounds)
 }
 
 /// Where the line holding byte `offset` of `source` starts: after the last
@@ -1786,6 +1932,207 @@ pub fn line_start(source: TailSource<'_>, offset: u64) -> Result<u64, CopyError>
         end = start;
     }
     Ok(0)
+}
+
+/// A byte where hot's journal holds no strict majority (ADR-065 D8): some
+/// witness holds a byte there that hot does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Contested {
+    /// The byte's offset.
+    pub at: u64,
+    /// The journals that hold a byte there: hot, when it is longer than
+    /// `at`, and every witness that is.
+    pub covering: usize,
+    /// Those of them that hold hot's byte, hot included; 0 past hot's end.
+    pub with_hot: usize,
+}
+
+/// [`first_contested`] over one window that starts at offset `base`: hot's
+/// bytes there and each witness's (any of them shorter than the window
+/// where its file ends).
+fn contested_window(base: u64, hot: &[u8], witnesses: &[&[u8]]) -> Option<Contested> {
+    if witnesses
+        .iter()
+        .all(|w| w.len() <= hot.len() && **w == hot[..w.len()])
+    {
+        return None;
+    }
+    let end = witnesses.iter().map(|w| w.len()).max().unwrap_or(0);
+    (0..end).find_map(|p| {
+        let mine = hot.get(p);
+        let mut covering = usize::from(mine.is_some());
+        let mut with_hot = covering;
+        let mut differs = false;
+        for byte in witnesses.iter().filter_map(|w| w.get(p)) {
+            covering += 1;
+            if Some(byte) == mine {
+                with_hot += 1;
+            } else {
+                differs = true;
+            }
+        }
+        (differs && 2 * with_hot <= covering).then_some(Contested {
+            at: base + p as u64,
+            covering,
+            with_hot,
+        })
+    })
+}
+
+/// The rule by which `mie store repair` may write hot's journal bytes into
+/// a journal copy (ADR-065 D8, #217): the first byte at or after `from`
+/// where some witness holds a byte other than hot's (or any byte, past
+/// hot's end) and hot's byte is not held by a strict majority of the
+/// journals that hold a byte there, hot and the witnesses. A witness
+/// covers the bytes below its length; bytes only hot holds are no contest.
+/// `None` when hot holds a strict majority at every byte a witness
+/// contradicts.
+#[must_use]
+pub fn first_contested(hot: &[u8], witnesses: &[&[u8]], from: u64) -> Option<Contested> {
+    let from_index = usize::try_from(from).unwrap_or(usize::MAX);
+    let views: Vec<&[u8]> = witnesses
+        .iter()
+        .map(|w| w.get(from_index..).unwrap_or(&[]))
+        .collect();
+    contested_window(from, hot.get(from_index..).unwrap_or(&[]), &views)
+}
+
+/// [`first_contested`] over files, in bounded chunks: hot's journal `hot`
+/// and the journals `witnesses`, each at the length it has when opened. A
+/// witness that does not exist holds no byte.
+///
+/// # Errors
+///
+/// A [`CopyError`] on [`Side::Source`] when hot's journal cannot be read,
+/// on [`Side::Destination`] when a witness cannot: a witness that cannot
+/// be read cannot be counted, so the rule cannot hold.
+pub fn first_contested_file(
+    hot: &Path,
+    witnesses: &[&Path],
+    from: u64,
+) -> Result<Option<Contested>, CopyError> {
+    first_contested_file_before(hot, witnesses, from, u64::MAX)
+}
+
+/// [`first_contested_file`] over the bytes below `until` only: `mie store
+/// repair-hot` asks whether hot holds a strict majority at every byte it
+/// holds, apart from the bytes past its end (ADR-065 D2, *behind* with
+/// the copies differing).
+///
+/// # Errors
+///
+/// As [`first_contested_file`].
+pub fn first_contested_file_before(
+    hot: &Path,
+    witnesses: &[&Path],
+    from: u64,
+    until: u64,
+) -> Result<Option<Contested>, CopyError> {
+    let mut hot_file = File::open(hot)
+        .map_err(io_error("open", hot))
+        .map_err(CopyError::source)?;
+    let hot_len = hot_file
+        .metadata()
+        .map_err(io_error("stat", hot))
+        .map_err(CopyError::source)?
+        .len();
+    let mut files: Vec<(File, &Path, u64)> = Vec::new();
+    for &path in witnesses {
+        match File::open(path) {
+            Ok(file) => {
+                let len = file.metadata().map_err(io_error("stat", path))?.len();
+                files.push((file, path, len));
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(io_error("open", path)(error).into()),
+        }
+    }
+    let end = files
+        .iter()
+        .map(|(_, _, len)| *len)
+        .max()
+        .unwrap_or(0)
+        .min(until);
+    let mut offset = from;
+    while offset < end {
+        let n = (end - offset).min(CHUNK as u64);
+        let take = |len: u64| usize::try_from(len.saturating_sub(offset).min(n)).unwrap_or(0);
+        let mine = read_at(&mut hot_file, hot, offset, take(hot_len)).map_err(CopyError::source)?;
+        let mut chunks = Vec::with_capacity(files.len());
+        for (file, path, len) in &mut files {
+            chunks.push(read_at(file, path, offset, take(*len))?);
+        }
+        let views: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
+        if let Some(contested) = contested_window(offset, &mine, &views) {
+            return Ok(Some(contested));
+        }
+        offset += n;
+    }
+    Ok(None)
+}
+
+/// The first byte at or after `from` where two of `witnesses` that hold a
+/// byte there hold different bytes; `None` when every byte from `from` on
+/// is held alike by every witness that holds it. `mie store repair-hot`
+/// extends a hot journal that is behind only over bytes every copy that
+/// holds them agrees on (ADR-065 D2): one witness suffices past hot's end,
+/// two that differ attribute nothing.
+#[must_use]
+pub fn first_disagreement(witnesses: &[&[u8]], from: u64) -> Option<u64> {
+    let from_index = usize::try_from(from).unwrap_or(usize::MAX);
+    let views: Vec<&[u8]> = witnesses
+        .iter()
+        .map(|w| w.get(from_index..).unwrap_or(&[]))
+        .collect();
+    disagreement_window(from, &views)
+}
+
+/// [`first_disagreement`] over one window that starts at offset `base`.
+fn disagreement_window(base: u64, witnesses: &[&[u8]]) -> Option<u64> {
+    let end = witnesses.iter().map(|w| w.len()).max().unwrap_or(0);
+    (0..end)
+        .find(|&p| {
+            let mut held = witnesses.iter().filter_map(|w| w.get(p));
+            held.next()
+                .is_some_and(|first| held.any(|byte| byte != first))
+        })
+        .map(|p| base + p as u64)
+}
+
+/// [`first_disagreement`] over files, in bounded chunks, each at the
+/// length it has when opened. A witness that does not exist holds no byte.
+///
+/// # Errors
+///
+/// A [`CopyError`] on [`Side::Destination`] when a witness cannot be read.
+pub fn first_disagreement_file(witnesses: &[&Path], from: u64) -> Result<Option<u64>, CopyError> {
+    let mut files: Vec<(File, &Path, u64)> = Vec::new();
+    for &path in witnesses {
+        match File::open(path) {
+            Ok(file) => {
+                let len = file.metadata().map_err(io_error("stat", path))?.len();
+                files.push((file, path, len));
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(io_error("open", path)(error).into()),
+        }
+    }
+    let end = files.iter().map(|(_, _, len)| *len).max().unwrap_or(0);
+    let mut offset = from;
+    while offset < end {
+        let n = (end - offset).min(CHUNK as u64);
+        let take = |len: u64| usize::try_from(len.saturating_sub(offset).min(n)).unwrap_or(0);
+        let mut chunks = Vec::with_capacity(files.len());
+        for (file, path, len) in &mut files {
+            chunks.push(read_at(file, path, offset, take(*len))?);
+        }
+        let views: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
+        if let Some(at) = disagreement_window(offset, &views) {
+            return Ok(Some(at));
+        }
+        offset += n;
+    }
+    Ok(None)
 }
 
 /// The steps of [`rebuild_prefix`]. Tests stop a rebuild after either.
@@ -1875,6 +2222,142 @@ pub fn rebuild_prefix(
     drop(file);
     rebuild_reached(RebuildStep::WriteTemp)?;
     rename_no_replace(&tmp, dest)?;
+    sync_dir(dir)?;
+    Ok(())
+}
+
+/// The steps of [`replace_with_evidence`]. The caller's hook runs after
+/// each one; an error from it stops the replace there, as a crash would
+/// (the hot repair's tests, #217).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplaceEvidenceStep {
+    /// `dest` is hard-linked to its evidence name.
+    Linked,
+    /// The new bytes are written to the temp name, fsynced and read back.
+    Temp,
+}
+
+/// Replaces `dest`, one of hot's own files (its journal, an import-ledger
+/// file), by the byte prefix `[0, upto)` of `source`, plus one `\n` with
+/// `newline`, and keeps the old bytes under `aside` (#217, ADR-065 D6):
+///
+/// 1. `dest` is hard-linked to `aside` ([`ReplaceEvidenceStep::Linked`]),
+///    the link refusing to replace, its directory created and fsynced: the
+///    evidence costs no copy, and a link reads no data, so it works on an
+///    unreadable file too;
+/// 2. the new bytes go to the temp name `.<name>.replace.tmp` beside `dest`
+///    (a stale one is removed first), are fsynced and read back
+///    ([`ReplaceEvidenceStep::Temp`]);
+/// 3. with `read_only` the temp file is made read-only (an import-ledger
+///    file is immutable);
+/// 4. it is renamed over `dest`, and the directory is fsynced.
+///
+/// A crash leaves the old file (perhaps with the link and the temp name,
+/// which the readers skip) or the new one, never no file: unlike
+/// [`rebuild_prefix`], which moves first, so a crash there leaves the copy
+/// absent, which is harmless on a copy target and not on hot (the next `mie
+/// ingest` would start a new journal). A re-run, with a new `aside`,
+/// completes it. `aside` must lie on `dest`'s filesystem.
+///
+/// # Errors
+///
+/// A [`CopyError`] on [`Side::Source`] when the source cannot be read (one
+/// shorter than `upto` included); on [`Side::Destination`] for a missing
+/// `dest` ([`RawStoreError::Invalid`]: nothing to replace, this never
+/// creates a file), an existing `aside` or a read-back mismatch
+/// ([`RawStoreError::Integrity`]: evidence is never overwritten), an error
+/// from `on_step`, and any I/O failure there.
+pub fn replace_with_evidence(
+    source: TailSource<'_>,
+    dest: &Path,
+    upto: u64,
+    newline: bool,
+    aside: &Path,
+    read_only: bool,
+    on_step: &mut dyn FnMut(ReplaceEvidenceStep) -> Result<(), RawStoreError>,
+) -> Result<(), CopyError> {
+    let dir = dest
+        .parent()
+        .ok_or_else(|| RawStoreError::Invalid(format!("{} has no directory", dest.display())))?;
+    let name = dest
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| RawStoreError::Invalid(format!("{} has no file name", dest.display())))?;
+    if !exists(dest)? {
+        return Err(RawStoreError::Invalid(format!(
+            "{} does not exist: there is nothing to replace, and the replace never creates a \
+             file",
+            dest.display()
+        ))
+        .into());
+    }
+    if exists(aside)? {
+        return Err(RawStoreError::Integrity(format!(
+            "{} exists: evidence is never overwritten",
+            aside.display()
+        ))
+        .into());
+    }
+    let aside_dir = aside
+        .parent()
+        .ok_or_else(|| RawStoreError::Invalid(format!("{} has no directory", aside.display())))?;
+    ensure_dir(aside_dir)?;
+    fs::hard_link(dest, aside).map_err(|error| {
+        if error.kind() == ErrorKind::AlreadyExists {
+            RawStoreError::Integrity(format!(
+                "{} exists: evidence is never overwritten",
+                aside.display()
+            ))
+        } else {
+            io_error("link", dest)(error)
+        }
+    })?;
+    sync_dir(aside_dir)?;
+    on_step(ReplaceEvidenceStep::Linked)?;
+
+    let tmp = dir.join(format!(".{name}.replace.tmp"));
+    remove_if_present(&tmp)?;
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .map_err(io_error("create", &tmp))?;
+    append_range(&mut file, &tmp, source, 0, upto)?;
+    if newline {
+        file.write_all(b"\n").map_err(io_error("write", &tmp))?;
+    }
+    file.sync_all().map_err(io_error("sync", &tmp))?;
+    let mut offset = 0;
+    while offset < upto {
+        let n = (upto - offset).min(CHUNK as u64) as usize;
+        if read_at(&mut file, &tmp, offset, n)? != source.read_at(offset, n)? {
+            drop(file);
+            remove_if_present(&tmp)?;
+            return Err(RawStoreError::Integrity(format!(
+                "{}: the new file read back differently from its source",
+                tmp.display()
+            ))
+            .into());
+        }
+        offset += n as u64;
+    }
+    let len = file.metadata().map_err(io_error("stat", &tmp))?.len();
+    if newline && (len != upto + 1 || read_at(&mut file, &tmp, upto, 1)? != b"\n") {
+        drop(file);
+        remove_if_present(&tmp)?;
+        return Err(RawStoreError::Integrity(format!(
+            "{}: the final line end read back differently",
+            tmp.display()
+        ))
+        .into());
+    }
+    drop(file);
+    on_step(ReplaceEvidenceStep::Temp)?;
+    if read_only {
+        mark_read_only(&tmp)?;
+    }
+    fs::rename(&tmp, dest).map_err(io_error("rename", &tmp))?;
     sync_dir(dir)?;
     Ok(())
 }
