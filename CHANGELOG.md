@@ -23,8 +23,10 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   copies are longer than is extended, and ended with its `\n` also when an
   earlier run's extension stopped before it; so is one that is behind
   while a copy is damaged, where hot holds a strict majority at every byte
-  it holds: it takes the bytes past its end that every copy holding them
-  agrees on, and the damaged copy is named for `mie store repair`; every
+  it holds: it takes the bytes past its end only from copies with no
+  difference with hot below it, and only where no copy holds another byte
+  there and no differing copy has a fork's shape, and the damaged copy is
+  named for `mie store repair`; every
   other state (damaged copies,
   two faults, hot ahead of the copies, a fork, one copy against hot) stops
   with nothing written, naming both sides and the next step.
@@ -1019,8 +1021,9 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   the next repair counted it as a second witness and rebuilt the last good
   copy with the damage. Copies of one length compare nothing; a lagging
   copy reads its overlap with each longer copy twice, a new target about
-  twice the journal once. A damaged copy holds a healthy lagging one back
-  until it is healed.
+  twice the journal once per longer copy, and a copy whose last line is
+  not hot's, which the pass refuses anyway, reads nothing for the guard.
+  A damaged copy holds a healthy lagging one back until it is healed.
 
 - **Import-ledger generations and current entries (#210, ADR-062 D11,
   proposed; ADR-034 D4 superseded at one point).** An import entry is

@@ -137,12 +137,12 @@ fn facts_of(hot: Option<&[u8]>, copies: &[&[u8]], k: usize) -> JournalFacts {
 
 /// [`BehindFacts`] over in-memory journals, as the run reads them where the
 /// copies differ: `None` without a copy longer than hot or where hot holds
-/// no strict majority at some byte below L_h.
+/// no strict majority at some byte below L_h. The tail is the longest copy
+/// with no difference with hot below L_h (the first on a tie); X2a runs
+/// over each differing copy's region.
 fn behind_of(hot: Option<&[u8]>, copies: &[&[u8]]) -> Option<BehindFacts> {
     let hot = hot?;
-    // The first of the longest, as the run picks it.
-    let longest = copies.iter().copied().rev().max_by_key(|c| c.len())?;
-    if longest.len() <= hot.len() {
+    if copies.iter().all(|c| c.len() <= hot.len()) {
         return None;
     }
     let below: Vec<&[u8]> = copies
@@ -153,11 +153,21 @@ fn behind_of(hot: Option<&[u8]>, copies: &[&[u8]]) -> Option<BehindFacts> {
         return None;
     }
     let disagree = replica::first_disagreement(copies, hot.len() as u64);
-    Some(behind_facts(
-        hot.len() as u64,
-        &longest[hot.len()..],
-        disagree,
-    ))
+    let tail = copies
+        .iter()
+        .copied()
+        .filter(|c| first_diff(c, hot).is_none())
+        .rev()
+        .max_by_key(|c| c.len())
+        .and_then(|c| c.get(hot.len()..))
+        .unwrap_or(&[]);
+    let fork = copies.iter().enumerate().find_map(|(w, c)| {
+        let d = first_diff(c, hot)?;
+        let common = c.len().min(hot.len());
+        let e = (0..common).rev().find(|&i| hot[i] != c[i])? as u64;
+        fork_of(hot, c, d, e).then_some((w, d))
+    });
+    Some(behind_facts(hot.len() as u64, tail, disagree, fork))
 }
 
 /// X2a over in-memory journals, hot's lines read one at a time from s.
@@ -418,17 +428,17 @@ fn x2_copy_damaged_is_r7s_majority_rule() {
 }
 
 /// Hot *behind* with the copies differing (ADR-065 D2, review of #226
-/// round 2, finding 2). Hot lost its last 200 bytes; cold-a has a bit
-/// flipped at 10, cold-b is the true journal. Hot holds two of three at
-/// 10, and past L_h both copies agree: *behind-copy-damaged* up to the
-/// copies' end, never a stop that offers `--keep-hot-journal` (which would
-/// drop the 200 bytes both copies hold). With cold-b also cut at 900, the
-/// bytes past it are cold-a's alone, one witness, as *behind* accepts.
-/// The copies disagreeing past L_h end the extension at that line's start
-/// (900 for a flip at 950); at 850, inside the first line past L_h,
-/// nothing is agreed as a line: *two-fault*. Hot contradicted below L_h
-/// (its own flip at 300, where both copies agree against it) or a tie
-/// there (only hot and cold-a hold byte 300) is no *behind*: *two-fault*.
+/// round 2, finding 2; round 3, finding 1). Hot lost its last 200 bytes;
+/// cold-a has a bit flipped at 10, cold-b is the true journal. Hot holds
+/// two of three at 10, and past L_h both copies agree:
+/// *behind-copy-damaged* to cold-b's end, never a stop that offers
+/// `--keep-hot-journal` (which would drop the 200 bytes both copies hold).
+/// The bytes past L_h come only from copies with no difference below it:
+/// with cold-b cut at 900, the bytes past it are flipped cold-a's alone,
+/// so it is *two-fault*. Copies that disagree past L_h (at 950, or at 850
+/// inside the first line) are *two-fault*. Hot contradicted below L_h (its
+/// own flip at 300, where both copies agree against it) or a tie there
+/// (only hot and cold-a hold byte 300) is no *behind*: *two-fault*.
 #[test]
 fn x2_behind_with_a_copy_fault_takes_the_agreed_tail() {
     let good = records("A", 1000);
@@ -438,14 +448,16 @@ fn x2_behind_with_a_copy_fault_takes_the_agreed_tail() {
         let facts = facts_of(Some(hot), copies, 2);
         (decide_journal(&facts), facts.behind)
     };
+    let two_fault = JournalDecision::TwoFault { group: None };
     assert_eq!(
         decided(hot, &[&cold_a, &good]),
         (
             JournalDecision::BehindCopyDamaged,
             Some(BehindFacts {
                 reach: 1000,
+                cut: false,
                 disagree: None,
-                cut: false
+                fork: None
             })
         )
     );
@@ -453,14 +465,20 @@ fn x2_behind_with_a_copy_fault_takes_the_agreed_tail() {
         decided(hot, &[&good, &cold_a]).0,
         JournalDecision::BehindCopyDamaged
     );
+    // The flipped copy may be shorter than the consistent one.
+    assert_eq!(
+        decided(hot, &[&cold_a[..900], &good]).0,
+        JournalDecision::BehindCopyDamaged
+    );
     assert_eq!(
         decided(hot, &[&cold_a, &good[..900]]),
         (
-            JournalDecision::BehindCopyDamaged,
+            two_fault.clone(),
             Some(BehindFacts {
-                reach: 1000,
+                reach: 900,
+                cut: false,
                 disagree: None,
-                cut: false
+                fork: None
             })
         )
     );
@@ -468,32 +486,37 @@ fn x2_behind_with_a_copy_fault_takes_the_agreed_tail() {
     let mut cut = good.clone();
     cut.extend_from_slice(b"{\"type\":");
     assert_eq!(
-        decided(hot, &[&cold_a, &cut]).1,
-        Some(BehindFacts {
-            reach: 1008,
-            disagree: None,
-            cut: true
-        })
+        decided(hot, &[&cold_a, &cut]),
+        (
+            JournalDecision::BehindCopyDamaged,
+            Some(BehindFacts {
+                reach: 1008,
+                cut: true,
+                disagree: None,
+                fork: None
+            })
+        )
     );
     assert_eq!(
         decided(hot, &[&cold_a, &flipped(&good, &[950])]),
         (
-            JournalDecision::BehindCopyDamaged,
+            two_fault.clone(),
             Some(BehindFacts {
-                reach: 900,
+                reach: 1000,
+                cut: false,
                 disagree: Some(950),
-                cut: false
+                fork: None
             })
         )
     );
     assert_eq!(
         decided(hot, &[&cold_a, &flipped(&good, &[850])]).0,
-        JournalDecision::TwoFault { group: None }
+        two_fault
     );
     let rotten = flipped(&good[..800], &[300]);
     assert_eq!(
         decided(&rotten, &[&cold_a, &good]),
-        (JournalDecision::TwoFault { group: None }, None)
+        (two_fault.clone(), None)
     );
     assert_eq!(
         decided(&rotten, &[&flipped(&good[..400], &[10]), &good[..200]]).1,
@@ -501,11 +524,68 @@ fn x2_behind_with_a_copy_fault_takes_the_agreed_tail() {
         "no copy longer than hot"
     );
     let tie = [&flipped(&good, &[10])[..], &good[..250]];
-    assert_eq!(
-        decided(&rotten, &tie),
-        (JournalDecision::TwoFault { group: None }, None)
-    );
+    assert_eq!(decided(&rotten, &tie), (two_fault, None));
     assert!(!JournalDecision::BehindCopyDamaged.keeps_hot());
+}
+
+/// A fork is never *behind-copy-damaged* (ADR-065 D2, D3; review of #226
+/// round 3, finding 1). P is 600 bytes of run A. (1) The reviewer's shape:
+/// hot lost O (300 bytes of run A) at a power loss after cold-b copied it,
+/// then wrote N (100 bytes of run B), which a pass copied to cold-a: hot
+/// and cold-a outvote cold-b below L_h, but only cold-b, which differs,
+/// holds bytes past L_h: *two-fault*, and its stop names the refusal. (2)
+/// N is 300 bytes and a later line M (100 bytes) reached only cold-a: the
+/// bytes past L_h are cold-a's, consistent with hot, and cold-b (P + 100
+/// bytes of run A) ends below L_h; X2a calls cold-b's region a fork, so
+/// it is *two-fault* as well. Without the fork verdict it would be
+/// *behind-copy-damaged*, which appends M and leaves O to the repair.
+#[test]
+fn x2_a_fork_is_never_behind_copy_damaged() {
+    let p = records("A", 600);
+    let joined = |parts: &[&[u8]]| parts.concat();
+    let o = line("A", "", 300);
+    let n = line("B", "", 100);
+    let hot = joined(&[&p, &n]);
+    let cold_b = joined(&[&p, &o]);
+    let facts = facts_of(Some(&hot), &[&hot, &cold_b], 2);
+    let behind = facts.behind.expect("behind");
+    assert_eq!(behind.reach, 700);
+    assert!(behind.fork.is_some_and(|(w, _)| w == 1), "{behind:?}");
+    assert_eq!(
+        decide_journal(&facts),
+        JournalDecision::TwoFault { group: None }
+    );
+    let clause = behind_clause(&facts);
+    assert!(
+        clause.contains("the copy on cold-b differs from hot's journal at byte")
+            && clause.contains("holds bytes past byte 700"),
+        "{clause}"
+    );
+
+    let n = line("B", "", 300);
+    let m = line("B", "", 100);
+    let hot = joined(&[&p, &n]);
+    let cold_a = joined(&[&p, &n, &m]);
+    let cold_b = joined(&[&p, &line("A", "", 100)]);
+    let mut facts = facts_of(Some(&hot), &[&cold_a, &cold_b], 2);
+    let behind = facts.behind.expect("behind");
+    assert_eq!((behind.reach, behind.disagree), (1000, None));
+    let (w, d) = behind.fork.expect("a fork");
+    assert_eq!((w, d), (1, first_diff(&cold_b, &hot).unwrap()));
+    assert_eq!(
+        decide_journal(&facts),
+        JournalDecision::TwoFault { group: None }
+    );
+    assert!(
+        behind_clause(&facts).contains("in the shape of a fork"),
+        "{}",
+        behind_clause(&facts)
+    );
+    facts.behind = Some(BehindFacts {
+        fork: None,
+        ..behind
+    });
+    assert_eq!(decide_journal(&facts), JournalDecision::BehindCopyDamaged);
 }
 
 /// A finished extension whose `\n` did not land leaves hot equal to C,

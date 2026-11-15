@@ -1767,12 +1767,25 @@ impl Pass<'_> {
             if !self.marker_present(i) {
                 continue;
             }
-            let Some(end) = self.guard_end(i, copy_len, end, &lens, &dests) else {
-                return appended;
+            // The guard runs only for a copy the extension accepts, still
+            // before any byte is written (review of #226 round 3, finding
+            // 2): a copy whose last line is not hot's is refused anyway,
+            // and guarding it read 2× its gap on every pass until the
+            // repair.
+            let checked = replica::check_extension(TailSource::File(self.journal), &dest, end);
+            let extended = match checked {
+                Ok(()) => {
+                    let Some(end) = self.guard_end(i, copy_len, end, &lens, &dests) else {
+                        return appended;
+                    };
+                    replica::extend_prefix(TailSource::File(self.journal), &dest, end)
+                        .map(|bytes| (bytes, end))
+                }
+                Err(error) => Err(error),
             };
-            match replica::extend_prefix(TailSource::File(self.journal), &dest, end) {
-                Ok(0) => {}
-                Ok(bytes) => {
+            match extended {
+                Ok((0, _)) => {}
+                Ok((bytes, end)) => {
                     appended += bytes;
                     self.line(format!(
                         "journal copy on {id}: appended {bytes} byte(s), now {end} bytes"

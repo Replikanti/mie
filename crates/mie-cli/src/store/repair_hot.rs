@@ -52,10 +52,12 @@
 //!   its `\n` did not land: hot is extended to C, one witness suffices, as
 //!   in the restore's H3); *behind-copy-damaged* (the copies differ, every
 //!   copy reads, one is longer than hot, and hot holds a strict majority at
-//!   every byte below L_h, D8's rule: hot is extended over the bytes past
-//!   L_h every copy holding them agrees on, up to the line of the first
-//!   byte where two copies disagree, and the damaged copies are named for
-//!   `mie store repair`); *damaged* (a difference, L_C = L_h, e < L_2, no
+//!   every byte below L_h, D8's rule: hot is extended to the end of the
+//!   longest copy with no difference with hot below L_h, and the damaged
+//!   copies are named for `mie store repair`; not where a differing copy
+//!   holds a byte past that end, two copies hold different bytes past L_h,
+//!   or X2a calls a differing copy's region a fork, [`behind_refusals`],
+//!   which fall back to the stops); *damaged* (a difference, L_C = L_h, e < L_2, no
 //!   fork shape: hot is replaced by C, since every byte where hot differs
 //!   has two independent witnesses against it). Every other state stops,
 //!   naming both sides: *copy-damaged* (the copies differ, and R7 rebuilds
@@ -68,7 +70,9 @@
 //!   written journal that ends inside a line gets one `\n`.
 //! - **X2a The fork guard** ([`fork_shaped`]): before *damaged* writes, an
 //!   equal-length fork (lines of a later run where the copies hold others)
-//!   makes the state *diverged*. It errs toward stopping.
+//!   makes the state *diverged*; before *behind-copy-damaged* writes, a
+//!   copy that differs from hot below L_h in a fork's shape makes it a
+//!   stop. It errs toward stopping.
 //! - **X3 `--keep-hot-journal`**: in *diverged*, *one-witness*,
 //!   *copy-damaged* and *two-fault* only, with hot's journal readable in
 //!   full, every witness that is no prefix of hot's journal is rebuilt from
@@ -297,42 +301,95 @@ pub struct JournalFacts {
     pub behind: Option<BehindFacts>,
 }
 
-/// How far a hot journal that is behind can be extended while the copies
-/// differ: past L_h only over bytes every copy that holds them agrees on.
+/// What decides whether a hot journal that is behind is extended while
+/// the copies differ (ADR-065 D2): past L_h, only from the copies with no
+/// difference with hot below L_h, and only where no copy holds another
+/// byte there and no differing copy is a fork (review of #226 round 3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BehindFacts {
-    /// The end of the extension: the longest copy's end, or the start of
-    /// the line that holds `disagree` (L_h or less when that line starts
-    /// at or before hot's end: nothing to append).
+    /// The end of the extension: the end of the longest copy with no
+    /// difference with hot below L_h (L_h when none is longer).
     pub reach: u64,
+    /// Whether that copy ends inside a line: the extension gets one `\n`.
+    pub cut: bool,
     /// The first byte past L_h where two copies hold different bytes.
     pub disagree: Option<u64>,
-    /// Whether the extension ends inside a line (no `disagree`, and the
-    /// longest copy ends inside a line): it gets one `\n`.
-    pub cut: bool,
+    /// The first witness that differs from hot below L_h in the shape of a
+    /// fork (X2a over its differing region), with its d.
+    pub fork: Option<(usize, u64)>,
 }
 
-/// [`BehindFacts`] from L_h, the longest copy's bytes past L_h (`tail`)
-/// and the first byte past L_h where two copies disagree. Pure.
+/// [`BehindFacts`] from L_h, the bytes past L_h of the longest copy with
+/// no difference with hot below L_h (`tail`), the first byte past L_h
+/// where two copies disagree, and X2a's first fork. Pure.
 #[must_use]
-pub fn behind_facts(hot_len: u64, tail: &[u8], disagree: Option<u64>) -> BehindFacts {
-    match disagree {
-        None => BehindFacts {
-            reach: hot_len + tail.len() as u64,
-            disagree,
-            cut: tail.last().is_some_and(|&byte| byte != b'\n'),
-        },
-        Some(at) => {
-            let agreed = usize::try_from(at - hot_len).map_or(tail.len(), |n| n.min(tail.len()));
-            BehindFacts {
-                reach: tail[..agreed]
-                    .iter()
-                    .rposition(|&byte| byte == b'\n')
-                    .map_or(hot_len, |i| hot_len + i as u64 + 1),
-                disagree,
-                cut: false,
-            }
+pub fn behind_facts(
+    hot_len: u64,
+    tail: &[u8],
+    disagree: Option<u64>,
+    fork: Option<(usize, u64)>,
+) -> BehindFacts {
+    BehindFacts {
+        reach: hot_len + tail.len() as u64,
+        cut: tail.last().is_some_and(|&byte| byte != b'\n'),
+        disagree,
+        fork,
+    }
+}
+
+/// Why a hot journal that is behind is not extended while the copies
+/// differ (ADR-065 D2; review of #226 round 3, finding 1): empty when it
+/// is, which is *behind-copy-damaged*. One witness suffices past L_h only
+/// for a copy read from this hot, so the bytes past L_h come from the
+/// copies with no difference below it; a differing copy that holds a byte
+/// past their end, two copies that hold different bytes past L_h, or a
+/// differing copy whose region is fork-shaped (X2a) leave the bytes past
+/// L_h unattributed, and the state falls back to the stops, which offer
+/// `--keep-hot-journal`. The fork guard errs toward stopping.
+fn behind_refusals(facts: &JournalFacts, behind: &BehindFacts) -> Vec<String> {
+    let mut refusals = Vec::new();
+    if let Some((w, d)) = behind.fork {
+        refusals.push(format!(
+            "the copy on {} differs from hot's journal from byte {d} in the shape of a fork \
+             (ADR-065 D3), and in a fork both sides hold live lines",
+            facts.witnesses[w].id
+        ));
+    }
+    for witness in &facts.witnesses {
+        if let Some(d) = witness.vs_hot
+            && witness.len > behind.reach
+        {
+            refusals.push(format!(
+                "the copy on {} differs from hot's journal at byte {d} and holds bytes past \
+                 byte {}, which no copy without a difference below hot's end holds: one \
+                 witness suffices past hot's end only for a copy read from this hot",
+                witness.id, behind.reach
+            ));
         }
+    }
+    if let Some(at) = behind.disagree {
+        refusals.push(format!(
+            "the journal copies disagree at byte {at}, past hot's end, where no journal outvotes \
+             another"
+        ));
+    }
+    refusals
+}
+
+/// The clause a stop adds where hot is behind but not extended
+/// ([`behind_refusals`]); empty otherwise.
+fn behind_clause(facts: &JournalFacts) -> String {
+    let refusals = facts
+        .behind
+        .map(|behind| behind_refusals(facts, &behind))
+        .unwrap_or_default();
+    if refusals.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " hot's journal is behind the copies, but it is not extended past its end: {}.",
+            refusals.join("; ")
+        )
     }
 }
 
@@ -372,9 +429,10 @@ pub enum JournalDecision {
     /// by C.
     Damaged,
     /// The copies differ, hot holds a strict majority at every byte it
-    /// holds, and past L_h the copies agree: hot is extended over those
-    /// bytes (to [`BehindFacts::reach`]); the copy damage is left to `mie
-    /// store verify` and `mie store repair`.
+    /// holds, and [`behind_refusals`] finds nothing: hot is extended from
+    /// the copies with no difference below L_h (to
+    /// [`BehindFacts::reach`]); the copy damage is left to `mie store
+    /// verify` and `mie store repair`.
     BehindCopyDamaged,
     /// Stop: the copies differ, and R7 rebuilds every copy that is no byte
     /// prefix of hot (`mie store verify`, then `mie store repair`).
@@ -460,12 +518,12 @@ fn consistent_group(facts: &JournalFacts) -> Option<Vec<usize>> {
 pub fn decide_journal(facts: &JournalFacts) -> JournalDecision {
     if !facts.copies_agree() {
         // Hot behind plus copy damage (review of #226 round 2, finding 2):
-        // the bytes past L_h that every copy holding them agrees on go to
-        // hot, before the copies are repaired from it.
-        if facts
-            .behind
-            .is_some_and(|behind| behind.reach > facts.hot_len)
-        {
+        // the bytes past L_h of the copies consistent with hot go to hot,
+        // before the copies are repaired from it, unless a fork or a
+        // differing copy leaves them unattributed (round 3, finding 1).
+        if facts.behind.is_some_and(|behind| {
+            behind.reach > facts.hot_len && behind_refusals(facts, &behind).is_empty()
+        }) {
             return JournalDecision::BehindCopyDamaged;
         }
         if copy_damaged(facts) {
@@ -673,6 +731,24 @@ pub fn fork_shaped(
         }
     }
     newlines_differ || glued_other_run
+}
+
+/// X2a over hot's journal at `hot_path` against `c`, hot's lines read
+/// from s one at a time; a read error is a fork.
+fn hot_fork_shaped(hot_path: &Path, c: &[u8], d: u64, e: u64) -> bool {
+    let s = line_start_in(c, d);
+    let mut reader = fs::File::open(hot_path).and_then(|mut file| {
+        file.seek(SeekFrom::Start(s))?;
+        Ok(BufReader::new(file))
+    });
+    fork_shaped(&ForkFacts { c, d, e }, &mut || {
+        let reader = reader.as_mut().map_err(|e| e.to_string())?;
+        let mut line = Vec::new();
+        reader
+            .read_until(b'\n', &mut line)
+            .map_err(|e| e.to_string())?;
+        Ok((!line.is_empty()).then_some(line))
+    })
 }
 
 // ------------------------------------------------ pure: import ledger
@@ -1397,19 +1473,7 @@ impl Run<'_> {
                     && chosen_len == hot_len
                     && e < facts.second_len()
                 {
-                    let s = line_start_in(&c_bytes, d);
-                    let mut reader = fs::File::open(&hot_path).and_then(|mut file| {
-                        file.seek(SeekFrom::Start(s))?;
-                        Ok(BufReader::new(file))
-                    });
-                    facts.fork = fork_shaped(&ForkFacts { c: &c_bytes, d, e }, &mut || {
-                        let reader = reader.as_mut().map_err(|e| e.to_string())?;
-                        let mut line = Vec::new();
-                        reader
-                            .read_until(b'\n', &mut line)
-                            .map_err(|e| e.to_string())?;
-                        Ok((!line.is_empty()).then_some(line))
-                    });
+                    facts.fork = hot_fork_shaped(&hot_path, &c_bytes, d, e);
                 }
                 (facts, readable, chosen)
             }
@@ -1492,18 +1556,18 @@ impl Run<'_> {
                 // *behind* with the copies differing (ADR-065 D2, review of
                 // #226 round 2): hot holds a strict majority at every byte
                 // it holds, and every copy reads, since a copy that cannot
-                // be read could hold another byte past L_h.
-                let longest = readable
-                    .iter()
-                    .copied()
-                    .max_by_key(|&i| (candidates[i].len, std::cmp::Reverse(i)));
+                // be read could hold another byte past L_h. The bytes past
+                // L_h come from the longest copy with no difference below
+                // L_h, and each differing copy's region goes through X2a
+                // first (round 3, finding 1).
+                let longest = readable.iter().map(|&i| candidates[i].len).max();
                 let behind = match longest {
-                    Some(l)
+                    Some(len)
                         if hot_exists
                             && hot_readable
                             && !uninspected
                             && readable.len() == candidates.len()
-                            && candidates[l].len > hot_len =>
+                            && len > hot_len =>
                     {
                         let inner =
                             replica::first_contested_file_before(&hot_path, &all, 0, hot_len)
@@ -1513,11 +1577,43 @@ impl Run<'_> {
                         } else {
                             let disagree = replica::first_disagreement_file(&all, hot_len)
                                 .map_err(|e| Stop(e.to_string()))?;
-                            behind_tail = read_range(&at[l].path, hot_len, candidates[l].len)
-                                .map_err(|error| {
+                            let consistent = readable
+                                .iter()
+                                .zip(&witnesses)
+                                .filter(|(_, witness)| witness.vs_hot.is_none())
+                                .map(|(&i, _)| i)
+                                .max_by_key(|&i| (candidates[i].len, std::cmp::Reverse(i)));
+                            if let Some(l) = consistent.filter(|&l| candidates[l].len > hot_len) {
+                                behind_tail = read_range(&at[l].path, hot_len, candidates[l].len)
+                                    .map_err(|error| {
                                     Stop(format!("read {}: {error}", at[l].path.display()))
                                 })?;
-                            Some(behind_facts(hot_len, &behind_tail, disagree))
+                            }
+                            let mut fork = None;
+                            for (w, witness) in witnesses.iter().enumerate() {
+                                let Some(d) = witness.vs_hot else {
+                                    continue;
+                                };
+                                let i = readable[w];
+                                let copy = read_range(&at[i].path, 0, candidates[i].len).map_err(
+                                    |error| Stop(format!("read {}: {error}", at[i].path.display())),
+                                )?;
+                                // A read error on hot, or no difference where
+                                // one was found, counts as a fork.
+                                let forked = match replica::difference_bounds(
+                                    &hot_path,
+                                    TailSource::Bytes(&copy),
+                                    candidates[i].len.min(hot_len),
+                                ) {
+                                    Ok(Some((d, e))) => hot_fork_shaped(&hot_path, &copy, d, e),
+                                    Ok(None) | Err(_) => true,
+                                };
+                                if forked {
+                                    fork = Some((w, d));
+                                    break;
+                                }
+                            }
+                            Some(behind_facts(hot_len, &behind_tail, disagree, fork))
                         }
                     }
                     _ => None,
@@ -1597,10 +1693,11 @@ impl Run<'_> {
             JournalDecision::Damaged => self.replace_hot(&hot_path, &c_bytes, &facts, report),
             JournalDecision::CopyDamaged => Err(Stop(format!(
                 "the journal copies differ, and hot's journal holds a strict majority at every \
-                 byte where a copy contradicts it: the faults are on the copies. {}. Run `mie \
+                 byte where a copy contradicts it: the faults are on the copies. {}.{} Run `mie \
                  store verify`, then `mie store repair` (R7 rebuilds each differing copy from \
                  hot, ADR-065 D8), then this command again; nothing is written (ADR-065 D2)",
-                sides()
+                sides(),
+                behind_clause(&facts)
             ))),
             JournalDecision::TwoFault { group } => {
                 let configuration = group.map_or_else(String::new, |group| {
@@ -1623,11 +1720,12 @@ impl Run<'_> {
                     "the journal copies differ, and at a byte where a copy contradicts hot's \
                      journal, hot holds no strict majority, so R7 refuses that copy (ADR-065 D8): \
                      two faults, which neither the copies nor hot can attribute byte for byte. \
-                     {}. `mie store repair` compares against hot, so it is not the next step. \
+                     {}.{} `mie store repair` compares against hot, so it is not the next step. \
                      When you hold hot's journal for right, `--keep-hot-journal` rebuilds every \
                      copy that is no prefix of it from hot, keeping their bytes in \
                      .mie/damaged/: {}.{configuration} Nothing is written (ADR-065 D2, D4)",
                     sides(),
+                    behind_clause(&facts),
                     drops()
                 )))
             }
@@ -1799,13 +1897,13 @@ impl Run<'_> {
         Ok(())
     }
 
-    /// *behind-copy-damaged* (X2; review of #226 round 2, finding 2): hot's
-    /// journal is extended over the bytes past L_h that every copy holding
-    /// them agrees on, up to [`BehindFacts::reach`], with *behind*'s
-    /// writes. The copies that differ from hot below L_h, where hot holds a
-    /// strict majority, are copy damage for `mie store verify` and `mie store
-    /// repair`, named; a disagreement of the copies past L_h ends the
-    /// extension at its line's start and is a problem naming both sides.
+    /// *behind-copy-damaged* (X2; review of #226 round 2, finding 2; round
+    /// 3, finding 1): hot's journal is extended to [`BehindFacts::reach`]
+    /// from the longest copy with no difference with hot below L_h, with
+    /// *behind*'s writes; every copy holding a byte past L_h holds that
+    /// copy's byte there. The copies that differ from hot below L_h, where
+    /// hot holds a strict majority, are copy damage for `mie store verify`
+    /// and `mie store repair`, named.
     fn extend_behind(
         &self,
         hot_path: &Path,
@@ -1833,11 +1931,12 @@ impl Run<'_> {
         let longer: Vec<&str> = facts
             .witnesses
             .iter()
-            .filter(|w| w.len > facts.hot_len)
+            .filter(|w| w.vs_hot.is_none() && w.len > facts.hot_len)
             .map(|w| w.id.as_str())
             .collect();
         let from = format!(
-            "the copies past its end (on {}; every copy holding a byte there holds the same)",
+            "the copies past its end (on {}, with no difference with hot below its end; every \
+             copy holding a byte there holds the same)",
             longer.join(", ")
         );
         self.extend_hot(hot_path, &bytes, &from, behind.cut, report)?;
@@ -1851,32 +1950,6 @@ impl Run<'_> {
                     paths[w].display()
                 ));
             }
-        }
-        if let Some(at) = behind.disagree {
-            let held: Vec<String> = facts
-                .witnesses
-                .iter()
-                .enumerate()
-                .map(|(w, witness)| {
-                    format!(
-                        "{} {} ({} bytes) holds {}",
-                        witness.id,
-                        paths[w].display(),
-                        witness.len,
-                        byte_text(paths[w], at)
-                    )
-                })
-                .collect();
-            report.problems.push(format!(
-                "the journal copies disagree at byte {at}, past the end of hot's journal before \
-                 this run (byte {}): {}. Past hot's end no journal outvotes another, so hot's \
-                 journal {} is extended only to byte {}, the start of that line; the next run of \
-                 this command stops and names what `--keep-hot-journal` would drop (ADR-065 D2)",
-                facts.hot_len,
-                held.join("; "),
-                hot_path.display(),
-                behind.reach
-            ));
         }
         Ok(())
     }

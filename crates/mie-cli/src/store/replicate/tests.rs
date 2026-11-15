@@ -759,6 +759,68 @@ fn the_guard_compares_nothing_at_equal_lengths() {
     assert_eq!(fs::read(&a).unwrap(), journal);
 }
 
+/// The guard's cost on a copy the extension refuses (ADR-065 D9, review
+/// of #226 round 3, finding 2): cold-a lags with its last line flipped,
+/// cold-b is current. `extend_prefix` refuses cold-a at its last line, so
+/// the guard reads nothing for it, on every pass until the repair; a copy
+/// that is no byte prefix of hot is never extended, guarded or not.
+#[test]
+fn the_guard_reads_nothing_for_a_copy_the_extension_refuses() {
+    let fixture = Fixture::new("pass-journal-guard-refused");
+    let journal = three_lines();
+    fs::write(&fixture.config.paths.journal, &journal).unwrap();
+    fixture.pass();
+    let [a, b] = journal_copies(&fixture);
+    let first = journal.iter().position(|byte| *byte == b'\n').unwrap() + 1;
+    let mut lagging = journal[..first].to_vec();
+    lagging[3] ^= 0x01;
+    fs::write(&a, &lagging).unwrap();
+    for _ in 0..2 {
+        GUARD_COMPARED.with(|bytes| bytes.set(0));
+        let report = fixture.pass();
+        assert_eq!(GUARD_COMPARED.with(Cell::get), 0, "{report:?}");
+        assert!(
+            report
+                .problems
+                .iter()
+                .any(|p| p.starts_with("the journal copy on cold-a (") && p.contains("is refused")),
+            "{report:?}"
+        );
+        assert_eq!(fs::read(&a).unwrap(), lagging);
+        assert_eq!(fs::read(&b).unwrap(), journal);
+    }
+
+    // A copy longer than hot is refused as before (never read past hot's
+    // end, which would be an error on hot's journal), and the next
+    // target's copy is still extended, guarded against it.
+    let mut longer = journal.clone();
+    longer.extend_from_slice(b"{\"type\":\"stats\",\"run_id\":\"r2\",\"at_ms\":2}\n");
+    fs::write(&a, &longer).unwrap();
+    fs::write(&b, &journal[..first]).unwrap();
+    GUARD_COMPARED.with(|bytes| bytes.set(0));
+    let report = fixture.pass();
+    assert_eq!(
+        GUARD_COMPARED.with(Cell::get),
+        (journal.len() - first) as u64,
+        "{report:?}"
+    );
+    assert!(
+        report
+            .problems
+            .iter()
+            .any(|p| p.starts_with("the journal copy on cold-a (")
+                && p.contains("is refused")
+                && p.contains("longer than the")),
+        "{report:?}"
+    );
+    assert!(
+        !report.problems.iter().any(|p| p.contains("cannot be read")),
+        "{report:?}"
+    );
+    assert_eq!(fs::read(&a).unwrap(), longer);
+    assert_eq!(fs::read(&b).unwrap(), journal);
+}
+
 /// The first live part of the fixture.
 fn first_live(fixture: &Fixture) -> String {
     replica::list_sealed(&fixture.hot)

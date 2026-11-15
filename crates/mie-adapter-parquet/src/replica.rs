@@ -1201,6 +1201,68 @@ fn last_line_start(file: &mut File, path: &Path, len: u64) -> Result<u64, RawSto
     Ok(0)
 }
 
+/// [`extend_prefix`]'s checks before it appends: a `dest` of `len` bytes
+/// longer than `end` is refused, then its last record (and any partial
+/// tail) is compared with the source.
+fn extension_refusal(
+    file: &mut File,
+    dest: &Path,
+    source: TailSource<'_>,
+    len: u64,
+    end: u64,
+) -> Result<(), CopyError> {
+    if len > end {
+        return Err(RawStoreError::Integrity(format!(
+            "{}: {len} bytes, longer than the {end} bytes of {} it copies; a copy is a byte \
+             prefix of hot's file (ADR-062 D11)",
+            dest.display(),
+            source.describe()
+        ))
+        .into());
+    }
+    let mut offset = last_line_start(file, dest, len)?;
+    while offset < len {
+        let n = (len - offset).min(CHUNK as u64) as usize;
+        let mine = read_at(file, dest, offset, n)?;
+        let theirs = source.read_at(offset, n)?;
+        if let Some(i) = mine.iter().zip(&theirs).position(|(a, b)| a != b) {
+            return Err(RawStoreError::Integrity(format!(
+                "{}: byte {} differs from {}; the copy's last record is not hot's record at that \
+                 offset, so it is not a byte prefix of hot's file (ADR-062 D11)",
+                dest.display(),
+                offset + i as u64,
+                source.describe()
+            ))
+            .into());
+        }
+        offset += n as u64;
+    }
+    Ok(())
+}
+
+/// The checks [`extend_prefix`] makes before it appends (`dest` no longer
+/// than `end`, its last record the source's), read only: a missing `dest`
+/// passes, as `extend_prefix` creates it. The replication pass guard
+/// (ADR-065 D9) runs only for a copy that passes, so a copy the extension
+/// refuses costs no guard reads (review of #226 round 3, finding 2).
+///
+/// # Errors
+///
+/// As [`extend_prefix`] for those checks: a [`CopyError`] on
+/// [`Side::Source`] when the source cannot be read, on
+/// [`Side::Destination`] for a `dest` longer than `end` or whose last
+/// record differs ([`RawStoreError::Integrity`]), and when `dest` cannot
+/// be read.
+pub fn check_extension(source: TailSource<'_>, dest: &Path, end: u64) -> Result<(), CopyError> {
+    let mut file = match File::open(dest) {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(io_error("open", dest)(error).into()),
+    };
+    let len = file.metadata().map_err(io_error("stat", dest))?.len();
+    extension_refusal(&mut file, dest, source, len, end)
+}
+
 /// Extends `dest` to the byte prefix `[0, end)` of `source` (the D11 tail
 /// append of a line-structured, append-only file) and returns the bytes
 /// appended.
@@ -1242,34 +1304,7 @@ pub fn extend_prefix(source: TailSource<'_>, dest: &Path, end: u64) -> Result<u6
         .open(dest)
         .map_err(io_error("open", dest))?;
     let len = file.metadata().map_err(io_error("stat", dest))?.len();
-    if len > end {
-        return Err(RawStoreError::Integrity(format!(
-            "{}: {len} bytes, longer than the {end} bytes of {} it copies; a copy is a byte \
-             prefix of hot's file (ADR-062 D11)",
-            dest.display(),
-            source.describe()
-        ))
-        .into());
-    }
-
-    // The copy's last record (and any partial tail) against the source.
-    let mut offset = last_line_start(&mut file, dest, len)?;
-    while offset < len {
-        let n = (len - offset).min(CHUNK as u64) as usize;
-        let mine = read_at(&mut file, dest, offset, n)?;
-        let theirs = source.read_at(offset, n)?;
-        if let Some(i) = mine.iter().zip(&theirs).position(|(a, b)| a != b) {
-            return Err(RawStoreError::Integrity(format!(
-                "{}: byte {} differs from {}; the copy's last record is not hot's record at that \
-                 offset, so it is not a byte prefix of hot's file (ADR-062 D11)",
-                dest.display(),
-                offset + i as u64,
-                source.describe()
-            ))
-            .into());
-        }
-        offset += n as u64;
-    }
+    extension_refusal(&mut file, dest, source, len, end)?;
     if len == end {
         return Ok(0);
     }
