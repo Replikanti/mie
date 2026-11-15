@@ -8,15 +8,18 @@ leaves to #217 (the restore's H0, resolve's RA5 and the repair's R7). It
 supersedes two parts of ADR-062 D11, and ADR-062's status line records
 both: R7's reason "preferring the copies over hot's live journal is the
 guess step 5 rejects", for the one state where two copies contradict hot
-over its whole length (D2), and R7's agreement condition, where the
-agreeing copy contradicts hot past the first differing byte (D8).
+over its whole length (D2), and R7's agreement condition, which D8
+replaces by hot's strict byte-wise majority over every byte the rebuild
+writes.
 Everything else in ADR-062 stands. CLAUDE.md invariant 4 is untouched: no
 sealed data file is moved or written. ADR-034 D4 (an import-ledger file is
 immutable) holds in the sense it protects: hot's entry gets back the bytes
 the copy targets hold, byte for byte, and the damaged bytes are kept. The
 decisions record the #217 plan
 (<https://github.com/Replikanti/mie/issues/217#issuecomment-6882706224>)
-and its STOP 1 operator decisions (2026-11-14/15).
+and its STOP 1 operator decisions (2026-11-14/15); D1's journal lock, D2's
+*behind* completion, D3's later glued lines and D8's majority rule come
+from the adversarial review of #226 (round 1).
 
 ## Context
 
@@ -91,6 +94,24 @@ concurrent writer refuses the run instead of racing it:
 - journal scope: the writer lock of `instrument.source`, which excludes
   `mie ingest`: replacing the journal under a live `BufWriter` would lose
   its next lines;
+- journal scope: the journal lock, `<journal>.lock` beside the file
+  `paths.journal` names (a link followed). The source's lock alone leaves
+  a gap: `mie ingest` releases it when its raw store closes, then writes
+  `sealed`, `run_end` and, after its final pass, `replication`. Taken in
+  that gap, a replace renames C over the journal while `run_end` goes into
+  the old file, which only the evidence name still reaches, and the run
+  replays as crashed (ADR-039 D2); an extension can interleave with a
+  line. So `mie ingest` holds the journal lock from the journal's open
+  until its last line (the journal value owns it; an abandoned final pass
+  keeps it until the process exits), and this command takes it without
+  waiting. Why a lock of its own and not the source's lock held longer:
+  the source's lock guards the raw store's files, and the importer and
+  the hot removal take other sources' locks; the journal has writers of
+  its own (`mie ingest`, this command, the restore's H3), and a lock
+  beside it follows a `paths.journal` outside `raw_root`. `mie store
+  restore` takes it too: a capture that runs from before a hot loss keeps
+  appending to the journal H3 extends, and its source lock is on the lost
+  hot, not the restored one;
 - import-ledger scope: the archive source's writer lock, which excludes the
   importer, `mie store resolve` and the hot removal of archive partitions.
 
@@ -123,24 +144,35 @@ lls(C) is the start of C's last complete line, the region a pass compares.
 
 - **agree:** no difference and L_C ≤ L_h. Nothing is written; the next pass
   extends the copies.
-- **behind:** no difference and L_h < L_C. Hot is extended to C. One
-  witness suffices, as in the restore's H3: a copy's bytes were read from
-  this hot, and hot's absence contradicts none of them.
+- **behind:** no difference and L_h < L_C, or L_h = L_C with C ending
+  inside a line. Hot is extended to C. One witness suffices, as in the
+  restore's H3: a copy's bytes were read from this hot, and hot's absence
+  contradicts none of them. The second form is the state the extension
+  leaves when its closing `\n` (below) did not land: the extension is
+  appended in bounded chunks and the `\n` after it, so no single write
+  holds both, and a crash or a failed append between them leaves hot
+  equal to C. The re-run decides *behind* there, appends nothing and
+  writes the `\n`. It cannot tell this from a cut line of a crashed `mie
+  ingest` that a pass already copied, and need not: there too the `\n`
+  makes the next `run_start` a line of its own, and `read_runs` skips the
+  cut line either way. A hot that holds a cut line past every copy's end
+  (L_h > L_C) stays *agree*: that is the capture's own torn line, #225.
 - **damaged:** a difference, L_C = L_h, e < L_2, and no fork shape (D3).
   Hot's journal is replaced by C. Every byte where hot differs then has two
   independent witnesses that agree against it.
 - Stops, nothing written, both sides named (hot's path, length, d, the line
   start s and hot's byte at d; each witness's root, path, length and byte
   at d):
-  - *copy-damaged:* the copies differ, and some copy A is consistent with
-    hot, every copy that contradicts A first differs from it below L_h,
-    and every copy consistent with A is consistent with hot. One fault, on
-    the copies: `mie store verify`, then `mie store repair`, whose R7
-    rebuilds each differing copy with A as the agreeing copy (which D8
-    allows, since A contradicts hot nowhere), then this command again. C
-    is tried as A first; trying every copy makes the result independent of
-    the configuration order on a tie.
-  - *two-fault:* the copies differ otherwise. It names every witness's
+  - *copy-damaged:* the copies differ, and R7 rebuilds every copy that is
+    no byte prefix of hot's journal under D8: the same rule
+    (`first_contested_file`) over the same witnesses, every copy target's
+    journal. The faults are on the copies: `mie store verify`, then `mie
+    store repair`, which rebuilds each differing copy, then this command
+    again. Sharing the rule keeps the two commands from sending the
+    operator in a circle: a stop that names the repair names one that
+    acts.
+  - *two-fault:* the copies differ otherwise: R7 refuses at least one
+    copy. It names every witness's
     first difference against C and against hot, and `--keep-hot-journal`
     (D4), never `mie store repair` first, since R7 compares against hot.
     With k ≥ 3 copy targets configured it also names a run with a
@@ -179,7 +211,10 @@ and 1 000 with d = e = 10 is *damaged*; against copies 1 000 and 500, e =
 499 is *damaged* and e = 500 *one-witness*; hot 400 under copies 1 000
 and 500 is *behind*; hot 1 200 against copies 1 000 with lls(C) = 900 is
 *hot-ahead* for e = 899 and *diverged* for e = 900; hot 800 under copies
-1 000 with d = 700 is *diverged*.
+1 000 with d = 700 is *diverged*. With the copies differing: hot intact,
+cold-a damaged at 110 and cold-b at 10 is *copy-damaged* (two of three
+for hot at every byte); hot damaged at 110, cold-b at 10 and cold-a only
+100 bytes long is *two-fault* (at 110 only hot and cold-b hold a byte).
 
 ### D3. The fork guard
 
@@ -201,14 +236,17 @@ splits them; a `\r` before it is JSON whitespace.
   whole record whose `\n` is missing: the two shapes a crash leaves, since
   `Journal::write` writes the object and its `\n` separately. Zero bytes
   fail with a syntax error instead.
-- The first line is **glued** when it is no record but its suffix from
-  some p with s < p ≤ d is one (or a torn record, when it is also the
-  last line): the shape the next run leaves after a torn line, since
-  `Journal::open` appends without a separator.
-- **Fork-shaped** ⇔ (1) every line is a record, except that the first may
-  be glued and the last torn; and (2) the `\n` positions of hot and C over
-  `[d, e]` differ, or the first line is glued through a complete record
-  whose `run_id` differs from that of C's line at s, itself a complete
+- A line is **glued** when it is no record but its suffix from some p is
+  one (or a torn record, when it is the journal's last line): the shape
+  the next run leaves after a torn line, since `Journal::open` appends
+  without a separator. For the first line s < p ≤ d: its bytes before p
+  are C's, the start of C's line at s. For every later line the bytes
+  before p must be a torn record themselves, since they need not be C's:
+  a run killed mid-line inside the region, with the next run glued on.
+- **Fork-shaped** ⇔ (1) every line is a record or glued, except that the
+  last may be torn; and (2) the `\n` positions of hot and C over `[d, e]`
+  differ, or a line is glued through a complete record whose `run_id`
+  differs from that of C's line at the same start, itself a complete
   record. A read error counts as a fork.
 
 Why `run_id`: a torn line means its run died, and the next line comes
@@ -223,12 +261,25 @@ not parse or splits one into two that do not, and p ≤ d keeps the merged
 line's second half out of the glued test. The guard does not apply to an
 unreadable hot: there are no bytes to classify.
 
+Why every line and not only the first (review of #226, finding 4): a fork
+can hold a second torn line, when the run that followed the first torn
+line died mid-line too. With the first-line rule, that line read as no
+record and the guard answered "no fork", although its `\n` positions
+differ; the guard errs toward stopping, so it must recognise the shape
+wherever it lies. The torn-prefix condition keeps one damage shape out: a
+`\n` turned into a byte that is neither JSON whitespace nor `\n` leaves
+the merged line's first part with trailing characters, a syntax error, so
+no glued line. A `\n` turned into a blank does read as glued (the blank is
+trailing whitespace), together with another difference earlier in the
+region: two faults read as a fork, which stops.
+
 What it cannot see: an equal-length fork whose new lines are complete
 records ending at exactly C's `\n` positions over `[d, e]`, with no torn
-line glued in front. That needs the new run's first line, a `run_start`,
-to end at the same byte as the copies' line there, and every following
-line to do the same. Then *damaged* applies, and hot's bytes stay in
-`<journal>.damaged-<at_ms>`, named in the report, never deleted.
+line glued in front of any of them. That needs the new run's first line,
+a `run_start`, to end at the same byte as the copies' line there, and
+every following line to do the same. Then *damaged* applies, and hot's
+bytes stay in `<journal>.damaged-<at_ms>`, named in the report, never
+deleted.
 
 ### D4. `--keep-hot-journal`
 
@@ -339,17 +390,66 @@ the problems the pass, the verification and the repair report on hot's
 import ledger name it at their call sites (not inside the shared reader,
 which the adoption also uses on another store).
 
-### D8. R7's agreeing copy
+### D8. R7's majority rule
 
-In `mie store repair`, another copy counts as agreeing only when it is
-longer than d, equals hot over `[0, d]`, and has no difference against
-hot over min(its length, L_h). Why: the closing pass extends the rebuilt
-copy from hot up to L_h, so R7 vouches for hot's bytes past d too, and a
-copy that contradicts hot there cannot. A copy that agrees with hot over
-`[0, d]` but differs later is named in the refusal with its first
-differing byte, and the text names `mie store repair-hot --scope journal`.
-Single-fault repairs are unchanged: there the other copies are byte
-prefixes of hot.
+In `mie store repair`, R7 rebuilds the journal copy on target i that
+first differs from hot at d (d = L_h when the copy is longer than hot and
+consistent with it): it moves the copy aside, writes hot's bytes up to u,
+the start of hot's line holding d, and the closing pass extends it from
+hot to L_h. So the repair overwrites copy i's bytes `[u, L_i)` and writes
+hot's bytes `[u, L_h)` into it. The rule:
+
+- The **witnesses** are hot, copy i and every other copy target's journal
+  copy, each as it was before this repair wrote anything: a copy R7
+  already rebuilt in this run counts by its `.mie/damaged/` evidence copy.
+  A journal **holds a byte** at p when it is longer than p. An absent copy
+  holds none; a copy that cannot be read refuses the rebuild, since it
+  cannot be counted.
+- Copy i is rebuilt only when, at every p ≥ u where some witness holds a
+  byte that hot does not (another byte, or any byte at p ≥ L_h), more than
+  half of the witnesses that hold a byte at p, hot included, hold hot's
+  byte. Hot holds nothing at p ≥ L_h, so a copy byte past hot's end always
+  refuses: hot is behind there, and the rebuild would drop the copy's
+  bytes or the next pass would write later hot bytes over them.
+- A byte only hot and one copy hold, where they differ, is one against
+  one: refused. Bytes only hot holds are no contest: that is the pass's
+  ordinary extension, as before.
+- The refusal names the first contested byte and its count, or hot's
+  journal as the suspect when every other copy holding byte d agrees with
+  copy i against hot there, and `mie store repair-hot --scope journal`.
+
+At the operator's k = 2 this means two of three at every contradicted
+byte. Why each part. The operator's goal (review of #226): a repair must
+never write hot's damage into a copy, and must not lose a repair that is
+valid. The rule checks exactly the bytes the repair writes, so every byte
+it changes in a copy is backed by more sources than contradict it. The
+rule before #217 checked `[0, d]` only, and the closing pass then copied
+hot's damage past d into the copy (Context 4). The first form of D8 (an
+agreeing copy consistent with hot over min(its length, L_h)) was too weak
+and too strict. Too weak: with cold-b damaged at 10, hot at x in a later
+line and cold-a, the agreeing copy, shorter than x, cold-a vouched for
+nothing at x, yet cold-b was rebuilt and took hot's byte x. Too strict:
+with hot intact, cold-b damaged at 10 and cold-a at x, every byte has two
+of three for hot, yet both copies were refused. Why the witnesses as they
+were before the run: R7 works copy by copy, and a copy rebuilt first is
+hot's prefix, which would count for hot at its own former damage. Why
+hot must hold a strict majority and a tie refuses: one against one
+cannot be attributed without a hash chain (ADR-062 D11 R7), and two
+against two at k ≥ 3 is the same tie. Why bytes before u do not count:
+copy i equals hot there, so the rebuild writes its own bytes back.
+
+What it cannot see: a copy shorter than a contested byte is a byte prefix
+of hot, so every pass extends it from hot, the repair's closing pass
+included; the pass compares only a copy's last line (ADR-062 D11). In the
+too-weak case above, R7 now refuses cold-b, but the closing pass extends
+cold-a over x with hot's damaged byte, and the next `mie store repair`
+then counts cold-a's copy of that byte as a second witness for hot and
+rebuilds cold-b with it (a probe run of #226, review round 1). Bytes a
+pass copied from hot are no independent witness of hot, and no byte
+comparison can tell them from bytes copied before the damage; closing
+this needs a pass that refuses to extend a copy over a byte another copy
+contradicts, a change to the replication path that this ADR does not
+make, or #224's per-line integrity field.
 
 ## Consequences
 
@@ -368,21 +468,32 @@ prefixes of hot.
   the bound the restore and the rebuild already accept; D3 adds one line.
 - **The import-ledger scope** reads about 2.25 MB (ADR-062 M1-15) and never
   stops the capture.
-- **D8** adds at most one read of L per rebuilt journal copy, about 13–37 s
-  after a year at the same assumed rate, with the capture running (the
-  repair takes no writer lock). It refuses a repair R7 used to do only when
-  the agreeing copy contradicts hot past d, which takes two faults.
+- **D8** reads hot and every copy over `[u, max length)` once per rebuilt
+  journal copy: at k = 2 at most 3·L, 5.7–16.5 GB after a year, about
+  38–110 s at the same assumed rate, with the capture running (the repair
+  takes no writer lock). A copy whose damage lies near the end reads only
+  the tail. It refuses a repair the rule before #217 did only where hot
+  holds no strict majority at a byte the repair writes, which takes two
+  faults, and it heals two damaged copies on an intact hot, which the
+  first form of D8 refused.
 - **A fork read as damage** (D3's blind spot) replaces hot; hot's bytes
   stay in `<journal>.damaged-<at_ms>`, named in the report.
 - **Damage read as a fork** only stops: it needs every hot line of the
   region to be a complete JSON object with the envelope while a `\n` moved,
   or a glued record of another `run_id`, not a shape of bit flips, zero
-  fills or torn writes.
+  fills or torn writes. D3's later glued lines add one two-fault shape: a
+  `\n` turned into a blank in a later line of a region that differs
+  earlier too.
+- **The journal lock** is one more file beside the journal,
+  `<journal>.lock`, created by the first `mie ingest` after this change;
+  nothing reads its bytes. A `mie ingest` refuses to start while this
+  command or the restore holds it, as it refuses on the source's lock.
 - **Two-fault residuals, each closed:** (1) k ≥ 3 with two copies agreeing
   against hot and a third damaged differently is unreachable at the
   operator's k = 2 (it needs three copy targets); if k is raised, the
   *two-fault* stop names the reduced configuration, and D8 keeps `mie store
-  repair` from copying hot's damage meanwhile. (2) Damage inside the
+  repair` from copying hot's damage meanwhile, short of D8's *What it
+  cannot see*. (2) Damage inside the
   copies' last line with hot longer is *diverged*, closed by
   `--keep-hot-journal`. (3) An import-ledger file bad everywhere: the
   closure by hand of D5.
@@ -415,8 +526,9 @@ prefixes of hot.
 ## Accept when
 
 Every item is an offline test the PR's CI runs, and the command changes
-no capture, removal or replication path, so the status is `accepted` at
-merge:
+no removal or replication path; the capture changes only by taking the
+journal lock at its journal's open, a refusal the offline tests cover. So
+the status is `accepted` at merge:
 
 - AC1: hot's journal in R7's suspect state is restored by `--scope
   journal`, byte-identical to both copies, the flipped file kept as
@@ -429,12 +541,15 @@ merge:
   copy anywhere stop, naming both sides, with nothing written
   (`ac3_a_fork_stops_naming_both_sides_and_writes_nothing`,
   `ac3_an_entry_without_a_good_copy_stops_and_writes_nothing`).
-- D8: `r7_a_copy_is_not_rebuilt_while_hot_is_contested_beyond_d`.
+- D8: `r7_a_copy_is_not_rebuilt_while_hot_is_contested_beyond_d`,
+  `r7_a_byte_only_hot_and_the_copy_hold_is_contested`,
+  `r7_two_copy_faults_on_an_intact_hot_heal_both_copies`.
 
 ## Acceptance
 
 Met by the PR that adds this ADR: the four offline tests above, the pure
-tests of every D2, D3 and D5 outcome with the numbers of D2, and the run
-tests of the refusals, the locks, a crash after each write step with its
+tests of every D2, D3 and D5 outcome with the numbers of D2, the D8 rule
+in memory and over files, and the run tests of the refusals, the locks
+(the journal lock against an open journal), a crash after each write step with its
 re-run, the evidence names, the path forms and refused writes, all pass
 in its CI.

@@ -31,8 +31,12 @@
 //!   configuration, and every `source=` at the top of any root's layout.
 //!   The live source too: if hot's marker was deleted under a running `mie
 //!   ingest`, the restore must not copy into partitions that writer
-//!   appends to. Nothing but `.mie/` and the lock files is written before
-//!   H7.
+//!   appends to. Then the journal lock (`<paths.journal>.lock`, its
+//!   directory created when absent), which `mie ingest` holds until its
+//!   last journal line: a writer from before the loss keeps appending to
+//!   the journal H3 extends, and its source lock is on the lost hot.
+//!   Nothing but `.mie/`, the journal's directory and the lock files is
+//!   written before H7.
 //! - **H2 Reads**, nothing written, in this order: every copy target's
 //!   ledger copy and hot's surviving ledger, which choose the start (H5 a);
 //!   the journal candidates; every import-ledger file on hot and on the
@@ -1341,6 +1345,12 @@ fn restore(
                 .map_err(|e| locked(&format!("the writer lock of source {source}"), e))?,
         );
     }
+    // A `mie ingest` that runs from before the loss holds its journal open
+    // and its source lock on the lost hot's lock file, not this one; the
+    // journal lock excludes it until its last line (review of #226,
+    // finding 3).
+    let _journal_lock =
+        replica::try_journal_lock(journal_path).map_err(|e| locked("the journal lock", e))?;
 
     // H2.
     let at_ms = now_ms();

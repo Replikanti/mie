@@ -291,6 +291,40 @@ fn x0_locks_are_taken_without_waiting() {
     assert_eq!(snapshot(&fixture), before);
 }
 
+/// The journal lock (review of #226, finding 3): `mie ingest` drops the
+/// source's writer lock when its store closes, then still writes `sealed`,
+/// `run_end` and the final pass's `replication`. Its open journal holds
+/// the journal lock until then, so the journal scope refuses while it is
+/// open, and while the lock is held otherwise, with nothing written; the
+/// import-ledger scope does not take it. A journal does not open while
+/// the lock is held, and opens again once the run ends.
+#[test]
+fn x0_the_journal_lock_excludes_every_journal_write() {
+    let fixture = with_journal("hot-journal-lock", &thousand());
+    flip(&fixture.config.paths.journal, 10);
+    let before = snapshot(&fixture);
+    let live = crate::journal::Journal::open(&fixture.config.paths.journal, "run-A").unwrap();
+    let report = journal(&fixture, AT);
+    assert_problem(&report, &["the journal lock", "stop `mie ingest`"]);
+    assert_nothing_written(&report);
+    assert_pass(&ledger(&fixture, AT));
+    drop(live);
+    {
+        let _held = replica::try_journal_lock(&fixture.config.paths.journal).unwrap();
+        let report = journal(&fixture, AT);
+        assert_problem(&report, &["the journal lock"]);
+        assert_nothing_written(&report);
+        let refused = crate::journal::Journal::open(&fixture.config.paths.journal, "run-B");
+        assert!(
+            refused.is_err_and(|e| e.contains("journal lock")),
+            "a journal opened under a held lock"
+        );
+    }
+    assert_eq!(snapshot(&fixture), before);
+    assert_pass(&journal(&fixture, AT));
+    assert_eq!(fs::read(&fixture.config.paths.journal).unwrap(), thousand());
+}
+
 /// The import-ledger scope runs beside a live writer.
 #[test]
 fn x0_import_ledger_scope_runs_beside_a_live_writer() {
@@ -422,7 +456,7 @@ fn x2_copies_differ_stop_texts() {
     assert_problem(
         &report,
         &[
-            "one fault, on the copies",
+            "the faults are on the copies",
             "`mie store verify`, then `mie store repair`",
             "cold-b",
         ],
@@ -670,6 +704,8 @@ fn x5_existing_evidence_name_stops() {
 fn x5_refused_write_stops_before_the_next() {
     let fixture = with_journal("hot-refused", &thousand());
     flip(&fixture.config.paths.journal, 10);
+    // The journal's lock file, as the `mie ingest` that wrote it leaves it.
+    drop(replica::try_journal_lock(&fixture.config.paths.journal).unwrap());
     let before = snapshot(&fixture);
     mode(&fixture.dir.0, 0o555);
     let report = journal(&fixture, AT);
@@ -748,6 +784,28 @@ fn x5_crash_at_every_step_resumes() {
         assert_eq!(fs::read(&entry).unwrap(), good, "{step:?}");
         assert!(!malformed.exists(), "{step:?}");
     }
+
+    // *behind*: a crash after the extension, before its closing `\n`,
+    // leaves hot equal to C; the re-run writes the `\n` (review of #226,
+    // finding 5), and a third run agrees.
+    let mut cut = thousand();
+    cut.extend_from_slice(b"{\"type\":\"stats\",\"run_id\":\"A\",\"at");
+    let fixture = with_journal("hot-crash-behind", &cut);
+    let journal_path = fixture.config.paths.journal.clone();
+    fs::write(&journal_path, &cut[..500]).unwrap();
+    AFTER_STEP.with(|crash| crash.set(Some(Step::Extended)));
+    assert_problem(&journal(&fixture, AT), &["simulated crash"]);
+    assert_eq!(fs::read(&journal_path).unwrap(), cut);
+    let report = journal(&fixture, AT + 1);
+    assert_pass(&report);
+    assert_line(&report, &["decision behind"]);
+    assert_eq!(report.written, 1);
+    let mut whole = cut.clone();
+    whole.push(b'\n');
+    assert_eq!(fs::read(&journal_path).unwrap(), whole);
+    let report = journal(&fixture, AT + 2);
+    assert_pass(&report);
+    assert_nothing_written(&report);
 
     let fixture = forked("hot-crash-keep");
     let hot = fs::read(&fixture.config.paths.journal).unwrap();

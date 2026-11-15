@@ -613,12 +613,13 @@ fn a_journal_copy_is_repaired_by_majority_and_refused_against_hot() {
     }
 }
 
-/// X8 (ADR-065 D8): with cold-b damaged at byte 10 and hot at a byte x in
-/// a later line, cold-a agrees with hot over [0, 10] but contradicts it at
-/// x, so it vouches for nothing past 10: the repair moves nothing, cold-b's
-/// refusal names cold-a's difference and `mie store repair-hot`, and a
-/// second repair moves nothing either. Without X8, cold-b would be rebuilt
-/// and the closing pass would copy hot's damaged byte x into it.
+/// D8 (ADR-065): with cold-b damaged at byte 10 and hot at a byte x in a
+/// later line, hot's byte at x is held by hot alone of the three journals,
+/// so cold-b, which the rebuild would overwrite there, is not rebuilt: the
+/// repair moves nothing, cold-b's refusal names the byte and `mie store
+/// repair-hot`, and a second repair moves nothing either. Without D8,
+/// cold-b would be rebuilt and the closing pass would copy hot's damaged
+/// byte x into it.
 #[test]
 fn r7_a_copy_is_not_rebuilt_while_hot_is_contested_beyond_d() {
     let (_dir, fixture) = adopted("repair-x8");
@@ -643,7 +644,7 @@ fn r7_a_copy_is_not_rebuilt_while_hot_is_contested_beyond_d() {
                 "cold-b",
                 "refused",
                 "byte 10",
-                &format!("cold-a) agrees with hot over [0, 10] but differs from it at byte {x}"),
+                &format!("at byte {x} hot's byte is held by 1 of the 3 journals"),
                 "mie store repair-hot --scope journal",
             ],
         );
@@ -657,6 +658,89 @@ fn r7_a_copy_is_not_rebuilt_while_hot_is_contested_beyond_d() {
             "run {i}"
         );
     }
+}
+
+/// D8, too weak before (review of #226, finding 1): cold-b damaged at
+/// byte 10, hot at a byte x in its second line, and cold-a, the copy that
+/// agrees with hot over [0, 10], only one line long, so it holds no byte
+/// at x. There only hot and cold-b hold a byte, and they differ: one
+/// against one, so cold-b is not rebuilt, and it keeps its true byte at x.
+/// The agreeing-copy rule rebuilt cold-b here, and the closing pass copied
+/// hot's damaged byte x into it. (cold-a, a byte prefix of hot, is
+/// extended by the closing pass as by every pass: bytes past a copy's end
+/// come from hot, ADR-065 D8 *What it cannot see*.)
+#[test]
+fn r7_a_byte_only_hot_and_the_copy_hold_is_contested() {
+    let (_dir, fixture) = adopted("repair-d8-short");
+    let copy = |root: &str| cold(&fixture, root).join(".mie/journal/journal.jsonl");
+    let good = fs::read(&fixture.config.paths.journal).unwrap();
+    let first_nl = good.iter().position(|b| *b == b'\n').unwrap();
+    let x = first_nl + 10;
+    assert!(x < good.len(), "the journal has a second line");
+    writable(&copy("cold-a"));
+    fs::write(copy("cold-a"), &good[..=first_nl]).unwrap();
+    flip(&copy("cold-b"), 10);
+    flip(&fixture.config.paths.journal, x);
+    let before: Vec<Vec<u8>> = ["cold-a", "cold-b"]
+        .iter()
+        .map(|root| fs::read(copy(root)).unwrap())
+        .collect();
+    assert_eq!(before[1][x], good[x], "cold-b holds the true byte at x");
+    let (pass, out) = verify(&fixture, VERIFIED);
+    assert!(!pass, "{out}");
+    let (pass, out) = repair(&fixture, REPAIRED);
+    assert!(!pass, "{out}");
+    assert_fail_line(
+        &out,
+        &[
+            "cold-b",
+            "refused",
+            "byte 10",
+            &format!("at byte {x} only hot and one copy hold a byte"),
+            "mie store repair-hot --scope journal",
+        ],
+    );
+    assert_eq!(fs::read(copy("cold-b")).unwrap(), before[1]);
+    assert!(
+        !cold(&fixture, "cold-b")
+            .join(format!(".mie/damaged/{REPAIRED}/.mie/journal"))
+            .exists()
+    );
+    assert!(fs::read(copy("cold-a")).unwrap().starts_with(&before[0]));
+}
+
+/// D8, too strict before (review of #226, finding 2): hot intact, cold-b
+/// damaged at byte 10 and cold-a at a byte x in its second line. At every
+/// byte two of the three journals hold hot's byte, so both copies are
+/// rebuilt (the first with the other's bytes as they were before this
+/// run, the second with the first's evidence copy) and the closing pass
+/// extends both from hot; the next verify passes.
+#[test]
+fn r7_two_copy_faults_on_an_intact_hot_heal_both_copies() {
+    let (_dir, fixture) = adopted("repair-d8-two");
+    let copy = |root: &str| cold(&fixture, root).join(".mie/journal/journal.jsonl");
+    let hot = fs::read(&fixture.config.paths.journal).unwrap();
+    let x = hot.iter().position(|b| *b == b'\n').unwrap() + 10;
+    assert!(x < hot.len(), "the journal has a second line");
+    flip(&copy("cold-b"), 10);
+    flip(&copy("cold-a"), x);
+    let (pass, out) = verify(&fixture, VERIFIED);
+    assert!(!pass, "{out}");
+    let (pass, out) = repair(&fixture, REPAIRED);
+    assert!(pass, "{out}");
+    for root in ["cold-a", "cold-b"] {
+        assert_eq!(fs::read(copy(root)).unwrap(), hot, "{root}");
+        assert!(
+            cold(&fixture, root)
+                .join(format!(
+                    ".mie/damaged/{REPAIRED}/.mie/journal/journal.jsonl"
+                ))
+                .exists(),
+            "{root}"
+        );
+    }
+    let (pass, out) = verify(&fixture, REPAIRED + 1);
+    assert!(pass, "{out}");
 }
 
 /// The entry copy: replaced from hot; refused as an entry conflict when

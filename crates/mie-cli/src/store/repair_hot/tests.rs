@@ -67,6 +67,20 @@ fn first_diff(a: &[u8], b: &[u8]) -> Option<u64> {
         .map(|i| i as u64)
 }
 
+/// Whether R7 refuses to rebuild `copy` from `hot` with `copies` (all of
+/// them, `copy` among them) as the witnesses (ADR-065 D8), in memory.
+fn r7_refuses(hot: Option<&[u8]>, copy: &[u8], copies: &[&[u8]]) -> bool {
+    let Some(hot) = hot else {
+        return !copy.is_empty();
+    };
+    let d = match first_diff(copy, hot) {
+        Some(d) => d,
+        None if copy.len() <= hot.len() => return false,
+        None => hot.len() as u64,
+    };
+    replica::first_contested(hot, copies, line_start_in(hot, d)).is_some()
+}
+
 /// X1's facts over in-memory journals, as the run reads them: hot (`None`
 /// when absent) and the copies in configuration order, with `k` copy
 /// targets configured; X2a runs where it decides.
@@ -81,6 +95,7 @@ fn facts_of(hot: Option<&[u8]>, copies: &[&[u8]], k: usize) -> JournalFacts {
             len: copy.len() as u64,
             vs_hot: first_diff(copy, hot_bytes),
             vs_others: copies.iter().map(|other| first_diff(copy, other)).collect(),
+            r7_refuses: r7_refuses(hot, copy, copies),
         })
         .collect();
     let mut facts = JournalFacts {
@@ -89,6 +104,7 @@ fn facts_of(hot: Option<&[u8]>, copies: &[&[u8]], k: usize) -> JournalFacts {
         chosen: None,
         bounds: None,
         last_line_start: 0,
+        cut: false,
         fork: false,
         copy_targets: k,
     };
@@ -104,6 +120,7 @@ fn facts_of(hot: Option<&[u8]>, copies: &[&[u8]], k: usize) -> JournalFacts {
     let e = (0..common).rev().find(|&i| hot_bytes[i] != c_bytes[i]);
     facts.bounds = d.zip(e).map(|(d, e)| (d as u64, e as u64));
     facts.last_line_start = last_line_start(c_bytes);
+    facts.cut = c_bytes.last().is_some_and(|&byte| byte != b'\n');
     if let Some((d, e)) = facts.bounds
         && c_bytes.len() == hot_bytes.len()
         && e < facts.second_len()
@@ -167,11 +184,13 @@ fn numbers(hot_len: u64, lens: &[u64], bounds: Option<(u64, u64)>, lls: u64) -> 
                 len,
                 vs_hot: bounds.map(|(d, _)| d).filter(|d| *d < len.min(hot_len)),
                 vs_others: vec![None; lens.len()],
+                r7_refuses: false,
             })
             .collect(),
         chosen: lens.iter().position(|&len| len == longest),
         bounds,
         last_line_start: lls,
+        cut: false,
         fork: false,
         copy_targets: lens.len().max(2),
     }
@@ -332,6 +351,52 @@ fn x2_copies_differ_splits_copy_damaged_and_two_fault() {
     );
 }
 
+/// *copy-damaged* is exactly R7's rule, D8 (review of #226, findings 1
+/// and 2): hot intact with cold-a damaged at x = 110 (the second line)
+/// and cold-b at 10 has two of three journals for hot at every byte, so
+/// R7 heals both, in either order: *copy-damaged*. Hot damaged at x with
+/// cold-b damaged at 10 and cold-a only the first line long: at x only hot
+/// and cold-b hold a byte (one against one), so R7 refuses cold-b, and the
+/// state is *two-fault*.
+#[test]
+fn x2_copy_damaged_is_r7s_majority_rule() {
+    let a = records("A", 1000);
+    let x = 110;
+    let (cold_a, cold_b) = (flipped(&a, &[x]), flipped(&a, &[10]));
+    assert_eq!(
+        decide(Some(&a), &[&cold_a, &cold_b]),
+        JournalDecision::CopyDamaged
+    );
+    assert_eq!(
+        decide(Some(&a), &[&cold_b, &cold_a]),
+        JournalDecision::CopyDamaged
+    );
+    let hot = flipped(&a, &[x]);
+    let facts = facts_of(Some(&hot), &[&a[..100], &cold_b], 2);
+    assert!(!facts.witnesses[0].r7_refuses, "a byte prefix of hot");
+    assert!(facts.witnesses[1].r7_refuses);
+    assert_eq!(
+        decide_journal(&facts),
+        JournalDecision::TwoFault { group: None }
+    );
+    // A copy longer than hot holds bytes hot lacks: R7 refuses it.
+    let facts = facts_of(Some(&a[..800]), &[&a, &flipped(&a, &[900])], 2);
+    assert!(facts.witnesses.iter().all(|w| w.r7_refuses));
+}
+
+/// A finished extension whose `\n` did not land leaves hot equal to C,
+/// which ends inside a line (review of #226, finding 5): *behind*, so the
+/// re-run writes the `\n`. Equal and whole is *agree*.
+#[test]
+fn x2_hot_equal_to_a_cut_copy_is_behind() {
+    let mut cut = records("A", 300);
+    cut.extend_from_slice(b"{\"type\":\"stats\"");
+    assert_eq!(decide(Some(&cut), &[&cut, &cut]), JournalDecision::Behind);
+    assert_eq!(decide(Some(&cut), &[&cut[..300]]), JournalDecision::Agree);
+    let whole = records("A", 300);
+    assert_eq!(decide(Some(&whole), &[&whole]), JournalDecision::Agree);
+}
+
 /// Which states `--keep-hot-journal` may act on (X3).
 #[test]
 fn x3_the_states_the_flag_acts_on() {
@@ -409,6 +474,33 @@ fn x2a_an_equal_length_fork_is_diverged() {
     let mut middle = unknown;
     middle.extend(line("B", "", 250));
     assert_eq!(fork_case(&c, &middle, 600, 1000), JournalDecision::Diverged);
+}
+
+/// A torn line inside the region, not only at its start (review of #226,
+/// finding 4): run B's record over 600–749, run B killed 50 bytes into
+/// its next line, then run C's record glued onto it, to 999. Every `\n`
+/// position differs from the copies', and the later glued line is
+/// recognised as one: *diverged*. Its torn part must be a torn record:
+/// two lines merged by a `\n` turned into 0x0B in a later line stay
+/// *damaged*; turned into a blank, the first record parses with the blank
+/// as trailing whitespace, so the merged line reads as glued and the
+/// guard stops (two faults read as a fork, ADR-065 D3).
+#[test]
+fn x2a_a_torn_line_glued_inside_the_region_is_a_fork() {
+    let c = layout("");
+    let mut middle = line("B", "", 150);
+    let mut torn = line("B", "", 100);
+    torn.truncate(50);
+    middle.extend(torn);
+    middle.extend(line("C", "", 200));
+    assert_eq!(fork_case(&c, &middle, 600, 1000), JournalDecision::Diverged);
+
+    let c = records("A", 1000);
+    assert_eq!((c[637], c[799]), (b'1', b'\n'));
+    let merged = with(&c, &[(637, b'0'), (799, 0x0B)]);
+    assert_eq!(decide(Some(&merged), &[&c, &c]), JournalDecision::Damaged);
+    let blank = with(&c, &[(637, b'0'), (799, b' ')]);
+    assert_eq!(decide(Some(&blank), &[&c, &c]), JournalDecision::Diverged);
 }
 
 /// A substitution that keeps every `\n` position and valid JSON (a digit

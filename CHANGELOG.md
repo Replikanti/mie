@@ -18,8 +18,10 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   on an intact hot from the copy targets, the case `mie store repair` and
   `mie store restore` left open. The journal is replaced by the copies only
   where two copies of hot's full length agree against it at every
-  differing byte and a fork guard finds no fork's shape; a hot journal the
-  copies are longer than is extended; every other state (damaged copies,
+  differing byte and a fork guard finds no fork's shape (a torn line glued
+  to the next run's anywhere in the differing region); a hot journal the
+  copies are longer than is extended, and ended with its `\n` also when an
+  earlier run's extension stopped before it; every other state (damaged copies,
   two faults, hot ahead of the copies, a fork, one copy against hot) stops
   with nothing written, naming both sides and the next step.
   `--keep-hot-journal` keeps hot's journal and rebuilds the copies that
@@ -976,13 +978,27 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
 
 ### Changed
 
-- **`mie store repair` R7: the agreeing copy must contradict hot nowhere
-  (#217, ADR-065 D8).** A journal copy is rebuilt only when another copy
-  equals hot over `[0, d]` and has no difference against hot over its
-  whole length, since the closing pass extends the rebuilt copy from hot
-  up to hot's end; before, with hot damaged past d and this copy at d, the
-  rebuild copied hot's damage into it. The refusal names the contested
-  copy and `mie store repair-hot --scope journal`.
+- **`mie store repair` R7: hot needs a strict majority at every byte the
+  rebuild writes (#217, ADR-065 D8).** The rebuild of a journal copy that
+  differs from hot at d writes hot's bytes into it from the start of d's
+  line to hot's end (the closing pass extends it). It is done only when,
+  at every one of those bytes where a journal contradicts hot, more than
+  half of the journals that hold a byte there (hot, this copy and every
+  other target's copy, as they were before the run) hold hot's byte; a
+  byte only hot and this copy hold, where they differ, is one against one
+  and refuses, and so does a copy byte past hot's end. Before, one other
+  copy equal to hot over `[0, d]` sufficed, and with hot damaged past d
+  the rebuild copied hot's damage into this copy. Two damaged copies on an
+  intact hot are both rebuilt. The refusal names the byte and `mie store
+  repair-hot --scope journal`; repair-hot's *copy-damaged* stop applies
+  the same rule.
+
+- **The journal lock (#217, review of #226).** `mie ingest` holds
+  `<paths.journal>.lock` from the journal's open until its last line
+  (`run_end`, the final pass's `replication`); `mie store repair-hot
+  --scope journal` and `mie store restore` take it without waiting, so
+  neither writes the journal under a capture that is shutting down, after
+  the source's writer lock is already released.
 
 - **Import-ledger generations and current entries (#210, ADR-062 D11,
   proposed; ADR-034 D4 superseded at one point).** An import entry is

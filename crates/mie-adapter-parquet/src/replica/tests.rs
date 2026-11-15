@@ -1488,3 +1488,125 @@ fn replace_with_evidence_read_only_and_missing_dest() {
     assert_eq!(error.side, Side::Source);
     assert_eq!(fs::read(&dest).unwrap(), before);
 }
+
+/// ADR-065 D8 (review of #226, findings 1 and 2): hot needs a strict
+/// majority of the journals that hold a byte, wherever one contradicts
+/// it. Two of three hold; one against one, one of three, two of four and
+/// a byte past hot's end do not; bytes only hot holds are no contest. The
+/// file form agrees with the in-memory form across chunk boundaries (97
+/// bytes under test), skips an absent witness and names an unreadable
+/// one.
+#[test]
+fn first_contested_needs_a_strict_majority_for_hot() {
+    let hot: Vec<u8> = (0..300u32).map(|i| b'a' + (i % 26) as u8).collect();
+    let at = |bytes: &[u8], i: usize| flipped(bytes, i);
+    let (b10, b250) = (at(&hot, 10), at(&hot, 250));
+    let contested = |witnesses: &[&[u8]], from: u64| first_contested(&hot, witnesses, from);
+    assert_eq!(contested(&[&hot, &b10], 0), None);
+    assert_eq!(contested(&[&b250, &b10], 0), None);
+    assert_eq!(
+        contested(&[&hot[..100], &b250], 0),
+        Some(Contested {
+            at: 250,
+            covering: 2,
+            with_hot: 1
+        })
+    );
+    assert_eq!(
+        contested(&[&b10, &b10], 0),
+        Some(Contested {
+            at: 10,
+            covering: 3,
+            with_hot: 1
+        })
+    );
+    assert_eq!(contested(&[&b10, &b10], 11), None, "before `from`");
+    assert_eq!(
+        contested(&[&b10, &b10, &hot], 0),
+        Some(Contested {
+            at: 10,
+            covering: 4,
+            with_hot: 2
+        })
+    );
+    assert_eq!(contested(&[&hot[..100], &hot[..200]], 0), None);
+    let mut longer = hot.clone();
+    longer.push(b'\n');
+    assert_eq!(
+        contested(&[&hot, &longer], 0),
+        Some(Contested {
+            at: 300,
+            covering: 1,
+            with_hot: 0
+        })
+    );
+
+    let dir = TempDir::new("replica-contested");
+    let write = |name: &str, bytes: &[u8]| {
+        let path = dir.path().join(name);
+        fs::write(&path, bytes).unwrap();
+        path
+    };
+    let hot_path = write("hot", &hot);
+    let cases: [&[&[u8]]; 4] = [
+        &[&hot, &b10],
+        &[&hot[..100], &b250],
+        &[&b10, &b10, &hot],
+        &[&hot, &longer],
+    ];
+    for (n, witnesses) in cases.iter().enumerate() {
+        let paths: Vec<PathBuf> = witnesses
+            .iter()
+            .enumerate()
+            .map(|(w, bytes)| write(&format!("{n}-{w}"), bytes))
+            .collect();
+        let refs: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
+        for from in [0, 96, 97, 251] {
+            assert_eq!(
+                first_contested_file(&hot_path, &refs, from).unwrap(),
+                first_contested(&hot, witnesses, from),
+                "case {n} from {from}"
+            );
+        }
+    }
+    let absent = dir.path().join("absent");
+    let b250_path = write("b250", &b250);
+    assert_eq!(
+        first_contested_file(&hot_path, &[&b250_path, &absent], 0).unwrap(),
+        Some(Contested {
+            at: 250,
+            covering: 2,
+            with_hot: 1
+        })
+    );
+    let error = first_contested_file(&hot_path, &[dir.path()], 0).unwrap_err();
+    assert_eq!(error.side, Side::Destination, "{error}");
+    let error = first_contested_file(&absent, &[&b250_path], 0).unwrap_err();
+    assert_eq!(error.side, Side::Source, "{error}");
+}
+
+/// The journal lock (review of #226, finding 3): one holder at a time,
+/// free after its drop, beside the file a link names, and its directory
+/// created when absent.
+#[test]
+fn the_journal_lock_refuses_a_second_holder() {
+    let dir = TempDir::new("replica-journal-lock");
+    let journal = dir.path().join("logs/journal.jsonl");
+    let lock = try_journal_lock(&journal).unwrap();
+    assert!(dir.path().join("logs/journal.jsonl.lock").exists());
+    assert!(matches!(
+        try_journal_lock(&journal),
+        Err(RawStoreError::Locked(_))
+    ));
+    drop(lock);
+    fs::write(&journal, b"").unwrap();
+    let link = dir.path().join("link.jsonl");
+    std::os::unix::fs::symlink(&journal, &link).unwrap();
+    let by_link = try_journal_lock(&link).unwrap();
+    assert!(matches!(
+        try_journal_lock(&journal),
+        Err(RawStoreError::Locked(_))
+    ));
+    drop(by_link);
+    drop(try_journal_lock(&journal).unwrap());
+}

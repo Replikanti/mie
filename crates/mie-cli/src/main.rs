@@ -379,9 +379,10 @@ USAGE:
         order), verified by its SHA-256 and recorded. Copy-ledger and
         journal copies are rebuilt from hot where that is safe (a damaged
         unterminated tail is cut off); a copy ledger whose complete records
-        verify but differ from hot's, a journal copy no other copy agrees
-        with, and an import entry hot cannot vouch for are refused and
-        named. A file with no good copy left is reported lost and nothing
+        verify but differ from hot's, a journal copy where hot's journal
+        holds no strict majority of the journals at a byte the rebuild
+        would write (one copy against hot is a tie), and an import entry
+        hot cannot vouch for are refused and named. A file with no good copy left is reported lost and nothing
         is written, but only when every root that records a copy of it
         still carries its marker and every root was read without error;
         otherwise it is not repairable in this run, naming those roots.
@@ -476,9 +477,10 @@ USAGE:
         from the copy targets (ADR-065), one scope per run. mie store repair
         never rewrites hot, and mie store restore is for a lost hot only.
         It takes the pass and verify locks and, for --scope journal, the
-        live writer lock (stop mie ingest first), for --scope import-ledger
-        the archive writer lock (the capture keeps running), all without
-        waiting. --scope journal replaces hot's journal by the copies only
+        live writer lock and the journal lock, which mie ingest holds until
+        its last journal line (stop mie ingest first and let it exit), for
+        --scope import-ledger the archive writer lock (the capture keeps
+        running), all without waiting. --scope journal replaces hot's journal by the copies only
         where two copies of hot's full length agree against it at every
         differing byte and the difference has no fork's shape, extends a
         hot journal the copies are longer than, and otherwise stops, naming

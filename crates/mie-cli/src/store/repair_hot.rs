@@ -25,11 +25,13 @@
 //!   copy target without a readable marker is skipped and named, never read
 //!   or written; read-only roots are never witnesses. Locks, each without
 //!   waiting, for the whole run: the pass lock, the verify lock, then the
-//!   writer lock of `instrument.source` (journal scope: it excludes `mie
-//!   ingest`; the pass lock excludes `mie store adopt`, the journal's only
-//!   other writer) or of the archive source (import-ledger scope: it
-//!   excludes the importer, `mie store resolve` and the hot removal of
-//!   archive partitions). The import-ledger scope leaves the capture
+//!   writer lock of `instrument.source` and the journal lock (journal
+//!   scope: they exclude `mie ingest`, the journal lock until its last
+//!   journal line, since the source's lock goes when its store closes,
+//!   before `run_end`; the pass lock excludes `mie store adopt`, the
+//!   journal's only other writer) or the writer lock of the archive source
+//!   (import-ledger scope: it excludes the importer, `mie store resolve`
+//!   and the hot removal of archive partitions). The import-ledger scope leaves the capture
 //!   running: no live writer touches the import ledger, and every minute of
 //!   a stopped capture is irreplaceable live data.
 //! - **X1 Journal reads.** The witnesses are the marked copy targets'
@@ -44,18 +46,21 @@
 //!   difference at every byte. L_2 is the second-longest witness's length,
 //!   lls(C) the start of C's last complete line.
 //! - **X2 The journal decision** ([`decide_journal`]): *agree* (no
-//!   difference, L_C ≤ L_h: nothing written); *behind* (no difference,
-//!   L_h < L_C: hot is extended to C, one witness suffices, as in the
-//!   restore's H3); *damaged* (a difference, L_C = L_h, e < L_2, no fork shape: hot is
-//!   replaced by C, since every byte where hot differs has two independent
-//!   witnesses against it). Every other state stops, naming both sides:
-//!   *copy-damaged* (the copies differ, and hot agrees with a copy that
-//!   every differing copy contradicts below L_h: `mie store verify`, then
-//!   `mie store repair`); *two-fault* (the copies differ otherwise); *hot
-//!   ahead* (L_C < L_h, e < lls(C): stop `mie ingest`, run `mie store
-//!   replicate`, run this again); *diverged* (L_h > L_C with e ≥ lls(C),
-//!   L_C > L_h with a difference, or a fork shape); *one-witness* (L_C =
-//!   L_h, e ≥ L_2). A written journal that ends inside a line gets one `\n`.
+//!   difference, L_C ≤ L_h, and hot does not equal a C that ends inside a
+//!   line: nothing written); *behind* (no difference, L_h < L_C, or L_h =
+//!   L_C with C ending inside a line, the state an extension leaves when
+//!   its `\n` did not land: hot is extended to C, one witness suffices, as
+//!   in the restore's H3); *damaged* (a difference, L_C = L_h, e < L_2, no
+//!   fork shape: hot is replaced by C, since every byte where hot differs
+//!   has two independent witnesses against it). Every other state stops,
+//!   naming both sides: *copy-damaged* (the copies differ, and R7 rebuilds
+//!   every copy that is no byte prefix of hot under ADR-065 D8, the same
+//!   rule over the same bytes: `mie store verify`, then `mie store
+//!   repair`); *two-fault* (the copies differ otherwise); *hot ahead* (L_C
+//!   < L_h, e < lls(C): stop `mie ingest`, run `mie store replicate`, run
+//!   this again); *diverged* (L_h > L_C with e ≥ lls(C), L_C > L_h with a
+//!   difference, or a fork shape); *one-witness* (L_C = L_h, e ≥ L_2). A
+//!   written journal that ends inside a line gets one `\n`.
 //! - **X2a The fork guard** ([`fork_shaped`]): before *damaged* writes, an
 //!   equal-length fork (lines of a later run where the copies hold others)
 //!   makes the state *diverged*. It errs toward stopping.
@@ -192,6 +197,8 @@ pub(crate) enum Step {
     MalformedMoved,
     /// The first copy is rebuilt by `--keep-hot-journal`.
     CopyRebuilt,
+    /// *behind* extended hot's journal to C, before its closing `\n`.
+    Extended,
 }
 
 #[cfg(test)]
@@ -245,6 +252,13 @@ pub struct WitnessFacts {
     /// differ; `None` when one is a byte prefix of the other (itself
     /// included).
     pub vs_others: Vec<Option<u64>>,
+    /// Whether `mie store repair`'s R7 refuses to rebuild it from hot
+    /// (ADR-065 D8): it is no byte prefix of hot's journal, and hot holds
+    /// no strict majority at some byte the rebuild would write
+    /// ([`replica::first_contested_file`] over every witness), or hot
+    /// cannot be read. False for a byte prefix of hot's journal. Read only
+    /// where the copies differ.
+    pub r7_refuses: bool,
 }
 
 /// What X2 decides on.
@@ -262,6 +276,9 @@ pub struct JournalFacts {
     pub bounds: Option<(u64, u64)>,
     /// lls(C): where C's last complete line starts.
     pub last_line_start: u64,
+    /// Whether C ends inside a line (it is not empty and its last byte is
+    /// no `\n`).
+    pub cut: bool,
     /// X2a's verdict, computed only where it decides (L_C = L_h, a
     /// difference, e < L_2, hot readable).
     pub fork: bool,
@@ -298,13 +315,14 @@ impl JournalFacts {
 pub enum JournalDecision {
     /// No difference, L_C ≤ L_h: nothing is written.
     Agree,
-    /// No difference, L_C > L_h: hot is extended to C.
+    /// No difference, L_C > L_h, or L_C = L_h with C ending inside a line:
+    /// hot is extended to C and ended with its `\n`.
     Behind,
     /// Two witnesses against hot at every differing byte: hot is replaced
     /// by C.
     Damaged,
-    /// Stop: one fault, on the copies (`mie store verify`, then `mie store
-    /// repair`).
+    /// Stop: the copies differ, and R7 rebuilds every copy that is no byte
+    /// prefix of hot (`mie store verify`, then `mie store repair`).
     CopyDamaged,
     /// Stop: the copies differ, and hot differs too, or past L_h. With
     /// k ≥ 3, `group` names copy targets whose journals are byte prefixes
@@ -348,28 +366,13 @@ impl JournalDecision {
     }
 }
 
-/// The copy-damaged test (X2): an anchor A among the witnesses that hot
-/// agrees with (no difference over min(L_h, L_A)), every witness A
-/// contradicts first differs from A below L_h, and every witness consistent
-/// with A is consistent with hot. Then R7, with A as the agreeing copy
-/// (which X8 allows, since A contradicts hot nowhere), rebuilds every
-/// differing copy, and the copies end up consistent with hot. C is the
-/// first anchor tried; the others make the result independent of the
-/// configuration order on a tie.
+/// The copy-damaged test (X2): R7 rebuilds every witness that is no byte
+/// prefix of hot's journal (ADR-065 D8, `r7_refuses`), so after `mie store
+/// verify` and `mie store repair` every copy is a byte prefix of hot's
+/// journal. The test is the rule R7 applies, over the same bytes: the
+/// two commands never disagree about which copies a repair heals.
 fn copy_damaged(facts: &JournalFacts) -> bool {
-    let witnesses = &facts.witnesses;
-    witnesses.iter().enumerate().any(|(a, anchor)| {
-        anchor.vs_hot.is_none()
-            && witnesses.iter().enumerate().all(|(w, witness)| {
-                if w == a {
-                    return true;
-                }
-                match anchor.vs_others[w] {
-                    Some(at) => at < facts.hot_len,
-                    None => witness.vs_hot.is_none(),
-                }
-            })
-    })
+    facts.witnesses.iter().all(|w| !w.r7_refuses)
 }
 
 /// The largest set of witnesses whose journals are byte prefixes of one
@@ -380,8 +383,8 @@ fn consistent_group(facts: &JournalFacts) -> Option<Vec<usize>> {
     let mut best: Option<Vec<usize>> = None;
     for a in 0..witnesses.len() {
         let mut group = vec![a];
-        for w in 0..witnesses.len() {
-            if w != a && group.iter().all(|&g| witnesses[g].vs_others[w].is_none()) {
+        for w in (0..witnesses.len()).filter(|&w| w != a) {
+            if group.iter().all(|&g| witnesses[g].vs_others[w].is_none()) {
                 group.push(w);
             }
         }
@@ -410,7 +413,10 @@ pub fn decide_journal(facts: &JournalFacts) -> JournalDecision {
     }
     let (hot, chosen) = (facts.hot_len, facts.chosen_len());
     let Some((_, e)) = facts.bounds else {
-        return if chosen <= hot {
+        // Hot equal to C that ends inside a line is the state *behind*
+        // leaves when its last write did not land (review of #226, finding
+        // 5): the re-run ends it with its `\n`.
+        return if chosen < hot || (chosen == hot && !(facts.cut && facts.chosen.is_some())) {
             JournalDecision::Agree
         } else {
             JournalDecision::Behind
@@ -504,6 +510,18 @@ fn torn_record(line: &[u8]) -> bool {
     }
 }
 
+/// The `run_id` of C's line that starts at `start`, when a line of C
+/// starts there and is a complete record.
+fn c_run_id_at(c: &[u8], start: u64) -> Option<String> {
+    let start = usize::try_from(start).ok()?;
+    if start > 0 && c.get(start - 1) != Some(&b'\n') {
+        return None;
+    }
+    let rest = c.get(start..)?;
+    let end = rest.iter().position(|b| *b == b'\n')?;
+    record_run_id(&rest[..end])
+}
+
 /// X2a (ADR-065 D3): whether hot's region that differs from C has the
 /// shape of a fork. `next_line` gives hot's lines from s, the start of the
 /// line that holds d (which hot and C share), one at a time with their
@@ -511,25 +529,21 @@ fn torn_record(line: &[u8]) -> bool {
 /// since the guard errs toward stopping.
 ///
 /// Fork-shaped ⇔ (1) every line of hot's region through the line that holds
-/// e is a record, except that the first may be glued (no record, but its
-/// suffix from some p with s < p ≤ d is one, the shape `Journal::open`
-/// leaves after a torn line) and the last may be torn; and (2) the `\n`
-/// positions of hot and C over `[d, e]` differ, or the first line is glued
+/// e is a record or glued, except that the last may be torn; and (2) the
+/// `\n` positions of hot and C over `[d, e]` differ, or a line is glued
 /// through a complete record whose `run_id` differs from that of C's line
-/// at s, itself a complete record.
+/// at the same start, itself a complete record. A line is glued when it is
+/// no record but its suffix from some p is one (a torn record, when it is
+/// the journal's last line): the shape `Journal::open` leaves after a torn
+/// line. For the first line s < p ≤ d (its bytes before p are C's); for
+/// every later line (review of #226, finding 4) the line's bytes before p
+/// must be a torn record themselves, since they need not be C's.
 pub fn fork_shaped(
     facts: &ForkFacts<'_>,
     next_line: &mut dyn FnMut() -> Result<Option<Vec<u8>>, String>,
 ) -> bool {
     let (c, d, e) = (facts.c, facts.d, facts.e);
     let s = line_start_in(c, d);
-    let c_run_id = usize::try_from(s)
-        .ok()
-        .and_then(|s| c.get(s..))
-        .and_then(|rest| {
-            let end = rest.iter().position(|b| *b == b'\n')?;
-            record_run_id(&rest[..end])
-        });
     let mut start = s;
     let mut first = true;
     let mut newlines_differ = false;
@@ -560,13 +574,15 @@ pub fn fork_shaped(
             torn_record(body)
         };
         if !fits {
-            if !first {
-                return false;
-            }
+            let c_run_id = c_run_id_at(c, start);
+            let candidates: Box<dyn Iterator<Item = usize>> = if first {
+                Box::new(((s + 1)..=d).map(|p| (p - s) as usize))
+            } else {
+                Box::new(1..body.len())
+            };
             let mut glued = false;
-            for p in (s + 1)..=d {
-                let at = (p - s) as usize;
-                if at >= body.len() || body[at] != b'{' {
+            for at in candidates {
+                if at >= body.len() || body[at] != b'{' || (!first && !torn_record(&body[..at])) {
                     continue;
                 }
                 let suffix = &body[at..];
@@ -1102,6 +1118,22 @@ impl Run<'_> {
             removal::take_source_lock(self.hot, &source)
                 .map_err(|e| locked(&format!("the writer lock of source {source}"), e, then))?,
         ));
+        if scope == Scope::Journal {
+            // `mie ingest` releases the source's lock when its store
+            // closes, before `sealed`, `run_end` and the final pass's
+            // `replication`; its journal holds this one until its last
+            // line (review of #226, finding 3).
+            held.push(Box::new(
+                replica::try_journal_lock(&self.config.paths.journal).map_err(|e| {
+                    locked(
+                        "the journal lock",
+                        e,
+                        "`mie ingest` (until its last journal line) or `mie store restore` holds \
+                         it: stop `mie ingest` and wait for it to exit, then run this again; ",
+                    )
+                })?,
+            ));
+        }
         Ok(held)
     }
 }
@@ -1150,6 +1182,9 @@ impl Run<'_> {
         let mut candidates: Vec<JournalCandidate> = Vec::new();
         let mut at: Vec<WitnessAt> = Vec::new();
         let mut elsewhere = Vec::new();
+        // A copy that cannot be inspected is no witness here, but R7 counts
+        // it and refuses (ADR-065 D8).
+        let mut uninspected = false;
         for (t, target) in self.targets.iter().enumerate() {
             let dir = target.path.join(META_DIR).join(JOURNAL_DIR);
             let path = dir.join(&name);
@@ -1171,12 +1206,15 @@ impl Run<'_> {
                         elsewhere.push(format!("{} holds {}", target.id, names.join(", ")));
                     }
                 }
-                Err(error) => report.problems.push(format!(
-                    "the journal copy on {} ({}) cannot be inspected ({error}): no witness. \
-                     {READ_ERROR} (ADR-065 D2)",
-                    target.id,
-                    path.display()
-                )),
+                Err(error) => {
+                    uninspected = true;
+                    report.problems.push(format!(
+                        "the journal copy on {} ({}) cannot be inspected ({error}): no witness. \
+                         {READ_ERROR} (ADR-065 D2)",
+                        target.id,
+                        path.display()
+                    ));
+                }
             }
         }
         if candidates.is_empty() {
@@ -1264,6 +1302,7 @@ impl Run<'_> {
                             .map(|(d, _)| d)
                             .filter(|d| *d < candidates[i].len.min(hot_len)),
                         vs_others: vec![None; readable.len()],
+                        r7_refuses: false,
                     })
                     .collect();
                 let chosen = choice
@@ -1275,6 +1314,7 @@ impl Run<'_> {
                     chosen,
                     bounds,
                     last_line_start: last_line_start(&c_bytes),
+                    cut: c_bytes.last().is_some_and(|&byte| byte != b'\n'),
                     fork: false,
                     copy_targets: self
                         .config
@@ -1333,6 +1373,10 @@ impl Run<'_> {
                     let len = a_len.min(b_len);
                     replica::first_difference(a, TailSource::File(b), len)
                 };
+                // D8's witnesses: every journal copy, the unreadable ones
+                // too, since R7 counts them and refuses when one cannot be
+                // read.
+                let all: Vec<&Path> = at.iter().map(|w| w.path.as_path()).collect();
                 let mut witnesses = Vec::new();
                 for &i in &readable {
                     let vs_hot = if !hot_readable {
@@ -1357,11 +1401,23 @@ impl Run<'_> {
                             .map_err(|e| Stop(e.to_string()))?
                         });
                     }
+                    let len = candidates[i].len;
+                    let r7_refuses = if !hot_readable || !hot_exists {
+                        len > 0
+                    } else if vs_hot.is_none() && len <= hot_len {
+                        false
+                    } else {
+                        let d = vs_hot.unwrap_or(hot_len);
+                        let contested = replica::line_start(TailSource::File(&hot_path), d)
+                            .and_then(|u| replica::first_contested_file(&hot_path, &all, u));
+                        uninspected || !matches!(contested, Ok(None))
+                    };
                     witnesses.push(WitnessFacts {
                         id: self.targets[at[i].target].id.clone(),
-                        len: candidates[i].len,
+                        len,
                         vs_hot,
                         vs_others,
+                        r7_refuses,
                     });
                 }
                 let chosen = c.and_then(|c| readable.iter().position(|&i| i == c));
@@ -1371,6 +1427,7 @@ impl Run<'_> {
                     chosen: None,
                     bounds: None,
                     last_line_start: 0,
+                    cut: false,
                     fork: false,
                     copy_targets: self
                         .config
@@ -1428,10 +1485,10 @@ impl Run<'_> {
             JournalDecision::Behind => self.extend_hot(&hot_path, &c_bytes, &facts, report),
             JournalDecision::Damaged => self.replace_hot(&hot_path, &c_bytes, &facts, report),
             JournalDecision::CopyDamaged => Err(Stop(format!(
-                "the journal copies differ, and hot's journal agrees with a copy that contradicts \
-                 every differing copy inside hot's length: one fault, on the copies. {}. Run `mie \
+                "the journal copies differ, and hot's journal holds a strict majority at every \
+                 byte where a copy contradicts it: the faults are on the copies. {}. Run `mie \
                  store verify`, then `mie store repair` (R7 rebuilds each differing copy from \
-                 hot), then this command again; nothing is written (ADR-065 D2)",
+                 hot, ADR-065 D8), then this command again; nothing is written (ADR-065 D2)",
                 sides()
             ))),
             JournalDecision::TwoFault { group } => {
@@ -1452,13 +1509,13 @@ impl Run<'_> {
                     )
                 });
                 Err(Stop(format!(
-                    "the journal copies differ, and no copy that hot agrees with contradicts \
-                     them inside hot's length: two faults, which neither the copies nor hot can \
-                     attribute byte for byte. {}. `mie store repair` compares against hot, so it \
-                     is not the next step. When you hold hot's journal for right, \
-                     `--keep-hot-journal` rebuilds every copy that is no prefix of it from hot, \
-                     keeping their bytes in .mie/damaged/.{configuration} Nothing is written \
-                     (ADR-065 D2, D4)",
+                    "the journal copies differ, and at a byte where a copy contradicts hot's \
+                     journal, hot holds no strict majority, so R7 refuses that copy (ADR-065 D8): \
+                     two faults, which neither the copies nor hot can attribute byte for byte. \
+                     {}. `mie store repair` compares against hot, so it is not the next step. \
+                     When you hold hot's journal for right, `--keep-hot-journal` rebuilds every \
+                     copy that is no prefix of it from hot, keeping their bytes in \
+                     .mie/damaged/.{configuration} Nothing is written (ADR-065 D2, D4)",
                     sides()
                 )))
             }
@@ -1566,7 +1623,11 @@ impl Run<'_> {
     }
 
     /// *behind* (X2): hot's journal is extended to C, then ended with one
-    /// `\n` when C ends inside a line.
+    /// `\n` when C ends inside a line. The extension is chunked and the
+    /// `\n` comes after it, so a crash or a failed write can leave hot equal
+    /// to C without its `\n`; the re-run decides *behind* there too, with
+    /// nothing left to extend, and writes the `\n` (review of #226,
+    /// finding 5).
     fn extend_hot(
         &self,
         hot_path: &Path,
@@ -1587,12 +1648,22 @@ impl Run<'_> {
                 hot_path.display()
             ))
         })?;
-        report.written += 1;
-        report.lines.push(format!(
-            "journal: hot's journal {} extended by {appended} byte(s) from the copy on {from}",
-            hot_path.display()
-        ));
-        if c_bytes.last().is_some_and(|&byte| byte != b'\n') {
+        if appended > 0 {
+            report.written += 1;
+            report.lines.push(format!(
+                "journal: hot's journal {} extended by {appended} byte(s) from the copy on {from}",
+                hot_path.display()
+            ));
+            reached(Step::Extended)?;
+        } else {
+            report.lines.push(format!(
+                "journal: hot's journal {} already holds every byte of the copy on {from}, but \
+                 not the `\\n` that ends its last line: an earlier run's extension, or a cut \
+                 line a pass copied",
+                hot_path.display()
+            ));
+        }
+        if facts.cut {
             fs::OpenOptions::new()
                 .append(true)
                 .open(hot_path)
@@ -1601,6 +1672,9 @@ impl Run<'_> {
                     file.sync_all()
                 })
                 .map_err(|e| Stop(format!("append to {}: {e}", hot_path.display())))?;
+            if appended == 0 {
+                report.written += 1;
+            }
             report.lines.push(
                 "journal: its last line was cut, so one `\\n` ends it: the next run_start parses \
                  as a line of its own (ADR-065 D2)"

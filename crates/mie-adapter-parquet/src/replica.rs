@@ -1416,6 +1416,59 @@ pub fn try_verify_lock(raw_root: &Path) -> Result<VerifyLock, RawStoreError> {
     }
 }
 
+/// The journal lock; dropping it releases the lock explicitly
+/// ([`HeldLock`]).
+#[derive(Debug)]
+pub struct JournalLock {
+    _lock: HeldLock,
+}
+
+/// The journal lock's path for the journal `journal`: `<journal>.lock`
+/// beside the file the path names (a link is followed, so every spelling
+/// of one journal shares one lock; an absent journal is taken as given).
+pub fn journal_lock_path(journal: &Path) -> PathBuf {
+    let target = fs::canonicalize(journal).unwrap_or_else(|_| journal.to_owned());
+    let mut name = target.as_os_str().to_owned();
+    name.push(".lock");
+    PathBuf::from(name)
+}
+
+/// Takes the journal lock [`journal_lock_path`] without waiting, creating
+/// the journal's directory when it is missing (#217, review of #226,
+/// finding 3). Every writer of a capture journal holds it for as long as
+/// it may write a line: `mie ingest` from the journal's open until its
+/// last line (`run_end`, the final pass's `replication`) is written,
+/// `mie store repair-hot --scope journal` and `mie store restore` for
+/// their whole run. The raw store's writer lock of the source is no
+/// substitute: `mie ingest` releases it when the store closes, before its
+/// last journal lines.
+///
+/// # Errors
+///
+/// [`RawStoreError::Locked`] when another writer holds it;
+/// [`RawStoreError::Io`] when the lock file cannot be opened.
+pub fn try_journal_lock(journal: &Path) -> Result<JournalLock, RawStoreError> {
+    let path = journal_lock_path(journal);
+    if let Some(dir) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+        fs::create_dir_all(dir).map_err(io_error("create", dir))?;
+    }
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .map_err(io_error("open", &path))?;
+    match HeldLock::try_take(file) {
+        Ok(lock) => Ok(JournalLock { _lock: lock }),
+        Err(TryLockError::WouldBlock) => Err(RawStoreError::Locked(format!(
+            "another writer of the journal holds {} (`mie ingest` for its whole run, `mie store \
+             repair-hot --scope journal` or `mie store restore` for theirs)",
+            path.display()
+        ))),
+        Err(TryLockError::Error(error)) => Err(io_error("lock", &path)(error)),
+    }
+}
+
 /// What [`check_sealed_copy`] found, in its precedence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CopyCheck {
@@ -1827,6 +1880,121 @@ pub fn line_start(source: TailSource<'_>, offset: u64) -> Result<u64, CopyError>
         end = start;
     }
     Ok(0)
+}
+
+/// A byte where hot's journal holds no strict majority (ADR-065 D8): some
+/// witness holds a byte there that hot does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Contested {
+    /// The byte's offset.
+    pub at: u64,
+    /// The journals that hold a byte there: hot, when it is longer than
+    /// `at`, and every witness that is.
+    pub covering: usize,
+    /// Those of them that hold hot's byte, hot included; 0 past hot's end.
+    pub with_hot: usize,
+}
+
+/// [`first_contested`] over one window that starts at offset `base`: hot's
+/// bytes there and each witness's (any of them shorter than the window
+/// where its file ends).
+fn contested_window(base: u64, hot: &[u8], witnesses: &[&[u8]]) -> Option<Contested> {
+    if witnesses
+        .iter()
+        .all(|w| w.len() <= hot.len() && **w == hot[..w.len()])
+    {
+        return None;
+    }
+    let end = witnesses.iter().map(|w| w.len()).max().unwrap_or(0);
+    (0..end).find_map(|p| {
+        let mine = hot.get(p);
+        let mut covering = usize::from(mine.is_some());
+        let mut with_hot = covering;
+        let mut differs = false;
+        for byte in witnesses.iter().filter_map(|w| w.get(p)) {
+            covering += 1;
+            if Some(byte) == mine {
+                with_hot += 1;
+            } else {
+                differs = true;
+            }
+        }
+        (differs && 2 * with_hot <= covering).then_some(Contested {
+            at: base + p as u64,
+            covering,
+            with_hot,
+        })
+    })
+}
+
+/// The rule by which `mie store repair` may write hot's journal bytes into
+/// a journal copy (ADR-065 D8, #217): the first byte at or after `from`
+/// where some witness holds a byte other than hot's (or any byte, past
+/// hot's end) and hot's byte is not held by a strict majority of the
+/// journals that hold a byte there, hot and the witnesses. A witness
+/// covers the bytes below its length; bytes only hot holds are no contest.
+/// `None` when hot holds a strict majority at every byte a witness
+/// contradicts.
+#[must_use]
+pub fn first_contested(hot: &[u8], witnesses: &[&[u8]], from: u64) -> Option<Contested> {
+    let from_index = usize::try_from(from).unwrap_or(usize::MAX);
+    let views: Vec<&[u8]> = witnesses
+        .iter()
+        .map(|w| w.get(from_index..).unwrap_or(&[]))
+        .collect();
+    contested_window(from, hot.get(from_index..).unwrap_or(&[]), &views)
+}
+
+/// [`first_contested`] over files, in bounded chunks: hot's journal `hot`
+/// and the journals `witnesses`, each at the length it has when opened. A
+/// witness that does not exist holds no byte.
+///
+/// # Errors
+///
+/// A [`CopyError`] on [`Side::Source`] when hot's journal cannot be read,
+/// on [`Side::Destination`] when a witness cannot: a witness that cannot
+/// be read cannot be counted, so the rule cannot hold.
+pub fn first_contested_file(
+    hot: &Path,
+    witnesses: &[&Path],
+    from: u64,
+) -> Result<Option<Contested>, CopyError> {
+    let mut hot_file = File::open(hot)
+        .map_err(io_error("open", hot))
+        .map_err(CopyError::source)?;
+    let hot_len = hot_file
+        .metadata()
+        .map_err(io_error("stat", hot))
+        .map_err(CopyError::source)?
+        .len();
+    let mut files: Vec<(File, &Path, u64)> = Vec::new();
+    for &path in witnesses {
+        match File::open(path) {
+            Ok(file) => {
+                let len = file.metadata().map_err(io_error("stat", path))?.len();
+                files.push((file, path, len));
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(io_error("open", path)(error).into()),
+        }
+    }
+    let end = files.iter().map(|(_, _, len)| *len).max().unwrap_or(0);
+    let mut offset = from;
+    while offset < end {
+        let n = (end - offset).min(CHUNK as u64);
+        let take = |len: u64| usize::try_from(len.saturating_sub(offset).min(n)).unwrap_or(0);
+        let mine = read_at(&mut hot_file, hot, offset, take(hot_len)).map_err(CopyError::source)?;
+        let mut chunks = Vec::with_capacity(files.len());
+        for (file, path, len) in &mut files {
+            chunks.push(read_at(file, path, offset, take(*len))?);
+        }
+        let views: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
+        if let Some(contested) = contested_window(offset, &mine, &views) {
+            return Ok(Some(contested));
+        }
+        offset += n;
+    }
+    Ok(None)
 }
 
 /// The steps of [`rebuild_prefix`]. Tests stop a rebuild after either.

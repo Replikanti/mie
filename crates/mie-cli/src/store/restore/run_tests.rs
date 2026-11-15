@@ -391,7 +391,8 @@ fn h1_locks_are_taken_without_waiting() {
     let before = snapshot(&fixture);
     let hot = fixture.hot.clone();
     type Take<'a> = Box<dyn Fn() -> Box<dyn std::any::Any> + 'a>;
-    let cases: [(&str, Take); 5] = [
+    let journal = fixture.config.paths.journal.clone();
+    let cases: [(&str, Take); 6] = [
         (
             "copy-ledger lock",
             Box::new(|| Box::new(CopyLedger::at(&hot).try_hold().unwrap())),
@@ -411,6 +412,10 @@ fn h1_locks_are_taken_without_waiting() {
         (
             "source binance-archive",
             Box::new(|| Box::new(removal::take_source_lock(&hot, ARCHIVE_SOURCE).unwrap())),
+        ),
+        (
+            "the journal lock",
+            Box::new(|| Box::new(replica::try_journal_lock(&journal).unwrap())),
         ),
     ];
     for (what, take) in cases {
