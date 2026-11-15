@@ -16,7 +16,8 @@
 //! - **H0 Refusals**, nothing written: an empty `cold_roots`; a `raw_root`
 //!   that does not exist (mie never creates it: a directory it created
 //!   could put hot on the wrong filesystem); a `raw_root` with hot's marker
-//!   (the restore is for a lost hot; damage on an intact hot is #217) or a
+//!   (the restore is for a lost hot; damage on an intact hot is `mie store
+//!   repair-hot --scope journal|import-ledger`, ADR-065) or a
 //!   cold root's; an archive configuration of another store; a configured
 //!   root, copy target or read-only, without a readable marker (an
 //!   unmounted root reads as empty, D7 step 2); a cold marker with hot's
@@ -281,29 +282,50 @@ pub struct JournalChoice {
 /// `i` differs from C's bytes, or the candidate's read error.
 pub type Differs<'a> = dyn FnMut(usize, &[u8], u64) -> Result<Option<u64>, String> + 'a;
 
-/// H3′ (#195 amendment 2): C is the first candidate, longest first and
-/// H2's order on equal lengths (so hot's own journal on a tie), whose
-/// bytes `read(i)` gives in full; every other candidate must be C's prefix
-/// of its own length (`differs(i, c, len)`, the first byte in `[0, len)`
-/// where candidate `i` differs from C's bytes `c`). A candidate whose read
-/// fails is unreadable: one of at most C's length (L, 0 without C) is left
-/// out (U), a longer one stops the run unless `skip_unreadable`, which
-/// leaves it out. `aside(i)` names where the caller moves candidate `i`.
-/// Pure.
+/// Why H3′ stops, as structured facts: the restore renders each into its
+/// text ([`choose_journal`]); `mie store repair-hot` (#217) decides its
+/// copies-differ states from the first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JournalStop {
+    /// Candidate `other` is no prefix of C (`chosen`) of its own length:
+    /// they first differ at `byte`.
+    Diverged {
+        /// The candidate that is no prefix of C.
+        other: usize,
+        /// C's index.
+        chosen: usize,
+        /// The first differing byte.
+        byte: u64,
+    },
+    /// Candidate `index` cannot be read and is longer than every readable
+    /// candidate (C, `chosen`), without `skip_unreadable`.
+    Unreadable {
+        /// The candidate's index.
+        index: usize,
+        /// Its read error.
+        error: String,
+        /// C's index; `None` when no candidate reads.
+        chosen: Option<usize>,
+    },
+}
+
+/// H3′ (#195 amendment 2) as structured stops, the rule of
+/// [`choose_journal`]: C is the first candidate, longest first and H2's
+/// order on equal lengths, whose bytes `read(i)` gives in full; every other
+/// candidate must be C's prefix of its own length. One of at most C's
+/// length that cannot be read is left out (U); a longer one is a
+/// [`JournalStop::Unreadable`] unless `skip_unreadable`. Pure.
 ///
 /// # Errors
 ///
-/// One line naming both candidates and the first differing byte when a
-/// candidate is not C's prefix of its own length, equal lengths included;
-/// otherwise one line per unreadable candidate longer than C, without
-/// `skip_unreadable`. Nothing may be written then.
-pub fn choose_journal(
+/// The first [`JournalStop::Diverged`] alone, otherwise one
+/// [`JournalStop::Unreadable`] per unreadable candidate longer than C.
+pub fn choose_journal_stops(
     candidates: &[JournalCandidate],
     skip_unreadable: bool,
     read: &mut dyn FnMut(usize) -> Result<Vec<u8>, String>,
     differs: &mut Differs<'_>,
-    aside: &dyn Fn(usize) -> String,
-) -> Result<JournalChoice, Vec<String>> {
+) -> Result<JournalChoice, Vec<JournalStop>> {
     let mut order: Vec<usize> = (0..candidates.len()).collect();
     order.sort_by(|a, b| candidates[*b].len.cmp(&candidates[*a].len));
     let mut unreadable: BTreeMap<usize, String> = BTreeMap::new();
@@ -328,15 +350,11 @@ pub fn choose_journal(
             match differs(i, &choice.bytes, candidates[i].len) {
                 Ok(None) => {}
                 Ok(Some(byte)) => {
-                    let (other, chosen) = (&candidates[i], &candidates[c]);
-                    return Err(vec![format!(
-                        "the journal copies differ beyond their common prefix: {} ({} bytes) \
-                         differs from {} ({} bytes) at byte {byte}. A copy is a byte prefix of \
-                         hot's journal, so one of them is damaged, and nothing can tell which \
-                         holds the live data; the restore stops with nothing written (ADR-062 \
-                         D11 step 2, step 5)",
-                        other.label, other.len, chosen.label, chosen.len
-                    )]);
+                    return Err(vec![JournalStop::Diverged {
+                        other: i,
+                        chosen: c,
+                        byte,
+                    }]);
                 }
                 Err(error) => {
                     unreadable.insert(i, error);
@@ -345,32 +363,15 @@ pub fn choose_journal(
         }
     }
     let longest = choice.chosen.map_or(0, |c| candidates[c].len);
-    let from = choice.chosen.map_or_else(
-        || "none reads".to_owned(),
-        |c| format!("{}, {longest} bytes", candidates[c].label),
-    );
-    let restored = choice.chosen.map_or_else(
-        || "stays absent".to_owned(),
-        |c| format!("is restored from {}", candidates[c].label),
-    );
     let mut stops = Vec::new();
     for (&i, error) in &unreadable {
-        let candidate = &candidates[i];
-        let by_flag = candidate.len > longest;
+        let by_flag = candidates[i].len > longest;
         if by_flag && !skip_unreadable {
-            stops.push(format!(
-                "the journal candidate {} ({} bytes) cannot be read ({error}), and it is longer \
-                 than every readable candidate ({from}). Nothing can tell what its last {} \
-                 byte(s) hold, and the runs that only they name would be missing from hot's \
-                 journal. The restore stops with nothing written. After a transient read error, \
-                 a plain re-run completes it. For a permanent one (a failing disk), \
-                 `--skip-unreadable-journal` leaves it out: hot's journal {restored}, and the \
-                 candidate is moved to {}, never deleted (ADR-062 D11 step 2)",
-                candidate.label,
-                candidate.len,
-                candidate.len - longest,
-                aside(i)
-            ));
+            stops.push(JournalStop::Unreadable {
+                index: i,
+                error: error.clone(),
+                chosen: choice.chosen,
+            });
             continue;
         }
         choice.left_out.push(LeftOut {
@@ -384,6 +385,85 @@ pub fn choose_journal(
     } else {
         Err(stops)
     }
+}
+
+/// H3′ (#195 amendment 2): C is the first candidate, longest first and H2's
+/// order on equal lengths (so hot's own journal on a tie), whose bytes
+/// `read(i)` gives in full; every other candidate must be C's prefix of its
+/// own length (`differs(i, c, len)`, the first byte in `[0, len)` where
+/// candidate `i` differs from C's bytes `c`). A candidate whose read fails
+/// is unreadable: one of at most C's length (L, 0 without C) is left out
+/// (U), a longer one stops the run unless `skip_unreadable`, which leaves
+/// it out. `aside(i)` names where the caller moves candidate `i`. Pure; the
+/// rule is [`choose_journal_stops`], and this renders its stops.
+///
+/// # Errors
+///
+/// One line naming both candidates and the first differing byte when a
+/// candidate is not C's prefix of its own length, equal lengths included;
+/// otherwise one line per unreadable candidate longer than C, without
+/// `skip_unreadable`. Nothing may be written then.
+pub fn choose_journal(
+    candidates: &[JournalCandidate],
+    skip_unreadable: bool,
+    read: &mut dyn FnMut(usize) -> Result<Vec<u8>, String>,
+    differs: &mut Differs<'_>,
+    aside: &dyn Fn(usize) -> String,
+) -> Result<JournalChoice, Vec<String>> {
+    let stops = match choose_journal_stops(candidates, skip_unreadable, read, differs) {
+        Ok(choice) => return Ok(choice),
+        Err(stops) => stops,
+    };
+    Err(stops
+        .into_iter()
+        .map(|stop| match stop {
+            JournalStop::Diverged {
+                other,
+                chosen,
+                byte,
+            } => {
+                let (other, chosen) = (&candidates[other], &candidates[chosen]);
+                format!(
+                    "the journal copies differ beyond their common prefix: {} ({} bytes) \
+                     differs from {} ({} bytes) at byte {byte}. A copy is a byte prefix of \
+                     hot's journal, so one of them is damaged, and nothing can tell which \
+                     holds the live data; the restore stops with nothing written (ADR-062 \
+                     D11 step 2, step 5)",
+                    other.label, other.len, chosen.label, chosen.len
+                )
+            }
+            JournalStop::Unreadable {
+                index,
+                error,
+                chosen,
+            } => {
+                let longest = chosen.map_or(0, |c| candidates[c].len);
+                let from = chosen.map_or_else(
+                    || "none reads".to_owned(),
+                    |c| format!("{}, {longest} bytes", candidates[c].label),
+                );
+                let restored = chosen.map_or_else(
+                    || "stays absent".to_owned(),
+                    |c| format!("is restored from {}", candidates[c].label),
+                );
+                let candidate = &candidates[index];
+                format!(
+                    "the journal candidate {} ({} bytes) cannot be read ({error}), and it is \
+                     longer than every readable candidate ({from}). Nothing can tell what its \
+                     last {} byte(s) hold, and the runs that only they name would be missing \
+                     from hot's journal. The restore stops with nothing written. After a \
+                     transient read error, a plain re-run completes it. For a permanent one (a \
+                     failing disk), `--skip-unreadable-journal` leaves it out: hot's journal \
+                     {restored}, and the candidate is moved to {}, never deleted (ADR-062 D11 \
+                     step 2)",
+                    candidate.label,
+                    candidate.len,
+                    candidate.len - longest,
+                    aside(index)
+                )
+            }
+        })
+        .collect())
 }
 
 /// One copy of an import-ledger file as H2 read it.
@@ -688,9 +768,9 @@ fn sync_dir(dir: &Path) -> Result<(), Stop> {
 /// An import-ledger directory as H2 reads it: every well-formed file by
 /// `<segment>/<name>`, and every malformed name.
 #[derive(Default)]
-struct LedgerListing {
-    files: Vec<(String, PathBuf)>,
-    malformed: Vec<String>,
+pub(super) struct LedgerListing {
+    pub(super) files: Vec<(String, PathBuf)>,
+    pub(super) malformed: Vec<String>,
 }
 
 /// Lists the import-ledger directory `dir` (hot's, or a target's
@@ -698,7 +778,7 @@ struct LedgerListing {
 /// immutable copy's temp names (`.<name>.tmp`) are skipped; every other
 /// name in a segment that is no import-ledger name (G1) is malformed,
 /// a segment that is no valid segment too: named, never written (H4).
-fn list_ledger(dir: &Path) -> std::io::Result<LedgerListing> {
+pub(super) fn list_ledger(dir: &Path) -> std::io::Result<LedgerListing> {
     let mut listing = LedgerListing::default();
     for segment in sorted_names(dir)? {
         let path = dir.join(&segment);
@@ -726,7 +806,7 @@ fn list_ledger(dir: &Path) -> std::io::Result<LedgerListing> {
 
 /// The `FAIL:` sentence for a file that cannot be read (U, #195
 /// amendment 2).
-const READ_ERROR: &str = "A read error can mean a failing disk: run `mie store verify`, then `mie \
+pub(super) const READ_ERROR: &str = "A read error can mean a failing disk: run `mie store verify`, then `mie \
                           store repair`, for what verify finds on that target";
 
 /// The stop of a move into `.mie/damaged/` that `error` refused (H6 k,
@@ -1186,8 +1266,9 @@ fn restore(
             return Err(Stop(format!(
                 "raw_root {} carries hot's marker: `mie store restore` is for a lost hot only and \
                  refuses an intact one. Damage to hot's own journal or import-ledger files on an \
-                 intact hot is #217; a damaged copy on a copy target is `mie store verify`, then \
-                 `mie store repair`; nothing is written (ADR-062 D11)",
+                 intact hot is `mie store repair-hot --scope journal|import-ledger` (ADR-065); a \
+                 damaged copy on a copy target is `mie store verify`, then `mie store repair`; \
+                 nothing is written (ADR-062 D11)",
                 hot.display()
             )));
         }

@@ -301,7 +301,12 @@ pub fn run(
     let entries = match &archive {
         Some(archive) => {
             let found = hot_entries(&archive.paths.import_ledger);
-            hot_problems.extend(found.problems);
+            hot_problems.extend(
+                found
+                    .problems
+                    .into_iter()
+                    .map(super::repair_hot::with_remedy),
+            );
             found.entries
         }
         None => Vec::new(),

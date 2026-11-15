@@ -57,18 +57,26 @@
 //!   supersedes both chains (#193).
 //! - **R7 Journal copies with an open journal finding:** let d be the first
 //!   byte where the copy differs from hot. Repaired only when another
-//!   target's copy is longer than d and equals hot over `[0, d]` (two of
-//!   three agree): the copy is moved aside and rebuilt up to the start of
-//!   the line that holds d, and the closing pass extends it under its usual
-//!   journal hold. Otherwise refused: the journal has no chain, so one copy
-//!   against hot cannot be attributed; when every other copy agrees with
-//!   this one against hot, hot's journal is named as the suspect. The
-//!   repair never rewrites hot, and `mie store restore` is for a lost hot
-//!   only: damage to hot's own journal on an intact hot is #217.
+//!   target's copy is longer than d, equals hot over `[0, d]` (two of
+//!   three agree) and has no difference against hot over min(its length,
+//!   L_h) (ADR-065 D8: the closing pass extends the rebuilt copy from hot
+//!   up to L_h, so the agreeing copy vouches for hot's bytes past d too):
+//!   the copy is moved aside and rebuilt up to the start of the line that
+//!   holds d, and the closing pass extends it under its usual journal
+//!   hold. Otherwise refused: the journal has no chain, so one copy
+//!   against hot cannot be attributed; a copy that agrees with hot over
+//!   `[0, d]` but differs from it later is named with its byte; when every
+//!   other copy agrees with this one against hot, hot's journal is named
+//!   as the suspect. The repair never rewrites hot, and `mie store restore`
+//!   is for a lost hot only: with `mie ingest` stopped, `mie store
+//!   repair-hot --scope journal` decides hot's journal (ADR-065).
 //! - **R8 Entry copies with an open entry finding:** replaced from hot only
 //!   when hot's entry lists every file with the SHA-256 of the ledger's
-//!   `manifest` record (else hot's manifest); otherwise refused as an entry
-//!   conflict, for the hold resolution (`mie store resolve`, ADR-062 D11).
+//!   `manifest` record (else hot's manifest, [`entry_mismatches`], the test
+//!   `mie store repair-hot` shares); otherwise refused, naming `mie store
+//!   repair-hot --scope import-ledger`, which restores hot's entry when a
+//!   copy target holds one that passes the test, then the hold resolution
+//!   (`mie store resolve`, ADR-062 D11).
 //!   An absent copy is left to the closing pass. A supersede record's copy
 //!   is replaced from hot when hot's record parses and names its own file
 //!   (it lists no part); a finding on a superseded entry is one line and no
@@ -362,7 +370,12 @@ pub fn run(
     let (entries, superseded) = match &archive_config {
         Some(archive) => {
             let found = hot_entries(&archive.paths.import_ledger);
-            problems.extend(found.problems);
+            problems.extend(
+                found
+                    .problems
+                    .into_iter()
+                    .map(super::repair_hot::with_remedy),
+            );
             (found.entries, found.superseded)
         }
         None => (Vec::new(), BTreeMap::new()),
@@ -1129,19 +1142,41 @@ impl Repair<'_> {
             }
         };
         let journal = self.config.paths.journal.clone();
-        // Another target's copy longer than d that equals hot over [0, d].
+        let hot_len = fs::metadata(&journal).map_or(0, |metadata| metadata.len());
+        // Another target's copy longer than d that equals hot over [0, d]
+        // and contradicts hot nowhere over min(its length, L_h) (X8,
+        // ADR-065 D8): the closing pass extends the rebuilt copy from hot
+        // up to L_h, so the agreeing copy vouches for hot's bytes past d
+        // too.
         let mut agree = false;
         let mut others = Vec::new();
+        let mut contested = Vec::new();
         for &j in targets.iter().filter(|&&j| j != i) {
             let Some(other) = self.journal_copy(j) else {
                 continue;
             };
-            let long = fs::metadata(&other).is_ok_and(|metadata| metadata.len() > first);
-            if !long {
+            let Ok(len) = fs::metadata(&other).map(|metadata| metadata.len()) else {
+                continue;
+            };
+            if len <= first {
                 continue;
             }
             match replica::first_difference(&other, TailSource::File(&journal), first + 1) {
-                Ok(None) => agree = true,
+                Ok(None) => {
+                    match replica::first_difference(
+                        &other,
+                        TailSource::File(&journal),
+                        len.min(hot_len),
+                    ) {
+                        Ok(None) => agree = true,
+                        Ok(Some(at)) => contested.push(format!(
+                            "the copy on {} agrees with hot over [0, {first}] but differs from \
+                             it at byte {at}",
+                            self.name(j)
+                        )),
+                        Err(_) => continue,
+                    }
+                }
                 Ok(Some(_)) => {}
                 Err(_) => continue,
             }
@@ -1155,13 +1190,24 @@ impl Repair<'_> {
                     .iter()
                     .all(|other| byte_at(other, first).ok().flatten() == mine)
                 && mine != theirs;
-            let tail = if suspect {
+            let tail = if !contested.is_empty() {
+                format!(
+                    " {}, so no copy vouches for hot's bytes past byte {first}, which the \
+                     closing pass would copy into this one. The repair never rewrites hot: with \
+                     `mie ingest` stopped, `mie store repair-hot --scope journal` decides hot's \
+                     journal (ADR-065 D8)",
+                    contested.join("; ")
+                )
+            } else if suspect {
                 " Every other copy agrees with this one against hot, so hot's journal is the \
                  suspect. The repair never rewrites hot, and `mie store restore` is for a lost \
-                 hot only: damage to hot's own journal on an intact hot is #217"
+                 hot only: with `mie ingest` stopped, `mie store repair-hot --scope journal` \
+                 decides hot's journal (ADR-065)"
+                    .to_owned()
             } else {
                 " No other copy agrees with hot over [0, d], and the journal has no hash chain, \
                  so the difference cannot be attributed"
+                    .to_owned()
             };
             self.problem(format!(
                 "the journal on {name} ({}): refused: it differs from hot's journal at byte \
@@ -1257,25 +1303,15 @@ impl Repair<'_> {
             }
             Ok(_) => {}
         }
-        let mut wrong = Vec::new();
-        for (file, sha) in &files {
-            let expected = match self.state.ledger_text(file) {
-                Some(text) => replica::parse_manifest(text).ok().map(|f| f.sha256),
-                None => replica::sealed_manifest(self.hot, file)
-                    .ok()
-                    .flatten()
-                    .map(|(_, f)| f.sha256),
-            };
-            if expected.as_deref() != Some(sha.as_str()) {
-                wrong.push(file.clone());
-            }
-        }
+        let wrong = entry_mismatches(&files, &self.state, self.hot);
         if !wrong.is_empty() {
             self.problem(format!(
                 "import entry {entry} on {name}: refused: hot's entry lists {} with another \
                  SHA-256 than the copy ledger's manifest record (else hot's manifest), so hot's \
-                 entry is no good source: an entry conflict, for the hold resolution (`mie store \
-                 resolve`; ADR-062 D11)",
+                 entry is no good source. When a copy target holds an entry of that name that \
+                 passes this test, `mie store repair-hot --scope import-ledger`, with the \
+                 importer stopped, restores hot's entry from it (ADR-065); otherwise it is an \
+                 entry conflict, for the hold resolution (`mie store resolve`; ADR-062 D11)",
                 wrong.join(", ")
             ));
             return Ok(());
@@ -1306,4 +1342,30 @@ impl Repair<'_> {
         }
         Ok(())
     }
+}
+
+/// R8's test, shared with `mie store repair-hot` (ADR-065 D5), so the two
+/// commands never disagree about which bytes are the entry: the files of
+/// `files` (`(path, sha256)`, as an entry lists them) whose SHA-256 is not
+/// the one of the copy ledger's `manifest` record (`state`), else of hot's
+/// sealed manifest. An entry is good when this is empty.
+pub(super) fn entry_mismatches(
+    files: &[(String, String)],
+    state: &CopyState,
+    hot: &Path,
+) -> Vec<String> {
+    let mut wrong = Vec::new();
+    for (file, sha) in files {
+        let expected = match state.ledger_text(file) {
+            Some(text) => replica::parse_manifest(text).ok().map(|f| f.sha256),
+            None => replica::sealed_manifest(hot, file)
+                .ok()
+                .flatten()
+                .map(|(_, f)| f.sha256),
+        };
+        if expected.as_deref() != Some(sha.as_str()) {
+            wrong.push(file.clone());
+        }
+    }
+    wrong
 }

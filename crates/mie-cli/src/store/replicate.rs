@@ -1202,7 +1202,9 @@ impl Pass<'_> {
             Some(archive) => hot_entries(&archive.paths.import_ledger),
             None => HotEntries::default(),
         };
-        self.report.problems.extend(problems);
+        self.report
+            .problems
+            .extend(problems.into_iter().map(super::repair_hot::with_remedy));
         let mut copied = 0usize;
         for path in &paths {
             copied += self.copy_file(path, &entries)?;

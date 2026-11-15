@@ -1,6 +1,10 @@
 # ADR-062: Raw-data retention and storage tiers
 
-- Status: accepted
+- Status: accepted; the intact-hot remedy that D11 leaves to #217 (H0,
+  RA5, R7) is decided by ADR-065, which supersedes R7's reason "preferring
+  the copies over hot's live journal is the guess step 5 rejects" where two
+  copies contradict hot over its whole length, and R7's agreement condition
+  where the agreeing copy contradicts hot past d
 - Date: 2026-11-05
 
 Relation to earlier ADRs: this ADR supersedes one point of ADR-034 D4:

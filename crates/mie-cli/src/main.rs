@@ -470,6 +470,36 @@ USAGE:
         `restored: …` or `not restored: …`, then PASS and exits 0, or one
         FAIL: <reason> line per problem and exits 1.
 
+    mie store repair-hot --config <path> [--archive-config <path>]
+                         --scope journal|import-ledger [--keep-hot-journal]
+        Repair hot's own journal or import-ledger files on an intact hot
+        from the copy targets (ADR-065), one scope per run. mie store repair
+        never rewrites hot, and mie store restore is for a lost hot only.
+        It takes the pass and verify locks and, for --scope journal, the
+        live writer lock (stop mie ingest first), for --scope import-ledger
+        the archive writer lock (the capture keeps running), all without
+        waiting. --scope journal replaces hot's journal by the copies only
+        where two copies of hot's full length agree against it at every
+        differing byte and the difference has no fork's shape, extends a
+        hot journal the copies are longer than, and otherwise stops, naming
+        both sides and the next step (mie store verify, then mie store
+        repair, for damaged copies; mie store replicate when hot is ahead).
+        --keep-hot-journal, for a fork or a state no copy can attribute,
+        keeps hot's journal and rebuilds every copy that is no prefix of it
+        from hot, moving the copies' bytes into .mie/damaged/<time>/.
+        --scope import-ledger writes hot's file from the copy targets when
+        hot's copy does not read, does not parse, lists a file with another
+        SHA-256 than the copy ledger (the test mie store repair applies) or
+        is missing, and exactly one good copy exists; a malformed .import
+        name on hot moves into the evidence directory. Every replaced file
+        is first linked to <file>.damaged-<time> (the journal) or
+        <import-ledger dir>.damaged-<time>/ beside it, never deleted, and a
+        difference it cannot attribute stops the run before any write. A
+        stopped or crashed run is completed by running it again. Prints the
+        witnesses and the decision, the import-ledger names it acts on and
+        the evidence, then `repaired: …` or `nothing written`, then PASS and
+        exits 0, or one FAIL: <reason> line per problem and exits 1.
+
     mie store resolve --config <path> [--archive-config <path>]
                       [--file <archive path> [--replace]]
         Resolve the held archive parts of a tiered raw store (ADR-062 D11)
@@ -1069,6 +1099,33 @@ fn dispatch(args: &[String]) -> Result<ExitCode, String> {
                 )?;
                 Ok(exit(pass))
             }
+            Some("repair-hot") => {
+                let options = Options::parse(
+                    &args[2..],
+                    &["--config", "--archive-config", "--scope"],
+                    &["--keep-hot-journal"],
+                )?;
+                let scope = store::repair_hot::Scope::parse(options.optional("--scope"))?;
+                let config =
+                    IngestConfig::load(&options.path("--config")?).map_err(|e| e.to_string())?;
+                let archive = options.optional("--archive-config").map(PathBuf::from);
+                let flags = store::repair_hot::Flags {
+                    keep_hot_journal: options.flag("--keep-hot-journal"),
+                };
+                let probe = store::device_probe()?;
+                let clock = SystemClock::new();
+                let now_ms = || clock.now_utc_ns().div_euclid(1_000_000);
+                let pass = store::repair_hot(
+                    &config,
+                    archive.as_deref(),
+                    scope,
+                    flags,
+                    probe.as_ref(),
+                    &now_ms,
+                    &mut std::io::stdout().lock(),
+                )?;
+                Ok(exit(pass))
+            }
             Some("resolve") => {
                 let options = Options::parse(
                     &args[2..],
@@ -1118,8 +1175,9 @@ fn dispatch(args: &[String]) -> Result<ExitCode, String> {
                  <path>] [--record-lost]`, `mie store rebuild --config <path> \
                  [--archive-config <path>] [--record-lost] [--record-unlisted] \
                  [--replace-hot-ledger]`, `mie store restore --config <path> \
-                 [--archive-config <path>] [--record-lost] [--skip-unreadable-journal]` or `mie \
-                 store resolve --config \
+                 [--archive-config <path>] [--record-lost] [--skip-unreadable-journal]`, `mie \
+                 store repair-hot --config <path> [--archive-config <path>] --scope \
+                 journal|import-ledger [--keep-hot-journal]` or `mie store resolve --config \
                  <path> [--archive-config <path>] [--file <archive path> [--replace]]`"
                     .to_owned(),
             ),

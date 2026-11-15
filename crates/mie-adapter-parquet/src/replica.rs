@@ -27,6 +27,12 @@
 //!   rebuild reads it (ADR-062 D7 step 5a, #211);
 //! - [`first_difference`], [`line_start`]: where a tail copy first differs
 //!   from hot's file, and where the line holding a byte starts;
+//!   [`difference_bounds`]: the first and the last byte where two files
+//!   differ (#217);
+//! - [`replace_with_evidence`]: the replace of one of hot's own small or
+//!   tail files (its journal, an import-ledger file) that keeps the old
+//!   bytes under an evidence name and never leaves hot without the file
+//!   (#217, ADR-065 D6);
 //! - [`try_verify_lock`]: the verification lock on hot (#192).
 //!
 //! Every primitive takes its source and destination explicitly, so the
@@ -1769,6 +1775,41 @@ pub fn first_difference(
     Ok(None)
 }
 
+/// The first and the last byte in `[0, len)` where the file `copy`
+/// differs from `source`, compared in bounded chunks as
+/// [`first_difference`] does; `None` when they agree. The caller makes sure
+/// both are at least `len` bytes long. The last byte matters to the hot
+/// repair (#217, ADR-065 D2): a difference that ends before every copy's
+/// end has two witnesses at every byte, one that runs into a copy's last
+/// line may not.
+///
+/// # Errors
+///
+/// A [`CopyError`] on [`Side::Destination`] when the copy cannot be read,
+/// on [`Side::Source`] when the source cannot.
+pub fn difference_bounds(
+    copy: &Path,
+    source: TailSource<'_>,
+    len: u64,
+) -> Result<Option<(u64, u64)>, CopyError> {
+    let mut file = File::open(copy).map_err(io_error("open", copy))?;
+    let mut bounds: Option<(u64, u64)> = None;
+    let mut offset = 0;
+    while offset < len {
+        let n = (len - offset).min(CHUNK as u64) as usize;
+        let mine = read_at(&mut file, copy, offset, n)?;
+        let theirs = source.read_at(offset, n)?;
+        let first = mine.iter().zip(&theirs).position(|(a, b)| a != b);
+        let last = mine.iter().zip(&theirs).rposition(|(a, b)| a != b);
+        if let (Some(first), Some(last)) = (first, last) {
+            let (first, last) = (offset + first as u64, offset + last as u64);
+            bounds = Some(bounds.map_or((first, last), |(d, _)| (d, last)));
+        }
+        offset += n as u64;
+    }
+    Ok(bounds)
+}
+
 /// Where the line holding byte `offset` of `source` starts: after the last
 /// `\n` before it, or 0.
 ///
@@ -1875,6 +1916,142 @@ pub fn rebuild_prefix(
     drop(file);
     rebuild_reached(RebuildStep::WriteTemp)?;
     rename_no_replace(&tmp, dest)?;
+    sync_dir(dir)?;
+    Ok(())
+}
+
+/// The steps of [`replace_with_evidence`]. The caller's hook runs after
+/// each one; an error from it stops the replace there, as a crash would
+/// (the hot repair's tests, #217).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplaceEvidenceStep {
+    /// `dest` is hard-linked to its evidence name.
+    Linked,
+    /// The new bytes are written to the temp name, fsynced and read back.
+    Temp,
+}
+
+/// Replaces `dest`, one of hot's own files (its journal, an import-ledger
+/// file), by the byte prefix `[0, upto)` of `source`, plus one `\n` with
+/// `newline`, and keeps the old bytes under `aside` (#217, ADR-065 D6):
+///
+/// 1. `dest` is hard-linked to `aside` ([`ReplaceEvidenceStep::Linked`]),
+///    the link refusing to replace, its directory created and fsynced: the
+///    evidence costs no copy, and a link reads no data, so it works on an
+///    unreadable file too;
+/// 2. the new bytes go to the temp name `.<name>.replace.tmp` beside `dest`
+///    (a stale one is removed first), are fsynced and read back
+///    ([`ReplaceEvidenceStep::Temp`]);
+/// 3. with `read_only` the temp file is made read-only (an import-ledger
+///    file is immutable);
+/// 4. it is renamed over `dest`, and the directory is fsynced.
+///
+/// A crash leaves the old file (perhaps with the link and the temp name,
+/// which the readers skip) or the new one, never no file: unlike
+/// [`rebuild_prefix`], which moves first, so a crash there leaves the copy
+/// absent, which is harmless on a copy target and not on hot (the next `mie
+/// ingest` would start a new journal). A re-run, with a new `aside`,
+/// completes it. `aside` must lie on `dest`'s filesystem.
+///
+/// # Errors
+///
+/// A [`CopyError`] on [`Side::Source`] when the source cannot be read (one
+/// shorter than `upto` included); on [`Side::Destination`] for a missing
+/// `dest` ([`RawStoreError::Invalid`]: nothing to replace, this never
+/// creates a file), an existing `aside` or a read-back mismatch
+/// ([`RawStoreError::Integrity`]: evidence is never overwritten), an error
+/// from `on_step`, and any I/O failure there.
+pub fn replace_with_evidence(
+    source: TailSource<'_>,
+    dest: &Path,
+    upto: u64,
+    newline: bool,
+    aside: &Path,
+    read_only: bool,
+    on_step: &mut dyn FnMut(ReplaceEvidenceStep) -> Result<(), RawStoreError>,
+) -> Result<(), CopyError> {
+    let dir = dest
+        .parent()
+        .ok_or_else(|| RawStoreError::Invalid(format!("{} has no directory", dest.display())))?;
+    let name = dest
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| RawStoreError::Invalid(format!("{} has no file name", dest.display())))?;
+    if !exists(dest)? {
+        return Err(RawStoreError::Invalid(format!(
+            "{} does not exist: there is nothing to replace, and the replace never creates a \
+             file",
+            dest.display()
+        ))
+        .into());
+    }
+    if exists(aside)? {
+        return Err(RawStoreError::Integrity(format!(
+            "{} exists: evidence is never overwritten",
+            aside.display()
+        ))
+        .into());
+    }
+    let aside_dir = aside
+        .parent()
+        .ok_or_else(|| RawStoreError::Invalid(format!("{} has no directory", aside.display())))?;
+    ensure_dir(aside_dir)?;
+    fs::hard_link(dest, aside).map_err(|error| {
+        if error.kind() == ErrorKind::AlreadyExists {
+            RawStoreError::Integrity(format!(
+                "{} exists: evidence is never overwritten",
+                aside.display()
+            ))
+        } else {
+            io_error("link", dest)(error)
+        }
+    })?;
+    sync_dir(aside_dir)?;
+    on_step(ReplaceEvidenceStep::Linked)?;
+
+    let tmp = dir.join(format!(".{name}.replace.tmp"));
+    remove_if_present(&tmp)?;
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .map_err(io_error("create", &tmp))?;
+    append_range(&mut file, &tmp, source, 0, upto)?;
+    if newline {
+        file.write_all(b"\n").map_err(io_error("write", &tmp))?;
+    }
+    file.sync_all().map_err(io_error("sync", &tmp))?;
+    let mut offset = 0;
+    while offset < upto {
+        let n = (upto - offset).min(CHUNK as u64) as usize;
+        if read_at(&mut file, &tmp, offset, n)? != source.read_at(offset, n)? {
+            drop(file);
+            remove_if_present(&tmp)?;
+            return Err(RawStoreError::Integrity(format!(
+                "{}: the new file read back differently from its source",
+                tmp.display()
+            ))
+            .into());
+        }
+        offset += n as u64;
+    }
+    let len = file.metadata().map_err(io_error("stat", &tmp))?.len();
+    if newline && (len != upto + 1 || read_at(&mut file, &tmp, upto, 1)? != b"\n") {
+        drop(file);
+        remove_if_present(&tmp)?;
+        return Err(RawStoreError::Integrity(format!(
+            "{}: the final line end read back differently",
+            tmp.display()
+        ))
+        .into());
+    }
+    drop(file);
+    on_step(ReplaceEvidenceStep::Temp)?;
+    if read_only {
+        mark_read_only(&tmp)?;
+    }
+    fs::rename(&tmp, dest).map_err(io_error("rename", &tmp))?;
     sync_dir(dir)?;
     Ok(())
 }

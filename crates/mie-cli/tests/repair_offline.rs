@@ -601,7 +601,7 @@ fn a_journal_copy_is_repaired_by_majority_and_refused_against_hot() {
                 "refused",
                 "byte 10",
                 "hot's journal is the suspect",
-                "#217",
+                "mie store repair-hot --scope journal",
             ],
         );
     }
@@ -609,6 +609,52 @@ fn a_journal_copy_is_repaired_by_majority_and_refused_against_hot() {
         assert_eq!(
             fs::read(cold(&fixture, root).join(".mie/journal/journal.jsonl")).unwrap(),
             before
+        );
+    }
+}
+
+/// X8 (ADR-065 D8): with cold-b damaged at byte 10 and hot at a byte x in
+/// a later line, cold-a agrees with hot over [0, 10] but contradicts it at
+/// x, so it vouches for nothing past 10: the repair moves nothing, cold-b's
+/// refusal names cold-a's difference and `mie store repair-hot`, and a
+/// second repair moves nothing either. Without X8, cold-b would be rebuilt
+/// and the closing pass would copy hot's damaged byte x into it.
+#[test]
+fn r7_a_copy_is_not_rebuilt_while_hot_is_contested_beyond_d() {
+    let (_dir, fixture) = adopted("repair-x8");
+    let copy = |root: &str| cold(&fixture, root).join(".mie/journal/journal.jsonl");
+    let hot = fs::read(&fixture.config.paths.journal).unwrap();
+    let x = hot.iter().position(|b| *b == b'\n').unwrap() + 10;
+    assert!(x < hot.len(), "the journal has a second line");
+    flip(&copy("cold-b"), 10);
+    flip(&fixture.config.paths.journal, x);
+    let before: Vec<Vec<u8>> = ["cold-a", "cold-b"]
+        .iter()
+        .map(|root| fs::read(copy(root)).unwrap())
+        .collect();
+    let (pass, out) = verify(&fixture, VERIFIED);
+    assert!(!pass, "{out}");
+    for (i, now) in [REPAIRED, REPAIRED + 1].into_iter().enumerate() {
+        let (pass, out) = repair(&fixture, now);
+        assert!(!pass, "{out}");
+        assert_fail_line(
+            &out,
+            &[
+                "cold-b",
+                "refused",
+                "byte 10",
+                &format!("cold-a) agrees with hot over [0, 10] but differs from it at byte {x}"),
+                "mie store repair-hot --scope journal",
+            ],
+        );
+        for (root, bytes) in ["cold-a", "cold-b"].iter().zip(&before) {
+            assert_eq!(&fs::read(copy(root)).unwrap(), bytes, "run {i}: {root}");
+        }
+        assert!(
+            !cold(&fixture, "cold-b")
+                .join(format!(".mie/damaged/{now}/.mie/journal"))
+                .exists(),
+            "run {i}"
         );
     }
 }
@@ -659,6 +705,7 @@ fn an_entry_copy_is_replaced_from_hot_unless_hot_cannot_vouch_for_it() {
             &name,
             "cold-a",
             "refused",
+            "mie store repair-hot --scope import-ledger",
             "entry conflict",
             "mie store resolve",
         ],

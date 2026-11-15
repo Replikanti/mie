@@ -12,6 +12,29 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
 
 ### Added
 
+- **Storage tiers: `mie store repair-hot` (#217, ADR-065).** Repairs hot's
+  own journal (`--scope journal`, with `mie ingest` stopped) or
+  import-ledger files (`--scope import-ledger`, beside a running capture)
+  on an intact hot from the copy targets, the case `mie store repair` and
+  `mie store restore` left open. The journal is replaced by the copies only
+  where two copies of hot's full length agree against it at every
+  differing byte and a fork guard finds no fork's shape; a hot journal the
+  copies are longer than is extended; every other state (damaged copies,
+  two faults, hot ahead of the copies, a fork, one copy against hot) stops
+  with nothing written, naming both sides and the next step.
+  `--keep-hot-journal` keeps hot's journal and rebuilds the copies that
+  are no prefix of it, for a fork or a state no copy can attribute. An
+  import-ledger file of hot's that does not read, does not parse, lists a
+  file with another SHA-256 than the copy ledger (R8's test, now shared)
+  or is missing is written from the single good copy on the targets; a
+  malformed `.import` name on hot moves into the evidence directory; with
+  no good copy anywhere the stop names the closure by hand. A replaced
+  file is first hard-linked to `<file>.damaged-<time>` (the journal) or
+  `<import-ledger dir>.damaged-<time>/`, never deleted, so a crash never
+  leaves hot without the file. The restore's, the repair's and resolve's
+  texts that pointed at #217 name the command. ADR-062's status line
+  points to ADR-065.
+
 - **ADR-062 accepted: the tiered model documented (#196, #184 T10).** The
   copy-ledger growth is now estimated from measured records (the #190
   adoption ledger and the #191 tiered capture): about 1.65 MB per day of
@@ -952,6 +975,14 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   (ADR-040 D4).
 
 ### Changed
+
+- **`mie store repair` R7: the agreeing copy must contradict hot nowhere
+  (#217, ADR-065 D8).** A journal copy is rebuilt only when another copy
+  equals hot over `[0, d]` and has no difference against hot over its
+  whole length, since the closing pass extends the rebuilt copy from hot
+  up to hot's end; before, with hot damaged past d and this copy at d, the
+  rebuild copied hot's damage into it. The refusal names the contested
+  copy and `mie store repair-hot --scope journal`.
 
 - **Import-ledger generations and current entries (#210, ADR-062 D11,
   proposed; ADR-034 D4 superseded at one point).** An import entry is

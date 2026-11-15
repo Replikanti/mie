@@ -1297,3 +1297,194 @@ fn list_temps_and_evidence_classify_every_name() {
     // Evidence is no temp name, and no temp name is evidence.
     assert_eq!(list_temps(root).unwrap(), temps);
 }
+
+/// The first and the last differing byte (#217): across chunks, at the
+/// first and the last byte, a single byte, and none.
+#[test]
+fn difference_bounds_first_last_and_none() {
+    let dir = TempDir::new("replica-bounds");
+    let path = dir.path().join("hot.jsonl");
+    // Longer than three chunks, so the bounds cross chunk borders.
+    let source: Vec<u8> = (0..400u32).map(|i| b'a' + (i % 26) as u8).collect();
+    let len = source.len() as u64;
+    let bounds = |copy: &[u8]| {
+        fs::write(&path, copy).unwrap();
+        difference_bounds(&path, TailSource::Bytes(&source), len).unwrap()
+    };
+    assert_eq!(bounds(&source), None);
+    assert_eq!(bounds(&flipped(&source, 10)), Some((10, 10)));
+    assert_eq!(bounds(&flipped(&flipped(&source, 0), 399)), Some((0, 399)));
+    assert_eq!(
+        bounds(&flipped(&flipped(&flipped(&source, 50), 200), 300)),
+        Some((50, 300))
+    );
+    // Only `[0, len)` counts.
+    fs::write(&path, flipped(&source, 399)).unwrap();
+    assert_eq!(
+        difference_bounds(&path, TailSource::Bytes(&source), 399).unwrap(),
+        None
+    );
+    // A missing copy is the destination's side, a short source the source's.
+    let error =
+        difference_bounds(&dir.path().join("absent"), TailSource::Bytes(&source), len).unwrap_err();
+    assert_eq!(error.side, Side::Destination);
+    fs::write(&path, &source).unwrap();
+    let error = difference_bounds(&path, TailSource::Bytes(&source[..10]), len).unwrap_err();
+    assert_eq!(error.side, Side::Source);
+}
+
+/// The replace of one of hot's files (#217, ADR-065 D6) across a crash
+/// after either step: the old file or the new one is always there, the
+/// evidence holds the old bytes, and a re-run with a new evidence name
+/// completes it.
+#[test]
+fn replace_with_evidence_crash_after_each_step() {
+    let dir = TempDir::new("replica-replace");
+    let dest = dir.path().join("journal.jsonl");
+    let old = b"{\"a\":1}\n{\"b\":2X}\n".to_vec();
+    let new = b"{\"a\":1}\n{\"b\":22}".to_vec();
+    let tmp = dir.path().join(".journal.jsonl.replace.tmp");
+    for (i, step) in [
+        Some(ReplaceEvidenceStep::Linked),
+        Some(ReplaceEvidenceStep::Temp),
+        None,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        fs::write(&dest, &old).unwrap();
+        let aside = dir.path().join(format!("journal.jsonl.damaged-{i}"));
+        let result = replace_with_evidence(
+            TailSource::Bytes(&new),
+            &dest,
+            new.len() as u64,
+            true,
+            &aside,
+            false,
+            &mut |reached| {
+                if Some(reached) == step {
+                    Err(RawStoreError::Io(format!(
+                        "simulated crash after {reached:?}"
+                    )))
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        // The evidence holds the old bytes in every case.
+        assert_eq!(fs::read(&aside).unwrap(), old, "{step:?}");
+        if step.is_some() {
+            assert!(result.is_err(), "{step:?}");
+            // Hot still holds its file: the old one.
+            assert_eq!(fs::read(&dest).unwrap(), old, "{step:?}");
+            let again = dir.path().join(format!("journal.jsonl.damaged-{i}-again"));
+            replace_with_evidence(
+                TailSource::Bytes(&new),
+                &dest,
+                new.len() as u64,
+                true,
+                &again,
+                false,
+                &mut |_| Ok(()),
+            )
+            .unwrap();
+            assert_eq!(fs::read(&again).unwrap(), old, "{step:?}");
+        } else {
+            result.unwrap();
+        }
+        let mut expected = new.clone();
+        expected.push(b'\n');
+        assert_eq!(fs::read(&dest).unwrap(), expected, "{step:?}");
+        assert!(!tmp.exists(), "{step:?}");
+        // A link, not a copy: the evidence is the old inode, linked once
+        // more by the re-run after a crash.
+        use std::os::unix::fs::MetadataExt;
+        let links = if step.is_some() { 2 } else { 1 };
+        assert_eq!(fs::metadata(&aside).unwrap().nlink(), links, "{step:?}");
+    }
+}
+
+/// An existing evidence name is refused before anything is written.
+#[test]
+fn replace_with_evidence_refuses_an_existing_aside() {
+    let dir = TempDir::new("replica-replace-aside");
+    let dest = dir.path().join("journal.jsonl");
+    fs::write(&dest, b"old\n").unwrap();
+    let aside = dir.path().join("journal.jsonl.damaged-1");
+    fs::write(&aside, b"earlier evidence\n").unwrap();
+    let before = snapshot(dir.path());
+    let error = replace_with_evidence(
+        TailSource::Bytes(b"new\n"),
+        &dest,
+        4,
+        false,
+        &aside,
+        false,
+        &mut |_| Ok(()),
+    )
+    .unwrap_err();
+    assert_eq!(error.side, Side::Destination);
+    assert!(
+        matches!(error.error, RawStoreError::Integrity(_)),
+        "{error}"
+    );
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+/// An import-ledger file ends read-only, an unreadable one is linked aside
+/// all the same, a missing `dest` is refused (the replace never creates a
+/// file), and a short source writes nothing over `dest`.
+#[test]
+fn replace_with_evidence_read_only_and_missing_dest() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new("replica-replace-ro");
+    let dest = dir.path().join("ledger/aggTrades/F.zip.import");
+    fs::create_dir_all(dest.parent().unwrap()).unwrap();
+    fs::write(&dest, b"rotten\n").unwrap();
+    fs::set_permissions(&dest, fs::Permissions::from_mode(0o000)).unwrap();
+    let aside = dir.path().join("ledger.damaged-7/aggTrades/F.zip.import");
+    let good = b"mie-archive-import 1\n".to_vec();
+    replace_with_evidence(
+        TailSource::Bytes(&good),
+        &dest,
+        good.len() as u64,
+        false,
+        &aside,
+        true,
+        &mut |_| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(fs::read(&dest).unwrap(), good);
+    assert!(fs::metadata(&dest).unwrap().permissions().readonly());
+    fs::set_permissions(&aside, fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(fs::read(&aside).unwrap(), b"rotten\n");
+
+    let missing = dir.path().join("ledger/aggTrades/G.zip.import");
+    let error = replace_with_evidence(
+        TailSource::Bytes(&good),
+        &missing,
+        good.len() as u64,
+        false,
+        &dir.path().join("ledger.damaged-8/aggTrades/G.zip.import"),
+        true,
+        &mut |_| Ok(()),
+    )
+    .unwrap_err();
+    assert!(matches!(error.error, RawStoreError::Invalid(_)), "{error}");
+    assert!(!missing.exists());
+    assert!(!dir.path().join("ledger.damaged-8").exists());
+
+    let before = fs::read(&dest).unwrap();
+    let error = replace_with_evidence(
+        TailSource::Bytes(&good[..3]),
+        &dest,
+        good.len() as u64,
+        false,
+        &dir.path().join("ledger.damaged-9/aggTrades/F.zip.import"),
+        true,
+        &mut |_| Ok(()),
+    )
+    .unwrap_err();
+    assert_eq!(error.side, Side::Source);
+    assert_eq!(fs::read(&dest).unwrap(), before);
+}
