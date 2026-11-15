@@ -21,11 +21,16 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   differing byte and a fork guard finds no fork's shape (a torn line glued
   to the next run's anywhere in the differing region); a hot journal the
   copies are longer than is extended, and ended with its `\n` also when an
-  earlier run's extension stopped before it; every other state (damaged copies,
+  earlier run's extension stopped before it; so is one that is behind
+  while a copy is damaged, where hot holds a strict majority at every byte
+  it holds: it takes the bytes past its end that every copy holding them
+  agrees on, and the damaged copy is named for `mie store repair`; every
+  other state (damaged copies,
   two faults, hot ahead of the copies, a fork, one copy against hot) stops
   with nothing written, naming both sides and the next step.
   `--keep-hot-journal` keeps hot's journal and rebuilds the copies that
-  are no prefix of it, for a fork or a state no copy can attribute. An
+  are no prefix of it, for a fork or a state no copy can attribute; every
+  stop that offers it names the copy bytes it would drop. An
   import-ledger file of hot's that does not read, does not parse, lists a
   file with another SHA-256 than the copy ledger (R8's test, now shared)
   or is missing is written from the single good copy on the targets; a
@@ -998,7 +1003,24 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   (`run_end`, the final pass's `replication`); `mie store repair-hot
   --scope journal` and `mie store restore` take it without waiting, so
   neither writes the journal under a capture that is shutting down, after
-  the source's writer lock is already released.
+  the source's writer lock is already released. `mie ingest` now refuses
+  to start when the lock file cannot be created (the journal's directory
+  is not writable) or is held, also by a second `mie ingest` of another
+  source that shares `paths.journal` (intended: two writers appending to
+  one file can interleave a line). A filesystem without `flock` support,
+  such as some NFS setups, fails the same way (not run).
+
+- **The replication pass guard (#217, ADR-065 D9).** A pass no longer
+  extends a journal copy over a byte that a longer copy holds differently
+  from hot: the copy stops before that byte's line, and the pass names the
+  byte, both sides and the next step (`mie store verify`, `mie store
+  repair`, then `mie store repair-hot --scope journal` where the repair
+  refuses). Before, a lagging copy took hot's damaged byte from hot, and
+  the next repair counted it as a second witness and rebuilt the last good
+  copy with the damage. Copies of one length compare nothing; a lagging
+  copy reads its overlap with each longer copy twice, a new target about
+  twice the journal once. A damaged copy holds a healthy lagging one back
+  until it is healed.
 
 - **Import-ledger generations and current entries (#210, ADR-062 D11,
   proposed; ADR-034 D4 superseded at one point).** An import entry is

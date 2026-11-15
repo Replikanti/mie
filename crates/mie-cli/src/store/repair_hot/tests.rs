@@ -107,8 +107,13 @@ fn facts_of(hot: Option<&[u8]>, copies: &[&[u8]], k: usize) -> JournalFacts {
         cut: false,
         fork: false,
         copy_targets: k,
+        behind: None,
     };
-    if !facts.copies_agree() || copies.is_empty() {
+    if !facts.copies_agree() {
+        facts.behind = behind_of(hot, copies);
+        return facts;
+    }
+    if copies.is_empty() {
         return facts;
     }
     let longest = copies.iter().map(|c| c.len()).max().unwrap_or(0);
@@ -128,6 +133,31 @@ fn facts_of(hot: Option<&[u8]>, copies: &[&[u8]], k: usize) -> JournalFacts {
         facts.fork = fork_of(hot_bytes, c_bytes, d, e);
     }
     facts
+}
+
+/// [`BehindFacts`] over in-memory journals, as the run reads them where the
+/// copies differ: `None` without a copy longer than hot or where hot holds
+/// no strict majority at some byte below L_h.
+fn behind_of(hot: Option<&[u8]>, copies: &[&[u8]]) -> Option<BehindFacts> {
+    let hot = hot?;
+    // The first of the longest, as the run picks it.
+    let longest = copies.iter().copied().rev().max_by_key(|c| c.len())?;
+    if longest.len() <= hot.len() {
+        return None;
+    }
+    let below: Vec<&[u8]> = copies
+        .iter()
+        .map(|c| &c[..c.len().min(hot.len())])
+        .collect();
+    if replica::first_contested(hot, &below, 0).is_some() {
+        return None;
+    }
+    let disagree = replica::first_disagreement(copies, hot.len() as u64);
+    Some(behind_facts(
+        hot.len() as u64,
+        &longest[hot.len()..],
+        disagree,
+    ))
 }
 
 /// X2a over in-memory journals, hot's lines read one at a time from s.
@@ -193,6 +223,7 @@ fn numbers(hot_len: u64, lens: &[u64], bounds: Option<(u64, u64)>, lls: u64) -> 
         cut: false,
         fork: false,
         copy_targets: lens.len().max(2),
+        behind: None,
     }
 }
 
@@ -336,8 +367,10 @@ fn x2_copies_differ_splits_copy_damaged_and_two_fault() {
         decide(Some(&hot), &[&a, &b]),
         JournalDecision::TwoFault { group: None }
     );
-    // Hot 800, a prefix of cold-a; cold-b differs from cold-a at 900.
-    let late = flipped(&a, &[900]);
+    // Hot 800, a prefix of cold-a; cold-b differs from cold-a at 850,
+    // inside the first line past hot's end: nothing past L_h is agreed as
+    // a line, so one copy stands against the other there.
+    let late = flipped(&a, &[850]);
     assert_eq!(
         decide(Some(&a[..800]), &[&a, &late]),
         JournalDecision::TwoFault { group: None }
@@ -384,6 +417,97 @@ fn x2_copy_damaged_is_r7s_majority_rule() {
     assert!(facts.witnesses.iter().all(|w| w.r7_refuses));
 }
 
+/// Hot *behind* with the copies differing (ADR-065 D2, review of #226
+/// round 2, finding 2). Hot lost its last 200 bytes; cold-a has a bit
+/// flipped at 10, cold-b is the true journal. Hot holds two of three at
+/// 10, and past L_h both copies agree: *behind-copy-damaged* up to the
+/// copies' end, never a stop that offers `--keep-hot-journal` (which would
+/// drop the 200 bytes both copies hold). With cold-b also cut at 900, the
+/// bytes past it are cold-a's alone, one witness, as *behind* accepts.
+/// The copies disagreeing past L_h end the extension at that line's start
+/// (900 for a flip at 950); at 850, inside the first line past L_h,
+/// nothing is agreed as a line: *two-fault*. Hot contradicted below L_h
+/// (its own flip at 300, where both copies agree against it) or a tie
+/// there (only hot and cold-a hold byte 300) is no *behind*: *two-fault*.
+#[test]
+fn x2_behind_with_a_copy_fault_takes_the_agreed_tail() {
+    let good = records("A", 1000);
+    let hot = &good[..800];
+    let cold_a = flipped(&good, &[10]);
+    let decided = |hot: &[u8], copies: &[&[u8]]| {
+        let facts = facts_of(Some(hot), copies, 2);
+        (decide_journal(&facts), facts.behind)
+    };
+    assert_eq!(
+        decided(hot, &[&cold_a, &good]),
+        (
+            JournalDecision::BehindCopyDamaged,
+            Some(BehindFacts {
+                reach: 1000,
+                disagree: None,
+                cut: false
+            })
+        )
+    );
+    assert_eq!(
+        decided(hot, &[&good, &cold_a]).0,
+        JournalDecision::BehindCopyDamaged
+    );
+    assert_eq!(
+        decided(hot, &[&cold_a, &good[..900]]),
+        (
+            JournalDecision::BehindCopyDamaged,
+            Some(BehindFacts {
+                reach: 1000,
+                disagree: None,
+                cut: false
+            })
+        )
+    );
+    // A copy that ends inside a line: the extension gets its `\n`.
+    let mut cut = good.clone();
+    cut.extend_from_slice(b"{\"type\":");
+    assert_eq!(
+        decided(hot, &[&cold_a, &cut]).1,
+        Some(BehindFacts {
+            reach: 1008,
+            disagree: None,
+            cut: true
+        })
+    );
+    assert_eq!(
+        decided(hot, &[&cold_a, &flipped(&good, &[950])]),
+        (
+            JournalDecision::BehindCopyDamaged,
+            Some(BehindFacts {
+                reach: 900,
+                disagree: Some(950),
+                cut: false
+            })
+        )
+    );
+    assert_eq!(
+        decided(hot, &[&cold_a, &flipped(&good, &[850])]).0,
+        JournalDecision::TwoFault { group: None }
+    );
+    let rotten = flipped(&good[..800], &[300]);
+    assert_eq!(
+        decided(&rotten, &[&cold_a, &good]),
+        (JournalDecision::TwoFault { group: None }, None)
+    );
+    assert_eq!(
+        decided(&rotten, &[&flipped(&good[..400], &[10]), &good[..200]]).1,
+        None,
+        "no copy longer than hot"
+    );
+    let tie = [&flipped(&good, &[10])[..], &good[..250]];
+    assert_eq!(
+        decided(&rotten, &tie),
+        (JournalDecision::TwoFault { group: None }, None)
+    );
+    assert!(!JournalDecision::BehindCopyDamaged.keeps_hot());
+}
+
 /// A finished extension whose `\n` did not land leaves hot equal to C,
 /// which ends inside a line (review of #226, finding 5): *behind*, so the
 /// re-run writes the `\n`. Equal and whole is *agree*.
@@ -403,6 +527,7 @@ fn x3_the_states_the_flag_acts_on() {
     for decision in [
         JournalDecision::Agree,
         JournalDecision::Behind,
+        JournalDecision::BehindCopyDamaged,
         JournalDecision::Damaged,
         JournalDecision::HotAhead,
     ] {

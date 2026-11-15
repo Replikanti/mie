@@ -1585,6 +1585,102 @@ fn first_contested_needs_a_strict_majority_for_hot() {
     assert_eq!(error.side, Side::Source, "{error}");
 }
 
+/// The bounded forms (ADR-065 D2, D9; review of #226 round 2): a
+/// difference is looked for in `[from, to)` only, a contest below `until`
+/// only, and a disagreement between witnesses is a byte two of them that
+/// hold it hold differently (hot takes no part). The file forms agree with
+/// the in-memory ones across chunk boundaries (97 bytes under test).
+#[test]
+fn the_bounded_difference_contest_and_disagreement() {
+    let hot: Vec<u8> = (0..300u32).map(|i| b'a' + (i % 26) as u8).collect();
+    let dir = TempDir::new("replica-bounded");
+    let write = |name: &str, bytes: &[u8]| {
+        let path = dir.path().join(name);
+        fs::write(&path, bytes).unwrap();
+        path
+    };
+    let hot_path = write("hot", &hot);
+    let b10_250 = flipped(&flipped(&hot, 10), 250);
+    let b10_250_path = write("b10-250", &b10_250);
+    let source = TailSource::File(&hot_path);
+    assert_eq!(
+        first_difference_in(&b10_250_path, source, 0, 300).unwrap(),
+        Some(10)
+    );
+    assert_eq!(
+        first_difference_in(&b10_250_path, source, 11, 300).unwrap(),
+        Some(250)
+    );
+    assert_eq!(
+        first_difference_in(&b10_250_path, source, 11, 250).unwrap(),
+        None,
+        "`to` is exclusive"
+    );
+    assert_eq!(
+        first_difference_in(&b10_250_path, source, 300, 300).unwrap(),
+        None,
+        "an empty range reads nothing"
+    );
+
+    // Hot 200 bytes long under two copies of 300: the bytes past its end
+    // are contested, the ones below are not.
+    let short_path = write("short", &hot[..200]);
+    let b10_path = write("b10", &flipped(&hot, 10));
+    let full_path = write("full", &hot);
+    let copies = [b10_path.as_path(), full_path.as_path()];
+    assert_eq!(
+        first_contested_file(&short_path, &copies, 0)
+            .unwrap()
+            .map(|c| c.at),
+        Some(200)
+    );
+    for until in [97, 194, 200] {
+        assert_eq!(
+            first_contested_file_before(&short_path, &copies, 0, until).unwrap(),
+            None,
+            "until {until}"
+        );
+    }
+    assert_eq!(
+        first_contested_file_before(&short_path, &copies, 0, 201)
+            .unwrap()
+            .map(|c| c.at),
+        Some(200)
+    );
+
+    let b250 = flipped(&hot, 250);
+    // (witnesses, from, the first disagreement)
+    type Case<'a> = (&'a [&'a [u8]], u64, Option<u64>);
+    let cases: [Case; 6] = [
+        (&[&hot, &hot], 0, None),
+        (&[&hot, &b250], 0, Some(250)),
+        (&[&hot, &b250], 251, None),
+        (&[&hot[..260], &b250], 0, Some(250)),
+        (&[&hot[..100], &b250], 0, None),
+        (&[&b250], 0, None),
+    ];
+    for (n, (witnesses, from, expected)) in cases.iter().enumerate() {
+        assert_eq!(first_disagreement(witnesses, *from), *expected, "case {n}");
+        let paths: Vec<PathBuf> = witnesses
+            .iter()
+            .enumerate()
+            .map(|(w, bytes)| write(&format!("d{n}-{w}"), bytes))
+            .collect();
+        let mut refs: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
+        let absent = dir.path().join("absent");
+        refs.push(&absent);
+        for from in [*from, from + 96, from + 97] {
+            assert_eq!(
+                first_disagreement_file(&refs, from).unwrap(),
+                first_disagreement(witnesses, from),
+                "case {n} from {from}"
+            );
+        }
+    }
+    let error = first_disagreement_file(&[dir.path()], 0).unwrap_err();
+    assert_eq!(error.side, Side::Destination, "{error}");
+}
+
 /// The journal lock (review of #226, finding 3): one holder at a time,
 /// free after its drop, beside the file a link names, and its directory
 /// created when absent.

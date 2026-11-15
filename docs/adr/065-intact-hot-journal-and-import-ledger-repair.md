@@ -19,7 +19,9 @@ decisions record the #217 plan
 (<https://github.com/Replikanti/mie/issues/217#issuecomment-6882706224>)
 and its STOP 1 operator decisions (2026-11-14/15); D1's journal lock, D2's
 *behind* completion, D3's later glued lines and D8's majority rule come
-from the adversarial review of #226 (round 1).
+from the adversarial review of #226 (round 1); D2's *behind-copy-damaged*,
+D4's named drops and D9's pass guard from its round 2, approved by the
+operator at STOP 2 (2026-11-15).
 
 ## Context
 
@@ -157,6 +159,28 @@ lls(C) is the start of C's last complete line, the region a pass compares.
   makes the next `run_start` a line of its own, and `read_runs` skips the
   cut line either way. A hot that holds a cut line past every copy's end
   (L_h > L_C) stays *agree*: that is the capture's own torn line, #225.
+- **behind-copy-damaged:** the copies differ, every copy reads, some copy
+  is longer than hot, and hot holds a strict majority at every byte below
+  L_h (D8's rule, `first_contested_file` bounded to `[0, L_h)`). Hot is
+  extended over the bytes past L_h that every copy holding them agrees on
+  (`first_disagreement_file`): to the longest copy's end, with one `\n`
+  when it ends inside a line; or, where two copies hold different bytes at
+  a byte q past L_h, to the start of q's line, and q is a problem naming
+  every copy's byte there. One witness suffices past L_h, as in *behind*.
+  The copies that differ from hot below L_h are copy damage, each named
+  for `mie store verify` and `mie store repair`, whose R7 then rebuilds it
+  from the extended hot. When q's line starts at or before L_h nothing is
+  agreed as a line, and the state is *two-fault*. Why (review of #226
+  round 2, finding 2): hot that lost its last line at a power loss after a
+  pass copied it (the state *behind* exists for) plus one bit flip on a
+  copy are two faults that the byte-wise majority attributes completely:
+  below L_h, hot and the intact copy outvote the flipped one; past L_h,
+  every copy agrees. Before, R7 refused both copies at L_h (a copy longer
+  than hot gets d = L_h, so it never weighed the flip), this command
+  decided *two-fault*, and the only remedy it named, `--keep-hot-journal`,
+  would have dropped the 356 bytes both copies hold. Why q's line start:
+  `read_runs` uses no part of a line, so the bytes of a line the copies
+  hold differently are contested as a line.
 - **damaged:** a difference, L_C = L_h, e < L_2, and no fork shape (D3).
   Hot's journal is replaced by C. Every byte where hot differs then has two
   independent witnesses that agree against it.
@@ -215,6 +239,12 @@ and 500 is *behind*; hot 1 200 against copies 1 000 with lls(C) = 900 is
 cold-a damaged at 110 and cold-b at 10 is *copy-damaged* (two of three
 for hot at every byte); hot damaged at 110, cold-b at 10 and cold-a only
 100 bytes long is *two-fault* (at 110 only hot and cold-b hold a byte).
+Hot 800 under copies of 1 000 with cold-a damaged at 10 is
+*behind-copy-damaged*, extended to 1 000; with cold-b also damaged at 950
+the extension stops at 900, the start of 950's line, and names 950; with
+cold-b damaged at 850, inside the first line past hot's end, it is
+*two-fault*; hot damaged at 300 as well is *two-fault* (both copies
+against hot at 300).
 
 ### D3. The fork guard
 
@@ -295,6 +325,18 @@ extends it. Hot is not written. Why a flag (STOP 1 decision 4): as with
 `--skip-unreadable-journal`, a permanent state must not leave the operator
 without a mie command, and no journal line leaves the journal unless a
 human asks. The copies' bytes stay in `.mie/damaged/`.
+
+Every stop that offers the flag names what it drops (review of #226 round
+2): per copy it rebuilds, the bytes from the start of hot's line that
+holds the copy's first difference to the copy's end. It is never offered
+where the copies agree on complete lines past hot's end and hot holds a
+strict majority at every byte it holds: that state is
+*behind-copy-damaged*, which appends those lines, and the flag is refused
+there. Where hot's own bytes are contradicted or tied (a fork, hot's
+damage, one copy against hot, copies that disagree inside the first line
+past hot's end), it stays the operator's explicit choice, also when two
+copies agree on bytes it drops: in a fork both sides hold live lines, and
+without the flag the state would have no mie command at all.
 
 ### D5. The import-ledger test
 
@@ -438,18 +480,78 @@ cannot be attributed without a hash chain (ADR-062 D11 R7), and two
 against two at k ≥ 3 is the same tie. Why bytes before u do not count:
 copy i equals hot there, so the rebuild writes its own bytes back.
 
-What it cannot see: a copy shorter than a contested byte is a byte prefix
-of hot, so every pass extends it from hot, the repair's closing pass
-included; the pass compares only a copy's last line (ADR-062 D11). In the
-too-weak case above, R7 now refuses cold-b, but the closing pass extends
-cold-a over x with hot's damaged byte, and the next `mie store repair`
-then counts cold-a's copy of that byte as a second witness for hot and
-rebuilds cold-b with it (a probe run of #226, review round 1). Bytes a
-pass copied from hot are no independent witness of hot, and no byte
-comparison can tell them from bytes copied before the damage; closing
-this needs a pass that refuses to extend a copy over a byte another copy
-contradicts, a change to the replication path that this ADR does not
-make, or #224's per-line integrity field.
+What it could not see without D9: a copy shorter than a contested byte is
+a byte prefix of hot, so every pass extended it from hot, the repair's
+closing pass included, since the pass compares only a copy's last line
+(ADR-062 D11). In the too-weak case above, R7 refused cold-b, but the
+closing pass extended cold-a over x with hot's damaged byte, and the next
+`mie store repair` counted cold-a's copy of that byte as a second witness
+for hot and rebuilt cold-b with it (probe runs of #226, review rounds 1
+and 2; the same sequence on main before #217). Bytes a pass copied from
+hot are no independent witness of hot, and no byte comparison can tell
+them from bytes copied before the damage. D9 keeps the pass from writing
+them over a contradiction.
+
+### D9. The pass guard
+
+Every pass extends the journal copies in one place, `Pass::copy_journal_tail`:
+`mie store replicate`, the capture's replication thread, the repair's
+closing pass and the adoption's pass. Before it extends copy i from its
+length L_i to `end`, it compares hot's bytes `[L_i, min(L_j, end))` with
+every other copy j of the pass's targets that is longer than copy i, each
+at its length from before the pass extended any copy. At the first byte p
+where some copy j holds another byte than hot, copy i is extended only to
+the start of hot's line that holds p (never below L_i: a copy that ends
+inside that line is only compared), and the pass reports a problem naming
+p, hot's byte, copy j's root, path and byte, and the next step: `mie store
+verify`, then `mie store repair`, whose R7 rebuilds copy j where hot holds
+a strict majority at p; where R7 refuses, one against one, `mie store
+repair-hot --scope journal` with `mie ingest` stopped, which stops naming
+both sides. A copy j that cannot be read is named and not counted.
+
+Why (review of #226 round 2, finding 1; operator decision at STOP 2): with
+hot bit-rotted at x while cold-a lagged below x and cold-b held the true
+byte, each step doing what the previous one named ended with hot's damage
+in cold-b: repair-hot stopped *one-witness*, the repair's closing pass (or
+any capture pass) extended cold-a over x, repair-hot then decided
+*copy-damaged*, and the next repair rebuilt cold-b from hot. With the
+guard, cold-a stays before x's line, the state stays one against one, R7
+refuses cold-b and repair-hot stops *one-witness* again, and the only
+command that writes hot's byte into cold-b is `--keep-hot-journal`, the
+operator's explicit choice (D4), whose stop names the bytes it drops.
+Rejected: a guard in R7 alone (the closing pass is not the only pass; the
+capture's thread extends the copy just the same), and comparing every copy
+over its whole length on every pass (L per copy and pass, for bytes a pass
+never writes).
+
+Why lengths from before the pass and only longer copies: a copy extended
+earlier in the same pass holds hot's bytes, no witness, and comparing with
+it would read the extension twice for nothing; bytes below L_i are not
+written. Why the line start: the copy stays a byte prefix of hot that ends
+at a line end, the shape a pass leaves, and the next pass compares its
+last line.
+
+Cost: at equal lengths, the steady state in which every pass extends all
+copies from one length, nothing is compared and nothing is read (pinned by
+a test counter). A lagging copy reads hot's and each longer copy's bytes
+over their overlap, 2× the overlap per longer copy, on every pass while it
+lags. A new or replaced target (L_i = 0) reads about 2·L once at k = 2,
+on the pass that copies its L bytes anyway: after a year 3.8–11 GB, about
+25–73 s at the assumed 150 MB/s, with the capture running.
+
+Side effect: a damaged copy j holds a healthy lagging copy i back until j
+is healed, reported on every pass. At k ≥ 3, R7 heals j when a third copy
+covers p. At the operator's k = 2 only hot and j hold p, so R7 refuses and
+repair-hot stops *one-witness*: the operator decides with
+`--keep-hot-journal`, which rebuilds j from hot. The guard errs toward
+stopping, as D3 does.
+
+What it cannot see: a copy the pass does not compare, on a target that
+lost its marker (skipped, R0), was stopped in the pass, or does not read.
+A lagging copy extended while the only contradicting copy is unmounted
+takes hot's byte, and once that mount returns, the next repair counts it.
+Holding every copy back while a target is missing would stop replication
+exactly when one disk is lost, the case k = 2 exists for.
 
 ## Consequences
 
@@ -464,8 +566,19 @@ make, or #224's per-line integrity field.
   5·L = 9.5–27.5 GB takes about 1.1–3.1 min of `mie ingest` downtime per
   year of journal age, and 6·L = 11.4–33.0 GB about 1.3–3.7 min. A slower
   disk scales these linearly; correctness does not depend on them.
+- **Downtime where the copies differ.** Every stop or decision there first
+  compares each witness with hot and with each other witness, then runs
+  `first_contested_file` (hot and all k copies) once per witness that is no
+  byte prefix of hot: about k·(k+1)·L reads, 6·L at k = 2, 11.4–33.0 GB
+  after a year, about 1.3–3.7 min of `mie ingest` downtime at the assumed
+  150 MB/s (review of #226 round 2). *behind-copy-damaged* adds one bounded
+  `first_contested_file` below L_h ((k+1)·L_h), the disagreement scan past
+  L_h, and reads hot into memory (L_h): about 10·L at k = 2 in all,
+  19–55 GB, about 2.1–6.1 min per year of journal age.
 - **Memory:** up to L_C, 5.5 GB at the busiest M1-11 rate after a year,
   the bound the restore and the rebuild already accept; D3 adds one line.
+  *behind-copy-damaged* holds hot's journal and the longest copy's bytes
+  past it, up to L in all.
 - **The import-ledger scope** reads about 2.25 MB (ADR-062 M1-15) and never
   stops the capture.
 - **D8** reads hot and every copy over `[u, max length)` once per rebuilt
@@ -487,16 +600,36 @@ make, or #224's per-line integrity field.
 - **The journal lock** is one more file beside the journal,
   `<journal>.lock`, created by the first `mie ingest` after this change;
   nothing reads its bytes. A `mie ingest` refuses to start while this
-  command or the restore holds it, as it refuses on the source's lock.
+  command or the restore holds it, as it refuses on the source's lock. It
+  also refuses to start when the lock file cannot be created (a journal
+  directory without write permission, though the journal file itself is
+  writable) or is held by another `mie ingest` that shares `paths.journal`
+  (another `instrument.source`, which `read_runs`' per-source filter
+  allows). The second refusal is intended: two `BufWriter`s appending to
+  one file can interleave a line longer than their buffer. A filesystem
+  without `flock` support (some NFS setups) fails the same way, with the
+  lock's error (reasoned from `flock(2)`, not run). Each refusal names the
+  lock file and its error (review of #226 round 2, finding 3).
+- **The pass guard (D9)** reports a lagging copy held back by a copy that
+  contradicts hot on every pass until the repair or this command settles
+  it; at equal lengths it reads nothing.
 - **Two-fault residuals, each closed:** (1) k ≥ 3 with two copies agreeing
   against hot and a third damaged differently is unreachable at the
   operator's k = 2 (it needs three copy targets); if k is raised, the
-  *two-fault* stop names the reduced configuration, and D8 keeps `mie store
-  repair` from copying hot's damage meanwhile, short of D8's *What it
-  cannot see*. (2) Damage inside the
-  copies' last line with hot longer is *diverged*, closed by
+  *two-fault* stop names the reduced configuration, and D8 with D9 keeps
+  `mie store repair` from copying hot's damage meanwhile, short of D9's
+  *What it cannot see*. (2) Damage inside the copies' last line with hot longer is *diverged*, closed by
   `--keep-hot-journal`. (3) An import-ledger file bad everywhere: the
-  closure by hand of D5.
+  closure by hand of D5. (4) Hot behind (its last line lost) plus one copy
+  fault: *behind-copy-damaged* extends hot from the copies, then `mie store
+  verify` and `mie store repair` rebuild the damaged copy from it; all
+  three journals end equal and true
+  (`behind_hot_plus_one_copy_fault_extends_hot_and_the_repair_heals_the_copy`).
+  (5) Hot damaged while a copy lags below the damage: D9 keeps the lagging
+  copy from vouching for hot's byte, so the state stays *one-witness*,
+  closed by `--keep-hot-journal` as the operator's explicit choice, whose
+  stop names the bytes it drops
+  (`guard_hot_damage_never_reaches_the_good_copy_through_a_lagging_copy`).
 - **Relation to #224.** The per-line integrity field #224 plans is the
   stronger remedy: a line that carries its own check identifies its damage
   without a vote. D2 and D3 remain the fallback for every line written
@@ -525,10 +658,12 @@ make, or #224's per-line integrity field.
 
 ## Accept when
 
-Every item is an offline test the PR's CI runs, and the command changes
-no removal or replication path; the capture changes only by taking the
-journal lock at its journal's open, a refusal the offline tests cover. So
-the status is `accepted` at merge:
+Every item is an offline test the PR's CI runs. The command changes no
+removal path; the replication path changes only by D9's guard, which
+writes nothing new (it stops an extension earlier) and reads nothing at
+equal lengths; the capture changes by taking the journal lock at its
+journal's open, a refusal the offline tests cover. So the status is
+`accepted` at merge:
 
 - AC1: hot's journal in R7's suspect state is restored by `--scope
   journal`, byte-identical to both copies, the flipped file kept as
@@ -544,10 +679,19 @@ the status is `accepted` at merge:
 - D8: `r7_a_copy_is_not_rebuilt_while_hot_is_contested_beyond_d`,
   `r7_a_byte_only_hot_and_the_copy_hold_is_contested`,
   `r7_two_copy_faults_on_an_intact_hot_heal_both_copies`.
+- D9: `the_guard_holds_a_lagging_copy_before_a_byte_another_copy_contradicts`,
+  `the_guard_compares_nothing_at_equal_lengths`, and the sequence of
+  review round 2 end to end
+  (`guard_hot_damage_never_reaches_the_good_copy_through_a_lagging_copy`).
+- D2 *behind-copy-damaged*:
+  `x2_behind_with_a_copy_fault_takes_the_agreed_tail`,
+  `behind_hot_plus_one_copy_fault_extends_hot_and_the_repair_heals_the_copy`,
+  `behind_hot_takes_only_the_lines_the_copies_agree_on` and
+  `behind_hot_outvoted_below_its_end_is_not_extended`.
 
 ## Acceptance
 
-Met by the PR that adds this ADR: the four offline tests above, the pure
+Met by the PR that adds this ADR: the offline tests above, the pure
 tests of every D2, D3 and D5 outcome with the numbers of D2, the D8 rule
 in memory and over files, and the run tests of the refusals, the locks
 (the journal lock against an open journal), a crash after each write step with its

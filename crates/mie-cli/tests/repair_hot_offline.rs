@@ -410,3 +410,192 @@ fn ac3_an_entry_without_a_good_copy_stops_and_writes_nothing() {
     let (pass, out) = verify(&fixture, RESOLVED + 3 * HOUR);
     assert!(pass, "{out}");
 }
+
+/// The pass guard (ADR-065 D9, review of #226 round 2, finding 1): hot's
+/// journal bit-rots at x in its second line while cold-a lags at its first
+/// line and cold-b holds the true bytes. Every step does what the one
+/// before it named: repair-hot stops *one-witness*, verify, repair (which
+/// refuses cold-b, one against one), repair-hot again, verify, repair.
+/// Before the guard, the repair's closing pass extended cold-a over x with
+/// hot's damage, repair-hot then decided *copy-damaged*, and the second
+/// repair rebuilt cold-b with hot's byte. Now no pass extends cold-a over
+/// a byte cold-b contradicts, so the state stays one against one and
+/// cold-b keeps the true byte; the one-witness stop names what
+/// `--keep-hot-journal` would drop.
+#[test]
+fn guard_hot_damage_never_reaches_the_good_copy_through_a_lagging_copy() {
+    let (_dir, fixture) = adopted("hot-guard-lagging");
+    let journal = fixture.config.paths.journal.clone();
+    let good = fs::read(&journal).unwrap();
+    let first_nl = good.iter().position(|b| *b == b'\n').unwrap();
+    let x = first_nl + 10;
+    let lagging = copy_of(&fixture, "cold-a");
+    writable(&lagging);
+    fs::write(&lagging, &good[..=first_nl]).unwrap();
+    flip(&journal, x);
+    let bad = fs::read(&journal).unwrap()[x];
+    assert_ne!(bad, good[x]);
+
+    let mut t = REPAIRED;
+    let (pass, out) = repair_hot(&fixture, Scope::Journal, false, t);
+    assert!(!pass, "{out}");
+    assert!(out.contains("journal: decision one-witness"), "{out}");
+    assert_fail_line(
+        &out,
+        &[
+            "one copy against hot",
+            "`--keep-hot-journal` would drop",
+            "the copy on cold-b from byte",
+        ],
+    );
+    for _ in 0..2 {
+        t += HOUR;
+        let _ = verify(&fixture, t);
+        t += HOUR;
+        let (pass, out) = repair(&fixture, t);
+        assert!(!pass, "{out}");
+        assert_eq!(
+            fs::read(&lagging).unwrap(),
+            &good[..=first_nl],
+            "cold-a is held at its line\n{out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "the journal copy on cold-a stops before byte {}",
+                first_nl + 1
+            )) && out.contains(&format!("at byte {x}")),
+            "{out}"
+        );
+        assert_eq!(fs::read(copy_of(&fixture, "cold-b")).unwrap(), good);
+        t += HOUR;
+        let (pass, out) = repair_hot(&fixture, Scope::Journal, false, t);
+        assert!(!pass, "{out}");
+        assert!(out.contains("journal: decision one-witness"), "{out}");
+    }
+    assert_eq!(fs::read(copy_of(&fixture, "cold-b")).unwrap(), good);
+}
+
+/// Hot *behind* plus one copy fault (ADR-065 D2, review of #226 round 2,
+/// finding 2): hot's journal lost its last line (unsynced at a power loss
+/// after a pass copied it), cold-a has one bit flipped at byte 10, cold-b
+/// is the true journal. Hot holds two of three at byte 10, and past hot's
+/// end both copies agree: repair-hot extends hot from the copies and
+/// leaves cold-a to the repair, never offering `--keep-hot-journal`; then
+/// verify and repair heal cold-a, and all three journals are the true one.
+#[test]
+fn behind_hot_plus_one_copy_fault_extends_hot_and_the_repair_heals_the_copy() {
+    let (_dir, fixture) = adopted("hot-behind-copy-fault");
+    let journal = fixture.config.paths.journal.clone();
+    let good = fs::read(&journal).unwrap();
+    let listed = runs(&fixture);
+    let cut = good[..good.len() - 1]
+        .iter()
+        .rposition(|b| *b == b'\n')
+        .unwrap()
+        + 1;
+    writable(&journal);
+    fs::write(&journal, &good[..cut]).unwrap();
+    flip(&copy_of(&fixture, "cold-a"), 10);
+
+    let (pass, out) = repair_hot(&fixture, Scope::Journal, false, REPAIRED);
+    assert!(pass, "{out}");
+    assert!(
+        out.contains("journal: decision behind-copy-damaged"),
+        "{out}"
+    );
+    assert!(!out.contains("--keep-hot-journal"), "{out}");
+    assert!(
+        out.lines().any(
+            |line| line.starts_with("journal: the journal copy on cold-a (")
+                && line.contains(
+                    "differs from hot's journal at byte 10, where hot holds a strict majority"
+                )
+                && line.contains("`mie store repair`")
+        ),
+        "{out}"
+    );
+    assert_eq!(fs::read(&journal).unwrap(), good);
+
+    let (pass, out) = verify(&fixture, REPAIRED + HOUR);
+    assert!(!pass, "{out}");
+    let (pass, out) = repair(&fixture, REPAIRED + 2 * HOUR);
+    assert!(pass, "{out}");
+    for root in ["cold-a", "cold-b"] {
+        assert_eq!(fs::read(copy_of(&fixture, root)).unwrap(), good, "{root}");
+    }
+    assert_eq!(fs::read(&journal).unwrap(), good);
+    let (pass, out) = verify(&fixture, REPAIRED + 3 * HOUR);
+    assert!(pass, "{out}");
+    assert_eq!(runs(&fixture), listed);
+}
+
+/// *behind-copy-damaged* stops at the copies' disagreement past hot's end
+/// (ADR-065 D2): hot lost its last two lines, cold-a has a bit flipped at
+/// 10, and cold-b one in the last line. Past hot's end the copies agree up
+/// to that byte, so hot takes the line before it and stops at the start
+/// of the last line, naming the byte and both copies; nothing past it is
+/// written.
+#[test]
+fn behind_hot_takes_only_the_lines_the_copies_agree_on() {
+    let (_dir, fixture) = adopted("hot-behind-disagree");
+    let journal = fixture.config.paths.journal.clone();
+    let good = fs::read(&journal).unwrap();
+    let last = good[..good.len() - 1]
+        .iter()
+        .rposition(|b| *b == b'\n')
+        .unwrap()
+        + 1;
+    let cut = good[..last - 1].iter().rposition(|b| *b == b'\n').unwrap() + 1;
+    writable(&journal);
+    fs::write(&journal, &good[..cut]).unwrap();
+    flip(&copy_of(&fixture, "cold-a"), 10);
+    let q = last + 5;
+    flip(&copy_of(&fixture, "cold-b"), q);
+
+    let (pass, out) = repair_hot(&fixture, Scope::Journal, false, REPAIRED);
+    assert!(!pass, "{out}");
+    assert!(
+        out.contains("journal: decision behind-copy-damaged"),
+        "{out}"
+    );
+    assert_fail_line(
+        &out,
+        &[
+            &format!("the journal copies disagree at byte {q}"),
+            "cold-a",
+            "cold-b",
+            &format!("extended only to byte {last}"),
+        ],
+    );
+    assert_eq!(fs::read(&journal).unwrap(), &good[..last]);
+}
+
+/// No *behind-copy-damaged* where hot is outvoted below its end (ADR-065
+/// D2): hot lost its last line and has a bit flipped at x, where both
+/// copies agree against it, and cold-a has one at 10. Hot holds no strict
+/// majority at x, so nothing is extended: *two-fault*, nothing written.
+#[test]
+fn behind_hot_outvoted_below_its_end_is_not_extended() {
+    let (_dir, fixture) = adopted("hot-behind-outvoted");
+    let journal = fixture.config.paths.journal.clone();
+    let good = fs::read(&journal).unwrap();
+    let cut = good[..good.len() - 1]
+        .iter()
+        .rposition(|b| *b == b'\n')
+        .unwrap()
+        + 1;
+    writable(&journal);
+    fs::write(&journal, &good[..cut]).unwrap();
+    let x = good.iter().position(|b| *b == b'\n').unwrap() + 10;
+    flip(&journal, x);
+    flip(&copy_of(&fixture, "cold-a"), 10);
+    let before = files(&fixture.dir);
+    let (pass, out) = repair_hot(&fixture, Scope::Journal, false, REPAIRED);
+    assert!(!pass, "{out}");
+    assert!(out.contains("journal: decision two-fault"), "{out}");
+    assert_fail_line(
+        &out,
+        &["`--keep-hot-journal` would drop", "cold-a", "cold-b"],
+    );
+    assert_eq!(files(&fixture.dir), before);
+}

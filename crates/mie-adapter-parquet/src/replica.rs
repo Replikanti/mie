@@ -1814,10 +1814,27 @@ pub fn first_difference(
     source: TailSource<'_>,
     len: u64,
 ) -> Result<Option<u64>, CopyError> {
+    first_difference_in(copy, source, 0, len)
+}
+
+/// [`first_difference`] over `[from, to)` only: the replication pass's
+/// guard (ADR-065 D9) compares hot's bytes past a lagging copy's end with
+/// a longer copy's, and reads nothing before `from`. The caller makes sure
+/// both are at least `to` bytes long.
+///
+/// # Errors
+///
+/// As [`first_difference`].
+pub fn first_difference_in(
+    copy: &Path,
+    source: TailSource<'_>,
+    from: u64,
+    to: u64,
+) -> Result<Option<u64>, CopyError> {
     let mut file = File::open(copy).map_err(io_error("open", copy))?;
-    let mut offset = 0;
-    while offset < len {
-        let n = (len - offset).min(CHUNK as u64) as usize;
+    let mut offset = from;
+    while offset < to {
+        let n = (to - offset).min(CHUNK as u64) as usize;
         let mine = read_at(&mut file, copy, offset, n)?;
         let theirs = source.read_at(offset, n)?;
         if let Some(i) = mine.iter().zip(&theirs).position(|(a, b)| a != b) {
@@ -1959,6 +1976,23 @@ pub fn first_contested_file(
     witnesses: &[&Path],
     from: u64,
 ) -> Result<Option<Contested>, CopyError> {
+    first_contested_file_before(hot, witnesses, from, u64::MAX)
+}
+
+/// [`first_contested_file`] over the bytes below `until` only: `mie store
+/// repair-hot` asks whether hot holds a strict majority at every byte it
+/// holds, apart from the bytes past its end (ADR-065 D2, *behind* with
+/// the copies differing).
+///
+/// # Errors
+///
+/// As [`first_contested_file`].
+pub fn first_contested_file_before(
+    hot: &Path,
+    witnesses: &[&Path],
+    from: u64,
+    until: u64,
+) -> Result<Option<Contested>, CopyError> {
     let mut hot_file = File::open(hot)
         .map_err(io_error("open", hot))
         .map_err(CopyError::source)?;
@@ -1978,7 +2012,12 @@ pub fn first_contested_file(
             Err(error) => return Err(io_error("open", path)(error).into()),
         }
     }
-    let end = files.iter().map(|(_, _, len)| *len).max().unwrap_or(0);
+    let end = files
+        .iter()
+        .map(|(_, _, len)| *len)
+        .max()
+        .unwrap_or(0)
+        .min(until);
     let mut offset = from;
     while offset < end {
         let n = (end - offset).min(CHUNK as u64);
@@ -1991,6 +2030,70 @@ pub fn first_contested_file(
         let views: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
         if let Some(contested) = contested_window(offset, &mine, &views) {
             return Ok(Some(contested));
+        }
+        offset += n;
+    }
+    Ok(None)
+}
+
+/// The first byte at or after `from` where two of `witnesses` that hold a
+/// byte there hold different bytes; `None` when every byte from `from` on
+/// is held alike by every witness that holds it. `mie store repair-hot`
+/// extends a hot journal that is behind only over bytes every copy that
+/// holds them agrees on (ADR-065 D2): one witness suffices past hot's end,
+/// two that differ attribute nothing.
+#[must_use]
+pub fn first_disagreement(witnesses: &[&[u8]], from: u64) -> Option<u64> {
+    let from_index = usize::try_from(from).unwrap_or(usize::MAX);
+    let views: Vec<&[u8]> = witnesses
+        .iter()
+        .map(|w| w.get(from_index..).unwrap_or(&[]))
+        .collect();
+    disagreement_window(from, &views)
+}
+
+/// [`first_disagreement`] over one window that starts at offset `base`.
+fn disagreement_window(base: u64, witnesses: &[&[u8]]) -> Option<u64> {
+    let end = witnesses.iter().map(|w| w.len()).max().unwrap_or(0);
+    (0..end)
+        .find(|&p| {
+            let mut held = witnesses.iter().filter_map(|w| w.get(p));
+            held.next()
+                .is_some_and(|first| held.any(|byte| byte != first))
+        })
+        .map(|p| base + p as u64)
+}
+
+/// [`first_disagreement`] over files, in bounded chunks, each at the
+/// length it has when opened. A witness that does not exist holds no byte.
+///
+/// # Errors
+///
+/// A [`CopyError`] on [`Side::Destination`] when a witness cannot be read.
+pub fn first_disagreement_file(witnesses: &[&Path], from: u64) -> Result<Option<u64>, CopyError> {
+    let mut files: Vec<(File, &Path, u64)> = Vec::new();
+    for &path in witnesses {
+        match File::open(path) {
+            Ok(file) => {
+                let len = file.metadata().map_err(io_error("stat", path))?.len();
+                files.push((file, path, len));
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(io_error("open", path)(error).into()),
+        }
+    }
+    let end = files.iter().map(|(_, _, len)| *len).max().unwrap_or(0);
+    let mut offset = from;
+    while offset < end {
+        let n = (end - offset).min(CHUNK as u64);
+        let take = |len: u64| usize::try_from(len.saturating_sub(offset).min(n)).unwrap_or(0);
+        let mut chunks = Vec::with_capacity(files.len());
+        for (file, path, len) in &mut files {
+            chunks.push(read_at(file, path, offset, take(*len))?);
+        }
+        let views: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
+        if let Some(at) = disagreement_window(offset, &views) {
+            return Ok(Some(at));
         }
         offset += n;
     }
