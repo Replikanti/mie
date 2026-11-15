@@ -1200,13 +1200,13 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
         }
     };
     // The remedy a `FAIL:` line for a damaged copy names (B5). The rebuild
-    // keeps its text; in the restore it depends on the copy (#195 round 3):
-    // verify, then repair (R1) only for a copy with a `copy` record on a
-    // copy target, since verify checks only those (V4) and the repair
-    // leaves a file on hot to its closing pass, whose D5 copy refuses the
-    // damaged one. An unrecorded copy, or a temp name, on a copy target is
-    // set aside by the restore after the path's copy-back (H6 k); a
-    // read-only root is never written (D11).
+    // keeps its text: the repair takes a recorded copy by R1 and, since
+    // #219, an unrecorded copy of a file hot holds by R2b. In the restore
+    // it depends on the copy (#195 round 3): verify, then repair (R1) only
+    // for a copy with a `copy` record on a copy target, since verify checks
+    // only those (V4). An unrecorded copy, or a temp name, on a copy target
+    // is set aside by the restore itself after the path's copy-back (H6 k);
+    // a read-only root is never written (D11).
     let remedy = |path: &str, id: &str, pending: bool| -> String {
         let repair = "run `mie store verify`, then `mie store repair`".to_owned();
         if restore.is_none() {
@@ -1310,7 +1310,7 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
                 // H5 b: another text than the start's on a live path. A
                 // copy whose data matches its own text is another sealed
                 // file under the path (D5), which no restore step moves
-                // (#219 case 2).
+                // (#227).
                 RootCopy::Text { data, .. }
                     if !is_archive_part(path)
                         && text.is_some()
@@ -1321,7 +1321,7 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
                         && state.copy(path, root).is_none_or(|c| c.latest.is_none())
                     {
                         "it is another self-consistent file under the path (D5): the restore \
-                         never moves it, and the path stays one copy short on this target (#219)"
+                         never moves it, and the path stays one copy short on this target (#227)"
                             .to_owned()
                     } else {
                         fix

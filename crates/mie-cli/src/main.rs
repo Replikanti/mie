@@ -382,10 +382,15 @@ USAGE:
         verify but differ from hot's, a journal copy where hot's journal
         holds no strict majority of the journals at a byte the rebuild
         would write (one copy against hot is a tie), and an import entry
-        hot cannot vouch for are refused and named. A file with no good copy left is reported lost and nothing
-        is written, but only when every root that records a copy of it
-        still carries its marker and every root was read without error;
-        otherwise it is not repairable in this run, naming those roots.
+        hot cannot vouch for are refused and named. A copy target's
+        unrecorded copy of a file hot holds that the next pass would refuse
+        is moved aside into <root>/.mie/damaged/<time>/, and the closing
+        pass copies the file from hot; another self-consistent file under
+        the path is refused. A file with no good copy left is reported
+        lost and nothing is written, but only when every root that records
+        a copy of it still carries its marker and every root was read
+        without error; otherwise it is not repairable in this run, naming
+        those roots.
         --record-lost then appends its lost record, after which every
         replay that covers it fails, so pass it only after a run without it
         reported the file. Replication pauses while the repair runs; it

@@ -6,9 +6,10 @@
 //! is what the copy ledger records (the findings `mie store verify` left
 //! open) plus the copies a configured target lacks without any record (a
 //! target added or replaced after files left hot, the comment of
-//! 2026-11-07 on #192). Every work item is re-checked first, so a copy that
-//! came back (a remount) is only re-recorded. The rules, as numbered in the
-//! plan of #192 (the tests cite them):
+//! 2026-11-07 on #192) and the forms a target holds without a record of
+//! files hot holds (#219). Every work item is re-checked first, so a copy
+//! that came back (a remount) is only re-recorded. The rules, as numbered
+//! in the plan of #192 plus R2b (#219; the tests cite them):
 //!
 //! - **R0 Refusals and locks.** The refusals of the verification, without
 //!   P. Then the verification lock and the pass lock, both without waiting,
@@ -26,7 +27,24 @@
 //!   with a recorded copy on some configured target but none on R is copied
 //!   to R from a source and recorded. The class is the adoption's own
 //!   (`adopt::complete`), so repair and adopt never disagree. Files on hot
-//!   that lack a target are left to the closing pass.
+//!   that lack a target are left to the closing pass, after R2b.
+//! - **R2b Unrecorded copies of hot's files** (#219): for every path hot
+//!   holds sealed whose partition is not recorded removed, whose verdict is
+//!   none, ordinary, without `manifest` record or held, and every marked
+//!   copy target without a `copy` record of it that holds its data file or
+//!   manifest: that form is judged against the text (the ledger's
+//!   `manifest` record, else hot's manifest, as V3 reads it) by the test
+//!   the closing pass's D5 copy from hot applies, the restore's H6 k1
+//!   (`restore::unrecorded_copy`). A copy the pass accepts stays, and the
+//!   closing pass records it or publishes its manifest; a self-consistent
+//!   other file is refused and never moved, as in R1 (D5; #227). Every
+//!   other form, an unreadable one included (a `FAIL:`, #219 STOP 1
+//!   decision 2), is moved aside (R5), and the closing pass copies the
+//!   path from hot and records it; R2b itself writes no record and copies
+//!   nothing. It moves only when hot's copy checks good against the text,
+//!   and an archive part only when a current import entry on hot lists it
+//!   with the text's SHA-256, since the closing pass copies nothing else;
+//!   otherwise the form is named and stays.
 //! - **R3 Sources, in order:** hot, then every cold root in configuration
 //!   order (copy targets and read-only roots alike), never the destination.
 //!   A source counts only when its manifest text equals the ledger's byte
@@ -108,6 +126,7 @@ use super::replicate::{
     self, Entry, Fold, IMPORT_LEDGER_DIR, JOURNAL_DIR, LedgerAppend, META_DIR, PassObserver,
     hot_entries,
 };
+use super::restore::{self, UnrecordedCopy};
 use super::{DeviceProbe, check_devices, check_hot, truncation_line};
 use crate::config::{ArchiveConfig, IngestConfig};
 use mie_adapter_parquet::copy_ledger::{
@@ -465,6 +484,30 @@ fn byte_at(path: &Path, offset: u64) -> std::io::Result<Option<u8>> {
     Ok(Some(byte[0]))
 }
 
+/// Whether R2b judges the unrecorded copies of a path of this verdict:
+/// none (no `manifest` record), ordinary, recorded without a `manifest`
+/// record, or held (as R1, R4 and V4 take held paths). A lost path is
+/// R9's, which writes nothing for it; a conflict is two texts (D5); a
+/// replaced or pending one belongs to the replace resolution (#211).
+fn r2b_takes(verdict: Option<PathVerdict>) -> bool {
+    matches!(
+        verdict,
+        None | Some(PathVerdict::Ordinary | PathVerdict::NoManifest | PathVerdict::Held)
+    )
+}
+
+/// What a hot copy that does not check good is, for R2b's report.
+fn hot_check(check: &Result<CopyCheck, RawStoreError>) -> String {
+    match check {
+        Ok(CopyCheck::Good) => "good".to_owned(),
+        Ok(CopyCheck::Missing) => "missing".to_owned(),
+        Ok(CopyCheck::Manifest { .. }) => "its manifest is not the text".to_owned(),
+        Ok(CopyCheck::Size) => "size".to_owned(),
+        Ok(CopyCheck::Sha256) => "sha256".to_owned(),
+        Err(error) => format!("it cannot be read: {error}"),
+    }
+}
+
 /// Where a copy's relative `path` goes in the damaged directory of `root`.
 fn aside_of(root: &Path, run_ms: i64, relative: &Path) -> PathBuf {
     replica::damaged_dir(root, run_ms).join(relative)
@@ -596,6 +639,8 @@ impl Repair<'_> {
                 }
             }
         }
+        // R2b.
+        self.repair_unrecorded(&targets)?;
         // R4.
         self.repair_hot()?;
         // R6, R7, R8.
@@ -754,6 +799,169 @@ impl Repair<'_> {
             source.display()
         ));
         Ok(())
+    }
+
+    /// R2b: the forms the marked copy targets `targets` hold of files hot
+    /// holds, without a `copy` record (module docs).
+    fn repair_unrecorded(&mut self, targets: &[usize]) -> Result<(), Stop> {
+        if targets.is_empty() {
+            return Ok(());
+        }
+        let listing = match replica::list_sealed(self.hot) {
+            Ok(listing) => listing,
+            Err(error) => {
+                self.problem(format!(
+                    "cannot list hot's sealed files, so no unrecorded copy on a copy target is \
+                     checked: {error}"
+                ));
+                return Ok(());
+            }
+        };
+        for path in &listing {
+            if self.removed.contains(partition_of(path)) || !r2b_takes(self.state.verdict(path)) {
+                continue;
+            }
+            let missing: Vec<usize> = targets
+                .iter()
+                .copied()
+                .filter(|&i| !self.fold.has_copy(path, &self.marked[i].id))
+                .collect();
+            if missing.is_empty() {
+                continue;
+            }
+            let (text, origin) = match self.state.ledger_text(path) {
+                Some(text) => (text.to_owned(), "the copy ledger's"),
+                None => match replica::sealed_manifest(self.hot, path) {
+                    Ok(Some((text, _))) => (text, "hot's"),
+                    // Gone or unreadable: the closing pass names it.
+                    Ok(None) | Err(_) => continue,
+                },
+            };
+            // Each candidate with why the pass refuses it (`Ok`), or the
+            // read error that leaves it unverifiable (`Err`).
+            let mut candidates: Vec<(usize, Result<String, String>)> = Vec::new();
+            for i in missing {
+                let name = self.name(i);
+                match restore::unrecorded_copy(&self.marked[i].path, path, &text) {
+                    Ok(UnrecordedCopy::Absent | UnrecordedCopy::Accepted) => {}
+                    Ok(UnrecordedCopy::OtherFile) => self.problem(format!(
+                        "{path} on {name}: refused: it holds no recorded copy but a \
+                         self-consistent other file under the same path (its own manifest \
+                         differs from {origin} and its data matches it), two sealed files under \
+                         one path, never a damaged copy; it is not moved, and the path stays one \
+                         copy short on this target until #227 decides it (ADR-062 D5)"
+                    )),
+                    Ok(UnrecordedCopy::Refused(why)) => candidates.push((i, Ok(why))),
+                    Err(error) => candidates.push((i, Err(error.to_string()))),
+                }
+            }
+            if candidates.is_empty() {
+                continue;
+            }
+            let found = |judged: &Result<String, String>| match judged {
+                Ok(why) => format!("its copy does not verify ({why})"),
+                Err(error) => format!("its copy cannot be read ({error})"),
+            };
+            if replicate::is_archive_part(path) && !self.listed(path, &text) {
+                let why = if self.archive.is_none() {
+                    "no archive configuration is given, so its import entry cannot be checked"
+                } else {
+                    "no current import entry on hot lists it with its manifest's SHA-256"
+                };
+                for (i, judged) in &candidates {
+                    let name = self.name(*i);
+                    self.problem(format!(
+                        "{path} on {name}: no copy record, and {}; not moved: an archive part, \
+                         and {why}, so the closing pass does not copy it; it is moved once a \
+                         current import entry on hot lists it (ADR-062 D11)",
+                        found(judged)
+                    ));
+                }
+                continue;
+            }
+            let hot = replica::check_sealed_copy(self.hot, path, &text);
+            if !matches!(hot, Ok(CopyCheck::Good)) {
+                for (i, judged) in &candidates {
+                    let name = self.name(*i);
+                    self.problem(format!(
+                        "{path} on {name}: no copy record, and {}; not moved: hot's copy is not \
+                         good ({}), and the closing pass copies from hot only. R4 repairs hot \
+                         when the copy ledger records its text and a cold root holds a good \
+                         copy; then run the repair again (ADR-062 D11)",
+                        found(judged),
+                        hot_check(&hot)
+                    ));
+                }
+                continue;
+            }
+            for (i, judged) in candidates {
+                self.move_unrecorded(i, path, &found(&judged), judged.is_err())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether a current import entry on hot lists the archive part
+    /// `path` with the SHA-256 of `text`: the closing pass's gate (D11).
+    fn listed(&self, path: &str, text: &str) -> bool {
+        let Ok(sha) = replica::parse_manifest(text).map(|file| file.sha256) else {
+            return false;
+        };
+        self.entries.iter().any(|entry| {
+            entry
+                .files
+                .iter()
+                .any(|(file, listed)| file == path && *listed == sha)
+        })
+    }
+
+    /// R2b's move-aside (R5) of the unrecorded copy of `path` on the
+    /// marked target `i`, which `found` describes; an `unreadable` one is
+    /// a problem (#219 STOP 1 decision 2).
+    fn move_unrecorded(
+        &mut self,
+        i: usize,
+        path: &str,
+        found: &str,
+        unreadable: bool,
+    ) -> Result<(), Stop> {
+        if !self.marker_present(i) {
+            return Ok(());
+        }
+        let root = self.marked[i].path.clone();
+        let name = self.name(i);
+        let aside = replica::damaged_dir(&root, self.run_ms);
+        let moved = match replica::move_aside(&root, path, &aside) {
+            Ok(moved) => moved,
+            Err(error) => {
+                self.problem(format!(
+                    "{path} on {name}: no copy record, and {found}; moving it aside failed: \
+                     {error}; nothing is replaced (ADR-062 D11)"
+                ));
+                return Ok(());
+            }
+        };
+        if moved.is_empty() {
+            return Ok(());
+        }
+        let names = moved.join(", ");
+        if unreadable {
+            self.problem(format!(
+                "{path} on {name}: no copy record, and {found}, so it is no verifiable copy: \
+                 {names} moved aside into {}; the closing pass copies it from hot and records \
+                 it. {} (ADR-062 D11)",
+                aside.display(),
+                restore::READ_ERROR
+            ));
+        } else {
+            self.line(format!(
+                "{path} on {name}: no copy record, and {found}, which the pass's D5 copy \
+                 refuses: {names} moved aside into {}; the closing pass copies it from hot and \
+                 records it (ADR-062 D5, D11)",
+                aside.display()
+            ));
+        }
+        reached(RepairStep::AfterMoveAside)
     }
 
     /// R9 for `path`, which has no good source; `unread` names the roots

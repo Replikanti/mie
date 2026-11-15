@@ -1128,6 +1128,26 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
 
 ### Fixed
 
+- **`mie store repair` clears an unrecorded damaged copy of a hot file on
+  a copy target (#219).** A copy target could hold a form of a file hot
+  holds that the copy ledger records no copy of there (a manifest without
+  its data, data of the wrong size or SHA-256, a manifest beside a data
+  temp file, a manifest that does not parse, unverifiable data without a
+  manifest), left by a pass that crashed after publishing, by
+  `mie store rebuild --replace-hot-ledger` or by outside damage. Every
+  pass refused it, verify only saw a missing copy, and the repair left it
+  to its closing pass, so the target stayed one copy short and the
+  partition stayed on hot. The new rule R2b judges such a form by the test
+  the pass applies (the one the hot restore already used, now shared),
+  moves what the pass refuses into `<root>/.mie/damaged/<time>/`, never
+  deleting it, and the closing pass copies the file from hot and records
+  it, so the next pass and verify are clean. An unreadable form is moved
+  too, with a `FAIL:` line. Nothing moves while hot's own copy is bad
+  (the run names it, R4 repairs hot, a second run completes) or for an
+  archive part no current import entry lists. A copy the pass accepts
+  stays and is recorded; another self-consistent file under the path is
+  refused and never moved (#227 decides it); read-only roots are never
+  written.
 - **Store locks are released explicitly (#220).** Dropping a pass,
   verify, writer or copy-ledger lock now unlocks it instead of only closing
   its descriptor, so a child process started by another thread can no

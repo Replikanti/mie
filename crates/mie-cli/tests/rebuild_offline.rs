@@ -659,3 +659,63 @@ fn a_dangling_import_ledger_symlink_stops_the_rebuild() {
     assert!(out.contains("nothing written"), "{out}");
     assert!(!hot_ledger(&fixture).exists());
 }
+
+/// #219 AC 5: the state `mie store rebuild --replace-hot-ledger` leaves
+/// when a copy target's copy of a hot file is damaged and the start copy
+/// lacks its `copy` record (an empty start): B5 names the copy, which gets
+/// no record, and the remedy `mie store verify`, then `mie store repair`.
+/// The pass refuses that copy, and the repair (R2b) moves it aside and its
+/// closing pass refills it from hot; verify and the next pass are clean.
+#[test]
+fn a_damaged_unrecorded_copy_the_rebuild_reports_is_cleared_by_the_repair() {
+    let (_dir, fixture) = adopted("rebuild-r2b");
+    let path = replica::list_sealed(&fixture.hot())
+        .unwrap()
+        .into_iter()
+        .find(|path| path.starts_with("source=binance-um"))
+        .unwrap();
+    let copy = cold(&fixture, "cold-b").join(&path);
+    let mut bytes = fs::read(&copy).unwrap();
+    bytes[40] ^= 0x01;
+    let mut permissions = fs::metadata(&copy).unwrap().permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    permissions.set_readonly(false);
+    fs::set_permissions(&copy, permissions).unwrap();
+    fs::write(&copy, &bytes).unwrap();
+    damage_both_copies(&fixture);
+    let flags = Flags {
+        replace_hot_ledger: true,
+        ..Flags::default()
+    };
+    let (pass, out) = rebuild(&fixture, flags, REBUILT);
+    assert!(!pass, "{out}");
+    assert!(out.contains("started empty"), "{out}");
+    assert_fail_line(
+        &out,
+        &[&path, "cold-b", "gets no record", "mie store repair"],
+    );
+    let records = copy_ledger::read(&fixture.hot()).unwrap().unwrap().records;
+    let copied = |root: &str| {
+        records.iter().any(
+            |r| matches!(&r.kind, Kind::Copy { path: p, root: id } if *p == path && id == root),
+        )
+    };
+    assert!(copied("cold-a") && !copied("cold-b"));
+    let (pass, out) = replicate(&fixture, REBUILT + 1);
+    assert!(!pass, "{out}");
+    assert_fail_line(&out, &[&path]);
+
+    let (pass, out) = repair(&fixture, REBUILT + 2);
+    assert!(pass, "{out}");
+    assert_eq!(
+        fs::read(replica::damaged_dir(&cold(&fixture, "cold-b"), REBUILT + 2).join(&path)).unwrap(),
+        bytes
+    );
+    assert_eq!(
+        fs::read(&copy).unwrap(),
+        fs::read(fixture.hot().join(&path)).unwrap()
+    );
+    let (pass, out) = verify(&fixture, REBUILT + 3);
+    assert!(pass, "{out}");
+    assert_pass(&replicate(&fixture, REBUILT + 4));
+}

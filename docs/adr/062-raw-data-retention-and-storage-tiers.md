@@ -7,6 +7,7 @@
   condition, replaced by hot's strict byte-wise majority over every byte
   the rebuild writes (ADR-065 D8)
 - Date: 2026-11-05
+- Amended: 2026-11-15 (#219)
 
 Relation to earlier ADRs: this ADR supersedes one point of ADR-034 D4:
 an archive file's import entry can be superseded by a later one (D11,
@@ -3547,3 +3548,72 @@ evidenced on #184 (each AW line there links its evidence):
 - Known open gap: #219 (Consequences).
 - The warm-up cost with a live segment on cold stays with #106
   (Consequences).
+
+## Justification addendum (2026-11-15)
+
+Added for #219. It explains why the repair rule R2b, added by #219,
+implements decisions this ADR already made, and which descriptive
+sentences above now describe the state before it. It changes no value,
+criterion or decision.
+
+**What #219 found.** A copy target can hold a form of a sealed path hot
+holds while the copy ledger has no `copy` record of the path on that
+target: a manifest without its data, data of the wrong size or SHA-256, a
+manifest beside a data temp file, a manifest that does not parse, data
+without a manifest that does not verify. It arises from a pass that
+crashes after publishing a copy and before its record (then damage), from
+the B5 rule of `mie store rebuild --replace-hot-ledger` on an empty start,
+and from outside damage. Every pass's D5 copy refuses such a form,
+`mie store verify` reports only the unrecorded `copies` gap (V4, V7), the
+repair as #192 implemented it left a file on hot to its closing pass,
+whose D5 copy refuses the same way, and removal rule (e) never plans the
+partition.
+
+**Why no new decision is needed.** D11 *On a finding* already states the
+rule: "An explicit repair step replaces a missing or bad copy from a good
+one by the D5 protocol", and "A marked copy target without a `copy`
+record for a recorded file counts as a missing copy". D11 *As implemented
+(#192)* already names the work list: the repair "works the list the ledger
+records plus the copies a configured target lacks without a record", and
+re-checks each item first. #192's rules covered the half of that list
+whose files left hot (R2); the files hot holds were left to the closing
+pass, which cannot clear a form it refuses. *Consequences* already
+classified the gap: "Case 1, an unrecorded damaged copy, is a repair
+rule." The judgment of which forms the pass refuses was fixed by H6 k1 of
+the hot restore (#195 round 3): "`check_sealed_copy` with `M`, else
+`check_file` on `D`", and the move is R5's.
+
+**What R2b does** (the repair module docs carry the rule; #219's plan the
+derivation). For every path hot holds sealed whose partition is not
+recorded removed, whose verdict is none, ordinary, without a `manifest`
+record, or held, and every marked copy target without a `copy` record of
+it that holds its `D` or `M`, the form is judged against the ledger's
+`manifest` record (else hot's manifest, as V3 reads it) by the same
+function H6 k1 now calls. A copy the pass accepts stays, for the closing
+pass to record; a self-consistent other file is refused and never moved,
+as R1 refuses one (D5); every other form, an unreadable one included
+(with a `FAIL:`, as H6 k1 under U), is moved by R5 into
+`.mie/damaged/<run at_ms>/`, only once hot's copy checks good against the
+text, and for an archive part only once a current hot import entry lists
+it with the text's SHA-256, since the closing pass copies nothing else
+(D11). R2b writes no record and copies nothing; the closing pass copies
+the path from hot and appends its records, so the D5 guard, the
+`manifest`-record order and the archive-entry gate stay in one place. No
+record kind, ledger format or `replica` function changes.
+
+**Sentences above that now describe the state before #219.** They stay
+as written, as history:
+
+- *Consequences*, the known-gap bullet ("a copy target can stay one copy
+  short of a path hot holds, and no mie command clears it"), and the
+  *Acceptance* line "Known open gap: #219": case 1 is now cleared by
+  `mie store repair`.
+- D11 H6 k1, "the repair leaves a file on hot to that same pass, so
+  nothing else clears it": since #219 R2b moves such a form aside first,
+  by H6 k1's own test.
+
+**Case 2 moved.** A self-consistent other file under the path (its own
+manifest with another text and data that matches it), which H6 k1, D11
+H7 and *Consequences* refer to as #219 case 2, is tracked as #227. Its fix
+moves a sealed file and needs its own ADR, as *Consequences* says; until
+then R1, R2b and H6 k1 refuse it and never move it.
