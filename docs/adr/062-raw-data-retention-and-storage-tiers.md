@@ -3604,7 +3604,12 @@ accepts, with a `FAIL:`; the accepted copy stays in place. That move
 keeps the marker and archive-entry conditions but not hot's: a temp name
 is no sealed file and no copy, so D5 is not at stake, and the pass meets
 it whatever hot's data is. A lost path's temp names the pass cannot
-remove move alone the same way; its form is R9's and never judged. A
+remove move alone the same way; its form is R9's and never judged. So do
+those of a path hot still holds in a partition recorded removed (a hot
+removal that crashed between its `removed` record and its delete): the
+pass copies such a path to a target without its `copy` record, a target
+it stops keeps the removal from completing, and the form there is the
+removal's, never judged. A
 regular temp file in a partition directory the process cannot write is
 no such case: the pass's unlink fails with EACCES, a rename would fail
 the same way, and the pass names the error itself. R2b writes no record

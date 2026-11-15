@@ -1149,7 +1149,8 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   refused and never moved (#227 decides it); read-only roots are never
   written. A temp name of the file the pass cannot remove (a directory),
   which would stop that target in every pass, is moved aside alone with a
-  `FAIL:` line, whatever hot's copy is, a lost file's included.
+  `FAIL:` line, whatever hot's copy is, a lost file's included, and so is
+  one in a partition whose hot removal crashed before deleting it.
 - **Store locks are released explicitly (#220).** Dropping a pass,
   verify, writer or copy-ledger lock now unlocks it instead of only closing
   its descriptor, so a child process started by another thread can no

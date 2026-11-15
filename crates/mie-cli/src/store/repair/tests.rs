@@ -1248,3 +1248,165 @@ fn r2b_a_stuck_temp_name_of_a_lost_path_moves_alone() {
         assert!(root.join(&q[0]).exists(), "{}", root.display());
     }
 }
+
+/// A new part P sealed after a clean pass, then one pass with cold-a's
+/// marker hidden: cold-b holds P with its `copy` record, cold-a holds no
+/// record of it.
+fn unrecorded_on_cold_a(tag: &str) -> (Fixture, String) {
+    let fixture = Fixture::new(tag);
+    assert_eq!(fixture.pass().problems, Vec::<String>::new());
+    let new = fixture.seal("binance-um", "aggTrade", D0 + 6_000, 2);
+    assert_eq!(new.len(), 1, "{new:?}");
+    let marker = root_marker::marker_path(&fixture.cold[0]);
+    let hidden = fixture.dir.0.join("cold-a.marker");
+    fs::rename(&marker, &hidden).unwrap();
+    fixture.pass();
+    fs::rename(&hidden, &marker).unwrap();
+    let path = new[0].clone();
+    let (_, copies) = counts(&fixture.records());
+    assert_eq!(copies.get(&(path.clone(), "cold-a".to_owned())), None);
+    assert_eq!(copies.get(&(path.clone(), "cold-b".to_owned())), Some(&1));
+    (fixture, path)
+}
+
+/// A hot removal that crashes after its `removed` record and before it
+/// deletes the files leaves a partition recorded removed whose files hot
+/// still holds, and the closing pass still copies them to a copy target
+/// without a `copy` record of them (#219 review, round 3). A directory at
+/// the data temp name of such a path P on cold-a is moved aside alone, and
+/// nothing sealed of P there is judged or moved. The closing pass then
+/// stops no target: P and a later healthy part Q in another partition
+/// reach cold-a, and a later pass, repair and verification are clean.
+/// Without the move, every pass stops cold-a on EISDIR, so the removal
+/// never completes and Q never reaches cold-a.
+#[test]
+fn r2b_a_stuck_temp_name_of_a_removed_partition_moves_alone() {
+    let (fixture, path) = unrecorded_on_cold_a("r2b-stuck-removed");
+    CopyLedger::at(&fixture.hot)
+        .append(&Record {
+            at_ms: D0 + HOUR,
+            kind: Kind::Removed {
+                partition: partition_of(&path).to_owned(),
+            },
+        })
+        .unwrap();
+    let cold_a = &fixture.cold[0];
+    let name = temp_of(&path, TempName::Data);
+    plant(cold_a, &name, &Plant::Dir);
+    let q = fixture.seal("binance-um", "aggTrade", D0 + 2 * 86_400_000, 2);
+    assert_eq!(q.len(), 1, "{q:?}");
+    assert_ne!(partition_of(&q[0]), partition_of(&path));
+    let at = D0 + 2 * HOUR;
+    let report = repair(&fixture, at);
+    assert!(
+        report.problems.iter().any(|p| p.contains(&path)
+            && p.contains("cold-a")
+            && p.contains(name.as_str())
+            && p.contains("recorded removed")
+            && p.contains("moved aside")),
+        "{report:?}"
+    );
+    assert!(
+        !report.problems.iter().any(|p| p.contains("stopped")),
+        "{report:?}"
+    );
+    assert!(!cold_a.join(&name).exists());
+    assert_eq!(moved_names(cold_a, at), vec![name.clone()]);
+    for root in &fixture.cold {
+        assert_eq!(
+            fs::read(root.join(&q[0])).unwrap(),
+            fs::read(fixture.hot.join(&q[0])).unwrap(),
+            "{}",
+            root.display()
+        );
+    }
+    assert_eq!(
+        fs::read(cold_a.join(&path)).unwrap(),
+        fs::read(fixture.cold[1].join(&path)).unwrap()
+    );
+    let (_, copies) = counts(&fixture.records());
+    assert_eq!(copies.get(&(path.clone(), "cold-a".to_owned())), Some(&1));
+    assert_eq!(fixture.pass().problems, Vec::<String>::new());
+    assert_eq!(repair(&fixture, at + HOUR).problems, Vec::<String>::new());
+    assert_eq!(verified(&fixture, at + 2 * HOUR), Vec::<String>::new());
+}
+
+/// R2b's report of a moved temp name says what the pass does with it
+/// (#219 review, round 3), and the move itself is the same in every case:
+/// (a) an absent form the pass reaches: every pass stops the target on
+/// it; (b) hot's manifest differs from the copy ledger's `manifest`
+/// record, so the pass's D5 guard copies nothing of the path and never
+/// reaches the name now; (c) a lost path whose form on the target is not
+/// judged (a manifest without its data), which the pass meets before the
+/// name.
+#[test]
+fn r2b_the_report_of_a_moved_temp_name_says_whether_the_pass_reaches_it() {
+    for case in ["reached", "guard", "lost-form"] {
+        let (fixture, path) = unrecorded_on_cold_a(&format!("r2b-stuck-say-{case}"));
+        let cold_a = &fixture.cold[0];
+        match case {
+            "guard" => {
+                let hot_manifest = fixture.hot.join(manifest_of(&path));
+                let text = fs::read_to_string(&hot_manifest).unwrap();
+                let sha = replica::parse_manifest(&text).unwrap().sha256;
+                let other = format!(
+                    "{}{}",
+                    if sha.starts_with('a') { 'b' } else { 'a' },
+                    &sha[1..]
+                );
+                let other_text = text.replace(&sha, &other);
+                assert!(replica::parse_manifest(&other_text).is_ok());
+                fs::set_permissions(&hot_manifest, fs::Permissions::from_mode(0o644)).unwrap();
+                fs::write(&hot_manifest, other_text).unwrap();
+            }
+            "lost-form" => {
+                let sha = replica::sealed_manifest(&fixture.hot, &path)
+                    .unwrap()
+                    .unwrap()
+                    .1
+                    .sha256;
+                CopyLedger::at(&fixture.hot)
+                    .append(&Record {
+                        at_ms: D0 + HOUR,
+                        kind: Kind::Lost {
+                            path: path.clone(),
+                            origin: LostOrigin::Verify,
+                            sha256: Some(sha),
+                        },
+                    })
+                    .unwrap();
+                let text = fs::read(fixture.hot.join(manifest_of(&path))).unwrap();
+                plant(cold_a, &manifest_of(&path), &Plant::Bytes(text));
+            }
+            _ => {}
+        }
+        let name = temp_of(&path, TempName::Data);
+        plant(cold_a, &name, &Plant::Dir);
+        let at = D0 + 2 * HOUR;
+        let report = repair(&fixture, at);
+        let said: Vec<&String> = report
+            .problems
+            .iter()
+            .filter(|p| p.contains(&path) && p.contains("cold-a") && p.contains("moved aside"))
+            .collect();
+        assert_eq!(said.len(), 1, "{case}: {report:?}");
+        let every = said[0].contains("every pass stops this target on it");
+        assert_eq!(every, case == "reached", "{case}: {}", said[0]);
+        match case {
+            "guard" => assert!(
+                said[0].contains("no pass copies it now")
+                    && said[0].contains("differs from the copy ledger's manifest record"),
+                "{case}: {}",
+                said[0]
+            ),
+            "lost-form" => assert!(
+                said[0].contains("whenever its D5 copy accepts the form there"),
+                "{case}: {}",
+                said[0]
+            ),
+            _ => {}
+        }
+        assert!(!cold_a.join(&name).exists(), "{case}");
+        assert_eq!(moved_names(cold_a, at), vec![name.clone()], "{case}");
+    }
+}

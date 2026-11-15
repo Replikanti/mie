@@ -53,8 +53,16 @@
 //!   gates but not hot's: a temp name is no sealed file and no copy, and
 //!   the pass meets it whatever hot's data is (#219 review, round 2). For
 //!   the same reason a lost path's temp names the pass cannot remove move
-//!   alone, while its form is never judged. A form the pass refuses moves
-//!   with its temp names.
+//!   alone, while its form is never judged, and so do those of a path hot
+//!   still holds in a partition recorded removed (a hot removal that
+//!   crashed between its `removed` record and its delete; the closing pass
+//!   copies such a path to a target without its `copy` record, and a
+//!   target it stops keeps the removal from completing), whose form is the
+//!   removal's and never judged (#219 review, round 3). The report of such
+//!   a move says whether the pass reaches the name now: not while its D5
+//!   guard copies nothing of the path, and for an unjudged form only once
+//!   its D5 copy accepts that form. A form the pass refuses moves with its
+//!   temp names.
 //! - **R3 Sources, in order:** hot, then every cold root in configuration
 //!   order (copy targets and read-only roots alike), never the destination.
 //!   A source counts only when its manifest text equals the ledger's byte
@@ -593,6 +601,50 @@ enum Beside {
     /// A form never judged: the path is recorded lost (R9's), and only its
     /// temp names move (#219 review, round 2).
     Lost,
+    /// A form never judged: the path's partition is recorded removed while
+    /// hot still holds it (a hot removal that crashed before its delete),
+    /// so the form is the removal's, and only its temp names move (#219
+    /// review, round 3).
+    Removed,
+}
+
+/// Whether the closing pass reaches a temp name R2b moves alone, for its
+/// report (#219 review, round 3). The move is the same in every case.
+enum Reach {
+    /// The pass's D5 copy of the path to the target meets the name first,
+    /// in every pass.
+    Every,
+    /// The pass's D5 guard copies nothing of the path now, with why.
+    Guarded(String),
+    /// The form beside the name is not judged (a lost path or a removed
+    /// partition), and the pass's D5 copy meets the name only once it
+    /// accepts that form.
+    Unjudged,
+}
+
+impl Reach {
+    /// What the pass does with the name, as the report says it.
+    fn says(&self) -> String {
+        match self {
+            Self::Every => "so every pass stops this target on it".to_owned(),
+            Self::Guarded(why) => format!(
+                "so a pass that copies the path to this target stops the target on it, but no \
+                 pass copies it now: {why}"
+            ),
+            Self::Unjudged => "so a pass stops this target on it whenever its D5 copy accepts \
+                               the form there, which is not judged"
+                .to_owned(),
+        }
+    }
+}
+
+/// Whether `root` holds the data file or the manifest of `path`, without
+/// judging either: a name that cannot be inspected counts as held.
+fn form_present(root: &Path, path: &str) -> bool {
+    let manifest = format!("{}.manifest", path.strip_suffix(".parquet").unwrap_or(path));
+    [root.join(path), root.join(manifest)].iter().any(
+        |file| !matches!(fs::symlink_metadata(file), Err(e) if e.kind() == ErrorKind::NotFound),
+    )
 }
 
 /// How R2b's report of the moved temp names of a path whose form is
@@ -602,7 +654,9 @@ fn stuck_then(beside: Beside, hot: &Result<CopyCheck, RawStoreError>) -> String 
     let repairs = "R4 repairs hot when the copy ledger records its text and a cold root holds a \
                    good copy";
     match beside {
-        Beside::Lost => "nothing else of the path there is judged or moved".to_owned(),
+        Beside::Lost | Beside::Removed => {
+            "nothing else of the path there is judged or moved".to_owned()
+        }
         Beside::Accepted if good => {
             "the copy there stays in place, and the closing pass records it".to_owned()
         }
@@ -944,12 +998,21 @@ impl Repair<'_> {
         };
         for path in &listing {
             let verdict = self.state.verdict(path);
-            // A lost path's form is R9's, but the closing pass still meets
-            // its temp names (#219 review, round 2).
+            // A lost path's form is R9's, and a form in a partition
+            // recorded removed is the hot removal's, but the closing pass
+            // still copies such a path while hot holds it, and so still
+            // meets its temp names (#219 review, rounds 2 and 3).
             let lost = verdict == Some(PathVerdict::Lost);
-            if self.removed.contains(partition_of(path)) || !(lost || r2b_takes(verdict)) {
+            if !(lost || r2b_takes(verdict)) {
                 continue;
             }
+            let alone = if self.removed.contains(partition_of(path)) {
+                Some(Beside::Removed)
+            } else if lost {
+                Some(Beside::Lost)
+            } else {
+                None
+            };
             let missing: Vec<usize> = targets
                 .iter()
                 .copied()
@@ -970,10 +1033,10 @@ impl Repair<'_> {
             let mut candidates: Vec<(usize, Found)> = Vec::new();
             for i in missing {
                 let name = self.name(i);
-                if lost {
+                if let Some(beside) = alone {
                     let stuck = stuck_temps(&self.marked[i].path, path);
                     if !stuck.is_empty() {
-                        candidates.push((i, Found::Stuck(stuck, Beside::Lost)));
+                        candidates.push((i, Found::Stuck(stuck, beside)));
                     }
                     continue;
                 }
@@ -1023,6 +1086,10 @@ impl Repair<'_> {
                             "the path is recorded lost, so its form there is not judged (R9's), \
                              but the pass's D5 copy cannot remove {names}"
                         ),
+                        Beside::Removed => format!(
+                            "its partition is recorded removed, so its form there is not judged \
+                             (the hot removal's), but the pass's D5 copy cannot remove {names}"
+                        ),
                         Beside::Accepted => format!(
                             "a copy the pass accepts, beside {names}, which the pass's D5 copy \
                              cannot remove"
@@ -1058,9 +1125,17 @@ impl Repair<'_> {
             // (#219 review, round 2).
             let hot = replica::check_sealed_copy(self.hot, path, &text);
             let good = matches!(hot, Ok(CopyCheck::Good));
+            let guard = self.pass_guard(path);
             for (i, judged) in candidates {
                 if good || matches!(judged, Found::Stuck(..)) {
-                    self.move_unrecorded(i, path, &found(&judged), &judged, &hot)?;
+                    self.move_unrecorded(
+                        i,
+                        path,
+                        &found(&judged),
+                        &judged,
+                        &hot,
+                        guard.as_deref(),
+                    )?;
                     continue;
                 }
                 let name = self.name(i);
@@ -1091,12 +1166,36 @@ impl Repair<'_> {
         })
     }
 
+    /// Why the closing pass's D5 guard copies nothing of `path` now, if it
+    /// does, as `replicate`'s `copy_file` decides before any copy: two
+    /// texts in the copy ledger, a hot manifest that is gone or cannot be
+    /// read, or one that differs from the ledger's `manifest` record. For
+    /// R2b's report only (#219 review, round 3).
+    fn pass_guard(&self, path: &str) -> Option<String> {
+        if self.fold.conflicts.contains(path) {
+            return Some("the copy ledger holds two different manifest texts for it".to_owned());
+        }
+        match replica::sealed_manifest(self.hot, path) {
+            Ok(Some((hot_text, _))) => match self.fold.manifests.get(path) {
+                Some(known) if *known != hot_text => {
+                    Some("hot's manifest differs from the copy ledger's manifest record".to_owned())
+                }
+                _ => None,
+            },
+            Ok(None) => Some("hot holds no manifest of it".to_owned()),
+            Err(error) => Some(format!("its manifest on hot cannot be read: {error}")),
+        }
+    }
+
     /// R2b's move-aside (R5) of the unrecorded copy of `path` on the
     /// marked target `i`, which `found` describes and `judged` is, with
     /// hot's copy `hot` checked against the text; an unreadable one is a
     /// problem (#219 STOP 1 decision 2), and so are temp names the pass's
     /// copy cannot remove (#219 review), which move alone: a copy the pass
-    /// accepts beside them stays in place, and so does a lost path's form.
+    /// accepts beside them stays in place, and so does the form of a lost
+    /// path or of a partition recorded removed. `guard` is why the pass
+    /// copies nothing of the path now ([`Self::pass_guard`]), for the
+    /// report of moved temp names.
     fn move_unrecorded(
         &mut self,
         i: usize,
@@ -1104,6 +1203,7 @@ impl Repair<'_> {
         found: &str,
         judged: &Found,
         hot: &Result<CopyCheck, RawStoreError>,
+        guard: Option<&str>,
     ) -> Result<(), Stop> {
         if !self.marker_present(i) {
             return Ok(());
@@ -1112,7 +1212,16 @@ impl Repair<'_> {
         let name = self.name(i);
         let aside = replica::damaged_dir(&root, self.run_ms);
         if let Found::Stuck(stuck, beside) = judged {
-            return self.move_stuck(i, path, found, stuck, &stuck_then(*beside, hot));
+            let reach = match guard {
+                Some(why) => Reach::Guarded(why.to_owned()),
+                None if matches!(beside, Beside::Lost | Beside::Removed)
+                    && form_present(&root, path) =>
+                {
+                    Reach::Unjudged
+                }
+                None => Reach::Every,
+            };
+            return self.move_stuck(i, path, found, stuck, &reach, &stuck_then(*beside, hot));
         }
         let moved = match replica::move_aside(&root, path, &aside) {
             Ok(moved) => moved,
@@ -1150,15 +1259,17 @@ impl Repair<'_> {
     /// R2b's move of the temp names `stuck` of `path` on the marked target
     /// `i` that the pass's copy cannot remove, each by itself into
     /// `.mie/damaged/<at_ms>/` under its own relative name, as the hot
-    /// restore's H6 k2 moves a temp name; `found` describes them, and
-    /// `then` ends the report ([`stuck_then`]). Nothing beside them is
-    /// moved. A `FAIL:`, as for an unreadable copy.
+    /// restore's H6 k2 moves a temp name; `found` describes them, `reach`
+    /// says what the pass does with them, and `then` ends the report
+    /// ([`stuck_then`]). Nothing beside them is moved. A `FAIL:`, as for
+    /// an unreadable copy.
     fn move_stuck(
         &mut self,
         i: usize,
         path: &str,
         found: &str,
         stuck: &[(PathBuf, String)],
+        reach: &Reach,
         then: &str,
     ) -> Result<(), Stop> {
         let root = self.marked[i].path.clone();
@@ -1186,8 +1297,9 @@ impl Repair<'_> {
             return Ok(());
         }
         self.problem(format!(
-            "{path} on {name}: no copy record, and {found}, so every pass stops this target on \
-             it: {} moved aside into {}; {then} (ADR-062 D11)",
+            "{path} on {name}: no copy record, and {found}, {}: {} moved aside into {}; {then} \
+             (ADR-062 D11)",
+            reach.says(),
             moved.join(", "),
             aside.display()
         ));
