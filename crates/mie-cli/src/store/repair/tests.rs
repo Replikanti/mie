@@ -1103,3 +1103,148 @@ fn r2b_a_stuck_temp_name_of_an_unlisted_archive_part_stays() {
     assert!(fixture.cold[0].join(&name).is_dir());
     assert!(!replica::damaged_dir(&fixture.cold[0], D0 + 2 * HOUR).exists());
 }
+
+/// The temp names `damaged/<at>/` holds on `root`, by relative path: R2b
+/// moves nothing else of a path whose form it does not move.
+fn moved_names(root: &Path, at: i64) -> Vec<String> {
+    let aside = replica::damaged_dir(root, at);
+    let mut names = Vec::new();
+    let mut dirs = vec![aside.clone()];
+    while let Some(dir) = dirs.pop() {
+        for entry in fs::read_dir(&dir).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.ends_with(".tmp") || !entry.file_type().unwrap().is_dir() {
+                let relative = entry.path().strip_prefix(&aside).unwrap().to_owned();
+                names.push(relative.display().to_string());
+            } else {
+                dirs.push(entry.path());
+            }
+        }
+    }
+    names.sort();
+    names
+}
+
+/// A temp name the pass cannot remove is no sealed file, so R2b moves it
+/// whatever hot's copy of the path is (#219 review, round 2): with one
+/// flipped data byte in hot's P (its manifest unchanged, so the pass still
+/// reaches its copy), a directory at P's data temp name on cold-a, the
+/// first copy target, is moved aside, while cold-b's manifest of P
+/// without its data, a form the pass refuses, stays in place, named, as
+/// with any bad hot copy. The closing pass then stops no target, and a
+/// later healthy part Q reaches both. Without the move, every pass stops
+/// cold-a on EISDIR before Q.
+#[test]
+fn r2b_a_stuck_temp_name_moves_although_hot_is_bad() {
+    let fixture = Fixture::new("r2b-stuck-hot-bad");
+    assert_eq!(fixture.pass().problems, Vec::<String>::new());
+    let new = fixture.seal("binance-um", "aggTrade", D0 + 6_000, 2);
+    assert_eq!(new.len(), 1, "{new:?}");
+    let path = new[0].clone();
+    let manifest = manifest_of(&path);
+    let (cold_a, cold_b) = (&fixture.cold[0], &fixture.cold[1]);
+    let name = temp_of(&path, TempName::Data);
+    plant(cold_a, &name, &Plant::Dir);
+    let text = fs::read(fixture.hot.join(&manifest)).unwrap();
+    plant(cold_b, &manifest, &Plant::Bytes(text.clone()));
+    flip(&fixture.hot.join(&path), 30);
+    let at = D0 + 2 * HOUR;
+    let report = repair(&fixture, at);
+    assert!(
+        report.problems.iter().any(|p| p.contains(&path)
+            && p.contains("cold-a")
+            && p.contains(name.as_str())
+            && p.contains("moved aside")
+            && p.contains("not good (sha256)")),
+        "{report:?}"
+    );
+    assert!(
+        report.problems.iter().any(|p| p.contains(&path)
+            && p.contains("cold-b")
+            && p.contains("not moved: hot's copy is not good")),
+        "{report:?}"
+    );
+    assert!(
+        !report.problems.iter().any(|p| p.contains("stopped")),
+        "{report:?}"
+    );
+    assert!(!cold_a.join(&name).exists());
+    assert_eq!(moved_names(cold_a, at), vec![name.clone()]);
+    assert_eq!(fs::read(cold_b.join(&manifest)).unwrap(), text);
+    assert!(!replica::damaged_dir(cold_b, at).exists());
+    let q = fixture.seal("binance-um", "aggTrade", D0 + 9_000, 2);
+    assert_eq!(q.len(), 1, "{q:?}");
+    let pass = fixture.pass();
+    assert!(
+        !pass.problems.iter().any(|p| p.contains("stopped")),
+        "{pass:?}"
+    );
+    for root in &fixture.cold {
+        assert_eq!(
+            fs::read(root.join(&q[0])).unwrap(),
+            fs::read(fixture.hot.join(&q[0])).unwrap(),
+            "{}",
+            root.display()
+        );
+    }
+}
+
+/// A path recorded lost is R9's, so R2b never judges its form, but the
+/// closing pass still copies it from hot when hot lists it with a
+/// manifest the ledger does not contradict, and so still meets its temp
+/// names (#219 review, round 2): a directory at its data temp name on
+/// cold-a, the first copy target, is moved aside alone, nothing sealed
+/// of it moves, and a later healthy part Q reaches both targets. Without
+/// the move, every pass stops cold-a on EISDIR before Q.
+#[test]
+fn r2b_a_stuck_temp_name_of_a_lost_path_moves_alone() {
+    let fixture = Fixture::new("r2b-stuck-lost");
+    assert_eq!(fixture.pass().problems, Vec::<String>::new());
+    let new = fixture.seal("binance-um", "aggTrade", D0 + 6_000, 2);
+    assert_eq!(new.len(), 1, "{new:?}");
+    let path = new[0].clone();
+    let sha = replica::sealed_manifest(&fixture.hot, &path)
+        .unwrap()
+        .unwrap()
+        .1
+        .sha256;
+    CopyLedger::at(&fixture.hot)
+        .append(&Record {
+            at_ms: D0 + HOUR,
+            kind: Kind::Lost {
+                path: path.clone(),
+                origin: LostOrigin::Verify,
+                sha256: Some(sha),
+            },
+        })
+        .unwrap();
+    let cold_a = &fixture.cold[0];
+    let name = temp_of(&path, TempName::Data);
+    plant(cold_a, &name, &Plant::Dir);
+    let at = D0 + 2 * HOUR;
+    let report = repair(&fixture, at);
+    assert!(
+        report.problems.iter().any(|p| p.contains(&path)
+            && p.contains("cold-a")
+            && p.contains(name.as_str())
+            && p.contains("moved aside")),
+        "{report:?}"
+    );
+    assert!(
+        !report.problems.iter().any(|p| p.contains("stopped")),
+        "{report:?}"
+    );
+    assert!(!cold_a.join(&name).exists());
+    assert_eq!(moved_names(cold_a, at), vec![name.clone()]);
+    let q = fixture.seal("binance-um", "aggTrade", D0 + 9_000, 2);
+    assert_eq!(q.len(), 1, "{q:?}");
+    let pass = fixture.pass();
+    assert!(
+        !pass.problems.iter().any(|p| p.contains("stopped")),
+        "{pass:?}"
+    );
+    for root in &fixture.cold {
+        assert!(root.join(&q[0]).exists(), "{}", root.display());
+    }
+}

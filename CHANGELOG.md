@@ -1147,7 +1147,9 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   archive part no current import entry lists. A copy the pass accepts
   stays and is recorded; another self-consistent file under the path is
   refused and never moved (#227 decides it); read-only roots are never
-  written.
+  written. A temp name of the file the pass cannot remove (a directory),
+  which would stop that target in every pass, is moved aside alone with a
+  `FAIL:` line, whatever hot's copy is, a lost file's included.
 - **Store locks are released explicitly (#220).** Dropping a pass,
   verify, writer or copy-ledger lock now unlocks it instead of only closing
   its descriptor, so a child process started by another thread can no

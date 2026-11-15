@@ -48,9 +48,13 @@
 //!   the pass's copy cannot remove (a directory: that copy removes both
 //!   temp names by unlink before it copies, publishes or records, so every
 //!   pass would stop the target on it) beside an absent form or a copy the
-//!   pass accepts is moved aside alone under the same gates, with a
-//!   `FAIL:` (#219 review); the accepted copy stays in place. A form the
-//!   pass refuses moves with its temp names.
+//!   pass accepts is moved aside alone, with a `FAIL:` (#219 review); the
+//!   accepted copy stays in place. That move keeps the marker and archive
+//!   gates but not hot's: a temp name is no sealed file and no copy, and
+//!   the pass meets it whatever hot's data is (#219 review, round 2). For
+//!   the same reason a lost path's temp names the pass cannot remove move
+//!   alone, while its form is never judged. A form the pass refuses moves
+//!   with its temp names.
 //! - **R3 Sources, in order:** hot, then every cold root in configuration
 //!   order (copy targets and read-only roots alike), never the destination.
 //!   A source counts only when its manifest text equals the ledger's byte
@@ -548,7 +552,9 @@ fn r2b_form(root: &Path, path: &str, text: &str) -> Result<Form, RawStoreError> 
 /// the pass, in every pass. A name that cannot be inspected counts too, as
 /// in `restore::unrecorded_copy`, and its failed move names the error. Every
 /// other entry there, a dangling symlink or an unreadable file included,
-/// the copy removes as debris.
+/// the copy unlinks as debris, unless the partition directory refuses the
+/// unlink (no write permission, EACCES): no move can clear that, since a
+/// rename needs the same permission, and the pass names the error itself.
 fn stuck_temps(root: &Path, path: &str) -> Vec<(PathBuf, String)> {
     let mut stuck = Vec::new();
     for name in [TempName::Data, TempName::Manifest] {
@@ -572,9 +578,47 @@ enum Found {
     Refused(String),
     /// A form that cannot be read, with the error.
     Unreadable(String),
-    /// Temp names the pass's copy cannot remove beside an absent form
-    /// (`false`) or an accepted copy (`true`), from [`stuck_temps`].
-    Stuck(Vec<(PathBuf, String)>, bool),
+    /// Temp names the pass's copy cannot remove, from [`stuck_temps`],
+    /// and what is beside them.
+    Stuck(Vec<(PathBuf, String)>, Beside),
+}
+
+/// What is beside the temp names R2b moves alone ([`Found::Stuck`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Beside {
+    /// Neither the data nor the manifest of the path.
+    Absent,
+    /// A copy the pass accepts, which stays in place.
+    Accepted,
+    /// A form never judged: the path is recorded lost (R9's), and only its
+    /// temp names move (#219 review, round 2).
+    Lost,
+}
+
+/// How R2b's report of the moved temp names of a path whose form is
+/// `beside` ends, with hot's copy `hot` checked against the text.
+fn stuck_then(beside: Beside, hot: &Result<CopyCheck, RawStoreError>) -> String {
+    let good = matches!(hot, Ok(CopyCheck::Good));
+    let repairs = "R4 repairs hot when the copy ledger records its text and a cold root holds a \
+                   good copy";
+    match beside {
+        Beside::Lost => "nothing else of the path there is judged or moved".to_owned(),
+        Beside::Accepted if good => {
+            "the copy there stays in place, and the closing pass records it".to_owned()
+        }
+        Beside::Absent if good => {
+            "the closing pass copies the path from hot and records it".to_owned()
+        }
+        Beside::Accepted => format!(
+            "the copy there stays in place; hot's copy is not good ({}), and {repairs}",
+            hot_check(hot)
+        ),
+        Beside::Absent => format!(
+            "hot's copy is not good ({}), so the closing pass copies nothing of the path from \
+             hot; {repairs}; then run the repair again",
+            hot_check(hot)
+        ),
+    }
 }
 
 /// What a hot copy that does not check good is, for R2b's report.
@@ -899,7 +943,11 @@ impl Repair<'_> {
             }
         };
         for path in &listing {
-            if self.removed.contains(partition_of(path)) || !r2b_takes(self.state.verdict(path)) {
+            let verdict = self.state.verdict(path);
+            // A lost path's form is R9's, but the closing pass still meets
+            // its temp names (#219 review, round 2).
+            let lost = verdict == Some(PathVerdict::Lost);
+            if self.removed.contains(partition_of(path)) || !(lost || r2b_takes(verdict)) {
                 continue;
             }
             let missing: Vec<usize> = targets
@@ -922,10 +970,22 @@ impl Repair<'_> {
             let mut candidates: Vec<(usize, Found)> = Vec::new();
             for i in missing {
                 let name = self.name(i);
+                if lost {
+                    let stuck = stuck_temps(&self.marked[i].path, path);
+                    if !stuck.is_empty() {
+                        candidates.push((i, Found::Stuck(stuck, Beside::Lost)));
+                    }
+                    continue;
+                }
                 match r2b_form(&self.marked[i].path, path, &text) {
                     Ok(Form::Judged(UnrecordedCopy::Absent | UnrecordedCopy::Accepted)) => {}
                     Ok(Form::Stuck { stuck, accepted }) => {
-                        candidates.push((i, Found::Stuck(stuck, accepted)));
+                        let beside = if accepted {
+                            Beside::Accepted
+                        } else {
+                            Beside::Absent
+                        };
+                        candidates.push((i, Found::Stuck(stuck, beside)));
                     }
                     Ok(Form::Judged(UnrecordedCopy::OtherFile)) => self.problem(format!(
                         "{path} on {name}: refused: it holds no recorded copy but a \
@@ -946,23 +1006,33 @@ impl Repair<'_> {
             let found = |judged: &Found| match judged {
                 Found::Refused(why) => format!("its copy does not verify ({why})"),
                 Found::Unreadable(error) => format!("its copy cannot be read ({error})"),
-                Found::Stuck(stuck, accepted) => format!(
-                    "{}, beside {}, which the pass's D5 copy cannot remove",
-                    if *accepted {
-                        "a copy the pass accepts"
-                    } else {
-                        "neither its data nor its manifest"
-                    },
-                    stuck
+                Found::Stuck(stuck, beside) => {
+                    let names = stuck
                         .iter()
-                        .map(|(file, what)| format!(
-                            "{}/{} ({what})",
-                            partition_of(path),
-                            file.file_name().unwrap_or_default().to_string_lossy()
-                        ))
+                        .map(|(file, what)| {
+                            format!(
+                                "{}/{} ({what})",
+                                partition_of(path),
+                                file.file_name().unwrap_or_default().to_string_lossy()
+                            )
+                        })
                         .collect::<Vec<_>>()
-                        .join(", ")
-                ),
+                        .join(", ");
+                    match beside {
+                        Beside::Lost => format!(
+                            "the path is recorded lost, so its form there is not judged (R9's), \
+                             but the pass's D5 copy cannot remove {names}"
+                        ),
+                        Beside::Accepted => format!(
+                            "a copy the pass accepts, beside {names}, which the pass's D5 copy \
+                             cannot remove"
+                        ),
+                        Beside::Absent => format!(
+                            "neither its data nor its manifest, beside {names}, which the pass's \
+                             D5 copy cannot remove"
+                        ),
+                    }
+                }
             };
             if replicate::is_archive_part(path) && !self.listed(path, &text) {
                 let why = if self.archive.is_none() {
@@ -981,23 +1051,27 @@ impl Repair<'_> {
                 }
                 continue;
             }
+            // A form moves only once hot's copy checks good, since the
+            // closing pass replaces it from hot only. A temp name the pass
+            // cannot remove is no sealed file and no copy, and the pass
+            // meets it whatever hot's data is, so it moves regardless
+            // (#219 review, round 2).
             let hot = replica::check_sealed_copy(self.hot, path, &text);
-            if !matches!(hot, Ok(CopyCheck::Good)) {
-                for (i, judged) in &candidates {
-                    let name = self.name(*i);
-                    self.problem(format!(
-                        "{path} on {name}: no copy record, and {}; not moved: hot's copy is not \
-                         good ({}), and the closing pass copies from hot only. R4 repairs hot \
-                         when the copy ledger records its text and a cold root holds a good \
-                         copy; then run the repair again (ADR-062 D11)",
-                        found(judged),
-                        hot_check(&hot)
-                    ));
-                }
-                continue;
-            }
+            let good = matches!(hot, Ok(CopyCheck::Good));
             for (i, judged) in candidates {
-                self.move_unrecorded(i, path, &found(&judged), &judged)?;
+                if good || matches!(judged, Found::Stuck(..)) {
+                    self.move_unrecorded(i, path, &found(&judged), &judged, &hot)?;
+                    continue;
+                }
+                let name = self.name(i);
+                self.problem(format!(
+                    "{path} on {name}: no copy record, and {}; not moved: hot's copy is not good \
+                     ({}), and the closing pass copies from hot only. R4 repairs hot when the \
+                     copy ledger records its text and a cold root holds a good copy; then run \
+                     the repair again (ADR-062 D11)",
+                    found(&judged),
+                    hot_check(&hot)
+                ));
             }
         }
         Ok(())
@@ -1018,16 +1092,18 @@ impl Repair<'_> {
     }
 
     /// R2b's move-aside (R5) of the unrecorded copy of `path` on the
-    /// marked target `i`, which `found` describes and `judged` is; an
-    /// unreadable one is a problem (#219 STOP 1 decision 2), and so are
-    /// temp names the pass's copy cannot remove (#219 review), which move
-    /// alone: a copy the pass accepts beside them stays in place.
+    /// marked target `i`, which `found` describes and `judged` is, with
+    /// hot's copy `hot` checked against the text; an unreadable one is a
+    /// problem (#219 STOP 1 decision 2), and so are temp names the pass's
+    /// copy cannot remove (#219 review), which move alone: a copy the pass
+    /// accepts beside them stays in place, and so does a lost path's form.
     fn move_unrecorded(
         &mut self,
         i: usize,
         path: &str,
         found: &str,
         judged: &Found,
+        hot: &Result<CopyCheck, RawStoreError>,
     ) -> Result<(), Stop> {
         if !self.marker_present(i) {
             return Ok(());
@@ -1035,8 +1111,8 @@ impl Repair<'_> {
         let root = self.marked[i].path.clone();
         let name = self.name(i);
         let aside = replica::damaged_dir(&root, self.run_ms);
-        if let Found::Stuck(stuck, accepted) = judged {
-            return self.move_stuck(i, path, found, stuck, *accepted);
+        if let Found::Stuck(stuck, beside) = judged {
+            return self.move_stuck(i, path, found, stuck, &stuck_then(*beside, hot));
         }
         let moved = match replica::move_aside(&root, path, &aside) {
             Ok(moved) => moved,
@@ -1075,15 +1151,15 @@ impl Repair<'_> {
     /// `i` that the pass's copy cannot remove, each by itself into
     /// `.mie/damaged/<at_ms>/` under its own relative name, as the hot
     /// restore's H6 k2 moves a temp name; `found` describes them, and
-    /// `accepted` says the target holds a copy the pass accepts beside
-    /// them, which is never moved. A `FAIL:`, as for an unreadable copy.
+    /// `then` ends the report ([`stuck_then`]). Nothing beside them is
+    /// moved. A `FAIL:`, as for an unreadable copy.
     fn move_stuck(
         &mut self,
         i: usize,
         path: &str,
         found: &str,
         stuck: &[(PathBuf, String)],
-        accepted: bool,
+        then: &str,
     ) -> Result<(), Stop> {
         let root = self.marked[i].path.clone();
         let name = self.name(i);
@@ -1109,11 +1185,6 @@ impl Repair<'_> {
         if moved.is_empty() {
             return Ok(());
         }
-        let then = if accepted {
-            "the copy there stays in place, and the closing pass records it"
-        } else {
-            "the closing pass copies the path from hot and records it"
-        };
         self.problem(format!(
             "{path} on {name}: no copy record, and {found}, so every pass stops this target on \
              it: {} moved aside into {}; {then} (ADR-062 D11)",

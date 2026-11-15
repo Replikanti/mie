@@ -3599,11 +3599,18 @@ it with the text's SHA-256, since the closing pass copies nothing else
 (D11). A temp name of the path that the pass's D5 copy cannot remove (a
 directory: the copy removes both temp names by unlink before it copies,
 publishes or records, and every pass would stop the target on it) is
-moved aside alone under the same conditions when the form beside it is
-absent or a copy the pass accepts, with a `FAIL:`; the accepted copy
-stays in place. R2b writes no record and copies nothing; the closing
-pass copies the path from hot and appends its records, so the D5 guard,
-the `manifest`-record order and the archive-entry gate stay in one place.
+moved aside alone when the form beside it is absent or a copy the pass
+accepts, with a `FAIL:`; the accepted copy stays in place. That move
+keeps the marker and archive-entry conditions but not hot's: a temp name
+is no sealed file and no copy, so D5 is not at stake, and the pass meets
+it whatever hot's data is. A lost path's temp names the pass cannot
+remove move alone the same way; its form is R9's and never judged. A
+regular temp file in a partition directory the process cannot write is
+no such case: the pass's unlink fails with EACCES, a rename would fail
+the same way, and the pass names the error itself. R2b writes no record
+and copies nothing; the closing pass copies the path from hot and appends
+its records, so the D5 guard, the `manifest`-record order and the
+archive-entry gate stay in one place.
 No record kind, ledger format or `replica` function changes.
 
 **Sentences above that now describe the state before #219.** They stay
