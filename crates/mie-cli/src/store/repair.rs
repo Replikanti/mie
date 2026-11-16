@@ -105,8 +105,9 @@
 //!   lines verifying is a fork, and a line that verifies is never
 //!   overwritten by bytes that do not); then hot's line Intact, or Failed
 //!   and recorded lost, with every contradicting line Failed settles the
-//!   line with no count (a recorded line settles nothing else, and a stale
-//!   record, whose bytes changed, matches nothing), and any other line,
+//!   line with no count (a recorded line only against lines of its own
+//!   span, as R7a judges the copies, and nothing else; a stale record,
+//!   whose bytes changed, matches nothing), and any other line,
 //!   where a check is missing, is ADR-065 D8's
 //!   strict majority unchanged: more than half of the journals that hold a
 //!   byte at p, hot included, hold hot's byte. So a journal without
@@ -116,7 +117,7 @@
 //!   cannot be read refuses. Otherwise refused, naming the byte and why:
 //!   hot's line fails its check and is not recorded lost (hot's journal is
 //!   the suspect), or is recorded but a journal's line there carries no
-//!   check; a copy's
+//!   check or fails over another span; a copy's
 //!   line verifies; or, without checks, one copy against hot (one against
 //!   one) cannot be attributed, and when every other copy agrees with this
 //!   one against hot at d, hot's journal is named as the suspect. The
@@ -229,6 +230,11 @@ thread_local! {
     /// Test hook: runs once after the run's ledger read and marker reads,
     /// before R1 (a concurrent removal, an unmount mid-run).
     pub(crate) static BEFORE_WORK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+    /// Test hook: runs once in R7a's recordable test, after the journal
+    /// copies are read and before the markers are read again (an unmount
+    /// in between).
+    pub(crate) static BEFORE_MARKER_REREAD: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         std::cell::RefCell::new(None);
 }
 
@@ -1945,6 +1951,10 @@ impl Repair<'_> {
                 refusals.join("; ")
             ));
         }
+        #[cfg(test)]
+        if let Some(hook) = BEFORE_MARKER_REREAD.with(|hook| hook.borrow_mut().take()) {
+            hook();
+        }
         for &i in targets {
             let root = &self.marked[i];
             match root_marker::read(&root.path) {
@@ -2052,8 +2062,10 @@ impl Repair<'_> {
                 } => format!(
                     " {rebuild}, and hot's line from byte {line_start}, which a copy contradicts \
                      at byte {at}, fails its check and is recorded lost, but a journal's line \
-                     there carries no check: a lost-line record settles a line only against \
-                     lines that fail their checks too. {repair_hot} (ADR-066 D5, D8)"
+                     there carries no check, or fails its check over another span (it may hold \
+                     the line's true bytes): a lost-line record settles a line only against \
+                     lines of the same span that fail their checks too. {repair_hot} (ADR-066 \
+                     D5, D8)"
                 ),
                 Contest::Fork { at, witness, hot } => {
                     let holder = if witness == 0 {
@@ -2061,14 +2073,21 @@ impl Repair<'_> {
                     } else {
                         format!("the journal copy {}", witnesses[witness].display())
                     };
-                    let why = if hot == LineCheck::Intact {
-                        "hot's line there verifies too: both sides hold lines as written, a fork, \
-                         which no byte count decides"
-                            .to_owned()
-                    } else {
-                        "hot's line there carries no check, and a line that verifies is never \
-                         overwritten by bytes that do not"
-                            .to_owned()
+                    let why = match hot {
+                        LineCheck::Intact => {
+                            "hot's line there verifies too: both sides hold lines as written, a \
+                             fork, which no byte count decides"
+                        }
+                        LineCheck::Failed => {
+                            "hot's line there fails its check and is recorded lost: the copy \
+                             holds the line as written, which `mie store repair-hot --scope \
+                             journal` restores to hot (the record then goes stale), and a line \
+                             that verifies is never overwritten by bytes that do not"
+                        }
+                        LineCheck::Unchecked => {
+                            "hot's line there carries no check, and a line that verifies is never \
+                             overwritten by bytes that do not"
+                        }
                     };
                     format!(
                         " {rebuild}, and the line of {holder} that holds byte {at} verifies its \
@@ -2291,7 +2310,8 @@ pub(super) enum Contest {
     /// contradicts it at byte `at`: hot's bytes there are not the bytes
     /// written, whatever a majority holds. With `recorded`, a lost-line
     /// record matches it (ADR-066 D8), and a contradicting witness line
-    /// carries no check, which a record does not settle.
+    /// carries no check or fails its check over another span, which a
+    /// record does not settle.
     HotLineFails {
         /// The first contradicted byte of the line.
         at: u64,
@@ -2394,8 +2414,9 @@ pub(super) fn held_line(path: &Path, offset: u64, len: u64) -> std::io::Result<H
 /// - hot's line that holds p Failed: [`Contest::HotLineFails`], even when
 ///   hot holds a majority, unless a record of `recorded` matches it
 ///   (ADR-066 D8): then it is settled for hot when every contradicting
-///   witness's line is Failed, refused as a fork when one is Intact, and
-///   otherwise [`Contest::HotLineFails`] with `recorded`;
+///   witness's line is Failed with hot's line's span, refused as a fork
+///   when one is Intact, and otherwise [`Contest::HotLineFails`] with
+///   `recorded`;
 /// - a contradicting witness's line (the one that holds its first byte
 ///   against hot's line) Intact: [`Contest::Fork`];
 /// - hot's line Intact and every contradicting witness's line Failed:
@@ -2477,10 +2498,19 @@ pub(super) fn journal_contest(
                     hot: line.check,
                 }));
             }
-            theirs.push(witness.check);
+            let same_span = witness.start == line.start && witness.end == line.end;
+            theirs.push((witness.check, same_span));
         }
-        let settled = (line.check == LineCheck::Intact || accepted)
-            && theirs.iter().all(|c| *c == LineCheck::Failed);
+        let failed = |(check, _): &(LineCheck, bool)| *check == LineCheck::Failed;
+        // A record settles hot's line only against lines of its own span
+        // that fail their checks, the copies D8's condition 4 accepts when
+        // recording: a failed line of another span (a `\n` flipped in or
+        // out) may hold the true line's bytes (review of #233, finding 1).
+        let settled = if accepted {
+            theirs.iter().all(|witness| failed(witness) && witness.1)
+        } else {
+            line.check == LineCheck::Intact && theirs.iter().all(failed)
+        };
         if accepted && !settled {
             return Ok(Some(Contest::HotLineFails {
                 at: p,

@@ -52,8 +52,8 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   a line no copy target holds intact (every copy target must present its
   marker and its journal copy must read); it writes no journal byte, so
   `mie ingest` keeps running. A recorded line is a note in `verify` from
-  then on, and R7 rebuilds a copy whose line fails differently to hot's
-  accepted bytes; `repair-hot --scope journal` reads the same records. A
+  then on, and R7 rebuilds a copy whose line fails differently over the
+  same span to hot's accepted bytes; `repair-hot --scope journal` reads the same records. A
   line damaged further or restored after its record fails again or leaves
   a stale note. **Downgrade:** the copy ledger's parser of an earlier
   binary refuses a ledger that holds a `lost-line` record, so after the

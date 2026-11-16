@@ -206,7 +206,8 @@ u where some witness contradicts hot (or holds a byte past hot's end):
 - p ≥ L_h → refused, as D8.
 - Hot's line holding p is Failed → refused ("hot's line fails its
   check"), even when hot holds a 2-of-3 majority. The one exception is a
-  line a lost-line record matches (D8). This closes the case ADR-065 D9
+  line a lost-line record matches, against witness lines that fail over
+  the same span (D8, *D5 with a record*). This closes the case ADR-065 D9
   cannot see: a lagging copy that took hot's damage while the good copy
   was unmounted.
 - A contradicting witness line (the witness's line that holds its first
@@ -243,8 +244,9 @@ Threshold arithmetic at k = 2, hot 1 000 B flipped or contradicted at p =
   lines' verdicts; the copy is read before hot, as V2 orders. Copy damage
   → `mie store repair`. Hot's damage → `mie store repair-hot --scope
   journal` with `mie ingest` stopped. Both verify → a fork. Hot's line
-  recorded lost (D8) and the copy's line failing too → `mie store repair`
-  makes the copy hot's bytes (D8, *D5 with a record*).
+  recorded lost (D8) and the copy's line failing too, over the same span
+  → `mie store repair` makes the copy hot's bytes (D8, *D5 with a
+  record*).
 - **V3** (hot alone) streams hot's journal. A last line without `\n` is
   not classified. Every complete Failed line is either a **FAIL** when no
   lost-line record matches it ("hot's journal line n at byte o fails its
@@ -349,10 +351,14 @@ STOP 1 decision 3).
   matches nothing and is a stale note. Records are never removed (the
   ledger is append-only).
 - **D5 with a record.** Hot's line is Failed but recorded: settled for hot
-  when every contradicting witness line is Failed; a verifying witness
-  line still refuses, and so does a witness line without a check (a record
-  settles a line only against lines that fail theirs, which is what the
-  recording judged); a stale record settles nothing. So R7 brings a
+  when every contradicting witness line is Failed with the same start and
+  end as hot's line; a verifying witness line still refuses, and so does a
+  witness line without a check or one that fails over another span (a
+  record settles a line only against the copy lines condition 4 accepts,
+  which is what the recording judged: a failed line of another span, a
+  `\n` flipped in or out, may hold the true line's bytes, and a copy
+  target absent from the configuration when the record was written was
+  never judged); a stale record settles nothing. So R7 brings a
   differently damaged copy to hot's accepted bytes, and V4's FAIL clears.
   `repair-hot --scope journal` reads the same records for the shared
   function, so the two commands agree; when it cannot read the ledger it

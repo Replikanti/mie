@@ -76,8 +76,8 @@
 //!     verifies, damage on the copy (`mie store repair`); hot's fails and
 //!     the copy's verifies, damage on hot (`mie store repair-hot --scope
 //!     journal`, with `mie ingest` stopped); both verify, a fork; both
-//!     fail and a `lost-line` record matches hot's line (ADR-066 D8), `mie
-//!     store repair` makes the copy hot's bytes. Where neither line
+//!     fail over the same span and a `lost-line` record matches hot's line
+//!     (ADR-066 D8), `mie store repair` makes the copy hot's bytes. Where neither line
 //!     verifies otherwise, no clause.
 //!   - *Records:* each recorded finding is appended as soon as it is found
 //!     (the remover counts a damaged copy until its finding exists, and a
@@ -1270,9 +1270,9 @@ fn describe(check: CopyCheck, path: &str) -> String {
 
 /// V4's attribution of a journal `prefix` finding at byte `offset`
 /// (ADR-066 D6): a clause from the verdicts of the copy's line and hot's
-/// line that hold it, the copy read first (V2). Where both fail and a
-/// record of `recorded` matches hot's line (ADR-066 D8), R7 makes the copy
-/// hot's bytes. Empty where neither side verifies otherwise, so a line
+/// line that hold it, the copy read first (V2). Where both fail over the
+/// same span and a record of `recorded` matches hot's line (ADR-066 D8),
+/// R7 makes the copy hot's bytes. Empty where neither side verifies otherwise, so a line
 /// without a check is reported as before.
 fn attribution(
     copy: &Path,
@@ -1282,9 +1282,9 @@ fn attribution(
     offset: u64,
     recorded: &[LostLine],
 ) -> Result<&'static str, Stop> {
-    let theirs = held_line(copy, offset, copy_len)
-        .map_err(|error| Stop::Root(format!("reading {}: {error}", copy.display())))?
-        .check;
+    let copy_line = held_line(copy, offset, copy_len)
+        .map_err(|error| Stop::Root(format!("reading {}: {error}", copy.display())))?;
+    let theirs = copy_line.check;
     let hot_error = |error: std::io::Error| {
         Stop::Root(format!(
             "reading hot's journal {}: {error}",
@@ -1293,7 +1293,11 @@ fn attribution(
     };
     let hot_line = held_line(journal, offset, hot_len).map_err(hot_error)?;
     let hot = hot_line.check;
+    // R7 settles a recorded line only against a copy line of its own span
+    // (ADR-066 D8, review of #233, finding 1).
+    let same_span = (copy_line.start, copy_line.end) == (hot_line.start, hot_line.end);
     if (theirs, hot) == (LineCheck::Failed, LineCheck::Failed)
+        && same_span
         && is_recorded(journal, &hot_line, recorded).map_err(hot_error)?
     {
         return Ok(

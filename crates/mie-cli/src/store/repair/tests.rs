@@ -2390,3 +2390,144 @@ fn record_lost_lines_runs_beside_a_capture() {
     drop(journal);
     assert_eq!(lost_records(&fixture).len(), 1);
 }
+
+// ------------------------------------------- review of #233 (ADR-066 D8)
+
+/// Appends the `lost-line` record of hot's line 3 of [`five`] (bytes
+/// `[400, 600)` of `hot`).
+fn record_line_3(fixture: &Fixture, hot: &[u8]) {
+    CopyLedger::at(&fixture.hot)
+        .append(&Record {
+            at_ms: D0,
+            kind: Kind::LostLine {
+                journal: "journal.jsonl".to_owned(),
+                line: 3,
+                offset: 400,
+                sha256: copy_ledger::line_sha256(&hot[400..599]),
+            },
+        })
+        .unwrap();
+}
+
+/// A record settles hot's line only against copy lines that fail their
+/// check over the same span, as recording judges them (D8 condition 4).
+/// cold-a holds line 3 as written with its `\n` at 599 flipped: one merged
+/// line [400, 800) that fails its check and holds the true line's bytes.
+/// D5 refuses (hot's line recorded, the copy's line of another span), V4
+/// does not point to `mie store repair`, and R7 leaves cold-a untouched.
+#[test]
+fn d5_a_recorded_line_does_not_settle_a_copy_line_of_another_span() {
+    let good = five(true);
+    let hot = flipped(&good, &[450]);
+    let merged = flipped(&good, &[599]);
+    let record = [lost(3, 400, &hot[400..600])];
+    let journals = Journals::new(&hot, &[&merged]);
+    assert_eq!(
+        journal_contest(&journals.hot, &journals.refs(), 0, u64::MAX, &record).unwrap(),
+        Some(Contest::HotLineFails {
+            at: 450,
+            line_start: 400,
+            recorded: true
+        })
+    );
+    // The same span still settles (the line fails differently).
+    let same = flipped(&good, &[460]);
+    let journals = Journals::new(&hot, &[&same]);
+    assert_eq!(
+        journal_contest(&journals.hot, &journals.refs(), 0, u64::MAX, &record).unwrap(),
+        None
+    );
+
+    let fixture = with_journal("d5-recorded-span", &good);
+    overwrite(&fixture.config.paths.journal, &hot);
+    overwrite(&copy_of(&fixture.cold[0]), &merged);
+    overwrite(&copy_of(&fixture.cold[1]), &hot);
+    record_line_3(&fixture, &hot);
+    let report = verify_at(&fixture, D0 + HOUR);
+    assert_any(&report.problems, &["(cold-a)", "prefix: byte 450"]);
+    assert!(
+        !report
+            .problems
+            .iter()
+            .any(|p| p.contains("makes the copy hot's bytes")),
+        "{report:#?}"
+    );
+    let report = repair_flags(&fixture, D0 + 2 * HOUR, false);
+    assert_any(
+        &report.problems,
+        &[
+            "cold-a",
+            "refused",
+            "is recorded lost",
+            "of the same span",
+            "mie store repair-hot --scope journal",
+        ],
+    );
+    assert_eq!(fs::read(copy_of(&fixture.cold[0])).unwrap(), merged);
+}
+
+/// R7's fork refusal follows hot's verdict: against a copy line that
+/// verifies, a recorded hot line is named as failing its check (repair-hot
+/// restores it from the copy), never as carrying no check.
+#[test]
+fn r7_fork_text_names_a_recorded_hot_line_as_failing() {
+    let good = five(true);
+    let hot = flipped(&good, &[450]);
+    let fixture = with_journal("r7-fork-recorded", &good);
+    overwrite(&fixture.config.paths.journal, &hot);
+    overwrite(&copy_of(&fixture.cold[1]), &hot);
+    record_line_3(&fixture, &hot);
+    let report = verify_at(&fixture, D0 + HOUR);
+    assert_any(&report.problems, &["(cold-a)", "prefix: byte 450"]);
+    let report = repair_flags(&fixture, D0 + 2 * HOUR, false);
+    assert_any(
+        &report.problems,
+        &[
+            "cold-a",
+            "refused",
+            "verifies its check",
+            "hot's line there fails its check and is recorded lost",
+            "mie store repair-hot --scope journal",
+        ],
+    );
+    assert!(
+        !report
+            .problems
+            .iter()
+            .any(|p| p.contains("carries no check, and a line that verifies")),
+        "{report:#?}"
+    );
+    assert_eq!(fs::read(copy_of(&fixture.cold[0])).unwrap(), good);
+}
+
+/// D8 condition 2 at the decision: a target unmounted after its journal
+/// copy was read (its marker and its copy gone together) refuses the
+/// record, since the markers are read again after the copies.
+#[test]
+fn record_lost_lines_refuses_a_target_unmounted_after_the_copy_reads() {
+    let six = six();
+    let fixture = with_journal("r7a-unmount", &six[..1000]);
+    overwrite(&fixture.config.paths.journal, &flipped(&six, &[1050]));
+    let cold_b = fixture.cold[1].clone();
+    let away = cold_b.with_extension("away");
+    BEFORE_MARKER_REREAD.with(|hook| {
+        let (cold_b, away) = (cold_b.clone(), away.clone());
+        *hook.borrow_mut() = Some(Box::new(move || {
+            fs::rename(&cold_b, &away).unwrap();
+            fs::create_dir(&cold_b).unwrap();
+        }));
+    });
+    let report = repair_flags(&fixture, D0 + 2 * HOUR, true);
+    BEFORE_MARKER_REREAD.with(|hook| assert!(hook.borrow().is_none(), "the hook never ran"));
+    fs::remove_dir(&cold_b).unwrap();
+    fs::rename(&away, &cold_b).unwrap();
+    assert_any(
+        &report.problems,
+        &[
+            "line 6 at byte 1000",
+            "not recordable in this run",
+            "no longer presents its marker",
+        ],
+    );
+    assert!(lost_records(&fixture).is_empty());
+}
