@@ -368,6 +368,7 @@ USAGE:
         the finding, and exits 1.
 
     mie store repair --config <path> [--archive-config <path>] [--record-lost]
+                     [--record-lost-lines]
         Repair the copies of a tiered raw store (ADR-062 D11) that mie store
         verify recorded as damaged or missing, and fill the copy targets
         that lack files which left hot (a target added or replaced). It
@@ -396,7 +397,14 @@ USAGE:
         those roots.
         --record-lost then appends its lost record, after which every
         replay that covers it fails, so pass it only after a run without it
-        reported the file. Replication pauses while the repair runs; it
+        reported the file. A complete line of hot's journal that fails its
+        check (ADR-066) is named; one that no copy target holds intact, while
+        every copy target carries its marker and its journal copy reads, can
+        be recorded lost: --record-lost-lines appends its lost-line record,
+        after which mie store verify lists the line as a note instead of a
+        FAIL, so pass it only after a run without it named the line and a
+        shared cause is ruled out. It writes no journal byte, so mie ingest
+        keeps running. Replication pauses while the repair runs; it
         ends with one replication pass. Refused like mie store verify, and
         when a replication pass runs. Prints what it repaired and the
         pass's lines, then PASS and exits 0, or one FAIL: <reason> line per
@@ -1038,7 +1046,7 @@ fn dispatch(args: &[String]) -> Result<ExitCode, String> {
                 let options = Options::parse(
                     &args[2..],
                     &["--config", "--archive-config"],
-                    &["--record-lost"],
+                    &["--record-lost", "--record-lost-lines"],
                 )?;
                 let config =
                     IngestConfig::load(&options.path("--config")?).map_err(|e| e.to_string())?;
@@ -1049,7 +1057,10 @@ fn dispatch(args: &[String]) -> Result<ExitCode, String> {
                 let pass = store::repair(
                     &config,
                     archive.as_deref(),
-                    options.flag("--record-lost"),
+                    store::repair::Flags {
+                        record_lost: options.flag("--record-lost"),
+                        record_lost_lines: options.flag("--record-lost-lines"),
+                    },
                     probe.as_ref(),
                     &now_ms,
                     &mut std::io::stdout().lock(),
@@ -1186,7 +1197,8 @@ fn dispatch(args: &[String]) -> Result<ExitCode, String> {
                  [--archive-config <path>] --from <path> [--journal <path>] [--import-ledger \
                  <dir>]`, `mie store verify --config <path> [--archive-config <path>] \
                  --period-hours <P>`, `mie store repair --config <path> [--archive-config \
-                 <path>] [--record-lost]`, `mie store rebuild --config <path> \
+                 <path>] [--record-lost] [--record-lost-lines]`, `mie store rebuild --config \
+                 <path> \
                  [--archive-config <path>] [--record-lost] [--record-unlisted] \
                  [--replace-hot-ledger]`, `mie store restore --config <path> \
                  [--archive-config <path>] [--record-lost] [--skip-unreadable-journal]`, `mie \

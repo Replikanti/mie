@@ -25,8 +25,20 @@
 //! - **V3 Hot, report only.** Every sealed file on hot is checked against
 //!   the ledger's `manifest` record (hot's own text when there is none),
 //!   and every ordinary recorded path that hot lacks although its partition
-//!   is not recorded removed is named. Nothing is recorded: ledger records
-//!   name copy targets only, and the hot copy never counts (D11).
+//!   is not recorded removed is named. Hot's journal is streamed up to the
+//!   length read at its start, one line at a time (ADR-066 D6): a last line
+//!   without its `\n` may be in the middle of being written and is not
+//!   classified; every complete line that fails its check (ADR-066 D2) is a
+//!   `FAIL` naming both remedies (`mie store repair-hot --scope journal`
+//!   when a copy holds it intact, else `mie store repair
+//!   --record-lost-lines`), unless a `lost-line` record of the journal's
+//!   file name matches it (it starts at the record's offset and its bytes
+//!   have the record's digest, ADR-066 D8), which makes it a listed note;
+//!   a record that matches no line is a stale note. A summary line counts
+//!   the complete lines, intact, without the check, failed and recorded.
+//!   Nothing is recorded: ledger records name copy targets only, and the
+//!   hot copy never counts (D11); so an unrecorded failed line fails every
+//!   run, and a recorded one never turns verify red again.
 //! - **V4 Per copy target R** that presents its marker, in configuration
 //!   order, one walk with `at_ms` = now at its start; the marker is re-read
 //!   before every record about R.
@@ -63,8 +75,10 @@
 //!     (ADR-066 D6), the copy read first: the copy's fails and hot's
 //!     verifies, damage on the copy (`mie store repair`); hot's fails and
 //!     the copy's verifies, damage on hot (`mie store repair-hot --scope
-//!     journal`, with `mie ingest` stopped); both verify, a fork. Where
-//!     neither line verifies, no clause.
+//!     journal`, with `mie ingest` stopped); both verify, a fork; both
+//!     fail and a `lost-line` record matches hot's line (ADR-066 D8), `mie
+//!     store repair` makes the copy hot's bytes. Where neither line
+//!     verifies otherwise, no clause.
 //!   - *Records:* each recorded finding is appended as soon as it is found
 //!     (the remover counts a damaged copy until its finding exists, and a
 //!     walk takes long), with R's root and `at_ms`; after the walk comes
@@ -91,10 +105,12 @@
 //!   seal pass and a pass running while a part seals leaves one wake-up
 //!   behind, so a healthy replicator copies a part within two intervals. A
 //!   future mtime is never exempt.
-//! - **V9 Output.** One summary line per root, then the `FAIL:` lines:
-//!   hot; each root in configuration order (data paths in path order, then
-//!   entries, the copy ledger and the journal); then `stale`; then one line
-//!   per file with fewer than k good copies. That last check needs every
+//! - **V9 Output.** One summary line per root (hot's followed by its
+//!   journal's summary and notes), then the `FAIL:` lines: hot (its sealed
+//!   files, then its journal's lines); each root in configuration order
+//!   (data paths in path order, then entries, the copy ledger and the
+//!   journal); then `stale`; then one line per file with fewer than k good
+//!   copies. That last check needs every
 //!   copy target verified in this run; otherwise the `not verified` and
 //!   `stale` lines stand in for it, instead of one line per file of the
 //!   whole store. `PASS` only without any `FAIL` line.
@@ -102,7 +118,7 @@
 //!   only writer of a second `copy` record for a copy S records, so a
 //!   finding never voids a copy made after S.
 
-use super::repair::held_line;
+use super::repair::{JournalScan, held_line, is_recorded, journal_name, renumbered, scan_journal};
 use super::replicate::{
     self, Entry, IMPORT_LEDGER_DIR, JOURNAL_DIR, LedgerAppend, META_DIR, hot_entries,
     is_archive_part,
@@ -116,7 +132,7 @@ use mie_adapter_parquet::copy_ledger::{
 };
 use mie_adapter_parquet::replica::{self, CopyCheck, CopyError, Side, TailSource};
 use mie_adapter_parquet::root_marker::{self, HOT_ID};
-use mie_adapter_parquet::verification::{CopyState, PathVerdict};
+use mie_adapter_parquet::verification::{CopyState, LostLine, PathVerdict};
 use mie_ports::raw::RawStoreError;
 use std::collections::BTreeSet;
 use std::fs;
@@ -220,6 +236,8 @@ struct Verify<'a> {
     hot_problems: Vec<String>,
     /// Hot's summary line.
     hot_line: String,
+    /// The summary and the notes of V3 over hot's journal (ADR-066 D6).
+    journal_lines: Vec<String>,
     /// Every copy-ledger truncation, as a line.
     truncations: Vec<String>,
 }
@@ -395,6 +413,7 @@ pub fn run(
         roots,
         hot_problems,
         hot_line: String::new(),
+        journal_lines: Vec::new(),
         truncations: Vec::new(),
     };
     let stopped = verify.verify_all();
@@ -552,6 +571,113 @@ impl Verify<'_> {
             self.hot.display(),
             self.listing.len()
         );
+        self.verify_hot_journal();
+    }
+
+    /// The lost-line records of hot's journal, by its file name (ADR-066
+    /// D8); none for a name that is not UTF-8.
+    fn lost_lines(&self) -> &[LostLine] {
+        journal_name(self.config).map_or(&[], |name| self.state.lost_lines(name))
+    }
+
+    /// V3 over hot's journal (ADR-066 D6), report only: every complete line
+    /// that fails its check is a `FAIL` unless a lost-line record matches
+    /// it, then a listed note; a record that matches no line is a stale
+    /// note. A last line without its `\n` may be in the middle of being
+    /// written and is not classified. Nothing is recorded (V7).
+    fn verify_hot_journal(&mut self) {
+        let journal = self.config.paths.journal.clone();
+        let len = match fs::metadata(&journal) {
+            Ok(metadata) => Some(metadata.len()),
+            Err(error) if error.kind() == ErrorKind::NotFound => None,
+            Err(error) => {
+                self.hot_problems.push(format!(
+                    "hot's journal {}: it cannot be inspected ({error}), so its lines are not \
+                     checked (ADR-066 D6)",
+                    journal.display()
+                ));
+                return;
+            }
+        };
+        let scan = match len.map(|len| scan_journal(&journal, len)) {
+            None => JournalScan::default(),
+            Some(Ok(scan)) => scan,
+            Some(Err(error)) => {
+                self.hot_problems.push(format!(
+                    "hot's journal {}: it cannot be read ({error}), so its lines are not checked \
+                     (ADR-066 D6)",
+                    journal.display()
+                ));
+                return;
+            }
+        };
+        let records = self.lost_lines().to_vec();
+        let mut matched = vec![false; records.len()];
+        let mut notes = Vec::new();
+        let mut problems = Vec::new();
+        let mut recorded = 0;
+        for line in &scan.failed {
+            let mut matching = records
+                .iter()
+                .enumerate()
+                .filter(|(_, record)| record.matches(line.start, &line.sha256))
+                .peekable();
+            let Some(&(_, first)) = matching.peek() else {
+                problems.push(format!(
+                    "hot's journal line {} at byte {} fails its check (ADR-066) and is not \
+                     recorded lost: when a copy holds it intact, `mie store repair-hot --scope \
+                     journal` (with `mie ingest` stopped) restores it; otherwise, after checking \
+                     for a shared cause, `mie store repair --record-lost-lines` records its loss",
+                    line.number, line.start
+                ));
+                continue;
+            };
+            recorded += 1;
+            notes.push(format!(
+                "note: hot's journal line {} at byte {} fails its check (ADR-066), recorded lost \
+                 at {}{} (ADR-066 D8)",
+                line.number,
+                line.start,
+                first.at_ms,
+                renumbered(first.line, line.number)
+            ));
+            for (i, _) in matching {
+                matched[i] = true;
+            }
+        }
+        for (record, _) in records
+            .iter()
+            .zip(&matched)
+            .filter(|(_, matched)| !**matched)
+        {
+            notes.push(format!(
+                "note: the lost-line record of line {} at byte {}, recorded at {}, matches no \
+                 line of hot's journal: stale: its bytes changed (ADR-066 D8)",
+                record.line, record.offset, record.at_ms
+            ));
+        }
+        let mut summary = match len {
+            None => format!("hot's journal {}: absent", journal.display()),
+            Some(_) => format!(
+                "hot's journal {}: {} complete line(s) checked: {} intact, {} without the check, \
+                 {} failed ({recorded} recorded lost)",
+                journal.display(),
+                scan.lines,
+                scan.intact,
+                scan.unchecked,
+                scan.failed.len()
+            ),
+        };
+        if scan.partial > 0 {
+            summary.push_str(&format!(
+                "; its last {} byte(s), a line without its end that may be in the middle of \
+                 being written, are not checked",
+                scan.partial
+            ));
+        }
+        self.journal_lines.push(summary);
+        self.journal_lines.extend(notes);
+        self.hot_problems.extend(problems);
     }
 
     /// Whether root `i` still presents its marker.
@@ -931,7 +1057,7 @@ impl Verify<'_> {
                 format!(
                     "prefix: byte {offset} differs from hot's journal, so the copy is not a byte \
                      prefix of it{}",
-                    attribution(copy, copy_len, journal, hot_len, offset)?
+                    attribution(copy, copy_len, journal, hot_len, offset, self.lost_lines())?
                 ),
             ))),
             Err(CopyError {
@@ -1047,6 +1173,7 @@ impl Verify<'_> {
             .filter_map(|root| root.id.clone())
             .collect();
         let mut lines = vec![std::mem::take(&mut self.hot_line)];
+        lines.append(&mut self.journal_lines);
         let mut stale = Vec::new();
         let mut all_verified = true;
         for i in 0..self.roots.len() {
@@ -1143,26 +1270,37 @@ fn describe(check: CopyCheck, path: &str) -> String {
 
 /// V4's attribution of a journal `prefix` finding at byte `offset`
 /// (ADR-066 D6): a clause from the verdicts of the copy's line and hot's
-/// line that hold it, the copy read first (V2). Empty where neither side
-/// verifies, so a line without a check is reported as before.
+/// line that hold it, the copy read first (V2). Where both fail and a
+/// record of `recorded` matches hot's line (ADR-066 D8), R7 makes the copy
+/// hot's bytes. Empty where neither side verifies otherwise, so a line
+/// without a check is reported as before.
 fn attribution(
     copy: &Path,
     copy_len: u64,
     journal: &Path,
     hot_len: u64,
     offset: u64,
+    recorded: &[LostLine],
 ) -> Result<&'static str, Stop> {
     let theirs = held_line(copy, offset, copy_len)
         .map_err(|error| Stop::Root(format!("reading {}: {error}", copy.display())))?
         .check;
-    let hot = held_line(journal, offset, hot_len)
-        .map_err(|error| {
-            Stop::Root(format!(
-                "reading hot's journal {}: {error}",
-                journal.display()
-            ))
-        })?
-        .check;
+    let hot_error = |error: std::io::Error| {
+        Stop::Root(format!(
+            "reading hot's journal {}: {error}",
+            journal.display()
+        ))
+    };
+    let hot_line = held_line(journal, offset, hot_len).map_err(hot_error)?;
+    let hot = hot_line.check;
+    if (theirs, hot) == (LineCheck::Failed, LineCheck::Failed)
+        && is_recorded(journal, &hot_line, recorded).map_err(hot_error)?
+    {
+        return Ok(
+            "; hot's line there fails its check and is recorded lost, and the copy's line \
+             fails its check too (ADR-066 D8): `mie store repair` makes the copy hot's bytes",
+        );
+    }
     Ok(match (theirs, hot) {
         (LineCheck::Failed, LineCheck::Intact) => {
             "; the copy's line there fails its check and hot's verifies (ADR-066 D6): damage on \

@@ -1,6 +1,6 @@
 # ADR-066: A per-line check in the capture journal
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-11-16
 
 Relation to earlier ADRs: this ADR gives the capture journal (ADR-039 D1,
@@ -13,11 +13,11 @@ The decisions record the #224 plan
 and its STOP 1 operator decisions (2026-11-16). Delivery is three PRs:
 the line format (D1, D2, D7), then attribution between hot and the copies
 (D4, D5, D6's V4), then hot's own failed lines and the lost-line record
-(D6's V3, D8). This ADR stays `proposed` until the third; the second may
-still edit it. At acceptance, the third records two changes on earlier
-status lines: ADR-065's (D2 and D8 for checked lines) and ADR-062's (D11
-R7's reason "the journal has no chain" for checked lines, and the copy
-ledger's `lost-line` kind with its place in D7's fold).
+(D6's V3, D8). It was `proposed` until the third PR, which accepted it
+and recorded two changes on earlier status lines: ADR-065's (D2 and D8 for
+checked lines) and ADR-062's (D11 R7's reason "the journal has no chain"
+for checked lines, and the copy ledger's `lost-line` kind with its place
+in D7's fold).
 
 ## Context
 
@@ -243,7 +243,8 @@ Threshold arithmetic at k = 2, hot 1 000 B flipped or contradicted at p =
   lines' verdicts; the copy is read before hot, as V2 orders. Copy damage
   → `mie store repair`. Hot's damage → `mie store repair-hot --scope
   journal` with `mie ingest` stopped. Both verify → a fork. Hot's line
-  recorded lost (D8) → `mie store repair` makes the copy hot's bytes.
+  recorded lost (D8) and the copy's line failing too → `mie store repair`
+  makes the copy hot's bytes (D8, *D5 with a record*).
 - **V3** (hot alone) streams hot's journal. A last line without `\n` is
   not classified. Every complete Failed line is either a **FAIL** when no
   lost-line record matches it ("hot's journal line n at byte o fails its
@@ -310,10 +311,14 @@ STOP 1 decision 3).
   repair already holds the verify and pass locks, and `--record-lost` is
   its flag for the same act on a sealed file. Why a flag of its own: a lost
   file fails every selection that covers it, while a lost line changes no
-  selection, so each is a separate consent. With the flag, the repair
-  streams hot's journal (one read of L) and records every recordable line;
-  without it, it names those lines and appends nothing. It is idempotent:
-  a line a record already matches gets no second record.
+  selection, so each is a separate consent. The repair streams hot's
+  journal (one read of L, up to the length read at the scan's start, so a
+  line a running capture is writing is never classified) and judges every
+  complete failed line no record matches. With the flag it records every
+  recordable line; without it, it names each as a problem (the repair does
+  not pass, as for a lost file) and appends nothing. A recorded line is a
+  report line, not a problem: the record is the operator's acceptance. It
+  is idempotent: a line a record already matches gets no second record.
 - **Recordable**, all four required, otherwise refused with nothing
   appended:
   1. The line is complete and Failed, and no record matches it.
@@ -322,9 +327,11 @@ STOP 1 decision 3).
      this run".
   3. Its journal copy reads; otherwise "not recordable in this run".
   4. Each copy's bytes over the line's span are absent, equal to hot's, or
-     a complete Failed line. A copy that holds the line Intact, or other
-     bytes that do not fail their check (Unchecked, or a cut line that
-     differs), refuses and names `mie store repair-hot --scope journal`.
+     a complete Failed line of the same span. A copy that holds the line
+     Intact, or other bytes that do not fail their check (Unchecked, or a
+     cut line that differs), or a Failed line of another span (a `\n`
+     flipped in or out, so the true line's bytes may sit inside a merged
+     line), refuses and names `mie store repair-hot --scope journal`.
 
   Why so strict: once recorded, D5 lets R7 write hot's accepted bytes over
   the copies the recording judged, so the recording must rule out every
@@ -343,7 +350,9 @@ STOP 1 decision 3).
   ledger is append-only).
 - **D5 with a record.** Hot's line is Failed but recorded: settled for hot
   when every contradicting witness line is Failed; a verifying witness
-  line still refuses; a stale record settles nothing. So R7 brings a
+  line still refuses, and so does a witness line without a check (a record
+  settles a line only against lines that fail theirs, which is what the
+  recording judged); a stale record settles nothing. So R7 brings a
   differently damaged copy to hot's accepted bytes, and V4's FAIL clears.
   `repair-hot --scope journal` reads the same records for the shared
   function, so the two commands agree; when it cannot read the ledger it
@@ -386,8 +395,10 @@ STOP 1 decision 3).
 - **Permanent formats.** The line member (first PR) and the `lost-line`
   kind (third PR) are permanent once on disk. Each lands alone in its own
   PR, stated normatively here and pinned by golden tests
-  (`a_written_line_has_its_golden_bytes`, and the record's golden text in
-  the third PR).
+  (`a_written_line_has_its_golden_bytes`; for the record, its line in the
+  copy ledger's golden text,
+  `golden_text_is_pinned_byte_for_byte_with_its_chain`, and
+  `lost_line_record_round_trips`).
 - **Fixture churn.** Every journal `ingest` writes gains 20 B per line, so
   tests with byte offsets or journal sizes may shift; in the first PR no
   existing test needed a change. ADR-065's offline tests, which pin the
@@ -398,8 +409,9 @@ STOP 1 decision 3).
   writer, which now hands the line and its `\n` to the `BufWriter` in one
   `write_all`. The shapes still occur: the `BufWriter` flushes at buffer
   boundaries, not at line ends (#225), and old journals keep them.
-- **Cost of the checks.** `verify`'s V3 and the flag's scan each add one
-  read of hot's journal: after a year L = 1.9–5.5 GB (ADR-062 M1-11 ×
+- **Cost of the checks.** `verify`'s V3 and the repair's scan of D8 (run
+  with or without the flag, since without it the repair names the lines)
+  each add one read of hot's journal: after a year L = 1.9–5.5 GB (ADR-062 M1-11 ×
   365), about 13–37 s at the assumed 150 MB/s, with the capture running,
   on top of the 4·L that verify already reads at k = 2. D5 scans like
   ADR-065 D8 ((k+1)·(L−u), 3·L at k = 2), plus one line per

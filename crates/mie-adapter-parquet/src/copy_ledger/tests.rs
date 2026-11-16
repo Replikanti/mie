@@ -30,6 +30,7 @@ const GOLDEN: &str = concat!(
     "hold-cleared 1791248400007 source=binance-um/instrument=BTCUSDT/stream=depth/date=2026-10-06/part-00003.parquet replace 84c011cbd6b3e85a71051fc4f7d4df2dfe03a18ca55d9b86928bbc531e9c17f0\n",
     "quarantined 1791248400008 source=binance-um/instrument=BTCUSDT/stream=depth/date=2026-10-06/part-00003.parquet q-20261006 80366222b7c66e39d7fc50a728f536808fc7272c3466bf68b8772ed565ea81cc\n",
     "replaced 1791248400009 source=binance-um/instrument=BTCUSDT/stream=depth/date=2026-10-06/part-00003.parquet aggTrades/BTCUSDT-aggTrades-2026-10-05.zip.import 5be25e1dc82313355937b86a02e10cac057a25e64f90f520966b79ef083845f1\n",
+    "lost-line 1791248400010 my%20journal%25.jsonl 6 1000 7f325e080f05ef6166b40bfef45ba8850257ad3f4dd9ba741d579dab92eec1ff d73ab8c42ff361aae34dcd68c832560c3e4877e1a9c2947f6332f83575560ade\n",
 );
 
 /// The manifest of a fixture `depth` file.
@@ -143,6 +144,15 @@ fn golden_records() -> Vec<Record> {
                 entry: ENTRY.to_owned(),
             },
         ),
+        record(
+            10,
+            Kind::LostLine {
+                journal: "my journal%.jsonl".to_owned(),
+                line: 6,
+                offset: 1_000,
+                sha256: line_sha256(b"journal line 6"),
+            },
+        ),
     ]
 }
 
@@ -200,7 +210,7 @@ fn golden_text_is_pinned_byte_for_byte_with_its_chain() {
     let dir = store("ledger-golden");
     let records = golden_records();
     let kinds: std::collections::BTreeSet<&str> = records.iter().map(|r| r.kind.name()).collect();
-    assert_eq!(kinds.len(), 12, "one record of every kind");
+    assert_eq!(kinds.len(), 13, "one record of every kind");
     append_all(dir.path(), &records);
     let text = fs::read_to_string(ledger_path(dir.path())).unwrap();
     assert_eq!(text, GOLDEN);
@@ -372,9 +382,12 @@ fn manifest_text_is_escaped_and_stored_verbatim() {
     let escaped = escape(&text);
     assert!(escaped.starts_with("mie-raw-manifest%201%0Apath%20source=binance-um/"));
     assert!(!escaped.contains([' ', '\n']));
-    assert_eq!(unescape(&escaped).unwrap(), text);
+    assert_eq!(unescape(&escaped, "manifest").unwrap(), text);
     assert_eq!(escape("50% \t\u{7f}é"), "50%25%20%09%7Fé");
-    assert_eq!(unescape("50%25%20%09%7Fé").unwrap(), "50% \t\u{7f}é");
+    assert_eq!(
+        unescape("50%25%20%09%7Fé", "manifest").unwrap(),
+        "50% \t\u{7f}é"
+    );
 }
 
 #[test]
@@ -1438,7 +1451,10 @@ fn replace_installs_only_a_ledger_that_parses() {
     );
     // Appends through the hold land in the installed ledger.
     hold.append(&records[0]).unwrap();
-    assert_eq!(read(dir.path()).unwrap().unwrap().records.len(), 13);
+    assert_eq!(
+        read(dir.path()).unwrap().unwrap().records.len(),
+        records.len() + 1
+    );
 
     // Without a ledger on hot nothing is linked.
     let empty = TempDir::new("ledger-replace-none");
@@ -1508,4 +1524,154 @@ fn existing_evidence_is_never_overwritten() {
     assert!(matches!(error, RawStoreError::Integrity(_)), "{error:?}");
     assert_eq!(meta_files(dir.path()), before);
     assert_eq!(fs::read(&aside).unwrap(), b"earlier evidence");
+}
+
+// ------------------------------------------------ lost-line (ADR-066 D8)
+
+/// A `lost-line` record of `journal.jsonl`.
+fn lost_line(line: u64, offset: u64) -> Kind {
+    Kind::LostLine {
+        journal: "journal.jsonl".to_owned(),
+        line,
+        offset,
+        sha256: line_sha256(b"journal line"),
+    }
+}
+
+/// The record's exact body, its digest computed independently of the
+/// module, and render then parse giving the record back. Its chained line
+/// is pinned in [`GOLDEN`].
+#[test]
+fn lost_line_record_round_trips() {
+    let digest = hex_of(&Sha256::digest(b"journal line"));
+    assert_eq!(line_sha256(b"journal line"), digest);
+    let record = record(10, lost_line(6, 1_000));
+    let body = record.body().unwrap();
+    assert_eq!(
+        body,
+        format!("lost-line 1791248400010 journal.jsonl 6 1000 {digest}")
+    );
+    assert_eq!(parse_body(&body).unwrap(), record);
+    // Line 1 at byte 0, and offsets past u32.
+    for (line, offset) in [(1, 0), (2, 1), (u64::MAX, u64::MAX)] {
+        let record = Record {
+            at_ms: 0,
+            kind: lost_line(line, offset),
+        };
+        assert_eq!(parse_body(&record.body().unwrap()).unwrap(), record);
+    }
+    // In a ledger: appended, chained and read back like every kind.
+    let dir = store("ledger-lost-line");
+    append_all(dir.path(), std::slice::from_ref(&record));
+    assert_eq!(read(dir.path()).unwrap().unwrap().records, [record]);
+}
+
+/// The grammar's refusals: the parser refuses each body as `Corrupt`
+/// (inside a valid chain), and the render refuses each record it could
+/// express as `Invalid`, so neither is ever written.
+#[test]
+fn lost_line_grammar_refusals() {
+    let sha = sha256_hex(b"journal line");
+    let bodies = [
+        // Line numbers and offsets.
+        format!("lost-line {AT} journal.jsonl 0 0 {sha}"),
+        format!("lost-line {AT} journal.jsonl 0 5 {sha}"),
+        format!("lost-line {AT} journal.jsonl 1 5 {sha}"),
+        format!("lost-line {AT} journal.jsonl 2 0 {sha}"),
+        format!("lost-line {AT} journal.jsonl 01 0 {sha}"),
+        format!("lost-line {AT} journal.jsonl 2 0100 {sha}"),
+        format!("lost-line {AT} journal.jsonl -2 100 {sha}"),
+        format!("lost-line {AT} journal.jsonl 2 18446744073709551616 {sha}"),
+        // The digest.
+        format!("lost-line {AT} journal.jsonl 2 100 {}", sha.to_uppercase()),
+        format!("lost-line {AT} journal.jsonl 2 100 {}", &sha[1..]),
+        format!("lost-line {AT} journal.jsonl 2 100 {sha}0"),
+        format!("lost-line {AT} journal.jsonl 2 100 -"),
+        // The name: a raw space, bad or needless escapes, a raw control
+        // byte.
+        format!("lost-line {AT} my journal.jsonl 2 100 {sha}"),
+        format!("lost-line {AT} journal.jsonl%2 2 100 {sha}"),
+        format!("lost-line {AT} journal.jsonl% 2 100 {sha}"),
+        format!("lost-line {AT} my%2ajournal.jsonl 2 100 {sha}"),
+        format!("lost-line {AT} my%41journal.jsonl 2 100 {sha}"),
+        format!("lost-line {AT} my\tjournal.jsonl 2 100 {sha}"),
+        format!("lost-line {AT} journal%FF.jsonl 2 100 {sha}"),
+        // Arity.
+        format!("lost-line {AT} journal.jsonl 2 100"),
+        format!("lost-line {AT} journal.jsonl 2 100 {sha} extra"),
+        format!("lost-line {AT} 2 100 {sha}"),
+    ];
+    for body in &bodies {
+        let ledger = ledger_of(&[body]);
+        assert_eq!(check_chain(&ledger).failure, None, "{body:?}");
+        assert!(
+            matches!(parsed(&ledger), Err(RawStoreError::Corrupt(_))),
+            "{body:?}: {:?}",
+            parsed(&ledger)
+        );
+    }
+
+    let dir = store("ledger-lost-line-invalid");
+    let before = fs::read(ledger_path(dir.path())).unwrap();
+    let mut bad: Vec<Kind> = [(0, 0), (0, 5), (1, 5), (2, 0)]
+        .into_iter()
+        .map(|(line, offset)| lost_line(line, offset))
+        .collect();
+    bad.push(Kind::LostLine {
+        journal: String::new(),
+        line: 2,
+        offset: 100,
+        sha256: sha.clone(),
+    });
+    bad.push(Kind::LostLine {
+        journal: "journal.jsonl".to_owned(),
+        line: 2,
+        offset: 100,
+        sha256: sha.to_uppercase(),
+    });
+    for kind in bad {
+        assert!(
+            matches!(
+                CopyLedger::at(dir.path())
+                    .append(&record(0, kind.clone()))
+                    .map_err(|e| e.error),
+                Err(RawStoreError::Invalid(_))
+            ),
+            "{kind:?}"
+        );
+    }
+    assert_eq!(fs::read(ledger_path(dir.path())).unwrap(), before);
+}
+
+/// The journal name is escaped as manifest text is: `%`, 0x00–0x20 and
+/// 0x7F as `%XX`, everything else literal, a zero-width space and other
+/// UTF-8 included, so any UTF-8 name is one token and round-trips.
+#[test]
+fn journal_name_escapes_round_trip() {
+    let names = [
+        ("journal.jsonl", "journal.jsonl"),
+        ("my journal%.jsonl", "my%20journal%25.jsonl"),
+        ("a\u{200b}b.jsonl", "a\u{200b}b.jsonl"),
+        ("tab\there\u{7f}.jsonl", "tab%09here%7F.jsonl"),
+        ("žurnál é 🦀", "žurnál%20é%20🦀"),
+        ("%", "%25"),
+    ];
+    for (name, token) in names {
+        let record = Record {
+            at_ms: AT,
+            kind: Kind::LostLine {
+                journal: name.to_owned(),
+                line: 3,
+                offset: 400,
+                sha256: line_sha256(b""),
+            },
+        };
+        let body = record.body().unwrap();
+        assert_eq!(
+            body,
+            format!("lost-line {AT} {token} 3 400 {}", line_sha256(b"")),
+            "{name:?}"
+        );
+        assert_eq!(parse_body(&body).unwrap(), record, "{name:?}");
+    }
 }

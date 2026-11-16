@@ -648,3 +648,267 @@ fn usage_errors_exit_2() {
         assert_eq!(output.status.code(), Some(2), "{args:?}");
     }
 }
+
+// ------------------------------------------- V3 over hot's journal (ADR-066)
+
+fn journal_copies(fixture: &Fixture) -> [PathBuf; 2] {
+    ["cold-a", "cold-b"].map(|root| cold(fixture, root).join(".mie/journal/journal.jsonl"))
+}
+
+/// Flips byte `offset` of hot's journal and of both copies, so the copies
+/// stay byte prefixes of hot and only V3 sees the damage.
+fn flip_everywhere(fixture: &Fixture, offset: usize) {
+    flip(&fixture.config.paths.journal, offset);
+    for copy in journal_copies(fixture) {
+        flip(&copy, offset);
+    }
+}
+
+/// The (number, start, end) of the complete lines of hot's journal.
+fn hot_lines(fixture: &Fixture) -> Vec<(u64, usize, usize)> {
+    let bytes = fs::read(&fixture.config.paths.journal).unwrap();
+    let mut lines = Vec::new();
+    let mut start = 0;
+    for (i, _) in bytes.iter().enumerate().filter(|(_, b)| **b == b'\n') {
+        lines.push((lines.len() as u64 + 1, start, i + 1));
+        start = i + 1;
+    }
+    lines
+}
+
+/// Appends the `lost-line` record of hot's line `number` as it is now,
+/// under the journal name `name`, at `at_ms`.
+fn record_lost_line(fixture: &Fixture, name: &str, number: u64, at_ms: i64) {
+    let (_, start, end) = hot_lines(fixture)[number as usize - 1];
+    let bytes = fs::read(&fixture.config.paths.journal).unwrap();
+    copy_ledger::CopyLedger::at(&fixture.hot())
+        .append(&Record {
+            at_ms,
+            kind: Kind::LostLine {
+                journal: name.to_owned(),
+                line: number,
+                offset: start as u64,
+                sha256: copy_ledger::line_sha256(&bytes[start..end - 1]),
+            },
+        })
+        .unwrap();
+}
+
+fn fail_lines(out: &str) -> Vec<&str> {
+    out.lines().filter(|l| l.starts_with("FAIL: ")).collect()
+}
+
+/// AC 7 (#224): hot's newest lines, past every copy's end, verify by their
+/// own checks with no copy; a flip in one of them is a `FAIL` naming both
+/// remedies, and nothing about hot is recorded (V7).
+#[test]
+fn v3_hot_tail_lines_verify_without_a_copy() {
+    let (_dir, fixture) = adopted("verify-v3-tail");
+    let journal = fixture.config.paths.journal.clone();
+    let copy_len = fs::metadata(&journal).unwrap().len();
+    for n in 1..=3 {
+        append(&journal, &checked_line("tail", n));
+    }
+    let lines = hot_lines(&fixture);
+    let count = lines.len();
+    let (pass, out) = verify_at(&fixture, NOW, "24");
+    assert!(pass, "{out}");
+    assert!(
+        out.contains(&format!(
+            "{count} complete line(s) checked: {count} intact, 0 without the check, 0 failed (0 \
+             recorded lost)"
+        )),
+        "{out}"
+    );
+    let (number, start, _) = lines[count - 2];
+    assert!(start as u64 > copy_len);
+    flip(&journal, start + 12);
+    let (pass, out) = verify_at(&fixture, NOW + 1, "24");
+    assert!(!pass, "{out}");
+    assert_fail_line(
+        &out,
+        &[
+            &format!("hot's journal line {number} at byte {start} fails its check (ADR-066)"),
+            "not recorded lost",
+            "when a copy holds it intact, `mie store repair-hot --scope journal` (with `mie \
+             ingest` stopped) restores it",
+            "after checking for a shared cause, `mie store repair --record-lost-lines` records \
+             its loss",
+        ],
+    );
+    assert_eq!(fail_lines(&out).len(), 1, "{out}");
+    assert!(findings(&fixture).is_empty());
+}
+
+/// An unrecorded failed line inside the copies' range, the copies holding
+/// the same bytes: one `FAIL` from V3 naming both remedies, on every run.
+#[test]
+fn v3_an_unrecorded_failed_line_fails_naming_both_remedies() {
+    let (_dir, fixture) = adopted("verify-v3-unrecorded");
+    let (number, start, _) = hot_lines(&fixture)[2];
+    flip_everywhere(&fixture, start + 5);
+    for now in [NOW, NOW + 1] {
+        let (pass, out) = verify_at(&fixture, now, "24");
+        assert!(!pass, "{out}");
+        assert_fail_line(
+            &out,
+            &[
+                &format!("hot's journal line {number} at byte {start} fails its check"),
+                "`mie store repair-hot --scope journal`",
+                "`mie store repair --record-lost-lines`",
+            ],
+        );
+        assert_eq!(fail_lines(&out).len(), 1, "{out}");
+        assert!(out.contains("1 failed (0 recorded lost)"), "{out}");
+    }
+    assert!(findings(&fixture).is_empty());
+}
+
+/// A recorded failed line is a listed note, and verify passes; it never
+/// turns verify red again.
+#[test]
+fn v3_a_recorded_failed_line_is_a_listed_note_and_verify_passes() {
+    let (_dir, fixture) = adopted("verify-v3-recorded");
+    let (number, start, _) = hot_lines(&fixture)[2];
+    flip_everywhere(&fixture, start + 5);
+    record_lost_line(&fixture, "journal.jsonl", number, NOW - 5);
+    for now in [NOW, NOW + 1] {
+        let (pass, out) = verify_at(&fixture, now, "24");
+        assert!(pass && out.ends_with("PASS\n"), "{out}");
+        assert!(
+            out.lines().any(|l| l.starts_with("note: ")
+                && l.contains(&format!("line {number} at byte {start} fails its check"))
+                && l.contains(&format!("recorded lost at {}", NOW - 5))),
+            "{out}"
+        );
+        assert!(out.contains("1 failed (1 recorded lost)"), "{out}");
+    }
+}
+
+/// Damaged further after the record: the digest no longer matches, so the
+/// line fails again, and the record is a stale note.
+#[test]
+fn v3_a_recorded_line_damaged_further_fails_again() {
+    let (_dir, fixture) = adopted("verify-v3-further");
+    let (number, start, _) = hot_lines(&fixture)[2];
+    flip_everywhere(&fixture, start + 5);
+    record_lost_line(&fixture, "journal.jsonl", number, NOW - 5);
+    flip_everywhere(&fixture, start + 6);
+    let (pass, out) = verify_at(&fixture, NOW, "24");
+    assert!(!pass, "{out}");
+    assert_fail_line(
+        &out,
+        &[
+            &format!("hot's journal line {number} at byte {start}"),
+            "not recorded lost",
+        ],
+    );
+    assert!(
+        out.lines().any(|l| l.starts_with("note: ")
+            && l.contains(&format!(
+                "line {number} at byte {start}, recorded at {}",
+                NOW - 5
+            ))
+            && l.contains("stale: its bytes changed")),
+        "{out}"
+    );
+    // Recorded again: a new record matches, the old one stays stale.
+    record_lost_line(&fixture, "journal.jsonl", number, NOW + 5);
+    let (pass, out) = verify_at(&fixture, NOW + 10, "24");
+    assert!(pass, "{out}");
+    assert!(
+        out.contains(&format!("recorded lost at {}", NOW + 5)),
+        "{out}"
+    );
+    assert!(out.contains("stale: its bytes changed"), "{out}");
+}
+
+/// The line restored after its record (intact again): no `FAIL`, and the
+/// record is a stale note.
+#[test]
+fn v3_a_restored_line_leaves_a_stale_note() {
+    let (_dir, fixture) = adopted("verify-v3-restored");
+    let (number, start, _) = hot_lines(&fixture)[2];
+    flip_everywhere(&fixture, start + 5);
+    record_lost_line(&fixture, "journal.jsonl", number, NOW - 5);
+    flip_everywhere(&fixture, start + 5);
+    let (pass, out) = verify_at(&fixture, NOW, "24");
+    assert!(pass, "{out}");
+    assert!(
+        out.lines()
+            .any(|l| l.starts_with("note: ") && l.contains("stale: its bytes changed")),
+        "{out}"
+    );
+    assert!(out.contains("0 failed (0 recorded lost)"), "{out}");
+}
+
+/// A record of another journal name is ignored: the line still fails, and
+/// the record is not listed.
+#[test]
+fn v3_records_of_another_journal_name_are_ignored() {
+    let (_dir, fixture) = adopted("verify-v3-other-name");
+    let (number, start, _) = hot_lines(&fixture)[2];
+    flip_everywhere(&fixture, start + 5);
+    record_lost_line(&fixture, "other.jsonl", number, NOW - 5);
+    let (pass, out) = verify_at(&fixture, NOW, "24");
+    assert!(!pass, "{out}");
+    assert_fail_line(
+        &out,
+        &[
+            &format!("line {number} at byte {start}"),
+            "not recorded lost",
+        ],
+    );
+    assert!(!out.contains("note: "), "{out}");
+}
+
+/// A last line without its `\n`, damaged, may be in the middle of being
+/// written: it is not classified, and verify passes.
+#[test]
+fn v3_skips_the_line_being_written() {
+    let (_dir, fixture) = adopted("verify-v3-partial");
+    let journal = fixture.config.paths.journal.clone();
+    let mut partial = checked_line("live", 1);
+    partial.pop();
+    partial[20] ^= 0x01;
+    append(&journal, &partial);
+    let (pass, out) = verify_at(&fixture, NOW, "24");
+    assert!(pass, "{out}");
+    assert!(
+        out.contains(&format!(
+            "0 failed (0 recorded lost); its last {} byte(s), a line without its end",
+            partial.len()
+        )),
+        "{out}"
+    );
+}
+
+/// Lines from before ADR-066, a torn line that #225 ended with `\n` and a
+/// line whose member's name is damaged are counted without the check,
+/// never failed.
+#[test]
+fn v3_counts_old_and_torn_lines_as_unchecked() {
+    let dir = TempDir::new("verify-v3-legacy");
+    let fixture = Fixture::new_legacy(dir.path());
+    assert_pass(&fixture.adopt(&fixture.request()));
+    let journal = fixture.config.paths.journal.clone();
+    let old = hot_lines(&fixture).len();
+    append(&journal, &checked_line("new", 1));
+    let torn = checked_line("new", 2);
+    append(&journal, &torn[..torn.len() / 2]);
+    append(&journal, b"\n");
+    let mut member = checked_line("new", 3);
+    let at = member.len() - 18;
+    member[at] = b'C';
+    append(&journal, &member);
+    let (pass, out) = verify_at(&fixture, NOW, "24");
+    assert!(pass, "{out}");
+    assert!(
+        out.contains(&format!(
+            "{} complete line(s) checked: 1 intact, {} without the check, 0 failed",
+            old + 3,
+            old + 2
+        )),
+        "{out}"
+    );
+}

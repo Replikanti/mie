@@ -28,14 +28,22 @@
 //! - The kinds and their fields are those of [`Kind`]; the value sets of
 //!   [`FindingCode`], [`Subject`], [`LostOrigin`], [`HoldReason`] and
 //!   [`Resolution`] are closed.
-//! - The manifest text of a [`Kind::Manifest`] record is escaped: `%`, the
-//!   bytes 0x00–0x20 and 0x7F are written as `%XX` with uppercase hex, every
-//!   other byte is literal, and any other spelling is refused. It is stored
-//!   verbatim, never re-rendered.
+//! - The manifest text of a [`Kind::Manifest`] record and the journal name
+//!   of a [`Kind::LostLine`] record are escaped: `%`, the bytes 0x00–0x20
+//!   and 0x7F are written as `%XX` with uppercase hex, every other byte is
+//!   literal, and any other spelling is refused. The manifest text is
+//!   stored verbatim, never re-rendered.
+//! - A [`Kind::LostLine`] record (ADR-066 D8) is `lost-line <at_ms>
+//!   <journal> <line> <offset> <sha256> <chain>`: the file name of the
+//!   capture journal, escaped; the line's 1-based number; its first byte;
+//!   the SHA-256 of its bytes without its `\n` ([`line_sha256`]). Line 1
+//!   starts at byte 0 and no other line does, so `line` 1 with `offset` ≠ 0
+//!   and `offset` 0 with `line` ≠ 1 are refused.
 //!
 //! The parser is strict: any line [`Record`] rendering cannot produce is
 //! [`RawStoreError::Corrupt`]. A later step adds a kind only together with
-//! an ADR-062 edit and a golden test.
+//! an ADR edit and a golden test (`lost-line`: ADR-066 D8, recorded on
+//! ADR-062's status line).
 //!
 //! # Readers and appenders
 //!
@@ -323,6 +331,21 @@ pub enum Kind {
         /// The import entry, `<segment>/<name>.import`.
         entry: String,
     },
+    /// `lost-line`: a line of hot's capture journal that fails its check
+    /// and that no copy can restore, its loss accepted by the operator
+    /// (`mie store repair --record-lost-lines`, ADR-066 D8). It changes no
+    /// file list and no path verdict.
+    LostLine {
+        /// The file name of the journal (`paths.journal`), any UTF-8 name.
+        journal: String,
+        /// The line's 1-based number, when recorded.
+        line: u64,
+        /// The line's first byte.
+        offset: u64,
+        /// The SHA-256 of the line's bytes without its `\n`, lowercase hex
+        /// ([`line_sha256`]).
+        sha256: String,
+    },
 }
 
 impl Kind {
@@ -341,6 +364,7 @@ impl Kind {
             Self::HoldCleared { .. } => "hold-cleared",
             Self::Quarantined { .. } => "quarantined",
             Self::Replaced { .. } => "replaced",
+            Self::LostLine { .. } => "lost-line",
         }
     }
 }
@@ -445,6 +469,24 @@ fn render_body(record: &Record) -> Result<String, String> {
             check_entry(entry)?;
             vec![path.clone(), entry.clone()]
         }
+        Kind::LostLine {
+            journal,
+            line,
+            offset,
+            sha256,
+        } => {
+            if journal.is_empty() {
+                return Err("the journal name is empty".to_owned());
+            }
+            check_line_offset(*line, *offset)?;
+            check_sha256(sha256)?;
+            vec![
+                escape(journal),
+                line.to_string(),
+                offset.to_string(),
+                sha256.clone(),
+            ]
+        }
     };
     let mut body = format!("{} {}", record.kind.name(), record.at_ms);
     for field in fields {
@@ -479,7 +521,7 @@ fn parse_body(body: &str) -> Result<Record, String> {
     let kind = match kind {
         "manifest" => {
             arity(1)?;
-            let text = unescape(fields[0])?;
+            let text = unescape(fields[0], "manifest")?;
             manifest::parse(&text).map_err(|e| e.to_string())?;
             Kind::Manifest { text }
         }
@@ -584,6 +626,19 @@ fn parse_body(body: &str) -> Result<Record, String> {
                 entry: fields[1].to_owned(),
             }
         }
+        "lost-line" => {
+            arity(4)?;
+            let journal = unescape(fields[0], "journal name")?;
+            let (line, offset) = (decimal(fields[1])?, decimal(fields[2])?);
+            check_line_offset(line, offset)?;
+            check_sha256(fields[3])?;
+            Kind::LostLine {
+                journal,
+                line,
+                offset,
+                sha256: fields[3].to_owned(),
+            }
+        }
         other => return Err(format!("unknown kind {other:?}")),
     };
     Ok(Record { at_ms, kind })
@@ -646,6 +701,26 @@ fn check_sha256(sha: &str) -> Result<(), String> {
     }
 }
 
+/// A lost line's number and first byte: line 1 starts at byte 0, and no
+/// other line does (a line ends with its `\n`, so line n > 1 starts after
+/// at least one byte).
+fn check_line_offset(line: u64, offset: u64) -> Result<(), String> {
+    match (line, offset) {
+        (0, _) => Err("line 0: lines are numbered from 1".to_owned()),
+        (1, 0) => Ok(()),
+        (1, _) => Err(format!("line 1 starts at byte 0, not {offset}")),
+        (_, 0) => Err(format!("line {line} cannot start at byte 0")),
+        _ => Ok(()),
+    }
+}
+
+/// The SHA-256 of one journal line's bytes without its `\n`, lowercase
+/// hex: the digest a [`Kind::LostLine`] record names (ADR-066 D8). Here so
+/// that `mie-cli` computes it without a `sha2` dependency of its own.
+pub fn line_sha256(body: &[u8]) -> String {
+    sha256_hex(body)
+}
+
 /// An import-ledger entry: `<segment>/<name>.import`, the name from
 /// `[A-Za-z0-9._-]`, not starting with `.`.
 fn check_entry(entry: &str) -> Result<(), String> {
@@ -660,7 +735,8 @@ fn check_entry(entry: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Whether a byte is written as `%XX` in a manifest field.
+/// Whether a byte is written as `%XX` in an escaped field (a manifest
+/// text, a journal name).
 fn needs_escape(byte: u8) -> bool {
     byte <= 0x20 || byte == 0x7F || byte == b'%'
 }
@@ -678,7 +754,8 @@ fn escape(text: &str) -> String {
     String::from_utf8(bytes).expect("escaping keeps UTF-8 intact")
 }
 
-fn unescape(token: &str) -> Result<String, String> {
+/// The inverse of [`escape`], strict: `field` names the field in errors.
+fn unescape(token: &str, field: &str) -> Result<String, String> {
     let bytes = token.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -691,24 +768,22 @@ fn unescape(token: &str) -> Result<String, String> {
                 _ => None,
             };
             let (Some(high), Some(low)) = (digit(bytes.get(i + 1)), digit(bytes.get(i + 2))) else {
-                return Err(format!("bad escape at byte {i} of the manifest field"));
+                return Err(format!("bad escape at byte {i} of the {field} field"));
             };
             let value = high * 16 + low;
             if !needs_escape(value) {
-                return Err(format!(
-                    "needless escape %{value:02X} in the manifest field"
-                ));
+                return Err(format!("needless escape %{value:02X} in the {field} field"));
             }
             out.push(value);
             i += 3;
         } else if needs_escape(byte) {
-            return Err(format!("unescaped byte 0x{byte:02X} in the manifest field"));
+            return Err(format!("unescaped byte 0x{byte:02X} in the {field} field"));
         } else {
             out.push(byte);
             i += 1;
         }
     }
-    String::from_utf8(out).map_err(|_| "the manifest field is not UTF-8".to_owned())
+    String::from_utf8(out).map_err(|_| format!("the {field} field is not UTF-8"))
 }
 
 /// The chain before record 1: the SHA-256 of the header line.
