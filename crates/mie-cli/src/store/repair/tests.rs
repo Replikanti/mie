@@ -1410,3 +1410,395 @@ fn r2b_the_report_of_a_moved_temp_name_says_whether_the_pass_reaches_it() {
         assert_eq!(moved_names(cold_a, at), vec![name.clone()], "{case}");
     }
 }
+
+// ------------------------------------------------- D5 (ADR-066, #224)
+
+/// One journal line of exactly `len` bytes, its `\n` included: a record
+/// carrying `"n":n` and a `pad` of `*`, with the line check (ADR-066 D1)
+/// when `checked`.
+fn journal_line(n: usize, len: usize, checked: bool) -> Vec<u8> {
+    let object_len = if checked { len - 21 } else { len - 1 };
+    let mut object =
+        format!("{{\"type\":\"stats\",\"run_id\":\"A\",\"at_ms\":1,\"n\":{n},\"pad\":\"")
+            .into_bytes();
+    object.resize(object_len - 2, b'*');
+    object.extend_from_slice(b"\"}");
+    let mut line = if checked {
+        crate::journal::with_check(&object)
+    } else {
+        object
+    };
+    line.push(b'\n');
+    assert_eq!(line.len(), len);
+    line
+}
+
+/// The plan's journal: five 200-byte lines (starts 0, 200, 400, 600, 800),
+/// checked or not.
+fn five(checked: bool) -> Vec<u8> {
+    (1..=5)
+        .flat_map(|n| journal_line(n, 200, checked))
+        .collect()
+}
+
+fn flipped(bytes: &[u8], at: &[usize]) -> Vec<u8> {
+    let mut bytes = bytes.to_vec();
+    for &i in at {
+        bytes[i] ^= 0x01;
+    }
+    bytes
+}
+
+/// Hot and its witnesses written to files of a fresh directory.
+struct Journals {
+    _dir: crate::store::replicate::tests::Dir,
+    hot: PathBuf,
+    witnesses: Vec<PathBuf>,
+}
+
+impl Journals {
+    fn new(hot: &[u8], witnesses: &[&[u8]]) -> Self {
+        let dir = crate::store::replicate::tests::Dir::new("repair-d5");
+        let path = dir.0.join("hot");
+        fs::write(&path, hot).unwrap();
+        let witnesses = witnesses
+            .iter()
+            .enumerate()
+            .map(|(i, bytes)| {
+                let path = dir.0.join(format!("copy-{i}"));
+                fs::write(&path, bytes).unwrap();
+                path
+            })
+            .collect();
+        Self {
+            _dir: dir,
+            hot: path,
+            witnesses,
+        }
+    }
+
+    fn refs(&self) -> Vec<&Path> {
+        self.witnesses.iter().map(PathBuf::as_path).collect()
+    }
+
+    /// D5 from `from`, unbounded.
+    fn contest(&self, from: u64) -> Option<Contest> {
+        journal_contest(&self.hot, &self.refs(), from, u64::MAX).unwrap()
+    }
+
+    /// ADR-065 D8 from `from`.
+    fn d8(&self, from: u64) -> Option<Contested> {
+        replica::first_contested_file(&self.hot, &self.refs(), from).unwrap()
+    }
+}
+
+/// The plan's threshold arithmetic at k = 2, hot 1 000 B contradicted at
+/// 450. Without checks: hot and cold-b against cold-a, 2·2 = 4 > 3, hot
+/// wins; cold-b only 400 B, hot against cold-a alone, 2·1 = 2 ≤ 2,
+/// refused. With checks, the same 400-B geometry: hot's line Intact and
+/// cold-a's Failed, settled for hot with no count.
+#[test]
+fn d5_hot_intact_settles_one_against_one() {
+    let legacy = five(false);
+    let damaged = flipped(&legacy, &[450]);
+    let two = Journals::new(&legacy, &[&damaged, &legacy]);
+    assert_eq!(two.contest(400), None);
+    let one = Journals::new(&legacy, &[&damaged, &legacy[..400]]);
+    let refused = Contested {
+        at: 450,
+        covering: 2,
+        with_hot: 1,
+    };
+    assert_eq!(one.d8(400), Some(refused));
+    assert_eq!(one.contest(400), Some(Contest::Majority(refused)));
+
+    let hot = five(true);
+    let cold_a = flipped(&hot, &[450]);
+    let checked = Journals::new(&hot, &[&cold_a, &hot[..400]]);
+    assert_eq!(checked.d8(400).map(|c| c.at), Some(450));
+    assert_eq!(checked.contest(400), None);
+    assert_eq!(checked.contest(0), None);
+}
+
+/// Hot's line 3 fails its check, cold-a holds hot's bytes, cold-b
+/// contradicts: hot holds 2 of 3, a majority, and D5 still refuses.
+#[test]
+fn d5_hot_line_failing_refuses_despite_a_majority() {
+    let good = five(true);
+    let hot = flipped(&good, &[450]);
+    let journals = Journals::new(&hot, &[&hot, &good]);
+    assert_eq!(journals.d8(0), None);
+    assert_eq!(
+        journals.contest(0),
+        Some(Contest::HotLineFails {
+            at: 450,
+            line_start: 400
+        })
+    );
+}
+
+/// Hot's line 3 and cold-a's differ and both verify: a fork, whoever holds
+/// a majority.
+#[test]
+fn d5_both_lines_verify_is_a_fork() {
+    let good = five(true);
+    let mut hot = good[..400].to_vec();
+    hot.extend(journal_line(9, 200, true));
+    hot.extend_from_slice(&good[600..]);
+    // `{"type":"stats","run_id":"A","at_ms":1,"n":` is 43 bytes.
+    let journals = Journals::new(&hot, &[&good, &hot]);
+    assert_eq!(journals.d8(0), None);
+    assert_eq!(
+        journals.contest(0),
+        Some(Contest::Fork {
+            at: 443,
+            witness: 0,
+            hot: LineCheck::Intact
+        })
+    );
+}
+
+/// A witness line without its check (its member's name damaged) makes no
+/// claim: ADR-065 D8's majority decides the line, one against one refused,
+/// two against one for hot settled.
+#[test]
+fn d5_unchecked_witness_line_keeps_the_majority() {
+    let hot = five(true);
+    // Line 3's member starts at 578 (its `,`); 580 is the first `c`.
+    let mut cold_a = hot.clone();
+    cold_a[580] = b'C';
+    let one = Journals::new(&hot, &[&cold_a]);
+    assert_eq!(
+        one.contest(0),
+        Some(Contest::Majority(Contested {
+            at: 580,
+            covering: 2,
+            with_hot: 1
+        }))
+    );
+    let two = Journals::new(&hot, &[&cold_a, &hot]);
+    assert_eq!(two.contest(0), None);
+}
+
+/// A copy's line that verifies is never overwritten by hot bytes without a
+/// check, however many journals hold them.
+#[test]
+fn d5_verifying_copy_line_against_unchecked_hot_refuses() {
+    let good = five(true);
+    let mut hot = good.clone();
+    hot[580] = b'C';
+    let journals = Journals::new(&hot, &[&good, &hot]);
+    assert_eq!(journals.d8(0), None);
+    assert_eq!(
+        journals.contest(0),
+        Some(Contest::Fork {
+            at: 580,
+            witness: 0,
+            hot: LineCheck::Unchecked
+        })
+    );
+}
+
+/// A witness whose `\n` at 599 is flipped holds one merged line that fails
+/// its check against hot's Intact line: settled for hot, one against one.
+/// Without checks the same flip is refused.
+#[test]
+fn d5_witness_newline_flip_is_settled_for_hot() {
+    let hot = five(true);
+    let cold_a = flipped(&hot, &[599]);
+    let journals = Journals::new(&hot, &[&cold_a, &hot[..400]]);
+    assert_eq!(journals.contest(400), None);
+    let legacy = five(false);
+    let journals = Journals::new(&legacy, &[&flipped(&legacy, &[599]), &legacy[..400]]);
+    assert_eq!(journals.contest(400).map(|_| ()), Some(()));
+}
+
+/// A byte past hot's end is refused, as ADR-065 D8, checked or not.
+#[test]
+fn d5_past_hot_end_refuses() {
+    for checked in [true, false] {
+        let copy = five(checked);
+        let journals = Journals::new(&copy[..800], &[&copy, &copy[..900]]);
+        let expected = Contested {
+            at: 800,
+            covering: 2,
+            with_hot: 0,
+        };
+        assert_eq!(journals.d8(0), Some(expected));
+        assert_eq!(journals.contest(0), Some(Contest::Majority(expected)));
+    }
+}
+
+/// A witness that cannot be read refuses (an error on the destination
+/// side, never a panic); an absent one holds no byte; an unreadable hot is
+/// an error on the source side.
+#[test]
+fn d5_unreadable_witness_refuses() {
+    let hot = five(true);
+    let journals = Journals::new(&hot, &[&flipped(&hot, &[450])]);
+    let dir = journals.hot.parent().unwrap().to_owned();
+    let error = journal_contest(&journals.hot, &[&dir], 0, u64::MAX).unwrap_err();
+    assert_eq!(error.side, Side::Destination, "{error}");
+    let absent = dir.join("absent");
+    assert_eq!(
+        journal_contest(&journals.hot, &[&absent], 0, u64::MAX).unwrap(),
+        None
+    );
+    let error = journal_contest(&absent, &journals.refs(), 0, u64::MAX).unwrap_err();
+    assert_eq!(error.side, Side::Source, "{error}");
+}
+
+/// On journals without checked lines D5 is exactly ADR-065 D8: 200
+/// damage patterns from a seeded LCG (flips, `\n` flips, cuts and
+/// extensions of hot and two witnesses, from a random line start).
+#[test]
+fn d5_unchecked_journal_matches_first_contested_file() {
+    let mut state: u64 = 0x2024_0224;
+    let mut next = |n: u64| {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (state >> 33) % n
+    };
+    let base: Vec<u8> = (1..=8)
+        .flat_map(|n| journal_line(n, 80 + 23 * n, false))
+        .collect();
+    let mut decided = [0usize; 2];
+    for case in 0..200 {
+        let variant = |bytes: &[u8], next: &mut dyn FnMut(u64) -> u64| {
+            let mut bytes = bytes.to_vec();
+            for _ in 0..next(3) {
+                let at = next(bytes.len() as u64) as usize;
+                bytes[at] = if next(4) == 0 {
+                    b'\n'
+                } else {
+                    bytes[at] ^ 0x01
+                };
+            }
+            match next(4) {
+                0 => bytes.truncate(next(bytes.len() as u64) as usize),
+                1 => bytes.extend(journal_line(9, 90, false)),
+                _ => {}
+            }
+            bytes
+        };
+        let hot = variant(&base, &mut next);
+        let a = variant(&base, &mut next);
+        let b = variant(&base, &mut next);
+        let journals = Journals::new(&hot, &[&a, &b]);
+        let from = if hot.is_empty() {
+            0
+        } else {
+            let at = next(hot.len() as u64) as usize;
+            hot[..at]
+                .iter()
+                .rposition(|&byte| byte == b'\n')
+                .map_or(0, |i| i as u64 + 1)
+        };
+        let d8 = journals.d8(from);
+        let d5 = match journals.contest(from) {
+            None => None,
+            Some(Contest::Majority(contested)) => Some(contested),
+            Some(other) => panic!("case {case}: {other:?} on journals without checks"),
+        };
+        assert_eq!(d5, d8, "case {case} from {from}");
+        decided[usize::from(d8.is_some())] += 1;
+    }
+    // Both outcomes occur, so the comparison is not vacuous.
+    assert!(decided[0] > 10 && decided[1] > 10, "{decided:?}");
+}
+
+/// R7 over files: cold-a's journal copy fails its check in line 3, cold-b's
+/// is 400 bytes (no witness there): one against one, which ADR-065 D8
+/// refuses and D5 rebuilds, since hot's line verifies. On the same
+/// journal without checks R7 still refuses.
+#[test]
+fn r7_rebuilds_a_failing_copy_line_one_against_one() {
+    for checked in [true, false] {
+        let fixture = Fixture::new(if checked {
+            "r7-d5-checked"
+        } else {
+            "r7-d5-legacy"
+        });
+        let journal = five(checked);
+        fs::write(&fixture.config.paths.journal, &journal).unwrap();
+        assert_eq!(fixture.pass().problems, Vec::<String>::new());
+        let copy_a = fixture.cold[0].join(".mie/journal/journal.jsonl");
+        let copy_b = fixture.cold[1].join(".mie/journal/journal.jsonl");
+        flip(&copy_a, 450);
+        fs::write(&copy_b, &journal[..400]).unwrap();
+        let report = verify::run(
+            &fixture.config,
+            Some(&fixture.archive()),
+            "24",
+            &fixture.probe,
+            &|| D0 + HOUR,
+            &CopyLedger::at(&fixture.hot),
+        );
+        assert!(
+            report
+                .problems
+                .iter()
+                .any(|p| p.contains("(cold-a)") && p.contains("prefix: byte 450")),
+            "{report:?}"
+        );
+        let report = repair(&fixture, D0 + 2 * HOUR);
+        if checked {
+            assert_eq!(report.problems, Vec::<String>::new(), "{report:?}");
+            assert!(
+                report
+                    .lines
+                    .iter()
+                    .any(|l| l.contains("settled for hot") && l.contains("rebuilt up to byte 400")),
+                "{report:?}"
+            );
+            assert_eq!(fs::read(&copy_a).unwrap(), journal);
+        } else {
+            assert!(
+                report
+                    .problems
+                    .iter()
+                    .any(|p| p.contains("cold-a") && p.contains("one against one")),
+                "{report:?}"
+            );
+        }
+    }
+}
+
+/// Hot's journal fails its check in line 3 where both copies hold the
+/// line intact: R7 refuses each copy, naming hot as the suspect and `mie
+/// store repair-hot --scope journal`.
+#[test]
+fn r7_refuses_while_hot_line_fails_its_check() {
+    let fixture = Fixture::new("r7-d5-hot-fails");
+    let journal = five(true);
+    fs::write(&fixture.config.paths.journal, &journal).unwrap();
+    assert_eq!(fixture.pass().problems, Vec::<String>::new());
+    flip(&fixture.config.paths.journal, 450);
+    let report = verify::run(
+        &fixture.config,
+        Some(&fixture.archive()),
+        "24",
+        &fixture.probe,
+        &|| D0 + HOUR,
+        &CopyLedger::at(&fixture.hot),
+    );
+    assert!(!report.problems.is_empty(), "{report:?}");
+    let report = repair(&fixture, D0 + 2 * HOUR);
+    for root in ["cold-a", "cold-b"] {
+        assert!(
+            report.problems.iter().any(|p| p.contains(root)
+                && p.contains("refused")
+                && p.contains("hot's line from byte 400")
+                && p.contains("fails its check")
+                && p.contains("mie store repair-hot --scope journal")),
+            "{root}: {report:?}"
+        );
+    }
+    for copy in &fixture.cold {
+        assert_eq!(
+            fs::read(copy.join(".mie/journal/journal.jsonl")).unwrap(),
+            journal
+        );
+    }
+}

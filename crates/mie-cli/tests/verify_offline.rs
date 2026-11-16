@@ -329,6 +329,99 @@ fn a_journal_copy_that_is_no_prefix_names_the_byte() {
     );
 }
 
+/// One checked journal line (ADR-066 D1) of run `run`, `"n":n`, its `\n`
+/// included.
+fn checked_line(run: &str, n: usize) -> Vec<u8> {
+    let object = format!("{{\"type\":\"stats\",\"run_id\":\"{run}\",\"at_ms\":1,\"n\":{n}}}");
+    let mut line = mie_cli::journal::with_check(object.as_bytes());
+    line.push(b'\n');
+    line
+}
+
+fn append(path: &Path, bytes: &[u8]) {
+    writable(path);
+    let mut all = fs::read(path).unwrap();
+    all.extend_from_slice(bytes);
+    fs::write(path, all).unwrap();
+}
+
+/// V4 (ADR-066 D6): the journal `prefix` finding names the damaged side by
+/// the two lines' checks: the copy's line fails, damage on the copy for
+/// `mie store repair`; hot's line fails, damage on hot for `mie store
+/// repair-hot --scope journal`; both verify, a fork. A journal without
+/// checks keeps today's text. The recorded finding is the same `prefix`.
+#[test]
+fn v4_names_the_damaged_side() {
+    let (_dir, fixture) = adopted("verify-v4-copy");
+    let copy = cold(&fixture, "cold-a").join(".mie/journal/journal.jsonl");
+    flip(&copy, 10);
+    let (pass, out) = verify_at(&fixture, NOW, "24");
+    assert!(!pass, "{out}");
+    assert_fail_line(
+        &out,
+        &[
+            "cold-a",
+            "prefix: byte 10",
+            "the copy's line there fails its check and hot's verifies",
+            "damage on the copy, which `mie store repair` rebuilds",
+        ],
+    );
+    assert_eq!(
+        findings(&fixture),
+        [("cold-a".to_owned(), FindingCode::Prefix, Subject::Journal)]
+    );
+
+    let (_dir, fixture) = adopted("verify-v4-hot");
+    flip(&fixture.config.paths.journal, 10);
+    let (pass, out) = verify_at(&fixture, NOW, "24");
+    assert!(!pass, "{out}");
+    for root in ["cold-a", "cold-b"] {
+        assert_fail_line(
+            &out,
+            &[
+                root,
+                "prefix: byte 10",
+                "hot's line there fails its check and the copy's verifies",
+                "`mie store repair-hot --scope journal`",
+                "`mie ingest` stopped",
+            ],
+        );
+    }
+
+    let (_dir, fixture) = adopted("verify-v4-fork");
+    let journal = fixture.config.paths.journal.clone();
+    let len = fs::metadata(&journal).unwrap().len();
+    append(&journal, &checked_line("y-run", 1));
+    for root in ["cold-a", "cold-b"] {
+        append(
+            &cold(&fixture, root).join(".mie/journal/journal.jsonl"),
+            &checked_line("x-run", 1),
+        );
+    }
+    let (pass, out) = verify_at(&fixture, NOW, "24");
+    assert!(!pass, "{out}");
+    let at = len + "{\"type\":\"stats\",\"run_id\":\"".len() as u64;
+    assert_fail_line(
+        &out,
+        &[
+            "cold-a",
+            &format!("prefix: byte {at}"),
+            "both lines there verify their checks",
+            "a fork, not damage",
+        ],
+    );
+
+    let dir = TempDir::new("verify-v4-legacy");
+    let fixture = Fixture::new_legacy(dir.path());
+    assert_pass(&fixture.adopt(&fixture.request()));
+    let copy = cold(&fixture, "cold-a").join(".mie/journal/journal.jsonl");
+    flip(&copy, 10);
+    let (pass, out) = verify_at(&fixture, NOW, "24");
+    assert!(!pass, "{out}");
+    assert_fail_line(&out, &["cold-a", "prefix: byte 10"]);
+    assert!(!out.contains("ADR-066"), "{out}");
+}
+
 /// `entry`: an import-ledger entry copy with other bytes.
 #[test]
 fn an_entry_copy_that_differs_is_an_entry_finding() {

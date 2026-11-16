@@ -96,20 +96,28 @@
 //!   start of hot's line that holds d. The rebuild moves the copy aside and
 //!   writes hot's bytes up to u, and the closing pass extends it from hot
 //!   to L_h under its usual journal hold, so the repair writes hot's bytes
-//!   into the copy from u on. It is done only when hot holds a strict
-//!   majority there (ADR-065 D8, [`replica::first_contested_file`]): at
-//!   every byte p ≥ u where a journal that holds a byte at p contradicts
-//!   hot (or holds one past hot's end), more than half of the journals
-//!   that hold a byte at p, hot included, hold hot's byte. The journals
-//!   are hot, this copy and every other target's copy, each as it was
-//!   before this run (a copy rebuilt earlier in the run counts by its
-//!   evidence copy); one that cannot be read refuses. Otherwise refused,
-//!   naming the byte: the journal has no chain, so one copy against hot
-//!   (one against one) cannot be attributed; when every other copy agrees
-//!   with this one against hot at d, hot's journal is named as the
-//!   suspect. The repair never rewrites hot, and `mie store restore` is for
-//!   a lost hot only: with `mie ingest` stopped, `mie store repair-hot
-//!   --scope journal` decides hot's journal (ADR-065).
+//!   into the copy from u on. It is done only when every byte p ≥ u where
+//!   a journal that holds a byte at p contradicts hot (or holds one past
+//!   hot's end) is settled for hot ([`journal_contest`], ADR-066 D5): p
+//!   below L_h; hot's line that holds p not Failed under its check
+//!   (ADR-066 D2), even where hot holds a majority; no contradicting
+//!   journal's line Intact (both lines verifying is a fork, and a line that
+//!   verifies is never overwritten by bytes that do not); then hot's line
+//!   Intact with every contradicting line Failed settles the line with no
+//!   count, and any other line, where a check is missing, is ADR-065 D8's
+//!   strict majority unchanged: more than half of the journals that hold a
+//!   byte at p, hot included, hold hot's byte. So a journal without
+//!   checked lines gets exactly D8. The journals are hot, this copy and
+//!   every other target's copy, each as it was before this run (a copy
+//!   rebuilt earlier in the run counts by its evidence copy); one that
+//!   cannot be read refuses. Otherwise refused, naming the byte and why:
+//!   hot's line fails its check (hot's journal is the suspect); a copy's
+//!   line verifies; or, without checks, one copy against hot (one against
+//!   one) cannot be attributed, and when every other copy agrees with this
+//!   one against hot at d, hot's journal is named as the suspect. The
+//!   repair never rewrites hot, and `mie store restore` is for a lost hot
+//!   only: with `mie ingest` stopped, `mie store repair-hot --scope
+//!   journal` decides hot's journal (ADR-065, ADR-066 D4).
 //! - **R8 Entry copies with an open entry finding:** replaced from hot only
 //!   when hot's entry lists every file with the SHA-256 of the ledger's
 //!   `manifest` record (else hot's manifest, [`entry_mismatches`], the test
@@ -147,11 +155,14 @@ use super::replicate::{
 use super::restore::{self, UnrecordedCopy};
 use super::{DeviceProbe, check_devices, check_hot, truncation_line};
 use crate::config::{ArchiveConfig, IngestConfig};
+use crate::journal::{LineCheck, MAX_CHECKED_LINE, check_line};
 use mie_adapter_parquet::copy_ledger::{
     self, AppendError, Kind, LedgerCopyCheck, LostOrigin, Record, Truncation,
 };
 use mie_adapter_parquet::removal;
-use mie_adapter_parquet::replica::{self, CopyCheck, CopyError, Side, TailSource, TempName};
+use mie_adapter_parquet::replica::{
+    self, Contested, CopyCheck, CopyError, Side, TailSource, TempName,
+};
 use mie_adapter_parquet::root_marker::{self, HOT_ID};
 use mie_adapter_parquet::verification::{CopyState, PathVerdict};
 use mie_ports::raw::RawStoreError;
@@ -1708,11 +1719,12 @@ impl Repair<'_> {
                 return Ok(());
             }
         };
-        // D8 (ADR-065): the rebuild writes hot's bytes into this copy from
-        // `upto` on (the closing pass extends it to L_h), so hot must hold
-        // a strict majority at every byte from there that a journal
-        // contradicts: hot, this copy and every other target's copy, each
-        // as it was before this run.
+        // D5 (ADR-066) over D8 (ADR-065): the rebuild writes hot's bytes
+        // into this copy from `upto` on (the closing pass extends it to
+        // L_h), so every byte from there that a journal contradicts must be
+        // settled for hot, by the lines' checks or by a strict majority:
+        // hot, this copy and every other target's copy, each as it was
+        // before this run.
         let others: Vec<PathBuf> = targets
             .iter()
             .filter(|&&j| j != i)
@@ -1725,63 +1737,98 @@ impl Repair<'_> {
             .collect();
         let mut witnesses: Vec<&Path> = vec![copy.as_path()];
         witnesses.extend(others.iter().map(PathBuf::as_path));
-        let contested = match replica::first_contested_file(&journal, &witnesses, upto) {
-            Ok(contested) => contested,
+        let contest = match journal_contest(&journal, &witnesses, upto, u64::MAX) {
+            Ok(contest) => contest,
             Err(error) => {
                 self.problem(format!(
                     "the journal on {name} ({}): refused: it differs from hot's journal at byte \
                      {first}, and a journal the rule counts cannot be read ({error}), so hot's \
-                     majority cannot be established (ADR-065 D8)",
+                     majority cannot be established (ADR-065 D8, ADR-066 D5)",
                     copy.display()
                 ));
                 return Ok(());
             }
         };
-        if let Some(contested) = contested {
-            let at = contested.at;
-            let mine = byte_at(&copy, first).ok().flatten();
-            let theirs = byte_at(&journal, first).ok().flatten();
-            let held: Vec<u8> = others
-                .iter()
-                .filter_map(|other| byte_at(other, first).ok().flatten())
-                .collect();
-            let suspect = at == first
-                && !held.is_empty()
-                && held.iter().all(|&byte| Some(byte) == mine)
-                && mine != theirs;
+        if let Some(contest) = contest {
             let repair_hot = "The repair never rewrites hot: with `mie ingest` stopped, `mie \
                               store repair-hot --scope journal` decides hot's journal";
-            let tail = if suspect {
-                format!(
-                    " Every other copy agrees with this one against hot, so hot's journal is the \
-                     suspect. {repair_hot}, and `mie store restore` is for a lost hot only \
-                     (ADR-065)"
-                )
-            } else {
-                let why = if at >= hot_len {
+            let rebuild = format!(
+                "The rebuild would write hot's bytes into it from byte {upto}, the start of that \
+                 line"
+            );
+            let tail = match contest {
+                Contest::HotLineFails { at, line_start } => format!(
+                    " {rebuild}, and hot's line from byte {line_start}, which a copy contradicts \
+                     at byte {at}, fails its check: hot's bytes there are not the bytes written, \
+                     so hot's journal is the suspect, whatever a majority holds. {repair_hot}, \
+                     and `mie store restore` is for a lost hot only (ADR-066 D5)"
+                ),
+                Contest::Fork { at, witness, hot } => {
+                    let holder = if witness == 0 {
+                        "this copy".to_owned()
+                    } else {
+                        format!("the journal copy {}", witnesses[witness].display())
+                    };
+                    let why = if hot == LineCheck::Intact {
+                        "hot's line there verifies too: both sides hold lines as written, a fork, \
+                         which no byte count decides"
+                            .to_owned()
+                    } else {
+                        "hot's line there carries no check, and a line that verifies is never \
+                         overwritten by bytes that do not"
+                            .to_owned()
+                    };
                     format!(
-                        "at byte {at}, past the end of hot's journal ({hot_len} bytes), {} \
-                         copies hold a byte that hot does not, and the rebuild would drop or \
-                         overwrite it",
-                        contested.covering
+                        " {rebuild}, and the line of {holder} that holds byte {at} verifies its \
+                         check, while {why}. {repair_hot} (ADR-066 D5)"
                     )
-                } else if contested.covering == 2 {
-                    format!(
-                        "at byte {at} only hot and one copy hold a byte, and they differ: one \
-                         against one, which the journal, without a hash chain, cannot attribute"
-                    )
-                } else {
-                    format!(
-                        "at byte {at} hot's byte is held by {} of the {} journals that hold a \
-                         byte there, no strict majority",
-                        contested.with_hot, contested.covering
-                    )
-                };
-                format!(
-                    " The rebuild would write hot's bytes into it from byte {upto}, the start of \
-                     that line, so hot must hold a strict majority at every byte from there that \
-                     a journal contradicts; {why}. {repair_hot} (ADR-065 D8)"
-                )
+                }
+                Contest::Majority(contested) => {
+                    let at = contested.at;
+                    let mine = byte_at(&copy, first).ok().flatten();
+                    let theirs = byte_at(&journal, first).ok().flatten();
+                    let held: Vec<u8> = others
+                        .iter()
+                        .filter_map(|other| byte_at(other, first).ok().flatten())
+                        .collect();
+                    let suspect = at == first
+                        && !held.is_empty()
+                        && held.iter().all(|&byte| Some(byte) == mine)
+                        && mine != theirs;
+                    if suspect {
+                        format!(
+                            " Every other copy agrees with this one against hot, so hot's \
+                             journal is the suspect. {repair_hot}, and `mie store restore` is \
+                             for a lost hot only (ADR-065)"
+                        )
+                    } else {
+                        let why = if at >= hot_len {
+                            format!(
+                                "at byte {at}, past the end of hot's journal ({hot_len} bytes), \
+                                 {} copies hold a byte that hot does not, and the rebuild would \
+                                 drop or overwrite it",
+                                contested.covering
+                            )
+                        } else if contested.covering == 2 {
+                            format!(
+                                "at byte {at} only hot and one copy hold a byte, and they \
+                                 differ: one against one, which bytes without a line check \
+                                 cannot attribute"
+                            )
+                        } else {
+                            format!(
+                                "at byte {at} hot's byte is held by {} of the {} journals that \
+                                 hold a byte there, no strict majority",
+                                contested.with_hot, contested.covering
+                            )
+                        };
+                        format!(
+                            " {rebuild}, so hot must hold a strict majority at every byte from \
+                             there that a journal contradicts where no line check decides; \
+                             {why}. {repair_hot} (ADR-065 D8, ADR-066 D5)"
+                        )
+                    }
+                }
             };
             self.problem(format!(
                 "the journal on {name} ({}): refused: it differs from hot's journal at byte \
@@ -1798,10 +1845,11 @@ impl Repair<'_> {
             Ok(()) => {
                 self.journal_before.insert(i, aside.clone());
                 self.line(format!(
-                    "the journal on {name}: it differed from hot's at byte {first}, and hot holds \
-                     a strict majority at every contradicted byte from byte {upto}, the start of \
-                     that line (ADR-065 D8); moved aside to {} and rebuilt up to byte {upto}; the \
-                     closing pass extends it",
+                    "the journal on {name}: it differed from hot's at byte {first}, and every \
+                     contradicted byte from byte {upto}, the start of that line, is settled for \
+                     hot by the lines' checks or a strict majority (ADR-065 D8, ADR-066 D5); \
+                     moved aside to {} and rebuilt up to byte {upto}; the closing pass extends \
+                     it",
                     aside.display()
                 ));
                 reached(RepairStep::AfterTailRebuild)
@@ -1937,4 +1985,205 @@ pub(super) fn entry_mismatches(
         }
     }
     wrong
+}
+
+/// What [`journal_contest`] stops at (ADR-066 D5): the first contradicted
+/// byte at or after `from` that no line check settles for hot and ADR-065
+/// D8's majority does not either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Contest {
+    /// D8's strict majority fails at a byte where no check decides, or
+    /// past hot's end.
+    Majority(Contested),
+    /// Hot's line from `line_start` fails its check and a witness
+    /// contradicts it at byte `at`: hot's bytes there are not the bytes
+    /// written, whatever a majority holds.
+    HotLineFails {
+        /// The first contradicted byte of the line.
+        at: u64,
+        /// Where hot's line starts.
+        line_start: u64,
+    },
+    /// The line of witness `witness` that holds its first byte `at`
+    /// against hot verifies its check: with `hot` [`LineCheck::Intact`]
+    /// both sides verify, a fork; otherwise a verifying line would be
+    /// overwritten by bytes that do not verify.
+    Fork {
+        /// The witness's first byte against hot's line.
+        at: u64,
+        /// The witness's index.
+        witness: usize,
+        /// The verdict of hot's line there.
+        hot: LineCheck,
+    },
+}
+
+/// One line of a journal file as D5 and V4 judge it (ADR-066 D2): where it
+/// starts, where it ends (after its `\n`, or where the read stopped), and
+/// its verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct HeldLine {
+    /// Its first byte.
+    pub start: u64,
+    /// The byte after its `\n`; the read's end for a line without one.
+    pub end: u64,
+    /// Its verdict; [`LineCheck::Unchecked`] for a line without its `\n`
+    /// (it may be in the middle of being written) and for one longer than
+    /// [`MAX_CHECKED_LINE`].
+    pub check: LineCheck,
+}
+
+/// The line of `path` that holds byte `offset` (`offset` < `len`), read no
+/// further than `len`, in bounded chunks: at most [`MAX_CHECKED_LINE`]
+/// bytes of it are held in memory, however long it is (ADR-066 D2).
+///
+/// # Errors
+///
+/// An I/O error, a file shorter than `len` included.
+pub(super) fn held_line(path: &Path, offset: u64, len: u64) -> std::io::Result<HeldLine> {
+    const STEP: u64 = 1 << 16;
+    let mut file = fs::File::open(path)?;
+    let mut read = |from: u64, n: u64| -> std::io::Result<Vec<u8>> {
+        let mut chunk = vec![0; usize::try_from(n).unwrap_or(usize::MAX)];
+        file.seek(SeekFrom::Start(from))?;
+        file.read_exact(&mut chunk)?;
+        Ok(chunk)
+    };
+    let mut start = 0;
+    let mut back = offset;
+    while back > 0 {
+        let from = back.saturating_sub(STEP);
+        if let Some(i) = read(from, back - from)?.iter().rposition(|&b| b == b'\n') {
+            start = from + i as u64 + 1;
+            break;
+        }
+        back = from;
+    }
+    let mut body = Vec::new();
+    let mut kept = true;
+    let mut terminated = false;
+    let mut end = start;
+    while end < len {
+        let chunk = read(end, (len - end).min(STEP))?;
+        let found = chunk.iter().position(|&b| b == b'\n');
+        let part = &chunk[..found.unwrap_or(chunk.len())];
+        if kept && body.len() + part.len() <= MAX_CHECKED_LINE {
+            body.extend_from_slice(part);
+        } else {
+            kept = false;
+            body = Vec::new();
+        }
+        end += part.len() as u64;
+        if found.is_some() {
+            end += 1;
+            terminated = true;
+            break;
+        }
+    }
+    let check = if terminated && kept {
+        check_line(&body)
+    } else {
+        LineCheck::Unchecked
+    };
+    Ok(HeldLine { start, end, check })
+}
+
+/// D5 (ADR-066), the rule by which `mie store repair` (R7) may write hot's
+/// journal bytes into a journal copy, shared with `mie store repair-hot`'s
+/// `r7_refuses` and its *behind* test so the two commands never disagree.
+/// It walks the bytes p in `[from, until)` where some witness contradicts
+/// hot ([`replica::first_contradiction_file_before`]); at each:
+///
+/// - p ≥ L_h: [`Contest::Majority`], as ADR-065 D8 (hot holds no byte);
+/// - hot's line that holds p Failed: [`Contest::HotLineFails`], even when
+///   hot holds a majority;
+/// - a contradicting witness's line (the one that holds its first byte
+///   against hot's line) Intact: [`Contest::Fork`];
+/// - hot's line Intact and every contradicting witness's line Failed:
+///   settled for hot, with no count;
+/// - otherwise D8's majority over the rest of hot's line
+///   ([`replica::first_contested_file_before`]), unchanged: every case
+///   where a line carries no check, so a journal without checked lines
+///   gets exactly D8.
+///
+/// Then the walk continues after hot's line. `None` when every
+/// contradicted byte is settled. A witness that does not exist holds no
+/// byte. The record rule of ADR-066 D8 (a failed hot line recorded lost)
+/// is not part of it yet.
+///
+/// # Errors
+///
+/// A [`CopyError`] on [`Side::Source`] when hot's journal cannot be read,
+/// on [`Side::Destination`] when a witness cannot: a witness that cannot
+/// be read cannot be judged, so the rule cannot hold.
+pub(super) fn journal_contest(
+    hot: &Path,
+    witnesses: &[&Path],
+    from: u64,
+    until: u64,
+) -> Result<Option<Contest>, CopyError> {
+    let io = |side: Side, path: &Path| {
+        let path = path.display().to_string();
+        move |error: std::io::Error| CopyError {
+            side,
+            error: RawStoreError::Io(format!("{path}: {error}")),
+        }
+    };
+    let hot_len = fs::metadata(hot).map_err(io(Side::Source, hot))?.len();
+    let mut lens = Vec::with_capacity(witnesses.len());
+    for &path in witnesses {
+        lens.push(match fs::metadata(path) {
+            Ok(metadata) => Some(metadata.len()),
+            Err(error) if error.kind() == ErrorKind::NotFound => None,
+            Err(error) => return Err(io(Side::Destination, path)(error)),
+        });
+    }
+    let mut next = from;
+    while let Some(p) = replica::first_contradiction_file_before(hot, witnesses, next, until)? {
+        if p >= hot_len {
+            let covering = lens.iter().flatten().filter(|&&len| len > p).count();
+            return Ok(Some(Contest::Majority(Contested {
+                at: p,
+                covering,
+                with_hot: 0,
+            })));
+        }
+        let line = held_line(hot, p, hot_len).map_err(io(Side::Source, hot))?;
+        if line.check == LineCheck::Failed {
+            return Ok(Some(Contest::HotLineFails {
+                at: p,
+                line_start: line.start,
+            }));
+        }
+        let to = line.end.min(until);
+        let mut theirs = Vec::new();
+        for (w, (&path, len)) in witnesses.iter().zip(&lens).enumerate() {
+            let Some(len) = *len else {
+                continue;
+            };
+            let Some(q) =
+                replica::first_difference_in(path, TailSource::File(hot), p, to.min(len))?
+            else {
+                continue;
+            };
+            let witness = held_line(path, q, len).map_err(io(Side::Destination, path))?;
+            if witness.check == LineCheck::Intact {
+                return Ok(Some(Contest::Fork {
+                    at: q,
+                    witness: w,
+                    hot: line.check,
+                }));
+            }
+            theirs.push(witness.check);
+        }
+        let settled =
+            line.check == LineCheck::Intact && theirs.iter().all(|c| *c == LineCheck::Failed);
+        if !settled
+            && let Some(contested) = replica::first_contested_file_before(hot, witnesses, p, to)?
+        {
+            return Ok(Some(Contest::Majority(contested)));
+        }
+        next = line.end;
+    }
+    Ok(None)
 }

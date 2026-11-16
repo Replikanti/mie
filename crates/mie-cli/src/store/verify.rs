@@ -58,7 +58,13 @@
 //!     chunks, and any difference is `prefix`, naming the first differing
 //!     byte (equivalent to comparing the SHA-256 of the copy with that of
 //!     hot's first `len(copy)` bytes, and it locates the damage, which the
-//!     repair needs).
+//!     repair needs). The `FAIL` line attributes the difference by the
+//!     verdicts of the copy's line and hot's line that hold that byte
+//!     (ADR-066 D6), the copy read first: the copy's fails and hot's
+//!     verifies, damage on the copy (`mie store repair`); hot's fails and
+//!     the copy's verifies, damage on hot (`mie store repair-hot --scope
+//!     journal`, with `mie ingest` stopped); both verify, a fork. Where
+//!     neither line verifies, no clause.
 //!   - *Records:* each recorded finding is appended as soon as it is found
 //!     (the remover counts a damaged copy until its finding exists, and a
 //!     walk takes long), with R's root and `at_ms`; after the walk comes
@@ -96,12 +102,14 @@
 //!   only writer of a second `copy` record for a copy S records, so a
 //!   finding never voids a copy made after S.
 
+use super::repair::held_line;
 use super::replicate::{
     self, Entry, IMPORT_LEDGER_DIR, JOURNAL_DIR, LedgerAppend, META_DIR, hot_entries,
     is_archive_part,
 };
 use super::{DeviceProbe, check_devices, check_hot, truncation_line};
 use crate::config::{ArchiveConfig, IngestConfig};
+use crate::journal::LineCheck;
 use mie_adapter_binance::archive::ledger::LedgerKind;
 use mie_adapter_parquet::copy_ledger::{
     self, AppendError, FindingCode, Kind, LedgerCopyCheck, Record, Subject,
@@ -922,7 +930,8 @@ impl Verify<'_> {
                 FindingCode::Prefix,
                 format!(
                     "prefix: byte {offset} differs from hot's journal, so the copy is not a byte \
-                     prefix of it"
+                     prefix of it{}",
+                    attribution(copy, copy_len, journal, hot_len, offset)?
                 ),
             ))),
             Err(CopyError {
@@ -1130,4 +1139,44 @@ fn describe(check: CopyCheck, path: &str) -> String {
             "sha256: its SHA-256 differs from the copy ledger's manifest".to_owned()
         }
     }
+}
+
+/// V4's attribution of a journal `prefix` finding at byte `offset`
+/// (ADR-066 D6): a clause from the verdicts of the copy's line and hot's
+/// line that hold it, the copy read first (V2). Empty where neither side
+/// verifies, so a line without a check is reported as before.
+fn attribution(
+    copy: &Path,
+    copy_len: u64,
+    journal: &Path,
+    hot_len: u64,
+    offset: u64,
+) -> Result<&'static str, Stop> {
+    let theirs = held_line(copy, offset, copy_len)
+        .map_err(|error| Stop::Root(format!("reading {}: {error}", copy.display())))?
+        .check;
+    let hot = held_line(journal, offset, hot_len)
+        .map_err(|error| {
+            Stop::Root(format!(
+                "reading hot's journal {}: {error}",
+                journal.display()
+            ))
+        })?
+        .check;
+    Ok(match (theirs, hot) {
+        (LineCheck::Failed, LineCheck::Intact) => {
+            "; the copy's line there fails its check and hot's verifies (ADR-066 D6): damage on \
+             the copy, which `mie store repair` rebuilds from hot"
+        }
+        (LineCheck::Intact, LineCheck::Failed) => {
+            "; hot's line there fails its check and the copy's verifies (ADR-066 D6): damage on \
+             hot, which `mie store repair-hot --scope journal` repairs, with `mie ingest` stopped"
+        }
+        (LineCheck::Intact, LineCheck::Intact) => {
+            "; both lines there verify their checks (ADR-066 D6): a fork, not damage, which \
+             `mie store repair-hot --scope journal`, with `mie ingest` stopped, names on both \
+             sides"
+        }
+        _ => "",
+    })
 }

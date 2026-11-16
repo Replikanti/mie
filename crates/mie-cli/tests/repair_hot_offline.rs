@@ -3,7 +3,10 @@
 //! hot after the adoption's pass. AC1: hot's journal in the R7 suspect
 //! state is restored and kept aside. AC2: a damaged hot import-ledger file
 //! is restored and kept aside. AC3: a fork, and an entry without a good
-//! copy, stop naming both sides and write nothing.
+//! copy, stop naming both sides and write nothing. The journal tests of
+//! ADR-065 run on journals stripped of the line check (ADR-066,
+//! `Fixture::new_legacy`), so they pin the byte rules that still decide
+//! lines without it; the `ac224_*` tests pin the checks.
 
 mod common;
 
@@ -100,7 +103,7 @@ fn append(path: &Path, bytes: &[u8]) {
 /// restores hot's journal from the copies and keeps the flipped file.
 #[test]
 fn ac1_hot_journal_r7_suspect_is_restored_and_kept_aside() {
-    let (_dir, fixture) = adopted("hot-ac1");
+    let (_dir, fixture) = adopted_legacy("hot-ac1");
     let journal = fixture.config.paths.journal.clone();
     let listed = runs(&fixture);
     assert!(listed.starts_with("Ok("), "{listed}");
@@ -258,7 +261,7 @@ fn ac2_hot_import_ledger_file_is_restored_and_kept_aside() {
 /// with X kept in their `.mie/damaged/`, and the pass brings them to hot.
 #[test]
 fn ac3_a_fork_stops_naming_both_sides_and_writes_nothing() {
-    let (_dir, fixture) = adopted("hot-ac3-fork");
+    let (_dir, fixture) = adopted_legacy("hot-ac3-fork");
     let s = fs::metadata(&fixture.config.paths.journal).unwrap().len();
     let x = record("x-run", 120);
     for root in ["cold-a", "cold-b"] {
@@ -288,7 +291,7 @@ fn ac3_a_fork_stops_naming_both_sides_and_writes_nothing() {
     assert_eq!(files(&fixture.dir), before);
 
     // Equal length: two lines of another run whose lengths add up to X's.
-    let (_dir2, other) = adopted("hot-ac3-equal");
+    let (_dir2, other) = adopted_legacy("hot-ac3-equal");
     for root in ["cold-a", "cold-b"] {
         append(&copy_of(&other, root), &x);
     }
@@ -424,7 +427,7 @@ fn ac3_an_entry_without_a_good_copy_stops_and_writes_nothing() {
 /// `--keep-hot-journal` would drop.
 #[test]
 fn guard_hot_damage_never_reaches_the_good_copy_through_a_lagging_copy() {
-    let (_dir, fixture) = adopted("hot-guard-lagging");
+    let (_dir, fixture) = adopted_legacy("hot-guard-lagging");
     let journal = fixture.config.paths.journal.clone();
     let good = fs::read(&journal).unwrap();
     let first_nl = good.iter().position(|b| *b == b'\n').unwrap();
@@ -484,7 +487,7 @@ fn guard_hot_damage_never_reaches_the_good_copy_through_a_lagging_copy() {
 /// verify and repair heal cold-a, and all three journals are the true one.
 #[test]
 fn behind_hot_plus_one_copy_fault_extends_hot_and_the_repair_heals_the_copy() {
-    let (_dir, fixture) = adopted("hot-behind-copy-fault");
+    let (_dir, fixture) = adopted_legacy("hot-behind-copy-fault");
     let journal = fixture.config.paths.journal.clone();
     let good = fs::read(&journal).unwrap();
     let listed = runs(&fixture);
@@ -537,7 +540,7 @@ fn behind_hot_plus_one_copy_fault_extends_hot_and_the_repair_heals_the_copy() {
 /// written.
 #[test]
 fn behind_hot_is_not_extended_where_the_copies_disagree_past_its_end() {
-    let (_dir, fixture) = adopted("hot-behind-disagree");
+    let (_dir, fixture) = adopted_legacy("hot-behind-disagree");
     let journal = fixture.config.paths.journal.clone();
     let good = fs::read(&journal).unwrap();
     let last = good[..good.len() - 1]
@@ -574,7 +577,7 @@ fn behind_hot_is_not_extended_where_the_copies_disagree_past_its_end() {
 /// the last line, so hot takes nothing: *two-fault*, nothing written.
 #[test]
 fn behind_hot_takes_no_byte_only_a_differing_copy_holds() {
-    let (_dir, fixture) = adopted("hot-behind-differing-tail");
+    let (_dir, fixture) = adopted_legacy("hot-behind-differing-tail");
     let journal = fixture.config.paths.journal.clone();
     let good = fs::read(&journal).unwrap();
     let last = good[..good.len() - 1]
@@ -619,7 +622,7 @@ fn behind_hot_takes_no_byte_only_a_differing_copy_holds() {
 /// O kept in its `.mie/damaged/`, and the next pass writes N there.
 #[test]
 fn a_fork_through_an_unmounted_copy_stops_and_the_flag_keeps_hot() {
-    let (_dir, fixture) = adopted("hot-fork-unmounted");
+    let (_dir, fixture) = adopted_legacy("hot-fork-unmounted");
     let journal = fixture.config.paths.journal.clone();
     let good = fs::read(&journal).unwrap();
     let cut = good[..good.len() - 1]
@@ -691,7 +694,7 @@ fn a_fork_through_an_unmounted_copy_stops_and_the_flag_keeps_hot() {
 /// given, so it stops *two-fault*, nothing written.
 #[test]
 fn behind_hot_stops_where_a_shorter_copy_is_a_fork() {
-    let (_dir, fixture) = adopted("hot-behind-fork");
+    let (_dir, fixture) = adopted_legacy("hot-behind-fork");
     let journal = fixture.config.paths.journal.clone();
     let good = fs::read(&journal).unwrap();
     let cut = good[..good.len() - 1]
@@ -734,7 +737,7 @@ fn behind_hot_stops_where_a_shorter_copy_is_a_fork() {
 /// majority at x, so nothing is extended: *two-fault*, nothing written.
 #[test]
 fn behind_hot_outvoted_below_its_end_is_not_extended() {
-    let (_dir, fixture) = adopted("hot-behind-outvoted");
+    let (_dir, fixture) = adopted_legacy("hot-behind-outvoted");
     let journal = fixture.config.paths.journal.clone();
     let good = fs::read(&journal).unwrap();
     let cut = good[..good.len() - 1]
@@ -755,5 +758,133 @@ fn behind_hot_outvoted_below_its_end_is_not_extended() {
         &out,
         &["`--keep-hot-journal` would drop", "cold-a", "cold-b"],
     );
+    assert_eq!(files(&fixture.dir), before);
+}
+
+/// One checked journal record of exactly `len` bytes, its `\n` included
+/// (ADR-066 D1).
+fn checked_record(run: &str, len: usize) -> Vec<u8> {
+    let object = record(run, len - 20);
+    let mut bytes = mie_cli::journal::with_check(&object[..object.len() - 1]);
+    bytes.push(b'\n');
+    assert_eq!(bytes.len(), len);
+    bytes
+}
+
+/// #224 AC 5: a damaged checked line in hot's journal is repaired from one
+/// copy. Hot's second line flips a bit while cold-b lags at hot's first
+/// line, so only cold-a holds the line: ADR-065 alone stops
+/// *one-witness* (the guard test above), and the line's own check
+/// attributes it: *line-damaged*, hot is cold-a's journal again, its
+/// former bytes kept, the runs unchanged, and the next verification
+/// passes.
+#[test]
+fn ac224_a_damaged_checked_line_in_hot_is_repaired_from_one_copy() {
+    let (_dir, fixture) = adopted("hot-ac224-5");
+    let journal = fixture.config.paths.journal.clone();
+    let good = fs::read(&journal).unwrap();
+    let listed = runs(&fixture);
+    let first_nl = good.iter().position(|b| *b == b'\n').unwrap();
+    let lagging = copy_of(&fixture, "cold-b");
+    writable(&lagging);
+    fs::write(&lagging, &good[..=first_nl]).unwrap();
+    flip(&journal, first_nl + 10);
+    let flipped = fs::read(&journal).unwrap();
+
+    let (pass, out) = repair_hot(&fixture, Scope::Journal, false, REPAIRED);
+    assert!(pass, "{out}");
+    assert!(out.contains("journal: decision line-damaged"), "{out}");
+    assert!(
+        out.contains(&format!(
+            "repaired from the copy on cold-a: its line(s) from byte(s) {} fail their check",
+            first_nl + 1
+        )) || out.contains(&format!(
+            "replaced by the copy on cold-a: its line(s) from byte(s) {} fail their check",
+            first_nl + 1
+        )),
+        "{out}"
+    );
+    assert_eq!(fs::read(&journal).unwrap(), good);
+    let mut aside = journal.as_os_str().to_owned();
+    aside.push(format!(".damaged-{REPAIRED}"));
+    assert_eq!(fs::read(PathBuf::from(aside)).unwrap(), flipped);
+    assert_eq!(runs(&fixture), listed);
+    let (pass, out) = verify(&fixture, REPAIRED + 1);
+    assert!(pass, "{out}");
+}
+
+/// #224 AC 6: a fork is detected from the checks and nothing is written.
+/// The copies hold a line X of run x after the common journal; hot holds a
+/// line Y of run y of X's length, so the `\n` positions agree: ADR-065
+/// D3's blind spot, where the byte rules call it *damaged* and would
+/// replace Y (shown on the same journal without checks). With checks
+/// both lines verify: *diverged*, naming the verifying hot line, nothing
+/// written.
+#[test]
+fn ac224_a_fork_is_detected_from_the_checks_and_nothing_is_written() {
+    let (_dir, fixture) = adopted("hot-ac224-6");
+    let s = fs::metadata(&fixture.config.paths.journal).unwrap().len();
+    for root in ["cold-a", "cold-b"] {
+        let copy = copy_of(&fixture, root);
+        writable(&copy);
+        append(&copy, &checked_record("x-run", 120));
+    }
+    append(&fixture.config.paths.journal, &checked_record("y-run", 120));
+    let before = files(&fixture.dir);
+    let (pass, out) = repair_hot(&fixture, Scope::Journal, false, REPAIRED);
+    assert!(!pass, "{out}");
+    assert!(out.contains("journal: decision diverged"), "{out}");
+    assert_fail_line(
+        &out,
+        &[
+            &format!("hot's line from byte {s} verifies its check"),
+            "never overwrites a hot line that verifies",
+            "--keep-hot-journal",
+        ],
+    );
+    assert_eq!(files(&fixture.dir), before);
+
+    // The same fork without checks: the byte rules cannot tell, and decide
+    // *damaged*; run with `--keep-hot-journal`, which *damaged* refuses, so
+    // the decision shows and nothing is written.
+    let (_dir, legacy) = adopted_legacy("hot-ac224-6-legacy");
+    for root in ["cold-a", "cold-b"] {
+        let copy = copy_of(&legacy, root);
+        writable(&copy);
+        append(&copy, &record("x-run", 120));
+    }
+    append(&legacy.config.paths.journal, &record("y-run", 120));
+    let (pass, out) = repair_hot(&legacy, Scope::Journal, true, REPAIRED);
+    assert!(!pass, "{out}");
+    assert!(out.contains("journal: decision damaged"), "{out}");
+}
+
+/// #224: ADR-065's rules still decide lines without checks. On a journal
+/// stripped of its checks, one flipped byte with two full copies is
+/// *damaged* (not *line-damaged*) and restored; with cold-b lagging at the
+/// first line, *one-witness*, nothing written, and the stop says the
+/// lines carry no check.
+#[test]
+fn ac224_the_217_rules_still_decide_old_lines() {
+    let (_dir, fixture) = adopted_legacy("hot-ac224-legacy");
+    let journal = fixture.config.paths.journal.clone();
+    let good = fs::read(&journal).unwrap();
+    assert!(!String::from_utf8_lossy(&good).contains("crc32c"));
+    flip(&journal, 10);
+    let (pass, out) = repair_hot(&fixture, Scope::Journal, false, REPAIRED);
+    assert!(pass, "{out}");
+    assert!(out.contains("journal: decision damaged"), "{out}");
+    assert_eq!(fs::read(&journal).unwrap(), good);
+
+    let first_nl = good.iter().position(|b| *b == b'\n').unwrap();
+    let lagging = copy_of(&fixture, "cold-b");
+    writable(&lagging);
+    fs::write(&lagging, &good[..=first_nl]).unwrap();
+    flip(&journal, first_nl + 10);
+    let before = files(&fixture.dir);
+    let (pass, out) = repair_hot(&fixture, Scope::Journal, false, REPAIRED + 1);
+    assert!(!pass, "{out}");
+    assert!(out.contains("journal: decision one-witness"), "{out}");
+    assert_fail_line(&out, &["the differing lines carry no check"]);
     assert_eq!(files(&fixture.dir), before);
 }

@@ -4,6 +4,7 @@
 
 use super::*;
 use crate::store::archive_checks::tests::{NAME, S1, entry, part, sha, supersede};
+use crate::store::repair::Contest;
 
 /// A supersede record of the fixture's archive file naming `entries`
 /// (`(name, bytes)`).
@@ -67,8 +68,46 @@ fn first_diff(a: &[u8], b: &[u8]) -> Option<u64> {
         .map(|i| i as u64)
 }
 
+/// One checked journal line of exactly `len` bytes, its `\n` included
+/// (ADR-066 D1): [`line`]'s record with the check appended.
+pub(super) fn checked(run: &str, fields: &str, len: usize) -> Vec<u8> {
+    let object = line(run, fields, len - 20);
+    let mut bytes = crate::journal::with_check(&object[..object.len() - 1]);
+    bytes.push(b'\n');
+    assert_eq!(bytes.len(), len);
+    assert_eq!(check_line(&bytes[..len - 1]), LineCheck::Intact);
+    bytes
+}
+
+/// `n` checked lines of run `run`, 200 bytes each, line `i` (from 1)
+/// carrying `"n":i`, so no two are alike.
+pub(super) fn checked_lines(run: &str, n: usize) -> Vec<u8> {
+    (1..=n)
+        .flat_map(|i| checked(run, &format!("\"n\":{i},"), 200))
+        .collect()
+}
+
+/// D5 (ADR-066, [`journal_contest`]) over in-memory journals written to
+/// files: hot and the witnesses `copies`, from `from` below `until`.
+pub(super) fn contest(hot: &[u8], copies: &[&[u8]], from: u64, until: u64) -> Option<Contest> {
+    let dir = crate::store::replicate::tests::Dir::new("repair-hot-contest");
+    let hot_path = dir.0.join("hot");
+    fs::write(&hot_path, hot).unwrap();
+    let paths: Vec<PathBuf> = copies
+        .iter()
+        .enumerate()
+        .map(|(i, copy)| {
+            let path = dir.0.join(format!("copy-{i}"));
+            fs::write(&path, copy).unwrap();
+            path
+        })
+        .collect();
+    let refs: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
+    journal_contest(&hot_path, &refs, from, until).unwrap()
+}
+
 /// Whether R7 refuses to rebuild `copy` from `hot` with `copies` (all of
-/// them, `copy` among them) as the witnesses (ADR-065 D8), in memory.
+/// them, `copy` among them) as the witnesses (ADR-066 D5).
 fn r7_refuses(hot: Option<&[u8]>, copy: &[u8], copies: &[&[u8]]) -> bool {
     let Some(hot) = hot else {
         return !copy.is_empty();
@@ -78,7 +117,7 @@ fn r7_refuses(hot: Option<&[u8]>, copy: &[u8], copies: &[&[u8]]) -> bool {
         None if copy.len() <= hot.len() => return false,
         None => hot.len() as u64,
     };
-    replica::first_contested(hot, copies, line_start_in(hot, d)).is_some()
+    contest(hot, copies, line_start_in(hot, d), u64::MAX).is_some()
 }
 
 /// X1's facts over in-memory journals, as the run reads them: hot (`None`
@@ -108,6 +147,7 @@ fn facts_of(hot: Option<&[u8]>, copies: &[&[u8]], k: usize) -> JournalFacts {
         fork: false,
         copy_targets: k,
         behind: None,
+        checked: None,
     };
     if !facts.copies_agree() {
         facts.behind = behind_of(hot, copies);
@@ -132,7 +172,37 @@ fn facts_of(hot: Option<&[u8]>, copies: &[&[u8]], k: usize) -> JournalFacts {
     {
         facts.fork = fork_of(hot_bytes, c_bytes, d, e);
     }
+    if let Some((d, e)) = facts.bounds {
+        facts.checked = checked_of(hot_bytes, c_bytes, d, e).map(|mut checked| {
+            if checked.all_restorable() {
+                checked.fork = fork_of(hot_bytes, c_bytes, d, e);
+            }
+            checked
+        });
+    }
     facts
+}
+
+/// X7's facts over in-memory journals, hot's lines read one at a time
+/// from s.
+fn checked_of(hot: &[u8], c: &[u8], d: u64, e: u64) -> Option<CheckedFacts> {
+    let s = line_start_in(c, d) as usize;
+    let mut rest = &hot[s..];
+    checked_facts(c, d, e, &mut || {
+        if rest.is_empty() {
+            return Ok(None);
+        }
+        let end = rest
+            .iter()
+            .position(|b| *b == b'\n')
+            .map_or(rest.len(), |i| i + 1);
+        let (line, tail) = rest.split_at(end);
+        rest = tail;
+        Ok(Some(RegionLine {
+            len: line.len() as u64,
+            bytes: Some(line.to_vec()),
+        }))
+    })
 }
 
 /// [`BehindFacts`] over in-memory journals, as the run reads them where the
@@ -145,11 +215,7 @@ fn behind_of(hot: Option<&[u8]>, copies: &[&[u8]]) -> Option<BehindFacts> {
     if copies.iter().all(|c| c.len() <= hot.len()) {
         return None;
     }
-    let below: Vec<&[u8]> = copies
-        .iter()
-        .map(|c| &c[..c.len().min(hot.len())])
-        .collect();
-    if replica::first_contested(hot, &below, 0).is_some() {
+    if contest(hot, copies, 0, hot.len() as u64).is_some() {
         return None;
     }
     let disagree = replica::first_disagreement(copies, hot.len() as u64);
@@ -234,6 +300,7 @@ fn numbers(hot_len: u64, lens: &[u64], bounds: Option<(u64, u64)>, lls: u64) -> 
         fork: false,
         copy_targets: lens.len().max(2),
         behind: None,
+        checked: None,
     }
 }
 
@@ -609,6 +676,7 @@ fn x3_the_states_the_flag_acts_on() {
         JournalDecision::Behind,
         JournalDecision::BehindCopyDamaged,
         JournalDecision::Damaged,
+        JournalDecision::LineDamaged,
         JournalDecision::HotAhead,
     ] {
         assert!(!decision.keeps_hot(), "{decision:?}");
@@ -621,6 +689,429 @@ fn x3_the_states_the_flag_acts_on() {
     ] {
         assert!(decision.keeps_hot(), "{decision:?}");
     }
+}
+
+// ----------------------------------------------------------------- X7
+
+/// The facts of the plan's geometry (ADR-066 D4): a journal of five
+/// 200-byte checked lines (starts 0, 200, 400, 600, 800), unless given.
+fn five() -> Vec<u8> {
+    checked_lines("A", 5)
+}
+
+/// The X7 facts of `hot` against `copies`, with their decision.
+fn x7(hot: &[u8], copies: &[&[u8]]) -> (Option<CheckedFacts>, JournalDecision) {
+    let facts = facts_of(Some(hot), copies, copies.len().max(2));
+    let decision = decide_journal(&facts);
+    (facts.checked, decision)
+}
+
+/// The facts of every differing line.
+fn facts_in(checked: &Option<CheckedFacts>) -> Vec<(u64, LineFact)> {
+    checked
+        .as_ref()
+        .expect("X7 facts")
+        .lines
+        .iter()
+        .map(|line| (line.start, line.fact))
+        .collect()
+}
+
+/// The plan's geometry: hot 1 000 B flipped at 450, cold-a 1 000 B, cold-b
+/// 400 B. ADR-065 alone says *one-witness* (e = 450 ≥ L_2 = 400); X7 says
+/// *line-damaged*, one witness enough, since hot's line 3 fails its check
+/// and cold-a holds it intact with the same span.
+#[test]
+fn x7_hot_line_fails_one_copy_repairs() {
+    let c = five();
+    let hot = flipped(&c, &[450]);
+    let (checked, decision) = x7(&hot, &[&c, &c[..400]]);
+    assert_eq!(facts_in(&checked), vec![(400, LineFact::Restorable)]);
+    assert_eq!(decision, JournalDecision::LineDamaged);
+    // The same bytes without checks: ADR-065 decides.
+    let legacy = records("A", 1000);
+    assert_eq!(
+        decide(Some(&flipped(&legacy, &[450])), &[&legacy, &legacy[..400]]),
+        JournalDecision::OneWitness
+    );
+    // Two flipped lines, one copy of hot's length.
+    let (checked, decision) = x7(&flipped(&c, &[250, 850]), &[&c]);
+    assert_eq!(
+        facts_in(&checked),
+        vec![(200, LineFact::Restorable), (800, LineFact::Restorable)]
+    );
+    assert_eq!(decision, JournalDecision::LineDamaged);
+}
+
+/// Hot 800 B under copies of 1 000 B, flipped at 450: *line-damaged*
+/// (ADR-065 alone: *diverged*, the copies longer and contradicted).
+#[test]
+fn x7_hot_shorter_takes_c() {
+    let c = five();
+    let hot = flipped(&c[..800], &[450]);
+    let (checked, decision) = x7(&hot, &[&c, &c]);
+    assert_eq!(facts_in(&checked), vec![(400, LineFact::Restorable)]);
+    assert_eq!(decision, JournalDecision::LineDamaged);
+    let legacy = records("A", 1000);
+    assert_eq!(
+        decide(Some(&flipped(&legacy[..800], &[450])), &[&legacy, &legacy]),
+        JournalDecision::Diverged
+    );
+}
+
+/// Hot 1 200 B (a sixth line past the copies) flipped at 450 and at 1 050:
+/// *line-damaged*; the flip past L_C is outside [d, e] and no fact.
+#[test]
+fn x7_hot_longer_is_line_damaged() {
+    let c = five();
+    let mut hot = checked_lines("A", 6);
+    hot = flipped(&hot, &[450, 1050]);
+    let (checked, decision) = x7(&hot, &[&c, &c[..400]]);
+    assert_eq!(facts_in(&checked), vec![(400, LineFact::Restorable)]);
+    assert_eq!(decision, JournalDecision::LineDamaged);
+}
+
+/// A fork at equal length: hot's line 3 is another intact line of 200
+/// bytes. Both lines verify, so *diverged*, whatever the copies.
+#[test]
+fn x7_equal_length_fork_by_checks_stops() {
+    let c = five();
+    let mut hot = c[..400].to_vec();
+    hot.extend(checked("B", "", 200));
+    hot.extend_from_slice(&c[600..]);
+    let (checked, decision) = x7(&hot, &[&c, &c]);
+    assert_eq!(facts_in(&checked), vec![(400, LineFact::Fork)]);
+    assert_eq!(decision, JournalDecision::Diverged);
+}
+
+/// A fork of other lengths: hot's line 3 is an intact line of 150 bytes,
+/// so every later line shifts; each differing hot line verifies.
+#[test]
+fn x7_unequal_fork_by_checks_stops() {
+    let c = five();
+    let mut hot = c[..400].to_vec();
+    hot.extend(checked("B", "", 150));
+    hot.extend_from_slice(&c[600..]);
+    let (checked, decision) = x7(&hot, &[&c, &c]);
+    let facts = facts_in(&checked);
+    assert!(!facts.is_empty());
+    assert!(
+        facts.iter().all(|(_, fact)| fact.hot_verifies()),
+        "{facts:?}"
+    );
+    assert_eq!(decision, JournalDecision::Diverged);
+}
+
+/// Hot intact, the copies' line 3 fails its check: *copy-damaged* (R7
+/// heals it, ADR-066 D5).
+#[test]
+fn x7_copy_line_fails_is_copy_damaged() {
+    let hot = five();
+    let c = flipped(&hot, &[450]);
+    let (checked, decision) = x7(&hot, &[&c, &c[..400]]);
+    assert_eq!(facts_in(&checked), vec![(400, LineFact::CopyFails)]);
+    assert_eq!(decision, JournalDecision::CopyDamaged);
+    assert!(decision.keeps_hot());
+}
+
+/// Hot's line 3 fails, the copies' line 4 fails: neither side alone is
+/// damaged, and a hot line that verifies differs, so *diverged*.
+#[test]
+fn x7_mixed_hot_and_copy_failures_stop() {
+    let good = five();
+    let hot = flipped(&good, &[450]);
+    let c = flipped(&good, &[650]);
+    let (checked, decision) = x7(&hot, &[&c, &c]);
+    assert_eq!(
+        facts_in(&checked),
+        vec![(400, LineFact::Restorable), (600, LineFact::CopyFails)]
+    );
+    assert_eq!(decision, JournalDecision::Diverged);
+}
+
+/// The copies' line 4 fails, and hot's line 3 lost its check (a flip in
+/// the member's name): one differing line is *copy fails*, the other
+/// unattributed, so *diverged*, not *copy-damaged*.
+#[test]
+fn x7_copy_fails_with_an_unchecked_line_is_diverged() {
+    let good = five();
+    // Line 3's member is the last 21 bytes of its body [400, 599): its `,`
+    // at 578, its `"` at 579, the first `c` of `crc32c` at 580.
+    let hot = with(&good, &[(580, b'C')]);
+    assert_eq!(check_line(&hot[400..599]), LineCheck::Unchecked);
+    let c = flipped(&good, &[650]);
+    let (checked, decision) = x7(&hot, &[&c, &c]);
+    assert_eq!(
+        facts_in(&checked),
+        vec![(400, LineFact::Unattributed), (600, LineFact::CopyFails)]
+    );
+    assert_eq!(decision, JournalDecision::Diverged);
+}
+
+/// A line deleted cleanly from hot: the lines on both sides verify, so
+/// the shifted lines are forks, and the state *diverged*.
+#[test]
+fn x7_cleanly_deleted_line_stops_as_a_fork() {
+    let c = five();
+    let mut hot = c[..400].to_vec();
+    hot.extend_from_slice(&c[600..]);
+    let (checked, decision) = x7(&hot, &[&c, &c]);
+    let facts = facts_in(&checked);
+    assert_eq!(facts.first(), Some(&(400, LineFact::Fork)));
+    assert_eq!(decision, JournalDecision::Diverged);
+}
+
+/// Hot's line 3 replaced by a byte-identical copy of line 2 (same
+/// envelope, same `at_ms`): it verifies, so a fork, never damage.
+#[test]
+fn x7_duplicated_line_stops_as_a_fork() {
+    let c = five();
+    let mut hot = c[..400].to_vec();
+    hot.extend_from_slice(&c[200..400]);
+    hot.extend_from_slice(&c[600..]);
+    let (checked, decision) = x7(&hot, &[&c, &c]);
+    assert_eq!(facts_in(&checked), vec![(400, LineFact::Fork)]);
+    assert_eq!(decision, JournalDecision::Diverged);
+}
+
+/// A fork line with the copy's own `run_id`, `type` and `at_ms` but other
+/// fields verifies: *diverged*.
+#[test]
+fn x7_identical_envelopes_still_fork() {
+    let c = five();
+    let mut hot = c[..400].to_vec();
+    hot.extend(checked("A", "\"n\":9,", 200));
+    hot.extend_from_slice(&c[600..]);
+    let (checked, decision) = x7(&hot, &[&c, &c]);
+    assert_eq!(facts_in(&checked), vec![(400, LineFact::Fork)]);
+    assert_eq!(decision, JournalDecision::Diverged);
+}
+
+/// Hot's line 3 is C's first 60 bytes glued to a checked record of run B
+/// that ends where C's line ends: it fails its check against a same-span
+/// intact line of C, but X2a finds a glued record of another run, so not
+/// *line-damaged*; ADR-065 decides (*diverged*, an equal-length fork).
+#[test]
+fn x7_fork_shape_blocks_line_damaged() {
+    let c = five();
+    let hot = glued(&c, 1000);
+    let (checked, decision) = x7(&hot, &[&c, &c]);
+    let checked = checked.unwrap();
+    assert!(checked.all_restorable(), "{checked:?}");
+    assert!(checked.fork);
+    assert_eq!(decision, JournalDecision::Diverged);
+}
+
+/// `c` (five checked lines) with line 3 replaced by its first 60 bytes and
+/// a checked record of run B to the line's end, then C's bytes from 600 up
+/// to `len` (or a sixth line of hot's own past 1 000).
+fn glued(c: &[u8], len: usize) -> Vec<u8> {
+    let mut hot = c[..460].to_vec();
+    hot.extend(checked("B", "", 140));
+    hot.extend_from_slice(&c[600..]);
+    if len > 1000 {
+        hot.extend(checked("A", "\"n\":6,", len - 1000));
+    }
+    assert_eq!(check_line(&hot[400..599]), LineCheck::Failed);
+    hot
+}
+
+/// X2a runs for X7 at any lengths: hot 1 200 B against copies of 1 000 B
+/// with the glued line 3 is fork-shaped, so not *line-damaged*.
+#[test]
+fn x2a_fork_shaped_at_unequal_lengths() {
+    let c = five();
+    let hot = glued(&c, 1200);
+    let (checked, decision) = x7(&hot, &[&c, &c]);
+    let checked = checked.unwrap();
+    assert!(checked.all_restorable() && checked.fork, "{checked:?}");
+    assert_ne!(decision, JournalDecision::LineDamaged);
+    // Without the glue the same lengths are *line-damaged*.
+    let (_, decision) = x7(&flipped(&checked_lines("A", 6), &[450]), &[&c, &c]);
+    assert_eq!(decision, JournalDecision::LineDamaged);
+}
+
+/// Lines without checks: every differing line is unattributed, and the
+/// decisions are ADR-065's (*damaged*, *one-witness*, *diverged*).
+#[test]
+fn x7_unchecked_lines_keep_adr065() {
+    let c = records("A", 1000);
+    for (hot, copies, expected) in [
+        (
+            flipped(&c, &[450]),
+            vec![&c[..], &c[..]],
+            JournalDecision::Damaged,
+        ),
+        (
+            flipped(&c, &[450]),
+            vec![&c[..], &c[..400]],
+            JournalDecision::OneWitness,
+        ),
+        (
+            flipped(&c[..800], &[450]),
+            vec![&c[..], &c[..]],
+            JournalDecision::Diverged,
+        ),
+    ] {
+        let (checked, decision) = x7(&hot, &copies);
+        let facts = facts_in(&checked);
+        assert!(
+            facts
+                .iter()
+                .all(|(_, fact)| *fact == LineFact::Unattributed),
+            "{facts:?}"
+        );
+        assert_eq!(decision, expected);
+    }
+}
+
+/// A one-line journal, damaged in hot, with one copy: *line-damaged*.
+#[test]
+fn x7_single_line_journal() {
+    let c = checked("A", "", 200);
+    let (checked, decision) = x7(&flipped(&c, &[90]), &[&c]);
+    assert_eq!(facts_in(&checked), vec![(0, LineFact::Restorable)]);
+    assert_eq!(decision, JournalDecision::LineDamaged);
+}
+
+/// The first byte flipped (the `{` at 0): the shape does not need `{`, so
+/// the line fails its check: *line-damaged*.
+#[test]
+fn x7_damage_at_the_first_byte() {
+    let c = five();
+    let (checked, decision) = x7(&flipped(&c, &[0]), &[&c, &c[..400]]);
+    assert_eq!(facts_in(&checked), vec![(0, LineFact::Restorable)]);
+    assert_eq!(decision, JournalDecision::LineDamaged);
+}
+
+/// The last complete line damaged: *line-damaged*.
+#[test]
+fn x7_damage_in_the_last_complete_line() {
+    let c = five();
+    let (checked, decision) = x7(&flipped(&c, &[950]), &[&c, &c[..400]]);
+    assert_eq!(facts_in(&checked), vec![(800, LineFact::Restorable)]);
+    assert_eq!(decision, JournalDecision::LineDamaged);
+}
+
+/// Hot's last line without its `\n`, damaged: it is not classified, so
+/// unattributed, and ADR-065 decides (*diverged*: the copies are longer and
+/// contradicted).
+#[test]
+fn x7_hot_last_line_cut() {
+    let c = five();
+    let hot = flipped(&c[..950], &[900]);
+    let (checked, decision) = x7(&hot, &[&c, &c]);
+    assert_eq!(facts_in(&checked), vec![(800, LineFact::Unattributed)]);
+    assert_eq!(decision, JournalDecision::Diverged);
+}
+
+/// C cut 50 bytes into a sixth line, hot 1 000 B flipped at 450:
+/// *line-damaged*, and C ends inside a line (the write adds its `\n`).
+#[test]
+fn x7_c_cut_after_the_damaged_line() {
+    let six = checked_lines("A", 6);
+    let c = &six[..1050];
+    let facts = facts_of(Some(&flipped(&six[..1000], &[450])), &[c, c], 2);
+    assert!(facts.cut);
+    assert_eq!(decide_journal(&facts), JournalDecision::LineDamaged);
+}
+
+/// A `\n` flipped in hot merges lines 3 and 4: the merged line fails its
+/// check, but C holds no line of its span, so unattributed, and ADR-065's
+/// *damaged* decides with two witnesses.
+#[test]
+fn x7_newline_flip_in_hot_falls_back() {
+    let c = five();
+    let hot = flipped(&c, &[599]);
+    assert_eq!(check_line(&hot[400..799]), LineCheck::Failed);
+    let (checked, decision) = x7(&hot, &[&c, &c]);
+    assert_eq!(facts_in(&checked), vec![(400, LineFact::Unattributed)]);
+    assert_eq!(decision, JournalDecision::Damaged);
+}
+
+/// Four lines from before ADR-066, then three checked ones; the `\n` that
+/// ends the last old line flipped in hot merges it with the first checked
+/// one: C's line there carries no check, so unattributed, and ADR-065
+/// decides.
+#[test]
+fn x7_damage_across_the_deployment_boundary() {
+    let mut c = records("A", 400);
+    c.extend(checked_lines("A", 3));
+    let hot = flipped(&c, &[399]);
+    assert_eq!(check_line(&hot[300..599]), LineCheck::Failed);
+    let (checked, decision) = x7(&hot, &[&c, &c]);
+    assert_eq!(facts_in(&checked), vec![(300, LineFact::Unattributed)]);
+    assert_eq!(decision, JournalDecision::Damaged);
+}
+
+/// d in line 2 and e in line 5, lines 3 and 4 equal: only lines 2 and 5
+/// are classified; d = e is one byte; a hot line spanning two of C's is
+/// unattributed.
+#[test]
+fn x7_region_classifies_only_differing_lines() {
+    let c = five();
+    let (checked, _) = x7(&flipped(&c, &[250, 850]), &[&c, &c]);
+    assert_eq!(
+        facts_in(&checked),
+        vec![(200, LineFact::Restorable), (800, LineFact::Restorable)]
+    );
+    let facts = facts_of(Some(&flipped(&c, &[450])), &[&c, &c], 2);
+    assert_eq!(facts.bounds, Some((450, 450)));
+    assert_eq!(facts_in(&facts.checked), vec![(400, LineFact::Restorable)]);
+    let (checked, decision) = x7(&flipped(&c, &[399, 850]), &[&c, &c]);
+    assert_eq!(
+        facts_in(&checked),
+        vec![(200, LineFact::Unattributed), (800, LineFact::Restorable)]
+    );
+    assert_ne!(decision, JournalDecision::LineDamaged);
+}
+
+/// A read error on hot's region gives no X7 facts, so ADR-065 decides.
+#[test]
+fn x7_hot_read_error_falls_back() {
+    let c = five();
+    let hot = flipped(&c, &[450]);
+    let mut calls = 0;
+    let checked = checked_facts(&c, 450, 450, &mut || {
+        calls += 1;
+        Err("Input/output error".to_owned())
+    });
+    assert_eq!(checked, None);
+    assert_eq!(calls, 1);
+    let mut facts = facts_of(Some(&hot), &[&c, &c[..400]], 2);
+    facts.checked = None;
+    assert_eq!(decide_journal(&facts), JournalDecision::OneWitness);
+}
+
+/// A hot line longer than the cap is not held in memory and is
+/// unattributed; [`read_region_line`] keeps its length.
+#[test]
+fn x7_lines_over_the_cap_are_unattributed() {
+    let mut long = vec![b'x'; MAX_CHECKED_LINE + 1];
+    long.push(b'\n');
+    let mut reader = std::io::Cursor::new([long.as_slice(), &b"{}\n"[..]].concat());
+    let first = read_region_line(&mut reader).unwrap().unwrap();
+    assert_eq!(first.len, long.len() as u64);
+    assert_eq!(first.bytes, None);
+    let second = read_region_line(&mut reader).unwrap().unwrap();
+    assert_eq!(second.bytes.as_deref(), Some(&b"{}\n"[..]));
+    assert_eq!(read_region_line(&mut reader).unwrap(), None);
+    // At the cap the line is held.
+    let mut at_cap = vec![b'x'; MAX_CHECKED_LINE];
+    at_cap.push(b'\n');
+    let line = read_region_line(&mut std::io::Cursor::new(at_cap.clone()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(line.bytes, Some(at_cap));
+    let c = vec![b'y'; long.len()];
+    let mut lines = vec![RegionLine {
+        len: long.len() as u64,
+        bytes: None,
+    }]
+    .into_iter();
+    let checked = checked_facts(&c, 5, 5, &mut || Ok(lines.next())).unwrap();
+    assert_eq!(checked.lines.len(), 1);
+    assert_eq!(checked.lines[0].fact, LineFact::Unattributed);
 }
 
 // ---------------------------------------------------------------- X2a

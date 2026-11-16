@@ -2028,6 +2028,65 @@ pub fn first_contested_file_before(
     from: u64,
     until: u64,
 ) -> Result<Option<Contested>, CopyError> {
+    scan_files_before(hot, witnesses, from, until, contested_window)
+}
+
+/// The first byte at or after `from` and below `until` where some witness
+/// contradicts hot's journal: it holds a byte other than hot's there, or
+/// any byte past hot's end. [`first_contested_file_before`] without D8's
+/// majority filter, over the same windows; `mie store repair` and `mie
+/// store repair-hot` judge each contradicted line by its check before they
+/// count bytes (ADR-066 D5). It knows nothing of the line format. A
+/// witness that does not exist holds no byte.
+///
+/// # Errors
+///
+/// As [`first_contested_file`].
+pub fn first_contradiction_file_before(
+    hot: &Path,
+    witnesses: &[&Path],
+    from: u64,
+    until: u64,
+) -> Result<Option<u64>, CopyError> {
+    scan_files_before(hot, witnesses, from, until, contradiction_window)
+}
+
+/// [`first_contradiction_file_before`] over one window that starts at
+/// offset `base`, as [`contested_window`] reads it.
+fn contradiction_window(base: u64, hot: &[u8], witnesses: &[&[u8]]) -> Option<u64> {
+    if witnesses
+        .iter()
+        .all(|w| w.len() <= hot.len() && **w == hot[..w.len()])
+    {
+        return None;
+    }
+    let end = witnesses.iter().map(|w| w.len()).max().unwrap_or(0);
+    (0..end)
+        .find(|&p| {
+            let mine = hot.get(p);
+            witnesses
+                .iter()
+                .filter_map(|w| w.get(p))
+                .any(|byte| Some(byte) != mine)
+        })
+        .map(|p| base + p as u64)
+}
+
+/// A window rule of [`scan_files_before`]: the window's offset, hot's bytes
+/// there and each witness's.
+type Window<T> = fn(u64, &[u8], &[&[u8]]) -> Option<T>;
+
+/// The windowed scan of hot's journal `hot` and the journals `witnesses`
+/// over `[from, min(until, the longest witness))`, in bounded chunks, each
+/// file at the length it has when opened (an absent witness holds no
+/// byte): the first window `window` finds something in.
+fn scan_files_before<T>(
+    hot: &Path,
+    witnesses: &[&Path],
+    from: u64,
+    until: u64,
+    window: Window<T>,
+) -> Result<Option<T>, CopyError> {
     let mut hot_file = File::open(hot)
         .map_err(io_error("open", hot))
         .map_err(CopyError::source)?;
@@ -2063,8 +2122,8 @@ pub fn first_contested_file_before(
             chunks.push(read_at(file, path, offset, take(*len))?);
         }
         let views: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
-        if let Some(contested) = contested_window(offset, &mine, &views) {
-            return Ok(Some(contested));
+        if let Some(found) = window(offset, &mine, &views) {
+            return Ok(Some(found));
         }
         offset += n;
     }

@@ -1681,6 +1681,108 @@ fn the_bounded_difference_contest_and_disagreement() {
     assert_eq!(error.side, Side::Destination, "{error}");
 }
 
+/// The journals of the contradiction tests (ADR-066 D5): 300 bytes of hot,
+/// written beside each witness, in a directory that lives as long as the
+/// returned value.
+struct Contradiction {
+    dir: TempDir,
+    hot: Vec<u8>,
+    hot_path: PathBuf,
+}
+
+impl Contradiction {
+    fn new(tag: &str) -> Self {
+        let dir = TempDir::new(tag);
+        let hot: Vec<u8> = (0..300u32).map(|i| b'a' + (i % 26) as u8).collect();
+        let hot_path = dir.path().join("hot");
+        fs::write(&hot_path, &hot).unwrap();
+        Self { dir, hot, hot_path }
+    }
+
+    fn write(&self, name: &str, bytes: &[u8]) -> PathBuf {
+        let path = self.dir.path().join(name);
+        fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    /// The first contradiction in `[from, until)` with `witnesses`.
+    fn first(&self, witnesses: &[&Path], from: u64, until: u64) -> Option<u64> {
+        first_contradiction_file_before(&self.hot_path, witnesses, from, until).unwrap()
+    }
+}
+
+/// A witness that differs from hot where hot holds a strict majority is
+/// no contest under ADR-065 D8, and still a contradiction: D5 judges its
+/// line before it counts. Across a chunk boundary (97 bytes under test)
+/// too.
+#[test]
+fn contradiction_finds_a_byte_hot_holds_by_majority() {
+    let c = Contradiction::new("replica-contradiction-majority");
+    for at in [10, 96, 97, 250] {
+        let other = c.write(&format!("b{at}"), &flipped(&c.hot, at));
+        let agree = c.write("agree", &c.hot);
+        let witnesses = [other.as_path(), agree.as_path()];
+        assert_eq!(
+            first_contested_file(&c.hot_path, &witnesses, 0).unwrap(),
+            None,
+            "{at}"
+        );
+        assert_eq!(c.first(&witnesses, 0, u64::MAX), Some(at as u64), "{at}");
+    }
+}
+
+/// Any byte a witness holds past hot's end contradicts it; a witness that
+/// ends at hot's end does not.
+#[test]
+fn contradiction_past_hot_end() {
+    let c = Contradiction::new("replica-contradiction-end");
+    let mut longer = c.hot.clone();
+    longer.extend_from_slice(b"\n{");
+    let longer = c.write("longer", &longer);
+    let equal = c.write("equal", &c.hot);
+    assert_eq!(c.first(&[&equal, &longer], 0, u64::MAX), Some(300));
+    assert_eq!(c.first(&[&equal, &longer], 299, u64::MAX), Some(300));
+    assert_eq!(c.first(&[&equal, &longer], 301, u64::MAX), Some(301));
+    assert_eq!(c.first(&[&equal], 0, u64::MAX), None);
+}
+
+/// Byte prefixes of hot, an empty witness, an absent one and no witness
+/// at all contradict nothing; an unreadable witness is an error on the
+/// destination side, an unreadable hot on the source side.
+#[test]
+fn contradiction_none_for_prefixes_and_absent_witnesses() {
+    let c = Contradiction::new("replica-contradiction-none");
+    let a = c.write("a", &c.hot[..100]);
+    let b = c.write("b", &c.hot[..200]);
+    let empty = c.write("empty", b"");
+    let absent = c.dir.path().join("absent");
+    assert_eq!(c.first(&[&a, &b, &empty, &absent], 0, u64::MAX), None);
+    assert_eq!(c.first(&[], 0, u64::MAX), None);
+    let error =
+        first_contradiction_file_before(&c.hot_path, &[c.dir.path()], 0, u64::MAX).unwrap_err();
+    assert_eq!(error.side, Side::Destination, "{error}");
+    let error = first_contradiction_file_before(&absent, &[&a], 0, u64::MAX).unwrap_err();
+    assert_eq!(error.side, Side::Source, "{error}");
+}
+
+/// `from` is inclusive and `until` exclusive: a witness flipped at 10 and
+/// 250 contradicts at 10 from 0 and from 10, at 250 from 11, at nothing
+/// below 250, and an empty range reads nothing.
+#[test]
+fn contradiction_bounds_are_from_inclusive_until_exclusive() {
+    let c = Contradiction::new("replica-contradiction-bounds");
+    let both = c.write("both", &flipped(&flipped(&c.hot, 10), 250));
+    let both = [both.as_path()];
+    assert_eq!(c.first(&both, 0, u64::MAX), Some(10));
+    assert_eq!(c.first(&both, 10, u64::MAX), Some(10));
+    assert_eq!(c.first(&both, 11, u64::MAX), Some(250));
+    assert_eq!(c.first(&both, 11, 250), None, "`until` is exclusive");
+    assert_eq!(c.first(&both, 11, 251), Some(250));
+    assert_eq!(c.first(&both, 0, 10), None);
+    assert_eq!(c.first(&both, 250, 250), None, "an empty range");
+    assert_eq!(c.first(&both, 251, u64::MAX), None);
+}
+
 /// The journal lock (review of #226, finding 3): one holder at a time,
 /// free after its drop, beside the file a link names, and its directory
 /// created when absent.
