@@ -62,9 +62,9 @@ member, restores the `}` and recomputes.
   recomputed independently of this code. The hex keeps its leading zeros
   (`%08x`).
 - **The name `crc32c` is reserved at every depth.** The writer drops a
-  top-level caller field of that name, and no line type nests one. JSON
-  escapes every `"` inside a string, so a string value cannot hold the
-  shape either. So a torn line, which ends before its final `}`, can
+  caller field of that name at every depth, inside arrays too, so no line
+  type can nest one. JSON escapes every `"` inside a string, so a string
+  value cannot hold the shape either. So a torn line, which ends before its final `}`, can
   never end in the member's shape.
 - **The check is never added to lines that already exist.** A journal
   written before this ADR keeps its bytes, and its lines stay Unchecked

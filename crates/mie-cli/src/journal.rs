@@ -43,8 +43,8 @@
 //! [`LineCheck::Intact`], [`LineCheck::Failed`] or [`LineCheck::Unchecked`]
 //! (no member of that shape: a line from before ADR-066, a torn line, a
 //! line longer than [`MAX_CHECKED_LINE`]). The name `crc32c` is reserved:
-//! the writer drops a caller field of that name, and no line type nests
-//! one. The check guards against accidental damage only: it is no MAC.
+//! the writer drops a caller field of that name at every depth. The check
+//! guards against accidental damage only: it is no MAC.
 //! Lines written before ADR-066 never gain it. Readers ignore the member:
 //! [`read_runs`] and every other reader index named keys.
 //!
@@ -788,6 +788,21 @@ pub fn read_runs(path: &Path, source: &str) -> Result<Vec<JournaledRun>, String>
 /// The name of the line check's member, always a line's last (ADR-066 D1).
 pub const CHECK_FIELD: &str = "crc32c";
 
+/// Drops every member named [`CHECK_FIELD`] from `value`, at every depth
+/// and inside arrays (ADR-066 D1). The name is the check's: a nested object
+/// keyed so would end in the member's shape, and a line torn right after it
+/// would read as [`LineCheck::Failed`] instead of [`LineCheck::Unchecked`].
+fn drop_check_fields(value: &mut Value) {
+    match value {
+        Value::Object(members) => {
+            members.remove(CHECK_FIELD);
+            members.values_mut().for_each(drop_check_fields);
+        }
+        Value::Array(items) => items.iter_mut().for_each(drop_check_fields),
+        _ => {}
+    }
+}
+
 /// The longest line body, in bytes without its `\n`, that [`check_line`]
 /// classifies (ADR-066 D2). A longer line is [`LineCheck::Unchecked`]: the
 /// cap bounds the memory per line of the scans that stream a journal beside
@@ -961,7 +976,7 @@ impl Journal {
 
     /// Appends one line of `kind` with `fields`, stamped at `at_utc_ns`, and
     /// ends it with its check ([`with_check`], ADR-066 D1). A field named
-    /// [`CHECK_FIELD`] is dropped: the name is the check's.
+    /// [`CHECK_FIELD`] is dropped at every depth: the name is the check's.
     pub fn write(&mut self, at_utc_ns: i64, kind: &str, fields: Value) {
         let mut line = Map::new();
         line.insert("type".to_owned(), json!(kind));
@@ -970,8 +985,9 @@ impl Journal {
         if let Value::Object(fields) = fields {
             line.extend(fields);
         }
-        line.remove(CHECK_FIELD);
-        let result = serde_json::to_vec(&Value::Object(line))
+        let mut line = Value::Object(line);
+        drop_check_fields(&mut line);
+        let result = serde_json::to_vec(&line)
             .map_err(|e| e.to_string())
             .and_then(|object| {
                 let mut body = with_check(&object);
@@ -2213,6 +2229,34 @@ mod tests {
         assert_eq!(object["records"], 3);
         let text = std::str::from_utf8(body).unwrap();
         assert_eq!(text.matches("crc32c").count(), 1, "{text}");
+    }
+
+    #[test]
+    fn a_nested_field_named_crc32c_is_dropped() {
+        let dir = Scratch::new();
+        let path = dir.journal();
+        let mut journal = Journal::open(&path, "A").unwrap();
+        journal.write(
+            1_000_000_000,
+            "stats",
+            json!({
+                "inner": {"a": 1, "crc32c": "00000000"},
+                "list": [{"b": 2, "crc32c": "00000000"}, 3],
+            }),
+        );
+        journal.sync();
+        let bytes = std::fs::read(&path).unwrap();
+        let body = bodies(&bytes)[0];
+        assert_eq!(check_line(body), LineCheck::Intact);
+        let text = std::str::from_utf8(body).unwrap();
+        assert_eq!(text.matches("crc32c").count(), 1, "{text}");
+        let object: Value = serde_json::from_slice(&strip_check(body).unwrap()).unwrap();
+        assert_eq!(object["inner"], json!({"a": 1}));
+        assert_eq!(object["list"], json!([{"b": 2}, 3]));
+        // Torn right after the nested object: without the drop it would end
+        // in the member's shape and read as Failed.
+        let torn = &body[..text.find("},\"list\"").unwrap() + 1];
+        assert_eq!(check_line(torn), LineCheck::Unchecked);
     }
 
     #[test]
