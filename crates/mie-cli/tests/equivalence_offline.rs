@@ -59,7 +59,7 @@ use common::warm::{
 };
 use common::{
     CUTOVER, Connections, DepthConnection, DrivenClock, HOUR, ORIGIN, TempDir, ingest_depth,
-    journal,
+    journal, strip_checks_where,
 };
 use mie_adapter_binance::archive::ArchiveStream;
 use mie_adapter_binance::archive::catalog::DAY_MS;
@@ -839,6 +839,47 @@ fn the_offline_live_path_in_two_runs_is_equivalent_with_state() {
     };
     assert_eq!((d.index, d.kind), (1, DivergenceKind::State));
     assert_eq!(outcome.exit_code(), 1);
+}
+
+/// The line check changes no equivalence verdict (ADR-066, #224 AC 8):
+/// the offline live path in two runs compares to the same report and
+/// outcome (every checkpoint's event and state hash) with every line
+/// checked, as a mixed journal (run 1's lines as written before ADR-066)
+/// and with no line checked.
+#[test]
+fn equivalence_is_identical_without_the_check() {
+    let fixture = Fixture::load();
+    let dir = TempDir::new("equivalence-checks");
+    let config = config(dir.path());
+    let first_ms = fixture.records.first().unwrap().event_time_ms;
+    let last_ms = fixture.records.last().unwrap().event_time_ms;
+    let middle_ms = first_ms + (last_ms - first_ms) / 2;
+    let (early, late): (Vec<&Record>, Vec<&Record>) = fixture
+        .records
+        .iter()
+        .partition(|r| r.event_time_ms < middle_ms);
+    let start1 = fixture.started_at_ms();
+    play(&config, start1, &early);
+    let runs = read_runs(&config.paths.journal, "binance-um").unwrap();
+    let start2 = runs[0].end.unwrap().at_ms + 1_000;
+    play(&config, start2, &late);
+    let (checked, checked_text) = check(&config, start1, start2 + 1);
+    assert_eq!(checked.runs.len(), 2, "{checked_text}");
+    assert!(checked.pass, "{checked_text}");
+
+    let run1 = runs[0].parameters.run_id.clone();
+    let old = strip_checks_where(&config.paths.journal, |line| {
+        line["run_id"] == run1.as_str()
+    });
+    assert!(old > 0);
+    let (mixed, mixed_text) = check(&config, start1, start2 + 1);
+    assert_eq!(mixed_text, checked_text);
+    assert_eq!(mixed, checked);
+
+    assert!(strip_checks_where(&config.paths.journal, |_| true) > 0);
+    let (plain, plain_text) = check(&config, start1, start2 + 1);
+    assert_eq!(plain_text, checked_text);
+    assert_eq!(plain, checked);
 }
 
 // ---------------------------------------------------------------------------

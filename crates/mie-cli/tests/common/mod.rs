@@ -212,6 +212,26 @@ pub fn journal(config: &IngestConfig) -> Vec<serde_json::Value> {
         .collect()
 }
 
+/// Rewrites the journal at `path` with the line check (ADR-066) stripped
+/// from every checked line `strip` picks: the bytes a writer from before
+/// ADR-066 would have left. Returns the number of lines stripped.
+pub fn strip_checks_where(path: &Path, strip: impl Fn(&serde_json::Value) -> bool) -> usize {
+    let bytes = std::fs::read(path).expect("read journal");
+    let mut stripped = 0;
+    let lines: Vec<Vec<u8>> = bytes
+        .split(|b| *b == b'\n')
+        .map(|body| match mie_cli::journal::strip_check(body) {
+            Some(object) if strip(&serde_json::from_slice(&object).expect("JSON")) => {
+                stripped += 1;
+                object
+            }
+            _ => body.to_vec(),
+        })
+        .collect();
+    std::fs::write(path, lines.join(&b'\n')).expect("write journal");
+    stripped
+}
+
 /// A configuration capturing `streams` into `dir`, hold-back 750 ms. The
 /// fake clocks barely move, so snapshot requests are spaced by 1 ms only.
 pub fn config_with(dir: &Path, streams: &[&str]) -> IngestConfig {
