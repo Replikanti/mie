@@ -1,7 +1,8 @@
 //! The capture journal: one JSON object per line, appended.
 //!
 //! Every line carries `type`, `run_id` and `at_ms` (wall clock, for humans
-//! and the soak report; it orders nothing). Line types:
+//! and the soak report; it orders nothing) and, as its last member,
+//! `crc32c`, the line's own check (ADR-066, below). Line types:
 //!
 //! | `type` | Written by | Content |
 //! |---|---|---|
@@ -32,6 +33,20 @@
 //! replay needs a run's `run_start` for every record the run seals
 //! (ADR-039 D2). A warm `warm_start` is synced before the core uses its
 //! seeds, and a cold one after a failed warm-up before the core drives.
+//!
+//! **The line check** (ADR-066 D1, D2). [`Journal::write`] serializes a
+//! line as before, computes the CRC-32C of those bytes, and ends the line
+//! with one more member, `,"crc32c":"<8 lowercase hex>"`, appended as bytes
+//! in place of the closing `}` ([`with_check`]). So a damaged line
+//! identifies itself with no other copy: [`check_line`] removes the member
+//! and recomputes, with no JSON parse, and calls a line
+//! [`LineCheck::Intact`], [`LineCheck::Failed`] or [`LineCheck::Unchecked`]
+//! (no member of that shape: a line from before ADR-066, a torn line, a
+//! line longer than [`MAX_CHECKED_LINE`]). The name `crc32c` is reserved:
+//! the writer drops a caller field of that name, and no line type nests
+//! one. The check guards against accidental damage only: it is no MAC.
+//! Lines written before ADR-066 never gain it. Readers ignore the member:
+//! [`read_runs`] and every other reader index named keys.
 //!
 //! The raw store alone does not determine what live delivered: the
 //! pipeline's `hold_back_ms`, `oi_retime_ms` and per-stream seeds are run
@@ -636,7 +651,10 @@ impl JournaledRun {
 /// that may hold the next run's first line glued onto it (#217). A line
 /// that is not valid UTF-8 (a crash can tear a multibyte character) is
 /// skipped the same way: the journal is read as bytes, and only the lines
-/// are decoded. A `run_start`, `run_end`,
+/// are decoded. A line's check (`crc32c`, ADR-066) is ignored: only named
+/// keys are read, so a line reads the same with the member or without it
+/// (written before ADR-066), and a line whose check fails reads like any
+/// other line (no gate here, ADR-066 D7). A `run_start`, `run_end`,
 /// `state_checkpoint`, `warm_start`, `warm_ready` or `chain_restart` that
 /// does not carry its fields is an error, and so are two `run_start`s of
 /// one run id — a restart within the same second, whose records the session
@@ -767,6 +785,136 @@ pub fn read_runs(path: &Path, source: &str) -> Result<Vec<JournaledRun>, String>
     Ok(runs)
 }
 
+/// The name of the line check's member, always a line's last (ADR-066 D1).
+pub const CHECK_FIELD: &str = "crc32c";
+
+/// The longest line body, in bytes without its `\n`, that [`check_line`]
+/// classifies (ADR-066 D2). A longer line is [`LineCheck::Unchecked`]: the
+/// cap bounds the memory per line of the scans that stream a journal beside
+/// a live capture, which a zero-filled region with no `\n` would otherwise
+/// fill. 1 MiB is about 450 times the longest line measured (2 318 B).
+pub const MAX_CHECKED_LINE: usize = 1_048_576;
+
+/// What precedes the hex digits in the member's 21-byte shape:
+/// `,"crc32c":"`. The shape is this, 8 lowercase hex digits, and `"}`.
+const CHECK_PREFIX: &[u8] = b",\"crc32c\":\"";
+
+/// The bytes the shape takes at a line's end, the closing `}` included.
+const CHECK_SHAPE: usize = CHECK_PREFIX.len() + 8 + 2;
+
+/// The byte-wise lookup table of CRC-32C (Castagnoli, the iSCSI CRC):
+/// the reflected polynomial 0x82F63B78.
+const CRC32C_TABLE: [u32; 256] = {
+    let mut table = [0; 256];
+    let mut byte = 0;
+    while byte < 256 {
+        let mut crc = byte as u32;
+        let mut bit = 0;
+        while bit < 8 {
+            crc = if crc & 1 == 1 {
+                (crc >> 1) ^ 0x82F6_3B78
+            } else {
+                crc >> 1
+            };
+            bit += 1;
+        }
+        table[byte] = crc;
+        byte += 1;
+    }
+    table
+};
+
+/// Runs the CRC register `crc` over `bytes`, with no initial or final
+/// inversion, so a CRC can span pieces.
+fn crc32c_update(mut crc: u32, bytes: &[u8]) -> u32 {
+    for &byte in bytes {
+        crc = CRC32C_TABLE[usize::from((crc as u8) ^ byte)] ^ (crc >> 8);
+    }
+    crc
+}
+
+/// The CRC-32C of `bytes`: init and xorout 0xFFFFFFFF (ADR-066 D1).
+fn crc32c(bytes: &[u8]) -> u32 {
+    !crc32c_update(!0, bytes)
+}
+
+/// A checked body split into the bytes before its member and the CRC its
+/// hex states, or `None` when the body does not end with the member's
+/// shape or is longer than [`MAX_CHECKED_LINE`].
+fn split_check(body: &[u8]) -> Option<(&[u8], u32)> {
+    if body.len() <= CHECK_SHAPE || body.len() > MAX_CHECKED_LINE {
+        return None;
+    }
+    let (head, shape) = body.split_at(body.len() - CHECK_SHAPE);
+    let hex = shape.strip_prefix(CHECK_PREFIX)?.strip_suffix(b"\"}")?;
+    hex.iter()
+        .try_fold(0_u32, |crc, digit| {
+            let value = match digit {
+                b'0'..=b'9' => digit - b'0',
+                b'a'..=b'f' => digit - b'a' + 10,
+                _ => return None,
+            };
+            Some(crc << 4 | u32::from(value))
+        })
+        .map(|crc| (head, crc))
+}
+
+/// A line's verdict under its check (ADR-066 D2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineCheck {
+    /// The line ends with the member's shape and its CRC matches.
+    Intact,
+    /// The line ends with the member's shape and its CRC differs: the line
+    /// was damaged after it was written.
+    Failed,
+    /// No member of that shape, so no claim: a line from before ADR-066, a
+    /// torn line, a trailing `\r`, damage to the member's fixed bytes, or a
+    /// line longer than [`MAX_CHECKED_LINE`].
+    Unchecked,
+}
+
+/// `object` with its check (ADR-066 D1): its bytes without the closing
+/// `}`, then `,"crc32c":"<CRC-32C of object, 8 lowercase hex>"}`. No `\n`.
+///
+/// `object` is a compact JSON object with at least one member, as
+/// `serde_json::to_vec` writes it. The check itself is over bytes: an
+/// `object` of `{}` gets a body that verifies but is no JSON.
+pub fn with_check(object: &[u8]) -> Vec<u8> {
+    debug_assert_eq!(object.last(), Some(&b'}'), "a JSON object");
+    let head = object.strip_suffix(b"}").unwrap_or(object);
+    let mut body = Vec::with_capacity(head.len() + CHECK_SHAPE + 1);
+    body.extend_from_slice(head);
+    body.extend_from_slice(CHECK_PREFIX);
+    body.extend_from_slice(format!("{:08x}\"}}", crc32c(object)).as_bytes());
+    body
+}
+
+/// The inverse of [`with_check`]: the object a checked body was made from,
+/// or `None` when the body carries no member of the check's shape
+/// ([`LineCheck::Unchecked`]). A [`LineCheck::Failed`] body is stripped
+/// too. For fixtures that make journals from before ADR-066.
+pub fn strip_check(body: &[u8]) -> Option<Vec<u8>> {
+    let (head, _) = split_check(body)?;
+    let mut object = Vec::with_capacity(head.len() + 1);
+    object.extend_from_slice(head);
+    object.push(b'}');
+    Some(object)
+}
+
+/// The verdict of one line `body`: the bytes between two `\n`, without
+/// them (ADR-066 D2). A last line without its `\n` may be in the middle of
+/// being written, and callers do not classify it.
+pub fn check_line(body: &[u8]) -> LineCheck {
+    match split_check(body) {
+        None => LineCheck::Unchecked,
+        // The CRC of the head with its `}` restored, without a copy.
+        Some((head, crc)) if !crc32c_update(crc32c_update(!0, head), b"}") == crc => {
+            LineCheck::Intact
+        }
+        Some(_) => LineCheck::Failed,
+    }
+}
+
 /// An open journal for one run. It holds the journal lock
 /// ([`replica::try_journal_lock`]) for as long as it exists, so every line
 /// of the run, `run_end` and the final pass's `replication` included, is
@@ -811,7 +959,9 @@ impl Journal {
         })
     }
 
-    /// Appends one line of `kind` with `fields`, stamped at `at_utc_ns`.
+    /// Appends one line of `kind` with `fields`, stamped at `at_utc_ns`, and
+    /// ends it with its check ([`with_check`], ADR-066 D1). A field named
+    /// [`CHECK_FIELD`] is dropped: the name is the check's.
     pub fn write(&mut self, at_utc_ns: i64, kind: &str, fields: Value) {
         let mut line = Map::new();
         line.insert("type".to_owned(), json!(kind));
@@ -820,9 +970,14 @@ impl Journal {
         if let Value::Object(fields) = fields {
             line.extend(fields);
         }
-        let result = serde_json::to_writer(&mut self.out, &Value::Object(line))
+        line.remove(CHECK_FIELD);
+        let result = serde_json::to_vec(&Value::Object(line))
             .map_err(|e| e.to_string())
-            .and_then(|()| self.out.write_all(b"\n").map_err(|e| e.to_string()));
+            .and_then(|object| {
+                let mut body = with_check(&object);
+                body.push(b'\n');
+                self.out.write_all(&body).map_err(|e| e.to_string())
+            });
         if let Err(error) = result {
             self.write_error.get_or_insert(error);
         }
@@ -1898,5 +2053,423 @@ mod tests {
         expected.push(b'\n');
         assert_eq!(std::fs::read(&path).unwrap(), expected);
         assert_eq!(ids(&read_runs(&path, "binance-um").unwrap()), ["A"]);
+    }
+
+    // -----------------------------------------------------------------
+    // The line check (ADR-066).
+
+    /// A compact object of exactly `len` bytes: `{"a":"xx…x"}`.
+    fn object_of(len: usize) -> Vec<u8> {
+        assert!(len >= 8);
+        let mut object = br#"{"a":""#.to_vec();
+        object.resize(len - 2, b'x');
+        object.extend_from_slice(br#""}"#);
+        object
+    }
+
+    /// `object` with a member of the check's name but `separator` between
+    /// `:` and the hex, and a correct CRC: a look-alike of the shape.
+    fn member_with(object: &[u8], name: &str, separator: &str) -> Vec<u8> {
+        let mut body = object[..object.len() - 1].to_vec();
+        body.extend_from_slice(
+            format!(",\"{name}\":{separator}\"{:08x}\"}}", crc32c(object)).as_bytes(),
+        );
+        body
+    }
+
+    /// The bodies of a journal's lines; the piece after the last `\n` is
+    /// returned too (empty when the journal ends with one).
+    fn bodies(bytes: &[u8]) -> Vec<&[u8]> {
+        bytes.split(|b| *b == b'\n').collect()
+    }
+
+    /// `bytes` with every checked line stripped back to its object: the
+    /// same journal as a writer from before ADR-066 would have left it.
+    fn stripped(bytes: &[u8]) -> Vec<u8> {
+        let lines: Vec<Vec<u8>> = bodies(bytes)
+            .into_iter()
+            .map(|body| strip_check(body).unwrap_or_else(|| body.to_vec()))
+            .collect();
+        lines.join(&b'\n')
+    }
+
+    /// A small deterministic generator (Knuth's MMIX LCG).
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            self.0 >> 33
+        }
+    }
+
+    #[test]
+    fn crc32c_matches_the_standard_check_values() {
+        assert_eq!(crc32c(b"123456789"), 0xe306_9283);
+        // RFC 3720 B.4.
+        assert_eq!(crc32c(&[0x00; 32]), 0x8a91_36aa);
+        assert_eq!(crc32c(&[0xff; 32]), 0x62a8_ab43);
+        let ascending: Vec<u8> = (0..32).collect();
+        assert_eq!(crc32c(&ascending), 0x46dd_794e);
+        assert_eq!(crc32c(b""), 0);
+    }
+
+    #[test]
+    fn a_written_line_has_its_golden_bytes() {
+        let dir = Scratch::new();
+        let path = dir.journal();
+        let mut journal = Journal::open(&path, "R1").unwrap();
+        journal.write(
+            1_700_000_000_123_456_789,
+            "gap",
+            json!({"stream": "aggTrade", "start": 1, "end": 2, "reason": "Disconnected"}),
+        );
+        journal.sync();
+        assert_eq!(journal.write_error(), None);
+        // The CRC-32C of the line up to `"type":"gap"}`, computed
+        // independently of this code.
+        let golden = concat!(
+            r#"{"at_ms":1700000000123,"end":2,"reason":"Disconnected","run_id":"R1","#,
+            r#""start":1,"stream":"aggTrade","type":"gap","crc32c":"6cb9bc4c"}"#,
+            "\n"
+        );
+        assert_eq!(
+            String::from_utf8(std::fs::read(&path).unwrap()).unwrap(),
+            golden
+        );
+    }
+
+    #[test]
+    fn every_written_line_carries_the_check_and_it_verifies() {
+        let dir = Scratch::new();
+        let path = dir.journal();
+        append_run(&path, "A", 1_000);
+        let mut journal = Journal::open(&path, "A").unwrap();
+        journal.write(
+            1_500_000_000,
+            "stats",
+            json!({"streams": {"depth": {"book": {"syncs": 1}}}, "note": "a \"quoted\" }"}),
+        );
+        journal.write(1_600_000_000, "sealed", json!({"files": []}));
+        let fields: Value = serde_json::from_str(&end("A", 2_000, 0, 42)).unwrap();
+        journal.write(2_000_000_000, "run_end", fields);
+        journal.sync();
+        let bytes = std::fs::read(&path).unwrap();
+        let lines = bodies(&bytes);
+        assert_eq!(lines.last(), Some(&&b""[..]), "the journal ends with a \\n");
+        let lines = &lines[..lines.len() - 1];
+        assert_eq!(lines.len(), 5);
+        for body in lines {
+            assert_eq!(check_line(body), LineCheck::Intact, "{body:?}");
+            let value: Value = serde_json::from_slice(body).unwrap();
+            assert_eq!(value[CHECK_FIELD].as_str().unwrap().len(), 8);
+            assert!(body.ends_with(b"\"}"));
+            assert_eq!(
+                &body[body.len() - CHECK_SHAPE..][..CHECK_PREFIX.len()],
+                CHECK_PREFIX
+            );
+        }
+        let runs = read_runs(&path, "binance-um").unwrap();
+        assert_eq!(ids(&runs), ["A"]);
+        assert_eq!(runs[0].live_run().clean_records, Some(42));
+    }
+
+    #[test]
+    fn the_check_is_the_crc_of_the_line_without_its_member() {
+        let dir = Scratch::new();
+        let path = dir.journal();
+        append_run(&path, "A", 1_000);
+        let bytes = std::fs::read(&path).unwrap();
+        for body in bodies(&bytes).into_iter().filter(|b| !b.is_empty()) {
+            let object = strip_check(body).unwrap();
+            let mut value: Value = serde_json::from_slice(body).unwrap();
+            let hex = value.as_object_mut().unwrap().remove(CHECK_FIELD).unwrap();
+            // The member is the last; the rest is serialized as before.
+            assert_eq!(object, serde_json::to_vec(&value).unwrap());
+            assert_eq!(hex, format!("{:08x}", crc32c(&object)));
+            assert_eq!(with_check(&object), body);
+        }
+    }
+
+    #[test]
+    fn a_caller_field_named_crc32c_is_dropped() {
+        let dir = Scratch::new();
+        let path = dir.journal();
+        let mut journal = Journal::open(&path, "A").unwrap();
+        journal.write(
+            1_000_000_000,
+            "stats",
+            json!({"crc32c": "00000000", "records": 3}),
+        );
+        journal.sync();
+        let bytes = std::fs::read(&path).unwrap();
+        let body = bodies(&bytes)[0];
+        assert_eq!(check_line(body), LineCheck::Intact);
+        let object: Value = serde_json::from_slice(&strip_check(body).unwrap()).unwrap();
+        assert_eq!(object.get(CHECK_FIELD), None);
+        assert_eq!(object["records"], 3);
+        let text = std::str::from_utf8(body).unwrap();
+        assert_eq!(text.matches("crc32c").count(), 1, "{text}");
+    }
+
+    #[test]
+    fn the_hex_keeps_its_leading_zeros() {
+        let object = (0_u64..)
+            .map(|n| format!(r#"{{"n":{n}}}"#).into_bytes())
+            .find(|object| crc32c(object) < 0x0100_0000)
+            .unwrap();
+        let body = with_check(&object);
+        let hex = &body[body.len() - 10..body.len() - 2];
+        assert!(hex.starts_with(b"00"), "{:?}", std::str::from_utf8(hex));
+        assert_eq!(body.len(), object.len() + 20);
+        assert_eq!(check_line(&body), LineCheck::Intact);
+    }
+
+    #[test]
+    fn check_line_minimum_shape() {
+        assert_eq!(check_line(b""), LineCheck::Unchecked);
+        // The member alone, 21 bytes, even with the CRC of `}`.
+        let alone = format!(",\"crc32c\":\"{:08x}\"}}", crc32c(b"}"));
+        assert_eq!(alone.len(), CHECK_SHAPE);
+        assert_eq!(check_line(alone.as_bytes()), LineCheck::Unchecked);
+        // `{` and the member, 22 bytes: the check is over bytes, not JSON.
+        let least = format!("{{,\"crc32c\":\"{:08x}\"}}", crc32c(b"{}"));
+        assert_eq!(least.len(), 22);
+        assert_eq!(check_line(least.as_bytes()), LineCheck::Intact);
+        assert_eq!(with_check(b"{}"), least.as_bytes());
+        assert_eq!(strip_check(least.as_bytes()).unwrap(), b"{}");
+        let wrong = format!("{{,\"crc32c\":\"{:08x}\"}}", crc32c(b"{}") ^ 1);
+        assert_eq!(check_line(wrong.as_bytes()), LineCheck::Failed);
+    }
+
+    #[test]
+    fn lines_over_the_cap_are_unchecked() {
+        let at_cap = with_check(&object_of(MAX_CHECKED_LINE - 20));
+        assert_eq!(at_cap.len(), MAX_CHECKED_LINE);
+        assert_eq!(check_line(&at_cap), LineCheck::Intact);
+        let over = with_check(&object_of(MAX_CHECKED_LINE - 19));
+        assert_eq!(over.len(), MAX_CHECKED_LINE + 1);
+        assert_eq!(check_line(&over), LineCheck::Unchecked);
+        assert_eq!(strip_check(&over), None);
+    }
+
+    #[test]
+    fn a_torn_line_is_unchecked_at_every_cut() {
+        let object = start("A", 1_000, "binance-um").into_bytes();
+        let body = with_check(&object);
+        for cut in 0..body.len() {
+            let torn = &body[..cut];
+            assert_eq!(check_line(torn), LineCheck::Unchecked, "cut at {cut}");
+            // The same once the next `Journal::open` ends it (#225).
+            let mut ended = torn.to_vec();
+            ended.push(b'\n');
+            ended.extend_from_slice(&with_check(&object));
+            assert_eq!(check_line(bodies(&ended)[0]), LineCheck::Unchecked);
+            assert_eq!(check_line(bodies(&ended)[1]), LineCheck::Intact);
+        }
+        assert_eq!(check_line(&body), LineCheck::Intact);
+    }
+
+    #[test]
+    fn every_single_bit_flip_fails() {
+        let body = with_check(&object_of(280));
+        assert_eq!(body.len(), 300);
+        let mut cases = 0;
+        // Every byte before the member's `,`.
+        for at in 0..body.len() - CHECK_SHAPE {
+            for bit in 0..8 {
+                let mut damaged = body.clone();
+                damaged[at] ^= 1 << bit;
+                assert_eq!(
+                    check_line(&damaged),
+                    LineCheck::Failed,
+                    "bit {bit} of byte {at}"
+                );
+                cases += 1;
+            }
+        }
+        assert_eq!(cases, 279 * 8);
+    }
+
+    #[test]
+    fn damage_in_the_member() {
+        let body = with_check(start("A", 1_000, "binance-um").as_bytes());
+        let hex = body.len() - 10..body.len() - 2;
+        let with = |at: usize, bytes: &[u8]| {
+            let mut damaged = body[..at].to_vec();
+            damaged.extend_from_slice(bytes);
+            damaged.extend_from_slice(&body[at + 1..]);
+            damaged
+        };
+        for at in hex.clone() {
+            for digit in b"0123456789abcdef" {
+                let expected = if *digit == body[at] {
+                    LineCheck::Intact
+                } else {
+                    LineCheck::Failed
+                };
+                assert_eq!(check_line(&with(at, &[*digit])), expected, "{at} {digit}");
+            }
+            for other in [&b"A"[..], b"F", b"g", "０".as_bytes()] {
+                assert_eq!(check_line(&with(at, other)), LineCheck::Unchecked);
+            }
+            if body[at].is_ascii_lowercase() {
+                let upper = body[at].to_ascii_uppercase();
+                assert_eq!(check_line(&with(at, &[upper])), LineCheck::Unchecked);
+            }
+        }
+        // `"}` to `" }`.
+        let end = body.len() - 1;
+        assert_eq!(check_line(&with(end, b" }")), LineCheck::Unchecked);
+        // No `,`.
+        let comma = body.len() - CHECK_SHAPE;
+        assert_eq!(body[comma], b',');
+        assert_eq!(check_line(&with(comma, b"")), LineCheck::Unchecked);
+        // 7 and 9 digits.
+        assert_eq!(check_line(&with(hex.start, b"")), LineCheck::Unchecked);
+        assert_eq!(check_line(&with(hex.start, b"00")), LineCheck::Unchecked);
+        let nine = with(hex.start, &[b'0', body[hex.start]]);
+        assert_eq!(check_line(&nine), LineCheck::Unchecked);
+    }
+
+    #[test]
+    fn lookalike_members_are_unchecked() {
+        let object = start("A", 1_000, "binance-um").into_bytes();
+        assert_eq!(
+            member_with(&object, "crc32c", ""),
+            with_check(&object),
+            "the helper builds the real member"
+        );
+        for (name, separator) in [
+            ("crc32с", ""),         // Cyrillic `с` (U+0441) last
+            ("сrc32c", ""),         // and first
+            ("crc\u{200B}32c", ""), // a zero-width space
+            ("crc32c", " "),
+            ("crc32c", "\t"),
+            ("crc32c", "\u{00A0}"),
+        ] {
+            let body = member_with(&object, name, separator);
+            assert_eq!(
+                check_line(&body),
+                LineCheck::Unchecked,
+                "{name:?} {separator:?}"
+            );
+            assert_eq!(strip_check(&body), None);
+        }
+        let mut crlf = with_check(&object);
+        crlf.push(b'\r');
+        assert_eq!(check_line(&crlf), LineCheck::Unchecked);
+    }
+
+    #[test]
+    fn check_line_never_panics() {
+        let body = with_check(start("A", 1_000, "binance-um").as_bytes());
+        let shape = body.len() - CHECK_SHAPE;
+        let hex = shape + CHECK_PREFIX.len()..body.len() - 2;
+        for at in shape..body.len() {
+            for value in 0..=u8::MAX {
+                let mut damaged = body.clone();
+                damaged[at] = value;
+                let expected = if value == body[at] {
+                    LineCheck::Intact
+                } else if hex.contains(&at) && matches!(value, b'0'..=b'9' | b'a'..=b'f') {
+                    LineCheck::Failed
+                } else {
+                    LineCheck::Unchecked
+                };
+                assert_eq!(check_line(&damaged), expected, "{value} at {at}");
+            }
+        }
+        let mut random = Lcg(224);
+        for case in 0..1_000 {
+            // Bodies of 0 to 300 bytes; a checked one has a head of at least
+            // one byte, or it is the member alone (`check_line_minimum_shape`).
+            let len = usize::try_from(random.next() % 301).unwrap();
+            let len = if case % 3 == 0 { len } else { len.max(1) };
+            let mut head: Vec<u8> = (0..len).map(|_| random.next() as u8).collect();
+            match case % 3 {
+                0 => {
+                    let verdict = check_line(&head);
+                    assert_eq!(
+                        strip_check(&head).is_some(),
+                        verdict != LineCheck::Unchecked
+                    );
+                }
+                1 => {
+                    head.push(b'}');
+                    let checked = with_check(&head);
+                    assert_eq!(check_line(&checked), LineCheck::Intact, "case {case}");
+                    assert_eq!(strip_check(&checked).unwrap(), head);
+                }
+                _ => {
+                    head.push(b'}');
+                    let mut checked = with_check(&head);
+                    let before = checked.len() - CHECK_SHAPE;
+                    let at = usize::try_from(random.next()).unwrap() % before;
+                    checked[at] ^= 1 << (random.next() % 8);
+                    assert_eq!(check_line(&checked), LineCheck::Failed, "case {case}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unicode_text_is_checked_by_bytes() {
+        let object = serde_json::to_vec(&json!({"error": "chyba é 🚀 ok", "type": "x"})).unwrap();
+        let rocket = "🚀".as_bytes();
+        let at = object
+            .windows(rocket.len())
+            .position(|w| w == rocket)
+            .expect("serde_json writes non-ASCII text unescaped");
+        let body = with_check(&object);
+        assert_eq!(check_line(&body), LineCheck::Intact);
+        assert_eq!(strip_check(&body).unwrap(), object);
+        let mut damaged = body.clone();
+        damaged[at + 1] ^= 0x01;
+        assert_eq!(check_line(&damaged), LineCheck::Failed);
+        assert!(
+            std::str::from_utf8(&damaged).is_ok(),
+            "still text, still caught"
+        );
+        let mut damaged = body;
+        damaged[at + 2] ^= 0x40;
+        assert!(std::str::from_utf8(&damaged).is_err());
+        assert_eq!(check_line(&damaged), LineCheck::Failed);
+    }
+
+    #[test]
+    fn mixed_journal_reads_as_without_the_check() {
+        let dir = Scratch::new();
+        let path = dir.journal();
+        // Run A from before ADR-066, then run B with checked lines.
+        let old = format!(
+            "{}\n{}\n",
+            start("A", 1_000, "binance-um"),
+            end("A", 2_000, 0, 42)
+        );
+        std::fs::write(&path, &old).unwrap();
+        append_run(&path, "B", 3_000);
+        let mut journal = Journal::open(&path, "B").unwrap();
+        let fields: Value = serde_json::from_str(&end("B", 4_000, 0, 7)).unwrap();
+        journal.write(4_000_000_000, "run_end", fields);
+        journal.sync();
+        drop(journal);
+        let mixed = std::fs::read(&path).unwrap();
+        let verdicts: Vec<LineCheck> = bodies(&mixed)
+            .into_iter()
+            .filter(|b| !b.is_empty())
+            .map(check_line)
+            .collect();
+        use LineCheck::{Intact, Unchecked};
+        assert_eq!(verdicts, [Unchecked, Unchecked, Intact, Intact, Intact]);
+        let with_checks = read_runs(&path, "binance-um").unwrap();
+        assert_eq!(ids(&with_checks), ["A", "B"]);
+        let plain = read_bytes(&stripped(&mixed)).unwrap();
+        assert!(!stripped(&mixed).windows(6).any(|w| w == b"crc32c"));
+        assert_eq!(with_checks, plain);
+        assert_eq!(with_checks[1].live_run().clean_records, Some(7));
     }
 }

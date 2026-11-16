@@ -21,7 +21,7 @@ use mie_adapter_binance::{BinanceStream, Pipeline, RUN_MARGIN_MS};
 use mie_adapter_parquet::ParquetRawStore;
 use mie_cli::config::IngestConfig;
 use mie_cli::ingest::{IngestOutcome, Transports, WarmUpHold};
-use mie_cli::journal::RunParameters;
+use mie_cli::journal::{CHECK_FIELD, LineCheck, RunParameters, check_line};
 use mie_cli::replay::{self, ReplayOutcome, ReplayRequest, ReplaySource};
 use mie_domain::event::MarketEvent;
 use mie_domain::event_hash;
@@ -225,6 +225,81 @@ fn recompute_gaps(config: &IngestConfig) -> Vec<(String, Vec<JournaledGap>)> {
         out.push((params.run_id, journaled));
     }
     out
+}
+
+/// ADR-066 D1: every line `mie ingest` writes ends with its check, and the
+/// check verifies; over two trade runs (a reconnect, an unparsable frame)
+/// and a depth and open-interest run, so every line type they write is
+/// covered.
+#[test]
+fn ingest_journal_lines_all_carry_the_check() {
+    let dir = TempDir::new("ingest-checks");
+    let trades = config(dir.path());
+    let t1 = D0 + HOUR;
+    let first = ingest(
+        &trades,
+        t1,
+        vec![
+            vec![agg(100, t1 + 10), "{\"e\":\"aggTrade\"".to_owned()],
+            vec![agg(102, t1 + 3_000)],
+        ],
+    );
+    let t2 = t1 + HOUR;
+    let second = ingest(&trades, t2, vec![vec![agg(300, t2 + 5)]]);
+    let depth_dir = TempDir::new("ingest-checks-depth");
+    let depth_config = config_with(
+        depth_dir.path(),
+        &["openInterest", "depth", "depthSnapshot"],
+    );
+    let third = ingest_depth(
+        &depth_config,
+        t1,
+        vec![DepthConnection {
+            frames: vec![depth(11, 20, 10, t1 + 10), depth(21, 30, 20, t1 + 110)],
+            await_served: 1,
+        }],
+        vec![depth_snapshot(15, t1 + 5)],
+        vec![format!(
+            r#"{{"symbol":"BTCUSDT","openInterest":"95253.475","time":{}}}"#,
+            t1 - 4_000
+        )],
+    );
+    for outcome in [&first, &second, &third] {
+        assert_eq!(outcome.exit_code(), 0, "{:?}", outcome.error);
+    }
+    let mut kinds = BTreeSet::new();
+    for config in [&trades, &depth_config] {
+        let bytes = std::fs::read(&config.paths.journal).unwrap();
+        let lines = bytes.strip_suffix(b"\n").expect("ends with a \\n");
+        for body in lines.split(|b| *b == b'\n') {
+            assert_eq!(
+                check_line(body),
+                LineCheck::Intact,
+                "{}",
+                String::from_utf8_lossy(body)
+            );
+            let line: Value = serde_json::from_slice(body).unwrap();
+            assert_eq!(line[CHECK_FIELD].as_str().map(str::len), Some(8));
+            kinds.insert(line["type"].as_str().unwrap().to_owned());
+        }
+    }
+    for kind in [
+        "run_start",
+        "recovery",
+        "warm_start",
+        "connected",
+        "gap",
+        "normalize_error",
+        "sealed",
+        "stats",
+        "state_checkpoint",
+        "oi_poll",
+        "depth_snapshot_fetch",
+        "book",
+        "run_end",
+    ] {
+        assert!(kinds.contains(kind), "{kind} in {kinds:?}");
+    }
 }
 
 #[test]

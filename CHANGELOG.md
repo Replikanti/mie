@@ -12,6 +12,19 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
 
 ### Added
 
+- **A per-line check in the capture journal (part of #224, ADR-066,
+  proposed).** Every line `mie ingest` writes ends with one more member,
+  `"crc32c":"<8 lowercase hex>"`: the CRC-32C of the line's own
+  serialization without it, so a damaged line identifies itself with no
+  other copy. The check is std-only (no new crate), adds 20 bytes a line
+  (+5.8–10.4 % of the journal at the means measured on three host soaks),
+  and is never added to lines that already exist. Readers ignore it:
+  `read_runs`, replay and `mie equivalence` give byte-identical output for
+  a journal with the check, without it, and mixed. `journal::check_line`
+  classifies a line as intact, failed or unchecked (a line from before
+  ADR-066, a torn line, one over 1 MiB). `verify`, `repair` and
+  `repair-hot` start using the verdicts in the follow-up PRs of #224.
+
 - **Storage tiers: `mie store repair-hot` (#217, ADR-065).** Repairs hot's
   own journal (`--scope journal`, with `mie ingest` stopped) or
   import-ledger files (`--scope import-ledger`, beside a running capture)

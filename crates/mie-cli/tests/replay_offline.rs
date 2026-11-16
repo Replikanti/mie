@@ -19,7 +19,7 @@ use common::{
     CUTOVER, Connections, D0, DepthConnection, DrivenClock, HOUR, ORIGIN, TempDir, agg,
     archive_trades, config, config_with, depth, depth_snapshot, depth_transports,
     history_archive_config, history_config, import_rows, ingest, ingest_depth, journal,
-    journaled_run, seam_fixture,
+    journaled_run, seam_fixture, strip_checks_where,
 };
 use mie_adapter_binance::archive::ArchiveStream;
 use mie_adapter_binance::archive::catalog::{DAY_MS, parse_day};
@@ -317,6 +317,56 @@ fn a_live_replay_of_a_tiered_store_is_byte_identical_after_the_move() {
     let (tiered, tiered_text) = run_replay(&request(&config));
     assert_eq!(tiered_text, single_text);
     assert_eq!(tiered, single);
+}
+
+// ---------------------------------------------------------------------------
+// The journal's line check (ADR-066, #224 AC 8).
+
+/// The line check changes no replay: two `mie ingest` runs replay to the
+/// same report and outcome (dataset version, event-stream and state hash)
+/// with every line checked, as a mixed journal (run 1's lines as written
+/// before ADR-066, run 2's checked), and with no line checked.
+#[test]
+fn replay_is_identical_without_the_check() {
+    let dir = TempDir::new("replay-checks");
+    let config = config(dir.path());
+    let t1 = D0 + HOUR;
+    let first = ingest(
+        &config,
+        t1,
+        vec![vec![
+            agg(100, t1 + 10),
+            agg(101, t1 + 20),
+            agg(103, t1 + 40),
+        ]],
+    );
+    let t2 = t1 + HOUR;
+    let second = ingest(&config, t2, vec![vec![agg(300, t2 + 5), agg(301, t2 + 6)]]);
+    assert_eq!((first.exit_code(), second.exit_code()), (0, 0));
+    let request = ReplayRequest {
+        source: ReplaySource::Live(config.clone()),
+        window: window(D0, D0 + DAY_MS),
+    };
+    let (checked, checked_text) = run_replay(&request);
+    assert!(checked.pass, "{checked_text}");
+    assert!(checked.dataset.is_some() && checked.stream_hash.is_some());
+    assert!(checked.state_hash.is_some());
+
+    let run1 = first.run_id.clone();
+    let old = strip_checks_where(&config.paths.journal, |line| {
+        line["run_id"] == run1.as_str()
+    });
+    assert!(old > 0);
+    let (mixed, mixed_text) = run_replay(&request);
+    assert_eq!(mixed_text, checked_text);
+    assert_eq!(mixed, checked);
+
+    assert!(strip_checks_where(&config.paths.journal, |_| true) > 0);
+    let text = std::fs::read_to_string(&config.paths.journal).unwrap();
+    assert!(!text.contains("crc32c"), "{text}");
+    let (plain, plain_text) = run_replay(&request);
+    assert_eq!(plain_text, checked_text);
+    assert_eq!(plain, checked);
 }
 
 // ---------------------------------------------------------------------------
