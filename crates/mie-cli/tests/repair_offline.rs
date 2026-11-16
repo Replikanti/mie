@@ -38,6 +38,16 @@ fn adopted(tag: &str) -> (TempDir, Fixture) {
     (dir, fixture)
 }
 
+/// [`adopted`] with a journal stripped of the line check (ADR-066): the
+/// journal tests of ADR-065 D8 pin the byte rules that still decide lines
+/// without it.
+fn adopted_legacy(tag: &str) -> (TempDir, Fixture) {
+    let dir = TempDir::new(tag);
+    let fixture = Fixture::new_legacy(dir.path());
+    assert_pass(&fixture.adopt(&fixture.request()));
+    (dir, fixture)
+}
+
 fn verify(fixture: &Fixture, now: i64) -> (bool, String) {
     let mut out = Vec::new();
     let pass = store::verify(
@@ -571,7 +581,7 @@ fn a_ledger_copy_is_rebuilt_and_a_divergent_one_refused() {
 /// copy differs from hot at the same byte.
 #[test]
 fn a_journal_copy_is_repaired_by_majority_and_refused_against_hot() {
-    let (_dir, fixture) = adopted("repair-journal");
+    let (_dir, fixture) = adopted_legacy("repair-journal");
     let copy = cold(&fixture, "cold-a").join(".mie/journal/journal.jsonl");
     flip(&copy, 10);
     assert!(!verify(&fixture, VERIFIED).0);
@@ -583,7 +593,7 @@ fn a_journal_copy_is_repaired_by_majority_and_refused_against_hot() {
     );
     assert!(verify(&fixture, REPAIRED + 1).0);
 
-    let (_dir, fixture) = adopted("repair-journal-hot");
+    let (_dir, fixture) = adopted_legacy("repair-journal-hot");
     flip(&fixture.config.paths.journal, 10);
     let (pass, out) = verify(&fixture, VERIFIED);
     assert!(!pass, "{out}");
@@ -622,7 +632,7 @@ fn a_journal_copy_is_repaired_by_majority_and_refused_against_hot() {
 /// byte x into it.
 #[test]
 fn r7_a_copy_is_not_rebuilt_while_hot_is_contested_beyond_d() {
-    let (_dir, fixture) = adopted("repair-x8");
+    let (_dir, fixture) = adopted_legacy("repair-x8");
     let copy = |root: &str| cold(&fixture, root).join(".mie/journal/journal.jsonl");
     let hot = fs::read(&fixture.config.paths.journal).unwrap();
     let x = hot.iter().position(|b| *b == b'\n').unwrap() + 10;
@@ -671,7 +681,7 @@ fn r7_a_copy_is_not_rebuilt_while_hot_is_contested_beyond_d() {
 /// come from hot, ADR-065 D8 *What it cannot see*.)
 #[test]
 fn r7_a_byte_only_hot_and_the_copy_hold_is_contested() {
-    let (_dir, fixture) = adopted("repair-d8-short");
+    let (_dir, fixture) = adopted_legacy("repair-d8-short");
     let copy = |root: &str| cold(&fixture, root).join(".mie/journal/journal.jsonl");
     let good = fs::read(&fixture.config.paths.journal).unwrap();
     let first_nl = good.iter().position(|b| *b == b'\n').unwrap();
@@ -717,7 +727,7 @@ fn r7_a_byte_only_hot_and_the_copy_hold_is_contested() {
 /// extends both from hot; the next verify passes.
 #[test]
 fn r7_two_copy_faults_on_an_intact_hot_heal_both_copies() {
-    let (_dir, fixture) = adopted("repair-d8-two");
+    let (_dir, fixture) = adopted_legacy("repair-d8-two");
     let copy = |root: &str| cold(&fixture, root).join(".mie/journal/journal.jsonl");
     let hot = fs::read(&fixture.config.paths.journal).unwrap();
     let x = hot.iter().position(|b| *b == b'\n').unwrap() + 10;

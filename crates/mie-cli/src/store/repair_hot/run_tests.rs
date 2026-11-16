@@ -4,7 +4,7 @@
 //! path forms, refused writes, the report and the exit code. The names
 //! follow the plan's edge cases.
 
-use super::tests::{line, records};
+use super::tests::{checked_lines, line, records};
 use super::*;
 use crate::store::replicate::tests::{D0, Fixture};
 use std::os::unix::fs::PermissionsExt;
@@ -854,6 +854,171 @@ fn x5_symlinked_journal_is_replaced_at_its_target() {
             .is_symlink()
     );
     assert_eq!(fs::read(&target).unwrap(), whole);
+    assert_eq!(fs::read(beside(&target, AT)).unwrap(), damaged);
+}
+
+// ------------------------------------------------------------------ X7
+
+/// Writes `bytes` over the journal copy on `id`.
+fn set_copy(fixture: &Fixture, id: &str, bytes: &[u8]) {
+    let path = copy_of(fixture, id);
+    mode(&path, 0o644);
+    fs::write(path, bytes).unwrap();
+}
+
+/// The plan's geometry with hot longer (ADR-066 D4): hot 1 200 B in six
+/// checked lines, cold-a 1 000 B, cold-b 400 B, hot flipped at 450 and at
+/// 1 050. *line-damaged*: hot becomes cold-a's 1 000 B followed by hot's
+/// bytes past them, the flip at 1 050 included and named, and the former
+/// bytes are kept beside the journal.
+#[test]
+fn x7_hot_longer_keeps_its_tail() {
+    let six = checked_lines("A", 6);
+    let fixture = with_journal("hot-x7-tail", &six);
+    set_copy(&fixture, "cold-a", &six[..1000]);
+    set_copy(&fixture, "cold-b", &six[..400]);
+    let journal_path = fixture.config.paths.journal.clone();
+    flip(&journal_path, 450);
+    flip(&journal_path, 1050);
+    let damaged = fs::read(&journal_path).unwrap();
+    let report = journal(&fixture, AT);
+    assert_pass(&report);
+    assert_line(&report, &["decision line-damaged"]);
+    assert_line(
+        &report,
+        &[
+            "repaired from the copy on cold-a",
+            "byte(s) 400",
+            "ADR-066 D4",
+        ],
+    );
+    assert_line(
+        &report,
+        &["hot's line from byte 1000 fails its check", "kept"],
+    );
+    let mut expected = six[..1000].to_vec();
+    expected.extend_from_slice(&damaged[1000..]);
+    assert_eq!(fs::read(&journal_path).unwrap(), expected);
+    assert_eq!(fs::read(beside(&journal_path, AT)).unwrap(), damaged);
+    assert_eq!(report.written, 1);
+}
+
+/// Hot 1 000 B flipped at 450 under a C cut 50 bytes into a sixth line:
+/// hot becomes C plus one `\n` (H3's), as *damaged* writes it.
+#[test]
+fn x7_c_cut_after_the_damaged_line() {
+    let six = checked_lines("A", 6);
+    let fixture = with_journal("hot-x7-cut", &six[..1000]);
+    set_copy(&fixture, "cold-a", &six[..1050]);
+    set_copy(&fixture, "cold-b", &six[..1050]);
+    flip(&fixture.config.paths.journal, 450);
+    let report = journal(&fixture, AT);
+    assert_pass(&report);
+    assert_line(&report, &["decision line-damaged"]);
+    let mut expected = six[..1050].to_vec();
+    expected.push(b'\n');
+    assert_eq!(fs::read(&fixture.config.paths.journal).unwrap(), expected);
+}
+
+/// Hot verifies where the copies' line 3 fails its check: *copy-damaged*,
+/// naming `mie store verify` then `mie store repair` and the line
+/// verdicts; nothing is written.
+#[test]
+fn x7_copy_line_fails_names_the_repair() {
+    let five = checked_lines("A", 5);
+    let fixture = with_journal("hot-x7-copy", &five);
+    let mut bad = five.clone();
+    bad[450] ^= 0x01;
+    set_copy(&fixture, "cold-a", &bad);
+    set_copy(&fixture, "cold-b", &bad[..400]);
+    let before = snapshot(&fixture);
+    let report = journal(&fixture, AT);
+    assert_line(&report, &["decision copy-damaged"]);
+    assert_problem(
+        &report,
+        &[
+            "verifies its check",
+            "mie store verify",
+            "mie store repair",
+            "hot's line from byte 400 verifies, C's line holding byte 450 fails its check",
+        ],
+    );
+    assert_nothing_written(&report);
+    assert_eq!(snapshot(&fixture), before);
+}
+
+/// A fork found by the checks stops as *diverged*, naming the verifying
+/// hot line and C's verdict there, and writes nothing.
+#[test]
+fn x7_fork_by_checks_names_the_verifying_line() {
+    let five = checked_lines("A", 5);
+    let mut hot = five[..400].to_vec();
+    hot.extend_from_slice(&five[200..400]);
+    hot.extend_from_slice(&five[600..]);
+    let fixture = with_journal("hot-x7-fork", &five);
+    fs::write(&fixture.config.paths.journal, &hot).unwrap();
+    let before = snapshot(&fixture);
+    let report = journal(&fixture, AT);
+    assert_line(&report, &["decision diverged"]);
+    assert_problem(
+        &report,
+        &[
+            "hot's line from byte 400 verifies its check",
+            "C's line that holds byte",
+            "verifies",
+            "never overwrites a hot line that verifies",
+            "--keep-hot-journal",
+        ],
+    );
+    assert_nothing_written(&report);
+    assert_eq!(snapshot(&fixture), before);
+}
+
+/// Unchecked lines against one copy: the *one-witness* stop says that the
+/// differing lines carry no check, not that the journal has no chain.
+#[test]
+fn x7_one_witness_names_the_missing_check() {
+    let fixture = with_journal("hot-x7-one", &thousand());
+    set_copy(&fixture, "cold-b", &thousand()[..400]);
+    flip(&fixture.config.paths.journal, 450);
+    let report = journal(&fixture, AT);
+    assert_line(&report, &["decision one-witness"]);
+    assert_problem(
+        &report,
+        &["the differing lines carry no check", "carries no check"],
+    );
+    assert!(
+        report.problems.iter().all(|p| !p.contains("hash chain")),
+        "{report:#?}"
+    );
+}
+
+/// `paths.journal` as a link: *line-damaged* replaces the link's target,
+/// as *damaged* does.
+#[test]
+fn x7_line_damaged_follows_a_linked_journal() {
+    let five = checked_lines("A", 5);
+    let mut fixture = with_journal("hot-x7-link", &five);
+    set_copy(&fixture, "cold-b", &five[..400]);
+    let link = fixture.config.paths.journal.clone();
+    let target = fixture.dir.0.join("elsewhere/j.jsonl");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::rename(&link, &target).unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    flip(&target, 450);
+    let damaged = fs::read(&target).unwrap();
+    fixture.config.paths.journal = relative(&link);
+    fixture.config.paths.raw_root = relative(&fixture.hot);
+    let report = journal(&fixture, AT);
+    assert_pass(&report);
+    assert_line(&report, &["decision line-damaged"]);
+    assert!(
+        fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(fs::read(&target).unwrap(), five);
     assert_eq!(fs::read(beside(&target, AT)).unwrap(), damaged);
 }
 

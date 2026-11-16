@@ -45,14 +45,15 @@
 //!   ([`replica::difference_bounds`]); a read error on it counts as a
 //!   difference at every byte. L_2 is the second-longest witness's length,
 //!   lls(C) the start of C's last complete line.
-//! - **X2 The journal decision** ([`decide_journal`]): *agree* (no
+//! - **X2 The journal decision** ([`decide_journal`], after X7): *agree* (no
 //!   difference, L_C ≤ L_h, and hot does not equal a C that ends inside a
 //!   line: nothing written); *behind* (no difference, L_h < L_C, or L_h =
 //!   L_C with C ending inside a line, the state an extension leaves when
 //!   its `\n` did not land: hot is extended to C, one witness suffices, as
 //!   in the restore's H3); *behind-copy-damaged* (the copies differ, every
-//!   copy reads, one is longer than hot, and hot holds a strict majority at
-//!   every byte below L_h, D8's rule: hot is extended to the end of the
+//!   copy reads, one is longer than hot, and every contradicted byte below
+//!   L_h is settled for hot under R7's rule, [`journal_contest`] (ADR-066
+//!   D5 over ADR-065 D8): hot is extended to the end of the
 //!   longest copy with no difference with hot below L_h, and the damaged
 //!   copies are named for `mie store repair`; not where a differing copy
 //!   holds a byte past that end, two copies hold different bytes past L_h,
@@ -61,13 +62,36 @@
 //!   fork shape: hot is replaced by C, since every byte where hot differs
 //!   has two independent witnesses against it). Every other state stops,
 //!   naming both sides: *copy-damaged* (the copies differ, and R7 rebuilds
-//!   every copy that is no byte prefix of hot under ADR-065 D8, the same
-//!   rule over the same bytes: `mie store verify`, then `mie store
-//!   repair`); *two-fault* (the copies differ otherwise); *hot ahead* (L_C
+//!   every copy that is no byte prefix of hot under ADR-066 D5, the same
+//!   function over the same bytes: `mie store verify`, then `mie store
+//!   repair`); *two-fault* (the copies differ otherwise; the stop names
+//!   the verdicts of hot's and each copy's line at their first
+//!   difference); *hot ahead* (L_C
 //!   < L_h, e < lls(C): stop `mie ingest`, run `mie store replicate`, run
 //!   this again); *diverged* (L_h > L_C with e ≥ lls(C), L_C > L_h with a
-//!   difference, or a fork shape); *one-witness* (L_C = L_h, e ≥ L_2). A
-//!   written journal that ends inside a line gets one `\n`.
+//!   difference, or a fork shape); *one-witness* (L_C = L_h, e ≥ L_2; the
+//!   stop says that the differing lines carry no check that attributes
+//!   them). A written journal that ends inside a line gets one `\n`.
+//! - **X7 Line checks** ([`checked_facts`], ADR-066 D4): where the copies
+//!   agree, a difference [d, e] exists and hot reads in full, hot's lines
+//!   from s through the line that holds e are read one at a time (at most
+//!   `MAX_CHECKED_LINE` bytes of a line held). Each hot line H that
+//!   differs from C is judged with C's line that holds H's first differing
+//!   byte: V when H verifies (C's line Intact: *fork*; Failed: *copy
+//!   fails*; no check: *unattributed*), F when H fails its check and C's
+//!   line is Intact with the same start and end, U otherwise (H without a
+//!   check, a flipped `\n`). Ahead of X2's states: some V makes the state
+//!   *copy-damaged* when every differing line is *copy fails* (the stop
+//!   names `mie store verify`, then `mie store repair`), else *diverged*
+//!   (naming the first verifying hot line and C's verdict there); every
+//!   line F with X2a finding no fork (at any lengths, its reads below
+//!   min(L_h, L_C) since e is) makes it *line-damaged*: hot is replaced by
+//!   C when L_C ≥ L_h (plus one `\n` when C ends inside a line), else by C
+//!   followed by hot's bytes past L_C, with X5's evidence and writes; one
+//!   witness suffices, since each replaced line is attributed by its own
+//!   check. Hot's lines past L_C that fail their check are named and kept.
+//!   Anything else, or a read error on hot's region, leaves X2 unchanged.
+//!   An automatic decision never overwrites a hot line that verifies.
 //! - **X2a The fork guard** ([`fork_shaped`]): before *damaged* writes, an
 //!   equal-length fork (lines of a later run where the copies hold others)
 //!   makes the state *diverged*; before *behind-copy-damaged* writes, a
@@ -101,11 +125,12 @@
 //!   written`. `PASS` needs no stop, no skipped target and no unreadable
 //!   witness.
 
-use super::repair::entry_mismatches;
+use super::repair::{entry_mismatches, held_line, journal_contest};
 use super::replicate::{self, IMPORT_LEDGER_DIR, JOURNAL_DIR, META_DIR, sorted_names};
 use super::restore::{self, JournalCandidate, JournalStop, LedgerListing, READ_ERROR, list_ledger};
 use super::{DeviceProbe, check_devices, check_hot};
 use crate::config::IngestConfig;
+use crate::journal::{LineCheck, MAX_CHECKED_LINE, check_line};
 use mie_adapter_binance::archive::ARCHIVE_SOURCE;
 use mie_adapter_binance::archive::ledger::{
     ImportLedger, LedgerKind, LedgerName, PENDING_FILE, Pending, SupersedeRecord, SupersededEntry,
@@ -263,10 +288,9 @@ pub struct WitnessFacts {
     /// included).
     pub vs_others: Vec<Option<u64>>,
     /// Whether `mie store repair`'s R7 refuses to rebuild it from hot
-    /// (ADR-065 D8): it is no byte prefix of hot's journal, and hot holds
-    /// no strict majority at some byte the rebuild would write
-    /// ([`replica::first_contested_file`] over every witness), or hot
-    /// cannot be read. False for a byte prefix of hot's journal. Read only
+    /// (ADR-066 D5 over ADR-065 D8): it is no byte prefix of hot's journal,
+    /// and some byte the rebuild would write is not settled for hot
+    /// ([`journal_contest`] over every witness), or hot cannot be read. False for a byte prefix of hot's journal. Read only
     /// where the copies differ.
     pub r7_refuses: bool,
 }
@@ -296,9 +320,78 @@ pub struct JournalFacts {
     pub copy_targets: usize,
     /// *behind* with the copies differing (ADR-065 D2, review of #226
     /// round 2): computed only where the copies differ, every copy reads,
-    /// some copy is longer than hot, and hot holds a strict majority at
-    /// every byte below L_h (D8's rule, `first_contested_file` below L_h).
+    /// some copy is longer than hot, and every contradicted byte below L_h
+    /// is settled for hot (R7's rule, [`journal_contest`] below L_h).
     pub behind: Option<BehindFacts>,
+    /// X7's facts (ADR-066 D4): computed only where the copies agree, a
+    /// difference exists and hot's region reads in full.
+    pub checked: Option<CheckedFacts>,
+}
+
+/// What X7 makes of one hot line H that differs from C, by H's verdict and
+/// that of C's line holding H's first differing byte (ADR-066 D4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineFact {
+    /// V: H verifies, and so does C's line: a fork.
+    Fork,
+    /// V: H verifies, C's line fails its check.
+    CopyFails,
+    /// V: H verifies, C's bytes there carry no check: unattributed.
+    HotVerifies,
+    /// F: H fails its check, and C holds an Intact line with the same start
+    /// and end.
+    Restorable,
+    /// U: everything else (H without a check, or H failing without a
+    /// same-span Intact line of C, as a flipped `\n` leaves).
+    Unattributed,
+}
+
+impl LineFact {
+    /// Whether H verifies (V).
+    #[must_use]
+    pub fn hot_verifies(self) -> bool {
+        matches!(self, Self::Fork | Self::CopyFails | Self::HotVerifies)
+    }
+}
+
+/// One hot line of X7's region that differs from C.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckedLine {
+    /// Where H starts.
+    pub start: u64,
+    /// H's first byte that differs from C.
+    pub first: u64,
+    /// H's verdict; a line without its `\n` is not classified (Unchecked).
+    pub hot: LineCheck,
+    /// The verdict of C's line that holds `first`; one that C cuts is not
+    /// classified (Unchecked).
+    pub copy: LineCheck,
+    /// What X7 makes of the two.
+    pub fact: LineFact,
+}
+
+/// X7's facts (ADR-066 D4): hot's lines from s through the line holding e
+/// that differ from C, and X2a's verdict over the region, computed only
+/// where every one of them is [`LineFact::Restorable`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckedFacts {
+    /// The differing lines, in order.
+    pub lines: Vec<CheckedLine>,
+    /// Whether X2a calls the region a fork.
+    pub fork: bool,
+}
+
+impl CheckedFacts {
+    /// Whether every differing line is [`LineFact::Restorable`] (and there
+    /// is one): the fork guard decides *line-damaged*.
+    #[must_use]
+    pub fn all_restorable(&self) -> bool {
+        !self.lines.is_empty()
+            && self
+                .lines
+                .iter()
+                .all(|line| line.fact == LineFact::Restorable)
+    }
 }
 
 /// What decides whether a hot journal that is behind is extended while
@@ -428,8 +521,13 @@ pub enum JournalDecision {
     /// Two witnesses against hot at every differing byte: hot is replaced
     /// by C.
     Damaged,
-    /// The copies differ, hot holds a strict majority at every byte it
-    /// holds, and [`behind_refusals`] finds nothing: hot is extended from
+    /// X7 (ADR-066 D4): every line of hot that differs from C fails its
+    /// check, C holds each Intact with the same span, and X2a finds no
+    /// fork: hot is replaced by C, followed by hot's bytes past L_C when
+    /// hot is longer.
+    LineDamaged,
+    /// The copies differ, every contradicted byte hot holds is settled for
+    /// hot (R7's rule), and [`behind_refusals`] finds nothing: hot is extended from
     /// the copies with no difference below L_h (to
     /// [`BehindFacts::reach`]); the copy damage is left to `mie store
     /// verify` and `mie store repair`.
@@ -461,6 +559,7 @@ impl JournalDecision {
             Self::Agree => "agree",
             Self::Behind => "behind",
             Self::Damaged => "damaged",
+            Self::LineDamaged => "line-damaged",
             Self::BehindCopyDamaged => "behind-copy-damaged",
             Self::CopyDamaged => "copy-damaged",
             Self::TwoFault { .. } => "two-fault",
@@ -545,6 +644,26 @@ pub fn decide_journal(facts: &JournalFacts) -> JournalDecision {
             JournalDecision::Behind
         };
     };
+    // X7 (ADR-066 D4), ahead of ADR-065 D2's states: an automatic decision
+    // never overwrites a hot line that verifies, and lines that each fail
+    // their check against a same-span Intact line of C are attributed by
+    // their own checks, one witness enough.
+    if let Some(checked) = &facts.checked {
+        if checked.lines.iter().any(|line| line.fact.hot_verifies()) {
+            return if checked
+                .lines
+                .iter()
+                .all(|line| line.fact == LineFact::CopyFails)
+            {
+                JournalDecision::CopyDamaged
+            } else {
+                JournalDecision::Diverged
+            };
+        }
+        if checked.all_restorable() && !checked.fork {
+            return JournalDecision::LineDamaged;
+        }
+    }
     if hot > chosen {
         return if e < facts.last_line_start {
             JournalDecision::HotAhead
@@ -591,12 +710,178 @@ fn line_start_in(bytes: &[u8], offset: u64) -> u64 {
         .map_or(0, |i| i as u64 + 1)
 }
 
+// ------------------------------------------------- pure: line checks
+
+/// One of hot's lines as X7 reads it: its length, its `\n` included, and
+/// its bytes, `None` for a line longer than [`MAX_CHECKED_LINE`] (only
+/// that many bytes of a line are held in memory, ADR-066 D2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegionLine {
+    /// Its length, its `\n` included.
+    pub len: u64,
+    /// Its bytes with its `\n`; `None` past the cap.
+    pub bytes: Option<Vec<u8>>,
+}
+
+/// The verdict of a line read with its `\n` (when it has one): a line
+/// without it is not classified.
+fn verdict_of(line: &[u8]) -> LineCheck {
+    match line.strip_suffix(b"\n") {
+        Some(body) => check_line(body),
+        None => LineCheck::Unchecked,
+    }
+}
+
+/// X7 (ADR-066 D4): hot's lines from s, the start of the line holding d,
+/// through the line holding e, one at a time from `next_line`, each set
+/// against C (`c`). Each line that differs from C is classified by its
+/// verdict and that of C's line holding its first differing byte. A line
+/// longer than the cap cannot be classified and is
+/// [`LineFact::Unattributed`]. `None` on a read error: X7 then decides
+/// nothing, and ADR-065's rules apply. Pure; [`CheckedFacts::fork`] is
+/// left false for the caller.
+pub fn checked_facts(
+    c: &[u8],
+    d: u64,
+    e: u64,
+    next_line: &mut dyn FnMut() -> Result<Option<RegionLine>, String>,
+) -> Option<CheckedFacts> {
+    let mut start = line_start_in(c, d);
+    let mut lines = Vec::new();
+    loop {
+        let line = match next_line() {
+            Ok(Some(line)) if line.len > 0 => line,
+            Ok(_) => break,
+            Err(_) => return None,
+        };
+        let end = start + line.len;
+        let from = start.max(d);
+        let to = end.min(e + 1);
+        let checked = match &line.bytes {
+            None => (from < to).then_some(CheckedLine {
+                start,
+                first: from,
+                hot: LineCheck::Unchecked,
+                copy: LineCheck::Unchecked,
+                fact: LineFact::Unattributed,
+            }),
+            Some(bytes) => (from..to)
+                .find(|&i| {
+                    let mine = bytes[(i - start) as usize];
+                    usize::try_from(i).ok().and_then(|i| c.get(i)) != Some(&mine)
+                })
+                .map(|first| classify_line(c, start, bytes, first)),
+        };
+        lines.extend(checked);
+        start = end;
+        if end > e {
+            break;
+        }
+    }
+    Some(CheckedFacts { lines, fork: false })
+}
+
+/// X7's table for hot's line `bytes` from `start`, which first differs
+/// from C (`c`) at `first`.
+fn classify_line(c: &[u8], start: u64, bytes: &[u8], first: u64) -> CheckedLine {
+    let hot = verdict_of(bytes);
+    let c_start = line_start_in(c, first);
+    let rest = usize::try_from(c_start)
+        .ok()
+        .and_then(|s| c.get(s..))
+        .unwrap_or(&[]);
+    let c_line = rest
+        .iter()
+        .position(|b| *b == b'\n')
+        .map_or(rest, |i| &rest[..=i]);
+    let copy = verdict_of(c_line);
+    let same_span = c_start == start && c_line.len() == bytes.len();
+    let fact = match (hot, copy) {
+        (LineCheck::Intact, LineCheck::Intact) => LineFact::Fork,
+        (LineCheck::Intact, LineCheck::Failed) => LineFact::CopyFails,
+        (LineCheck::Intact, LineCheck::Unchecked) => LineFact::HotVerifies,
+        (LineCheck::Failed, LineCheck::Intact) if same_span => LineFact::Restorable,
+        _ => LineFact::Unattributed,
+    };
+    CheckedLine {
+        start,
+        first,
+        hot,
+        copy,
+        fact,
+    }
+}
+
+/// The next line of `reader`, its `\n` included, holding at most
+/// [`MAX_CHECKED_LINE`] bytes and its `\n` in memory; `None` at the end.
+fn read_region_line(reader: &mut impl BufRead) -> std::io::Result<Option<RegionLine>> {
+    let mut bytes = Vec::new();
+    let mut kept = true;
+    let mut len = 0u64;
+    loop {
+        let buffer = reader.fill_buf()?;
+        if buffer.is_empty() {
+            break;
+        }
+        let found = buffer.iter().position(|b| *b == b'\n');
+        let n = found.map_or(buffer.len(), |i| i + 1);
+        if kept && bytes.len() + n <= MAX_CHECKED_LINE + 1 {
+            bytes.extend_from_slice(&buffer[..n]);
+        } else {
+            kept = false;
+            bytes = Vec::new();
+        }
+        len += n as u64;
+        reader.consume(n);
+        if found.is_some() {
+            break;
+        }
+    }
+    Ok((len > 0).then(|| RegionLine {
+        len,
+        bytes: kept.then_some(bytes),
+    }))
+}
+
+/// [`checked_facts`] over hot's journal at `hot_path` against `c`, hot's
+/// lines read from s one at a time; a read error gives `None`.
+fn hot_checked_facts(hot_path: &Path, c: &[u8], d: u64, e: u64) -> Option<CheckedFacts> {
+    let s = line_start_in(c, d);
+    let mut reader = fs::File::open(hot_path).and_then(|mut file| {
+        file.seek(SeekFrom::Start(s))?;
+        Ok(BufReader::new(file))
+    });
+    checked_facts(c, d, e, &mut || {
+        let reader = reader.as_mut().map_err(|e| e.to_string())?;
+        read_region_line(reader).map_err(|e| e.to_string())
+    })
+}
+
+/// The verdict of the line of `path` holding byte `at` (of its first
+/// `len`), in a stop's words (ADR-066 D2).
+fn line_verdict_text(path: &Path, at: u64, len: u64) -> String {
+    match held_line(path, at, len) {
+        Ok(line) => verdict_text(line.check).to_owned(),
+        Err(error) => format!("unreadable ({error})"),
+    }
+}
+
+/// A verdict in a stop's or a report's words.
+fn verdict_text(check: LineCheck) -> &'static str {
+    match check {
+        LineCheck::Intact => "verifies",
+        LineCheck::Failed => "fails its check",
+        LineCheck::Unchecked => "carries no check",
+    }
+}
+
 // ----------------------------------------------------- pure: fork guard
 
 /// What X2a reads besides hot's lines.
 #[derive(Debug, Clone, Copy)]
 pub struct ForkFacts<'a> {
-    /// C's bytes; L = L_h = L_C.
+    /// C's bytes. Any lengths: the guard reads below min(L_h, L_C), since
+    /// e is below it (ADR-066 D4); *damaged* asks it at L_h = L_C.
     pub c: &'a [u8],
     /// d, the first byte where hot differs from C.
     pub d: u64,
@@ -1468,6 +1753,7 @@ impl Run<'_> {
                         .filter(|r| r.copy_target)
                         .count(),
                     behind: None,
+                    checked: None,
                 };
                 if let Some((d, e)) = bounds
                     && hot_readable
@@ -1475,6 +1761,20 @@ impl Run<'_> {
                     && e < facts.second_len()
                 {
                     facts.fork = hot_fork_shaped(&hot_path, &c_bytes, d, e);
+                }
+                // X7 (ADR-066 D4): hot's differing lines by their checks;
+                // X2a runs at any lengths where they would decide
+                // *line-damaged*, its reads below min(L_h, L_C) since e is.
+                if let Some((d, e)) = bounds
+                    && hot_readable
+                {
+                    facts.checked =
+                        hot_checked_facts(&hot_path, &c_bytes, d, e).map(|mut checked| {
+                            if checked.all_restorable() {
+                                checked.fork = hot_fork_shaped(&hot_path, &c_bytes, d, e);
+                            }
+                            checked
+                        });
                 }
                 (facts, readable, chosen)
             }
@@ -1542,7 +1842,7 @@ impl Run<'_> {
                     } else {
                         let d = vs_hot.unwrap_or(hot_len);
                         let contested = replica::line_start(TailSource::File(&hot_path), d)
-                            .and_then(|u| replica::first_contested_file(&hot_path, &all, u));
+                            .and_then(|u| journal_contest(&hot_path, &all, u, u64::MAX));
                         uninspected || !matches!(contested, Ok(None))
                     };
                     witnesses.push(WitnessFacts {
@@ -1555,8 +1855,8 @@ impl Run<'_> {
                 }
                 let chosen = c.and_then(|c| readable.iter().position(|&i| i == c));
                 // *behind* with the copies differing (ADR-065 D2, review of
-                // #226 round 2): hot holds a strict majority at every byte
-                // it holds, and every copy reads, since a copy that cannot
+                // #226 round 2): every contradicted byte hot holds is
+                // settled for hot under R7's rule, and every copy reads, since a copy that cannot
                 // be read could hold another byte past L_h. The bytes past
                 // L_h come from the longest copy with no difference below
                 // L_h, and each differing copy's region goes through X2a
@@ -1570,9 +1870,8 @@ impl Run<'_> {
                             && readable.len() == candidates.len()
                             && len > hot_len =>
                     {
-                        let inner =
-                            replica::first_contested_file_before(&hot_path, &all, 0, hot_len)
-                                .map_err(|e| Stop(e.to_string()))?;
+                        let inner = journal_contest(&hot_path, &all, 0, hot_len)
+                            .map_err(|e| Stop(e.to_string()))?;
                         if inner.is_some() {
                             None
                         } else {
@@ -1635,6 +1934,7 @@ impl Run<'_> {
                         .filter(|r| r.copy_target)
                         .count(),
                     behind,
+                    checked: None,
                 };
                 (facts, readable, chosen)
             }
@@ -1691,12 +1991,29 @@ impl Run<'_> {
             JournalDecision::BehindCopyDamaged => {
                 self.extend_behind(&hot_path, &facts, &paths, &behind_tail, report)
             }
-            JournalDecision::Damaged => self.replace_hot(&hot_path, &c_bytes, &facts, report),
+            JournalDecision::Damaged => {
+                let from = facts.chosen.map_or("", |c| facts.witnesses[c].id.as_str());
+                let done = format!(
+                    "replaced by the copy on {from}; every differing byte had two copies against \
+                     it"
+                );
+                self.replace_hot(&hot_path, &c_bytes, facts.cut, &done, "ADR-065 D2", report)
+            }
+            JournalDecision::LineDamaged => self.repair_lines(&hot_path, &c_bytes, &facts, report),
+            JournalDecision::CopyDamaged if facts.copies_agree() => Err(Stop(format!(
+                "every line of hot's journal that differs from the copies verifies its check, and \
+                 the copies' line there fails its own (ADR-066 D4): the faults are on the copies. \
+                 {}. Run `mie store verify`, then `mie store repair` (R7 rebuilds each differing \
+                 copy from hot, ADR-066 D5), then this command again; nothing is written \
+                 (ADR-066 D4)",
+                sides()
+            ))),
             JournalDecision::CopyDamaged => Err(Stop(format!(
                 "the journal copies differ, and hot's journal holds a strict majority at every \
-                 byte where a copy contradicts it: the faults are on the copies. {}.{} Run `mie \
-                 store verify`, then `mie store repair` (R7 rebuilds each differing copy from \
-                 hot, ADR-065 D8), then this command again; nothing is written (ADR-065 D2)",
+                 byte where a copy contradicts it, or its lines' checks settle it: the faults are \
+                 on the copies. {}.{} Run `mie store verify`, then `mie store repair` (R7 \
+                 rebuilds each differing copy from hot, ADR-065 D8, ADR-066 D5), then this \
+                 command again; nothing is written (ADR-065 D2)",
                 sides(),
                 behind_clause(&facts)
             ))),
@@ -1719,8 +2036,9 @@ impl Run<'_> {
                 });
                 Err(Stop(format!(
                     "the journal copies differ, and at a byte where a copy contradicts hot's \
-                     journal, hot holds no strict majority, so R7 refuses that copy (ADR-065 D8): \
-                     two faults, which neither the copies nor hot can attribute byte for byte. \
+                     journal, neither the lines' checks nor a strict majority settle it for hot, \
+                     so R7 refuses that copy (ADR-065 D8, ADR-066 D5): two faults, which neither \
+                     the copies nor hot can attribute byte for byte. \
                      {}.{} `mie store repair` compares against hot, so it is not the next step. \
                      When you hold hot's journal for right, `--keep-hot-journal` rebuilds every \
                      copy that is no prefix of it from hot, keeping their bytes in \
@@ -1744,15 +2062,27 @@ impl Run<'_> {
                  you hold hot's journal for right, `--keep-hot-journal` rebuilds every copy that \
                  is no prefix of it from hot, keeping their bytes in .mie/damaged/: {} (ADR-065 \
                  D2, D3, D4)",
-                if facts.fork {
-                    "a fork of equal length: the lines differ in shape, not by damage"
+                if let Some(line) = facts.checked.as_ref().and_then(|checked| {
+                    checked.lines.iter().find(|line| line.fact.hot_verifies())
+                }) {
+                    format!(
+                        "hot's line from byte {} verifies its check, and C's line that holds \
+                         byte {} {}: an automatic decision never overwrites a hot line that \
+                         verifies (ADR-066 D4)",
+                        line.start,
+                        line.first,
+                        verdict_text(line.copy)
+                    )
+                } else if facts.fork {
+                    "a fork of equal length: the lines differ in shape, not by damage".to_owned()
                 } else if hot_len > facts.chosen_len() {
                     "hot is longer, and the difference reaches the copies' last line, so the \
                      pass refuses the tail"
+                        .to_owned()
                 } else if facts.chosen_len() > hot_len {
-                    "the copies are longer, and hot contradicts them"
+                    "the copies are longer, and hot contradicts them".to_owned()
                 } else {
-                    "equal lengths"
+                    "equal lengths".to_owned()
                 },
                 sides(),
                 drops()
@@ -1760,12 +2090,19 @@ impl Run<'_> {
             JournalDecision::OneWitness => Err(Stop(format!(
                 "hot's journal differs from the copies up to byte {}, and only one copy reaches \
                  it (the second-longest ends at byte {}): one copy against hot cannot be \
-                 attributed, since the journal has no hash chain (ADR-062 D11 R7). {}. Nothing \
-                 is written. When you hold hot's journal for right, `--keep-hot-journal` \
-                 rebuilds every copy that is no prefix of it from hot, keeping their bytes in \
-                 .mie/damaged/: {} (ADR-065 D2, D4)",
+                 attributed, since {}. {}. Nothing is written. When you hold hot's journal for \
+                 right, `--keep-hot-journal` rebuilds every copy that is no prefix of it from \
+                 hot, keeping their bytes in .mie/damaged/: {} (ADR-065 D2, D4)",
                 facts.bounds.map_or(0, |(_, e)| e),
                 facts.second_len(),
+                if facts.checked.is_some() {
+                    "the differing lines carry no check that attributes them: a line of hot \
+                     that fails its check against a same-span line of C that verifies is \
+                     attributed by its own check (ADR-066 D4)"
+                } else {
+                    "hot's differing lines cannot be read, and bytes without a line check carry \
+                     no attribution (ADR-062 D11 R7, ADR-066 D4)"
+                },
                 sides(),
                 drops()
             ))),
@@ -1803,6 +2140,34 @@ impl Run<'_> {
                     byte_text(paths[w], d)
                 ));
             }
+            if let Some(checked) = &facts.checked {
+                // The first lines only: a fork can differ in every line.
+                const SHOWN: usize = 3;
+                let mut verdicts: Vec<String> = checked
+                    .lines
+                    .iter()
+                    .take(SHOWN)
+                    .map(|line| {
+                        format!(
+                            "hot's line from byte {} {}, C's line holding byte {} {}",
+                            line.start,
+                            verdict_text(line.hot),
+                            line.first,
+                            verdict_text(line.copy)
+                        )
+                    })
+                    .collect();
+                if checked.lines.len() > SHOWN {
+                    verdicts.push(format!(
+                        "{} more differing line(s)",
+                        checked.lines.len() - SHOWN
+                    ));
+                }
+                parts.push(format!(
+                    "the differing lines under their checks (ADR-066 D2): {}",
+                    verdicts.join(", ")
+                ));
+            }
         } else {
             parts.push(format!(
                 "hot's journal {} ({} bytes)",
@@ -1822,7 +2187,12 @@ impl Run<'_> {
                     None => "C undecided".to_owned(),
                 };
                 let against_hot = match witness.vs_hot {
-                    Some(at) => format!("first differs from hot's journal at byte {at}"),
+                    Some(at) => format!(
+                        "first differs from hot's journal at byte {at} (hot's line there {}, \
+                         this copy's {})",
+                        line_verdict_text(hot_path, at, facts.hot_len),
+                        line_verdict_text(paths[w], at, witness.len)
+                    ),
                     None => "consistent with hot's journal".to_owned(),
                 };
                 parts.push(format!(
@@ -1903,7 +2273,7 @@ impl Run<'_> {
     /// from the longest copy with no difference with hot below L_h, with
     /// *behind*'s writes; every copy holding a byte past L_h holds that
     /// copy's byte there. The copies that differ from hot below L_h, where
-    /// hot holds a strict majority, are copy damage for `mie store verify`
+    /// R7's rule settles it for hot, are copy damage for `mie store verify`
     /// and `mie store repair`, named.
     fn extend_behind(
         &self,
@@ -1945,8 +2315,9 @@ impl Run<'_> {
             if let Some(d) = witness.vs_hot {
                 report.lines.push(format!(
                     "journal: the journal copy on {} ({}) differs from hot's journal at byte {d}, \
-                     where hot holds a strict majority: copy damage, which `mie store verify`, \
-                     then `mie store repair` rebuild from hot (ADR-065 D2, D8)",
+                     where hot holds a strict majority or the lines' checks settle it for hot: \
+                     copy damage, which `mie store verify`, then `mie store repair` rebuild from \
+                     hot (ADR-065 D2, D8, ADR-066 D5)",
                     witness.id,
                     paths[w].display()
                 ));
@@ -1955,13 +2326,17 @@ impl Run<'_> {
         Ok(())
     }
 
-    /// *damaged* (X2, X5): hot's journal is replaced by C, its old bytes
-    /// linked to `<journal>.damaged-<at_ms>`.
+    /// *damaged* and *line-damaged* (X2, X7, X5): hot's journal is replaced
+    /// by `bytes`, plus one `\n` with `newline`, its old bytes linked to
+    /// `<journal>.damaged-<at_ms>`. `done` says what replaced it, `rule` the
+    /// rule that decided.
     fn replace_hot(
         &self,
         hot_path: &Path,
-        c_bytes: &[u8],
-        facts: &JournalFacts,
+        bytes: &[u8],
+        newline: bool,
+        done: &str,
+        rule: &str,
         report: &mut RepairHotReport,
     ) -> Result<(), Stop> {
         let aside = beside(hot_path, self.at_ms);
@@ -1972,13 +2347,11 @@ impl Run<'_> {
                 aside.display()
             )));
         }
-        let from = facts.chosen.map_or("", |c| facts.witnesses[c].id.as_str());
-        let newline = c_bytes.last().is_some_and(|&byte| byte != b'\n');
         let mut linked = false;
         let result = replica::replace_with_evidence(
-            TailSource::Bytes(c_bytes),
+            TailSource::Bytes(bytes),
             hot_path,
-            c_bytes.len() as u64,
+            bytes.len() as u64,
             newline,
             &aside,
             false,
@@ -2005,15 +2378,78 @@ impl Run<'_> {
         }
         report.written += 1;
         report.lines.push(format!(
-            "journal: hot's journal {} replaced by the copy on {from} ({} bytes{}); every \
-             differing byte had two copies against it. Its former bytes are linked to {}, never \
-             deleted (ADR-065 D2, D6)",
+            "journal: hot's journal {} {done} ({} bytes{}). Its former bytes are linked to {}, \
+             never deleted ({rule}, ADR-065 D6)",
             hot_path.display(),
-            c_bytes.len(),
+            bytes.len(),
             if newline { ", plus one `\\n`" } else { "" },
             aside.display()
         ));
         reached(Step::Renamed)
+    }
+
+    /// *line-damaged* (X7, ADR-066 D4): hot's journal is replaced by C when
+    /// L_C ≥ L_h (plus one `\n` when C ends inside a line), and by C
+    /// followed by hot's bytes `[L_C, L_h)` when hot is longer: hot with
+    /// the bytes [d, e] taken from C, since the `\n` positions agree there.
+    /// Hot's lines past L_C that fail their check are named and kept: no
+    /// copy holds them.
+    fn repair_lines(
+        &self,
+        hot_path: &Path,
+        c_bytes: &[u8],
+        facts: &JournalFacts,
+        report: &mut RepairHotReport,
+    ) -> Result<(), Stop> {
+        let c_len = c_bytes.len() as u64;
+        let (bytes, newline) = if facts.hot_len > c_len {
+            let tail = read_range(hot_path, c_len, facts.hot_len).map_err(|error| {
+                Stop(format!(
+                    "read hot's journal {} past byte {c_len}: {error}; nothing is written \
+                     (ADR-066 D4)",
+                    hot_path.display()
+                ))
+            })?;
+            let mut bytes = c_bytes.to_vec();
+            bytes.extend_from_slice(&tail);
+            (bytes, false)
+        } else {
+            (c_bytes.to_vec(), facts.cut)
+        };
+        let from = facts.chosen.map_or("", |c| facts.witnesses[c].id.as_str());
+        let lines: Vec<String> = facts
+            .checked
+            .iter()
+            .flat_map(|checked| &checked.lines)
+            .map(|line| line.start.to_string())
+            .collect();
+        let done = if facts.hot_len > c_len {
+            format!(
+                "repaired from the copy on {from}: its line(s) from byte(s) {} fail their check, \
+                 and that copy holds each intact with the same span, so its first {c_len} bytes \
+                 replace hot's and hot's bytes past them are kept",
+                lines.join(", ")
+            )
+        } else {
+            format!(
+                "replaced by the copy on {from}: its line(s) from byte(s) {} fail their check, \
+                 and that copy holds each intact with the same span",
+                lines.join(", ")
+            )
+        };
+        self.replace_hot(hot_path, &bytes, newline, &done, "ADR-066 D4", report)?;
+        let mut start = 0;
+        for line in bytes.split_inclusive(|b| *b == b'\n') {
+            let end = start + line.len() as u64;
+            if end > c_len && verdict_of(line) == LineCheck::Failed {
+                report.lines.push(format!(
+                    "journal: hot's line from byte {start} fails its check, and no copy holds it: \
+                     kept as it is (ADR-066 D4)"
+                ));
+            }
+            start = end;
+        }
+        Ok(())
     }
 
     /// X3: every witness that is no prefix of hot's journal is rebuilt

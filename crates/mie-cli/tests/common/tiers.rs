@@ -259,6 +259,18 @@ pub struct Fixture {
 
 impl Fixture {
     pub fn new(dir: &Path) -> Self {
+        Self::build(dir, false)
+    }
+
+    /// [`Fixture::new`] with the source journal stripped of the line check
+    /// (ADR-066) before the adoption, so hot and both copies hold the
+    /// journal a writer from before ADR-066 left: the tests that pin
+    /// ADR-065's byte rules keep pinning them as the fallback.
+    pub fn new_legacy(dir: &Path) -> Self {
+        Self::build(dir, true)
+    }
+
+    fn build(dir: &Path, legacy: bool) -> Self {
         let src = dir.join("src");
         let src_config = ingest_toml(
             &dir.join("src.toml"),
@@ -281,6 +293,9 @@ impl Fixture {
             vec![vec![agg(300, T2 + 5), agg(301, T2 + 6)]],
         );
         assert_eq!((t1.exit_code(), t2.exit_code()), (0, 0));
+        if legacy {
+            assert!(strip_checks(&src.join("journal.jsonl")) > 0);
+        }
         let fake = fake_archive();
         let src_archive = archive_toml(&dir.join("src-archive.toml"), &src, &src.join("raw"), &[]);
         let first = D0 / DAY_MS - 4;
@@ -366,6 +381,12 @@ impl Fixture {
             .tiered_writer(source, RotationPolicy::default(), ctx)
             .unwrap()
     }
+}
+
+/// Strips the line check (ADR-066) from every line of the journal at
+/// `path`; returns the number of lines stripped.
+pub fn strip_checks(path: &Path) -> usize {
+    super::strip_checks_where(path, |_| true)
 }
 
 /// The copy targets `dir/cold-a` and `dir/cold-b`.

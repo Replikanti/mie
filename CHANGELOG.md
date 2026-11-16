@@ -25,6 +25,22 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   ADR-066, a torn line, one over 1 MiB). `verify`, `repair` and
   `repair-hot` start using the verdicts in the follow-up PRs of #224.
 
+- **Journal damage attributed by the line check (part of #224, ADR-066
+  D4–D6, proposed).** `mie store repair` (R7) and `mie store repair-hot`
+  judge each contradicted journal line by its check before they count
+  bytes: a hot line that verifies against copy lines that fail is settled
+  for hot with no majority, so one damaged copy against hot is rebuilt;
+  a hot line that fails its check is never written over a copy, even with
+  a majority; a copy line that verifies is never overwritten. `repair-hot
+  --scope journal` gains the state `line-damaged`: where every line of hot
+  that differs from the longest copy fails its check and that copy holds
+  it intact with the same span, hot is repaired from one copy (hot's bytes
+  past the copy are kept); a hot line that verifies is never overwritten,
+  so a fork the byte rules took for damage now stops as `diverged`.
+  `mie store verify` names the damaged side of a journal `prefix` finding
+  (the copy, hot, or a fork). Lines without the check keep ADR-065's
+  byte rules unchanged.
+
 - **Storage tiers: `mie store repair-hot` (#217, ADR-065).** Repairs hot's
   own journal (`--scope journal`, with `mie ingest` stopped) or
   import-ledger files (`--scope import-ledger`, beside a running capture)

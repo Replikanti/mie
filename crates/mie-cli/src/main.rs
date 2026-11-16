@@ -379,10 +379,13 @@ USAGE:
         order), verified by its SHA-256 and recorded. Copy-ledger and
         journal copies are rebuilt from hot where that is safe (a damaged
         unterminated tail is cut off); a copy ledger whose complete records
-        verify but differ from hot's, a journal copy where hot's journal
-        holds no strict majority of the journals at a byte the rebuild
-        would write (one copy against hot is a tie), and an import entry
-        hot cannot vouch for are refused and named. A copy target's
+        verify but differ from hot's, a journal copy where a byte the
+        rebuild would write is settled for hot neither by the lines'
+        checks (ADR-066: hot's line verifies and the copies' lines fail
+        theirs) nor by a strict majority of the journals (one copy against
+        hot is a tie; a hot line that fails its check or a copy line that
+        verifies is never outvoted), and an import entry hot cannot vouch
+        for are refused and named. A copy target's
         unrecorded copy of a file hot holds that the next pass would refuse
         is moved aside into <root>/.mie/damaged/<time>/, and the closing
         pass copies the file from hot; another self-consistent file under
@@ -487,7 +490,11 @@ USAGE:
         --scope import-ledger the archive writer lock (the capture keeps
         running), all without waiting. --scope journal replaces hot's journal by the copies only
         where two copies of hot's full length agree against it at every
-        differing byte and the difference has no fork's shape, extends a
+        differing byte and the difference has no fork's shape, or where
+        every line of hot that differs fails its check (ADR-066) and the
+        longest copy holds each intact with the same span (hot's bytes past
+        that copy are kept); it never overwrites a hot line that verifies.
+        It extends a
         hot journal the copies are longer than, and otherwise stops, naming
         both sides and the next step (mie store verify, then mie store
         repair, for damaged copies; mie store replicate when hot is ahead).

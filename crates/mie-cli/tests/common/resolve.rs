@@ -26,6 +26,15 @@ pub fn adopted(tag: &str) -> (TempDir, Fixture) {
     (dir, fixture)
 }
 
+/// [`adopted`] over [`Fixture::new_legacy`]: a journal without line checks
+/// (ADR-066), for the tests that pin ADR-065's byte rules.
+pub fn adopted_legacy(tag: &str) -> (TempDir, Fixture) {
+    let dir = TempDir::new(tag);
+    let fixture = Fixture::new_legacy(dir.path());
+    assert_pass(&fixture.adopt(&fixture.request()));
+    (dir, fixture)
+}
+
 pub fn resolve_with(
     fixture: &Fixture,
     file: Option<&str>,
