@@ -1128,6 +1128,24 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
 
 ### Fixed
 
+- **`mie ingest` ends a torn last line of the journal before it appends
+  (#225).** The journal writer flushes when its buffer is full, not on line
+  boundaries, so a crash could leave the journal's last line without its
+  `\n`. The next run's `run_start` was then glued onto it, `read_runs`
+  skipped the glued line, and the run's later lines failed the whole
+  journal with "... without run_start", which blocked replay and every
+  other reader for all runs. `Journal::open` now appends one `\n` to a
+  non-empty journal whose last byte is not one, after it takes the journal
+  lock and before the run's first line. The torn bytes stay, nothing is
+  truncated, and nothing is reported: the crashed run already shows as a
+  run without `run_end`. `read_runs` now reads bytes and skips a line that
+  is not valid UTF-8 like one that is not JSON, so a tail torn inside a
+  multibyte character no longer blocks the journal either; `mie
+  capture-report` counts such a line as an unparsable journal line instead
+  of failing to read the journal. Behaviour change: a journal with invalid
+  UTF-8 in the middle used to fail every reader with a read error; that
+  line is now skipped (counted by `capture-report`) and the runs around it
+  are listed.
 - **`mie store repair` clears an unrecorded damaged copy of a hot file on
   a copy target (#219).** A copy target could hold a form of a file hot
   holds that the copy ledger records no copy of there (a manifest without

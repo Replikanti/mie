@@ -320,18 +320,22 @@ pub fn run(
 }
 
 /// The runs that started in the window, by run id, and the number of
-/// unparsable lines.
+/// unparsable lines. The journal is read as bytes: a line that is not valid
+/// UTF-8 (a crash can tear a multibyte character) is unparsable, like one
+/// that is not JSON, and never blank.
 fn read_journal(
     path: &Path,
     from_ms: i64,
     to_ms: i64,
 ) -> Result<(BTreeMap<String, RunJournal>, u64), String> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| format!("read journal {}: {e}", path.display()))?;
+    let bytes = std::fs::read(path).map_err(|e| format!("read journal {}: {e}", path.display()))?;
     let mut runs: BTreeMap<String, RunJournal> = BTreeMap::new();
     let mut unparsable = 0;
-    for line in text.lines().filter(|l| !l.trim().is_empty()) {
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
+    for line in bytes.split(|b| *b == b'\n') {
+        if std::str::from_utf8(line).is_ok_and(|text| text.trim().is_empty()) {
+            continue;
+        }
+        let Ok(value) = serde_json::from_slice::<Value>(line) else {
             unparsable += 1;
             continue;
         };

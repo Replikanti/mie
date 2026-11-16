@@ -657,10 +657,11 @@ fn c_run_id_at(c: &[u8], start: u64) -> Option<String> {
 /// through a complete record whose `run_id` differs from that of C's line
 /// at the same start, itself a complete record. A line is glued when it is
 /// no record but its suffix from some p is one (a torn record, when it is
-/// the journal's last line): the shape `Journal::open` leaves after a torn
-/// line. For the first line s < p ≤ d (its bytes before p are C's); for
-/// every later line (review of #226, finding 4) the line's bytes before p
-/// must be a torn record themselves, since they need not be C's.
+/// the journal's last line): the shape `Journal::open` left after a torn
+/// line before it ended one (#225), which older journals still hold. For
+/// the first line s < p ≤ d (its bytes before p are C's); for every later
+/// line (review of #226, finding 4) the line's bytes before p must be a
+/// torn record themselves, since they need not be C's.
 pub fn fork_shaped(
     facts: &ForkFacts<'_>,
     next_line: &mut dyn FnMut() -> Result<Option<Vec<u8>>, String>,
