@@ -630,8 +630,13 @@ impl JournaledRun {
 /// Reads every run of `source` from the journal at `path`, in journal
 /// order.
 ///
-/// A line that is not JSON is skipped: a crash can leave a partial line,
-/// which the next run's first line then follows. A `run_start`, `run_end`,
+/// A line that is not JSON is skipped: a crash can leave a partial line.
+/// The next [`Journal::open`] ends it with a `\n` (#225), so the next run's
+/// first line follows it on a line of its own; journals written before
+/// that may hold the next run's first line glued onto it (#217). A line
+/// that is not valid UTF-8 (a crash can tear a multibyte character) is
+/// skipped the same way: the journal is read as bytes, and only the lines
+/// are decoded. A `run_start`, `run_end`,
 /// `state_checkpoint`, `warm_start`, `warm_ready` or `chain_restart` that
 /// does not carry its fields is an error, and so are two `run_start`s of
 /// one run id — a restart within the same second, whose records the session
@@ -642,12 +647,13 @@ impl JournaledRun {
 ///
 /// A description naming the line.
 pub fn read_runs(path: &Path, source: &str) -> Result<Vec<JournaledRun>, String> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| format!("read journal {}: {e}", path.display()))?;
+    let bytes = std::fs::read(path).map_err(|e| format!("read journal {}: {e}", path.display()))?;
     let mut runs: Vec<JournaledRun> = Vec::new();
-    for (index, line) in text.lines().enumerate() {
+    // `serde_json` rejects invalid UTF-8 and takes a `\r` before the `\n`
+    // as whitespace, so this splits as `str::lines` did.
+    for (index, line) in bytes.split(|b| *b == b'\n').enumerate() {
         let at = |detail: String| format!("journal line {}: {detail}", index + 1);
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
+        let Ok(value) = serde_json::from_slice::<Value>(line) else {
             continue;
         };
         match value["type"].as_str() {
@@ -775,8 +781,11 @@ pub struct Journal {
 }
 
 impl Journal {
-    /// Opens `path` for appending, creating it and its directory, and takes
-    /// the journal lock without waiting.
+    /// Opens `path` for appending, creating it and its directory, takes the
+    /// journal lock without waiting, and then ends a torn last line with a
+    /// `\n` ([`terminate_torn_tail`]), so the run's first line starts a line
+    /// of its own. The check runs only under the lock: a writer that holds
+    /// it is never raced.
     ///
     /// # Errors
     ///
@@ -785,13 +794,15 @@ impl Journal {
         if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
             std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
         }
-        let file = OpenOptions::new()
+        let mut file = OpenOptions::new()
+            .read(true)
             .create(true)
             .append(true)
             .open(path)
             .map_err(|e| format!("open journal {}: {e}", path.display()))?;
         let lock = replica::try_journal_lock(path)
             .map_err(|e| format!("the journal lock of {}: {e}", path.display()))?;
+        terminate_torn_tail(&mut file, path)?;
         Ok(Self {
             out: BufWriter::new(file),
             run_id: run_id.to_owned(),
@@ -838,6 +849,42 @@ impl Journal {
     pub fn write_error(&self) -> Option<&str> {
         self.write_error.as_deref()
     }
+}
+
+/// Appends one `\n` to the journal when it is not empty and its last byte
+/// is not one (#225). [`Journal::write`] hands its lines to a `BufWriter`
+/// that flushes when its buffer is full, not at line ends, so a crash after
+/// a partial flush leaves a last line without its `\n`. The next run's
+/// `run_start` would be glued onto it: [`read_runs`] skips the glued line as
+/// no JSON and then fails the whole journal on the run's next line, "...
+/// without run_start".
+///
+/// The torn bytes are kept, never truncated: they are the crash's evidence,
+/// and readers skip them as no JSON. Nothing is reported: the crashed run
+/// already shows as a run without `run_end`. The check reads one byte, never
+/// text, so a tail torn inside a multibyte character is ended too. No sync
+/// here: the run's `run_start`, written next, is synced, and that covers this
+/// byte of the same file.
+///
+/// # Errors
+///
+/// A description of the I/O failure: a run never appends onto a tail that
+/// could not be checked.
+fn terminate_torn_tail(file: &mut File, path: &Path) -> Result<(), String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let failed =
+        |e: std::io::Error| format!("end the torn last line of journal {}: {e}", path.display());
+    if file.metadata().map_err(failed)?.len() == 0 {
+        return Ok(());
+    }
+    let mut last = [0; 1];
+    file.seek(SeekFrom::End(-1)).map_err(failed)?;
+    file.read_exact(&mut last).map_err(failed)?;
+    if last != *b"\n" {
+        // Append mode writes at the end, wherever the cursor is.
+        file.write_all(b"\n").map_err(failed)?;
+    }
+    Ok(())
 }
 
 /// A shared journal as the capture's observer.
@@ -1577,5 +1624,279 @@ mod tests {
             json!({"type": "run_end", "run_id": "A", "at_ms": 2, "exit_code": 0}).to_string(),
         ]);
         assert!(no_records.unwrap_err().contains("run_end without records"));
+    }
+
+    /// Like [`read`], over raw bytes: a journal need not be valid UTF-8.
+    fn read_bytes(bytes: &[u8]) -> Result<Vec<JournaledRun>, String> {
+        let dir = Scratch::new();
+        let path = dir.journal();
+        std::fs::write(&path, bytes).unwrap();
+        read_runs(&path, "binance-um")
+    }
+
+    /// A directory of one test's journal (and its lock), named like
+    /// [`read`]'s files and removed on drop.
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dir =
+                std::env::temp_dir().join(format!("mie-journal-open-{}-{n}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn journal(&self) -> std::path::PathBuf {
+            self.0.join("journal.jsonl")
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Opens the journal at `path` for run `run_id` and writes its
+    /// `run_start` and `warm_ready`, as `mie ingest` does.
+    fn append_run(path: &Path, run_id: &str, at_ms: i64) {
+        let mut journal = Journal::open(path, run_id).unwrap();
+        let fields: Value = serde_json::from_str(&start(run_id, at_ms, "binance-um")).unwrap();
+        journal.write(at_ms * 1_000_000, "run_start", fields);
+        journal.write(
+            (at_ms + 10) * 1_000_000,
+            "warm_ready",
+            json!({"ready_after_ms": 10}),
+        );
+        journal.sync();
+        assert_eq!(journal.write_error(), None);
+    }
+
+    fn ids(runs: &[JournaledRun]) -> Vec<&str> {
+        runs.iter().map(|r| r.parameters.run_id.as_str()).collect()
+    }
+
+    /// `original`'s bytes, one `\n`, then the next run's `run_start`.
+    fn assert_terminated_once(after: &[u8], original: &[u8]) {
+        assert!(after.starts_with(original), "the torn bytes are kept");
+        assert_eq!(after[original.len()], b'\n');
+        let next = after[original.len() + 1..].split(|b| *b == b'\n').next();
+        let next: Value = serde_json::from_slice(next.unwrap()).unwrap();
+        assert_eq!(next["type"], "run_start");
+    }
+
+    #[test]
+    fn a_torn_last_line_does_not_swallow_the_next_runs_start() {
+        let dir = Scratch::new();
+        let path = dir.journal();
+        // Run A crashed after a partial flush: its last line has no `\n`.
+        let original = format!(
+            "{}\n{}\n{}",
+            start("A", 1_000, "binance-um"),
+            r#"{"type":"gap","run_id":"A"}"#,
+            r#"{"type":"stats","run_id":"A","reco"#,
+        );
+        std::fs::write(&path, &original).unwrap();
+        append_run(&path, "B", 3_000);
+        let runs = read_runs(&path, "binance-um").unwrap();
+        assert_eq!(ids(&runs), ["A", "B"]);
+        assert_terminated_once(&std::fs::read(&path).unwrap(), original.as_bytes());
+        // The crash stays visible: A has no run_end.
+        assert_eq!(runs[0].live_run().ended_at_ms, None);
+        assert_eq!(runs[1].ready_after_ms, Some(10));
+    }
+
+    #[test]
+    fn a_tail_torn_inside_a_multibyte_character_does_not_hide_the_next_run() {
+        let dir = Scratch::new();
+        let path = dir.journal();
+        let mut original = format!(
+            "{}\n{}\n{}\n",
+            start("A", 1_000, "binance-um"),
+            end("A", 2_000, 0, 42),
+            start("C", 2_500, "binance-um"),
+        )
+        .into_bytes();
+        // The first two bytes of the three of `€`.
+        original.extend_from_slice(br#"{"type":"stats","run_id":"C","note":""#);
+        original.extend_from_slice(&[0xE2, 0x82]);
+        std::fs::write(&path, &original).unwrap();
+        append_run(&path, "B", 3_000);
+        let runs = read_runs(&path, "binance-um").unwrap();
+        assert_eq!(ids(&runs), ["A", "C", "B"]);
+        assert_terminated_once(&std::fs::read(&path).unwrap(), &original);
+        assert_eq!(runs[0].live_run().clean_records, Some(42));
+    }
+
+    #[test]
+    fn a_line_that_is_not_utf8_is_skipped_like_one_that_is_not_json() {
+        let around = |bad: &[u8]| {
+            let mut bytes = format!(
+                "{}\n{}\n",
+                start("A", 1_000, "binance-um"),
+                end("A", 2_000, 0, 42)
+            )
+            .into_bytes();
+            bytes.extend_from_slice(bad);
+            bytes.extend_from_slice(
+                format!(
+                    "\n{}\n{}\n",
+                    start("B", 3_000, "binance-um"),
+                    end("B", 4_000, 0, 7)
+                )
+                .as_bytes(),
+            );
+            read_bytes(&bytes)
+        };
+        // A bare invalid byte, outside any JSON string.
+        let runs = around(&[0xFF]).unwrap();
+        assert_eq!(ids(&runs), ["A", "B"]);
+        // An object of the right shape with an invalid byte in a string.
+        let runs = around(b"{\"type\":\"stats\",\"run_id\":\"A\",\"note\":\"\xFF\"}").unwrap();
+        assert_eq!(ids(&runs), ["A", "B"]);
+        assert_eq!(runs[1].live_run().clean_records, Some(7));
+    }
+
+    #[test]
+    fn error_line_numbers_count_the_skipped_non_utf8_line() {
+        let mut bytes = format!("{}\n", start("A", 1_000, "binance-um")).into_bytes();
+        bytes.extend_from_slice(b"\xFF\n");
+        bytes.extend_from_slice(
+            json!({"type": "run_end", "run_id": "A", "at_ms": 2, "exit_code": 0})
+                .to_string()
+                .as_bytes(),
+        );
+        let error = read_bytes(&bytes).unwrap_err();
+        assert!(
+            error.starts_with("journal line 3: run_end without records"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn crlf_and_an_unterminated_last_record_still_parse() {
+        let text = format!(
+            "{}\r\n{}\r\n{}\r\n{}",
+            start("A", 1_000, "binance-um"),
+            end("A", 2_000, 0, 42),
+            start("B", 3_000, "binance-um"),
+            end("B", 4_000, 0, 7),
+        );
+        let runs = read_bytes(text.as_bytes()).unwrap();
+        assert_eq!(ids(&runs), ["A", "B"]);
+        assert_eq!(runs[1].live_run().clean_records, Some(7));
+    }
+
+    #[test]
+    fn a_terminated_journal_gains_no_byte_on_open() {
+        let dir = Scratch::new();
+        let path = dir.journal();
+        let original = format!(
+            "{}\n{}\n",
+            start("A", 1_000, "binance-um"),
+            end("A", 2_000, 0, 42)
+        );
+        std::fs::write(&path, &original).unwrap();
+        drop(Journal::open(&path, "B").unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), original.as_bytes());
+    }
+
+    #[test]
+    fn a_new_or_empty_journal_gains_no_byte_on_open() {
+        let dir = Scratch::new();
+        let missing = dir.0.join("new").join("journal.jsonl");
+        drop(Journal::open(&missing, "A").unwrap());
+        assert_eq!(std::fs::read(&missing).unwrap(), b"");
+        let empty = dir.journal();
+        std::fs::write(&empty, b"").unwrap();
+        drop(Journal::open(&empty, "A").unwrap());
+        assert_eq!(std::fs::read(&empty).unwrap(), b"");
+    }
+
+    #[test]
+    fn a_journal_of_one_torn_fragment_is_terminated() {
+        let dir = Scratch::new();
+        let path = dir.journal();
+        let original = br#"{"type":"run_st"#;
+        std::fs::write(&path, original).unwrap();
+        append_run(&path, "B", 3_000);
+        assert_eq!(ids(&read_runs(&path, "binance-um").unwrap()), ["B"]);
+        assert_terminated_once(&std::fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn a_complete_record_missing_its_newline_still_counts() {
+        let dir = Scratch::new();
+        let path = dir.journal();
+        let original = format!(
+            "{}\n{}",
+            start("A", 1_000, "binance-um"),
+            end("A", 2_000, 0, 42)
+        );
+        std::fs::write(&path, &original).unwrap();
+        append_run(&path, "B", 3_000);
+        let runs = read_runs(&path, "binance-um").unwrap();
+        assert_eq!(ids(&runs), ["A", "B"]);
+        assert_terminated_once(&std::fs::read(&path).unwrap(), original.as_bytes());
+        let a = runs[0].live_run();
+        assert_eq!((a.ended_at_ms, a.clean_records), (Some(2_000), Some(42)));
+    }
+
+    #[test]
+    fn reopening_adds_the_newline_only_once() {
+        let dir = Scratch::new();
+        let path = dir.journal();
+        let original = format!(
+            "{}\n{}",
+            start("A", 1_000, "binance-um"),
+            r#"{"type":"stats","run_id":"A","reco"#
+        );
+        std::fs::write(&path, &original).unwrap();
+        drop(Journal::open(&path, "B").unwrap());
+        drop(Journal::open(&path, "C").unwrap());
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            format!("{original}\n").as_bytes()
+        );
+    }
+
+    #[test]
+    fn a_held_journal_lock_refuses_before_any_byte_is_written() {
+        let dir = Scratch::new();
+        let path = dir.journal();
+        let original = format!(
+            "{}\n{}",
+            start("A", 1_000, "binance-um"),
+            r#"{"type":"stats","run_id":"A","reco"#
+        );
+        std::fs::write(&path, &original).unwrap();
+        let held = replica::try_journal_lock(&path).unwrap();
+        let error = Journal::open(&path, "B").unwrap_err();
+        assert!(error.contains("journal lock"), "{error}");
+        assert_eq!(std::fs::read(&path).unwrap(), original.as_bytes());
+        drop(held);
+    }
+
+    #[test]
+    fn the_guard_works_on_bytes_not_text() {
+        let dir = Scratch::new();
+        let path = dir.journal();
+        let mut original = format!(
+            "{}\n{}\n",
+            start("A", 1_000, "binance-um"),
+            end("A", 2_000, 0, 42)
+        )
+        .into_bytes();
+        original.extend_from_slice(br#"{"type":"stats","run_id":"A","note":""#);
+        original.extend_from_slice(&[0xE2, 0x82]);
+        std::fs::write(&path, &original).unwrap();
+        drop(Journal::open(&path, "B").unwrap());
+        let mut expected = original.clone();
+        expected.push(b'\n');
+        assert_eq!(std::fs::read(&path).unwrap(), expected);
+        assert_eq!(ids(&read_runs(&path, "binance-um").unwrap()), ["A"]);
     }
 }

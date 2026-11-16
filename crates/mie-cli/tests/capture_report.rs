@@ -200,6 +200,30 @@ fn the_late_fraction_is_judged_against_the_limit() {
     assert!(pass, "{text}");
 }
 
+#[test]
+fn a_non_utf8_journal_line_is_counted_as_unparsable_not_a_read_error() {
+    let dir = TempDir::new("non-utf8");
+    let config = config(dir.path());
+    journal_with(&config, serde_json::json!({}));
+    let (pass, text) = report(&config);
+    assert!(pass, "{text}");
+    // Blank lines, Unicode whitespace included, are not counted.
+    let mut journal = std::fs::read(&config.paths.journal).unwrap();
+    journal.extend_from_slice("\n  \t\n\u{a0}\n".as_bytes());
+    std::fs::write(&config.paths.journal, &journal).unwrap();
+    let (pass, text) = report(&config);
+    assert!(pass, "{text}");
+    // A crash tore the last line inside `€`: two of its three bytes.
+    journal.extend_from_slice(br#"{"type":"stats","run_id":"20261006T010000Z","note":""#);
+    journal.extend_from_slice(&[0xE2, 0x82]);
+    std::fs::write(&config.paths.journal, &journal).unwrap();
+    let (pass, text) = report(&config);
+    assert!(!pass, "{text}");
+    assert!(text.contains("1 run(s)"), "{text}");
+    assert!(text.contains("journal: 1 unparsable lines"), "{text}");
+    assert!(text.trim_end().ends_with("FAIL (1 problem(s))"), "{text}");
+}
+
 /// A depth capture that reconnects once: synced on the first snapshot,
 /// resynced behind a `Disconnected` gap on the second.
 fn depth_capture_with_reconnect(config: &IngestConfig) -> mie_cli::ingest::IngestOutcome {
