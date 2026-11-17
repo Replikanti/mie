@@ -1,6 +1,9 @@
 # ADR-066: A per-line check in the capture journal
 
-- Status: accepted
+- Status: accepted; for checked lines of a kind `read_runs` or
+  `warm_handoffs` consumes, ADR-068 replaces D7's "no gate": a failed line
+  stops those readers unless a lost-line record (D8) matches it, and a
+  recorded line is read without its bytes by ADR-068's rule
 - Date: 2026-11-16
 
 Relation to earlier ADRs: this ADR gives the capture journal (ADR-039 D1,

@@ -279,8 +279,9 @@ pub struct MovedFile {
 pub enum Journal {
     /// No journal file.
     Missing,
-    /// Every warm handoff, as (run id, handoff).
-    Runs(Vec<(String, WarmHandoff)>),
+    /// Every warm handoff, as (run id, handoff), and the cost lines of the
+    /// lines read without their bytes (ADR-068 D8).
+    Runs(Vec<(String, WarmHandoff)>, Vec<String>),
 }
 
 /// RQ5, pure: the cost lines of moving `moved`.
@@ -311,7 +312,7 @@ pub fn cost(moved: &[MovedFile], journal: &Journal) -> Vec<String> {
     let mut runs = 0usize;
     match journal {
         Journal::Missing => lines.push("cost: no journal: no warm run recorded".to_owned()),
-        Journal::Runs(handoffs) => {
+        Journal::Runs(handoffs, _) => {
             for (run_id, handoff) in handoffs {
                 let overlaps =
                     |(min, max): (i64, i64)| min < handoff.cutover_ms && max >= handoff.origin_ms;
@@ -347,6 +348,9 @@ pub fn cost(moved: &[MovedFile], journal: &Journal) -> Vec<String> {
                 ));
             }
         }
+    }
+    if let Journal::Runs(_, notes) = journal {
+        lines.extend(notes.iter().cloned());
     }
     lines.push(format!(
         "cost: {} moved path(s), {runs} journaled warm run(s) whose prefix_dataset changes",
@@ -626,15 +630,14 @@ impl Context<'_> {
         Ok(())
     }
 
-    /// The journal's warm runs (RQ5).
+    /// The journal's warm runs (RQ5), behind the gate of ADR-068 D8.
     fn journal(&self) -> Result<Journal, Stop> {
-        match crate::journal::warm_handoffs(self.journal) {
+        match crate::journal::warm_handoffs(self.journal, self.hot) {
             Ok(None) => Ok(Journal::Missing),
-            Ok(Some(runs)) => Ok(Journal::Runs(runs)),
+            Ok(Some(read)) => Ok(Journal::Runs(read.runs, read.notes)),
             Err(error) => Err(Stop(format!(
-                "the journal {} cannot be read ({error}): the replace's cost names every warm run \
-                 that cited a moved part, so nothing is written",
-                self.journal.display()
+                "{error}: the replace's cost names every warm run that cited a moved part, so \
+                 nothing is written"
             ))),
         }
     }

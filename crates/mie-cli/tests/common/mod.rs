@@ -232,6 +232,115 @@ pub fn strip_checks_where(path: &Path, strip: impl Fn(&serde_json::Value) -> boo
     stripped
 }
 
+// ---------------------------------------------------------------------------
+// Damage to the journal's checked lines (ADR-066, ADR-068).
+
+/// The 0-based index, start and end (its `\n`) of the first line of the
+/// journal at `path` whose `type` is `kind` and `run_id` is `run`.
+pub fn journal_line(path: &Path, kind: &str, run: &str) -> (usize, usize, usize) {
+    let bytes = std::fs::read(path).unwrap();
+    let mut start = 0;
+    for (index, body) in bytes.split(|b| *b == b'\n').enumerate() {
+        let end = start + body.len();
+        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(body)
+            && value["type"] == kind
+            && value["run_id"] == run
+        {
+            return (index, start, end);
+        }
+        start = end + 1;
+    }
+    panic!("no {kind} of {run} in {}", path.display());
+}
+
+/// Flips the last digit of the `at_ms` value of the line at `start` of the
+/// journal at `path` (the first could make a leading zero, which is no
+/// JSON): the line still parses as its kind, and fails its check.
+pub fn flip_value_digit(path: &Path, start: usize) {
+    let mut bytes = std::fs::read(path).unwrap();
+    let value = start
+        + bytes[start..]
+            .windows(8)
+            .position(|w| w == b"\"at_ms\":")
+            .expect("an at_ms")
+        + 8;
+    let at = value
+        + bytes[value..]
+            .iter()
+            .take_while(|b| b.is_ascii_digit())
+            .count()
+        - 1;
+    bytes[at] ^= 0x01;
+    std::fs::write(path, bytes).unwrap();
+}
+
+/// Turns the `{` of the line at `start` of the journal at `path` into `[`
+/// (one bit): the line is no JSON, and fails its check when it has one.
+pub fn break_json(path: &Path, start: usize) {
+    let mut bytes = std::fs::read(path).unwrap();
+    assert_eq!(bytes[start], b'{');
+    bytes[start] ^= 0x20;
+    std::fs::write(path, bytes).unwrap();
+}
+
+/// Gives every line of the journal at `path` that is a JSON object without
+/// the check its check (ADR-066 D1), as a writer since ADR-066 would have
+/// written it: for fixtures that write their journal directly.
+pub fn check_lines(path: &Path) {
+    let bytes = std::fs::read(path).unwrap();
+    let lines: Vec<Vec<u8>> = bytes
+        .split(|b| *b == b'\n')
+        .map(|body| {
+            let object = serde_json::from_slice::<serde_json::Value>(body)
+                .is_ok_and(|value| value.is_object());
+            if object && mie_cli::journal::strip_check(body).is_none() {
+                let compact =
+                    serde_json::to_vec(&serde_json::from_slice::<serde_json::Value>(body).unwrap())
+                        .unwrap();
+                mie_cli::journal::with_check(&compact)
+            } else {
+                body.to_vec()
+            }
+        })
+        .collect();
+    std::fs::write(path, lines.join(&b'\n')).unwrap();
+}
+
+/// One live run `20261006T000000Z` of 360 aggTrades every 10 s from
+/// [`D0`] in the store of `config`, its journal written directly and then
+/// checked (ADR-066): the live fixture of the gate tests (ADR-068).
+pub fn checked_live_run(config: &IngestConfig) -> String {
+    let run_id = "20261006T000000Z";
+    let times: Vec<i64> = (0..360).map(|i| D0 + 5_000 + i * 10_000).collect();
+    let (journal, records) = journaled_run(run_id, D0, D0 + HOUR + 60_000, 100, &times);
+    write_records(config, &records, &journal);
+    check_lines(&config.paths.journal);
+    run_id.to_owned()
+}
+
+/// Makes the store of `config` tiered (ADR-062 D7), the copy targets
+/// `cold-a` and `cold-b` under `dir`, with no lost-line record: a gated
+/// line of its journal stops every reader (ADR-068 D2).
+pub fn make_tiered(config: &mut IngestConfig, dir: &Path) {
+    config.paths.cold_roots = cold_roots(dir);
+    init_tiers(&config.paths.raw_root, &config.paths.cold_roots);
+}
+
+/// Damages run `run`'s `run_end` in the journal of `config` (a value digit:
+/// it parses and fails its check). Returns the stop's text ADR-068 D2
+/// starts with.
+pub fn fail_run_end(config: &IngestConfig, run: &str) -> String {
+    let journal = &config.paths.journal;
+    let (index, start, _) = journal_line(journal, "run_end", run);
+    flip_value_digit(journal, start);
+    format!(
+        "journal {} line {} at byte {start} fails its check (ADR-066 D2) and is not recorded \
+         lost",
+        journal.display(),
+        index + 1
+    )
+}
+
 /// A configuration capturing `streams` into `dir`, hold-back 750 ms. The
 /// fake clocks barely move, so snapshot requests are spaced by 1 ms only.
 pub fn config_with(dir: &Path, streams: &[&str]) -> IngestConfig {

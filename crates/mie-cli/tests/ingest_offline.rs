@@ -2183,8 +2183,8 @@ mod tiered_start {
         stripped.paths.journal = dir.path().join("plain.jsonl");
         std::fs::write(&stripped.paths.journal, plain).unwrap();
         assert_eq!(
-            mie_cli::journal::read_runs(&config.paths.journal, "binance-um").unwrap(),
-            mie_cli::journal::read_runs(&stripped.paths.journal, "binance-um").unwrap()
+            mie_cli::journal::read_runs(&config.paths, "binance-um").unwrap(),
+            mie_cli::journal::read_runs(&stripped.paths, "binance-um").unwrap()
         );
         let report = |config: &IngestConfig| {
             let mut out = Vec::new();
@@ -2194,4 +2194,48 @@ mod tiered_start {
         };
         assert_eq!(report(&config), report(&stripped));
     }
+}
+
+/// ADR-068, the ingest warm start: the memory guard reads the journal
+/// through the gate. The chain run before the cutover-crossing run has its
+/// `run_start` damaged in a single-root store, so it is read without the
+/// line (D5) and excluded (D4); an excluded run in the chain cannot be
+/// recomputed, so the run starts cold with `warm-up-failed`, its error
+/// naming the line, and the capture goes on.
+#[test]
+fn a_gated_line_makes_the_warm_up_cold_naming_it() {
+    let t = CUTOVER + 2 * HOUR;
+    let frames = || vec![vec![agg(1, t + 10), agg(2, t + 20)]];
+    let dir = TempDir::new("warm-up-gate");
+    import_archive(dir.path());
+    let mut config = history_config(dir.path(), "2026-10-03", "2026-10-06");
+    config.history.as_mut().unwrap().max_run_records = Some(103);
+    let times = [
+        CUTOVER + HOUR,
+        CUTOVER + HOUR + 1_000,
+        CUTOVER + HOUR + 2_000,
+    ];
+    let (lines, records) = journaled_run(
+        "20261006T010000Z",
+        CUTOVER + HOUR,
+        CUTOVER + HOUR + 60_000,
+        500,
+        &times,
+    );
+    write_records(&config, &records, &lines);
+    common::check_lines(&config.paths.journal);
+    let (_, start, _) =
+        common::journal_line(&config.paths.journal, "run_start", "20261006T010000Z");
+    assert_eq!(start, 0);
+    common::flip_value_digit(&config.paths.journal, start);
+    let outcome = ingest(&config, t, frames());
+    let cold = assert_cold(&config, &outcome, "warm-up-failed");
+    let error = cold["error"].as_str().unwrap();
+    assert!(
+        error.contains(
+            "the history chain may hold run 20261006T010000Z, which is excluded: journal line 1 \
+             at byte 0 (ADR-068 D4)"
+        ),
+        "{error}"
+    );
 }

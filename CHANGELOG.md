@@ -1060,6 +1060,28 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
 
 ### Changed
 
+- **Journal readers fail closed on a damaged line (#229, ADR-068).** The
+  readers that recompute from the capture journal (`mie replay`, `mie
+  equivalence`, `mie experiment run`, `mie conditional`, `mie alerts`,
+  the history chain and the ingest warm start, and the cost of `mie store
+  resolve`'s replace) no longer read a line whose check fails (ADR-066)
+  when its kind may be one they consume: they stop and name the line, its
+  byte and both repairs (`mie store repair-hot --scope journal`, or `mie
+  store repair --record-lost-lines`). A line a lost-line record matches is
+  read without its bytes: a lost `run_end`, `state_checkpoint` or
+  `chain_restart` marks its run (an equivalence of a run without its
+  `run_end` or a checkpoint is NOT COMPARABLE), a lost `run_start`,
+  `warm_start` or `warm_ready` excludes it, and a line whose run cannot be
+  told excludes the runs on either side, each with a `journal:` note. A
+  single-root store reads such a line the same way without a record,
+  since it cannot record one, and never stops; a line damaged in its check
+  member between two intact lines of its run excludes that run. In a
+  tiered store an unrecorded failed line makes every ingest warm start
+  cold (`warm-up-failed` naming the line) until it is repaired or
+  recorded; the capture keeps running. A journal without a failed line
+  reads, replays and compares byte-identically, and `mie capture-report`
+  and the rebuild are not gated.
+
 - **`mie store repair` R7: hot needs a strict majority at every byte the
   rebuild writes (#217, ADR-065 D8).** The rebuild of a journal copy that
   differs from hot at d writes hot's bytes into it from the start of d's

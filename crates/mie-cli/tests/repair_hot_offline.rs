@@ -77,8 +77,11 @@ fn copy_of(fixture: &Fixture, root: &str) -> PathBuf {
 fn runs(fixture: &Fixture) -> String {
     format!(
         "{:?}",
-        read_runs(&fixture.config.paths.journal, "binance-um")
-            .map(|runs| runs.iter().map(|r| r.started_at_ms).collect::<Vec<_>>())
+        read_runs(&fixture.config.paths, "binance-um").map(|read| read
+            .runs
+            .iter()
+            .map(|r| r.started_at_ms)
+            .collect::<Vec<_>>())
     )
 }
 
@@ -887,4 +890,226 @@ fn ac224_the_217_rules_still_decide_old_lines() {
     assert!(out.contains("journal: decision one-witness"), "{out}");
     assert_fail_line(&out, &["the differing lines carry no check"]);
     assert_eq!(files(&fixture.dir), before);
+}
+
+/// The index (0-based), start and end of every complete line of `bytes`
+/// whose `type` is `kind`.
+fn lines_of_kind(bytes: &[u8], kind: &str) -> Vec<(usize, usize, usize)> {
+    let mut found = Vec::new();
+    let mut start = 0;
+    for (index, body) in bytes.split(|b| *b == b'\n').enumerate() {
+        let end = start + body.len();
+        if end < bytes.len()
+            && serde_json::from_slice::<serde_json::Value>(body)
+                .is_ok_and(|value| value["type"] == kind)
+        {
+            found.push((index, start, end));
+        }
+        start = end + 1;
+    }
+    found
+}
+
+/// The last digit of the `at_ms` value of the line starting at `start`:
+/// flipped, the line still parses as its kind and fails its check (the
+/// first could make a leading zero, which is no JSON).
+fn at_ms_digit(bytes: &[u8], start: usize) -> usize {
+    let value = start
+        + bytes[start..]
+            .windows(8)
+            .position(|w| w == b"\"at_ms\":")
+            .unwrap()
+        + 8;
+    value
+        + bytes[value..]
+            .iter()
+            .take_while(|b| b.is_ascii_digit())
+            .count()
+        - 1
+}
+
+/// #229 (ADR-068 D2): a `run_start` of hot's journal fails its check while
+/// cold-a holds it intact (cold-b lags at the first line, as in
+/// `ac224_a_damaged_checked_line_in_hot_is_repaired_from_one_copy`). The
+/// reader stops naming the line, its byte and both repairs; after
+/// `repair-hot` restores it the runs are the runs before the damage.
+#[test]
+fn ac229_a_gated_line_a_copy_holds_refuses_until_repair_hot_restores_it() {
+    let (_dir, fixture) = adopted("hot-ac229-copy");
+    let journal = fixture.config.paths.journal.clone();
+    let good = fs::read(&journal).unwrap();
+    let listed = runs(&fixture);
+    assert!(listed.starts_with("Ok("), "{listed}");
+    let first_nl = good.iter().position(|b| *b == b'\n').unwrap();
+    let (index, start, end) = lines_of_kind(&good, "run_start")
+        .into_iter()
+        .find(|(_, start, _)| *start > first_nl)
+        .expect("a run_start after the first line");
+    assert_eq!(
+        mie_cli::journal::check_line(&good[start..end]),
+        mie_cli::journal::LineCheck::Intact
+    );
+    let lagging = copy_of(&fixture, "cold-b");
+    writable(&lagging);
+    fs::write(&lagging, &good[..=first_nl]).unwrap();
+    flip(&journal, at_ms_digit(&good, start));
+    let flipped = fs::read(&journal).unwrap();
+    assert_eq!(
+        mie_cli::journal::check_line(&flipped[start..end]),
+        mie_cli::journal::LineCheck::Failed
+    );
+
+    let error = read_runs(&fixture.config.paths, "binance-um").unwrap_err();
+    assert!(
+        error.contains(&format!(
+            "line {} at byte {start} fails its check (ADR-066 D2) and is not recorded lost",
+            index + 1
+        )),
+        "{error}"
+    );
+    assert!(
+        error.contains(mie_cli::journal::FAILED_LINE_REMEDY),
+        "{error}"
+    );
+    assert!(
+        error.contains("`mie store verify` names which applies"),
+        "{error}"
+    );
+
+    let (pass, out) = repair_hot(&fixture, Scope::Journal, false, REPAIRED);
+    assert!(pass, "{out}");
+    assert!(out.contains("journal: decision line-damaged"), "{out}");
+    assert_eq!(fs::read(&journal).unwrap(), good);
+    assert_eq!(runs(&fixture), listed);
+}
+
+/// Appends a checked `state_checkpoint` of the journal's last run to hot's
+/// journal only, past every copy's end, damaged in a value digit: a gated
+/// line no copy holds. Returns its 0-based index, its start and its run.
+fn append_failed_checkpoint(fixture: &Fixture) -> (usize, usize, String) {
+    let journal = &fixture.config.paths.journal;
+    let mut bytes = fs::read(journal).unwrap();
+    let last = bytes[..bytes.len() - 1]
+        .iter()
+        .rposition(|b| *b == b'\n')
+        .map_or(0, |i| i + 1);
+    let value: serde_json::Value = serde_json::from_slice(&bytes[last..bytes.len() - 1]).unwrap();
+    let run = value["run_id"].as_str().unwrap().to_owned();
+    let start = bytes.len();
+    let index = bytes.iter().filter(|&&b| b == b'\n').count();
+    let line = serde_json::json!({
+        "type": "state_checkpoint", "run_id": run, "at_ms": 1_000, "ordinal": 3,
+        "as_of": 5, "event_hash": "000000000000abcd", "state_hash": "000000000000abcd",
+        "last": false,
+    });
+    let mut line = mie_cli::journal::with_check(line.to_string().as_bytes());
+    line.push(b'\n');
+    bytes.extend_from_slice(&line);
+    let digit = at_ms_digit(&bytes, start);
+    bytes[digit] ^= 0x01;
+    fs::write(journal, bytes).unwrap();
+    (index, start, run)
+}
+
+/// #229 (ADR-068 D3, D4): a `state_checkpoint` no copy holds fails its
+/// check. The reader stops; `mie store repair --record-lost-lines` records
+/// it, and the reader then proceeds, reading the run without it, marked,
+/// with a note naming the record.
+#[test]
+fn ac229_a_gated_line_no_copy_holds_proceeds_once_recorded() {
+    let (_dir, fixture) = adopted("hot-ac229-record");
+    let before = read_runs(&fixture.config.paths, "binance-um").unwrap();
+    let (index, start, run) = append_failed_checkpoint(&fixture);
+    let error = read_runs(&fixture.config.paths, "binance-um").unwrap_err();
+    assert!(
+        error.contains(&format!(
+            "line {} at byte {start} fails its check",
+            index + 1
+        )),
+        "{error}"
+    );
+
+    let mut out = Vec::new();
+    let flags = store::repair::Flags {
+        record_lost_lines: true,
+        ..store::repair::Flags::default()
+    };
+    let pass = store::repair(
+        &fixture.config,
+        Some(&fixture.dst_archive),
+        flags,
+        &fixture.probe(),
+        &|| REPAIRED,
+        &mut out,
+    )
+    .unwrap();
+    let out = String::from_utf8(out).unwrap();
+    assert!(pass, "{out}");
+
+    let read = read_runs(&fixture.config.paths, "binance-um").unwrap();
+    let notes = read.notes();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(
+        notes[0].starts_with(&format!(
+            "journal: line {} at byte {start} fails its check (ADR-066 D2), recorded lost at \
+             {REPAIRED} (ADR-066 D8): run {run} reads without this state_checkpoint and is \
+             marked",
+            index + 1
+        )),
+        "{notes:?}"
+    );
+    let marked = read
+        .runs
+        .iter()
+        .find(|r| r.parameters.run_id == run)
+        .expect("the run");
+    assert_eq!(marked.lost.len(), 1);
+    let mut unmarked = read.runs.clone();
+    for r in &mut unmarked {
+        r.lost.clear();
+    }
+    assert_eq!(unmarked, before.runs, "nothing else changes");
+}
+
+/// #229 (ADR-068 D3): with the copy ledger out of reach no record is used,
+/// the stricter outcome: the recorded line stops the reader again, and the
+/// stop says why.
+#[test]
+fn ac229_an_unreadable_copy_ledger_uses_no_records() {
+    let (_dir, fixture) = adopted("hot-ac229-ledger");
+    let (index, start, _) = append_failed_checkpoint(&fixture);
+    let mut out = Vec::new();
+    let flags = store::repair::Flags {
+        record_lost_lines: true,
+        ..store::repair::Flags::default()
+    };
+    assert!(
+        store::repair(
+            &fixture.config,
+            Some(&fixture.dst_archive),
+            flags,
+            &fixture.probe(),
+            &|| REPAIRED,
+            &mut out,
+        )
+        .unwrap(),
+        "{}",
+        String::from_utf8_lossy(&out)
+    );
+    assert!(read_runs(&fixture.config.paths, "binance-um").is_ok());
+    let ledger = hot_ledger(&fixture);
+    let away = ledger.with_extension("away");
+    fs::rename(&ledger, &away).unwrap();
+    let error = read_runs(&fixture.config.paths, "binance-um").unwrap_err();
+    assert!(
+        error.contains(&format!(
+            "line {} at byte {start} fails its check",
+            index + 1
+        )),
+        "{error}"
+    );
+    assert!(error.contains("the stricter outcome"), "{error}");
+    assert!(error.contains("does not exist"), "{error}");
+    fs::rename(&away, &ledger).unwrap();
+    assert!(read_runs(&fixture.config.paths, "binance-um").is_ok());
 }

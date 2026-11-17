@@ -226,3 +226,38 @@ fn the_report_is_the_market_as_of_the_window_end() {
         "FAIL: the window holds no event\n"
     );
 }
+
+/// ADR-068, the reader verdicts: `mie alerts replay` and `mie alerts
+/// report` read the live journal through the gate. A run_end that fails
+/// its check in a tiered store without a record stops both, naming it.
+#[test]
+fn alerts_replay_and_report_read_through_the_gate() {
+    let dir = TempDir::new("alerts-gate");
+    let mut config = common::config(dir.path());
+    let run = common::checked_live_run(&config);
+    common::make_tiered(&mut config, dir.path());
+    let from = common::D0;
+    let replay = ReplayRequest {
+        source: ReplaySource::Live(config.clone()),
+        replay: window(from, from + 3_600_000),
+        emit_from: EventTime::from_millis(from + 1_800_000),
+        out: dir.path().join("alerts.jsonl"),
+    };
+    let (pass, text) = run_replay(&replay);
+    assert!(pass, "{text}");
+    fs::remove_file(&replay.out).unwrap();
+    let stop = common::fail_run_end(&config, &run);
+    let (pass, text) = run_replay(&replay);
+    assert!(!pass);
+    assert!(text.starts_with(&format!("FAIL: {stop}")), "{text}");
+    assert!(!replay.out.exists());
+
+    let report = ReportRequest {
+        source: ReplaySource::Live(config),
+        window: window(from, from + 3_600_000),
+    };
+    let mut out = Vec::new();
+    assert!(!alerts::report(&report, &mut out).unwrap());
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.starts_with(&format!("FAIL: {stop}")), "{text}");
+}

@@ -307,7 +307,7 @@ fn cost_overlap_bounds() {
     let named = |prefix: (i64, i64)| {
         let lines = cost(
             &[moved(&a, 1_000, 2_000)],
-            &Journal::Runs(vec![("r".to_owned(), warm(prefix.0, prefix.1))]),
+            &Journal::Runs(vec![("r".to_owned(), warm(prefix.0, prefix.1))], Vec::new()),
         );
         lines.iter().any(|l| l.starts_with("cost: warm run r"))
     };
@@ -317,7 +317,7 @@ fn cost_overlap_bounds() {
     assert!(!named((2_001, 3_000)));
     let lines = cost(
         &[moved(&a, 1_000, 2_000), moved(&b, 3_000, 4_000)],
-        &Journal::Runs(vec![("r".to_owned(), warm(0, 10_000))]),
+        &Journal::Runs(vec![("r".to_owned(), warm(0, 10_000))], Vec::new()),
     );
     let runs: Vec<&String> = lines
         .iter()
@@ -347,7 +347,7 @@ fn a_manifest_less_moved_path_names_the_runs_over_its_day() {
     let named = |prefix: (i64, i64)| {
         cost(
             std::slice::from_ref(&bare),
-            &Journal::Runs(vec![("r".to_owned(), warm(prefix.0, prefix.1))]),
+            &Journal::Runs(vec![("r".to_owned(), warm(prefix.0, prefix.1))], Vec::new()),
         )
         .iter()
         .any(|l| l.starts_with("cost: warm run r") && l.contains(&a))
@@ -375,7 +375,10 @@ fn a_manifest_less_moved_path_names_the_runs_over_its_day() {
 fn cost_reads_only_warm_starts() {
     let fixture = Fixture::new("replace-journal");
     let path = fixture.dir.0.join("journal-cost.jsonl");
-    assert_eq!(crate::journal::warm_handoffs(&path).unwrap(), None);
+    assert_eq!(
+        crate::journal::warm_handoffs(&path, &fixture.hot).unwrap(),
+        None
+    );
     let mut line = crate::journal::warm_start_json(&crate::journal::WarmStart::Warm(warm(1, 2)));
     line["type"] = "warm_start".into();
     line["run_id"] = "w".into();
@@ -387,11 +390,161 @@ fn cost_reads_only_warm_starts() {
         format!("{line}\nnot json\n{cold}\n{{\"type\":\"run_start\"}}\n"),
     )
     .unwrap();
-    let runs = crate::journal::warm_handoffs(&path).unwrap().unwrap();
+    let runs = crate::journal::warm_handoffs(&path, &fixture.hot)
+        .unwrap()
+        .unwrap()
+        .runs;
     assert_eq!(runs, vec![("w".to_owned(), warm(1, 2))]);
     let dir = fixture.dir.0.join("a-directory");
     fs::create_dir(&dir).unwrap();
-    assert!(crate::journal::warm_handoffs(&dir).is_err());
+    assert!(crate::journal::warm_handoffs(&dir, &fixture.hot).is_err());
+}
+
+/// A checked journal of warm run `w`: run_start, warm_start, warm_ready,
+/// stats, run_end, each ended by `\n` (ADR-066 D1), and the lines' starts.
+fn checked_handoff_journal(path: &Path) -> (Vec<u8>, Vec<usize>) {
+    let mut warm_start =
+        crate::journal::warm_start_json(&crate::journal::WarmStart::Warm(warm(1, 2)));
+    warm_start["type"] = "warm_start".into();
+    warm_start["run_id"] = "w".into();
+    warm_start["at_ms"] = 1_000.into();
+    let lines = [
+        serde_json::json!({"type": "run_start", "run_id": "w", "at_ms": 1_000}),
+        warm_start,
+        serde_json::json!({"type": "warm_ready", "run_id": "w", "at_ms": 1_000, "ready_after_ms": 5}),
+        serde_json::json!({"type": "stats", "run_id": "w", "at_ms": 1_000, "records": 1}),
+        serde_json::json!({"type": "run_end", "run_id": "w", "at_ms": 1_000, "exit_code": 0}),
+    ];
+    let mut bytes = Vec::new();
+    let mut starts = Vec::new();
+    for line in lines {
+        starts.push(bytes.len());
+        bytes.extend_from_slice(&crate::journal::with_check(line.to_string().as_bytes()));
+        bytes.push(b'\n');
+    }
+    fs::write(path, &bytes).unwrap();
+    (bytes, starts)
+}
+
+/// `bytes` with the last digit of `at_ms` of the line at `start` flipped:
+/// it still parses, and fails its check.
+fn flip_at_ms(bytes: &mut [u8], start: usize) {
+    let value = start
+        + bytes[start..]
+            .windows(8)
+            .position(|w| w == b"\"at_ms\":")
+            .unwrap()
+        + 8;
+    let at = value
+        + bytes[value..]
+            .iter()
+            .take_while(|b| b.is_ascii_digit())
+            .count()
+        - 1;
+    bytes[at] ^= 0x01;
+}
+
+/// ADR-068 D8: a `warm_start` that fails its check stops the cost read,
+/// naming the line and both repairs; no copy ledger is needed to stop.
+#[test]
+fn warm_handoffs_gates_a_failed_warm_start() {
+    let fixture = Fixture::new("replace-gate-warm-start");
+    let path = fixture.dir.0.join("journal-gate.jsonl");
+    let (mut bytes, starts) = checked_handoff_journal(&path);
+    assert_eq!(
+        crate::journal::warm_handoffs(&path, &fixture.hot)
+            .unwrap()
+            .unwrap()
+            .runs
+            .len(),
+        1
+    );
+    flip_at_ms(&mut bytes, starts[1]);
+    fs::write(&path, &bytes).unwrap();
+    let error = crate::journal::warm_handoffs(&path, &fixture.hot).unwrap_err();
+    assert!(
+        error.contains(&format!("line 2 at byte {} fails its check", starts[1])),
+        "{error}"
+    );
+    assert!(
+        error.contains(crate::journal::FAILED_LINE_REMEDY),
+        "{error}"
+    );
+}
+
+/// ADR-068 D8: the cost read consumes `warm_start` only, so a failed
+/// `run_start` reads as before and reads no copy ledger.
+#[test]
+fn warm_handoffs_ignores_a_failed_run_start() {
+    let fixture = Fixture::new("replace-gate-run-start");
+    let path = fixture.dir.0.join("journal-gate.jsonl");
+    let (mut bytes, starts) = checked_handoff_journal(&path);
+    flip_at_ms(&mut bytes, starts[0]);
+    flip_at_ms(&mut bytes, starts[2]);
+    fs::write(&path, &bytes).unwrap();
+    let ledger = copy_ledger::ledger_path(&fixture.hot);
+    let away = ledger.with_extension("away");
+    if ledger.exists() {
+        fs::rename(&ledger, &away).unwrap();
+    }
+    let read = crate::journal::warm_handoffs(&path, &fixture.hot)
+        .unwrap()
+        .unwrap();
+    assert_eq!(read.runs, vec![("w".to_owned(), warm(1, 2))]);
+    assert!(read.notes.is_empty());
+}
+
+/// ADR-068 D8: a recorded `warm_start` and a line damaged in its member
+/// between two intact lines of its run are read without their bytes, and
+/// each adds a cost line; the cost prints them.
+#[test]
+fn warm_handoffs_names_a_recorded_line() {
+    let fixture = Fixture::new("replace-gate-recorded");
+    let path = fixture.dir.0.join("journal-gate.jsonl");
+    let (mut bytes, starts) = checked_handoff_journal(&path);
+    flip_at_ms(&mut bytes, starts[1]);
+    // stats' member `,` damaged: Unchecked, no JSON, between two intact
+    // lines of run w (ADR-068 D6).
+    let comma = starts[4] - 1 - 21;
+    assert_eq!(bytes[comma], b',');
+    bytes[comma] ^= 0x01;
+    fs::write(&path, &bytes).unwrap();
+    copy_ledger::CopyLedger::at(&fixture.hot)
+        .append(&copy_ledger::Record {
+            at_ms: 4_242,
+            kind: copy_ledger::Kind::LostLine {
+                journal: "journal-gate.jsonl".to_owned(),
+                line: 2,
+                offset: starts[1] as u64,
+                sha256: copy_ledger::line_sha256(&bytes[starts[1]..starts[2] - 1]),
+            },
+        })
+        .unwrap();
+    let read = crate::journal::warm_handoffs(&path, &fixture.hot)
+        .unwrap()
+        .unwrap();
+    assert!(read.runs.is_empty());
+    assert_eq!(read.notes.len(), 2, "{:?}", read.notes);
+    assert!(
+        read.notes[0].starts_with(&format!(
+            "cost: journal line 2 at byte {} fails its check (ADR-066 D2), recorded lost at 4242",
+            starts[1]
+        )),
+        "{:?}",
+        read.notes
+    );
+    assert!(read.notes[1].contains("line 4 at byte"), "{:?}", read.notes);
+    assert!(read.notes[1].contains("ADR-068 D6"), "{:?}", read.notes);
+    for note in &read.notes {
+        assert!(
+            note.ends_with(
+                "if it was a warm run's warm_start, that run is not named above (ADR-068 D8)"
+            ),
+            "{note}"
+        );
+    }
+    let lines = cost(&[], &Journal::Runs(read.runs, read.notes.clone()));
+    assert_eq!(lines[..2], read.notes[..]);
 }
 
 // ------------------------------------------------------------- the run

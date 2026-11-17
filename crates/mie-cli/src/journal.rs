@@ -46,7 +46,15 @@
 //! the writer drops a caller field of that name at every depth. The check
 //! guards against accidental damage only: it is no MAC.
 //! Lines written before ADR-066 never gain it. Readers ignore the member:
-//! [`read_runs`] and every other reader index named keys.
+//! they index named keys, so a line reads the same with it or without it.
+//!
+//! **The gate** (ADR-068). [`read_runs`] and [`warm_handoffs`] recompute
+//! from the journal, so they do not read a line whose check fails when its
+//! kind may be one they consume: they stop and name the line and both
+//! repairs, unless a lost-line record (ADR-066 D8) accepts its loss. A
+//! recorded line is read without its bytes, by a rule that marks or
+//! excludes runs and is printed as a note. `capture-report` and the
+//! rebuild's B1 are not gated (ADR-068, the reader verdicts).
 //!
 //! The raw store alone does not determine what live delivered: the
 //! pipeline's `hold_back_ms`, `oi_retime_ms` and per-stream seeds are run
@@ -68,6 +76,7 @@
 //! engine, and the history chain keeps them, so it recomputes the run
 //! exactly as it was consumed.
 
+use crate::config::Paths;
 use crate::ingest::tiers::Recalled;
 use crate::store::PassReport;
 use mie_adapter_binance::live::ChannelStats;
@@ -75,9 +84,10 @@ use mie_adapter_binance::{
     BinanceStream, BookStats, BookTransition, CaptureEvent, CaptureObserver, CheckpointResult,
     LiveRun, MIN_SIDE_LEVELS, PipelineStats, SideCoverage, SnapshotTrigger,
 };
-use mie_adapter_parquet::copy_ledger::Truncation;
+use mie_adapter_parquet::copy_ledger::{self, Truncation};
 use mie_adapter_parquet::removal::{RemovalPlan, RemovalReport};
 use mie_adapter_parquet::replica::{self, JournalLock};
+use mie_adapter_parquet::verification::{CopyState, LostLine};
 use mie_app::equivalence::StateCheckpoint;
 use mie_domain::book::{Invalidation, Side};
 use mie_domain::event_hash::EventStreamHash;
@@ -87,7 +97,7 @@ use mie_domain::state_hash::StateHash;
 use mie_domain::time::EventTime;
 use mie_ports::raw::{DatasetVersion, SealedFile};
 use serde_json::{Map, Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::Path;
@@ -173,6 +183,9 @@ pub struct JournaledRun {
     pub ready_after_ms: Option<i64>,
     /// The times of the run's `chain_restart` lines, in journal order.
     pub chain_restarts: Vec<EventTime>,
+    /// The run's lines read without their bytes, which mark it (ADR-068
+    /// D4): a lost `run_end`, `state_checkpoint` or `chain_restart`.
+    pub lost: Vec<LostRef>,
 }
 
 /// The history chain's bounds a run journaled in `run_start` (ADR-052 D6).
@@ -526,32 +539,94 @@ pub fn warm_start_from_json(line: &Value) -> Result<WarmStart, String> {
     }))
 }
 
-/// Every warm run's handoff in the journal at `path`, as (run id,
+/// Every warm run's handoff in the journal at `journal`, as (run id,
 /// handoff), in journal order (ADR-062 D11, the replace's cost, #211
-/// RQ5). The journal is streamed line by line with bounded memory; only
-/// `warm_start` lines with `warm: true` are parsed, and a line that is no
-/// JSON or no complete warm handoff is skipped, as `read_runs` skips it.
-/// `None` when the journal does not exist.
+/// RQ5), with the notes of the lines read without their bytes. The journal
+/// is streamed line by line with bounded memory; only `warm_start` lines
+/// with `warm: true` are taken, and a line that is no JSON or no complete
+/// warm handoff is skipped, as [`read_runs`] skips it.
+///
+/// The gate of ADR-068 D1 applies with `warm_start` as the consumed kind
+/// (D8): a complete line that fails its check and is no JSON object, has no
+/// string `type`, is a `warm_start` or names no kind the writer writes,
+/// stops the read unless a lost-line record in hot's copy ledger matches
+/// it. A recorded line, and a line that is no JSON object between two
+/// Intact lines of one run (D6), is a note: if it was a warm run's
+/// `warm_start`, that run is not named. `None` when the journal does not
+/// exist.
 ///
 /// # Errors
 ///
-/// The I/O error when the journal exists and cannot be read.
-pub fn warm_handoffs(path: &Path) -> std::io::Result<Option<Vec<(String, WarmHandoff)>>> {
+/// A description of the I/O error when the journal exists and cannot be
+/// read, or the gate's stop.
+pub fn warm_handoffs(journal: &Path, hot: &Path) -> Result<Option<WarmHandoffs>, String> {
     use std::io::BufRead;
-    let file = match File::open(path) {
+    let unreadable = |error: std::io::Error| {
+        format!("the journal {} cannot be read ({error})", journal.display())
+    };
+    let file = match File::open(journal) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
+        Err(error) => return Err(unreadable(error)),
+    };
+    let mut fetch = || tiered_records(hot, journal);
+    let mut records = Records {
+        fetch: &mut fetch,
+        fetched: None,
     };
     let mut reader = std::io::BufReader::new(file);
-    let mut runs = Vec::new();
+    let mut handoffs = WarmHandoffs::default();
     let mut line = Vec::new();
+    // The previous complete line's body, and a D6 candidate: the previous
+    // line's number and offset, and the run of the Intact line before it.
+    let mut previous: Option<Vec<u8>> = None;
+    let mut candidate: Option<(u64, u64, String)> = None;
+    let (mut number, mut offset) = (0_u64, 0_u64);
     loop {
         line.clear();
-        if reader.read_until(b'\n', &mut line)? == 0 {
+        let n = reader.read_until(b'\n', &mut line).map_err(unreadable)?;
+        if n == 0 {
             break;
         }
-        let Ok(value) = serde_json::from_slice::<Value>(&line) else {
+        number += 1;
+        let at = offset;
+        offset += n as u64;
+        let complete = line.last() == Some(&b'\n');
+        let body = if complete {
+            &line[..line.len() - 1]
+        } else {
+            &line[..]
+        };
+        if let Some((line, offset, run)) = candidate.take()
+            && complete
+            && check_line(body) == LineCheck::Intact
+            && run_id_of(body).as_ref() == Some(&run)
+        {
+            handoffs
+                .notes
+                .push(handoff_note(line, offset, &LostWhy::MemberDamaged));
+        }
+        let value = serde_json::from_slice::<Value>(body).ok();
+        let mut skip = false;
+        if complete && gate_candidate(value.as_ref(), &HANDOFF_KINDS) {
+            match check_line(body) {
+                LineCheck::Failed => {
+                    let why = records.judge(journal, number, at, body)?;
+                    handoffs.notes.push(handoff_note(number, at, &why));
+                    skip = true;
+                }
+                LineCheck::Unchecked if value.as_ref().is_none_or(|v| !v.is_object()) => {
+                    candidate = previous
+                        .as_deref()
+                        .filter(|before| check_line(before) == LineCheck::Intact)
+                        .and_then(run_id_of)
+                        .map(|run| (number, at, run));
+                }
+                _ => {}
+            }
+        }
+        previous = complete.then(|| body.to_vec());
+        let Some(value) = value.filter(|_| !skip) else {
             continue;
         };
         if value["type"].as_str() != Some("warm_start") {
@@ -559,10 +634,28 @@ pub fn warm_handoffs(path: &Path) -> std::io::Result<Option<Vec<(String, WarmHan
         }
         if let Ok(WarmStart::Warm(handoff)) = warm_start_from_json(&value) {
             let run_id = value["run_id"].as_str().unwrap_or("?").to_owned();
-            runs.push((run_id, handoff));
+            handoffs.runs.push((run_id, handoff));
         }
     }
-    Ok(Some(runs))
+    Ok(Some(handoffs))
+}
+
+/// What [`warm_handoffs`] read.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WarmHandoffs {
+    /// Every warm handoff, as (run id, handoff), in journal order.
+    pub runs: Vec<(String, WarmHandoff)>,
+    /// One cost line per line read without its bytes (ADR-068 D8).
+    pub notes: Vec<String>,
+}
+
+/// The cost line of a line [`warm_handoffs`] reads without its bytes.
+fn handoff_note(line: u64, offset: u64, why: &LostWhy) -> String {
+    format!(
+        "cost: journal line {line} at byte {offset} {}: if it was a warm run's warm_start, that \
+         run is not named above (ADR-068 D8)",
+        lost_why(why, line)
+    )
 }
 
 /// Reads a `state_checkpoint` journal line.
@@ -642,41 +735,724 @@ impl JournaledRun {
     }
 }
 
-/// Reads every run of `source` from the journal at `path`, in journal
-/// order.
+/// Reads every run of `source` from the journal of `paths`, in journal
+/// order, behind the line gate of ADR-068.
 ///
-/// A line that is not JSON is skipped: a crash can leave a partial line.
-/// The next [`Journal::open`] ends it with a `\n` (#225), so the next run's
-/// first line follows it on a line of its own; journals written before
-/// that may hold the next run's first line glued onto it (#217). A line
-/// that is not valid UTF-8 (a crash can tear a multibyte character) is
-/// skipped the same way: the journal is read as bytes, and only the lines
-/// are decoded. A line's check (`crc32c`, ADR-066) is ignored: only named
-/// keys are read, so a line reads the same with the member or without it
-/// (written before ADR-066), and a line whose check fails reads like any
-/// other line (no gate here, ADR-066 D7). A `run_start`, `run_end`,
-/// `state_checkpoint`, `warm_start`, `warm_ready` or `chain_restart` that
+/// **Structure.** A line that is not JSON is skipped: a crash can leave a
+/// partial line. The next [`Journal::open`] ends it with a `\n` (#225), so
+/// the next run's first line follows it on a line of its own; journals
+/// written before that may hold the next run's first line glued onto it
+/// (#217). A line that is not valid UTF-8 (a crash can tear a multibyte
+/// character) is skipped the same way: the journal is read as bytes, and
+/// only the lines are decoded. Only named keys are read, so a line reads
+/// the same with its check (`crc32c`, ADR-066) or without it (written
+/// before ADR-066). A `run_start`, `run_end`, `state_checkpoint`,
+/// `warm_start`, `warm_ready` or `chain_restart` ([`GATED_KINDS`]) that
 /// does not carry its fields is an error, and so are two `run_start`s of
 /// one run id — a restart within the same second, whose records the session
 /// prefix could not tell apart (ADR-032) — a second `run_end`, `warm_start`
 /// or `warm_ready`, and any of these lines without a `run_start`.
 ///
+/// **The gate** (ADR-068 D1, D2). A complete line whose check fails
+/// ([`LineCheck::Failed`]) is *gated* when the reader cannot tell that it
+/// ignores the line's kind: the line is no JSON object, has no string
+/// `type`, or its `type` is one of [`GATED_KINDS`] or names no kind the
+/// writer writes ([`KNOWN_KINDS`]). Lines are parsed first, so only such
+/// lines pay a CRC. The first gated line in journal order stops the read
+/// with an error naming the line, its byte offset and both repairs
+/// ([`FAILED_LINE_REMEDY`]), unless a lost-line record matches it (ADR-066
+/// D8). Hot's copy ledger is read for that at most once, and only when a
+/// gated line exists (D3); when it gives no records, the read stops and
+/// says why. A single-root store has neither copies nor a copy ledger: its
+/// gated lines are read as recorded ones, with a note (D5). The last line
+/// without its `\n` is never classified (ADR-066 D2). Every other line
+/// reads as before: a Failed line of a kind the reader ignores, and every
+/// Intact or Unchecked line.
+///
+/// **A lost line** (D4) is read without its bytes. Its neighbours are the
+/// nearest lines on each side that parse with a string `run_id`, do not
+/// fail their check and are not lost themselves. When the line parses, its
+/// kind is one of the six and its `run_id` is every neighbour's, it acts by
+/// its kind: a lost `run_end`, `state_checkpoint` or `chain_restart` marks
+/// its run ([`JournaledRun::lost`]), which reads without the line; a lost
+/// `run_start`, `warm_start` or `warm_ready` excludes the run. Otherwise
+/// the runs of both neighbours are excluded. An excluded run is read as one
+/// whose `run_start` was lost (ADR-039 D2): its structural lines are
+/// skipped, and it is listed in [`RunsRead::excluded`].
+///
+/// **Member damage** (D6). A complete line that is no JSON object, carries
+/// no member of the check's shape and lies between two Intact lines of one
+/// run excludes that run: no crash leaves such a line.
+///
+/// Every lost line is a [`LostNote`]; [`RunsRead::notes`] prints them.
+///
 /// # Errors
 ///
-/// A description naming the line.
-pub fn read_runs(path: &Path, source: &str) -> Result<Vec<JournaledRun>, String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("read journal {}: {e}", path.display()))?;
-    let mut runs: Vec<JournaledRun> = Vec::new();
+/// A description naming the line: the gate's stop, or a structural error.
+pub fn read_runs(paths: &Paths, source: &str) -> Result<RunsRead, String> {
+    let bytes = std::fs::read(&paths.journal)
+        .map_err(|e| format!("read journal {}: {e}", paths.journal.display()))?;
+    runs_from_bytes(&bytes, &paths.journal, source, &mut || {
+        lost_line_records_of(paths)
+    })
+}
+
+/// The kinds [`read_runs`] consumes, its six arms (ADR-068 D1): a failed
+/// line of one of them is gated.
+pub const GATED_KINDS: [&str; 6] = [
+    "run_start",
+    "run_end",
+    "state_checkpoint",
+    "warm_start",
+    "warm_ready",
+    "chain_restart",
+];
+
+/// The kind [`warm_handoffs`] consumes (ADR-068 D1, D8).
+const HANDOFF_KINDS: [&str; 1] = ["warm_start"];
+
+/// Every kind [`Journal::write`] writes: the module table's (ADR-068 D1).
+/// A failed line whose `type` names none of them is gated, since damage can
+/// have renamed a consumed kind.
+pub const KNOWN_KINDS: [&str; 25] = [
+    "run_start",
+    "warm_start",
+    "warm_ready",
+    "chain_restart",
+    "recovery",
+    "connected",
+    "connect_failed",
+    "disconnected",
+    "planned_rotation",
+    "backoff",
+    "oi_poll",
+    "depth_snapshot_fetch",
+    "book",
+    "book_checkpoint",
+    "gap",
+    "sealed",
+    "normalize_error",
+    "stats",
+    "domain_rejection",
+    "state_checkpoint",
+    "run_end",
+    "replication",
+    "copy_ledger_truncated",
+    "removal",
+    "recall",
+];
+
+/// What to do about a hot journal line that fails its check and is not
+/// recorded lost: `mie store verify` (V3, ADR-066 D6) and the gate of
+/// ADR-068 D2 print the same text.
+pub const FAILED_LINE_REMEDY: &str = "when a copy holds it intact, `mie store repair-hot \
+     --scope journal` (with `mie ingest` stopped) restores it; otherwise, after checking for a \
+     shared cause, `mie store repair --record-lost-lines` records its loss";
+
+/// The lost-line records a gated line is matched against (ADR-068 D3, D5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LostLineRecords {
+    /// A single-root store: no copy to restore a line from and no copy
+    /// ledger to record it in (D5).
+    SingleRoot,
+    /// The records of the journal in hot's copy ledger, in ledger order.
+    Read(Vec<LostLine>),
+    /// Why the copy ledger gives none: the stricter outcome, every gated
+    /// line stops the read.
+    Unavailable(String),
+}
+
+/// Why a line is read without its bytes (ADR-068 D4–D6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LostWhy {
+    /// A lost-line record matches it (ADR-066 D8): the first in ledger
+    /// order.
+    Recorded {
+        /// When it was recorded.
+        at_ms: i64,
+        /// The line's number when it was recorded.
+        line: u64,
+    },
+    /// It fails its check in a single-root store, which cannot record it
+    /// (D5).
+    NotRecordable,
+    /// It is no JSON object between two Intact lines of its run (D6).
+    MemberDamaged,
+}
+
+/// A line read without its bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LostRef {
+    /// Its 1-based number among the `\n`-split lines.
+    pub line: u64,
+    /// Its first byte.
+    pub offset: u64,
+    /// The `type` its bytes name, when they parse with one; trusted only
+    /// for a line that marks a run.
+    pub kind: Option<String>,
+    /// Why.
+    pub why: LostWhy,
+}
+
+/// What a lost line does to the runs (ADR-068 D4, D6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LostEffect {
+    /// A trusted `run_end`, `state_checkpoint` or `chain_restart`: the run
+    /// reads without it and is marked.
+    Marked(String),
+    /// A trusted `run_start`, `warm_start` or `warm_ready`, or a D6 line:
+    /// its run is excluded.
+    Excluded(String),
+    /// An untrusted line: the runs of its neighbours are excluded, none when
+    /// it has none.
+    Neighbours(Vec<String>),
+}
+
+/// A lost line and its effect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LostNote {
+    /// The line.
+    pub lost: LostRef,
+    /// Its effect.
+    pub effect: LostEffect,
+}
+
+impl LostNote {
+    /// The note's text, without the `journal: ` prefix (ADR-068 D7).
+    pub fn text(&self) -> String {
+        let LostRef {
+            line, offset, why, ..
+        } = &self.lost;
+        let why = lost_why(why, *line);
+        let kind = self.lost.kind.as_deref().unwrap_or("?");
+        let effect = match &self.effect {
+            LostEffect::Marked(run) if kind == "run_end" => {
+                format!("run {run} reads without its run_end, as a crashed run, and is marked")
+            }
+            LostEffect::Marked(run) => {
+                format!("run {run} reads without this {kind} and is marked")
+            }
+            LostEffect::Excluded(run) if self.lost.why == LostWhy::MemberDamaged => {
+                format!("run {run} is excluded, as a run whose run_start is lost (ADR-039 D2)")
+            }
+            LostEffect::Excluded(run) => format!(
+                "its {kind} is lost, so run {run} is excluded, as a run whose run_start is lost \
+                 (ADR-039 D2)"
+            ),
+            LostEffect::Neighbours(runs) if runs.is_empty() => {
+                "its run cannot be told and no line beside it names one: no run is excluded"
+                    .to_owned()
+            }
+            LostEffect::Neighbours(runs) => format!(
+                "its run cannot be told, so run(s) {} beside it are excluded, as runs whose \
+                 run_start is lost (ADR-039 D2)",
+                runs.join(", ")
+            ),
+        };
+        let decision = if self.lost.why == LostWhy::MemberDamaged {
+            "D6"
+        } else {
+            "D4"
+        };
+        format!("line {line} at byte {offset} {why}: {effect} (ADR-068 {decision})")
+    }
+}
+
+/// Why a line numbered `line` is read without its bytes, as a note says it.
+fn lost_why(why: &LostWhy, line: u64) -> String {
+    match why {
+        LostWhy::Recorded { at_ms, line: then } => format!(
+            "fails its check (ADR-066 D2), recorded lost at {at_ms}{} (ADR-066 D8)",
+            renumbered(*then, line)
+        ),
+        LostWhy::NotRecordable => "fails its check (ADR-066 D2) and is not recordable: a \
+             single-root store keeps no copy to restore it from and no copy ledger to record \
+             it (ADR-068 D5)"
+            .to_owned(),
+        LostWhy::MemberDamaged => "is no JSON object between two intact lines of its run, \
+             damage no crash leaves (ADR-068 D6)"
+            .to_owned(),
+    }
+}
+
+/// A run a lost line excludes (ADR-068 D4, D6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExcludedRun {
+    /// The run.
+    pub run_id: String,
+    /// The first lost line that excludes it.
+    pub by: LostRef,
+    /// Its `run_start`'s `at_ms`, symbol and source, when that line was
+    /// read.
+    pub start: Option<(i64, String, String)>,
+    /// The `at_ms` of the first line naming the run.
+    pub first_at_ms: Option<i64>,
+}
+
+impl ExcludedRun {
+    /// Where its exclusion comes from, for a report line.
+    pub fn cause(&self) -> String {
+        format!(
+            "excluded: journal line {} at byte {} (ADR-068 D4)",
+            self.by.line, self.by.offset
+        )
+    }
+}
+
+/// What [`read_runs`] read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunsRead {
+    /// The runs of the source, in journal order, the excluded ones left
+    /// out.
+    pub runs: Vec<JournaledRun>,
+    /// The excluded runs not known to be another source's, in the order
+    /// their lost lines are met.
+    pub excluded: Vec<ExcludedRun>,
+    /// Every line read without its bytes, in journal order.
+    pub lost: Vec<LostNote>,
+}
+
+impl RunsRead {
+    /// One `journal: <note>` line per lost line, in journal order (ADR-068
+    /// D7). Empty for a journal without a failed or member-damaged line.
+    pub fn notes(&self) -> Vec<String> {
+        self.lost
+            .iter()
+            .map(|note| format!("journal: {}", note.text()))
+            .collect()
+    }
+
+    /// The excluded run `run_id`, if any.
+    pub fn excluded_run(&self, run_id: &str) -> Option<&ExcludedRun> {
+        self.excluded.iter().find(|run| run.run_id == run_id)
+    }
+}
+
+/// The records of `paths`' journal (ADR-068 D3, D5): none to read in a
+/// single-root store, otherwise hot's copy ledger, read once.
+pub fn lost_line_records_of(paths: &Paths) -> LostLineRecords {
+    if paths.cold_roots.is_empty() {
+        return LostLineRecords::SingleRoot;
+    }
+    tiered_records(&paths.raw_root, &paths.journal)
+}
+
+/// The records of `journal` in the copy ledger of the tiered store whose
+/// hot is `hot`.
+fn tiered_records(hot: &Path, journal: &Path) -> LostLineRecords {
+    if journal.file_name().and_then(|n| n.to_str()).is_none() {
+        return LostLineRecords::Unavailable(
+            "the journal's file name is not UTF-8, so no lost-line record can name it".to_owned(),
+        );
+    }
+    match lost_line_records(hot, journal) {
+        Ok(records) => LostLineRecords::Read(records),
+        Err(why) => LostLineRecords::Unavailable(format!(
+            "hot's copy ledger {} gives none ({why})",
+            copy_ledger::ledger_path(hot).display()
+        )),
+    }
+}
+
+/// The `lost-line` records of the journal `journal` (by its file name) in
+/// hot's copy ledger (ADR-066 D8), in ledger order, as `mie store repair`
+/// reads them for R7. A name that is not UTF-8 has none.
+///
+/// # Errors
+///
+/// Why the ledger gives none: it is absent, cannot be read or folded.
+pub fn lost_line_records(hot: &Path, journal: &Path) -> Result<Vec<LostLine>, String> {
+    let Some(name) = journal.file_name().and_then(|name| name.to_str()) else {
+        return Ok(Vec::new());
+    };
+    match copy_ledger::read(hot) {
+        Ok(Some(ledger)) => CopyState::fold(&ledger)
+            .map(|state| state.lost_lines(name).to_vec())
+            .map_err(|error| error.to_string()),
+        Ok(None) => Err("it does not exist".to_owned()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// A lost-line record's line number beside the line's number now, when
+/// they differ: an earlier `\n` flip shifts the numbers, not the bytes
+/// (ADR-066 D8).
+pub fn renumbered(recorded: u64, now: u64) -> String {
+    if recorded == now {
+        String::new()
+    } else {
+        format!(" (recorded as line {recorded})")
+    }
+}
+
+/// The `type` of a parsed line, when it is an object with a string `type`.
+fn kind_of(value: Option<&Value>) -> Option<&str> {
+    value?.as_object()?.get("type")?.as_str()
+}
+
+/// Whether a line parsed as `value` is a candidate of the gate for a reader
+/// consuming `consumed` (ADR-068 D1): no object, no string `type`, a
+/// consumed kind, or a kind the writer does not write.
+fn gate_candidate(value: Option<&Value>, consumed: &[&str]) -> bool {
+    match kind_of(value) {
+        None => true,
+        Some(kind) => consumed.contains(&kind) || !KNOWN_KINDS.contains(&kind),
+    }
+}
+
+/// The `run_id` of a line's bytes, when they parse as an object with a
+/// string one.
+fn run_id_of(body: &[u8]) -> Option<String> {
+    let value: Value = serde_json::from_slice(body).ok()?;
+    value.get("run_id")?.as_str().map(str::to_owned)
+}
+
+/// The stop of a gated line no record matches (ADR-068 D2, D3).
+fn gate_stop(journal: &Path, line: u64, offset: u64, unavailable: Option<&str>) -> String {
+    let why = match unavailable {
+        None => "and is not recorded lost, so the journal is not read (ADR-068 D2)".to_owned(),
+        Some(why) => format!(
+            "and no lost-line record is used, the stricter outcome, since {why}; so the journal \
+             is not read (ADR-068 D3)"
+        ),
+    };
+    format!(
+        "journal {} line {line} at byte {offset} fails its check (ADR-066 D2) {why}: \
+         {FAILED_LINE_REMEDY}; `mie store verify` names which applies",
+        journal.display()
+    )
+}
+
+/// The records of a read, fetched at most once (ADR-068 D3).
+struct Records<'a> {
+    fetch: &'a mut dyn FnMut() -> LostLineRecords,
+    fetched: Option<LostLineRecords>,
+}
+
+impl Records<'_> {
+    /// Why a gated line at `offset` with `body` is lost, or the read's stop.
+    fn judge(
+        &mut self,
+        journal: &Path,
+        line: u64,
+        offset: u64,
+        body: &[u8],
+    ) -> Result<LostWhy, String> {
+        let records = self.fetched.get_or_insert_with(|| (self.fetch)());
+        match records {
+            LostLineRecords::SingleRoot => Ok(LostWhy::NotRecordable),
+            LostLineRecords::Unavailable(why) => Err(gate_stop(journal, line, offset, Some(why))),
+            LostLineRecords::Read(records) => {
+                let sha = copy_ledger::line_sha256(body);
+                records
+                    .iter()
+                    .find(|record| record.matches(offset, &sha))
+                    .map(|record| LostWhy::Recorded {
+                        at_ms: record.at_ms,
+                        line: record.line,
+                    })
+                    .ok_or_else(|| gate_stop(journal, line, offset, None))
+            }
+        }
+    }
+}
+
+/// The span `[start, end)` of the line of `bytes` that starts at `start`,
+/// `end` at its `\n` or at the end of `bytes`.
+fn span_from(bytes: &[u8], start: usize) -> (usize, usize) {
+    let end = bytes[start..]
+        .iter()
+        .position(|b| *b == b'\n')
+        .map_or(bytes.len(), |i| start + i);
+    (start, end)
+}
+
+/// The line before the one that starts at `start`, if any.
+fn span_before(bytes: &[u8], start: usize) -> Option<(usize, usize)> {
+    let end = start.checked_sub(1)?;
+    let begin = bytes[..end]
+        .iter()
+        .rposition(|b| *b == b'\n')
+        .map_or(0, |i| i + 1);
+    Some((begin, end))
+}
+
+/// The line after the one that ends at `end`, if any: none past the last
+/// `\n`, whose empty piece is no line.
+fn span_after(bytes: &[u8], end: usize) -> Option<(usize, usize)> {
+    (end + 1 < bytes.len()).then(|| span_from(bytes, end + 1))
+}
+
+/// The run id of the nearest neighbour of the line `span` on one side
+/// (ADR-068 D4): a line that parses with a string `run_id`, does not fail
+/// its check (complete lines only; the unterminated tail is not classified)
+/// and is not lost (`lost` holds the lost lines' first bytes).
+fn neighbour(
+    bytes: &[u8],
+    span: (usize, usize),
+    forward: bool,
+    lost: &BTreeSet<usize>,
+) -> Option<String> {
+    let mut at = span;
+    loop {
+        at = if forward {
+            span_after(bytes, at.1)?
+        } else {
+            span_before(bytes, at.0)?
+        };
+        if lost.contains(&at.0) {
+            continue;
+        }
+        let body = &bytes[at.0..at.1];
+        let complete = at.1 < bytes.len();
+        if let Some(run_id) = run_id_of(body)
+            && (!complete || check_line(body) != LineCheck::Failed)
+        {
+            return Some(run_id);
+        }
+    }
+}
+
+/// Whether the complete line `span` is Intact, and its run id when it
+/// parses with one (ADR-068 D6).
+fn intact_run(bytes: &[u8], span: (usize, usize)) -> Option<String> {
+    let body = &bytes[span.0..span.1];
+    if span.1 >= bytes.len() || check_line(body) != LineCheck::Intact {
+        return None;
+    }
+    run_id_of(body)
+}
+
+/// The run of a D6 line `span`: both immediate neighbours Intact lines of
+/// that run.
+fn member_damaged_run(bytes: &[u8], span: (usize, usize)) -> Option<String> {
+    let before = intact_run(bytes, span_before(bytes, span.0)?)?;
+    let after = intact_run(bytes, span_after(bytes, span.1)?)?;
+    (before == after).then_some(before)
+}
+
+/// A lost line as the gate pass found it.
+struct Lost {
+    span: (usize, usize),
+    lost: LostRef,
+    run_id: Option<String>,
+}
+
+/// The core of [`read_runs`] over the journal's `bytes`; `journal` names it
+/// in errors, `records` fetches the lost-line records, called at most once
+/// and only when a gated line exists (ADR-068 D3).
+///
+/// One pass parses every line once: it gates, and reads the structure as
+/// long as no line is lost. A lost line can exclude a run whose lines came
+/// before it, so the structure is then read again with the exclusions:
+/// only a journal holding a lost line is parsed twice.
+///
+/// # Errors
+///
+/// The gate's stop, or a structural error naming the line.
+pub fn runs_from_bytes(
+    bytes: &[u8],
+    journal: &Path,
+    source: &str,
+    records: &mut dyn FnMut() -> LostLineRecords,
+) -> Result<RunsRead, String> {
+    let mut records = Records {
+        fetch: records,
+        fetched: None,
+    };
+    let mut lost: Vec<Lost> = Vec::new();
+    let mut structure = Structure::default();
+    let mut deferred: Option<String> = None;
+    // The previous line when it is a D6 candidate.
+    let mut candidate: Option<(usize, usize, u64)> = None;
+    let mut start = 0;
     // `serde_json` rejects invalid UTF-8 and takes a `\r` before the `\n`
     // as whitespace, so this splits as `str::lines` did.
-    for (index, line) in bytes.split(|b| *b == b'\n').enumerate() {
-        let at = |detail: String| format!("journal line {}: {detail}", index + 1);
-        let Ok(value) = serde_json::from_slice::<Value>(line) else {
-            continue;
+    for (index, body) in bytes.split(|b| *b == b'\n').enumerate() {
+        let span = (start, start + body.len());
+        start = span.1 + 1;
+        let number = index as u64 + 1;
+        let complete = span.1 < bytes.len();
+        if let Some((s, e, line)) = candidate.take()
+            && let Some(run_id) = member_damaged_run(bytes, (s, e))
+        {
+            lost.push(Lost {
+                span: (s, e),
+                lost: LostRef {
+                    line,
+                    offset: s as u64,
+                    kind: None,
+                    why: LostWhy::MemberDamaged,
+                },
+                run_id: Some(run_id),
+            });
+        }
+        let value = serde_json::from_slice::<Value>(body).ok();
+        let mut skip = false;
+        if complete && gate_candidate(value.as_ref(), &GATED_KINDS) {
+            match check_line(body) {
+                LineCheck::Failed => {
+                    let why = records.judge(journal, number, span.0 as u64, body)?;
+                    lost.push(Lost {
+                        span,
+                        lost: LostRef {
+                            line: number,
+                            offset: span.0 as u64,
+                            kind: kind_of(value.as_ref()).map(str::to_owned),
+                            why,
+                        },
+                        run_id: value
+                            .as_ref()
+                            .and_then(|v| v.get("run_id"))
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                    });
+                    skip = true;
+                }
+                LineCheck::Unchecked if value.as_ref().is_none_or(|v| !v.is_object()) => {
+                    candidate = Some((span.0, span.1, number));
+                }
+                _ => {}
+            }
+        }
+        if !skip
+            && lost.is_empty()
+            && deferred.is_none()
+            && let Some(value) = &value
+            && let Err(error) = structure.line(number, value, None)
+        {
+            deferred = Some(error);
+        }
+    }
+    let mut excluded: Vec<ExcludedRun> = Vec::new();
+    let mut notes = Vec::new();
+    let mut marks: Vec<(String, LostRef)> = Vec::new();
+    let lost_at: BTreeSet<usize> = lost.iter().map(|l| l.span.0).collect();
+    lost.sort_by_key(|l| l.span.0);
+    for line in &lost {
+        let effect = if line.lost.why == LostWhy::MemberDamaged {
+            LostEffect::Excluded(line.run_id.clone().unwrap_or_default())
+        } else {
+            let before = neighbour(bytes, line.span, false, &lost_at);
+            let after = neighbour(bytes, line.span, true, &lost_at);
+            let sides: Vec<String> = before.into_iter().chain(after).collect();
+            let kind = line.lost.kind.as_deref();
+            let trusted = kind.is_some_and(|kind| GATED_KINDS.contains(&kind))
+                && line
+                    .run_id
+                    .as_ref()
+                    .is_some_and(|run| !sides.is_empty() && sides.iter().all(|side| side == run));
+            match (trusted, kind, &line.run_id) {
+                (true, Some("run_end" | "state_checkpoint" | "chain_restart"), Some(run)) => {
+                    LostEffect::Marked(run.clone())
+                }
+                (true, _, Some(run)) => LostEffect::Excluded(run.clone()),
+                _ => {
+                    let mut runs = sides;
+                    runs.dedup();
+                    LostEffect::Neighbours(runs)
+                }
+            }
         };
+        let excludes: Vec<&String> = match &effect {
+            LostEffect::Marked(run) => {
+                marks.push((run.clone(), line.lost.clone()));
+                Vec::new()
+            }
+            LostEffect::Excluded(run) => vec![run],
+            LostEffect::Neighbours(runs) => runs.iter().collect(),
+        };
+        for run in excludes {
+            if !excluded.iter().any(|e| e.run_id == *run) {
+                excluded.push(ExcludedRun {
+                    run_id: run.clone(),
+                    by: line.lost.clone(),
+                    start: None,
+                    first_at_ms: None,
+                });
+            }
+        }
+        notes.push(LostNote {
+            lost: line.lost.clone(),
+            effect,
+        });
+    }
+    let mut runs = if lost.is_empty() {
+        if let Some(error) = deferred {
+            return Err(error);
+        }
+        structure.runs
+    } else {
+        // The second pass, with the exclusions.
+        let mut structure = Structure::default();
+        let mut start = 0;
+        for (index, body) in bytes.split(|b| *b == b'\n').enumerate() {
+            let at = start;
+            start += body.len() + 1;
+            if lost_at.contains(&at) {
+                continue;
+            }
+            let Ok(value) = serde_json::from_slice::<Value>(body) else {
+                continue;
+            };
+            structure.line(index as u64 + 1, &value, Some(&mut excluded))?;
+        }
+        structure.runs
+    };
+    for (run_id, lost) in marks {
+        if let Some(run) = runs.iter_mut().find(|r| r.parameters.run_id == run_id) {
+            run.lost.push(lost);
+        }
+    }
+    runs.retain(|run| run.source == source);
+    excluded.retain(|run| run.start.as_ref().is_none_or(|(_, _, s)| s == source));
+    Ok(RunsRead {
+        runs,
+        excluded,
+        lost: notes,
+    })
+}
+
+/// The structural read of [`read_runs`], line by line.
+#[derive(Default)]
+struct Structure {
+    runs: Vec<JournaledRun>,
+}
+
+impl Structure {
+    /// Reads one parsed line, number `number`. With `excluded`, a line
+    /// naming an excluded run is skipped, after it fills in the run's
+    /// `start` and `first_at_ms`.
+    fn line(
+        &mut self,
+        number: u64,
+        value: &Value,
+        excluded: Option<&mut Vec<ExcludedRun>>,
+    ) -> Result<(), String> {
+        let at = |detail: String| format!("journal line {number}: {detail}");
+        if let Some(excluded) = excluded
+            && let Some(run_id) = value["run_id"].as_str()
+            && let Some(run) = excluded.iter_mut().find(|r| r.run_id == run_id)
+        {
+            if run.first_at_ms.is_none() {
+                run.first_at_ms = value["at_ms"].as_i64();
+            }
+            if value["type"] == "run_start"
+                && run.start.is_none()
+                && let (Some(at_ms), Some(symbol), Some(source)) = (
+                    value["at_ms"].as_i64(),
+                    value["symbol"].as_str(),
+                    value["source"].as_str(),
+                )
+            {
+                run.start = Some((at_ms, symbol.to_owned(), source.to_owned()));
+            }
+            return Ok(());
+        }
+        let runs = &mut self.runs;
         match value["type"].as_str() {
             Some("run_start") => {
-                let parameters = RunParameters::from_run_start(&value).map_err(at)?;
+                let parameters = RunParameters::from_run_start(value).map_err(at)?;
                 if runs
                     .iter()
                     .any(|r| r.parameters.run_id == parameters.run_id)
@@ -702,8 +1478,8 @@ pub fn read_runs(path: &Path, source: &str) -> Result<Vec<JournaledRun>, String>
                 let started_at_ms = value["at_ms"]
                     .as_i64()
                     .ok_or_else(|| at("run_start without at_ms".to_owned()))?;
-                let checkpointing = Checkpointing::from_run_start(&value).map_err(at)?;
-                let history = RunHistory::from_run_start(&value).map_err(at)?;
+                let checkpointing = Checkpointing::from_run_start(value).map_err(at)?;
+                let history = RunHistory::from_run_start(value).map_err(at)?;
                 runs.push(JournaledRun {
                     parameters,
                     source: run_source.to_owned(),
@@ -716,6 +1492,7 @@ pub fn read_runs(path: &Path, source: &str) -> Result<Vec<JournaledRun>, String>
                     warm_start: None,
                     ready_after_ms: None,
                     chain_restarts: Vec::new(),
+                    lost: Vec::new(),
                 });
             }
             Some(kind @ ("state_checkpoint" | "warm_start" | "warm_ready" | "chain_restart")) => {
@@ -727,10 +1504,10 @@ pub fn read_runs(path: &Path, source: &str) -> Result<Vec<JournaledRun>, String>
                 match kind {
                     "state_checkpoint" => {
                         run.checkpoints
-                            .push(state_checkpoint_from_json(&value).map_err(at)?);
+                            .push(state_checkpoint_from_json(value).map_err(at)?);
                     }
                     "warm_start" => {
-                        let start = warm_start_from_json(&value).map_err(at)?;
+                        let start = warm_start_from_json(value).map_err(at)?;
                         if run.warm_start.is_some() {
                             return Err(at(format!("run {run_id} has a second warm_start")));
                         }
@@ -780,9 +1557,8 @@ pub fn read_runs(path: &Path, source: &str) -> Result<Vec<JournaledRun>, String>
             }
             _ => {}
         }
+        Ok(())
     }
-    runs.retain(|run| run.source == source);
-    Ok(runs)
 }
 
 /// The name of the line check's member, always a line's last (ADR-066 D1).
@@ -978,6 +1754,10 @@ impl Journal {
     /// ends it with its check ([`with_check`], ADR-066 D1). A field named
     /// [`CHECK_FIELD`] is dropped at every depth: the name is the check's.
     pub fn write(&mut self, at_utc_ns: i64, kind: &str, fields: Value) {
+        debug_assert!(
+            KNOWN_KINDS.contains(&kind),
+            "{kind} is not in KNOWN_KINDS (ADR-068 D1)"
+        );
         let mut line = Map::new();
         line.insert("type".to_owned(), json!(kind));
         line.insert("run_id".to_owned(), json!(self.run_id));
@@ -1442,9 +2222,25 @@ mod tests {
             std::process::id()
         ));
         std::fs::write(&path, lines.join("\n")).unwrap();
-        let runs = read_runs(&path, "binance-um");
+        let runs = runs_at(&path);
         std::fs::remove_file(&path).unwrap();
         runs
+    }
+
+    /// A single-root store's paths around `journal`: [`read_runs`] reads no
+    /// copy ledger there (ADR-068 D5).
+    fn single_root(journal: &Path) -> Paths {
+        Paths {
+            raw_root: std::path::PathBuf::new(),
+            journal: journal.to_owned(),
+            cold_roots: Vec::new(),
+        }
+    }
+
+    /// The runs [`read_runs`] reads from the journal at `path` of a
+    /// single-root store.
+    fn runs_at(path: &Path) -> Result<Vec<JournaledRun>, String> {
+        read_runs(&single_root(path), "binance-um").map(|read| read.runs)
     }
 
     #[test]
@@ -1802,7 +2598,7 @@ mod tests {
         let dir = Scratch::new();
         let path = dir.journal();
         std::fs::write(&path, bytes).unwrap();
-        read_runs(&path, "binance-um")
+        runs_at(&path)
     }
 
     /// A directory of one test's journal (and its lock), named like
@@ -1872,7 +2668,7 @@ mod tests {
         );
         std::fs::write(&path, &original).unwrap();
         append_run(&path, "B", 3_000);
-        let runs = read_runs(&path, "binance-um").unwrap();
+        let runs = runs_at(&path).unwrap();
         assert_eq!(ids(&runs), ["A", "B"]);
         assert_terminated_once(&std::fs::read(&path).unwrap(), original.as_bytes());
         // The crash stays visible: A has no run_end.
@@ -1896,7 +2692,7 @@ mod tests {
         original.extend_from_slice(&[0xE2, 0x82]);
         std::fs::write(&path, &original).unwrap();
         append_run(&path, "B", 3_000);
-        let runs = read_runs(&path, "binance-um").unwrap();
+        let runs = runs_at(&path).unwrap();
         assert_eq!(ids(&runs), ["A", "C", "B"]);
         assert_terminated_once(&std::fs::read(&path).unwrap(), &original);
         assert_eq!(runs[0].live_run().clean_records, Some(42));
@@ -1994,7 +2790,7 @@ mod tests {
         let original = br#"{"type":"run_st"#;
         std::fs::write(&path, original).unwrap();
         append_run(&path, "B", 3_000);
-        assert_eq!(ids(&read_runs(&path, "binance-um").unwrap()), ["B"]);
+        assert_eq!(ids(&runs_at(&path).unwrap()), ["B"]);
         assert_terminated_once(&std::fs::read(&path).unwrap(), original);
     }
 
@@ -2009,7 +2805,7 @@ mod tests {
         );
         std::fs::write(&path, &original).unwrap();
         append_run(&path, "B", 3_000);
-        let runs = read_runs(&path, "binance-um").unwrap();
+        let runs = runs_at(&path).unwrap();
         assert_eq!(ids(&runs), ["A", "B"]);
         assert_terminated_once(&std::fs::read(&path).unwrap(), original.as_bytes());
         let a = runs[0].live_run();
@@ -2068,7 +2864,7 @@ mod tests {
         let mut expected = original.clone();
         expected.push(b'\n');
         assert_eq!(std::fs::read(&path).unwrap(), expected);
-        assert_eq!(ids(&read_runs(&path, "binance-um").unwrap()), ["A"]);
+        assert_eq!(ids(&runs_at(&path).unwrap()), ["A"]);
     }
 
     // -----------------------------------------------------------------
@@ -2188,7 +2984,7 @@ mod tests {
                 CHECK_PREFIX
             );
         }
-        let runs = read_runs(&path, "binance-um").unwrap();
+        let runs = runs_at(&path).unwrap();
         assert_eq!(ids(&runs), ["A"]);
         assert_eq!(runs[0].live_run().clean_records, Some(42));
     }
@@ -2509,11 +3305,1020 @@ mod tests {
             .collect();
         use LineCheck::{Intact, Unchecked};
         assert_eq!(verdicts, [Unchecked, Unchecked, Intact, Intact, Intact]);
-        let with_checks = read_runs(&path, "binance-um").unwrap();
+        let with_checks = runs_at(&path).unwrap();
         assert_eq!(ids(&with_checks), ["A", "B"]);
         let plain = read_bytes(&stripped(&mixed)).unwrap();
         assert!(!stripped(&mixed).windows(6).any(|w| w == b"crc32c"));
         assert_eq!(with_checks, plain);
         assert_eq!(with_checks[1].live_run().clean_records, Some(7));
+    }
+
+    // -----------------------------------------------------------------
+    // The gate (ADR-068).
+
+    /// The lines of one run as `mie ingest` writes them, the ones
+    /// [`read_runs`] ignores at both ends: `recovery`, `run_start`,
+    /// `warm_start`, `warm_ready`, `stats`, `state_checkpoint`,
+    /// `chain_restart`, `run_end`, `replication`.
+    fn run_lines(run_id: &str, at_ms: i64) -> Vec<String> {
+        let mut start: Value = serde_json::from_str(&start(run_id, at_ms, "binance-um")).unwrap();
+        start["state_checkpoint_interval_ms"] = json!(60_000);
+        start["state_hash_encoding"] = json!(1);
+        start["event_hash_encoding"] = json!(1);
+        start["feature_set"] = json!("00000000000000ff");
+        vec![
+            line(
+                "recovery",
+                run_id,
+                json!({"rolled_forward": [], "discarded": []}),
+            ),
+            start.to_string(),
+            line(
+                "warm_start",
+                run_id,
+                warm_start_json(&WarmStart::Warm(handoff())),
+            ),
+            line("warm_ready", run_id, warm_ready_json(25)),
+            line("stats", run_id, json!({"records": 3, "note": "é"})),
+            checkpoint_line(run_id, &checkpoint(3, true)),
+            line(
+                "chain_restart",
+                run_id,
+                chain_restart_json(EventTime::from_millis(at_ms + 7)),
+            ),
+            end(run_id, at_ms + 900, 0, 3),
+            line(
+                "replication",
+                run_id,
+                json!({"passed": true, "problems": 0}),
+            ),
+        ]
+    }
+
+    /// Runs A and B, nine lines each (A: lines 1–9, B: 10–18).
+    fn two_runs() -> Vec<String> {
+        let mut lines = run_lines("A", 1_000);
+        lines.extend(run_lines("B", 5_000));
+        lines
+    }
+
+    /// `lines` with their checks, each ended by `\n`, as the writer leaves
+    /// them.
+    fn checked(lines: &[String]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for line in lines {
+            bytes.extend_from_slice(&with_check(line.as_bytes()));
+            bytes.push(b'\n');
+        }
+        bytes
+    }
+
+    /// The span `[start, end)` of every line of `bytes` (the empty piece
+    /// after a last `\n` left out).
+    fn spans(bytes: &[u8]) -> Vec<(usize, usize)> {
+        let mut spans = Vec::new();
+        let mut start = 0;
+        for body in bytes.split(|b| *b == b'\n') {
+            if start < bytes.len() {
+                spans.push((start, start + body.len()));
+            }
+            start += body.len() + 1;
+        }
+        spans
+    }
+
+    /// `bytes` with the last digit of line `index`'s (0-based) `at_ms`
+    /// value flipped to another digit (the first could make a leading
+    /// zero, which is no JSON): the line still parses, as its kind, and
+    /// fails its check.
+    fn flip_digit(bytes: &[u8], index: usize) -> Vec<u8> {
+        let (start, end) = spans(bytes)[index];
+        let value = bytes[start..end]
+            .windows(8)
+            .position(|w| w == b"\"at_ms\":")
+            .expect("an at_ms")
+            + start
+            + 8;
+        let at = value
+            + bytes[value..]
+                .iter()
+                .take_while(|b| b.is_ascii_digit())
+                .count()
+            - 1;
+        let mut damaged = bytes.to_vec();
+        damaged[at] ^= 0x01;
+        assert!(damaged[at].is_ascii_digit());
+        damaged
+    }
+
+    /// `bytes` with line `index`'s `{` turned into `[` (one bit): no JSON.
+    fn break_json(bytes: &[u8], index: usize) -> Vec<u8> {
+        let (start, _) = spans(bytes)[index];
+        let mut damaged = bytes.to_vec();
+        assert_eq!(damaged[start], b'{');
+        damaged[start] ^= 0x20;
+        damaged
+    }
+
+    /// The record of line `index` of `bytes` as it is now.
+    fn record_of(bytes: &[u8], index: usize, at_ms: i64) -> LostLine {
+        let (start, end) = spans(bytes)[index];
+        LostLine {
+            at_ms,
+            line: index as u64 + 1,
+            offset: start as u64,
+            sha256: copy_ledger::line_sha256(&bytes[start..end]),
+        }
+    }
+
+    /// Reads `bytes` with `records`; the result and how often the records
+    /// were fetched.
+    fn gated(bytes: &[u8], records: LostLineRecords) -> (Result<RunsRead, String>, usize) {
+        let mut calls = 0;
+        let read = runs_from_bytes(bytes, Path::new("j.jsonl"), "binance-um", &mut || {
+            calls += 1;
+            records.clone()
+        });
+        (read, calls)
+    }
+
+    fn none() -> LostLineRecords {
+        LostLineRecords::Read(Vec::new())
+    }
+
+    /// The fixture's verdicts hold: every line of `bytes` Intact except
+    /// `damaged`, which is `verdict` (no test can pass vacuously).
+    fn assert_verdicts(bytes: &[u8], damaged: &[usize], verdict: LineCheck) {
+        for (index, (start, end)) in spans(bytes).into_iter().enumerate() {
+            let expected = if damaged.contains(&index) {
+                verdict
+            } else {
+                LineCheck::Intact
+            };
+            assert_eq!(check_line(&bytes[start..end]), expected, "line {index}");
+        }
+    }
+
+    /// The undamaged read of [`two_runs`].
+    fn undamaged() -> RunsRead {
+        let (read, calls) = gated(&checked(&two_runs()), none());
+        assert_eq!(calls, 0);
+        read.unwrap()
+    }
+
+    fn assert_stops_at(read: Result<RunsRead, String>, bytes: &[u8], index: usize) {
+        let error = read.unwrap_err();
+        let (start, _) = spans(bytes)[index];
+        assert!(
+            error.contains(&format!(
+                "line {} at byte {start} fails its check",
+                index + 1
+            )),
+            "{error}"
+        );
+        assert!(
+            error.contains("`mie store repair-hot --scope journal`"),
+            "{error}"
+        );
+        assert!(
+            error.contains("`mie store repair --record-lost-lines`"),
+            "{error}"
+        );
+        assert!(error.contains(FAILED_LINE_REMEDY), "{error}");
+    }
+
+    #[test]
+    fn gate_refuses_a_failed_structural_line_that_still_parses() {
+        let good = checked(&two_runs());
+        for (index, kind) in [
+            (1, "run_start"),
+            (2, "warm_start"),
+            (3, "warm_ready"),
+            (5, "state_checkpoint"),
+            (6, "chain_restart"),
+            (7, "run_end"),
+        ] {
+            let bytes = flip_digit(&good, index);
+            assert_verdicts(&bytes, &[index], LineCheck::Failed);
+            let (start, end) = spans(&bytes)[index];
+            let value: Value = serde_json::from_slice(&bytes[start..end]).unwrap();
+            assert_eq!(value["type"], kind);
+            let (read, calls) = gated(&bytes, none());
+            assert_stops_at(read, &bytes, index);
+            assert_eq!(calls, 1, "{kind}");
+        }
+    }
+
+    #[test]
+    fn gate_refuses_a_failed_line_that_no_longer_parses() {
+        // A `stats` line, a kind the reader ignores, that no longer parses:
+        // its kind may have been one it consumes.
+        let bytes = break_json(&checked(&two_runs()), 4);
+        assert_verdicts(&bytes, &[4], LineCheck::Failed);
+        let (read, _) = gated(&bytes, none());
+        assert_stops_at(read, &bytes, 4);
+    }
+
+    #[test]
+    fn gate_refuses_a_failed_line_that_is_not_utf8() {
+        let good = checked(&two_runs());
+        let (start, end) = spans(&good)[4];
+        let at = good[start..end]
+            .windows(2)
+            .position(|w| w == "é".as_bytes())
+            .unwrap()
+            + start;
+        let mut bytes = good.clone();
+        bytes[at + 1] ^= 0x40;
+        assert!(std::str::from_utf8(&bytes[start..end]).is_err());
+        assert_verdicts(&bytes, &[4], LineCheck::Failed);
+        let (read, _) = gated(&bytes, none());
+        assert_stops_at(read, &bytes, 4);
+    }
+
+    #[test]
+    fn failed_lines_of_ignored_kinds_read_as_today() {
+        for kind in KNOWN_KINDS.iter().filter(|k| !GATED_KINDS.contains(k)) {
+            let mut lines = two_runs();
+            lines.insert(4, line(kind, "A", json!({"n": 1})));
+            let good = checked(&lines);
+            let bytes = flip_digit(&good, 4);
+            assert_verdicts(&bytes, &[4], LineCheck::Failed);
+            let (read, calls) = gated(&bytes, none());
+            assert_eq!(read.unwrap(), undamaged(), "{kind}");
+            assert_eq!(calls, 0, "{kind}: no ledger read");
+        }
+    }
+
+    #[test]
+    fn a_failed_line_whose_kind_was_renamed_is_gated() {
+        let good = checked(&two_runs());
+        let (start, end) = spans(&good)[7];
+        let body = good[start..end].to_vec();
+        let text = String::from_utf8(body.clone()).unwrap();
+        for renamed in [
+            text.replace("\"run_end\"", "\"run_enx\""),
+            text.replace("\"run_end\"", "\"run_\u{0435}nd\""),
+            text.replace("\"run_end\"", "\"run\u{200B}_end\""),
+            text.replace("\"run_end\"", "\"run_end \""),
+            text.replace("\"run_end\"", "\"Stats\""),
+            text.replace("\"type\":\"run_end\",", ""),
+            text.replace("\"type\":\"run_end\"", "\"type\":5"),
+        ] {
+            assert_ne!(renamed, text);
+            let mut bytes = good[..start].to_vec();
+            bytes.extend_from_slice(renamed.as_bytes());
+            bytes.extend_from_slice(&good[end..]);
+            assert_verdicts(&bytes, &[7], LineCheck::Failed);
+            let (read, _) = gated(&bytes, none());
+            assert_stops_at(read, &bytes, 7);
+        }
+    }
+
+    #[test]
+    fn an_intact_line_of_an_unknown_kind_is_ignored() {
+        let mut lines = two_runs();
+        lines.insert(4, line("a_future_kind", "A", json!({"n": 1})));
+        let bytes = checked(&lines);
+        assert_verdicts(&bytes, &[], LineCheck::Intact);
+        let (read, calls) = gated(&bytes, none());
+        assert_eq!(read.unwrap(), undamaged());
+        assert_eq!(calls, 0);
+    }
+
+    #[test]
+    fn the_gated_kinds_are_the_arms_read_runs_matches() {
+        // A lone line of a kind the reader consumes is an error (no
+        // run_start, or no fields); of a kind it ignores, nothing.
+        let mut consumed: Vec<&str> = KNOWN_KINDS
+            .iter()
+            .copied()
+            .chain(["a_future_kind", "Stats"])
+            .filter(|kind| read(&[line(kind, "Z", json!({}))]).is_err())
+            .collect();
+        consumed.sort_unstable();
+        let mut gated = GATED_KINDS.to_vec();
+        gated.sort_unstable();
+        assert_eq!(consumed, gated);
+        for kind in GATED_KINDS {
+            assert!(KNOWN_KINDS.contains(&kind), "{kind}");
+        }
+        assert_eq!(HANDOFF_KINDS, ["warm_start"]);
+    }
+
+    #[test]
+    fn known_kinds_match_the_module_table() {
+        let source = include_str!("journal.rs");
+        let mut table: Vec<&str> = source
+            .lines()
+            .filter_map(|line| line.strip_prefix("//! | `"))
+            .filter_map(|row| row.split(" |").next())
+            .flat_map(|cell| cell.split(", "))
+            .map(|name| name.trim_matches('`'))
+            .filter(|name| *name != "type")
+            .collect();
+        table.sort_unstable();
+        let mut known = KNOWN_KINDS.to_vec();
+        known.sort_unstable();
+        assert_eq!(table, known);
+        known.dedup();
+        assert_eq!(known.len(), KNOWN_KINDS.len());
+    }
+
+    #[test]
+    #[should_panic(expected = "not in KNOWN_KINDS")]
+    #[cfg(debug_assertions)]
+    fn writing_an_unknown_kind_panics_in_debug() {
+        let dir = Scratch::new();
+        let mut journal = Journal::open(&dir.journal(), "A").unwrap();
+        journal.write(1, "a_future_kind", json!({}));
+    }
+
+    #[test]
+    fn an_unterminated_failed_last_line_is_not_classified() {
+        let good = checked(&two_runs());
+        let bytes = flip_digit(&good, 16);
+        assert_verdicts(&bytes, &[16], LineCheck::Failed);
+        // B's run_end is the last line, without its `\n`.
+        let (start, _) = spans(&bytes)[17];
+        let tail = &bytes[..start - 1];
+        let (read, calls) = gated(tail, none());
+        let read = read.unwrap();
+        assert_eq!(calls, 0);
+        assert_eq!(ids(&read.runs), ["A", "B"]);
+        assert!(read.runs[1].end.is_some(), "read as today: from its bytes");
+        assert!(read.lost.is_empty());
+        // With its `\n`, it is classified and gated.
+        let (read, _) = gated(&bytes[..start], none());
+        assert_stops_at(read, &bytes, 16);
+    }
+
+    #[test]
+    fn gate_bounds_at_max_checked_line() {
+        let body = |len: usize| {
+            let mut object = end("A", 1_900, 0, 3).into_bytes();
+            object.pop();
+            object.extend_from_slice(b",\"pad\":\"");
+            object.resize(len - 20 - 2, b'x');
+            object.extend_from_slice(b"\"}");
+            let body = with_check(&object);
+            assert_eq!(body.len(), len);
+            body
+        };
+        let mut lines = run_lines("A", 1_000);
+        lines.remove(7);
+        for (len, stops) in [(MAX_CHECKED_LINE, true), (MAX_CHECKED_LINE + 1, false)] {
+            let mut bytes = checked(&lines[..7]);
+            let start = bytes.len();
+            let mut long = body(len);
+            // A pad byte: the line still parses as a run_end.
+            long[len - 100] ^= 0x01;
+            bytes.extend_from_slice(&long);
+            bytes.push(b'\n');
+            bytes.extend_from_slice(&checked(&lines[7..]));
+            let verdict = check_line(&bytes[start..start + len]);
+            let (read, _) = gated(&bytes, none());
+            if stops {
+                assert_eq!(verdict, LineCheck::Failed);
+                assert_stops_at(read, &bytes, 7);
+            } else {
+                assert_eq!(verdict, LineCheck::Unchecked);
+                assert!(read.unwrap().runs[0].end.is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn no_failed_line_reads_no_ledger() {
+        let (read, calls) = gated(&checked(&two_runs()), none());
+        assert_eq!(calls, 0);
+        let read = read.unwrap();
+        assert!(read.lost.is_empty() && read.excluded.is_empty());
+        assert!(read.notes().is_empty());
+    }
+
+    #[test]
+    fn the_ledger_is_read_once() {
+        let good = checked(&two_runs());
+        let bytes = flip_digit(&flip_digit(&good, 5), 14);
+        assert_verdicts(&bytes, &[5, 14], LineCheck::Failed);
+        let records = vec![record_of(&bytes, 5, 10), record_of(&bytes, 14, 11)];
+        let (read, calls) = gated(&bytes, LostLineRecords::Read(records));
+        assert_eq!(read.unwrap().lost.len(), 2);
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn a_recorded_line_mid_run_reads_by_its_kind() {
+        let good = checked(&two_runs());
+        let whole = undamaged();
+        for (index, kind) in [
+            (1, "run_start"),
+            (2, "warm_start"),
+            (3, "warm_ready"),
+            (5, "state_checkpoint"),
+            (6, "chain_restart"),
+            (7, "run_end"),
+        ] {
+            let bytes = flip_digit(&good, index);
+            let record = record_of(&bytes, index, 77);
+            let (read, _) = gated(&bytes, LostLineRecords::Read(vec![record]));
+            let read = read.unwrap();
+            assert_eq!(read.lost.len(), 1, "{kind}");
+            let note = &read.notes()[0];
+            assert!(note.contains("recorded lost at 77"), "{note}");
+            assert!(
+                note.starts_with(&format!(
+                    "journal: line {} at byte {}",
+                    index + 1,
+                    spans(&bytes)[index].0
+                )),
+                "{note}"
+            );
+            let b = read.runs.iter().find(|r| r.parameters.run_id == "B");
+            assert_eq!(b, Some(&whole.runs[1]), "B is untouched");
+            match kind {
+                "run_start" | "warm_start" | "warm_ready" => {
+                    assert_eq!(ids(&read.runs), ["B"], "{kind}");
+                    assert_eq!(read.excluded.len(), 1);
+                    assert_eq!(read.excluded[0].run_id, "A");
+                    assert_eq!(read.lost[0].effect, LostEffect::Excluded("A".to_owned()));
+                    assert!(note.contains("so run A is excluded"), "{note}");
+                }
+                _ => {
+                    assert_eq!(ids(&read.runs), ["A", "B"], "{kind}");
+                    assert!(read.excluded.is_empty());
+                    let a = &read.runs[0];
+                    assert_eq!(a.lost.len(), 1);
+                    assert_eq!(a.lost[0].kind.as_deref(), Some(kind));
+                    let mut expected = whole.runs[0].clone();
+                    match kind {
+                        "state_checkpoint" => expected.checkpoints.clear(),
+                        "chain_restart" => expected.chain_restarts.clear(),
+                        _ => expected.end = None,
+                    }
+                    expected.lost = a.lost.clone();
+                    assert_eq!(*a, expected, "{kind}");
+                    assert!(note.contains("and is marked"), "{note}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_stale_record_gates_again() {
+        let good = checked(&two_runs());
+        let once = flip_digit(&good, 5);
+        let (start, end) = spans(&once)[5];
+        let mut twice = once.clone();
+        twice[start + 30] ^= 0x01;
+        assert_verdicts(&twice, &[5], LineCheck::Failed);
+        let intact = record_of(&good, 5, 1);
+        let mut elsewhere = record_of(&twice, 5, 1);
+        elsewhere.offset = spans(&twice)[6].0 as u64;
+        let mut inside = record_of(&twice, 5, 1);
+        inside.offset += 1;
+        for stale in [record_of(&once, 5, 1), intact, elsewhere, inside] {
+            let (read, _) = gated(&twice, LostLineRecords::Read(vec![stale]));
+            assert_stops_at(read, &twice, 5);
+        }
+        assert_ne!(&twice[start..end], &once[start..end]);
+        let (read, _) = gated(&twice, LostLineRecords::Read(vec![record_of(&twice, 5, 1)]));
+        assert!(read.is_ok());
+    }
+
+    #[test]
+    fn two_records_of_one_line_name_the_first() {
+        let bytes = flip_digit(&checked(&two_runs()), 5);
+        for (first, second) in [(7, 5), (5, 7), (6, 6)] {
+            let mut a = record_of(&bytes, 5, first);
+            let mut b = record_of(&bytes, 5, second);
+            a.line = 40;
+            b.line = 41;
+            let (read, _) = gated(&bytes, LostLineRecords::Read(vec![a, b]));
+            let note = &read.unwrap().notes()[0];
+            assert!(
+                note.contains(&format!("recorded lost at {first} (recorded as line 40)")),
+                "{note}"
+            );
+        }
+    }
+
+    #[test]
+    fn records_unavailable_gate_and_say_why() {
+        let bytes = flip_digit(&checked(&two_runs()), 5);
+        let (read, _) = gated(
+            &bytes,
+            LostLineRecords::Unavailable("the ledger is gone".to_owned()),
+        );
+        let error = read.unwrap_err();
+        assert!(error.contains("the ledger is gone"), "{error}");
+        assert!(error.contains("the stricter outcome"), "{error}");
+        assert_stops_at(Err(error), &bytes, 5);
+        // From a tiered store's paths: an absent ledger, a name that is not
+        // UTF-8.
+        let dir = Scratch::new();
+        let tiered = |journal: std::path::PathBuf| Paths {
+            raw_root: dir.0.join("hot"),
+            journal,
+            cold_roots: vec![crate::config::ColdRoot {
+                path: dir.0.join("cold"),
+                copy_target: true,
+            }],
+        };
+        let absent = lost_line_records_of(&tiered(dir.journal()));
+        let LostLineRecords::Unavailable(why) = absent else {
+            panic!("{absent:?}");
+        };
+        assert!(why.contains("does not exist"), "{why}");
+        use std::os::unix::ffi::OsStrExt;
+        let odd = dir.0.join(std::ffi::OsStr::from_bytes(b"j\xFF.jsonl"));
+        let odd = lost_line_records_of(&tiered(odd));
+        let LostLineRecords::Unavailable(why) = odd else {
+            panic!("{odd:?}");
+        };
+        assert!(why.contains("not UTF-8"), "{why}");
+        assert_eq!(
+            lost_line_records_of(&single_root(&dir.journal())),
+            LostLineRecords::SingleRoot
+        );
+        std::fs::write(dir.journal(), &bytes).unwrap();
+        let error = read_runs(&tiered(dir.journal()), "binance-um").unwrap_err();
+        assert!(error.contains("does not exist"), "{error}");
+        assert!(error.contains("the stricter outcome"), "{error}");
+    }
+
+    /// The effect of the one recorded line `index` of `bytes`.
+    fn recorded(bytes: &[u8], index: usize) -> RunsRead {
+        let (read, _) = gated(
+            bytes,
+            LostLineRecords::Read(vec![record_of(bytes, index, 9)]),
+        );
+        read.unwrap()
+    }
+
+    fn neighbours(runs: &[&str]) -> LostEffect {
+        LostEffect::Neighbours(runs.iter().map(|r| (*r).to_owned()).collect())
+    }
+
+    #[test]
+    fn an_untrusted_recorded_line_excludes_its_neighbours_runs() {
+        let good = checked(&two_runs());
+        // A's replication, between A's run_end and B's recovery.
+        let read = recorded(&break_json(&good, 8), 8);
+        assert_eq!(read.lost[0].effect, neighbours(&["A", "B"]));
+        assert!(read.runs.is_empty());
+        let excluded: Vec<&str> = read.excluded.iter().map(|r| r.run_id.as_str()).collect();
+        assert_eq!(excluded, ["A", "B"]);
+        assert_eq!(read.excluded[1].start.as_ref().unwrap().0, 5_000);
+        assert!(read.notes()[0].contains("so run(s) A, B beside it are excluded"));
+        // A's stats, between two A lines.
+        let read = recorded(&break_json(&good, 4), 4);
+        assert_eq!(read.lost[0].effect, neighbours(&["A"]));
+        assert_eq!(ids(&read.runs), ["B"]);
+        // At the head, and at the tail.
+        let read = recorded(&break_json(&good, 0), 0);
+        assert_eq!(read.lost[0].effect, neighbours(&["A"]));
+        let read = recorded(&break_json(&good, 17), 17);
+        assert_eq!(read.lost[0].effect, neighbours(&["B"]));
+        assert_eq!(ids(&read.runs), ["A"]);
+        // The only line in the journal.
+        let alone = break_json(&checked(&[end("A", 2, 0, 1)]), 0);
+        let read = recorded(&alone, 0);
+        assert_eq!(read.lost[0].effect, neighbours(&[]));
+        assert!(read.runs.is_empty() && read.excluded.is_empty());
+        assert!(
+            read.notes()[0].contains("no run is excluded"),
+            "{:?}",
+            read.notes()
+        );
+        // A trusted kind with no neighbour is untrusted too.
+        let alone = flip_digit(&checked(&[end("A", 2, 0, 1)]), 0);
+        assert_eq!(recorded(&alone, 0).lost[0].effect, neighbours(&[]));
+    }
+
+    /// `bytes` with line `index`'s `"run_id":"A"` replaced by
+    /// `"run_id":"<run>"` after its check was computed: Failed, parses.
+    fn claim(bytes: &[u8], index: usize, run: &str) -> Vec<u8> {
+        let (start, end) = spans(bytes)[index];
+        let text = std::str::from_utf8(&bytes[start..end]).unwrap();
+        let claimed = text.replacen("\"run_id\":\"A\"", &format!("\"run_id\":\"{run}\""), 1);
+        assert_ne!(claimed, text);
+        let mut out = bytes[..start].to_vec();
+        out.extend_from_slice(claimed.as_bytes());
+        out.extend_from_slice(&bytes[end..]);
+        out
+    }
+
+    #[test]
+    fn a_recorded_line_whose_run_id_disagrees_is_untrusted() {
+        let good = checked(&two_runs());
+        // A's run_end claiming run B, between two A lines.
+        let bytes = claim(&good, 7, "B");
+        assert_verdicts(&bytes, &[7], LineCheck::Failed);
+        let read = recorded(&bytes, 7);
+        assert_eq!(read.lost[0].effect, neighbours(&["A"]));
+        assert_eq!(ids(&read.runs), ["B"]);
+        // At the A|B boundary: A's replication turned into B's run_end.
+        let mut lines = two_runs();
+        lines[8] = end("A", 1_950, 0, 3);
+        let bytes = claim(&checked(&lines), 8, "B");
+        let read = recorded(&bytes, 8);
+        assert_eq!(read.lost[0].effect, neighbours(&["A", "B"]));
+        assert!(read.runs.is_empty());
+        // One agreeing neighbour of two is not enough.
+        let mut lines = two_runs();
+        lines.insert(9, end("B", 4_000, 0, 1));
+        lines.remove(8);
+        let bytes = flip_digit(&checked(&lines), 8);
+        let read = recorded(&bytes, 8);
+        assert_eq!(read.lost[0].effect, neighbours(&["A", "B"]));
+    }
+
+    #[test]
+    fn neighbour_walk_skips_failed_and_recorded_lines() {
+        let good = checked(&two_runs());
+        // A's stats, failing and claiming run Z, before A's lost checkpoint:
+        // the walk skips it and reaches A's warm_ready.
+        let bytes = flip_digit(&claim(&good, 4, "Z"), 5);
+        assert_verdicts(&bytes, &[4, 5], LineCheck::Failed);
+        let read = recorded(&bytes, 5);
+        assert_eq!(read.lost[0].effect, LostEffect::Marked("A".to_owned()));
+        assert_eq!(ids(&read.runs), ["A", "B"]);
+        // Two recorded lines in a row share their neighbours: A's stats (no
+        // JSON) and A's checkpoint.
+        let bytes = flip_digit(&break_json(&good, 4), 5);
+        let records = vec![record_of(&bytes, 4, 1), record_of(&bytes, 5, 2)];
+        let (read, _) = gated(&bytes, LostLineRecords::Read(records));
+        let read = read.unwrap();
+        assert_eq!(read.lost[0].effect, neighbours(&["A"]));
+        assert_eq!(read.lost[1].effect, LostEffect::Marked("A".to_owned()));
+        // An unparseable line is no neighbour: A's stats broken, but
+        // unchecked (legacy, so no D6 line either), before the lost
+        // checkpoint.
+        let mut bytes = good.clone();
+        let (start, end) = spans(&good)[4];
+        let stripped = strip_check(&good[start..end]).unwrap();
+        let mut broken = stripped.clone();
+        broken[0] = b'[';
+        bytes.splice(start..end, broken);
+        let bytes = flip_digit(&bytes, 5);
+        let read = recorded(&bytes, 5);
+        assert_eq!(read.lost[0].effect, LostEffect::Marked("A".to_owned()));
+    }
+
+    #[test]
+    fn excluded_runs_raise_no_orphan_errors() {
+        // A's run_start lost: A's warm_start, warm_ready, checkpoint,
+        // chain_restart and run_end would each be an orphan.
+        let bytes = flip_digit(&checked(&two_runs()), 1);
+        let read = recorded(&bytes, 1);
+        assert_eq!(ids(&read.runs), ["B"]);
+        assert_eq!(read.excluded[0].start, None);
+        assert_eq!(read.excluded[0].first_at_ms, Some(1_500));
+    }
+
+    #[test]
+    fn an_unrecorded_line_in_an_excluded_run_still_stops() {
+        let bytes = flip_digit(&flip_digit(&checked(&two_runs()), 1), 7);
+        let (read, _) = gated(&bytes, LostLineRecords::Read(vec![record_of(&bytes, 1, 1)]));
+        assert_stops_at(read, &bytes, 7);
+    }
+
+    #[test]
+    fn renumbered_records_name_both_numbers() {
+        let bytes = flip_digit(&checked(&two_runs()), 6);
+        let mut record = record_of(&bytes, 6, 3);
+        record.line = 6;
+        let (read, _) = gated(&bytes, LostLineRecords::Read(vec![record]));
+        let note = &read.unwrap().notes()[0];
+        assert!(
+            note.contains("line 7 at byte") && note.contains("(recorded as line 6)"),
+            "{note}"
+        );
+        let record = record_of(&bytes, 6, 3);
+        let (read, _) = gated(&bytes, LostLineRecords::Read(vec![record]));
+        assert!(!read.unwrap().notes()[0].contains("recorded as line"));
+    }
+
+    #[test]
+    fn records_at_head_and_tail_match() {
+        let bytes = break_json(&break_json(&checked(&two_runs()), 0), 17);
+        assert_eq!(spans(&bytes)[0].0, 0);
+        let records = vec![record_of(&bytes, 0, 1), record_of(&bytes, 17, 2)];
+        assert_eq!(records[0].offset, 0);
+        let (read, _) = gated(&bytes, LostLineRecords::Read(records));
+        let read = read.unwrap();
+        assert_eq!(read.lost.len(), 2);
+        assert_eq!(read.lost[0].lost.line, 1);
+        assert_eq!(read.lost[1].lost.line, 18);
+    }
+
+    #[test]
+    fn single_root_reads_a_gated_line_without_a_record() {
+        let good = checked(&two_runs());
+        let bytes = flip_digit(&good, 5);
+        let (read, calls) = gated(&bytes, LostLineRecords::SingleRoot);
+        let read = read.unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(read.lost[0].effect, LostEffect::Marked("A".to_owned()));
+        assert_eq!(read.lost[0].lost.why, LostWhy::NotRecordable);
+        let note = &read.notes()[0];
+        assert!(
+            note.contains(
+                "is not recordable: a single-root store keeps no copy to restore it from and no \
+                 copy ledger to record it"
+            ),
+            "{note}"
+        );
+        // Never a stop, for any gated line.
+        for index in 0..18 {
+            let (read, _) = gated(&break_json(&good, index), LostLineRecords::SingleRoot);
+            assert!(read.is_ok(), "{index}");
+        }
+    }
+
+    /// `bytes` with the member's `,` of line `index` damaged: Unchecked,
+    /// no JSON (ADR-068 D6).
+    fn damage_member(bytes: &[u8], index: usize) -> Vec<u8> {
+        let (_, end) = spans(bytes)[index];
+        let mut damaged = bytes.to_vec();
+        assert_eq!(damaged[end - CHECK_SHAPE], b',');
+        damaged[end - CHECK_SHAPE] ^= 0x01;
+        damaged
+    }
+
+    #[test]
+    fn a_member_damaged_line_mid_run_excludes_its_run() {
+        let good = checked(&two_runs());
+        // A's stats: between A's warm_ready and A's checkpoint.
+        let bytes = damage_member(&good, 4);
+        assert_verdicts(&bytes, &[4], LineCheck::Unchecked);
+        let (read, calls) = gated(&bytes, none());
+        let read = read.unwrap();
+        assert_eq!(calls, 0);
+        assert_eq!(ids(&read.runs), ["B"]);
+        assert_eq!(read.lost[0].lost.why, LostWhy::MemberDamaged);
+        assert_eq!(read.lost[0].effect, LostEffect::Excluded("A".to_owned()));
+        let note = &read.notes()[0];
+        assert!(
+            note.contains("damage no crash leaves (ADR-068 D6)"),
+            "{note}"
+        );
+        assert!(note.ends_with("(ADR-068 D6)"), "{note}");
+        // The same on a run_end mid-run (A's replication follows it).
+        let read = gated(&damage_member(&good, 7), none()).0.unwrap();
+        assert_eq!(ids(&read.runs), ["B"]);
+    }
+
+    #[test]
+    fn a_torn_line_at_a_boundary_reads_as_today() {
+        let good = checked(&two_runs());
+        // A's replication torn by a crash and ended by the next open (#225).
+        let (start, end) = spans(&good)[8];
+        let mut bytes = good[..start + (end - start) / 2].to_vec();
+        bytes.extend_from_slice(&good[end..]);
+        assert_eq!(
+            check_line(&bytes[start..spans(&bytes)[8].1]),
+            LineCheck::Unchecked
+        );
+        let (read, calls) = gated(&bytes, none());
+        assert_eq!(read.unwrap(), undamaged());
+        assert_eq!(calls, 0);
+        // Legacy lines never qualify: their neighbours carry no check.
+        let legacy = stripped(&good);
+        let (start, _) = spans(&legacy)[4];
+        let mut bytes = legacy.clone();
+        bytes[start] = b'[';
+        let read = gated(&bytes, none()).0.unwrap();
+        assert!(read.lost.is_empty());
+        assert_eq!(ids(&read.runs), ["A", "B"]);
+    }
+
+    #[test]
+    fn a_damaged_member_at_a_run_boundary_reads_as_today() {
+        // The residual (ADR-068 D6): A's run_end is A's last line, and its
+        // damaged member cannot be told apart from a torn line: A reads as
+        // crashed, with no note.
+        let mut lines = two_runs();
+        lines.remove(8);
+        let good = checked(&lines);
+        let bytes = damage_member(&good, 7);
+        assert_verdicts(&bytes, &[7], LineCheck::Unchecked);
+        let read = gated(&bytes, none()).0.unwrap();
+        assert!(read.lost.is_empty() && read.excluded.is_empty());
+        assert_eq!(ids(&read.runs), ["A", "B"]);
+        assert_eq!(read.runs[0].end, None);
+    }
+
+    #[test]
+    fn legacy_journal_reads_byte_identically() {
+        // Two runs from before ADR-066, with an unparseable line, a line
+        // that is not UTF-8 and CRLF line ends.
+        let lines = two_runs();
+        let mut bytes = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            bytes.extend_from_slice(line.as_bytes());
+            bytes.extend_from_slice(if i % 2 == 0 { b"\r\n" } else { b"\n" });
+            if i == 4 {
+                bytes.extend_from_slice(b"{\"type\":\"run_end\",\"run_id\":\"A\",\"at\n");
+                bytes.extend_from_slice(b"{\"type\":\"run_start\",\"x\":\"\xFF\"}\n");
+            }
+        }
+        let (read, calls) = gated(&bytes, none());
+        let read = read.unwrap();
+        assert_eq!(calls, 0);
+        assert!(read.lost.is_empty() && read.excluded.is_empty());
+        // The pinned read: what the checked journal reads, line for line.
+        assert_eq!(read, undamaged());
+        let a = &read.runs[0];
+        assert_eq!(a.live_run().clean_records, Some(3));
+        assert_eq!(a.checkpoints, [checkpoint(3, true)]);
+        assert_eq!(a.warm_start, Some(WarmStart::Warm(handoff())));
+        assert_eq!(a.ready_after_ms, Some(25));
+        assert_eq!(a.chain_restarts, [EventTime::from_millis(1_007)]);
+        assert!(a.lost.is_empty());
+    }
+
+    /// The single-bit flips of every byte of [`two_runs`]'s journal: each
+    /// either stops at the flipped line (or the line a flipped `\n` merged
+    /// it into), or reads every run as written or excluded and named by a
+    /// D6 line, and never panics. Returns the flipped journals that stop,
+    /// with the flipped byte and the index of the line they name, and the
+    /// count of D6 exclusions.
+    fn all_flips() -> (Vec<(Vec<u8>, usize, usize)>, usize) {
+        let good = checked(&two_runs());
+        let whole = undamaged();
+        let mut stops = Vec::new();
+        let mut member = 0;
+        for at in 0..good.len() {
+            for bit in 0..8 {
+                let mut bytes = good.clone();
+                bytes[at] ^= 1 << bit;
+                let line = spans(&good)
+                    .iter()
+                    .position(|(s, e)| (*s..=*e).contains(&at))
+                    .unwrap();
+                match gated(&bytes, none()).0 {
+                    Err(error) => {
+                        let (start, _) = spans(&bytes)[line];
+                        assert!(
+                            error.contains(&format!("line {} at byte {start} fails", line + 1)),
+                            "{at}/{bit}: {error}"
+                        );
+                        stops.push((bytes, at, line));
+                    }
+                    Ok(read) => {
+                        for run in &whole.runs {
+                            let id = &run.parameters.run_id;
+                            if let Some(excluded) = read.excluded_run(id) {
+                                assert_eq!(excluded.by.why, LostWhy::MemberDamaged);
+                                assert!(
+                                    read.notes()
+                                        .iter()
+                                        .any(|n| n.contains(&format!("run {id}"))),
+                                    "{at}/{bit}"
+                                );
+                                member += 1;
+                            } else {
+                                let read = read.runs.iter().find(|r| r.parameters.run_id == *id);
+                                assert_eq!(read, Some(run), "{at}/{bit}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        (stops, member)
+    }
+
+    #[test]
+    fn every_single_bit_flip_stops_or_reads_as_written() {
+        let good = checked(&two_runs());
+        let (stops, member) = all_flips();
+        // Every flip before the member of a line of a consumed kind fails
+        // that line's check (ADR-066) and stops the read, whatever it does
+        // to the line's kind.
+        for (index, (start, end)) in spans(&good).into_iter().enumerate() {
+            let value: Value = serde_json::from_slice(&good[start..end]).unwrap();
+            if !GATED_KINDS.contains(&value["type"].as_str().unwrap()) {
+                continue;
+            }
+            for at in start..end - CHECK_SHAPE {
+                let stopped = stops
+                    .iter()
+                    .filter(|(_, a, l)| *a == at && *l == index)
+                    .count();
+                assert_eq!(stopped, 8, "line {index} byte {at}");
+            }
+        }
+        assert_eq!(member, MEMBER_DAMAGE_EXCLUSIONS, "{member}");
+    }
+
+    /// The D6 exclusions among the single-bit flips of [`two_runs`]'s
+    /// journal: flips in the member of one of the 14 lines between two
+    /// Intact lines of its run (lines 2–8 of each run) that leave the line
+    /// Unchecked and no JSON, 79.3 a line (ADR-068 D6, its count; the
+    /// per-line terms are [`member_damage_bit_positions`]').
+    const MEMBER_DAMAGE_EXCLUSIONS: usize = 1_110;
+
+    /// The single-bit flips of a line's member that leave the line
+    /// Unchecked and no JSON (ADR-068 D6): 65 of the 104 bits of its 13
+    /// fixed bytes (`,"crc32c":"` and `"}`), and per hex digit 2 for `0`–`9`
+    /// and `b`, 3 for `2`, 1 for `a` and `c`–`f`. So 73–89 a line, 79 for
+    /// uniform digits (65 + 8 × 28 / 16).
+    #[test]
+    fn member_damage_bit_positions() {
+        let per_digit = |digit: u8| match digit {
+            b'2' => 3,
+            b'0'..=b'9' | b'b' => 2,
+            _ => 1,
+        };
+        let damaged = |body: &[u8], at: usize, bit: u8| {
+            let mut bytes = body.to_vec();
+            bytes[at] ^= 1 << bit;
+            check_line(&bytes) == LineCheck::Unchecked
+                && !serde_json::from_slice::<Value>(&bytes).is_ok_and(|v| v.is_object())
+        };
+        let mut seen = BTreeSet::new();
+        let mut total = 0;
+        for line in two_runs()
+            .iter()
+            .map(String::as_bytes)
+            .chain([&b"{\"n\":222}"[..], b"{\"n\":5}"])
+        {
+            let body = with_check(line);
+            let member = body.len() - CHECK_SHAPE;
+            let hex = member + CHECK_PREFIX.len()..body.len() - 2;
+            let mut fixed = 0;
+            let mut digits = 0;
+            for at in member..body.len() {
+                let count = (0..8).filter(|bit| damaged(&body, at, *bit)).count();
+                if hex.contains(&at) {
+                    assert_eq!(count, per_digit(body[at]), "{}", body[at] as char);
+                    seen.insert(body[at]);
+                    digits += count;
+                } else {
+                    fixed += count;
+                }
+            }
+            assert_eq!(fixed, 65);
+            assert!((73..=89).contains(&(fixed + digits)));
+            total += fixed + digits;
+        }
+        assert!(seen.contains(&b'2') && seen.len() >= 10, "{seen:?}");
+        assert!(total > 0);
+    }
+
+    /// ADR-068 D1: why the parsed `type` of a failed line can be trusted.
+    /// Between a kind [`read_runs`] consumes and one it ignores, names of
+    /// equal length differ by at least 13 bits, in 6 bytes (`run_end` and
+    /// `removal`); for [`warm_handoffs`], by 9 bits in 4 bytes
+    /// (`warm_start` and `warm_ready`). Damage in place inserts no byte, so
+    /// names of other lengths are further apart.
+    #[test]
+    fn kind_names_are_far_apart_in_bits() {
+        fn nearest(consumed: &[&'static str]) -> (u32, usize, &'static str, &'static str) {
+            let mut pairs = Vec::new();
+            for a in consumed {
+                for b in KNOWN_KINDS.iter().filter(|b| !consumed.contains(b)) {
+                    if a.len() != b.len() {
+                        continue;
+                    }
+                    let (bits, bytes) = a.bytes().zip(b.bytes()).fold((0, 0), |(n, m), (x, y)| {
+                        (n + (x ^ y).count_ones(), m + usize::from(x != y))
+                    });
+                    pairs.push((bits, bytes, *a, *b));
+                }
+            }
+            pairs.sort_unstable();
+            pairs[0]
+        }
+        assert_eq!(nearest(&GATED_KINDS), (13, 6, "run_end", "removal"));
+        assert_eq!(nearest(&HANDOFF_KINDS), (9, 4, "warm_start", "warm_ready"));
+    }
+
+    #[test]
+    fn every_recorded_flip_reads_by_the_rule() {
+        let whole = undamaged();
+        let (stops, _) = all_flips();
+        for (bytes, _, line) in stops {
+            let record = record_of(&bytes, line, 1);
+            let read = gated(&bytes, LostLineRecords::Read(vec![record]))
+                .0
+                .unwrap_or_else(|e| panic!("line {line}: {e}"));
+            assert_eq!(read.lost.len(), 1, "line {line}");
+            for run in &whole.runs {
+                let id = &run.parameters.run_id;
+                match read.runs.iter().find(|r| r.parameters.run_id == *id) {
+                    None => assert!(read.excluded_run(id).is_some(), "line {line}"),
+                    Some(got) if got.lost.is_empty() => assert_eq!(got, run, "line {line}"),
+                    Some(got) => {
+                        assert_eq!(read.lost[0].effect, LostEffect::Marked(id.clone()));
+                        assert_eq!(got.parameters, run.parameters, "line {line}");
+                    }
+                }
+            }
+        }
     }
 }

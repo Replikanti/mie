@@ -593,3 +593,43 @@ fn liquidation_gaps_do_not_hide_a_loss() {
         "{text}"
     );
 }
+
+/// ADR-068, the reader verdicts: `mie capture-report` is not gated. It is
+/// a PASS/FAIL report, not a recompute, and verify V3 reports failed lines:
+/// in a tiered store without a lost-line record, where `read_runs` stops
+/// on a failed `run_start`, the report reads the journal as before.
+#[test]
+fn capture_report_is_not_gated() {
+    let dir = TempDir::new("report-not-gated");
+    let mut config = config(dir.path());
+    let t1 = D0 + HOUR;
+    let outcome = ingest(
+        &config,
+        t1,
+        vec![vec![agg(100, t1 + 10), agg(101, t1 + 20)]],
+    );
+    assert_eq!(outcome.exit_code(), 0, "{:?}", outcome.error);
+    common::make_tiered(&mut config, dir.path());
+    let (pass, before) = report(&config);
+    assert!(pass, "{before}");
+    let journal = config.paths.journal.clone();
+    let (_, start, end) = common::journal_line(&journal, "run_start", &outcome.run_id);
+    // `hold_back_ms`, which the report does not read: 750 → 751.
+    let mut bytes = std::fs::read(&journal).unwrap();
+    let at = start
+        + bytes[start..end]
+            .windows(19)
+            .position(|w| w == b"\"hold_back_ms\":750,")
+            .unwrap()
+        + 17;
+    bytes[at] ^= 0x01;
+    std::fs::write(&journal, bytes).unwrap();
+    assert!(
+        mie_cli::journal::read_runs(&config.paths, "binance-um")
+            .unwrap_err()
+            .contains("fails its check")
+    );
+    let (pass, after) = report(&config);
+    assert!(pass, "{after}");
+    assert_eq!(after, before);
+}

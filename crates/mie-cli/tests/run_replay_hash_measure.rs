@@ -25,7 +25,18 @@ fn env_path(name: &str) -> PathBuf {
 fn measure_run_replay_event_hash() {
     let raw_root = env_path("MIE_MEASURE_RAW_ROOT");
     let journal = env_path("MIE_MEASURE_JOURNAL");
-    let runs: Vec<JournaledRun> = read_runs(&journal, "binance-um").unwrap();
+    // The journal alone, read as a single-root store's: a failed line is
+    // read under ADR-068 D5 and noted, never a stop.
+    let paths = mie_cli::config::Paths {
+        raw_root: std::path::PathBuf::new(),
+        journal: journal.clone(),
+        cold_roots: Vec::new(),
+    };
+    let read = read_runs(&paths, "binance-um").unwrap();
+    for note in read.notes() {
+        eprintln!("{note}");
+    }
+    let runs: Vec<JournaledRun> = read.runs;
     let store = ParquetRawStore::new(&raw_root);
     let live = LiveReplay::new(
         &store,

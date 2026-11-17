@@ -58,8 +58,8 @@ use common::warm::{
     Step, import_archive, import_archive_with, oi, one, run_steps, warm_config, warm_ingest,
 };
 use common::{
-    CUTOVER, Connections, DepthConnection, DrivenClock, HOUR, ORIGIN, TempDir, ingest_depth,
-    journal, strip_checks_where,
+    CUTOVER, Connections, DepthConnection, DrivenClock, HOUR, ORIGIN, TempDir, flip_value_digit,
+    ingest_depth, journal, journal_line, strip_checks_where,
 };
 use mie_adapter_binance::archive::ArchiveStream;
 use mie_adapter_binance::archive::catalog::DAY_MS;
@@ -264,8 +264,9 @@ fn recompute(
     interval_ms: i64,
 ) -> (Vec<MarketEvent>, Vec<StateCheckpoint>) {
     let store = ParquetRawStore::new(&config.paths.raw_root);
-    let runs: Vec<_> = read_runs(&config.paths.journal, "binance-um")
+    let runs: Vec<_> = read_runs(&config.paths, "binance-um")
         .unwrap()
+        .runs
         .iter()
         .map(JournaledRun::live_run)
         .collect();
@@ -789,11 +790,11 @@ fn the_offline_live_path_in_two_runs_is_equivalent_with_state() {
         .partition(|r| r.event_time_ms < middle_ms);
     let start1 = fixture.started_at_ms();
     play(&config, start1, &early);
-    let runs = read_runs(&config.paths.journal, "binance-um").unwrap();
+    let runs = read_runs(&config.paths, "binance-um").unwrap().runs;
     let start2 = runs[0].end.unwrap().at_ms + 1_000;
     play(&config, start2, &late);
 
-    let runs = read_runs(&config.paths.journal, "binance-um").unwrap();
+    let runs = read_runs(&config.paths, "binance-um").unwrap().runs;
     assert_eq!(runs.len(), 2);
     // Run 2 restarted with seeds from run 1's records.
     assert!(!runs[1].parameters.seeds.is_empty());
@@ -860,7 +861,7 @@ fn equivalence_is_identical_without_the_check() {
         .partition(|r| r.event_time_ms < middle_ms);
     let start1 = fixture.started_at_ms();
     play(&config, start1, &early);
-    let runs = read_runs(&config.paths.journal, "binance-um").unwrap();
+    let runs = read_runs(&config.paths, "binance-um").unwrap().runs;
     let start2 = runs[0].end.unwrap().at_ms + 1_000;
     play(&config, start2, &late);
     let (checked, checked_text) = check(&config, start1, start2 + 1);
@@ -989,7 +990,7 @@ fn the_order_book_state_replays_equivalently_and_a_mutated_level_diverges() {
     );
     assert_eq!(outcome.exit_code(), 0, "{:?}", outcome.error);
     assert_eq!(outcome.domain_rejections, 0);
-    let runs = read_runs(&config.paths.journal, "binance-um").unwrap();
+    let runs = read_runs(&config.paths, "binance-um").unwrap().runs;
     assert_eq!(runs.len(), 1);
     let run = &runs[0];
     assert!(run.checkpoints.len() >= 3, "{run:?}");
@@ -1722,4 +1723,102 @@ fn export_equivalence_fixture() {
     std::fs::create_dir_all(&out).unwrap();
     std::fs::write(out.join("records.tsv"), tsv).unwrap();
     write_journal(&out.join("journal.jsonl"), &journal);
+}
+
+// ---------------------------------------------------------------------------
+// The gate (ADR-068): a single-root store reads a failed line without a
+// record (D5), by the rule of D4.
+
+/// Two runs of the fixture played into a single-root store, as in
+/// [`equivalence_is_identical_without_the_check`]: the config, both
+/// starts and the runs.
+fn two_played_runs(dir: &Path) -> (IngestConfig, i64, i64, Vec<JournaledRun>) {
+    let fixture = Fixture::load();
+    let config = config(dir);
+    let first_ms = fixture.records.first().unwrap().event_time_ms;
+    let last_ms = fixture.records.last().unwrap().event_time_ms;
+    let middle_ms = first_ms + (last_ms - first_ms) / 2;
+    let (early, late): (Vec<&Record>, Vec<&Record>) = fixture
+        .records
+        .iter()
+        .partition(|r| r.event_time_ms < middle_ms);
+    let start1 = fixture.started_at_ms();
+    play(&config, start1, &early);
+    let runs = read_runs(&config.paths, "binance-um").unwrap().runs;
+    let start2 = runs[0].end.unwrap().at_ms + 1_000;
+    play(&config, start2, &late);
+    let runs = read_runs(&config.paths, "binance-um").unwrap().runs;
+    (config, start1, start2, runs)
+}
+
+/// ADR-068 D4: run 1's lost `state_checkpoint` marks it, and a marked run
+/// is NOT COMPARABLE, naming the line: `compare` matches checkpoints by
+/// index, so the run read without it would read as DIVERGED. Run 2 is
+/// still judged. The note follows the header lines.
+#[test]
+fn equivalence_marked_run_is_not_comparable() {
+    let dir = TempDir::new("equivalence-gate-marked");
+    let (config, start1, start2, runs) = two_played_runs(dir.path());
+    let run1 = runs[0].parameters.run_id.clone();
+    let journal = config.paths.journal.clone();
+    let (index, start, _) = journal_line(&journal, "state_checkpoint", &run1);
+    flip_value_digit(&journal, start);
+    let (outcome, text) = check(&config, start1, start2 + 1);
+    assert!(!outcome.pass, "{text}");
+    let lines: Vec<&str> = text.lines().collect();
+    assert!(
+        lines[2].starts_with(&format!(
+            "journal: line {} at byte {start} fails its check (ADR-066 D2) and is not recordable",
+            index + 1
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "run {run1}: NOT COMPARABLE: its state_checkpoint at journal line {} at byte {start} \
+             is lost, so the run reads without it (ADR-068 D4)",
+            index + 1
+        )),
+        "{text}"
+    );
+    assert_eq!(outcome.runs[1].verdict, Verdict::Equivalent, "{text}");
+}
+
+/// ADR-068 D4: a lost `chain_restart` marks its run, which no reader
+/// consumes, so the run is still judged EQUIVALENT. The fixture's runs are
+/// cold, so the line is a checked `chain_restart` inserted into run 1.
+#[test]
+fn equivalence_judges_a_run_whose_chain_restart_is_lost() {
+    let dir = TempDir::new("equivalence-gate-restart");
+    let (config, start1, start2, runs) = two_played_runs(dir.path());
+    let run1 = runs[0].parameters.run_id.clone();
+    let journal = config.paths.journal.clone();
+    let (index, start, _) = journal_line(&journal, "run_end", &run1);
+    let restart = serde_json::json!({
+        "type": "chain_restart", "run_id": run1, "at_ms": start1 + 1, "time": start1,
+    });
+    let mut line = mie_cli::journal::with_check(restart.to_string().as_bytes());
+    line.push(b'\n');
+    let mut bytes = std::fs::read(&journal).unwrap();
+    bytes.splice(start..start, line);
+    std::fs::write(&journal, bytes).unwrap();
+    flip_value_digit(&journal, start);
+    let read = read_runs(&config.paths, "binance-um").unwrap();
+    assert_eq!(read.runs[0].lost.len(), 1);
+    assert_eq!(read.runs[0].lost[0].kind.as_deref(), Some("chain_restart"));
+    assert_eq!(read.runs[0].lost[0].line, index as u64 + 1);
+    let (outcome, text) = check(&config, start1, start2 + 1);
+    assert!(outcome.pass, "{text}");
+    assert!(
+        text.contains(&format!(
+            "journal: line {} at byte {start} fails its check (ADR-066 D2) and is not \
+             recordable",
+            index + 1
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("run {run1} reads without this chain_restart")),
+        "{text}"
+    );
 }

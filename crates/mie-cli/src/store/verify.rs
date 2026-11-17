@@ -132,7 +132,7 @@
 //!   only writer of a second `copy` record for a copy S records, so a
 //!   finding never voids a copy made after S.
 
-use super::repair::{JournalScan, held_line, is_recorded, journal_name, renumbered, scan_journal};
+use super::repair::{JournalScan, held_line, is_recorded, journal_name, scan_journal};
 use super::replicate::{
     self, Entry, IMPORT_LEDGER_DIR, JOURNAL_DIR, LedgerAppend, META_DIR, hot_entries,
     is_archive_part,
@@ -140,6 +140,7 @@ use super::replicate::{
 use super::{DeviceProbe, check_devices, check_hot, truncation_line};
 use crate::config::{ArchiveConfig, IngestConfig};
 use crate::journal::LineCheck;
+use crate::journal::{FAILED_LINE_REMEDY, renumbered};
 use mie_adapter_binance::archive::ledger::LedgerKind;
 use mie_adapter_parquet::copy_ledger::{
     self, AppendError, FindingCode, Kind, LedgerCopyCheck, Record, Subject,
@@ -642,9 +643,7 @@ impl Verify<'_> {
             let Some(&(_, first)) = matching.peek() else {
                 problems.push(format!(
                     "hot's journal line {} at byte {} fails its check (ADR-066) and is not \
-                     recorded lost: when a copy holds it intact, `mie store repair-hot --scope \
-                     journal` (with `mie ingest` stopped) restores it; otherwise, after checking \
-                     for a shared cause, `mie store repair --record-lost-lines` records its loss",
+                     recorded lost: {FAILED_LINE_REMEDY}",
                     line.number, line.start
                 ));
                 continue;

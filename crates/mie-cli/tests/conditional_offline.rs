@@ -341,3 +341,36 @@ fn the_code_version_names_a_commit_or_unknown() {
         });
     assert!(valid, "{CODE_VERSION}");
 }
+
+/// ADR-068, the reader verdicts: `mie conditional` reads the live journal
+/// through the gate. In a single-root store a failed run_end is read
+/// without a record (D5): the note goes to the report, never into the
+/// dataset's provenance. In a tiered store without a record it stops.
+#[test]
+fn conditional_live_reads_through_the_gate() {
+    let dir = TempDir::new("conditional-gate");
+    let mut config = common::config(dir.path());
+    let run = common::checked_live_run(&config);
+    let stop = common::fail_run_end(&config, &run);
+    let start = common::D0;
+    let request = |config: &mie_cli::config::IngestConfig, out: &str| BuildRequest {
+        source: ReplaySource::Live(config.clone()),
+        records: window(start, start + 3_600_000),
+        replay: window(start, start + 3_600_000),
+        out: dir.path().join(out),
+    };
+    let (pass, text) = run_build(&request(&config, "single"));
+    assert!(pass, "{text}");
+    assert!(text.starts_with("journal: line 2 at byte "), "{text}");
+    assert!(text.contains("is not recordable"), "{text}");
+    for (name, bytes) in files(&dir.path().join("single")) {
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(!text.contains("journal: line"), "{name}");
+    }
+
+    common::make_tiered(&mut config, dir.path());
+    let (pass, text) = run_build(&request(&config, "tiered"));
+    assert!(!pass);
+    assert!(text.starts_with(&format!("FAIL: {stop}")), "{text}");
+    assert!(!dir.path().join("tiered").exists());
+}

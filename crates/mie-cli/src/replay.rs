@@ -27,7 +27,7 @@
 //! completed, delivered at least one event and the domain rejected none.
 
 use crate::config::{ArchiveConfig, IngestConfig};
-use crate::journal::read_runs;
+use crate::journal::{ExcludedRun, RunsRead, read_runs};
 use mie_adapter_binance::archive::catalog::DAY_MS;
 use mie_adapter_binance::archive::catalog::day_label;
 use mie_adapter_binance::archive::fold::TradeCorrection;
@@ -136,15 +136,21 @@ pub fn run(request: &ReplayRequest, out: &mut dyn Write) -> Result<ReplayOutcome
                 &mut report,
                 format!("replay {} source live {source}/{symbol}", span(window)),
             );
-            let opened = read_runs(&config.paths.journal, source).and_then(|runs| {
+            let opened = read_runs(&config.paths, source).and_then(|read| {
                 crate::store::raw_store(&config.paths.raw_root, &config.paths.cold_roots)
-                    .map(|store| (runs, store))
+                    .map(|store| (read, store))
             });
             match opened {
-                Ok((runs, store)) => {
-                    let runs = runs.iter().map(|run| run.live_run()).collect();
+                Ok((read, store)) => {
+                    notes(&mut report, &read);
+                    let runs = read.runs.iter().map(|run| run.live_run()).collect();
                     let live = LiveReplay::new(&store, source, symbol, runs);
-                    drive(live.replay(window), &mut report, describe_live, false)
+                    drive(
+                        live.replay(window),
+                        &mut report,
+                        |stream, report| describe_live(stream, &read, report),
+                        false,
+                    )
                 }
                 Err(error) => failed(&mut report, error),
             }
@@ -203,34 +209,38 @@ fn history(config: &IngestConfig, window: ReplayWindow, report: &mut Vec<u8>) ->
         Ok(store) => store,
         Err(error) => return failed(report, error),
     };
-    let chain = match history_chain(config, &store) {
-        Ok(chain) => chain,
+    let (chain, read) = match history_chain(config, &store) {
+        Ok(opened) => opened,
         Err(error) => return failed(report, error),
     };
+    notes(report, &read);
     let source = &config.instrument.source;
     let symbol = &config.instrument.symbol;
     drive(
         chain.replay(window),
         report,
-        |stream, report| describe_history(&chain, source, symbol, stream, report),
+        |stream, report| describe_history(&chain, &read, source, symbol, stream, report),
         true,
     )
 }
 
 /// The history chain of `config` over `store` (ADR-052 D2): the archive
 /// configuration of its `[history]` section up to the cutover, then its
-/// journaled runs from it. `mie replay --source history` and
-/// `mie experiment run --source history` both build it here.
+/// journaled runs from it, with the journal as [`read_runs`] read it, whose
+/// notes the caller prints (ADR-068 D7). `mie replay`, `mie experiment
+/// run`, `mie alerts` with `--source history`, the equivalence warm pass and
+/// the ingest warm-up all build it here.
 ///
 /// # Errors
 ///
 /// A description when `config` has no `[history]` section, the archive
-/// configuration or the journal cannot be read, or the chain refuses its
-/// bounds or runs ([`HistoryChain::new`]).
+/// configuration or the journal cannot be read (the gate of ADR-068
+/// included), or the chain refuses its bounds or runs
+/// ([`HistoryChain::new`]).
 pub(crate) fn history_chain<'a>(
     config: &IngestConfig,
     store: &'a ParquetRawStore,
-) -> Result<HistoryChain<'a>, String> {
+) -> Result<(HistoryChain<'a>, RunsRead), String> {
     let (history, archive) = match config.history_archive() {
         Ok(Some(loaded)) => loaded,
         Ok(None) => return Err(NO_HISTORY.to_owned()),
@@ -244,10 +254,8 @@ pub(crate) fn history_chain<'a>(
             }
         };
     let source = &config.instrument.source;
-    let runs = read_runs(&config.paths.journal, source)?
-        .iter()
-        .map(|run| run.live_run())
-        .collect();
+    let read = read_runs(&config.paths, source)?;
+    let runs = read.runs.iter().map(|run| run.live_run()).collect();
     HistoryChain::new(
         store,
         &config.instrument.symbol,
@@ -257,7 +265,15 @@ pub(crate) fn history_chain<'a>(
         EventTime::from_millis(origin),
         EventTime::from_millis(cutover),
     )
+    .map(|chain| (chain, read))
     .map_err(|error| error.to_string())
+}
+
+/// The journal's notes (ADR-068 D7), one line each, after the header.
+fn notes(report: &mut Vec<u8>, read: &RunsRead) {
+    for note in read.notes() {
+        line(report, note);
+    }
 }
 
 /// The archive replay of `config`: `streams` when given, else the
@@ -457,13 +473,14 @@ fn trailing(report: &mut Vec<u8>, gaps: &[FeedGap]) {
     }
 }
 
-fn describe_live(stream: &LiveReplayStream<'_>, report: &mut Vec<u8>) {
-    describe_runs(stream, report);
+fn describe_live(stream: &LiveReplayStream<'_>, read: &RunsRead, report: &mut Vec<u8>) {
+    describe_runs(stream, read, report);
     trailing(report, stream.trailing_gaps());
 }
 
-/// The run and unjournaled-run lines of a live replay.
-fn describe_runs(stream: &LiveReplayStream<'_>, report: &mut Vec<u8>) {
+/// The run and unjournaled-run lines of a live replay. An unjournaled run
+/// that a lost line excluded names that line (ADR-068 D4).
+fn describe_runs(stream: &LiveReplayStream<'_>, read: &RunsRead, report: &mut Vec<u8>) {
     for run in stream.runs() {
         line(
             report,
@@ -478,11 +495,15 @@ fn describe_runs(stream: &LiveReplayStream<'_>, report: &mut Vec<u8>) {
         );
     }
     for (run, count) in stream.unattributed_outside() {
+        let why = read.excluded_run(run).map_or_else(
+            || "no run_start in the journal".to_owned(),
+            ExcludedRun::cause,
+        );
         line(
             report,
             format!(
                 "unjournaled run {run}: {count} record(s) outside the window, not replayed \
-                 (no run_start in the journal)"
+                 ({why})"
             ),
         );
     }
@@ -494,6 +515,7 @@ fn describe_runs(stream: &LiveReplayStream<'_>, report: &mut Vec<u8>) {
 /// are among its lines.
 fn describe_history(
     chain: &HistoryChain<'_>,
+    read: &RunsRead,
     source: &str,
     symbol: &str,
     stream: &HistoryChainStream<'_>,
@@ -533,7 +555,7 @@ fn describe_history(
                     live.delivered()
                 ),
             );
-            describe_runs(live.stream(), report);
+            describe_runs(live.stream(), read, report);
         }
         None => line(report, "segment live: none".to_owned()),
     }
