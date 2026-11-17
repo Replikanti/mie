@@ -70,7 +70,11 @@ fn repair_with(
     record_lost: bool,
 ) -> (bool, String) {
     let mut out = Vec::new();
-    let pass = store::repair(config, Some(archive), record_lost, probe, &|| now, &mut out).unwrap();
+    let flags = store::repair::Flags {
+        record_lost,
+        record_lost_lines: false,
+    };
+    let pass = store::repair(config, Some(archive), flags, probe, &|| now, &mut out).unwrap();
     (pass, String::from_utf8(out).unwrap())
 }
 

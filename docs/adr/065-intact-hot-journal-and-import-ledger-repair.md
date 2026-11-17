@@ -1,6 +1,12 @@
 # ADR-065: Repair of hot's journal and import ledger on an intact hot
 
-- Status: accepted
+- Status: accepted; for journal lines that carry ADR-066's per-line
+  check, ADR-066 D4 decides ahead of D2 (rule X7: the state
+  *line-damaged* repairs hot from one copy where each differing hot line
+  fails its own check, and an automatic decision never overwrites a hot
+  line that verifies), and ADR-066 D5 refines D8 (a line's check, and a
+  lost-line record of hot's line, decide before the byte majority, which
+  still decides every line without a check)
 - Date: 2026-11-15
 
 Relation to earlier ADRs: this ADR decides the three pointers ADR-062 D11

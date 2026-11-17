@@ -75,7 +75,7 @@ fn repair(fixture: &Fixture, now: i64) -> (bool, String) {
     let pass = store::repair(
         &fixture.config,
         Some(&fixture.dst_archive),
-        false,
+        store::repair::Flags::default(),
         &fixture.probe(),
         &|| now,
         &mut out,
@@ -718,4 +718,105 @@ fn a_damaged_unrecorded_copy_the_rebuild_reports_is_cleared_by_the_repair() {
     let (pass, out) = verify(&fixture, REBUILT + 3);
     assert!(pass, "{out}");
     assert_pass(&replicate(&fixture, REBUILT + 4));
+}
+
+/// Appends one checked journal line to hot's journal only, damaged in its
+/// body: a failed line no copy holds. Returns its (number, start).
+fn append_failed_line(fixture: &Fixture) -> (u64, u64) {
+    let journal = &fixture.config.paths.journal;
+    let mut bytes = fs::read(journal).unwrap();
+    let start = bytes.len() as u64;
+    let number = bytes.iter().filter(|&&b| b == b'\n').count() as u64 + 1;
+    let mut line =
+        mie_cli::journal::with_check(br#"{"type":"stats","run_id":"r","at_ms":1,"n":1}"#);
+    line[20] ^= 0x01;
+    line.push(b'\n');
+    bytes.extend_from_slice(&line);
+    fs::write(journal, bytes).unwrap();
+    (number, start)
+}
+
+fn record_lost_lines(fixture: &Fixture, now: i64) -> (bool, String) {
+    let mut out = Vec::new();
+    let flags = store::repair::Flags {
+        record_lost: false,
+        record_lost_lines: true,
+    };
+    let pass = store::repair(
+        &fixture.config,
+        Some(&fixture.dst_archive),
+        flags,
+        &fixture.probe(),
+        &|| now,
+        &mut out,
+    )
+    .unwrap();
+    (pass, String::from_utf8(out).unwrap())
+}
+
+fn lost_line_offsets(fixture: &Fixture) -> Vec<u64> {
+    copy_ledger::read(&fixture.hot())
+        .unwrap()
+        .unwrap()
+        .records
+        .into_iter()
+        .filter_map(|record| match record.kind {
+            Kind::LostLine { offset, .. } => Some(offset),
+            _ => None,
+        })
+        .collect()
+}
+
+/// ADR-066 D8: B2 carries a `lost-line` record from its start like every
+/// start record, so after a rebuild the recorded line is still a note and
+/// verify passes.
+#[test]
+fn rebuild_carries_lost_line_records_from_its_start() {
+    let (_dir, fixture) = adopted("rebuild-lost-line-start");
+    let (number, start) = append_failed_line(&fixture);
+    assert_pass(&record_lost_lines(&fixture, D0 + HOUR));
+    assert_eq!(lost_line_offsets(&fixture), [start]);
+    fs::remove_file(hot_ledger(&fixture)).unwrap();
+    let (pass, out) = rebuild(&fixture, Flags::default(), REBUILT);
+    assert!(pass, "{out}");
+    assert_eq!(lost_line_offsets(&fixture), [start]);
+    assert_pass(&replicate(&fixture, REBUILT + 1));
+    let (pass, out) = verify(&fixture, REBUILT + 2);
+    assert!(pass, "{out}");
+    assert!(
+        out.contains(&format!(
+            "note: hot's journal line {number} at byte {start} fails its check"
+        )),
+        "{out}"
+    );
+}
+
+/// The B-rules never derive a `lost-line` record: from an empty start the
+/// rebuilt ledger lacks it, verify fails on the line again, and recording
+/// it again restores the note.
+#[test]
+fn rebuild_derives_no_lost_line_record() {
+    let (_dir, fixture) = adopted("rebuild-lost-line-derived");
+    let (number, start) = append_failed_line(&fixture);
+    assert_pass(&record_lost_lines(&fixture, D0 + HOUR));
+    fs::remove_file(hot_ledger(&fixture)).unwrap();
+    damage_both_copies(&fixture);
+    let (pass, out) = rebuild(&fixture, Flags::default(), REBUILT);
+    assert!(pass && out.contains("started empty"), "{out}");
+    assert!(lost_line_offsets(&fixture).is_empty());
+    assert_pass(&replicate(&fixture, REBUILT + 1));
+    let (pass, out) = verify(&fixture, REBUILT + 2);
+    assert!(!pass, "{out}");
+    assert_fail_line(
+        &out,
+        &[
+            &format!("hot's journal line {number} at byte {start} fails its check"),
+            "`mie store repair --record-lost-lines`",
+        ],
+    );
+    assert_pass(&record_lost_lines(&fixture, REBUILT + HOUR));
+    assert_eq!(lost_line_offsets(&fixture), [start]);
+    let (pass, out) = verify(&fixture, REBUILT + HOUR + 2);
+    assert!(pass, "{out}");
+    assert!(out.contains("recorded lost at"), "{out}");
 }

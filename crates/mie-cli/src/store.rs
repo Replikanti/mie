@@ -538,7 +538,10 @@ pub fn verify(
 /// `mie store repair`: one repair of the store of `config` (ADR-062 D11,
 /// the module [`repair`](mod@repair)), with the archive configuration
 /// `archive`, else `[history] archive_config`, else none. With
-/// `record_lost` (`--record-lost`) a lost file gets its `lost` record.
+/// `flags.record_lost` (`--record-lost`) a lost file gets its `lost`
+/// record, and with `flags.record_lost_lines` (`--record-lost-lines`) a
+/// recordable failed line of hot's journal its `lost-line` record (ADR-066
+/// D8).
 /// `now_ms` stamps the records and names the run's `.mie/damaged/`
 /// directories.
 ///
@@ -552,13 +555,13 @@ pub fn verify(
 pub fn repair(
     config: &IngestConfig,
     archive: Option<&Path>,
-    record_lost: bool,
+    flags: repair::Flags,
     probe: &dyn DeviceProbe,
     now_ms: &dyn Fn() -> i64,
     out: &mut dyn Write,
 ) -> Result<bool, String> {
     let ledger = copy_ledger::CopyLedger::at(&config.paths.raw_root);
-    let report = repair::run(config, archive, record_lost, probe, now_ms, &ledger);
+    let report = repair::run(config, archive, flags, probe, now_ms, &ledger);
     print_report(report.lines, &report.problems, out)
 }
 

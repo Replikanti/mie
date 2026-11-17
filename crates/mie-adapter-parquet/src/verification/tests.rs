@@ -226,3 +226,62 @@ fn the_last_good_verification_needs_a_covering_pass_without_a_finding() {
     assert_eq!(after.last_good_verification(&path(1), "cold-a"), Some(at1));
     assert!(after.has_copies_on("cold-a") && !after.has_copies_on("cold-b"));
 }
+
+fn lost_line(journal: &str, line: u64, offset: u64, body: &[u8]) -> Kind {
+    Kind::LostLine {
+        journal: journal.to_owned(),
+        line,
+        offset,
+        sha256: copy_ledger::line_sha256(body),
+    }
+}
+
+/// ADR-066 D8: the `lost-line` records are collected per journal name, in
+/// ledger order with their `at_ms`; a record matches by offset and digest,
+/// never by line number; and they touch no other state.
+#[test]
+fn fold_collects_lost_lines_per_journal() {
+    let fx = TieredFixture::new("verification-lost-lines");
+    fx.copy_path(&path(0), &["cold-a"]);
+    let before = state(&fx);
+    assert!(before.lost_lines("journal.jsonl").is_empty());
+    append_at(&fx, D0 + 1, lost_line("journal.jsonl", 6, 1_000, b"six"));
+    append_at(&fx, D0 + 2, lost_line("other.jsonl", 2, 200, b"two"));
+    append_at(
+        &fx,
+        D0 + 3,
+        lost_line("journal.jsonl", 6, 1_000, b"six, worse"),
+    );
+    append_at(&fx, D0 + 4, lost_line("journal.jsonl", 1, 0, b"one"));
+    let after = state(&fx);
+    let lines = after.lost_lines("journal.jsonl");
+    assert_eq!(
+        lines
+            .iter()
+            .map(|l| (l.at_ms, l.line, l.offset))
+            .collect::<Vec<_>>(),
+        [(D0 + 1, 6, 1_000), (D0 + 3, 6, 1_000), (D0 + 4, 1, 0)]
+    );
+    assert_eq!(lines[0].sha256, copy_ledger::line_sha256(b"six"));
+    assert_eq!(after.lost_lines("other.jsonl").len(), 1);
+    assert!(after.lost_lines("journal").is_empty());
+    assert!(after.lost_lines("JOURNAL.JSONL").is_empty());
+
+    let six = copy_ledger::line_sha256(b"six");
+    assert!(lines[0].matches(1_000, &six));
+    assert!(!lines[0].matches(1_001, &six));
+    assert!(!lines[1].matches(1_000, &six));
+
+    // Nothing else changes: paths, verdicts, copies, findings.
+    assert_eq!(
+        after.paths().collect::<Vec<_>>(),
+        before.paths().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        after.copy(&path(0), "cold-a").map(|c| c.open),
+        before.copy(&path(0), "cold-a").map(|c| c.open)
+    );
+    assert!(!after.open_journal_finding("cold-a"));
+    assert!(after.verifies("cold-a").is_empty());
+    assert!(open_ledger_findings(&copy_ledger::read(&fx.hot).unwrap().unwrap().records).is_empty());
+}

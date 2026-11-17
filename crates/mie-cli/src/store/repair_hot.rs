@@ -53,7 +53,9 @@
 //!   in the restore's H3); *behind-copy-damaged* (the copies differ, every
 //!   copy reads, one is longer than hot, and every contradicted byte below
 //!   L_h is settled for hot under R7's rule, [`journal_contest`] (ADR-066
-//!   D5 over ADR-065 D8): hot is extended to the end of the
+//!   D5 over ADR-065 D8, with the `lost-line` records of hot's copy ledger,
+//!   ADR-066 D8; none when the ledger cannot be read, the stricter outcome,
+//!   which the report names): hot is extended to the end of the
 //!   longest copy with no difference with hot below L_h, and the damaged
 //!   copies are named for `mie store repair`; not where a differing copy
 //!   holds a byte past that end, two copies hold different bytes past L_h,
@@ -140,7 +142,7 @@ use mie_adapter_parquet::copy_ledger;
 use mie_adapter_parquet::removal;
 use mie_adapter_parquet::replica::{self, ReplaceEvidenceStep, Side, TailSource};
 use mie_adapter_parquet::root_marker::{self, HOT_ID};
-use mie_adapter_parquet::verification::CopyState;
+use mie_adapter_parquet::verification::{CopyState, LostLine};
 use mie_ports::raw::RawStoreError;
 use std::collections::BTreeMap;
 use std::fs;
@@ -814,7 +816,7 @@ fn classify_line(c: &[u8], start: u64, bytes: &[u8], first: u64) -> CheckedLine 
 
 /// The next line of `reader`, its `\n` included, holding at most
 /// [`MAX_CHECKED_LINE`] bytes and its `\n` in memory; `None` at the end.
-fn read_region_line(reader: &mut impl BufRead) -> std::io::Result<Option<RegionLine>> {
+pub(super) fn read_region_line(reader: &mut impl BufRead) -> std::io::Result<Option<RegionLine>> {
     let mut bytes = Vec::new();
     let mut kept = true;
     let mut len = 0u64;
@@ -1378,6 +1380,26 @@ pub(super) fn byte_text(path: &Path, at: u64) -> String {
     }
 }
 
+/// The `lost-line` records of the journal `journal` (by its file name) in
+/// hot's copy ledger (ADR-066 D8), as `mie store repair` reads them for
+/// R7. A name that is not UTF-8 has none.
+///
+/// # Errors
+///
+/// Why the ledger gives none: it is absent, cannot be read or folded.
+fn lost_line_records(hot: &Path, journal: &Path) -> Result<Vec<LostLine>, String> {
+    let Some(name) = journal.file_name().and_then(|name| name.to_str()) else {
+        return Ok(Vec::new());
+    };
+    match copy_ledger::read(hot) {
+        Ok(Some(ledger)) => CopyState::fold(&ledger)
+            .map(|state| state.lost_lines(name).to_vec())
+            .map_err(|error| error.to_string()),
+        Ok(None) => Err("it does not exist".to_owned()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
 /// Whether the first `len` bytes of `path` read without error.
 fn reads_in_full(path: &Path, len: u64) -> Result<(), String> {
     let mut file = fs::File::open(path).map_err(|e| e.to_string())?;
@@ -1602,6 +1624,25 @@ impl Run<'_> {
             report.lines.push(format!(
                 "evidence of an earlier run beside hot's journal, kept: {}",
                 earlier.display()
+            ));
+        }
+        // ADR-066 D8: the lost-line records R7 settles by, so that
+        // `r7_refuses` and the *behind* test agree with `mie store repair`.
+        let recorded = match lost_line_records(self.hot, configured) {
+            Ok(recorded) => recorded,
+            Err(why) => {
+                report.lines.push(format!(
+                    "hot's copy ledger {} cannot be read ({why}): no lost-line record is used, \
+                     the stricter outcome (ADR-066 D8)",
+                    copy_ledger::ledger_path(self.hot).display()
+                ));
+                Vec::new()
+            }
+        };
+        if !recorded.is_empty() {
+            report.lines.push(format!(
+                "lost-line records of hot's journal in the copy ledger: {} (ADR-066 D8)",
+                recorded.len()
             ));
         }
 
@@ -1842,7 +1883,7 @@ impl Run<'_> {
                     } else {
                         let d = vs_hot.unwrap_or(hot_len);
                         let contested = replica::line_start(TailSource::File(&hot_path), d)
-                            .and_then(|u| journal_contest(&hot_path, &all, u, u64::MAX));
+                            .and_then(|u| journal_contest(&hot_path, &all, u, u64::MAX, &recorded));
                         uninspected || !matches!(contested, Ok(None))
                     };
                     witnesses.push(WitnessFacts {
@@ -1870,7 +1911,7 @@ impl Run<'_> {
                             && readable.len() == candidates.len()
                             && len > hot_len =>
                     {
-                        let inner = journal_contest(&hot_path, &all, 0, hot_len)
+                        let inner = journal_contest(&hot_path, &all, 0, hot_len, &recorded)
                             .map_err(|e| Stop(e.to_string()))?;
                         if inner.is_some() {
                             None

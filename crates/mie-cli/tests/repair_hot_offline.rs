@@ -49,7 +49,7 @@ fn repair(fixture: &Fixture, now: i64) -> (bool, String) {
     let pass = store::repair(
         &fixture.config,
         Some(&fixture.dst_archive),
-        false,
+        store::repair::Flags::default(),
         &fixture.probe(),
         &|| now,
         &mut out,

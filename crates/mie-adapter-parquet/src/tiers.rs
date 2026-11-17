@@ -164,7 +164,8 @@ impl LedgerView {
                 | Kind::Returned { .. }
                 | Kind::LedgerCopy { .. }
                 | Kind::Finding { .. }
-                | Kind::Verify { .. } => {}
+                | Kind::Verify { .. }
+                | Kind::LostLine { .. } => {}
             }
         }
         Ok(Self { entries })
@@ -341,7 +342,10 @@ impl TierState {
                     state.removed.remove(partition);
                     continue;
                 }
-                Kind::LedgerCopy { .. } | Kind::Finding { .. } | Kind::Verify { .. } => continue,
+                Kind::LedgerCopy { .. }
+                | Kind::Finding { .. }
+                | Kind::Verify { .. }
+                | Kind::LostLine { .. } => continue,
             };
             if !path.starts_with(&prefix) {
                 continue;

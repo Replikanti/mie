@@ -5,7 +5,12 @@
   the copies over hot's live journal is the guess step 5 rejects" where two
   copies contradict hot over its whole length, and R7's agreement
   condition, replaced by hot's strict byte-wise majority over every byte
-  the rebuild writes (ADR-065 D8)
+  the rebuild writes (ADR-065 D8); ADR-066 supersedes R7's reason "the
+  journal has no chain" for journal lines that carry its per-line check
+  (a line's own check attributes one copy against hot, ADR-066 D5), and
+  adds the copy-ledger kind `lost-line` (ADR-066 D8), which D7's fold
+  counts among the kinds that do not change the file list, beside
+  `finding` and `verify`
 - Date: 2026-11-05
 - Amended: 2026-11-15 (#219)
 

@@ -849,3 +849,72 @@ fn the_import_view_skips_only_a_quarantined_pending_path() {
     });
     assert!(integrity(import(&fx)).contains("is lost"));
 }
+
+/// ADR-066 D8: a `lost-line` record changes no file list and no verdict.
+/// With records of every shape between the select fold's other records
+/// (a copied and removed partition, a lost file), every selection, every
+/// read and the writer's numbering equal those without them.
+#[test]
+fn lost_line_changes_no_file_list() {
+    let partition = TieredFixture::partition(&a(), 1);
+    let build = |tag: &str, lost_lines: bool| {
+        let fx = TieredFixture::new(tag);
+        let line = |n: u64| Kind::LostLine {
+            journal: "journal.jsonl".to_owned(),
+            line: n,
+            offset: if n == 1 { 0 } else { 200 * (n - 1) },
+            sha256: copy_ledger::line_sha256(format!("line {n}").as_bytes()),
+        };
+        if lost_lines {
+            fx.append(line(1));
+        }
+        fx.copy(&partition);
+        if lost_lines {
+            fx.append(line(6));
+        }
+        fx.remove(&partition);
+        let lost = format!("{}/part-00099.parquet", TieredFixture::partition(&b(), 3));
+        fx.append(Kind::Lost {
+            path: lost,
+            origin: LostOrigin::Verify,
+            sha256: None,
+        });
+        if lost_lines {
+            fx.append(line(9));
+        }
+        fx
+    };
+    let with = build("tiers-lost-line-with", true);
+    let without = build("tiers-lost-line-without", false);
+    let ledger = copy_ledger::read(&with.hot).unwrap().unwrap();
+    assert_eq!(
+        ledger
+            .records
+            .iter()
+            .filter(|r| r.kind.name() == "lost-line")
+            .count(),
+        3
+    );
+    for selection in windows() {
+        assert_eq!(
+            format!("{:?}", with.store().select(&selection)),
+            format!("{:?}", without.store().select(&selection)),
+            "{selection:?}"
+        );
+    }
+    let view = |fx: &TieredFixture| {
+        let ledger = copy_ledger::read(&fx.hot).unwrap().unwrap();
+        let state = crate::verification::CopyState::fold(&ledger).unwrap();
+        let paths: Vec<(String, crate::verification::PathVerdict)> = state
+            .paths()
+            .map(|(path, verdict)| (path.to_owned(), verdict))
+            .collect();
+        let writer = super::TierState::fold(&ledger, a().source()).unwrap();
+        (
+            paths,
+            writer.is_removed(&partition),
+            writer.next_part(&partition, 0),
+        )
+    };
+    assert_eq!(view(&with), view(&without));
+}

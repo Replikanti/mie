@@ -1061,3 +1061,83 @@ fn x6_report_and_exit() {
     assert!(text.lines().any(|l| l.starts_with("FAIL: ")), "{text}");
     assert!(!text.contains("PASS"), "{text}");
 }
+
+/// ADR-066 D8 in the journal scope: hot's line 3 fails its check (a flip
+/// at 450), cold-a's line 3 fails differently (460), cold-b holds hot's
+/// bytes. With the line recorded lost, R7 rebuilds cold-a, and the journal
+/// scope reads the same record: `r7_refuses` agrees, the state is
+/// *copy-damaged* naming `mie store repair`, and the repair then makes
+/// cold-a hot's bytes. Without the record, or without a readable copy
+/// ledger (named in the report), R7 refuses and the state is *two-fault*.
+#[test]
+fn x7_journal_scope_uses_the_same_records_as_r7() {
+    let good = checked_lines("A", 5);
+    let mut hot = good.clone();
+    hot[450] ^= 0x01;
+    let mut cold_a = good.clone();
+    cold_a[460] ^= 0x01;
+    let fixture = with_journal("x7-records", &good);
+    fs::write(&fixture.config.paths.journal, &hot).unwrap();
+    fs::write(copy_of(&fixture, "cold-a"), &cold_a).unwrap();
+    fs::write(copy_of(&fixture, "cold-b"), &hot).unwrap();
+    let report = journal(&fixture, AT);
+    assert_line(&report, &["decision two-fault"]);
+    assert_nothing_written(&report);
+
+    copy_ledger::CopyLedger::at(&fixture.hot)
+        .append(&copy_ledger::Record {
+            at_ms: D0,
+            kind: copy_ledger::Kind::LostLine {
+                journal: "journal.jsonl".to_owned(),
+                line: 3,
+                offset: 400,
+                sha256: copy_ledger::line_sha256(&hot[400..599]),
+            },
+        })
+        .unwrap();
+    let report = journal(&fixture, AT);
+    assert_line(&report, &["lost-line records of hot's journal", ": 1"]);
+    assert_line(&report, &["decision copy-damaged"]);
+    assert_problem(
+        &report,
+        &["`mie store verify`, then `mie store repair`", "cold-a"],
+    );
+    assert_nothing_written(&report);
+
+    // The copy ledger out of reach: no record is used, and the report
+    // says so.
+    let ledger = copy_ledger::ledger_path(&fixture.hot);
+    let away = ledger.with_extension("away");
+    fs::rename(&ledger, &away).unwrap();
+    let report = journal(&fixture, AT);
+    fs::rename(&away, &ledger).unwrap();
+    assert_line(&report, &["cannot be read", "no lost-line record is used"]);
+    assert_line(&report, &["decision two-fault"]);
+
+    // R7 agrees: the verification finds cold-a, the repair rebuilds it.
+    let ledger_append = copy_ledger::CopyLedger::at(&fixture.hot);
+    let verified = crate::store::verify::run(
+        &fixture.config,
+        Some(&fixture.archive()),
+        "24",
+        &fixture.probe,
+        &|| D0 + 3_600_000,
+        &ledger_append,
+    );
+    assert!(
+        verified.problems.iter().any(|p| p.contains("(cold-a)")),
+        "{verified:#?}"
+    );
+    let repaired = crate::store::repair::run(
+        &fixture.config,
+        Some(&fixture.archive()),
+        crate::store::repair::Flags::default(),
+        &fixture.probe,
+        &|| D0 + 2 * 3_600_000,
+        &ledger_append,
+    );
+    assert_eq!(repaired.problems, Vec::<String>::new(), "{repaired:#?}");
+    assert_eq!(fs::read(copy_of(&fixture, "cold-a")).unwrap(), hot);
+    let report = journal(&fixture, AT + 1);
+    assert_line(&report, &["decision agree"]);
+}

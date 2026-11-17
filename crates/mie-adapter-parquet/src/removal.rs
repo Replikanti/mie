@@ -779,7 +779,9 @@ fn recheck(
                 Subject::CopyLedger => true,
                 Subject::Journal | Subject::Entry(_) => false,
             },
-            Kind::Verify { .. } => false,
+            // A lost journal line names no partition and no file (ADR-066
+            // D8).
+            Kind::Verify { .. } | Kind::LostLine { .. } => false,
         };
         if named {
             return Err(format!(

@@ -103,7 +103,7 @@ pub(super) fn contest(hot: &[u8], copies: &[&[u8]], from: u64, until: u64) -> Op
         })
         .collect();
     let refs: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
-    journal_contest(&hot_path, &refs, from, until).unwrap()
+    journal_contest(&hot_path, &refs, from, until, &[]).unwrap()
 }
 
 /// Whether R7 refuses to rebuild `copy` from `hot` with `copies` (all of

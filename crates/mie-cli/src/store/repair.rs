@@ -100,24 +100,50 @@
 //!   a journal that holds a byte at p contradicts hot (or holds one past
 //!   hot's end) is settled for hot ([`journal_contest`], ADR-066 D5): p
 //!   below L_h; hot's line that holds p not Failed under its check
-//!   (ADR-066 D2), even where hot holds a majority; no contradicting
-//!   journal's line Intact (both lines verifying is a fork, and a line that
-//!   verifies is never overwritten by bytes that do not); then hot's line
-//!   Intact with every contradicting line Failed settles the line with no
-//!   count, and any other line, where a check is missing, is ADR-065 D8's
+//!   (ADR-066 D2), even where hot holds a majority, unless a `lost-line`
+//!   record matches it (R7a); no contradicting journal's line Intact (both
+//!   lines verifying is a fork, and a line that verifies is never
+//!   overwritten by bytes that do not); then hot's line Intact, or Failed
+//!   and recorded lost, with every contradicting line Failed settles the
+//!   line with no count (a recorded line only against lines of its own
+//!   span, as R7a judges the copies, and nothing else; a stale record,
+//!   whose bytes changed, matches nothing), and any other line,
+//!   where a check is missing, is ADR-065 D8's
 //!   strict majority unchanged: more than half of the journals that hold a
 //!   byte at p, hot included, hold hot's byte. So a journal without
 //!   checked lines gets exactly D8. The journals are hot, this copy and
 //!   every other target's copy, each as it was before this run (a copy
 //!   rebuilt earlier in the run counts by its evidence copy); one that
 //!   cannot be read refuses. Otherwise refused, naming the byte and why:
-//!   hot's line fails its check (hot's journal is the suspect); a copy's
+//!   hot's line fails its check and is not recorded lost (hot's journal is
+//!   the suspect), or is recorded but a journal's line there carries no
+//!   check or fails over another span; a copy's
 //!   line verifies; or, without checks, one copy against hot (one against
 //!   one) cannot be attributed, and when every other copy agrees with this
 //!   one against hot at d, hot's journal is named as the suspect. The
 //!   repair never rewrites hot, and `mie store restore` is for a lost hot
 //!   only: with `mie ingest` stopped, `mie store repair-hot --scope
 //!   journal` decides hot's journal (ADR-065, ADR-066 D4).
+//! - **R7a Hot's failed journal lines** (ADR-066 D8), before R7: hot's
+//!   journal is streamed up to the length read now (a capture appends
+//!   beside the repair), and every complete line that fails its check is
+//!   judged; a last line without its `\n` is never classified. A line a
+//!   `lost-line` record of the journal's file name matches (its offset and
+//!   its bytes' digest) is reported recorded. Any other is recordable when
+//!   every configured copy target presents its marker, its journal copy
+//!   reads, and its bytes over the line's span are absent, hot's, or a
+//!   complete line of the same span that fails its check; the markers are
+//!   read again last, at the decision, as R9 does. A missing marker or an
+//!   unreadable copy makes it "not recordable in this run"; a copy holding
+//!   the line intact, or other bytes that do not fail their check, refuses
+//!   and names `mie store repair-hot --scope journal`, since the record
+//!   would let R7 write hot's accepted bytes over every copy it judged.
+//!   Only with `--record-lost-lines` does a recordable line get its
+//!   `lost-line <at_ms> <journal> <line> <offset> <sha256>` record, which R7
+//!   settles by in the same run and `mie store verify` lists as a note;
+//!   without it, it is a problem naming the flag, and nothing is appended.
+//!   A journal name that is not UTF-8 cannot be recorded. The record writes
+//!   no journal byte, so `mie ingest` keeps running (ADR-066 D8).
 //! - **R8 Entry copies with an open entry finding:** replaced from hot only
 //!   when hot's entry lists every file with the SHA-256 of the ledger's
 //!   `manifest` record (else hot's manifest, [`entry_mismatches`], the test
@@ -144,8 +170,8 @@
 //!   copy-ledger hold, so the fresh `copy` records land inside the prefix k
 //!   ledger copies hold and a refilled target's journal copy moves past the
 //!   refilled files. The repair passes only when every work item was
-//!   repaired or re-verified, nothing was refused or lost, and the closing
-//!   pass passed.
+//!   repaired or re-verified, nothing was refused or lost, no failed line
+//!   of hot's journal is left unrecorded, and the closing pass passed.
 
 use super::adopt::{self, Target};
 use super::replicate::{
@@ -164,11 +190,11 @@ use mie_adapter_parquet::replica::{
     self, Contested, CopyCheck, CopyError, Side, TailSource, TempName,
 };
 use mie_adapter_parquet::root_marker::{self, HOT_ID};
-use mie_adapter_parquet::verification::{CopyState, PathVerdict};
+use mie_adapter_parquet::verification::{CopyState, LostLine, PathVerdict};
 use mie_ports::raw::RawStoreError;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{ErrorKind, Read, Seek, SeekFrom};
+use std::io::{BufReader, ErrorKind, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 #[cfg(test)]
@@ -205,6 +231,11 @@ thread_local! {
     /// before R1 (a concurrent removal, an unmount mid-run).
     pub(crate) static BEFORE_WORK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         std::cell::RefCell::new(None);
+    /// Test hook: runs once in R7a's recordable test, after the journal
+    /// copies are read and before the markers are read again (an unmount
+    /// in between).
+    pub(crate) static BEFORE_MARKER_REREAD: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
 }
 
 /// Why the repair stopped early.
@@ -225,6 +256,17 @@ fn reached(step: RepairStep) -> Result<(), Stop> {
     }
     let _ = step;
     Ok(())
+}
+
+/// The flags of `mie store repair`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Flags {
+    /// `--record-lost`: R9 appends the `lost` record of a lost file (#192,
+    /// STOP 1 decision 1).
+    pub record_lost: bool,
+    /// `--record-lost-lines`: R7a appends the `lost-line` record of every
+    /// recordable line of hot's journal (ADR-066 D8).
+    pub record_lost_lines: bool,
 }
 
 /// What one repair did: its report lines and every problem that makes it
@@ -270,7 +312,7 @@ struct Repair<'a> {
     config: &'a IngestConfig,
     hot: &'a Path,
     archive: Option<ArchiveConfig>,
-    record_lost: bool,
+    flags: Flags,
     now_ms: &'a dyn Fn() -> i64,
     /// The run's `at_ms`: the name of its `.mie/damaged/` directories.
     run_ms: i64,
@@ -292,6 +334,9 @@ struct Repair<'a> {
     /// Per marked root whose journal copy R7 rebuilt in this run, where
     /// its former bytes lie: D8 counts every copy as it was before the run.
     journal_before: BTreeMap<usize, PathBuf>,
+    /// The `lost-line` records of hot's journal (ADR-066 D8): the
+    /// snapshot's, then those R7a appends in this run. R7 settles by them.
+    lost_lines: Vec<LostLine>,
     report: RepairReport,
 }
 
@@ -299,7 +344,7 @@ struct Repair<'a> {
 pub fn run(
     config: &IngestConfig,
     archive: Option<&Path>,
-    record_lost: bool,
+    flags: Flags,
     probe: &dyn DeviceProbe,
     now_ms: &dyn Fn() -> i64,
     ledger: &dyn LedgerAppend,
@@ -437,11 +482,14 @@ pub fn run(
     };
     report.problems.extend(problems);
 
+    let lost_lines = journal_name(config)
+        .map(|name| state.lost_lines(name).to_vec())
+        .unwrap_or_default();
     let mut repair = Repair {
         config,
         hot,
         archive: archive_config,
-        record_lost,
+        flags,
         now_ms,
         run_ms: now_ms(),
         ledger,
@@ -455,6 +503,7 @@ pub fn run(
         cleared: BTreeSet::new(),
         judged: BTreeSet::new(),
         journal_before: BTreeMap::new(),
+        lost_lines,
         report,
     };
     #[cfg(test)]
@@ -487,6 +536,70 @@ pub fn run(
     let mut report = repair.report;
     report.lines.extend(repair.truncations.0);
     report
+}
+
+/// The file name of `paths.journal` as a lost-line record names it (ADR-066
+/// D8); `None` without one or when it is not UTF-8.
+pub(super) fn journal_name(config: &IngestConfig) -> Option<&str> {
+    config
+        .paths
+        .journal
+        .file_name()
+        .and_then(|name| name.to_str())
+}
+
+/// A lost-line record's line number beside the line's number now, when
+/// they differ: an earlier `\n` flip shifts the numbers, not the bytes
+/// (ADR-066 D8).
+pub(super) fn renumbered(recorded: u64, now: u64) -> String {
+    if recorded == now {
+        String::new()
+    } else {
+        format!(" (recorded as line {recorded})")
+    }
+}
+
+/// ADR-066 D8's condition 4 for the journal copy `copy` and hot's failed
+/// `line` of `journal`: `None` when the copy's bytes over the line's span
+/// are absent, equal to hot's, or a complete line of the same span that
+/// fails its check; otherwise why not.
+///
+/// # Errors
+///
+/// An I/O error on the copy or on hot's journal.
+fn copy_span(copy: &Path, journal: &Path, line: &FailedLine) -> std::io::Result<Option<String>> {
+    let len = match fs::metadata(copy) {
+        Ok(metadata) => metadata.len(),
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if len <= line.start {
+        return Ok(None);
+    }
+    let to = len.min(line.end);
+    let first = replica::first_difference_in(copy, TailSource::File(journal), line.start, to)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let Some(first) = first else {
+        return Ok(None);
+    };
+    let held = held_line(copy, first, len)?;
+    let same_span = held.start == line.start && held.end == line.end;
+    Ok(match held.check {
+        LineCheck::Failed if same_span => None,
+        LineCheck::Intact => Some(format!(
+            "holds a line at byte {} that verifies its check",
+            held.start
+        )),
+        LineCheck::Failed => Some(format!(
+            "holds other bytes from byte {first}, in a line from byte {} that fails its check \
+             but does not span hot's line",
+            held.start
+        )),
+        LineCheck::Unchecked => Some(format!(
+            "holds other bytes from byte {first} that carry no check (a line without its check, \
+             or cut short)"
+        )),
+    })
 }
 
 /// The partition directory of a data path.
@@ -833,6 +946,8 @@ impl Repair<'_> {
         self.repair_unrecorded(&targets)?;
         // R4.
         self.repair_hot()?;
+        // R7a, before R7 settles by its records.
+        self.record_lost_lines(&targets)?;
         // R6, R7, R8.
         for &i in &targets {
             if self.state.open_ledger_finding(&self.marked[i].id) {
@@ -1376,7 +1491,7 @@ impl Repair<'_> {
             return;
         }
         let sha = replica::parse_manifest(text).ok().map(|file| file.sha256);
-        let recorded = if self.record_lost {
+        let recorded = if self.flags.record_lost {
             let kind = Kind::Lost {
                 path: path.to_owned(),
                 origin: LostOrigin::Verify,
@@ -1685,6 +1800,177 @@ impl Repair<'_> {
             .map_err(|e| e.to_string())
     }
 
+    /// R7a (ADR-066 D8): every complete line of hot's journal that fails
+    /// its check and that no lost-line record matches is judged
+    /// recordable or not; with `--record-lost-lines` a recordable one gets
+    /// its `lost-line` record, which R7 then settles by.
+    fn record_lost_lines(&mut self, targets: &[usize]) -> Result<(), Stop> {
+        let journal = self.config.paths.journal.clone();
+        let hot_len = match fs::metadata(&journal) {
+            Ok(metadata) => metadata.len(),
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                self.problem(format!(
+                    "hot's journal {}: {error}; its lines are not checked in this run (ADR-066 \
+                     D8)",
+                    journal.display()
+                ));
+                return Ok(());
+            }
+        };
+        // Up to the length read now: a capture appends beside the repair,
+        // and a last line without its `\n` is never classified.
+        let scan = match scan_journal(&journal, hot_len) {
+            Ok(scan) => scan,
+            Err(error) => {
+                self.problem(format!(
+                    "hot's journal {}: {error}; its lines are not checked in this run (ADR-066 \
+                     D8)",
+                    journal.display()
+                ));
+                return Ok(());
+            }
+        };
+        let name = journal_name(self.config).map(str::to_owned);
+        for line in scan.failed {
+            let what = format!(
+                "hot's journal line {} at byte {} fails its check (ADR-066 D2)",
+                line.number, line.start
+            );
+            if let Some(record) = self
+                .lost_lines
+                .iter()
+                .find(|record| record.matches(line.start, &line.sha256))
+            {
+                let numbered = renumbered(record.line, line.number);
+                self.line(format!(
+                    "{what}: recorded lost at {}{numbered} (ADR-066 D8)",
+                    record.at_ms
+                ));
+                continue;
+            }
+            let Some(name) = name.clone() else {
+                self.problem(format!(
+                    "{what}, and the journal's file name {:?} is not UTF-8, so no lost-line \
+                     record can name it; nothing is recorded (ADR-066 D8)",
+                    journal.file_name().unwrap_or_default()
+                ));
+                continue;
+            };
+            if let Err(why) = self.recordable(&journal, &line, targets) {
+                self.problem(format!("{what}: not recordable: {why} (ADR-066 D8)"));
+                continue;
+            }
+            if !self.flags.record_lost_lines {
+                self.problem(format!(
+                    "{what}, and no copy target holds it intact: its loss can be recorded. \
+                     Nothing is recorded; after checking for a shared cause, `mie store repair \
+                     --record-lost-lines` records it, and `mie store verify` then lists it as a \
+                     note (ADR-066 D8)"
+                ));
+                continue;
+            }
+            let kind = Kind::LostLine {
+                journal: name,
+                line: line.number,
+                offset: line.start,
+                sha256: line.sha256.clone(),
+            };
+            let at_ms = (self.now_ms)();
+            self.append(kind)?;
+            self.lost_lines.push(LostLine {
+                at_ms,
+                line: line.number,
+                offset: line.start,
+                sha256: line.sha256,
+            });
+            self.line(format!(
+                "{what}, and no copy target holds it intact: its lost-line record is appended \
+                 (--record-lost-lines); `mie store verify` lists it as a note from now on \
+                 (ADR-066 D8)"
+            ));
+        }
+        Ok(())
+    }
+
+    /// ADR-066 D8's conditions 2 to 4 for hot's failed `line` (condition 1
+    /// holds): every configured copy target presents its marker, its
+    /// journal copy reads, and its bytes over the line's span are absent,
+    /// hot's, or a complete line of the same span that fails its check.
+    /// The markers are read again last, at the decision, as R9 does.
+    fn recordable(
+        &self,
+        journal: &Path,
+        line: &FailedLine,
+        targets: &[usize],
+    ) -> Result<(), String> {
+        let not_now = "not recordable in this run";
+        let configured: Vec<&Path> = self
+            .config
+            .paths
+            .cold_roots
+            .iter()
+            .filter(|root| root.copy_target)
+            .map(|root| root.path.as_path())
+            .collect();
+        let unmarked: Vec<String> = configured
+            .iter()
+            .filter(|path| !targets.iter().any(|&i| self.marked[i].path == **path))
+            .map(|path| path.display().to_string())
+            .collect();
+        if !unmarked.is_empty() {
+            return Err(format!(
+                "{not_now}: copy target {} presented no marker, so its journal copy cannot be \
+                 judged",
+                unmarked.join(", ")
+            ));
+        }
+        let mut refusals = Vec::new();
+        for &i in targets {
+            let Some(copy) = self.journal_copy(i) else {
+                continue;
+            };
+            match copy_span(&copy, journal, line) {
+                Ok(None) => {}
+                Ok(Some(why)) => {
+                    refusals.push(format!("the journal copy on {} {why}", self.name(i)))
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "{not_now}: the journal copy on {} cannot be read ({error})",
+                        self.name(i)
+                    ));
+                }
+            }
+        }
+        if !refusals.is_empty() {
+            return Err(format!(
+                "{}; a copy that may hold the line as written is never overwritten by a record. \
+                 With `mie ingest` stopped, `mie store repair-hot --scope journal` restores the \
+                 line where a copy holds it intact",
+                refusals.join("; ")
+            ));
+        }
+        #[cfg(test)]
+        if let Some(hook) = BEFORE_MARKER_REREAD.with(|hook| hook.borrow_mut().take()) {
+            hook();
+        }
+        for &i in targets {
+            let root = &self.marked[i];
+            match root_marker::read(&root.path) {
+                Ok(Some(id)) if id == root.id => {}
+                _ => {
+                    return Err(format!(
+                        "{not_now}: {} no longer presents its marker (an unmounted mount \
+                         point?)",
+                        self.name(i)
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// R7 for the journal copy of the marked target `i`.
     fn repair_journal_copy(&mut self, i: usize, targets: &[usize]) -> Result<(), Stop> {
         let name = self.name(i);
@@ -1737,7 +2023,8 @@ impl Repair<'_> {
             .collect();
         let mut witnesses: Vec<&Path> = vec![copy.as_path()];
         witnesses.extend(others.iter().map(PathBuf::as_path));
-        let contest = match journal_contest(&journal, &witnesses, upto, u64::MAX) {
+        let contest = match journal_contest(&journal, &witnesses, upto, u64::MAX, &self.lost_lines)
+        {
             Ok(contest) => contest,
             Err(error) => {
                 self.problem(format!(
@@ -1757,11 +2044,28 @@ impl Repair<'_> {
                  line"
             );
             let tail = match contest {
-                Contest::HotLineFails { at, line_start } => format!(
+                Contest::HotLineFails {
+                    at,
+                    line_start,
+                    recorded: false,
+                } => format!(
                     " {rebuild}, and hot's line from byte {line_start}, which a copy contradicts \
-                     at byte {at}, fails its check: hot's bytes there are not the bytes written, \
-                     so hot's journal is the suspect, whatever a majority holds. {repair_hot}, \
-                     and `mie store restore` is for a lost hot only (ADR-066 D5)"
+                     at byte {at}, fails its check and is not recorded lost: hot's bytes there \
+                     are not the bytes written, so hot's journal is the suspect, whatever a \
+                     majority holds. {repair_hot}, and `mie store restore` is for a lost hot \
+                     only (ADR-066 D5)"
+                ),
+                Contest::HotLineFails {
+                    at,
+                    line_start,
+                    recorded: true,
+                } => format!(
+                    " {rebuild}, and hot's line from byte {line_start}, which a copy contradicts \
+                     at byte {at}, fails its check and is recorded lost, but a journal's line \
+                     there carries no check, or fails its check over another span (it may hold \
+                     the line's true bytes): a lost-line record settles a line only against \
+                     lines of the same span that fail their checks too. {repair_hot} (ADR-066 \
+                     D5, D8)"
                 ),
                 Contest::Fork { at, witness, hot } => {
                     let holder = if witness == 0 {
@@ -1769,14 +2073,21 @@ impl Repair<'_> {
                     } else {
                         format!("the journal copy {}", witnesses[witness].display())
                     };
-                    let why = if hot == LineCheck::Intact {
-                        "hot's line there verifies too: both sides hold lines as written, a fork, \
-                         which no byte count decides"
-                            .to_owned()
-                    } else {
-                        "hot's line there carries no check, and a line that verifies is never \
-                         overwritten by bytes that do not"
-                            .to_owned()
+                    let why = match hot {
+                        LineCheck::Intact => {
+                            "hot's line there verifies too: both sides hold lines as written, a \
+                             fork, which no byte count decides"
+                        }
+                        LineCheck::Failed => {
+                            "hot's line there fails its check and is recorded lost: the copy \
+                             holds the line as written, which `mie store repair-hot --scope \
+                             journal` restores to hot (the record then goes stale), and a line \
+                             that verifies is never overwritten by bytes that do not"
+                        }
+                        LineCheck::Unchecked => {
+                            "hot's line there carries no check, and a line that verifies is never \
+                             overwritten by bytes that do not"
+                        }
                     };
                     format!(
                         " {rebuild}, and the line of {holder} that holds byte {at} verifies its \
@@ -1997,12 +2308,17 @@ pub(super) enum Contest {
     Majority(Contested),
     /// Hot's line from `line_start` fails its check and a witness
     /// contradicts it at byte `at`: hot's bytes there are not the bytes
-    /// written, whatever a majority holds.
+    /// written, whatever a majority holds. With `recorded`, a lost-line
+    /// record matches it (ADR-066 D8), and a contradicting witness line
+    /// carries no check or fails its check over another span, which a
+    /// record does not settle.
     HotLineFails {
         /// The first contradicted byte of the line.
         at: u64,
         /// Where hot's line starts.
         line_start: u64,
+        /// Whether a lost-line record matches hot's line.
+        recorded: bool,
     },
     /// The line of witness `witness` that holds its first byte `at`
     /// against hot verifies its check: with `hot` [`LineCheck::Intact`]
@@ -2096,7 +2412,11 @@ pub(super) fn held_line(path: &Path, offset: u64, len: u64) -> std::io::Result<H
 ///
 /// - p ≥ L_h: [`Contest::Majority`], as ADR-065 D8 (hot holds no byte);
 /// - hot's line that holds p Failed: [`Contest::HotLineFails`], even when
-///   hot holds a majority;
+///   hot holds a majority, unless a record of `recorded` matches it
+///   (ADR-066 D8): then it is settled for hot when every contradicting
+///   witness's line is Failed with hot's line's span, refused as a fork
+///   when one is Intact, and otherwise [`Contest::HotLineFails`] with
+///   `recorded`;
 /// - a contradicting witness's line (the one that holds its first byte
 ///   against hot's line) Intact: [`Contest::Fork`];
 /// - hot's line Intact and every contradicting witness's line Failed:
@@ -2108,8 +2428,8 @@ pub(super) fn held_line(path: &Path, offset: u64, len: u64) -> std::io::Result<H
 ///
 /// Then the walk continues after hot's line. `None` when every
 /// contradicted byte is settled. A witness that does not exist holds no
-/// byte. The record rule of ADR-066 D8 (a failed hot line recorded lost)
-/// is not part of it yet.
+/// byte. `recorded` holds the `lost-line` records of hot's journal; a
+/// stale one (its bytes changed) matches nothing and settles nothing.
 ///
 /// # Errors
 ///
@@ -2121,6 +2441,7 @@ pub(super) fn journal_contest(
     witnesses: &[&Path],
     from: u64,
     until: u64,
+    recorded: &[LostLine],
 ) -> Result<Option<Contest>, CopyError> {
     let io = |side: Side, path: &Path| {
         let path = path.display().to_string();
@@ -2149,10 +2470,13 @@ pub(super) fn journal_contest(
             })));
         }
         let line = held_line(hot, p, hot_len).map_err(io(Side::Source, hot))?;
-        if line.check == LineCheck::Failed {
+        let accepted = line.check == LineCheck::Failed
+            && is_recorded(hot, &line, recorded).map_err(io(Side::Source, hot))?;
+        if line.check == LineCheck::Failed && !accepted {
             return Ok(Some(Contest::HotLineFails {
                 at: p,
                 line_start: line.start,
+                recorded: false,
             }));
         }
         let to = line.end.min(until);
@@ -2174,10 +2498,26 @@ pub(super) fn journal_contest(
                     hot: line.check,
                 }));
             }
-            theirs.push(witness.check);
+            let same_span = witness.start == line.start && witness.end == line.end;
+            theirs.push((witness.check, same_span));
         }
-        let settled =
-            line.check == LineCheck::Intact && theirs.iter().all(|c| *c == LineCheck::Failed);
+        let failed = |(check, _): &(LineCheck, bool)| *check == LineCheck::Failed;
+        // A record settles hot's line only against lines of its own span
+        // that fail their checks, the copies D8's condition 4 accepts when
+        // recording: a failed line of another span (a `\n` flipped in or
+        // out) may hold the true line's bytes (review of #233, finding 1).
+        let settled = if accepted {
+            theirs.iter().all(|witness| failed(witness) && witness.1)
+        } else {
+            line.check == LineCheck::Intact && theirs.iter().all(failed)
+        };
+        if accepted && !settled {
+            return Ok(Some(Contest::HotLineFails {
+                at: p,
+                line_start: line.start,
+                recorded: true,
+            }));
+        }
         if !settled
             && let Some(contested) = replica::first_contested_file_before(hot, witnesses, p, to)?
         {
@@ -2186,4 +2526,125 @@ pub(super) fn journal_contest(
         next = line.end;
     }
     Ok(None)
+}
+
+/// Whether a record of `recorded` matches hot's complete `line` of `hot`
+/// (ADR-066 D8): it starts at the record's offset and its bytes have the
+/// record's digest. The line is read only when a record names its offset.
+///
+/// # Errors
+///
+/// An I/O error on `hot`.
+pub(super) fn is_recorded(
+    hot: &Path,
+    line: &HeldLine,
+    recorded: &[LostLine],
+) -> std::io::Result<bool> {
+    if !recorded.iter().any(|record| record.offset == line.start) {
+        return Ok(false);
+    }
+    let sha = line_sha256_at(hot, line.start, line.end)?;
+    Ok(recorded
+        .iter()
+        .any(|record| record.matches(line.start, &sha)))
+}
+
+/// The digest a lost-line record names (`copy_ledger::line_sha256`) of the
+/// complete line of `path` in `[start, end)`, its `\n` at `end - 1` left
+/// out.
+///
+/// # Errors
+///
+/// An I/O error.
+fn line_sha256_at(path: &Path, start: u64, end: u64) -> std::io::Result<String> {
+    let mut file = fs::File::open(path)?;
+    file.seek(SeekFrom::Start(start))?;
+    let mut body = vec![0; usize::try_from(end.saturating_sub(start + 1)).unwrap_or(0)];
+    file.read_exact(&mut body)?;
+    Ok(copy_ledger::line_sha256(&body))
+}
+
+/// A complete line of hot's journal that fails its check (ADR-066 D2), as
+/// [`scan_journal`] finds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct FailedLine {
+    /// Its 1-based number.
+    pub number: u64,
+    /// Its first byte.
+    pub start: u64,
+    /// The byte after its `\n`.
+    pub end: u64,
+    /// The SHA-256 of its bytes without its `\n`
+    /// (`copy_ledger::line_sha256`).
+    pub sha256: String,
+}
+
+/// What [`scan_journal`] found in a journal's first `len` bytes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct JournalScan {
+    /// The complete lines (each ends with its `\n`).
+    pub lines: u64,
+    /// Those that verify their check.
+    pub intact: u64,
+    /// Those without the check (before ADR-066, torn, damaged in the
+    /// member, longer than `MAX_CHECKED_LINE`).
+    pub unchecked: u64,
+    /// Those that fail it, in file order.
+    pub failed: Vec<FailedLine>,
+    /// The bytes after the last `\n`: a line that may be in the middle of
+    /// being written, never classified.
+    pub partial: u64,
+}
+
+/// Streams the first `len` bytes of the journal at `path` one line at a
+/// time, at most `MAX_CHECKED_LINE` bytes of a line in memory, and
+/// classifies every complete line (ADR-066 D2): V3 of `mie store verify`
+/// and R7a of the repair read hot's journal through it.
+///
+/// # Errors
+///
+/// An I/O error, a file shorter than `len` included.
+pub(super) fn scan_journal(path: &Path, len: u64) -> std::io::Result<JournalScan> {
+    let file = fs::File::open(path)?;
+    let mut reader = BufReader::new(file.take(len));
+    let mut scan = JournalScan::default();
+    let mut offset = 0;
+    while let Some(line) = super::repair_hot::read_region_line(&mut reader)? {
+        let terminated = match &line.bytes {
+            Some(bytes) => bytes.last() == Some(&b'\n'),
+            // Past the cap: complete when the read ended inside `len`.
+            None => offset + line.len < len || byte_at(path, offset + line.len - 1)? == Some(b'\n'),
+        };
+        if !terminated {
+            scan.partial = line.len;
+            offset += line.len;
+            break;
+        }
+        scan.lines += 1;
+        match line
+            .bytes
+            .as_deref()
+            .and_then(|bytes| bytes.strip_suffix(b"\n"))
+        {
+            Some(body) => match check_line(body) {
+                LineCheck::Intact => scan.intact += 1,
+                LineCheck::Unchecked => scan.unchecked += 1,
+                LineCheck::Failed => scan.failed.push(FailedLine {
+                    number: scan.lines,
+                    start: offset,
+                    end: offset + line.len,
+                    sha256: copy_ledger::line_sha256(body),
+                }),
+            },
+            None => scan.unchecked += 1,
+        }
+        offset += line.len;
+    }
+    if offset < len {
+        return Err(std::io::Error::new(
+            ErrorKind::UnexpectedEof,
+            format!("{offset} of its {len} bytes read"),
+        ));
+    }
+    Ok(scan)
 }

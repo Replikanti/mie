@@ -43,6 +43,12 @@
 //!   U), which the rebuild did not read before #195.
 //! - **B2 Start:** the longest verified prefix among the targets' ledger
 //!   copies, configuration order on a tie, the header alone without one.
+//!   Every record of the start is carried, a `lost-line` record (ADR-066
+//!   D8) included; the B-rules never derive one, since they do not read
+//!   the copies' journals and the record is an operator's acceptance
+//!   (`mie store repair --record-lost-lines`), not a derivable fact. A
+//!   record that only hot's lost ledger tail held is gone after a rebuild:
+//!   the line fails `mie store verify` again until it is recorded again.
 //! - **B3 Texts:** a root holds a path when it has its manifest. The
 //!   distinct texts that parse and describe the path's own location, from
 //!   every root and the start, are the path's texts; two of them are a D5

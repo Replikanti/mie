@@ -22,6 +22,11 @@
 //!   `finding R` records before it that carry the same `at_ms`; findings of
 //!   a pass that never wrote its `verify` record (it stopped on an I/O
 //!   error) belong to no pass.
+//! - **A lost line** (`lost-line`, ADR-066 D8) is collected per journal
+//!   name, in ledger order ([`CopyState::lost_lines`]). It changes no file
+//!   list and no path verdict. A record matches a line of that journal
+//!   that starts at its offset and whose bytes have its digest
+//!   ([`LostLine::matches`]); the line number is not part of the match.
 //!
 //! The path verdicts are those of the union `select` ([`tiers`](crate::tiers)).
 
@@ -90,6 +95,28 @@ pub struct VerifyPass {
     pub files: BTreeSet<String>,
 }
 
+/// One `lost-line` record (ADR-066 D8), without its journal name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LostLine {
+    /// When it was recorded.
+    pub at_ms: i64,
+    /// The line's 1-based number when recorded.
+    pub line: u64,
+    /// The line's first byte.
+    pub offset: u64,
+    /// The SHA-256 of the line's bytes without its `\n`.
+    pub sha256: String,
+}
+
+impl LostLine {
+    /// Whether the record matches the line that starts at `offset` and
+    /// whose bytes without its `\n` have the digest `sha256`
+    /// ([`copy_ledger::line_sha256`](crate::copy_ledger::line_sha256)).
+    pub fn matches(&self, offset: u64, sha256: &str) -> bool {
+        self.offset == offset && self.sha256 == sha256
+    }
+}
+
 /// The copy state of one ledger read (module docs).
 #[derive(Debug, Clone)]
 pub struct CopyState {
@@ -104,6 +131,8 @@ pub struct CopyState {
     open_journal: BTreeSet<String>,
     open_entries: BTreeMap<String, BTreeSet<String>>,
     verifies: BTreeMap<String, Vec<VerifyPass>>,
+    /// Per journal name, its `lost-line` records in ledger order.
+    lost_lines: BTreeMap<String, Vec<LostLine>>,
 }
 
 /// The roots with an open copy-ledger finding: a `finding R … copy-ledger`
@@ -147,6 +176,7 @@ impl CopyState {
             open_journal: BTreeSet::new(),
             open_entries: BTreeMap::new(),
             verifies: BTreeMap::new(),
+            lost_lines: BTreeMap::new(),
         };
         // The findings of the pass in progress per root, with its `at_ms`.
         let mut pending: BTreeMap<String, (i64, Vec<Subject>)> = BTreeMap::new();
@@ -236,7 +266,28 @@ impl CopyState {
                             files,
                         });
                 }
-                _ => {}
+                Kind::LostLine {
+                    journal,
+                    line,
+                    offset,
+                    sha256,
+                } => state
+                    .lost_lines
+                    .entry(journal.clone())
+                    .or_default()
+                    .push(LostLine {
+                        at_ms: record.at_ms,
+                        line: *line,
+                        offset: *offset,
+                        sha256: sha256.clone(),
+                    }),
+                Kind::Removed { .. }
+                | Kind::Returned { .. }
+                | Kind::Lost { .. }
+                | Kind::Hold { .. }
+                | Kind::HoldCleared { .. }
+                | Kind::Quarantined { .. }
+                | Kind::Replaced { .. } => {}
             }
         }
         Ok(state)
@@ -371,6 +422,12 @@ impl CopyState {
             .get(root)
             .map(|open| open.iter().cloned().collect())
             .unwrap_or_default()
+    }
+
+    /// The `lost-line` records of the journal named `journal` (the file
+    /// name of `paths.journal`), in ledger order (ADR-066 D8).
+    pub fn lost_lines(&self, journal: &str) -> &[LostLine] {
+        self.lost_lines.get(journal).map_or(&[], Vec::as_slice)
     }
 
     /// Every verification pass over `root`, in ledger order.

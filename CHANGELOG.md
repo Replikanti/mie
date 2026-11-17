@@ -12,8 +12,7 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
 
 ### Added
 
-- **A per-line check in the capture journal (part of #224, ADR-066,
-  proposed).** Every line `mie ingest` writes ends with one more member,
+- **A per-line check in the capture journal (part of #224, ADR-066).** Every line `mie ingest` writes ends with one more member,
   `"crc32c":"<8 lowercase hex>"`: the CRC-32C of the line's own
   serialization without it, so a damaged line identifies itself with no
   other copy. The check is std-only (no new crate), adds 20 bytes a line
@@ -26,7 +25,7 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   `repair-hot` start using the verdicts in the follow-up PRs of #224.
 
 - **Journal damage attributed by the line check (part of #224, ADR-066
-  D4–D6, proposed).** `mie store repair` (R7) and `mie store repair-hot`
+  D4–D6).** `mie store repair` (R7) and `mie store repair-hot`
   judge each contradicted journal line by its check before they count
   bytes: a hot line that verifies against copy lines that fail is settled
   for hot with no majority, so one damaged copy against hot is rebuilt;
@@ -40,6 +39,26 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   `mie store verify` names the damaged side of a journal `prefix` finding
   (the copy, hot, or a fork). Lines without the check keep ADR-065's
   byte rules unchanged.
+
+- **Hot's own failed journal lines and the lost-line record (#224,
+  ADR-066 D6 V3 and D8; ADR-066 accepted).** `mie store verify` streams
+  hot's journal and fails on every complete line that fails its check,
+  naming both remedies: `mie store repair-hot --scope journal` when a copy
+  holds the line intact, otherwise `mie store repair --record-lost-lines`;
+  a last line without its line end, which may be in the middle of being
+  written, is not checked. So hot's newest lines, past every copy, are
+  verified with no copy. `mie store repair` names each such line, and with
+  `--record-lost-lines` appends a `lost-line` record to the copy ledger for
+  a line no copy target holds intact (every copy target must present its
+  marker and its journal copy must read); it writes no journal byte, so
+  `mie ingest` keeps running. A recorded line is a note in `verify` from
+  then on, and R7 rebuilds a copy whose line fails differently over the
+  same span to hot's accepted bytes; `repair-hot --scope journal` reads the same records. A
+  line damaged further or restored after its record fails again or leaves
+  a stale note. **Downgrade:** the copy ledger's parser of an earlier
+  binary refuses a ledger that holds a `lost-line` record, so after the
+  first record such a binary fails every tiered `select`, verify and
+  repair on that store.
 
 - **Storage tiers: `mie store repair-hot` (#217, ADR-065).** Repairs hot's
   own journal (`--scope journal`, with `mie ingest` stopped) or
