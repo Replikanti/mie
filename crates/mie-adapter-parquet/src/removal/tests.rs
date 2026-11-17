@@ -809,3 +809,49 @@ fn a_source_lock_is_free_after_its_drop_beside_a_duplicate() {
         drop(child);
     }
 }
+
+/// ADR-067 D7 in the re-check: a `displaced` record after the plan whose
+/// text names a file of a planned partition stops its removal (the copies
+/// the plan counted may have changed); one naming a file of another
+/// partition does not. Before the plan it changes nothing.
+#[test]
+fn a_displaced_record_after_the_plan_stops_the_removal() {
+    let displaced = |fx: &TieredFixture, path: &str| Kind::Displaced {
+        root: "cold-b".to_owned(),
+        dir: D0,
+        text: fx.other_text(path),
+    };
+    let fx = eligible("removal-displaced-after");
+    let path = TieredFixture::data_paths(&fx.hot, &partition())[0].clone();
+    let plan = plan_now(&fx, &TieredFixture::target_ids(), 2, &first_hot());
+    assert_eq!(plan.candidates.len(), 1);
+    fx.append(displaced(&fx, &path));
+    let report = remove(&fx, &plan);
+    assert!(report.removed.is_empty(), "{report:?}");
+    assert!(
+        report.skipped.iter().any(|(p, why)| *p == partition()
+            && why.contains("a displaced record after the plan names it")),
+        "{report:?}"
+    );
+    assert_eq!(removed_records(&fx, &partition()), 0);
+    assert!(layout::resolve(&fx.hot, &partition()).exists());
+
+    // Another partition's file: the removal goes ahead.
+    let fx = eligible("removal-displaced-elsewhere");
+    let elsewhere = TieredFixture::partition(&key(), 1);
+    let other = TieredFixture::data_paths(&fx.hot, &elsewhere)[0].clone();
+    let plan = plan_now(&fx, &TieredFixture::target_ids(), 2, &first_hot());
+    fx.append(displaced(&fx, &other));
+    let report = remove(&fx, &plan);
+    assert_eq!(report.removed, vec![partition()], "{report:?}");
+
+    // Before the plan: planned and removed as without it.
+    let fx = TieredFixture::new("removal-displaced-before");
+    fx.copy(&partition());
+    let path = TieredFixture::data_paths(&fx.hot, &partition())[0].clone();
+    fx.append(displaced(&fx, &path));
+    fx.ledger_copies();
+    let plan = plan_now(&fx, &TieredFixture::target_ids(), 2, &first_hot());
+    let report = remove(&fx, &plan);
+    assert_eq!(report.removed, vec![partition()], "{report:?}");
+}

@@ -165,7 +165,8 @@ impl LedgerView {
                 | Kind::LedgerCopy { .. }
                 | Kind::Finding { .. }
                 | Kind::Verify { .. }
-                | Kind::LostLine { .. } => {}
+                | Kind::LostLine { .. }
+                | Kind::Displaced { .. } => {}
             }
         }
         Ok(Self { entries })
@@ -312,7 +313,8 @@ pub(crate) struct TierState {
 impl TierState {
     /// Folds `ledger` for the partitions of `source`: the removed set, and
     /// the highest part per partition over the `manifest`, `copy`, `lost`,
-    /// `hold`, `hold-cleared`, `quarantined` and `replaced` paths.
+    /// `hold`, `hold-cleared`, `quarantined`, `replaced` and `displaced`
+    /// paths.
     ///
     /// # Errors
     ///
@@ -325,7 +327,11 @@ impl TierState {
         let mut state = Self::default();
         for record in &ledger.records {
             let path = match &record.kind {
-                Kind::Manifest { text } => manifest::parse(text)?.relative_path,
+                // A displaced file's path is named too, so no path any
+                // record names is ever reused (ADR-067 D7).
+                Kind::Manifest { text } | Kind::Displaced { text, .. } => {
+                    manifest::parse(text)?.relative_path
+                }
                 Kind::Copy { path, .. }
                 | Kind::Lost { path, .. }
                 | Kind::Hold { path, .. }

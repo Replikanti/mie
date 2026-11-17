@@ -179,3 +179,239 @@ fn verify_checks_supersede_records_and_skips_superseded_entries() {
     let report = verify(now + 3);
     assert!(about(&report, &s1, "missing"), "{report:?}");
 }
+
+/// The first live path of `fixture` and hot's manifest text of it with one
+/// row more: a self-consistent other file's text over the same data.
+fn live_and_other(fixture: &Fixture) -> (String, String) {
+    let path = replica::list_sealed(&fixture.hot)
+        .unwrap()
+        .into_iter()
+        .find(|p| p.starts_with("source=binance-um"))
+        .unwrap();
+    let text = fs::read_to_string(fixture.hot.join(manifest_name(&path))).unwrap();
+    let rows = text
+        .lines()
+        .find_map(|line| line.strip_prefix("rows "))
+        .unwrap()
+        .to_owned();
+    let other = text.replace(
+        &format!("\nrows {rows}\n"),
+        &format!("\nrows {}\n", rows.parse::<u64>().unwrap() + 1),
+    );
+    (path, other)
+}
+
+fn manifest_name(path: &str) -> String {
+    format!("{}.manifest", path.strip_suffix(".parquet").unwrap())
+}
+
+fn verify_at(fixture: &Fixture, now: i64) -> VerifyReport {
+    run(
+        &fixture.config,
+        Some(&fixture.archive()),
+        "24",
+        &fixture.probe,
+        &|| now,
+        &CopyLedger::at(&fixture.hot),
+    )
+}
+
+/// ADR-067 D6: a `displaced` record of a copy target whose manifest of the
+/// path is no longer the record's text is a note naming the path, rows,
+/// SHA-256 and directory, and the verification passes.
+#[test]
+fn v4_a_displaced_record_is_a_note() {
+    let fixture = Fixture::new("verify-displaced-note");
+    assert_eq!(fixture.pass().problems, Vec::<String>::new());
+    let (path, other) = live_and_other(&fixture);
+    let parsed = replica::parse_manifest(&other).unwrap();
+    CopyLedger::at(&fixture.hot)
+        .append(&Record {
+            at_ms: D0 + 10,
+            kind: Kind::Displaced {
+                root: "cold-b".to_owned(),
+                dir: D0 + 10,
+                text: other,
+            },
+        })
+        .unwrap();
+    let report = verify_at(&fixture, D0 + 3_600_000);
+    assert_eq!(report.problems, Vec::<String>::new(), "{report:?}");
+    let dir = replica::damaged_dir(&fixture.cold[1], D0 + 10);
+    assert!(
+        report.lines.iter().any(|l| l.contains(&path)
+            && l.contains("cold-b")
+            && l.contains(&format!("rows {}", parsed.rows))
+            && l.contains(&parsed.sha256)
+            && l.contains(&dir.display().to_string())),
+        "{report:?}"
+    );
+}
+
+/// ADR-067 D6: while the target's manifest of the path still equals the
+/// record's text (a move that crashed after its record), the note is a
+/// `FAIL` naming `mie store repair`.
+#[test]
+fn v4_an_incomplete_move_fails_naming_the_repair() {
+    let fixture = Fixture::new("verify-displaced-incomplete");
+    assert_eq!(fixture.pass().problems, Vec::<String>::new());
+    let (path, other) = live_and_other(&fixture);
+    let manifest = fixture.cold[1].join(manifest_name(&path));
+    let mut permissions = fs::metadata(&manifest).unwrap().permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    permissions.set_readonly(false);
+    fs::set_permissions(&manifest, permissions).unwrap();
+    fs::write(&manifest, &other).unwrap();
+    CopyLedger::at(&fixture.hot)
+        .append(&Record {
+            at_ms: D0 + 10,
+            kind: Kind::Displaced {
+                root: "cold-b".to_owned(),
+                dir: D0 + 10,
+                text: other,
+            },
+        })
+        .unwrap();
+    let report = verify_at(&fixture, D0 + 3_600_000);
+    assert!(
+        report.problems.iter().any(|p| p.contains(&path)
+            && p.contains("cold-b")
+            && p.contains("did not complete")
+            && p.contains("`mie store repair`")),
+        "{report:?}"
+    );
+}
+
+/// Makes the manifest of `path` on `root` writable and writes `text` to it.
+fn overwrite_manifest(root: &Path, path: &str, text: &str) {
+    let manifest = root.join(manifest_name(path));
+    let mut permissions = fs::metadata(&manifest).unwrap().permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    permissions.set_readonly(false);
+    fs::set_permissions(&manifest, permissions).unwrap();
+    fs::write(&manifest, text).unwrap();
+}
+
+/// Appends the `displaced` record of `text` on cold-b, directory `D0 + 10`.
+fn record_displaced(fixture: &Fixture, text: &str) {
+    CopyLedger::at(&fixture.hot)
+        .append(&Record {
+            at_ms: D0 + 10,
+            kind: Kind::Displaced {
+                root: "cold-b".to_owned(),
+                dir: D0 + 10,
+                text: text.to_owned(),
+            },
+        })
+        .unwrap();
+}
+
+/// ADR-067 D6: when the damaged directory holds the record's manifest, the
+/// note says the move put the file there.
+#[test]
+fn v4_a_completed_move_is_a_note_naming_the_damaged_directory() {
+    let fixture = Fixture::new("verify-displaced-moved");
+    assert_eq!(fixture.pass().problems, Vec::<String>::new());
+    let (path, other) = live_and_other(&fixture);
+    record_displaced(&fixture, &other);
+    let dir = replica::damaged_dir(&fixture.cold[1], D0 + 10);
+    let aside = dir.join(manifest_name(&path));
+    fs::create_dir_all(aside.parent().unwrap()).unwrap();
+    fs::write(&aside, &other).unwrap();
+    let report = verify_at(&fixture, D0 + 3_600_000);
+    assert_eq!(report.problems, Vec::<String>::new(), "{report:?}");
+    assert!(
+        report.lines.iter().any(|l| l.contains(&path)
+            && l.contains("cold-b")
+            && l.contains("`mie store repair --move-other-files` moved")
+            && l.contains(&format!("into {}", dir.display()))),
+        "{report:?}"
+    );
+}
+
+/// ADR-067 D6 (#234 review, round 2): the recorded move never happened,
+/// and a later replace moved the target's files of the path into the
+/// root's quarantine. The note names the quarantine and never says the
+/// file was moved into the damaged directory, which does not hold it.
+#[test]
+fn v4_a_displaced_file_a_replace_moved_is_named_in_its_quarantine() {
+    let fixture = Fixture::new("verify-displaced-replaced");
+    assert_eq!(fixture.pass().problems, Vec::<String>::new());
+    let (path, other) = live_and_other(&fixture);
+    let parsed = replica::parse_manifest(&other).unwrap();
+    let target = &fixture.cold[1];
+    overwrite_manifest(target, &path, &other);
+    record_displaced(&fixture, &other);
+    // The replace: the target's files of the path move into its
+    // quarantine, and the ledger records `quarantined` and `replaced`.
+    let id = "q-1000";
+    let quarantine = replica::quarantine_dir(target, id);
+    for name in [path.clone(), manifest_name(&path)] {
+        let to = quarantine.join(&name);
+        fs::create_dir_all(to.parent().unwrap()).unwrap();
+        fs::rename(target.join(&name), &to).unwrap();
+    }
+    for kind in [
+        Kind::Quarantined {
+            path: path.clone(),
+            quarantine: id.to_owned(),
+        },
+        Kind::Replaced {
+            path: path.clone(),
+            entry: "aggTrades/BTCUSDT-aggTrades-2026-10-01.zip.1.import".to_owned(),
+        },
+    ] {
+        CopyLedger::at(&fixture.hot)
+            .append(&Record {
+                at_ms: D0 + 20,
+                kind,
+            })
+            .unwrap();
+    }
+    let report = verify_at(&fixture, D0 + 3_600_000);
+    let notes: Vec<&String> = report
+        .lines
+        .iter()
+        .filter(|l| l.contains(&path) && l.contains("cold-b") && l.contains(&parsed.sha256))
+        .collect();
+    assert!(!notes.is_empty(), "{report:?}");
+    assert!(
+        notes
+            .iter()
+            .all(|l| !l.contains("`mie store repair --move-other-files` moved")),
+        "{notes:?}"
+    );
+    assert!(
+        notes.iter().any(|l| l.starts_with("note: ")
+            && l.contains("replace")
+            && l.contains(&quarantine.display().to_string())),
+        "{notes:?}"
+    );
+    assert!(
+        report.problems.iter().all(|p| !p.contains(&parsed.sha256)),
+        "{report:?}"
+    );
+}
+
+/// ADR-067 D6: neither the path nor the damaged directory holds the
+/// record's manifest: the note says so and names no place it did not
+/// check.
+#[test]
+fn v4_a_displaced_file_found_nowhere_names_no_location() {
+    let fixture = Fixture::new("verify-displaced-nowhere");
+    assert_eq!(fixture.pass().problems, Vec::<String>::new());
+    let (path, other) = live_and_other(&fixture);
+    record_displaced(&fixture, &other);
+    let report = verify_at(&fixture, D0 + 3_600_000);
+    assert_eq!(report.problems, Vec::<String>::new(), "{report:?}");
+    let dir = replica::damaged_dir(&fixture.cold[1], D0 + 10);
+    assert!(
+        report.lines.iter().any(|l| l.starts_with("note: ")
+            && l.contains(&path)
+            && l.contains("no longer under the path")
+            && l.contains(&format!("{} does not hold", dir.display()))
+            && !l.contains("moved")
+            && !l.contains("deleted")),
+        "{report:?}"
+    );
+}

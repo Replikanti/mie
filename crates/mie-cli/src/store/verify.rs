@@ -53,6 +53,19 @@
 //!     R) is `copies`, except an archive part that no current hot entry
 //!     lists (it waits for its entry) and a file on hot whose data mtime lies within
 //!     G before now.
+//!   - *Displaced files* (ADR-067 D6): each `displaced` record of R is a
+//!     note naming the path, rows, SHA-256 and directory; it is a `FAIL`
+//!     naming `mie store repair` while R's manifest of the path still
+//!     equals the record's text (the recorded move did not complete), one
+//!     naming `mie store resolve` first for a held path, and a note again
+//!     for a lost, conflicting, replaced or pending path, which no repair
+//!     rule visits (#234 review, finding 2). An I/O error reading that
+//!     manifest stops R. Once R's manifest no longer equals the text, the
+//!     note says the file was moved into the record's directory only when
+//!     that directory's manifest equals the text, and into the replace's
+//!     `.quarantine/<id>/` (a replaced or pending path) only when that one
+//!     does; otherwise it says neither holds it, naming no other place
+//!     (#234 review, round 2).
 //!   - *Entries:* each current hot entry whose listed parts all have
 //!     `copy` records for R older than G, and each supersede record whose
 //!     mtime on hot lies outside G before now (a future mtime is never
@@ -106,10 +119,11 @@
 //!   behind, so a healthy replicator copies a part within two intervals. A
 //!   future mtime is never exempt.
 //! - **V9 Output.** One summary line per root (hot's followed by its
-//!   journal's summary and notes), then the `FAIL:` lines: hot (its sealed
+//!   journal's summary and notes, a copy target's by its displaced
+//!   notes), then the `FAIL:` lines: hot (its sealed
 //!   files, then its journal's lines); each root in configuration order
-//!   (data paths in path order, then entries, the copy ledger and the
-//!   journal); then `stale`; then one line per file with fewer than k good
+//!   (data paths in path order, then displaced files, entries, the copy
+//!   ledger and the journal); then `stale`; then one line per file with fewer than k good
 //!   copies. That last check needs every
 //!   copy target verified in this run; otherwise the `not verified` and
 //!   `stale` lines stand in for it, instead of one line per file of the
@@ -132,7 +146,7 @@ use mie_adapter_parquet::copy_ledger::{
 };
 use mie_adapter_parquet::replica::{self, CopyCheck, CopyError, Side, TailSource};
 use mie_adapter_parquet::root_marker::{self, HOT_ID};
-use mie_adapter_parquet::verification::{CopyState, LostLine, PathVerdict};
+use mie_adapter_parquet::verification::{CopyState, Displaced, LostLine, PathVerdict};
 use mie_ports::raw::RawStoreError;
 use std::collections::BTreeSet;
 use std::fs;
@@ -207,6 +221,8 @@ struct Root {
     bad: BTreeSet<String>,
     /// Its summary line.
     summary: Option<String>,
+    /// Its notes: the `displaced` records of a copy target (ADR-067 D6).
+    notes: Vec<String>,
 }
 
 /// Why a root's walk ended early.
@@ -384,6 +400,7 @@ pub fn run(
             problems: Vec::new(),
             bad: BTreeSet::new(),
             summary: None,
+            notes: Vec::new(),
         });
     }
     let marked: Vec<&Path> = roots
@@ -833,6 +850,9 @@ impl Verify<'_> {
             }
         }
 
+        // The displaced files (ADR-067 D6).
+        self.displaced_notes(i)?;
+
         // Entries.
         let mut entries_checked = 0usize;
         if self.archive.is_some() {
@@ -998,6 +1018,130 @@ impl Verify<'_> {
              byte(s) of the copy ledger",
             self.verified_len
         ));
+        Ok(())
+    }
+
+    /// V4's notes on the `displaced` records of the copy target `i`
+    /// (ADR-067 D6): a note per record, a `FAIL` while the target's
+    /// manifest of the path still equals the record's text (the recorded
+    /// move did not complete).
+    fn displaced_notes(&mut self, i: usize) -> Result<(), Stop> {
+        let id = self.roots[i].id.clone().unwrap_or_default();
+        let root = self.roots[i].path.clone();
+        let name = self.name(i);
+        for record in self.state.displaced(&id).to_vec() {
+            let manifest = root.join(format!(
+                "{}.manifest",
+                record.path.strip_suffix(".parquet").unwrap_or(&record.path)
+            ));
+            let present = match fs::read(&manifest) {
+                Ok(bytes) => record.matches(&bytes),
+                Err(error) if error.kind() == ErrorKind::NotFound => false,
+                Err(error) => {
+                    return Err(Stop::Root(format!(
+                        "reading {}: {error}",
+                        manifest.display()
+                    )));
+                }
+            };
+            let aside = replica::damaged_dir(&root, record.dir);
+            let file = format!(
+                "a self-consistent other file (rows {}, SHA-256 {}), displaced record at {}",
+                record.rows, record.sha256, record.at_ms
+            );
+            let what = format!("{file}, into {}", aside.display());
+            // The remedy by the path's verdict: R5b completes a move only
+            // where R5a may move (gate 1), and no repair rule visits a lost,
+            // conflicting, replaced or pending path, so verify never fails
+            // naming a repair that never acts (review of #234, finding 2).
+            let verdict = self.state.verdict(&record.path);
+            let unvisited = match verdict {
+                None
+                | Some(PathVerdict::Ordinary | PathVerdict::NoManifest | PathVerdict::Held) => None,
+                Some(PathVerdict::Lost) => Some(
+                    "the path is recorded lost: nothing is written for a lost path (ADR-062 \
+                     D11), and every selection that covers it fails",
+                ),
+                Some(PathVerdict::Conflict) => Some(
+                    "the copy ledger holds two manifest texts for the path, and every selection \
+                     that covers it fails",
+                ),
+                Some(PathVerdict::Replaced | PathVerdict::Pending) => {
+                    Some("the path's files are the replace resolution's (ADR-062 D11)")
+                }
+            };
+            if present && let Some(why) = unvisited {
+                self.roots[i].notes.push(format!(
+                    "note: {} on {name}: the recorded move of {what} did not complete, and {why}; \
+                     no repair rule visits the path, so no repair moves the file, and it stays \
+                     in place, never deleted (ADR-067 D6)",
+                    record.path
+                ));
+            } else if present && verdict == Some(PathVerdict::Held) {
+                self.roots[i].problems.push(format!(
+                    "{} on {name}: the recorded move of {what} did not complete: the target still \
+                     holds it, and the path is held: `mie store resolve` decides the hold first, \
+                     then `mie store repair` completes it (ADR-067 D5, D6)",
+                    record.path
+                ));
+            } else if present {
+                self.roots[i].problems.push(format!(
+                    "{} on {name}: the recorded move of {what} did not complete: the target still \
+                     holds it; `mie store repair` completes it (ADR-067 D6)",
+                    record.path
+                ));
+            } else {
+                // The note names only a place it checked: the damaged
+                // directory, or for a replaced or pending path the
+                // replace's quarantine, each holding the record's text
+                // (review of #234, round 2).
+                let manifest_name = manifest.strip_prefix(&root).unwrap_or(&manifest);
+                let held = holds_record(&aside.join(manifest_name), &record);
+                let note = if held == Ok(true) {
+                    format!("`mie store repair --move-other-files` moved {what}, never deleted")
+                } else {
+                    let quarantine = match verdict {
+                        Some(PathVerdict::Replaced | PathVerdict::Pending) => self
+                            .state
+                            .quarantine(&record.path)
+                            .map(|id| replica::quarantine_dir(&root, id)),
+                        _ => None,
+                    };
+                    let quarantined = quarantine
+                        .as_ref()
+                        .map(|dir| (dir, holds_record(&dir.join(manifest_name), &record)));
+                    let unread = |checked: &Result<bool, String>, dir: &Path| match checked {
+                        Err(error) => format!(" ({} cannot be read: {error})", dir.display()),
+                        Ok(_) => String::new(),
+                    };
+                    match quarantined {
+                        Some((dir, Ok(true))) => format!(
+                            "the recorded move of {what} did not complete, and the replace \
+                             resolution moved the path's files into its quarantine {}, never \
+                             deleted (ADR-062 D11)",
+                            dir.display()
+                        ),
+                        Some((dir, checked)) => format!(
+                            "{file} is no longer under the path, and neither {} nor the replace \
+                             resolution's quarantine {} holds the record's manifest{}{}",
+                            aside.display(),
+                            dir.display(),
+                            unread(&held, &aside),
+                            unread(&checked, dir)
+                        ),
+                        None => format!(
+                            "{file} is no longer under the path, and {} does not hold the \
+                             record's manifest{}",
+                            aside.display(),
+                            unread(&held, &aside)
+                        ),
+                    }
+                };
+                self.roots[i]
+                    .notes
+                    .push(format!("note: {} on {name}: {note} (ADR-067)", record.path));
+            }
+        }
         Ok(())
     }
 
@@ -1190,6 +1334,7 @@ impl Verify<'_> {
                 Some(why) => lines.push(format!("{}: not checked: {why}", self.name(i))),
                 None => lines.extend(root.summary.clone()),
             }
+            lines.extend(root.notes.iter().cloned());
         }
         problems.extend(stale);
         if all_verified {
@@ -1238,6 +1383,20 @@ impl Verify<'_> {
     }
 }
 
+/// Whether `manifest` (a displaced file's manifest outside the layout)
+/// holds `record`'s text byte for byte: `Ok(false)` when it is absent or
+/// holds other bytes, `Err` naming any other I/O error. A displaced note
+/// only names a place this checked (ADR-067 D6).
+fn holds_record(manifest: &Path, record: &Displaced) -> Result<bool, String> {
+    match fs::read(manifest) {
+        Ok(bytes) => Ok(record.matches(&bytes)),
+        Err(error) if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
+            Ok(false)
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
 /// The partition directory of a data path.
 fn partition_of(path: &str) -> &str {
     path.rsplit_once('/')
@@ -1254,7 +1413,9 @@ fn describe(check: CopyCheck, path: &str) -> String {
         CopyCheck::Manifest { other_file: true } => format!(
             "manifest: its manifest differs from the copy ledger's manifest record and its data \
              matches that other manifest: two sealed files under one path {path}, which must be \
-             byte-identical on every root (ADR-062 D5)"
+             byte-identical on every root (ADR-062 D5); after checking it, and once hot's copy is \
+             good or hot holds none of the path, `mie store repair --move-other-files` moves it \
+             aside and records the move (ADR-067)"
         ),
         CopyCheck::Manifest { other_file: false } => {
             "manifest: its manifest is absent or differs from the copy ledger's manifest record \

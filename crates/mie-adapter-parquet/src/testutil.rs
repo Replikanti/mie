@@ -180,6 +180,22 @@ impl TieredFixture {
             .expect("a data path")
     }
 
+    /// Hot's manifest text of `path` with its row count raised by one: the
+    /// text of a self-consistent other file under the path (ADR-067), the
+    /// text a `displaced` record carries.
+    pub(crate) fn other_text(&self, path: &str) -> String {
+        let manifest = Self::manifest_of(path);
+        let text = std::fs::read_to_string(crate::layout::resolve(&self.hot, &manifest))
+            .expect("read a manifest");
+        let rows = text
+            .lines()
+            .find_map(|line| line.strip_prefix("rows "))
+            .expect("a rows line")
+            .to_owned();
+        let more = rows.parse::<u64>().expect("a row count") + 1;
+        text.replace(&format!("\nrows {rows}\n"), &format!("\nrows {more}\n"))
+    }
+
     /// Copies every file of hot's `partition` to both cold roots and
     /// records it: one `manifest` record per file, then one `copy` record
     /// per root (D5, the copy protocol).

@@ -16,16 +16,17 @@
 //!   held for the whole run: replication pauses while it runs. A copy target
 //!   without its marker is named, skipped and never written.
 //! - **R1 Data copies with an open finding** (a finding after the latest
-//!   `copy` record, the remover's rule): good now, a fresh `copy` record and
-//!   no byte written; a self-consistent other file, refused and never moved
-//!   (D5); otherwise a good source (R3), the bad copy moved aside (R5), the
+//!   `copy` record, the remover's rule): R5b first; good now, a fresh
+//!   `copy` record and no byte written; a self-consistent other file, R5a
+//!   (ADR-067); otherwise a good source (R3), the bad copy moved aside (R5), the
 //!   D5 copy from the source, its published text checked against the
 //!   ledger's, the marker re-read, and a fresh `copy` record. That record
 //!   ends the finding's void, so a repaired partition becomes removable
 //!   again (the comment of 2026-11-08).
 //! - **R2 Refill:** a path that left hot (its partition recorded removed)
 //!   with a recorded copy on some configured target but none on R is copied
-//!   to R from a source and recorded. The class is the adoption's own
+//!   to R from a source and recorded, after R5b, and after R5a for a
+//!   self-consistent other file there. The class is the adoption's own
 //!   (`adopt::complete`), so repair and adopt never disagree. Files on hot
 //!   that lack a target are left to the closing pass, after R2b.
 //! - **R2b Unrecorded copies of hot's files** (#219): for every path hot
@@ -35,9 +36,10 @@
 //!   manifest: that form is judged against the text (the ledger's
 //!   `manifest` record, else hot's manifest, as V3 reads it) by the test
 //!   the closing pass's D5 copy from hot applies, the restore's H6 k1
-//!   (`restore::unrecorded_copy`). A copy the pass accepts stays, and the
-//!   closing pass records it or publishes its manifest; a self-consistent
-//!   other file is refused and never moved, as in R1 (D5; #227). Every
+//!   (`restore::unrecorded_copy`), after R5b. A copy the pass accepts
+//!   stays, and the closing pass records it or publishes its manifest; a
+//!   self-consistent other file is R5a's (ADR-067), behind the same hot
+//!   and archive-entry gates as a moved form. Every
 //!   other form, an unreadable one included (a `FAIL:`, #219 STOP 1
 //!   decision 2), is moved aside (R5), and the closing pass copies the
 //!   path from hot and records it; R2b itself writes no record and copies
@@ -81,6 +83,38 @@
 //!   each an atomic rename on the same filesystem. Nothing in mie deletes or
 //!   lists it: the bytes are the evidence of a shared cause, the rename
 //!   costs no I/O, and an overwrite that crashes leaves neither version.
+//! - **R5a Displacement** (ADR-067 D5), for a copy target's form judged a
+//!   self-consistent other file (its own manifest differs from the path's
+//!   text, the ledger's `manifest` record else hot's manifest, and its data
+//!   matches it: an earlier D5 violation, a path sealed twice). Gates, in
+//!   order, each a named problem that writes nothing: the path's verdict
+//!   is ordinary (R1, R2) or none, ordinary or without a `manifest` record
+//!   (R2b), and a held path's other file names `mie store resolve`, since
+//!   the texts of a hold are the resolution's; in R2b the archive-entry
+//!   gate and hot's copy good; in R1 and R2 a good source (R3), then hot
+//!   holding none of the path or a copy that checks good (a target's file
+//!   may be a copy of hot's own other file, review of #234); the flag
+//!   `--move-other-files`, whose absence names the other file's rows and
+//!   SHA-256; the marker, re-read; none of the path's four names already
+//!   below the run's `.mie/damaged/<at_ms>/`. Then `displaced <at_ms>
+//!   <root> <dir> <text>` is appended, carrying the other file's manifest
+//!   text, and only then R5's move. R1 and R2 go on to the D5 copy from
+//!   the source and its `copy` record; R2b leaves the path to the closing
+//!   pass.
+//! - **R5b Completion** (ADR-067 D5), first for every path and copy target
+//!   R1, R2 and R2b visit: when a `displaced` record of that root carries a
+//!   text equal, byte for byte, to the target's manifest of the path, the
+//!   marker is re-read and R5's move completes into the record's own
+//!   directory, with no flag and no new record (the record is the
+//!   operator's consent), but only under gate 1: a held path's move waits
+//!   for `mie store resolve` (review of #234). No rule visits a lost path
+//!   (nothing is written for it), and verify names that as a note. It
+//!   completes a crash after the record, and one
+//!   between the data rename and the manifest rename, whose manifest alone
+//!   would otherwise be judged a manifest without its data and moved into
+//!   a new run's directory. A record matches no other text, so the path's
+//!   recorded file placed there afterwards, whose rows and SHA-256 the
+//!   other file may share, is never moved.
 //! - **R6 Ledger copies with an open copy-ledger finding:** when the copy's
 //!   chain fails at or before the first byte f where it differs from hot,
 //!   it is moved aside and rebuilt as hot's verified bytes up to f, and the
@@ -190,7 +224,7 @@ use mie_adapter_parquet::replica::{
     self, Contested, CopyCheck, CopyError, Side, TailSource, TempName,
 };
 use mie_adapter_parquet::root_marker::{self, HOT_ID};
-use mie_adapter_parquet::verification::{CopyState, LostLine, PathVerdict};
+use mie_adapter_parquet::verification::{CopyState, Displaced, LostLine, PathVerdict};
 use mie_ports::raw::RawStoreError;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -211,14 +245,17 @@ pub(crate) enum RepairStep {
     /// A tail copy (ledger or journal) was rebuilt, before the closing
     /// pass.
     AfterTailRebuild,
+    /// A `displaced` record was appended, before its move (R5a, ADR-067).
+    AfterDisplacedRecord,
 }
 
 #[cfg(test)]
 impl RepairStep {
-    pub(crate) const ALL: [Self; 3] = [
+    pub(crate) const ALL: [Self; 4] = [
         Self::AfterMoveAside,
         Self::AfterPublish,
         Self::AfterTailRebuild,
+        Self::AfterDisplacedRecord,
     ];
 }
 
@@ -267,6 +304,10 @@ pub struct Flags {
     /// `--record-lost-lines`: R7a appends the `lost-line` record of every
     /// recordable line of hot's journal (ADR-066 D8).
     pub record_lost_lines: bool,
+    /// `--move-other-files`: R5a moves a copy target's self-consistent
+    /// other file under a recorded path into that root's
+    /// `.mie/damaged/<at_ms>/`, after its `displaced` record (ADR-067).
+    pub move_other_files: bool,
 }
 
 /// What one repair did: its report lines and every problem that makes it
@@ -704,6 +745,15 @@ fn stuck_temps(root: &Path, path: &str) -> Vec<(PathBuf, String)> {
     stuck
 }
 
+/// How R2b describes a self-consistent other file whose own manifest
+/// differs from `origin`'s text.
+fn other_found(origin: &str) -> String {
+    format!(
+        "a self-consistent other file under the same path (its own manifest differs from \
+         {origin} and its data matches it)"
+    )
+}
+
 /// What R2b found on a copy target, for the move and its report.
 enum Found {
     /// A form the pass's D5 copy refuses, with why.
@@ -713,6 +763,8 @@ enum Found {
     /// Temp names the pass's copy cannot remove, from [`stuck_temps`],
     /// and what is beside them.
     Stuck(Vec<(PathBuf, String)>, Beside),
+    /// A self-consistent other file under the path: R5a's (ADR-067).
+    Other,
 }
 
 /// What is beside the temp names R2b moves alone ([`Found::Stuck`]).
@@ -765,8 +817,7 @@ impl Reach {
 /// Whether `root` holds the data file or the manifest of `path`, without
 /// judging either: a name that cannot be inspected counts as held.
 fn form_present(root: &Path, path: &str) -> bool {
-    let manifest = format!("{}.manifest", path.strip_suffix(".parquet").unwrap_or(path));
-    [root.join(path), root.join(manifest)].iter().any(
+    [root.join(path), root.join(manifest_of(path))].iter().any(
         |file| !matches!(fs::symlink_metadata(file), Err(e) if e.kind() == ErrorKind::NotFound),
     )
 }
@@ -809,6 +860,30 @@ fn hot_check(check: &Result<CopyCheck, RawStoreError>) -> String {
         Ok(CopyCheck::Sha256) => "sha256".to_owned(),
         Err(error) => format!("it cannot be read: {error}"),
     }
+}
+
+/// The manifest name of the data path `path`.
+fn manifest_of(path: &str) -> String {
+    format!("{}.manifest", path.strip_suffix(".parquet").unwrap_or(path))
+}
+
+/// The names of the part `path` below the directory `aside` (a
+/// [`replica::damaged_dir`]) that already exist: `D`, `M`, `D~`, `M~`.
+/// A name that cannot be inspected counts as taken.
+fn taken_names(aside: &Path, path: &str) -> Vec<String> {
+    let mut names = vec![aside.join(path), aside.join(manifest_of(path))];
+    for name in [TempName::Data, TempName::Manifest] {
+        if let Ok(temp) = replica::temp_path(aside, path, name) {
+            names.push(temp);
+        }
+    }
+    names
+        .into_iter()
+        .filter(
+            |name| !matches!(fs::symlink_metadata(name), Err(e) if e.kind() == ErrorKind::NotFound),
+        )
+        .map(|name| name.display().to_string())
+        .collect()
 }
 
 /// Where a copy's relative `path` goes in the damaged directory of `root`.
@@ -1010,6 +1085,10 @@ impl Repair<'_> {
         let root = self.marked[i].path.clone();
         let id = self.marked[i].id.clone();
         let name = self.name(i);
+        // R5b: a recorded move that did not complete.
+        if !self.complete_displaced(i, path)? {
+            return Ok(());
+        }
         let check = match replica::check_sealed_copy(&root, path, text) {
             Ok(check) => check,
             Err(error) => {
@@ -1017,35 +1096,56 @@ impl Repair<'_> {
                 return Ok(());
             }
         };
-        match check {
-            CopyCheck::Good => {
-                if !self.marker_present(i) {
-                    return Ok(());
-                }
-                self.append(Kind::Copy {
-                    path: path.to_owned(),
-                    root: id.clone(),
-                })?;
-                self.line(format!(
-                    "{path} on {name}: re-verified good, recorded again; no byte written"
-                ));
+        if check == CopyCheck::Good {
+            if !self.marker_present(i) {
                 return Ok(());
             }
-            CopyCheck::Manifest { other_file: true } => {
-                self.problem(format!(
-                    "{path} on {name}: refused: it holds a self-consistent other file under the \
-                     same path (its own manifest differs from the copy ledger's and its data \
-                     matches it), two sealed files under one path, never a damaged copy; it is \
-                     not moved (ADR-062 D5)"
-                ));
-                return Ok(());
-            }
-            _ => {}
+            self.append(Kind::Copy {
+                path: path.to_owned(),
+                root: id.clone(),
+            })?;
+            self.line(format!(
+                "{path} on {name}: re-verified good, recorded again; no byte written"
+            ));
+            return Ok(());
+        }
+        let other = check == CopyCheck::Manifest { other_file: true };
+        let found = "a self-consistent other file under the same path (its own manifest \
+                     differs from the copy ledger's and its data matches it)";
+        // R5a gate 1: the texts of a held path are the resolution's.
+        if other && self.state.verdict(path) != Some(PathVerdict::Ordinary) {
+            self.held_other(&name, path, found);
+            return Ok(());
         }
         let sources = self.source(path, text, &root);
         let Some(source) = self.good_source(path, text, sources) else {
             return Ok(());
         };
+        if other {
+            // R5a gate 2 for R1 and R2: hot holds none of the path, or its
+            // copy checks good against the text. When hot holds a
+            // self-consistent other file itself, the target's file may be a
+            // copy of hot's bytes, and that hot-versus-ledger state is
+            // ADR-067's out of scope (review of #234, finding 1).
+            if let Some(why) = self.hot_not_good(path, text) {
+                self.problem(format!(
+                    "{path} on {name}: refused: it holds {found}, but hot's copy is not good \
+                     ({why}); it is not moved, even with --move-other-files: while hot does not \
+                     hold the copy ledger's text, the target's file may be a copy of hot's own, \
+                     and a text on hot that differs from the copy ledger's needs its own \
+                     decision. R4 repairs a damaged hot copy when a cold root holds a good one; \
+                     then run the repair again (ADR-067 D5)"
+                ));
+                return Ok(());
+            }
+            let then = format!(
+                "the path's recorded file is copied there from {}",
+                source.display()
+            );
+            if !self.displace(i, path, found, &then)? {
+                return Ok(());
+            }
+        }
         if !self.marker_present(i) {
             return Ok(());
         }
@@ -1104,6 +1204,29 @@ impl Repair<'_> {
             source.display()
         ));
         Ok(())
+    }
+
+    /// Why hot's copy of `path` is not good against `text`, if it holds
+    /// any of the path: R5a gate 2 of R1 and R2 (ADR-067 D5). `None` when
+    /// it checks good, or when hot holds neither the data nor the
+    /// manifest (a path that left hot); a manifest without its data and a
+    /// copy that cannot be read are not good (fail closed).
+    fn hot_not_good(&self, path: &str, text: &str) -> Option<String> {
+        let check = replica::check_sealed_copy(self.hot, path, text);
+        match check {
+            Ok(CopyCheck::Good) => None,
+            Ok(CopyCheck::Missing) => {
+                match fs::symlink_metadata(self.hot.join(manifest_of(path))) {
+                    Err(error) if error.kind() == ErrorKind::NotFound => None,
+                    Ok(_) => Some("a manifest without its data".to_owned()),
+                    Err(error) => Some(format!("its manifest cannot be inspected: {error}")),
+                }
+            }
+            Ok(CopyCheck::Manifest { other_file: true }) => {
+                Some("hot holds a self-consistent other file under the path".to_owned())
+            }
+            _ => Some(hot_check(&check)),
+        }
     }
 
     /// R2b: the forms the marked copy targets `targets` hold of files hot
@@ -1166,6 +1289,10 @@ impl Repair<'_> {
                     }
                     continue;
                 }
+                // R5b: a recorded move that did not complete.
+                if !self.complete_displaced(i, path)? {
+                    continue;
+                }
                 match r2b_form(&self.marked[i].path, path, &text) {
                     Ok(Form::Judged(UnrecordedCopy::Absent | UnrecordedCopy::Accepted)) => {}
                     Ok(Form::Stuck { stuck, accepted }) => {
@@ -1176,13 +1303,16 @@ impl Repair<'_> {
                         };
                         candidates.push((i, Found::Stuck(stuck, beside)));
                     }
-                    Ok(Form::Judged(UnrecordedCopy::OtherFile)) => self.problem(format!(
-                        "{path} on {name}: refused: it holds no recorded copy but a \
-                         self-consistent other file under the same path (its own manifest \
-                         differs from {origin} and its data matches it), two sealed files under \
-                         one path, never a damaged copy; it is not moved, and the path stays one \
-                         copy short on this target until #227 decides it (ADR-062 D5)"
-                    )),
+                    // R5a gate 1: the texts of a held path are the
+                    // resolution's.
+                    Ok(Form::Judged(UnrecordedCopy::OtherFile))
+                        if verdict == Some(PathVerdict::Held) =>
+                    {
+                        self.held_other(&name, path, &other_found(origin));
+                    }
+                    Ok(Form::Judged(UnrecordedCopy::OtherFile)) => {
+                        candidates.push((i, Found::Other));
+                    }
                     Ok(Form::Judged(UnrecordedCopy::Refused(why))) => {
                         candidates.push((i, Found::Refused(why)));
                     }
@@ -1193,6 +1323,7 @@ impl Repair<'_> {
                 continue;
             }
             let found = |judged: &Found| match judged {
+                Found::Other => other_found(origin),
                 Found::Refused(why) => format!("its copy does not verify ({why})"),
                 Found::Unreadable(error) => format!("its copy cannot be read ({error})"),
                 Found::Stuck(stuck, beside) => {
@@ -1331,6 +1462,15 @@ impl Repair<'_> {
         hot: &Result<CopyCheck, RawStoreError>,
         guard: Option<&str>,
     ) -> Result<(), Stop> {
+        if matches!(judged, Found::Other) {
+            self.displace(
+                i,
+                path,
+                found,
+                "the closing pass copies the path from hot and records it",
+            )?;
+            return Ok(());
+        }
         if !self.marker_present(i) {
             return Ok(());
         }
@@ -1430,6 +1570,174 @@ impl Repair<'_> {
             aside.display()
         ));
         reached(RepairStep::AfterMoveAside)
+    }
+
+    /// R5a's refusal of a held path's other file on `name` (gate 1):
+    /// `found` describes it.
+    fn held_other(&mut self, name: &str, path: &str, found: &str) {
+        self.problem(format!(
+            "{path} on {name}: refused: it holds {found}, and the path is held: the texts of a \
+             held path are the hold resolution's to decide, so it is not moved, even with \
+             --move-other-files; `mie store resolve` decides the hold first (ADR-067 D5, \
+             ADR-062 D11)"
+        ));
+    }
+
+    /// R5a (ADR-067 D5) for the self-consistent other file of `path` on the
+    /// marked target `i`, which `found` describes, past gates 1 to 3 (the
+    /// caller's): the flag, the marker, the run's evidence names, then the
+    /// `displaced` record and R5's move; `then` ends the report line.
+    /// Returns whether it moved.
+    fn displace(&mut self, i: usize, path: &str, found: &str, then: &str) -> Result<bool, Stop> {
+        let root = self.marked[i].path.clone();
+        let id = self.marked[i].id.clone();
+        let name = self.name(i);
+        let (text, file) = match replica::sealed_manifest(&root, path) {
+            Ok(Some(manifest)) => manifest,
+            Ok(None) => {
+                self.problem(format!(
+                    "{path} on {name}: {found}, but its manifest is gone since it was judged; \
+                     nothing is recorded or moved (ADR-067)"
+                ));
+                return Ok(false);
+            }
+            Err(error) => {
+                self.problem(format!(
+                    "{path} on {name}: {found}, but its manifest cannot be read again: {error}; \
+                     nothing is recorded or moved (ADR-067)"
+                ));
+                return Ok(false);
+            }
+        };
+        let what = format!("rows {}, SHA-256 {}", file.rows, file.sha256);
+        if !self.flags.move_other_files {
+            self.problem(format!(
+                "{path} on {name}: refused: it holds {found} ({what}), two sealed files under one \
+                 path, never a damaged copy; it is not moved. It is evidence of an earlier D5 \
+                 violation (a path sealed twice), so check it first; then `mie store repair \
+                 --move-other-files` records it and moves it into {}/.mie/damaged/<at_ms>/, \
+                 never deleted, and the path's recorded file takes its place (ADR-067)",
+                root.display()
+            ));
+            return Ok(false);
+        }
+        if !self.marker_present(i) {
+            return Ok(false);
+        }
+        let aside = replica::damaged_dir(&root, self.run_ms);
+        let taken = taken_names(&aside, path);
+        if !taken.is_empty() {
+            self.problem(format!(
+                "{path} on {name}: {found} ({what}): not moved and nothing recorded, since {} \
+                 already exists; a run at a later time moves it (ADR-067)",
+                taken.join(", ")
+            ));
+            return Ok(false);
+        }
+        self.append(Kind::Displaced {
+            root: id,
+            dir: self.run_ms,
+            text,
+        })?;
+        reached(RepairStep::AfterDisplacedRecord)?;
+        match replica::move_aside(&root, path, &aside) {
+            Ok(moved) => {
+                self.line(format!(
+                    "{path} on {name}: {found} ({what}): its displaced record appended, {} moved \
+                     into {}, never deleted; {then} (ADR-067)",
+                    moved.join(", "),
+                    aside.display()
+                ));
+                Ok(true)
+            }
+            Err(error) => {
+                self.problem(format!(
+                    "{path} on {name}: {found} ({what}): its displaced record is appended, but \
+                     moving it into {} failed: {error}; nothing is overwritten, and the next \
+                     `mie store repair` completes the move (ADR-067)",
+                    aside.display()
+                ));
+                Ok(false)
+            }
+        }
+    }
+
+    /// R5b (ADR-067 D5) for `path` on the marked target `i`: when a
+    /// `displaced` record of the root carries a text byte-equal to the
+    /// target's manifest of the path, the recorded move completes into the
+    /// record's directory. Returns whether the caller goes on with the
+    /// path on this target: false after a named problem.
+    fn complete_displaced(&mut self, i: usize, path: &str) -> Result<bool, Stop> {
+        let root = self.marked[i].path.clone();
+        let records: Vec<Displaced> = self
+            .state
+            .displaced(&self.marked[i].id)
+            .iter()
+            .filter(|record| record.path == path)
+            .cloned()
+            .collect();
+        if records.is_empty() {
+            return Ok(true);
+        }
+        // An unreadable manifest is the caller's check to name.
+        let Ok(present) = fs::read(root.join(manifest_of(path))) else {
+            return Ok(true);
+        };
+        let Some(record) = records.iter().find(|record| record.matches(&present)) else {
+            return Ok(true);
+        };
+        let name = self.name(i);
+        let what = format!("rows {}, SHA-256 {}", record.rows, record.sha256);
+        // Gate 1 holds for the completion too: the record is consent to
+        // move, never a decision on a held path's texts, which are the
+        // resolution's (review of #234, finding 2). R1, R2 and R2b pass no
+        // other verdict; one would be refused the same way (fail closed).
+        let verdict = self.state.verdict(path);
+        if !matches!(
+            verdict,
+            None | Some(PathVerdict::Ordinary | PathVerdict::NoManifest)
+        ) {
+            let why = if verdict == Some(PathVerdict::Held) {
+                "the path is held, and the texts of a held path are the hold resolution's to \
+                 decide: `mie store resolve` decides the hold first, then `mie store repair` \
+                 completes the move"
+            } else {
+                "the path's verdict is none R5b completes a move for"
+            };
+            self.problem(format!(
+                "{path} on {name}: the recorded move of a self-consistent other file ({what}, \
+                 its displaced record at {}) is not completed and nothing is moved: {why} \
+                 (ADR-067 D5)",
+                record.at_ms
+            ));
+            return Ok(false);
+        }
+        if !self.marker_present(i) {
+            return Ok(false);
+        }
+        let aside = replica::damaged_dir(&root, record.dir);
+        match replica::move_aside(&root, path, &aside) {
+            Ok(moved) => {
+                self.line(format!(
+                    "{path} on {name}: completed the recorded move of a self-consistent other \
+                     file ({what}, its displaced record at {}): {} moved into {} (ADR-067)",
+                    record.at_ms,
+                    moved.join(", "),
+                    aside.display()
+                ));
+                Ok(true)
+            }
+            Err(error) => {
+                self.problem(format!(
+                    "{path} on {name}: completing the recorded move of a self-consistent other \
+                     file ({what}, its displaced record at {}) into {} failed: {error}; nothing \
+                     is overwritten (ADR-067)",
+                    record.at_ms,
+                    aside.display()
+                ));
+                Ok(false)
+            }
+        }
     }
 
     /// R9 for `path`, which has no good source; `unread` names the roots

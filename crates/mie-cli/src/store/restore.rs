@@ -860,7 +860,8 @@ pub(super) enum UnrecordedCopy {
     /// publishes its manifest.
     Accepted,
     /// A self-consistent other file under the path (its own `M` with
-    /// another text and data that matches it): never moved (D5, #227).
+    /// another text and data that matches it): never moved here (D5);
+    /// `mie store repair --move-other-files` moves it (ADR-067).
     OtherFile,
     /// A form the next pass's D5 copy refuses, with why.
     Refused(String),
@@ -917,9 +918,10 @@ pub(super) fn unrecorded_copy(
 /// [`replica::check_sealed_copy`] against the installed `text`; without
 /// it, [`replica::check_file`] on `D`. `Good` stays (the pass records or
 /// publishes it), and so does a self-consistent other file (D5, a
-/// `FAIL:`; #227). Everything else, an unreadable copy included (U), is
-/// moved by R5's own [`replica::move_aside`] into `.mie/damaged/<at_ms>/`,
-/// so the next pass copies the path from hot. Returns whether anything
+/// `FAIL:` naming `mie store repair --move-other-files`, ADR-067).
+/// Everything else, an unreadable copy included (U), is moved by R5's own
+/// [`replica::move_aside`] into `.mie/damaged/<at_ms>/`, so the next pass
+/// copies the path from hot. Returns whether anything
 /// moved.
 fn sealed_aside(
     target: &Marked,
@@ -942,7 +944,8 @@ fn sealed_aside(
                 "{path} on {} ({}): another self-consistent file under the path (its own \
                  manifest with another text and data that matches it): not moved, since it may \
                  be a second sealed file (D5); the path stays one copy short on this target \
-                 until #227 decides it (ADR-062 D5, D11)",
+                 until `mie store repair --move-other-files` moves it aside (ADR-062 D5, D11, \
+                 ADR-067)",
                 target.path.display(),
                 target.id
             ));

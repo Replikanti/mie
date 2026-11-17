@@ -34,7 +34,7 @@ use crate::layout::{self, PartFile};
 use crate::replica::layout_values;
 use crate::tiers::Verdict;
 use crate::verification::CopyState;
-use crate::{io_error, list_entries, sync_dir};
+use crate::{io_error, list_entries, manifest, sync_dir};
 use mie_ports::raw::RawStoreError;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions, TryLockError};
@@ -770,6 +770,13 @@ fn recheck(
             | Kind::Replaced { path, .. } => {
                 files.contains(path.as_str()) || path.starts_with(&format!("{partition}/"))
             }
+            // A file moved off a copy target under a path of the
+            // partition (ADR-067 D7): the copies the plan counted may have
+            // changed. A text that does not parse names it (fail closed).
+            Kind::Displaced { text, .. } => manifest::parse(text).map_or(true, |file| {
+                files.contains(file.relative_path.as_str())
+                    || file.relative_path.starts_with(&format!("{partition}/"))
+            }),
             Kind::Finding { subject, .. } => match subject {
                 Subject::File(path) => {
                     files.contains(path.as_str()) || path.starts_with(&format!("{partition}/"))

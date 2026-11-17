@@ -69,13 +69,42 @@ fn repair_with(
     now: i64,
     record_lost: bool,
 ) -> (bool, String) {
-    let mut out = Vec::new();
     let flags = store::repair::Flags {
         record_lost,
-        record_lost_lines: false,
+        ..store::repair::Flags::default()
     };
+    repair_flags(config, archive, probe, now, flags)
+}
+
+fn repair_flags(
+    config: &IngestConfig,
+    archive: &Path,
+    probe: &dyn DeviceProbe,
+    now: i64,
+    flags: store::repair::Flags,
+) -> (bool, String) {
+    let mut out = Vec::new();
     let pass = store::repair(config, Some(archive), flags, probe, &|| now, &mut out).unwrap();
     (pass, String::from_utf8(out).unwrap())
+}
+
+/// The flags of `mie store repair --move-other-files` (ADR-067).
+fn moving() -> store::repair::Flags {
+    store::repair::Flags {
+        move_other_files: true,
+        ..store::repair::Flags::default()
+    }
+}
+
+/// [`repair`] with `--move-other-files`.
+fn repair_moving(fixture: &Fixture, now: i64) -> (bool, String) {
+    repair_flags(
+        &fixture.config,
+        &fixture.dst_archive,
+        &fixture.probe(),
+        now,
+        moving(),
+    )
 }
 
 fn repair(fixture: &Fixture, now: i64) -> (bool, String) {
@@ -173,6 +202,24 @@ fn plan(fixture: &Fixture, now: i64) -> Option<RemovalPlan> {
         &fixture.probe(),
         &|| now,
         &CopyLedger::at(&fixture.hot()),
+        &mut Ignore,
+        LATER_FIRST_HOT,
+    )
+    .1
+}
+
+/// [`plan`] under R2b's configuration (cold-a and cold-b2).
+fn plan_with(store: &Unrecorded, now: i64) -> Option<RemovalPlan> {
+    struct Ignore;
+    impl store::PassObserver for Ignore {
+        fn ledger_truncated(&mut self, _: &Path, _: copy_ledger::Truncation) {}
+    }
+    store::replicate::run_planned(
+        &store.config,
+        Some(mie_cli::config::ArchiveConfig::load(&store.archive).unwrap()),
+        &store.probe,
+        &|| now,
+        &CopyLedger::at(&store.fixture.hot()),
         &mut Ignore,
         LATER_FIRST_HOT,
     )
@@ -814,40 +861,170 @@ fn an_entry_copy_is_replaced_from_hot_unless_hot_cannot_vouch_for_it() {
     );
 }
 
-/// The D5 discriminator: a self-consistent other file on cold-a is refused
-/// and cold-a is untouched.
+/// The text of a self-consistent other file under the path of `text`,
+/// holding `data`: one row more, and the size and SHA-256 of `data`
+/// (ADR-067: a path sealed twice with different bytes).
+fn other_manifest(text: &str, data: &[u8]) -> String {
+    text.lines()
+        .map(|line| {
+            if let Some(rows) = line.strip_prefix("rows ") {
+                format!("rows {}\n", rows.parse::<u64>().unwrap() + 1)
+            } else if line.starts_with("bytes ") {
+                format!("bytes {}\n", data.len())
+            } else if line.starts_with("sha256 ") {
+                format!("sha256 {}\n", copy_ledger::line_sha256(data))
+            } else {
+                format!("{line}\n")
+            }
+        })
+        .collect()
+}
+
+/// The field `name` of a manifest text.
+fn field<'a>(text: &'a str, name: &str) -> &'a str {
+    text.lines()
+        .find_map(|line| line.strip_prefix(&format!("{name} ")))
+        .unwrap()
+}
+
+/// Replaces the copy of `path` on `root` by a self-consistent other file
+/// built from `source`'s copy: the same data with one row more when
+/// `same_data`, else one flipped data byte. Returns its manifest text.
+fn plant_other(root: &Path, source: &Path, path: &str, same_data: bool) -> String {
+    let text = fs::read_to_string(source.join(manifest_of(path))).unwrap();
+    let mut data = fs::read(source.join(path)).unwrap();
+    if !same_data {
+        data[40] ^= 0x01;
+    }
+    let other = other_manifest(&text, &data);
+    assert_ne!(other, text);
+    for (name, bytes) in [
+        (path.to_owned(), data),
+        (manifest_of(path), other.clone().into_bytes()),
+    ] {
+        let file = root.join(&name);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        if file.exists() {
+            writable(&file);
+        }
+        fs::write(&file, bytes).unwrap();
+    }
+    other
+}
+
+/// The inodes of the data file and manifest of `path` on `root`.
+fn inodes(root: &Path, path: &str) -> [u64; 2] {
+    use std::os::unix::fs::MetadataExt;
+    [path.to_owned(), manifest_of(path)].map(|name| fs::metadata(root.join(name)).unwrap().ino())
+}
+
+/// The `displaced` records of hot's ledger, as `(root, dir, text)`.
+fn displaced_records(fixture: &Fixture) -> Vec<(String, i64, String)> {
+    records(fixture)
+        .into_iter()
+        .filter_map(|r| match r.kind {
+            Kind::Displaced { root, dir, text } => Some((root, dir, text)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The D5 discriminator without `--move-other-files` (ADR-067 D4): a
+/// self-consistent other file on cold-a is refused, the `FAIL:` line names
+/// the flag and the other file's rows and SHA-256, nothing is recorded and
+/// cold-a is untouched.
 #[test]
-fn a_self_consistent_other_file_is_refused_and_never_moved() {
+fn r1_other_file_without_the_flag_is_named_and_never_moved() {
     let (_dir, fixture) = adopted("repair-d5");
     let path = removed_file(&fixture);
-    let manifest = cold(&fixture, "cold-a").join(manifest_of(&path));
-    writable(&manifest);
-    let text = fs::read_to_string(&manifest).unwrap();
-    let rows = text
-        .lines()
-        .find_map(|line| line.strip_prefix("rows "))
-        .unwrap()
-        .to_owned();
-    let more = rows.parse::<u64>().unwrap() + 1;
-    fs::write(
-        &manifest,
-        text.replace(&format!("rows {rows}\n"), &format!("rows {more}\n")),
-    )
-    .unwrap();
+    let cold_a = cold(&fixture, "cold-a");
+    let other = plant_other(&cold_a, &cold_a, &path, true);
     assert!(!verify(&fixture, VERIFIED).0);
-    let before = files(&cold(&fixture, "cold-a"));
+    let before = files(&cold_a);
+    let ledger_len = records(&fixture).len();
     let (pass, out) = repair(&fixture, REPAIRED);
     assert!(!pass, "{out}");
     assert_fail_line(
         &out,
-        &[&path, "cold-a", "refused", "self-consistent other file"],
+        &[
+            &path,
+            "cold-a",
+            "refused",
+            "self-consistent other file",
+            "--move-other-files",
+            &format!("rows {}", field(&other, "rows")),
+            field(&other, "sha256"),
+        ],
     );
     let strip = |tree: Vec<(String, Vec<u8>)>| -> Vec<(String, Vec<u8>)> {
         tree.into_iter()
             .filter(|(name, _)| name != ".mie/copy-ledger")
             .collect()
     };
-    assert_eq!(strip(files(&cold(&fixture, "cold-a"))), strip(before));
+    assert_eq!(strip(files(&cold_a)), strip(before));
+    assert!(
+        !records(&fixture)[ledger_len..]
+            .iter()
+            .any(|r| matches!(r.kind, Kind::Displaced { .. } | Kind::Copy { .. })),
+        "{out}"
+    );
+}
+
+/// R1 with `--move-other-files` (ADR-067 D5): the other file on cold-a
+/// moves by rename (its inodes kept) into `cold-a/.mie/damaged/<run>/`
+/// after its `displaced` record, the path's recorded file is copied there
+/// from a good copy and recorded after that record, a later verification
+/// passes, and a second run moves and records nothing.
+#[test]
+fn r1_other_file_moves_with_the_flag_and_is_repaired_from_a_good_copy() {
+    let (_dir, fixture) = adopted("repair-d5-move");
+    let path = removed_file(&fixture);
+    let (cold_a, cold_b) = (cold(&fixture, "cold-a"), cold(&fixture, "cold-b"));
+    let other = plant_other(&cold_a, &cold_a, &path, false);
+    let other_data = fs::read(cold_a.join(&path)).unwrap();
+    let moved_inodes = inodes(&cold_a, &path);
+    assert!(!verify(&fixture, VERIFIED).0);
+    let ledger_len = records(&fixture).len();
+    let (pass, out) = repair_moving(&fixture, REPAIRED);
+    assert!(pass, "{out}");
+    let aside = replica::damaged_dir(&cold_a, REPAIRED);
+    assert_eq!(inodes(&aside, &path), moved_inodes);
+    assert_eq!(fs::read(aside.join(&path)).unwrap(), other_data);
+    assert_eq!(
+        fs::read_to_string(aside.join(manifest_of(&path))).unwrap(),
+        other
+    );
+    for name in [path.clone(), manifest_of(&path)] {
+        assert_eq!(
+            fs::read(cold_a.join(&name)).unwrap(),
+            fs::read(cold_b.join(&name)).unwrap()
+        );
+    }
+    assert_eq!(
+        displaced_records(&fixture),
+        [("cold-a".to_owned(), REPAIRED, other.clone())]
+    );
+    let after = &records(&fixture)[ledger_len..];
+    let displaced = position(after, |k| matches!(k, Kind::Displaced { .. })).unwrap();
+    let copied = position(
+        after,
+        |k| matches!(k, Kind::Copy { path: p, root } if *p == path && root == "cold-a"),
+    )
+    .unwrap();
+    assert!(displaced < copied, "{after:?}");
+    assert!(out.contains("moved"), "{out}");
+    let (pass, out) = verify(&fixture, REPAIRED + 1);
+    assert!(pass, "{out}");
+    let len = records(&fixture).len();
+    let (pass, out) = repair_moving(&fixture, REPAIRED + 2);
+    assert!(pass, "{out}");
+    assert!(
+        !records(&fixture)[len..]
+            .iter()
+            .any(|r| matches!(r.kind, Kind::Displaced { .. })),
+        "{out}"
+    );
+    assert!(!replica::damaged_dir(&cold_a, REPAIRED + 2).exists());
 }
 
 /// The tiered writer of `source`, as a `Result`.
@@ -1122,6 +1299,10 @@ impl Unrecorded {
         repair_with(&self.config, &self.archive, &self.probe, now, false)
     }
 
+    fn repair_moving(&self, now: i64) -> (bool, String) {
+        repair_flags(&self.config, &self.archive, &self.probe, now, moving())
+    }
+
     fn replicate(&self, now: i64) -> (bool, String) {
         replicate_with(&self.config, &self.archive, &self.probe, now)
     }
@@ -1371,56 +1552,302 @@ fn r2b_a_copy_the_pass_accepts_is_never_moved() {
     }
 }
 
-/// AC 3: until the case 2 ADR (#227) is accepted, a self-consistent other
-/// file under the path (its own manifest with `rows N+1`, and data that
-/// matches it) is refused and never moved, as R1 refuses one (D5).
+/// AC 3 of #219, under ADR-067 D4: without `--move-other-files` a
+/// self-consistent other file under the path (its own manifest with `rows
+/// N+1`, and data that matches it) is refused naming the flag, its rows
+/// and SHA-256, and never moved, as R1 refuses one; nothing is recorded.
 #[test]
-fn r2b_a_self_consistent_other_file_is_refused_and_never_moved() {
-    use std::os::unix::fs::MetadataExt;
+fn r2b_other_file_without_the_flag_is_named_and_never_moved() {
     let store = unrecorded("r2b-other-file");
     let hot = store.fixture.hot();
     let path = hot_file(&store.fixture, "binance-um");
-    let text = fs::read_to_string(hot.join(manifest_of(&path))).unwrap();
-    let rows = text
-        .lines()
-        .find_map(|line| line.strip_prefix("rows "))
-        .unwrap()
-        .to_owned();
-    let more = rows.parse::<u64>().unwrap() + 1;
-    let other = text.replace(&format!("rows {rows}\n"), &format!("rows {more}\n"));
-    assert_ne!(other, text);
-    plant(
-        &store.target,
-        &manifest_of(&path),
-        &Planted::Bytes(other.into_bytes()),
-    );
-    plant(
-        &store.target,
-        &path,
-        &Planted::Bytes(fs::read(hot.join(&path)).unwrap()),
-    );
-    let names = [path.clone(), manifest_of(&path)];
-    let inodes: Vec<u64> = names
-        .iter()
-        .map(|name| fs::metadata(store.target.join(name)).unwrap().ino())
-        .collect();
+    let other = plant_other(&store.target, &hot, &path, true);
+    let before = inodes(&store.target, &path);
     let (pass, out) = store.repair(REPAIRED);
     assert!(!pass, "{out}");
     assert_fail_line(
         &out,
-        &[&path, "cold-b2", "refused", "self-consistent other file"],
+        &[
+            &path,
+            "cold-b2",
+            "refused",
+            "self-consistent other file",
+            "--move-other-files",
+            &format!("rows {}", field(&other, "rows")),
+            field(&other, "sha256"),
+        ],
     );
-    let after: Vec<u64> = names
-        .iter()
-        .map(|name| fs::metadata(store.target.join(name)).unwrap().ino())
-        .collect();
-    assert_eq!(after, inodes);
+    assert_eq!(inodes(&store.target, &path), before);
     assert!(
         !replica::damaged_dir(&store.target, REPAIRED)
             .join(&path)
             .exists()
     );
     assert_eq!(store.copies(&path, "cold-b2"), 0);
+    assert!(displaced_records(&store.fixture).is_empty());
+}
+
+/// AC 2 of #227 (ADR-067 D5): with `--move-other-files` the other file on
+/// cold-b2, which records no copy of the path while cold-a does (1 of 2
+/// good copies, verify names it), moves by rename into
+/// `cold-b2/.mie/damaged/<REPAIRED>/` after exactly one `displaced`
+/// record; the closing pass copies the path from hot and records `copy P
+/// cold-b2` (2 of 2); a later pass and verification are clean; the
+/// partition becomes a removal candidate; a second run moves nothing.
+#[test]
+fn ac227_r2b_other_file_moves_with_the_flag_and_reaches_k() {
+    let store = unrecorded("ac227-r2b-move");
+    let hot = store.fixture.hot();
+    let path = hot_file(&store.fixture, "binance-um");
+    let other = plant_other(&store.target, &hot, &path, true);
+    let moved = inodes(&store.target, &path);
+    assert_eq!(store.copies(&path, "cold-a"), 1);
+    assert_eq!(store.copies(&path, "cold-b2"), 0);
+    let (pass, out) = store.verify(REPAIRED - 2);
+    assert!(!pass, "{out}");
+    assert_fail_line(&out, &[&format!("{path}: 1 of 2 good copies"), "cold-b2"]);
+    let partition = partition_of(&path).to_owned();
+    assert!(!planned(&plan_with(&store, REPAIRED - 1)).contains(&partition));
+
+    let (pass, out) = store.repair_moving(REPAIRED);
+    assert!(pass, "{out}");
+    let aside = replica::damaged_dir(&store.target, REPAIRED);
+    assert_eq!(inodes(&aside, &path), moved);
+    assert_eq!(
+        fs::read_to_string(aside.join(manifest_of(&path))).unwrap(),
+        other
+    );
+    assert_eq!(
+        displaced_records(&store.fixture),
+        [("cold-b2".to_owned(), REPAIRED, other)]
+    );
+    for name in [path.clone(), manifest_of(&path)] {
+        assert_eq!(
+            fs::read(store.target.join(&name)).unwrap(),
+            fs::read(hot.join(&name)).unwrap()
+        );
+    }
+    assert_eq!(store.copies(&path, "cold-b2"), 1);
+    let (pass, out) = store.replicate(REPAIRED + 1);
+    assert!(pass, "{out}");
+    let (pass, out) = store.verify(REPAIRED + 2);
+    assert!(pass, "{out}");
+    assert!(!out.contains("good copies"), "{out}");
+    assert!(planned(&plan_with(&store, REPAIRED + 3)).contains(&partition));
+
+    let len = records(&store.fixture).len();
+    let (pass, out) = store.repair_moving(REPAIRED + 4);
+    assert!(pass, "{out}");
+    assert!(!replica::damaged_dir(&store.target, REPAIRED + 4).exists());
+    assert!(
+        !records(&store.fixture)[len..]
+            .iter()
+            .any(|r| matches!(r.kind, Kind::Displaced { .. })),
+        "{out}"
+    );
+}
+
+/// AC 3 of #227: with hot's copy bad, nothing moves on the target and no
+/// record is written, even with the flag; R4 repairs hot from cold-a in the
+/// same run, and the next run with the flag moves the other file and
+/// completes.
+#[test]
+fn ac227_hot_bad_moves_nothing_and_r4_repairs_hot() {
+    let store = unrecorded("ac227-hot-bad");
+    let hot = store.fixture.hot();
+    let path = hot_file(&store.fixture, "binance-um");
+    plant_other(&store.target, &hot, &path, false);
+    let before = inodes(&store.target, &path);
+    flip(&hot.join(&path), 40);
+    let (pass, out) = store.repair_moving(REPAIRED);
+    assert!(!pass, "{out}");
+    assert_fail_line(
+        &out,
+        &[&path, "cold-b2", "not moved", "hot's copy is not good"],
+    );
+    assert_eq!(inodes(&store.target, &path), before);
+    assert!(!replica::damaged_dir(&store.target, REPAIRED).exists());
+    assert!(displaced_records(&store.fixture).is_empty());
+    assert_eq!(
+        fs::read(hot.join(&path)).unwrap(),
+        fs::read(cold(&store.fixture, "cold-a").join(&path)).unwrap()
+    );
+    let (pass, out) = store.repair_moving(REPAIRED + 1);
+    assert!(pass, "{out}");
+    assert_eq!(
+        inodes(&replica::damaged_dir(&store.target, REPAIRED + 1), &path),
+        before
+    );
+    assert_eq!(displaced_records(&store.fixture).len(), 1);
+    assert_eq!(store.copies(&path, "cold-b2"), 1);
+}
+
+/// ADR-067 D3: the move changes no dataset version a selection can reach.
+/// Every selection gives the same result before the repair, after it
+/// (the move and its closing pass) and after a later pass, and the other
+/// file's SHA-256 never appears in a selected file list.
+#[test]
+fn ac227_dataset_version_is_unchanged_by_the_move() {
+    let store = unrecorded("ac227-version");
+    let hot = store.fixture.hot();
+    let path = hot_file(&store.fixture, "binance-um");
+    let other = plant_other(&store.target, &hot, &path, false);
+    let sha = field(&other, "sha256").to_owned();
+    let before = selected(&store.fixture);
+    assert!(before.iter().any(|s| s.contains(&path)), "{before:?}");
+    let (pass, out) = store.repair_moving(REPAIRED);
+    assert!(pass, "{out}");
+    let after = selected(&store.fixture);
+    let (pass, out) = store.replicate(REPAIRED + 1);
+    assert!(pass, "{out}");
+    let later = selected(&store.fixture);
+    assert_eq!(after, before);
+    assert_eq!(later, before);
+    for result in before.iter().chain(&after).chain(&later) {
+        assert!(!result.contains(&sha), "{result}");
+    }
+}
+
+/// R2 under ADR-067 (decision 3 of STOP 1): a path that left hot, whose
+/// first root in read order (cold-b2, new, without its `copy` record)
+/// holds an other file. Every tiered read of the path fails with
+/// `Integrity` before the repair; after the repair with the flag it
+/// returns the path's records, and a verification passes.
+#[test]
+fn ac227_a_removed_path_reads_again_after_the_move() {
+    let (_dir, fixture) = adopted("ac227-r2-read");
+    let path = removed_file(&fixture);
+    let (config, archive, probe) = with_targets(&fixture, &["cold-b2", "cold-a"]);
+    let cold_a = cold(&fixture, "cold-a");
+    let target = cold(&fixture, "cold-b2");
+    plant_other(&target, &cold_a, &path, false);
+    let read = || {
+        let tiered = store::raw_store(&fixture.hot(), &config.paths.cold_roots).unwrap();
+        let file = selections()
+            .iter()
+            .filter_map(|selection| tiered.select(selection).ok())
+            .flat_map(|dataset| dataset.files)
+            .find(|file| file.relative_path == path)
+            .expect("a selection covers the path");
+        tiered.read(&file)
+    };
+    assert!(
+        matches!(read(), Err(RawStoreError::Integrity(_))),
+        "{:?}",
+        read()
+    );
+    let (pass, out) = repair_flags(&config, &archive, &probe, REPAIRED, moving());
+    assert!(pass, "{out}");
+    assert!(
+        out.contains(&format!("{path} on {}", target.display())),
+        "{out}"
+    );
+    let records = read().unwrap();
+    assert!(!records.is_empty());
+    assert_eq!(
+        fs::read(target.join(&path)).unwrap(),
+        fs::read(cold_a.join(&path)).unwrap()
+    );
+    let (pass, out) = verify_with(&config, &archive, &probe, REPAIRED + 1);
+    assert!(pass, "{out}");
+}
+
+/// ADR-067 D5 gate 1: a held path's other file stays refused even with the
+/// flag, naming `mie store resolve`, since the texts of a held path are
+/// the hold resolution's to decide; nothing is recorded or moved.
+#[test]
+fn ac227_held_path_other_file_is_refused_naming_resolve() {
+    let store = unrecorded("ac227-held");
+    let hot = store.fixture.hot();
+    let part = hot_file(&store.fixture, ARCHIVE_SOURCE);
+    CopyLedger::at(&hot)
+        .append(&Record {
+            at_ms: REPAIRED - 1,
+            kind: Kind::Hold {
+                path: part.clone(),
+                reason: copy_ledger::HoldReason::EntryConflict,
+            },
+        })
+        .unwrap();
+    plant_other(&store.target, &hot, &part, true);
+    let before = inodes(&store.target, &part);
+    let (pass, out) = store.repair_moving(REPAIRED);
+    assert!(!pass, "{out}");
+    assert_fail_line(
+        &out,
+        &[
+            &part,
+            "cold-b2",
+            "self-consistent other file",
+            "mie store resolve",
+        ],
+    );
+    assert_eq!(inodes(&store.target, &part), before);
+    assert!(
+        !replica::damaged_dir(&store.target, REPAIRED)
+            .join(&part)
+            .exists()
+    );
+    assert!(displaced_records(&store.fixture).is_empty());
+}
+
+fn rebuild(fixture: &Fixture, now: i64) -> (bool, String) {
+    let mut out = Vec::new();
+    let pass = store::rebuild(
+        &fixture.config,
+        Some(&fixture.dst_archive),
+        store::rebuild::Flags::default(),
+        FIRST_HOT,
+        &fixture.probe(),
+        &|| now,
+        &mut out,
+    )
+    .unwrap();
+    (pass, String::from_utf8(out).unwrap())
+}
+
+/// ADR-067 D7: after an R1 move, a rebuild from a full start keeps the
+/// `displaced` record, and one from an empty start (both ledger copies
+/// damaged) derives none; both derive the same selection as before, since
+/// `.mie/damaged/` evidence never supplies a text, and the evidence bytes
+/// stay.
+#[test]
+fn ac227_rebuild_after_a_move_derives_the_same_selection() {
+    let (_dir, fixture) = adopted("ac227-rebuild");
+    let path = removed_file(&fixture);
+    let cold_a = cold(&fixture, "cold-a");
+    let other = plant_other(&cold_a, &cold_a, &path, false);
+    assert!(!verify(&fixture, VERIFIED).0);
+    let (pass, out) = repair_moving(&fixture, REPAIRED);
+    assert!(pass, "{out}");
+    let evidence = files(&replica::damaged_dir(&cold_a, REPAIRED));
+    assert!(!evidence.is_empty());
+    let reference = selected(&fixture);
+
+    let hot_ledger = copy_ledger::ledger_path(&fixture.hot());
+    fs::remove_file(&hot_ledger).unwrap();
+    let (pass, out) = rebuild(&fixture, REPAIRED + HOUR);
+    assert!(pass, "{out}");
+    assert!(out.contains("start: the ledger copy"), "{out}");
+    assert_eq!(
+        displaced_records(&fixture),
+        [("cold-a".to_owned(), REPAIRED, other)]
+    );
+    assert_eq!(selected(&fixture), reference);
+
+    for name in ["cold-a", "cold-b"] {
+        let ledger = copy_ledger::ledger_path(&cold(&fixture, name));
+        let mut bytes = fs::read(&ledger).unwrap();
+        bytes[copy_ledger::HEADER.len() + 3] ^= 0x01;
+        fs::write(&ledger, bytes).unwrap();
+    }
+    fs::remove_file(&hot_ledger).unwrap();
+    let (pass, out) = rebuild(&fixture, REPAIRED + 2 * HOUR);
+    assert!(pass, "{out}");
+    assert!(out.contains("started empty"), "{out}");
+    assert!(displaced_records(&fixture).is_empty());
+    assert_eq!(selected(&fixture), reference);
+    assert_eq!(files(&replica::damaged_dir(&cold_a, REPAIRED)), evidence);
 }
 
 /// AC 4: with hot's copy bad, R2b moves nothing on the target and names
@@ -1536,4 +1963,87 @@ fn r2b_unreadable_forms_and_read_only_roots() {
     let (pass, out) = repair_with(&config, &archive, &fixture.probe(), REPAIRED, false);
     assert!(pass, "{out}");
     assert_eq!(files(&ro), before);
+}
+
+/// ADR-067 D5, D11: a read-only root that holds a self-consistent other
+/// file of a hot path is never written, with `--move-other-files`: no
+/// record, no move, every byte in place; it is no source either.
+#[test]
+fn r5a_read_only_root_is_never_written() {
+    let (_dir, fixture) = adopted("r5a-read-only");
+    let path = hot_file(&fixture, "binance-um");
+    let ro = fixture.dir.join("ro");
+    fs::create_dir_all(&ro).unwrap();
+    root_marker::create_meta(&ro, "ro", false).unwrap();
+    plant_other(&ro, &fixture.hot(), &path, false);
+    let mut cold_roots = fixture.config.paths.cold_roots.clone();
+    cold_roots.push(ColdRoot {
+        path: ro.clone(),
+        copy_target: false,
+    });
+    let dst = fixture.dir.join("dst");
+    let config = ingest_toml(
+        &dst.join("ingest-ro-other.toml"),
+        &fixture.hot(),
+        &fixture.config.paths.journal,
+        &cold_roots,
+    );
+    let archive = dst.join("archive-ro-other.toml");
+    archive_toml(&archive, &dst, &fixture.hot(), &cold_roots);
+    let before = files(&ro);
+    let (pass, out) = repair_flags(&config, &archive, &fixture.probe(), REPAIRED, moving());
+    assert!(pass, "{out}");
+    assert_eq!(files(&ro), before);
+    assert!(displaced_records(&fixture).is_empty());
+}
+
+/// R5a's hot gate in R1 and R2 (review of #234, finding 1): when hot
+/// itself holds a self-consistent other file under the path (hot's
+/// manifest differs from the copy ledger's, which ADR-067 leaves to its
+/// own decision), a copy target's byte-identical copy of hot's file is
+/// never moved, even with the flag: the refusal names hot's state, no
+/// `displaced` record is appended, and hot's bytes keep both their
+/// copies. R4 still refuses hot's file.
+#[test]
+fn r5a_r1_never_moves_a_copy_of_hots_own_other_file() {
+    let (_dir, fixture) = adopted("r5a-hot-other");
+    let hot = fixture.hot();
+    let path = hot_file(&fixture, "binance-um");
+    let cold_a = cold(&fixture, "cold-a");
+    let other = plant_other(&hot, &hot, &path, true);
+    for name in [path.clone(), manifest_of(&path)] {
+        let file = cold_a.join(&name);
+        writable(&file);
+        fs::write(&file, fs::read(hot.join(&name)).unwrap()).unwrap();
+    }
+    let before = inodes(&cold_a, &path);
+    assert!(!verify(&fixture, VERIFIED).0);
+    let (pass, out) = repair_moving(&fixture, REPAIRED);
+    assert!(!pass, "{out}");
+    assert_fail_line(
+        &out,
+        &[
+            &path,
+            "cold-a",
+            "self-consistent other file",
+            "hot's copy is not good",
+            "ADR-067",
+        ],
+    );
+    assert_fail_line(&out, &[&path, "on hot: refused"]);
+    let aside = replica::damaged_dir(&cold_a, REPAIRED);
+    assert_eq!(
+        fs::read_to_string(hot.join(manifest_of(&path))).unwrap(),
+        other
+    );
+    assert!(
+        !aside.join(&path).exists(),
+        "cold-a's copy of hot's own file was moved\n{out}"
+    );
+    assert_eq!(inodes(&cold_a, &path), before);
+    assert_eq!(
+        fs::read_to_string(cold_a.join(manifest_of(&path))).unwrap(),
+        other
+    );
+    assert!(displaced_records(&fixture).is_empty(), "{out}");
 }

@@ -17,7 +17,8 @@ fn flip(path: &Path, offset: usize) {
 }
 
 /// A replicated fixture with a damaged data copy, ledger copy and journal
-/// copy on cold-a and a damaged hot archive part, found by a verification.
+/// copy on cold-a, a damaged hot archive part and a self-consistent other
+/// file under a live path on cold-b, found by a verification.
 fn damaged(tag: &str) -> Fixture {
     let fixture = Fixture::new(tag);
     assert_eq!(fixture.pass().problems, Vec::<String>::new());
@@ -38,6 +39,8 @@ fn damaged(tag: &str) -> Fixture {
     start += bytes[start..].iter().position(|&b| b == b'\n').unwrap() + 1;
     flip(&ledger, start + 2);
     flip(&fixture.cold[0].join(".mie/journal/journal.jsonl"), 5);
+    // A self-consistent other file under the live path on cold-b (ADR-067).
+    plant_other_file(&fixture.cold[1], live, &other_text(&fixture.hot, live));
     let report = verify::run(
         &fixture.config,
         Some(&fixture.archive()),
@@ -59,6 +62,63 @@ fn repair(fixture: &Fixture, now: i64) -> RepairReport {
         &|| now,
         &CopyLedger::at(&fixture.hot),
     )
+}
+
+/// [`repair`] with `--move-other-files` (ADR-067).
+fn repair_moving(fixture: &Fixture, now: i64) -> RepairReport {
+    run(
+        &fixture.config,
+        Some(&fixture.archive()),
+        moving(),
+        &fixture.probe,
+        &|| now,
+        &CopyLedger::at(&fixture.hot),
+    )
+}
+
+fn moving() -> Flags {
+    Flags {
+        move_other_files: true,
+        ..Flags::default()
+    }
+}
+
+/// `root`'s manifest text of `path` with one row more: a self-consistent
+/// other file under the path when written beside the same data.
+fn other_text(root: &Path, path: &str) -> String {
+    let text = fs::read_to_string(root.join(manifest_of(path))).unwrap();
+    let rows = text
+        .lines()
+        .find_map(|line| line.strip_prefix("rows "))
+        .unwrap()
+        .to_owned();
+    text.replace(
+        &format!("\nrows {rows}\n"),
+        &format!("\nrows {}\n", rows.parse::<u64>().unwrap() + 1),
+    )
+}
+
+/// Writes `text` as the manifest of `path` on `root`, beside the data
+/// there (copied from the root's own data, else left as it is).
+fn plant_other_file(root: &Path, path: &str, text: &str) {
+    let manifest = root.join(manifest_of(path));
+    if manifest.exists() {
+        fs::set_permissions(&manifest, fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+    fs::write(&manifest, text).unwrap();
+}
+
+/// The `displaced` records of hot's ledger, as `(root, dir, text)`.
+fn displaced(fixture: &Fixture) -> Vec<(String, i64, String)> {
+    fixture
+        .records()
+        .into_iter()
+        .filter_map(|r| match r.kind {
+            Kind::Displaced { root, dir, text } => Some((root, dir, text)),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Every file below `root` with its bytes, by relative path; the copy
@@ -98,16 +158,20 @@ fn trees(fixture: &Fixture) -> Vec<Vec<(String, Vec<u8>)>> {
 /// A crash at every repair step, then a re-run, leaves every root as an
 /// uninterrupted run does, every ledger copy a valid prefix of hot's, and
 /// a verification that passes.
+///
+/// The repairs run with `--move-other-files`: after a crash between the
+/// `displaced` record and its move, the re-run completes the move into the
+/// record's directory, the crashed run's, and appends no second record.
 #[test]
 fn a_crash_at_every_repair_step_is_completed_by_the_next_run() {
     let reference = damaged("repair-crash-reference");
-    let report = repair(&reference, D0 + 2 * HOUR);
+    let report = repair_moving(&reference, D0 + 2 * HOUR);
     assert_eq!(report.problems, Vec::<String>::new(), "{report:?}");
     let expected = trees(&reference);
     for step in RepairStep::ALL {
         let fixture = damaged(&format!("repair-crash-{step:?}"));
         CRASH_AT.with(|crash| crash.set(Some(step)));
-        let crashed = repair(&fixture, D0 + 2 * HOUR);
+        let crashed = repair_moving(&fixture, D0 + 2 * HOUR);
         assert!(
             CRASH_AT.with(std::cell::Cell::get).is_none(),
             "{step:?} never reached"
@@ -119,13 +183,31 @@ fn a_crash_at_every_repair_step_is_completed_by_the_next_run() {
                 .any(|p| p.contains("simulated crash")),
             "{step:?}: {crashed:?}"
         );
-        let report = repair(&fixture, D0 + 3 * HOUR);
+        let report = repair_moving(&fixture, D0 + 3 * HOUR);
         assert_eq!(
             report.problems,
             Vec::<String>::new(),
             "{step:?}: {report:?}"
         );
         assert_eq!(trees(&fixture), expected, "{step:?}");
+        // The other file sits in exactly one run's directory, the one its
+        // only record names.
+        let records = displaced(&fixture);
+        assert_eq!(records.len(), 1, "{step:?}");
+        let (root, dir, text) = &records[0];
+        assert_eq!(root, "cold-b", "{step:?}");
+        let live = replica::list_sealed(&fixture.hot)
+            .unwrap()
+            .into_iter()
+            .find(|p| p.starts_with("source=binance-um"))
+            .unwrap();
+        let moved = |at: i64| replica::damaged_dir(&fixture.cold[1], at).join(manifest_of(&live));
+        assert_eq!(fs::read_to_string(moved(*dir)).unwrap(), *text, "{step:?}");
+        let other_run = if *dir == D0 + 2 * HOUR { 3 } else { 2 };
+        assert!(!moved(D0 + other_run * HOUR).exists(), "{step:?}");
+        if step == RepairStep::AfterDisplacedRecord {
+            assert_eq!(*dir, D0 + 2 * HOUR, "{step:?}");
+        }
         let hot = fs::read(copy_ledger::ledger_path(&fixture.hot)).unwrap();
         for root in &fixture.cold {
             let copy = fs::read(copy_ledger::ledger_path(root)).unwrap();
@@ -202,7 +284,7 @@ fn a_target_unmounted_mid_run_makes_a_file_not_repairable_never_lost() {
         Some(&fixture.archive()),
         Flags {
             record_lost: true,
-            record_lost_lines: false,
+            ..Flags::default()
         },
         &fixture.probe,
         &|| D0 + 2 * HOUR,
@@ -443,6 +525,21 @@ fn r2b_moves_exactly_what_the_pass_refuses() {
         dir_of(&file_name.replace(".parquet", "\u{200b}.parquet")),
         dir_of(&format!("{file_name} ")),
     ];
+    // ADR-067: a manifest whose path line spells the path with a
+    // look-alike hyphen or a zero-width character, with one row more and
+    // the same data, never parses to the path's own location, so it is
+    // case 1 (#219), moved without a record or the flag, never an other
+    // file.
+    let look_alike_path = |from: &str, to: &str| {
+        other.replacen(
+            &format!("path {path}\n"),
+            &format!("path {}\n", path.replacen(from, to, 1)),
+            1,
+        )
+    };
+    let hyphen = look_alike_path("part-", "part\u{2011}");
+    let zero_width = look_alike_path(".parquet", "\u{200b}.parquet");
+    assert!(hyphen != other && zero_width != other);
     let t = text.as_bytes();
     let cases: Vec<(&str, Class, Planted)> = vec![
         ("nothing", Class::Absent, vec![]),
@@ -542,6 +639,22 @@ fn r2b_moves_exactly_what_the_pass_refuses() {
             Class::OtherFile,
             vec![
                 (m.clone(), bytes(other.as_bytes())),
+                (d.clone(), bytes(&data)),
+            ],
+        ),
+        (
+            "an other text whose path line has a look-alike hyphen",
+            Class::Refused,
+            vec![
+                (m.clone(), bytes(hyphen.as_bytes())),
+                (d.clone(), bytes(&data)),
+            ],
+        ),
+        (
+            "an other text whose path line has a zero-width character",
+            Class::Refused,
+            vec![
+                (m.clone(), bytes(zero_width.as_bytes())),
                 (d.clone(), bytes(&data)),
             ],
         ),
@@ -897,6 +1010,34 @@ fn r2b_archive_parts_follow_the_pass_gate() {
         manifest
     );
     assert!(!replica::damaged_dir(&fixture.cold[0], D0 + 2 * HOUR).exists());
+
+    // (a′) ADR-067: a self-consistent other file under the unlisted part
+    // stays too, with the flag, named, and nothing is recorded.
+    let fixture = Fixture::new("r2b-archive-unlisted-other");
+    assert_eq!(fixture.pass().problems, Vec::<String>::new());
+    let new = fixture.seal("binance-archive", "aggTrades", D0 - 86_400_000 + 10_000, 2);
+    let part = new[0].clone();
+    plant(
+        &fixture.cold[0],
+        &part,
+        &Plant::Bytes(fs::read(fixture.hot.join(&part)).unwrap()),
+    );
+    plant_other_file(&fixture.cold[0], &part, &other_text(&fixture.hot, &part));
+    let before = fs::read(fixture.cold[0].join(manifest_of(&part))).unwrap();
+    let report = repair_moving(&fixture, D0 + 2 * HOUR);
+    assert!(
+        report.problems.iter().any(|p| p.contains(&part)
+            && p.contains("cold-a")
+            && p.contains("self-consistent other file")
+            && p.contains("import entry")),
+        "{report:?}"
+    );
+    assert_eq!(
+        fs::read(fixture.cold[0].join(manifest_of(&part))).unwrap(),
+        before
+    );
+    assert!(!replica::damaged_dir(&fixture.cold[0], D0 + 2 * HOUR).exists());
+    assert!(displaced(&fixture).is_empty());
 
     let fixture = Fixture::new("r2b-archive-held");
     let marker = root_marker::marker_path(&fixture.cold[1]);
@@ -1855,8 +1996,8 @@ fn repair_flags(fixture: &Fixture, now: i64, record_lost_lines: bool) -> RepairR
         &fixture.config,
         Some(&fixture.archive()),
         Flags {
-            record_lost: false,
             record_lost_lines,
+            ..Flags::default()
         },
         &fixture.probe,
         &|| now,
@@ -2530,4 +2671,509 @@ fn record_lost_lines_refuses_a_target_unmounted_after_the_copy_reads() {
         ],
     );
     assert!(lost_records(&fixture).is_empty());
+}
+
+// ------------------------------------------- R5a, R5b (ADR-067, #227)
+
+/// A replicated fixture whose cold-b holds `text` as the manifest of the
+/// first live path beside its data, found by a verification. Returns the
+/// path.
+fn other_on_cold_b(tag: &str, text: impl Fn(&Path, &str) -> String) -> (Fixture, String) {
+    let fixture = Fixture::new(tag);
+    assert_eq!(fixture.pass().problems, Vec::<String>::new());
+    let path = replica::list_sealed(&fixture.hot)
+        .unwrap()
+        .into_iter()
+        .find(|p| p.starts_with("source=binance-um"))
+        .unwrap();
+    plant_other_file(&fixture.cold[1], &path, &text(&fixture.hot, &path));
+    assert!(!verified(&fixture, D0 + HOUR).is_empty());
+    (fixture, path)
+}
+
+/// The inodes of the data file and manifest of `path` on `root`.
+fn inodes(root: &Path, path: &str) -> [u64; 2] {
+    use std::os::unix::fs::MetadataExt;
+    [path.to_owned(), manifest_of(path)].map(|name| fs::metadata(root.join(name)).unwrap().ino())
+}
+
+fn append_displaced(fixture: &Fixture, root: &str, dir: i64, text: &str) {
+    CopyLedger::at(&fixture.hot)
+        .append(&Record {
+            at_ms: dir,
+            kind: Kind::Displaced {
+                root: root.to_owned(),
+                dir,
+                text: text.to_owned(),
+            },
+        })
+        .unwrap();
+}
+
+/// R5b: a crash between the move's two renames leaves the other file's
+/// data in the record's directory and its manifest in place. The next run,
+/// without the flag, moves the manifest to its data (never into its own
+/// directory, never judged as a manifest without its data), appends no
+/// record, and repairs the path from hot.
+#[test]
+fn r5b_a_manifest_left_between_the_renames_joins_its_data() {
+    let (fixture, path) = other_on_cold_b("r5b-between", other_text);
+    let cold_b = &fixture.cold[1];
+    let text = fs::read_to_string(cold_b.join(manifest_of(&path))).unwrap();
+    let recorded = D0 + HOUR + 1;
+    append_displaced(&fixture, "cold-b", recorded, &text);
+    let aside = replica::damaged_dir(cold_b, recorded);
+    fs::create_dir_all(aside.join(&path).parent().unwrap()).unwrap();
+    fs::rename(cold_b.join(&path), aside.join(&path)).unwrap();
+    let report = repair(&fixture, D0 + 2 * HOUR);
+    assert_eq!(report.problems, Vec::<String>::new(), "{report:?}");
+    assert_eq!(
+        fs::read_to_string(aside.join(manifest_of(&path))).unwrap(),
+        text
+    );
+    assert!(aside.join(&path).exists());
+    assert!(!replica::damaged_dir(cold_b, D0 + 2 * HOUR).exists());
+    assert_eq!(displaced(&fixture).len(), 1);
+    assert_eq!(
+        fs::read(cold_b.join(&path)).unwrap(),
+        fs::read(fixture.hot.join(&path)).unwrap()
+    );
+    assert!(
+        report
+            .lines
+            .iter()
+            .any(|l| l.contains(&path) && l.contains("completed the recorded move")),
+        "{report:?}"
+    );
+}
+
+/// The adversarial case of ADR-067 D4: an other file with the rows and the
+/// SHA-256 of the recorded file, its text differing only in
+/// `max_event_time_ms`, moves with the flag; afterwards the canonical copy
+/// the repair placed there is never moved, with the flag or without, since
+/// a record matches only a byte-equal text. A second D5 violation later
+/// (another text) needs the flag again and gets its own record, and the
+/// same other file on both targets gets one record per root.
+#[test]
+fn r5a_same_rows_and_sha_other_text_never_moves_the_canonical_copy() {
+    let later_max = |hot: &Path, path: &str| {
+        let text = fs::read_to_string(hot.join(manifest_of(path))).unwrap();
+        let max = text
+            .lines()
+            .find_map(|line| line.strip_prefix("max_event_time_ms "))
+            .unwrap()
+            .to_owned();
+        text.replace(
+            &format!("max_event_time_ms {max}\n"),
+            &format!("max_event_time_ms {}\n", max.parse::<i64>().unwrap() + 1),
+        )
+    };
+    let (fixture, path) = other_on_cold_b("r5a-same-sha", later_max);
+    let cold_b = fixture.cold[1].clone();
+    let other = fs::read_to_string(cold_b.join(manifest_of(&path))).unwrap();
+    let canonical = fs::read_to_string(fixture.hot.join(manifest_of(&path))).unwrap();
+    let field = |text: &str, name: &str| {
+        text.lines()
+            .find(|line| line.starts_with(&format!("{name} ")))
+            .unwrap()
+            .to_owned()
+    };
+    assert_ne!(other, canonical);
+    for name in ["rows", "bytes", "sha256"] {
+        assert_eq!(field(&other, name), field(&canonical, name));
+    }
+    let report = repair_moving(&fixture, D0 + 2 * HOUR);
+    assert_eq!(report.problems, Vec::<String>::new(), "{report:?}");
+    assert_eq!(
+        displaced(&fixture),
+        [("cold-b".to_owned(), D0 + 2 * HOUR, other.clone())]
+    );
+    let placed = inodes(&cold_b, &path);
+    for (n, flags) in [Flags::default(), moving()].into_iter().enumerate() {
+        // An open finding makes R1, and so R5b, visit the canonical copy.
+        CopyLedger::at(&fixture.hot)
+            .append(&Record {
+                at_ms: D0 + (2 + n as i64) * HOUR + 1,
+                kind: Kind::Finding {
+                    root: "cold-b".to_owned(),
+                    code: copy_ledger::FindingCode::Stale,
+                    subject: copy_ledger::Subject::File(path.clone()),
+                },
+            })
+            .unwrap();
+        let report = run(
+            &fixture.config,
+            Some(&fixture.archive()),
+            flags,
+            &fixture.probe,
+            &|| D0 + (3 + n as i64) * HOUR,
+            &CopyLedger::at(&fixture.hot),
+        );
+        assert_eq!(report.problems, Vec::<String>::new(), "{n}: {report:?}");
+        assert!(
+            report
+                .lines
+                .iter()
+                .any(|l| l.contains(&path) && l.contains("re-verified good")),
+            "{n}: {report:?}"
+        );
+        assert_eq!(inodes(&cold_b, &path), placed, "{n}");
+        assert_eq!(displaced(&fixture).len(), 1, "{n}");
+    }
+
+    // A second D5 violation: another text under the path, on both
+    // targets. Without the flag it is refused; with it, one record per
+    // root, each with that text.
+    let second = other_text(&fixture.hot, &path);
+    for root in &fixture.cold {
+        plant_other_file(root, &path, &second);
+    }
+    assert!(!verified(&fixture, D0 + 5 * HOUR).is_empty());
+    let report = repair(&fixture, D0 + 6 * HOUR);
+    assert!(
+        report
+            .problems
+            .iter()
+            .any(|p| p.contains(&path) && p.contains("--move-other-files")),
+        "{report:?}"
+    );
+    assert_eq!(displaced(&fixture).len(), 1);
+    let report = repair_moving(&fixture, D0 + 7 * HOUR);
+    assert_eq!(report.problems, Vec::<String>::new(), "{report:?}");
+    let records = displaced(&fixture);
+    assert_eq!(
+        records[1..],
+        [
+            ("cold-a".to_owned(), D0 + 7 * HOUR, second.clone()),
+            ("cold-b".to_owned(), D0 + 7 * HOUR, second)
+        ]
+    );
+    for root in &fixture.cold {
+        assert_eq!(
+            fs::read_to_string(root.join(manifest_of(&path))).unwrap(),
+            canonical
+        );
+    }
+    assert_eq!(verified(&fixture, D0 + 8 * HOUR), Vec::<String>::new());
+}
+
+/// R5a gate 5: a target whose marker is gone after the run's marker reads
+/// gets no record and no move, and the marker is named.
+#[test]
+fn r5a_marker_gone_before_the_record_writes_nothing() {
+    let (fixture, path) = other_on_cold_b("r5a-marker", other_text);
+    let cold_b = fixture.cold[1].clone();
+    let before = inodes(&cold_b, &path);
+    let marker = root_marker::marker_path(&cold_b);
+    let hidden = fixture.dir.0.join("cold-b.marker");
+    {
+        let (marker, hidden) = (marker.clone(), hidden.clone());
+        BEFORE_WORK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || fs::rename(&marker, &hidden).unwrap()));
+        });
+    }
+    let report = repair_moving(&fixture, D0 + 2 * HOUR);
+    fs::rename(&hidden, &marker).unwrap();
+    assert!(
+        report
+            .problems
+            .iter()
+            .any(|p| p.contains("cold-b") && p.contains("marker")),
+        "{report:?}"
+    );
+    assert_eq!(inodes(&cold_b, &path), before);
+    assert!(displaced(&fixture).is_empty());
+    assert!(!replica::damaged_dir(&cold_b, D0 + 2 * HOUR).exists());
+}
+
+/// R5a gate 6: a name of the path already taken below the run's
+/// `.mie/damaged/<at_ms>/` (planted by hand, or the same millisecond)
+/// records nothing and moves nothing; a run at a later `at_ms` moves the
+/// file. The completion variant: the record's own directory already holds
+/// the data name, so R5b's move refuses, names it, and overwrites nothing.
+#[test]
+fn r5a_a_taken_evidence_name_records_nothing() {
+    let (fixture, path) = other_on_cold_b("r5a-taken", other_text);
+    let cold_b = fixture.cold[1].clone();
+    let at = D0 + 2 * HOUR;
+    let before = inodes(&cold_b, &path);
+    for name in [
+        path.clone(),
+        manifest_of(&path),
+        temp_of(&path, TempName::Data),
+        temp_of(&path, TempName::Manifest),
+    ] {
+        let taken = replica::damaged_dir(&cold_b, at).join(&name);
+        plant(
+            &cold_b,
+            &rel(&cold_b, &taken),
+            &Plant::Bytes(b"evidence".to_vec()),
+        );
+        let report = repair_moving(&fixture, at);
+        assert!(
+            report
+                .problems
+                .iter()
+                .any(|p| p.contains(&path) && p.contains("cold-b") && p.contains("already")),
+            "{name}: {report:?}"
+        );
+        assert_eq!(inodes(&cold_b, &path), before, "{name}");
+        assert!(displaced(&fixture).is_empty(), "{name}");
+        assert_eq!(fs::read(&taken).unwrap(), b"evidence", "{name}");
+        fs::remove_file(&taken).unwrap();
+    }
+    let report = repair_moving(&fixture, at + 1);
+    assert_eq!(report.problems, Vec::<String>::new(), "{report:?}");
+    assert_eq!(
+        inodes(&replica::damaged_dir(&cold_b, at + 1), &path),
+        before
+    );
+
+    // Completion: a record whose directory already holds the data name.
+    let (fixture, path) = other_on_cold_b("r5b-taken", other_text);
+    let cold_b = fixture.cold[1].clone();
+    let text = fs::read_to_string(cold_b.join(manifest_of(&path))).unwrap();
+    let recorded = D0 + HOUR + 1;
+    append_displaced(&fixture, "cold-b", recorded, &text);
+    let taken = replica::damaged_dir(&cold_b, recorded).join(&path);
+    plant(
+        &cold_b,
+        &rel(&cold_b, &taken),
+        &Plant::Bytes(b"evidence".to_vec()),
+    );
+    let before = inodes(&cold_b, &path);
+    let report = repair(&fixture, D0 + 2 * HOUR);
+    assert!(
+        report.problems.iter().any(|p| p.contains(&path)
+            && p.contains("cold-b")
+            && p.contains("completing the recorded move")),
+        "{report:?}"
+    );
+    assert_eq!(inodes(&cold_b, &path), before);
+    assert_eq!(fs::read(&taken).unwrap(), b"evidence");
+    assert_eq!(displaced(&fixture).len(), 1);
+}
+
+/// `name` relative to `root`, as [`plant`] takes it.
+fn rel(root: &Path, name: &Path) -> String {
+    name.strip_prefix(root).unwrap().display().to_string()
+}
+
+/// An appender that fails every `displaced` append.
+struct FailingDisplaced<'a>(&'a CopyLedger);
+
+impl LedgerAppend for FailingDisplaced<'_> {
+    fn path(&self) -> &Path {
+        self.0.path()
+    }
+
+    fn append(
+        &self,
+        record: &Record,
+    ) -> Result<copy_ledger::AppendOutcome, copy_ledger::AppendError> {
+        if matches!(record.kind, Kind::Displaced { .. }) {
+            return Err(copy_ledger::AppendError {
+                error: RawStoreError::Io("injected: no space left on device".to_owned()),
+                truncation: None,
+            });
+        }
+        self.0.append(record)
+    }
+
+    fn append_unless(
+        &self,
+        record: &Record,
+        offset: u64,
+        chain: &str,
+        veto: &dyn Fn(&[Record]) -> Option<String>,
+    ) -> Result<copy_ledger::Guarded, copy_ledger::AppendError> {
+        self.0.append_unless(record, offset, chain, veto)
+    }
+}
+
+/// The record comes before the move: a failed `displaced` append stops
+/// the run, and the other file stays in place.
+#[test]
+fn r5a_a_failed_append_moves_nothing() {
+    let (fixture, path) = other_on_cold_b("r5a-append-fails", other_text);
+    let cold_b = fixture.cold[1].clone();
+    let before = inodes(&cold_b, &path);
+    let ledger = CopyLedger::at(&fixture.hot);
+    let report = run(
+        &fixture.config,
+        Some(&fixture.archive()),
+        moving(),
+        &fixture.probe,
+        &|| D0 + 2 * HOUR,
+        &FailingDisplaced(&ledger),
+    );
+    assert!(
+        report
+            .problems
+            .iter()
+            .any(|p| p.contains("the displaced append") && p.contains("the repair stops")),
+        "{report:?}"
+    );
+    assert_eq!(inodes(&cold_b, &path), before);
+    assert!(displaced(&fixture).is_empty());
+    assert!(!replica::damaged_dir(&cold_b, D0 + 2 * HOUR).exists());
+}
+
+/// A partition recorded removed while hot still holds it (a hot removal
+/// that crashed before its delete): R2b never judges its forms, so an
+/// other file on a target without a `copy` record of the path stays and
+/// nothing is recorded, even with the flag.
+#[test]
+fn r5a_removed_partition_on_hot_is_not_judged() {
+    let fixture = Fixture::new("r5a-removed");
+    assert_eq!(fixture.pass().problems, Vec::<String>::new());
+    let new = fixture.seal("binance-um", "aggTrade", D0 + 6_000, 2);
+    assert_eq!(new.len(), 1, "{new:?}");
+    let path = new[0].clone();
+    let cold_b = fixture.cold[1].clone();
+    plant(
+        &cold_b,
+        &path,
+        &Plant::Bytes(fs::read(fixture.hot.join(&path)).unwrap()),
+    );
+    plant_other_file(&cold_b, &path, &other_text(&fixture.hot, &path));
+    CopyLedger::at(&fixture.hot)
+        .append(&Record {
+            at_ms: D0 + HOUR,
+            kind: Kind::Removed {
+                partition: partition_of(&path).to_owned(),
+            },
+        })
+        .unwrap();
+    let before = inodes(&cold_b, &path);
+    let report = repair_moving(&fixture, D0 + 2 * HOUR);
+    assert_eq!(inodes(&cold_b, &path), before, "{report:?}");
+    assert!(displaced(&fixture).is_empty(), "{report:?}");
+    assert!(
+        !replica::damaged_dir(&cold_b, D0 + 2 * HOUR)
+            .join(&path)
+            .exists()
+    );
+}
+
+/// A replicated fixture whose cold-b holds a self-consistent other file
+/// under the first path of `source`, found by a verification, with its
+/// `displaced` record appended and the move not done (a crash after the
+/// record, or a failed rename). Returns the path and the record's text.
+fn incomplete_move(tag: &str, source: &str) -> (Fixture, String, String) {
+    let fixture = Fixture::new(tag);
+    assert_eq!(fixture.pass().problems, Vec::<String>::new());
+    let path = replica::list_sealed(&fixture.hot)
+        .unwrap()
+        .into_iter()
+        .find(|p| p.starts_with(&format!("source={source}/")))
+        .unwrap();
+    let text = other_text(&fixture.hot, &path);
+    plant_other_file(&fixture.cold[1], &path, &text);
+    assert!(!verified(&fixture, D0 + HOUR).is_empty());
+    append_displaced(&fixture, "cold-b", D0 + HOUR + 1, &text);
+    (fixture, path, text)
+}
+
+/// R5b under gate 1 (review of #234, finding 2): a path held after its
+/// `displaced` record was appended. R1 visits it (its finding is open),
+/// but the recorded move is not completed before `mie store resolve`
+/// decides the hold: the repair names the hold resolution and moves
+/// nothing, and verify's `FAIL:` names `mie store resolve` first.
+#[test]
+fn r5b_a_held_path_is_not_completed_before_resolve() {
+    let (fixture, path, text) = incomplete_move("r5b-held", "binance-archive");
+    let cold_b = fixture.cold[1].clone();
+    CopyLedger::at(&fixture.hot)
+        .append(&Record {
+            at_ms: D0 + HOUR + 2,
+            kind: Kind::Hold {
+                path: path.clone(),
+                reason: copy_ledger::HoldReason::EntryConflict,
+            },
+        })
+        .unwrap();
+    let report = verify_at(&fixture, D0 + HOUR + 3);
+    assert_any(
+        &report.problems,
+        &[
+            &path,
+            "cold-b",
+            "did not complete",
+            "the path is held",
+            "`mie store resolve`",
+        ],
+    );
+    let before = inodes(&cold_b, &path);
+    let report = repair_moving(&fixture, D0 + 2 * HOUR);
+    assert!(
+        !replica::damaged_dir(&cold_b, D0 + HOUR + 1)
+            .join(manifest_of(&path))
+            .exists(),
+        "a held path's other file moved before the resolution: {report:?}"
+    );
+    assert_eq!(inodes(&cold_b, &path), before, "{report:?}");
+    assert_eq!(
+        fs::read_to_string(cold_b.join(manifest_of(&path))).unwrap(),
+        text
+    );
+    assert_any(
+        &report.problems,
+        &[&path, "cold-b", "the path is held", "`mie store resolve`"],
+    );
+    assert_eq!(displaced(&fixture).len(), 1, "{report:?}");
+}
+
+/// R5b and the lost-file rule (review of #234, finding 2): a path
+/// recorded lost after its `displaced` record was appended. No repair
+/// rule visits a lost path (nothing is written for it, ADR-062 D11), so
+/// verify never fails naming a repair that never acts: the incomplete
+/// move is a note naming the lost record, and a repair with the flag
+/// leaves the file in place and appends nothing.
+#[test]
+fn r5b_a_lost_path_is_a_note_and_never_moved() {
+    let (fixture, path, text) = incomplete_move("r5b-lost", "binance-um");
+    let cold_b = fixture.cold[1].clone();
+    let sha =
+        replica::parse_manifest(&fs::read_to_string(fixture.hot.join(manifest_of(&path))).unwrap())
+            .unwrap()
+            .sha256;
+    CopyLedger::at(&fixture.hot)
+        .append(&Record {
+            at_ms: D0 + HOUR + 2,
+            kind: Kind::Lost {
+                path: path.clone(),
+                origin: LostOrigin::Verify,
+                sha256: Some(sha),
+            },
+        })
+        .unwrap();
+    let report = verify_at(&fixture, D0 + HOUR + 3);
+    assert!(
+        !report
+            .problems
+            .iter()
+            .any(|p| p.contains(&path) && p.contains("did not complete")),
+        "{report:?}"
+    );
+    assert_any(
+        &report.lines,
+        &[&path, "cold-b", "did not complete", "recorded lost"],
+    );
+    let before = inodes(&cold_b, &path);
+    let len = fixture.records().len();
+    let report = repair_moving(&fixture, D0 + 2 * HOUR);
+    assert_eq!(inodes(&cold_b, &path), before, "{report:?}");
+    assert_eq!(
+        fs::read_to_string(cold_b.join(manifest_of(&path))).unwrap(),
+        text
+    );
+    assert!(
+        !fixture.records()[len..].iter().any(|r| match &r.kind {
+            Kind::Displaced { .. } => true,
+            Kind::Copy { path: copied, .. } => *copied == path,
+            _ => false,
+        }),
+        "{report:?}"
+    );
 }

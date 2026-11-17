@@ -27,6 +27,12 @@
 //!   list and no path verdict. A record matches a line of that journal
 //!   that starts at its offset and whose bytes have its digest
 //!   ([`LostLine::matches`]); the line number is not part of the match.
+//! - **A displaced file** (`displaced`, ADR-067 D4) is collected per copy
+//!   target, in ledger order ([`CopyState::displaced`]). It changes no file
+//!   list, no copy and no path verdict. A record matches a manifest on its
+//!   root only when the two texts are byte-equal ([`Displaced::matches`]),
+//!   never by rows or SHA-256: an other file can share both with the path's
+//!   recorded file.
 //!
 //! The path verdicts are those of the union `select` ([`tiers`](crate::tiers)).
 
@@ -117,6 +123,31 @@ impl LostLine {
     }
 }
 
+/// One `displaced` record (ADR-067 D4), without its root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Displaced {
+    /// When it was recorded.
+    pub at_ms: i64,
+    /// The data path its text describes.
+    pub path: String,
+    /// The name of the `.mie/damaged/` directory the file moves into.
+    pub dir: i64,
+    /// The moved file's manifest text, verbatim.
+    pub text: String,
+    /// The text's row count.
+    pub rows: u64,
+    /// The text's SHA-256, lowercase hex.
+    pub sha256: String,
+}
+
+impl Displaced {
+    /// Whether the record matches the manifest `text` found on its root:
+    /// byte-equal texts only.
+    pub fn matches(&self, text: &[u8]) -> bool {
+        self.text.as_bytes() == text
+    }
+}
+
 /// The copy state of one ledger read (module docs).
 #[derive(Debug, Clone)]
 pub struct CopyState {
@@ -133,6 +164,8 @@ pub struct CopyState {
     verifies: BTreeMap<String, Vec<VerifyPass>>,
     /// Per journal name, its `lost-line` records in ledger order.
     lost_lines: BTreeMap<String, Vec<LostLine>>,
+    /// Per root id, its `displaced` records in ledger order.
+    displaced: BTreeMap<String, Vec<Displaced>>,
 }
 
 /// The roots with an open copy-ledger finding: a `finding R … copy-ledger`
@@ -177,6 +210,7 @@ impl CopyState {
             open_entries: BTreeMap::new(),
             verifies: BTreeMap::new(),
             lost_lines: BTreeMap::new(),
+            displaced: BTreeMap::new(),
         };
         // The findings of the pass in progress per root, with its `at_ms`.
         let mut pending: BTreeMap<String, (i64, Vec<Subject>)> = BTreeMap::new();
@@ -281,6 +315,21 @@ impl CopyState {
                         offset: *offset,
                         sha256: sha256.clone(),
                     }),
+                Kind::Displaced { root, dir, text } => {
+                    let file = manifest::parse(text)?;
+                    state
+                        .displaced
+                        .entry(root.clone())
+                        .or_default()
+                        .push(Displaced {
+                            at_ms: record.at_ms,
+                            path: file.relative_path,
+                            dir: *dir,
+                            text: text.clone(),
+                            rows: file.rows,
+                            sha256: file.sha256,
+                        });
+                }
                 Kind::Removed { .. }
                 | Kind::Returned { .. }
                 | Kind::Lost { .. }
@@ -428,6 +477,12 @@ impl CopyState {
     /// name of `paths.journal`), in ledger order (ADR-066 D8).
     pub fn lost_lines(&self, journal: &str) -> &[LostLine] {
         self.lost_lines.get(journal).map_or(&[], Vec::as_slice)
+    }
+
+    /// The `displaced` records of the copy target `root`, in ledger order
+    /// (ADR-067 D4).
+    pub fn displaced(&self, root: &str) -> &[Displaced] {
+        self.displaced.get(root).map_or(&[], Vec::as_slice)
     }
 
     /// Every verification pass over `root`, in ledger order.

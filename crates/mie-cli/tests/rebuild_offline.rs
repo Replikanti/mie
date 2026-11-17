@@ -739,8 +739,8 @@ fn append_failed_line(fixture: &Fixture) -> (u64, u64) {
 fn record_lost_lines(fixture: &Fixture, now: i64) -> (bool, String) {
     let mut out = Vec::new();
     let flags = store::repair::Flags {
-        record_lost: false,
         record_lost_lines: true,
+        ..store::repair::Flags::default()
     };
     let pass = store::repair(
         &fixture.config,
@@ -819,4 +819,61 @@ fn rebuild_derives_no_lost_line_record() {
     let (pass, out) = verify(&fixture, REBUILT + HOUR + 2);
     assert!(pass, "{out}");
     assert!(out.contains("recorded lost at"), "{out}");
+}
+
+/// ADR-067 D7: B2 carries a `displaced` record from its start like every
+/// start record, never derived; after the rebuild verify lists it as a
+/// note and passes.
+#[test]
+fn rebuild_carries_displaced_records_from_its_start() {
+    let (_dir, fixture) = adopted("rebuild-displaced-start");
+    let path = replica::list_sealed(&cold(&fixture, "cold-a"))
+        .unwrap()
+        .into_iter()
+        .find(|p| p.starts_with("source=binance-um"))
+        .unwrap();
+    let manifest = format!("{}.manifest", path.strip_suffix(".parquet").unwrap());
+    let text = fs::read_to_string(cold(&fixture, "cold-a").join(&manifest)).unwrap();
+    let rows = text
+        .lines()
+        .find_map(|line| line.strip_prefix("rows "))
+        .unwrap()
+        .to_owned();
+    let other = text.replace(
+        &format!("\nrows {rows}\n"),
+        &format!("\nrows {}\n", rows.parse::<u64>().unwrap() + 1),
+    );
+    let kind = Kind::Displaced {
+        root: "cold-a".to_owned(),
+        dir: D0 + HOUR,
+        text: other,
+    };
+    CopyLedger::at(&fixture.hot())
+        .append(&Record {
+            at_ms: D0 + HOUR,
+            kind: kind.clone(),
+        })
+        .unwrap();
+    assert_pass(&replicate(&fixture, D0 + HOUR + 1));
+    let displaced = |fixture: &Fixture| -> Vec<Kind> {
+        copy_ledger::read(&fixture.hot())
+            .unwrap()
+            .unwrap()
+            .records
+            .into_iter()
+            .filter(|r| matches!(r.kind, Kind::Displaced { .. }))
+            .map(|r| r.kind)
+            .collect()
+    };
+    fs::remove_file(hot_ledger(&fixture)).unwrap();
+    let (pass, out) = rebuild(&fixture, Flags::default(), REBUILT);
+    assert!(pass, "{out}");
+    assert_eq!(displaced(&fixture), [kind]);
+    assert_pass(&replicate(&fixture, REBUILT + 1));
+    let (pass, out) = verify(&fixture, REBUILT + 2);
+    assert!(pass, "{out}");
+    assert!(
+        out.contains(&format!("note: {path} on copy target")),
+        "{out}"
+    );
 }

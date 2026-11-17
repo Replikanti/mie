@@ -703,7 +703,9 @@ pub(super) fn choose_start(
 /// The data path a record names, with its kind (B6 sources).
 fn named_path(kind: &Kind) -> Option<String> {
     match kind {
-        Kind::Manifest { text } => replica::parse_manifest(text).ok().map(|f| f.relative_path),
+        Kind::Manifest { text } | Kind::Displaced { text, .. } => {
+            replica::parse_manifest(text).ok().map(|f| f.relative_path)
+        }
         Kind::Copy { path, .. }
         | Kind::Lost { path, .. }
         | Kind::Hold { path, .. }
@@ -1315,8 +1317,8 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
                 },
                 // H5 b: another text than the start's on a live path. A
                 // copy whose data matches its own text is another sealed
-                // file under the path (D5), which no restore step moves
-                // (#227).
+                // file under the path (D5), which no restore step moves;
+                // `mie store repair --move-other-files` does (ADR-067).
                 RootCopy::Text { data, .. }
                     if !is_archive_part(path)
                         && text.is_some()
@@ -1327,7 +1329,8 @@ pub fn derive(inputs: &RebuildInputs) -> Result<Derived, Stop> {
                         && state.copy(path, root).is_none_or(|c| c.latest.is_none())
                     {
                         "it is another self-consistent file under the path (D5): the restore \
-                         never moves it, and the path stays one copy short on this target (#227)"
+                         never moves it, and the path stays one copy short on this target until \
+                         `mie store repair --move-other-files` moves it aside (ADR-067)"
                             .to_owned()
                     } else {
                         fix

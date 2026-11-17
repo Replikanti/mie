@@ -108,7 +108,8 @@ path, bytes and manifest on every root (ADR-062 D5).
   replication pass; and it reads held archive parts like ordinary files,
   where `select` fails with `Integrity`. `.mie/` and `.quarantine/` lie
   outside the layout, so a `source=…` glob never reads a quarantined part
-  or a damaged copy moved aside.
+  or a damaged copy moved aside, or another self-consistent file the
+  repair moved aside (ADR-067).
 - **What a cold root must provide**, as the POSIX behaviour mie relies
   on, naming no filesystem or product:
   [ADR-062 D4](adr/062-raw-data-retention-and-storage-tiers.md#d4-two-tiers-hot-and-cold).
