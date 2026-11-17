@@ -285,3 +285,70 @@ fn fold_collects_lost_lines_per_journal() {
     assert!(after.verifies("cold-a").is_empty());
     assert!(open_ledger_findings(&copy_ledger::read(&fx.hot).unwrap().unwrap().records).is_empty());
 }
+
+/// ADR-067 D4: the `displaced` records are collected per root, in ledger
+/// order with their `at_ms`, directory, rows and SHA-256; a record matches
+/// only a byte-equal manifest text; and they touch no other state.
+#[test]
+fn copy_state_folds_displaced_records_per_root() {
+    let fx = TieredFixture::new("verification-displaced");
+    fx.copy_path(&path(0), &["cold-a", "cold-b"]);
+    let before = state(&fx);
+    assert!(before.displaced("cold-b").is_empty());
+    let other = fx.other_text(&path(0));
+    let canonical = before.ledger_text(&path(0)).unwrap().to_owned();
+    assert_ne!(other, canonical);
+    let displaced = |root: &str, dir: i64, text: &str| Kind::Displaced {
+        root: root.to_owned(),
+        dir,
+        text: text.to_owned(),
+    };
+    append_at(&fx, D0 + 1, displaced("cold-b", D0, &other));
+    append_at(&fx, D0 + 2, displaced("cold-a", D0 + 2, &other));
+    let third = other.replace("\nrows ", "\nrows 1");
+    append_at(&fx, D0 + 3, displaced("cold-b", D0 + 3, &third));
+    let after = state(&fx);
+    let records = after.displaced("cold-b");
+    assert_eq!(
+        records
+            .iter()
+            .map(|d| (d.at_ms, d.dir, d.path.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            (D0 + 1, D0, path(0).as_str()),
+            (D0 + 3, D0 + 3, path(0).as_str())
+        ]
+    );
+    let parsed = crate::manifest::parse(&other).unwrap();
+    assert_eq!(
+        (records[0].rows, &records[0].sha256),
+        (parsed.rows, &parsed.sha256)
+    );
+    assert_eq!(records[0].text, other);
+    assert_eq!(after.displaced("cold-a").len(), 1);
+    assert!(after.displaced("cold-c").is_empty());
+
+    // Byte-equal texts only: never the canonical text, whose SHA-256 the
+    // other text shares.
+    assert_eq!(
+        parsed.sha256,
+        crate::manifest::parse(&canonical).unwrap().sha256
+    );
+    assert!(records[0].matches(other.as_bytes()));
+    assert!(!records[0].matches(canonical.as_bytes()));
+    assert!(!records[0].matches(third.as_bytes()));
+    assert!(records[1].matches(third.as_bytes()));
+    assert!(!records[0].matches(format!("{other}\n").as_bytes()));
+
+    // Nothing else changes: paths, verdicts, copies, findings.
+    assert_eq!(
+        after.paths().collect::<Vec<_>>(),
+        before.paths().collect::<Vec<_>>()
+    );
+    assert_eq!(after.ledger_text(&path(0)), Some(canonical.as_str()));
+    for root in ["cold-a", "cold-b"] {
+        assert_eq!(after.copy(&path(0), root), before.copy(&path(0), root));
+    }
+    assert!(!after.open_journal_finding("cold-b"));
+    assert!(after.verifies("cold-b").is_empty());
+}

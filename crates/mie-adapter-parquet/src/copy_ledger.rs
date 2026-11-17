@@ -28,22 +28,28 @@
 //! - The kinds and their fields are those of [`Kind`]; the value sets of
 //!   [`FindingCode`], [`Subject`], [`LostOrigin`], [`HoldReason`] and
 //!   [`Resolution`] are closed.
-//! - The manifest text of a [`Kind::Manifest`] record and the journal name
-//!   of a [`Kind::LostLine`] record are escaped: `%`, the bytes 0x00–0x20
-//!   and 0x7F are written as `%XX` with uppercase hex, every other byte is
-//!   literal, and any other spelling is refused. The manifest text is
-//!   stored verbatim, never re-rendered.
+//! - The manifest text of a [`Kind::Manifest`] or [`Kind::Displaced`]
+//!   record and the journal name of a [`Kind::LostLine`] record are
+//!   escaped: `%`, the bytes 0x00–0x20 and 0x7F are written as `%XX` with
+//!   uppercase hex, every other byte is literal, and any other spelling is
+//!   refused. A manifest text is stored verbatim, never re-rendered.
 //! - A [`Kind::LostLine`] record (ADR-066 D8) is `lost-line <at_ms>
 //!   <journal> <line> <offset> <sha256> <chain>`: the file name of the
 //!   capture journal, escaped; the line's 1-based number; its first byte;
 //!   the SHA-256 of its bytes without its `\n` ([`line_sha256`]). Line 1
 //!   starts at byte 0 and no other line does, so `line` 1 with `offset` ≠ 0
 //!   and `offset` 0 with `line` ≠ 1 are refused.
+//! - A [`Kind::Displaced`] record (ADR-067 D4) is `displaced <at_ms>
+//!   <root> <dir> <text> <chain>`: the copy target's id, as a `copy`
+//!   record's root; the decimal name of the `.mie/damaged/` directory the
+//!   file moves into, a canonical decimal in `0 ..= MAX_EVENT_TIME_MS` like
+//!   `at_ms`; the moved file's manifest text, escaped as a `manifest`
+//!   record's text, which must parse.
 //!
 //! The parser is strict: any line [`Record`] rendering cannot produce is
 //! [`RawStoreError::Corrupt`]. A later step adds a kind only together with
-//! an ADR edit and a golden test (`lost-line`: ADR-066 D8, recorded on
-//! ADR-062's status line).
+//! an ADR edit and a golden test (`lost-line`: ADR-066 D8; `displaced`:
+//! ADR-067 D4; both recorded on ADR-062's status line).
 //!
 //! # Readers and appenders
 //!
@@ -346,6 +352,22 @@ pub enum Kind {
         /// ([`line_sha256`]).
         sha256: String,
     },
+    /// `displaced`: a self-consistent other file under a recorded path on
+    /// a copy target, moved into that root's `.mie/damaged/<dir>/` by
+    /// `mie store repair --move-other-files` (ADR-067 D4). Appended before
+    /// the move, so a crash between them leaves a record the next repair
+    /// completes. It changes no file list and no path verdict.
+    Displaced {
+        /// The copy target's id.
+        root: String,
+        /// The name of the `.mie/damaged/` directory the file moves into:
+        /// the repair run's `at_ms`.
+        dir: i64,
+        /// The moved file's manifest text, verbatim; it must parse as a
+        /// manifest. A later repair completes the move only for a manifest
+        /// byte-equal to it.
+        text: String,
+    },
 }
 
 impl Kind {
@@ -365,6 +387,7 @@ impl Kind {
             Self::Quarantined { .. } => "quarantined",
             Self::Replaced { .. } => "replaced",
             Self::LostLine { .. } => "lost-line",
+            Self::Displaced { .. } => "displaced",
         }
     }
 }
@@ -486,6 +509,12 @@ fn render_body(record: &Record) -> Result<String, String> {
                 offset.to_string(),
                 sha256.clone(),
             ]
+        }
+        Kind::Displaced { root, dir, text } => {
+            check_id(root)?;
+            check_dir(*dir)?;
+            manifest::parse(text).map_err(|e| e.to_string())?;
+            vec![root.clone(), dir.to_string(), escape(text)]
         }
     };
     let mut body = format!("{} {}", record.kind.name(), record.at_ms);
@@ -639,6 +668,20 @@ fn parse_body(body: &str) -> Result<Record, String> {
                 sha256: fields[3].to_owned(),
             }
         }
+        "displaced" => {
+            arity(3)?;
+            check_id(fields[0])?;
+            let dir = i64::try_from(decimal(fields[1])?)
+                .map_err(|_| format!("directory {:?} out of range", fields[1]))?;
+            check_dir(dir)?;
+            let text = unescape(fields[2], "manifest")?;
+            manifest::parse(&text).map_err(|e| e.to_string())?;
+            Kind::Displaced {
+                root: fields[0].to_owned(),
+                dir,
+                text,
+            }
+        }
         other => return Err(format!("unknown kind {other:?}")),
     };
     Ok(Record { at_ms, kind })
@@ -663,6 +706,17 @@ fn check_at_ms(at_ms: i64) -> Result<(), String> {
             layout::MAX_EVENT_TIME_MS
         ))
     }
+}
+
+/// The `.mie/damaged/` directory name of a `displaced` record: a repair
+/// run's `at_ms`, so the range of [`check_at_ms`].
+fn check_dir(dir: i64) -> Result<(), String> {
+    check_at_ms(dir).map_err(|_| {
+        format!(
+            "directory {dir} is outside 0 ..= {}",
+            layout::MAX_EVENT_TIME_MS
+        )
+    })
 }
 
 /// Whether `path` is a sealed data path a record may name: the layout's

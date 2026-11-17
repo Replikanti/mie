@@ -1328,9 +1328,18 @@ mod tests {
         assert_eq!(sealed[0].part, 3);
 
         // Each kind alone raises the next number: lost, held and
-        // quarantined entries (written directly until #193 and #194).
+        // quarantined entries (written directly until #193 and #194), and
+        // a displaced file's text (ADR-067 D7).
         let path = |part: u32| format!("{partition}/{}", PartFile::Data.name(part));
-        let rows: [(&str, Kind); 3] = [
+        let displaced = {
+            let base = TieredFixture::new("union-displaced-text");
+            let first = &TieredFixture::data_paths(&base.hot, &partition)[0];
+            let mut file = crate::manifest::parse(&base.other_text(first)).unwrap();
+            file.part = 7;
+            file.relative_path = path(7);
+            crate::manifest::render(&file)
+        };
+        let rows: [(&str, Kind); 4] = [
             (
                 "lost",
                 Kind::Lost {
@@ -1351,6 +1360,14 @@ mod tests {
                 Kind::Quarantined {
                     path: path(7),
                     quarantine: "q-0001".to_owned(),
+                },
+            ),
+            (
+                "displaced",
+                Kind::Displaced {
+                    root: "cold-b".to_owned(),
+                    dir: FIXTURE_D0,
+                    text: displaced,
                 },
             ),
         ];

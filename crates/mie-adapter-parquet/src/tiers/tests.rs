@@ -918,3 +918,63 @@ fn lost_line_changes_no_file_list() {
     };
     assert_eq!(view(&with), view(&without));
 }
+
+/// ADR-067 D7: a `displaced` record changes no selection. With records of
+/// another text under a selected path, before and after a removal, every
+/// selection and the copy state's verdicts equal those without them.
+#[test]
+fn a_displaced_record_changes_no_selection() {
+    let partition = TieredFixture::partition(&a(), 1);
+    let build = |tag: &str, displaced: bool| {
+        let fx = TieredFixture::new(tag);
+        let path = TieredFixture::data_paths(&fx.hot, &partition)[0].clone();
+        let other = fx.other_text(&path);
+        let record = |dir: i64| Kind::Displaced {
+            root: "cold-b".to_owned(),
+            dir,
+            text: other.clone(),
+        };
+        fx.copy(&partition);
+        if displaced {
+            fx.append(record(1));
+        }
+        fx.remove(&partition);
+        if displaced {
+            fx.append(record(2));
+        }
+        fx
+    };
+    let with = build("tiers-displaced-with", true);
+    let without = build("tiers-displaced-without", false);
+    let ledger = copy_ledger::read(&with.hot).unwrap().unwrap();
+    assert_eq!(
+        ledger
+            .records
+            .iter()
+            .filter(|r| r.kind.name() == "displaced")
+            .count(),
+        2
+    );
+    for selection in windows() {
+        assert_eq!(
+            format!("{:?}", with.store().select(&selection)),
+            format!("{:?}", without.store().select(&selection)),
+            "{selection:?}"
+        );
+    }
+    let paths = |fx: &TieredFixture| {
+        let ledger = copy_ledger::read(&fx.hot).unwrap().unwrap();
+        let state = crate::verification::CopyState::fold(&ledger).unwrap();
+        state
+            .paths()
+            .map(|(path, verdict)| {
+                (
+                    path.to_owned(),
+                    verdict,
+                    state.ledger_text(path).map(str::to_owned),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(paths(&with), paths(&without));
+}

@@ -31,17 +31,25 @@ const GOLDEN: &str = concat!(
     "quarantined 1791248400008 source=binance-um/instrument=BTCUSDT/stream=depth/date=2026-10-06/part-00003.parquet q-20261006 80366222b7c66e39d7fc50a728f536808fc7272c3466bf68b8772ed565ea81cc\n",
     "replaced 1791248400009 source=binance-um/instrument=BTCUSDT/stream=depth/date=2026-10-06/part-00003.parquet aggTrades/BTCUSDT-aggTrades-2026-10-05.zip.import 5be25e1dc82313355937b86a02e10cac057a25e64f90f520966b79ef083845f1\n",
     "lost-line 1791248400010 my%20journal%25.jsonl 6 1000 7f325e080f05ef6166b40bfef45ba8850257ad3f4dd9ba741d579dab92eec1ff d73ab8c42ff361aae34dcd68c832560c3e4877e1a9c2947f6332f83575560ade\n",
+    "displaced 1791248400011 cold-b 1791248400011 mie-raw-manifest%201%0Apath%20source=binance-um/instrument=BTCUSDT/stream=depth/date=2026-10-06/part-00003.parquet%0Asource%20binance-um%0Ainstrument%20BTCUSDT%0Astream%20depth%0Adate%202026-10-06%0Apart%203%0Arows%204218%0Abytes%201048576%0Amin_event_time_ms%201791244800000%0Amax_event_time_ms%201791248399999%0Asha256%2053791ac4060bf10774bb05e40a8afaa60f490a0cb329ef0be31f7610f938b364%0A ec75cc60a7bf96b68eff0693c0a0332b5cc1c9dbb8f2a6425d1cafaab4812c0a\n",
 );
 
 /// The manifest of a fixture `depth` file.
 fn manifest_text() -> String {
+    manifest_with_rows(4_217)
+}
+
+/// The manifest of the fixture `depth` file with `rows` rows: with
+/// another count, a self-consistent other file under the same path (the
+/// form `displaced` records, ADR-067).
+fn manifest_with_rows(rows: u64) -> String {
     let stream = stream("depth");
     manifest::render(&SealedFile {
         relative_path: layout::file_path(&stream, "2026-10-06", PartFile::Data, 3),
         stream,
         date: "2026-10-06".to_owned(),
         part: 3,
-        rows: 4_217,
+        rows,
         bytes: 1_048_576,
         min_event_time: EventTime::from_millis(1_791_244_800_000),
         max_event_time: EventTime::from_millis(1_791_248_399_999),
@@ -153,6 +161,14 @@ fn golden_records() -> Vec<Record> {
                 sha256: line_sha256(b"journal line 6"),
             },
         ),
+        record(
+            11,
+            Kind::Displaced {
+                root: "cold-b".to_owned(),
+                dir: AT + 11,
+                text: manifest_with_rows(4_218),
+            },
+        ),
     ]
 }
 
@@ -210,7 +226,7 @@ fn golden_text_is_pinned_byte_for_byte_with_its_chain() {
     let dir = store("ledger-golden");
     let records = golden_records();
     let kinds: std::collections::BTreeSet<&str> = records.iter().map(|r| r.kind.name()).collect();
-    assert_eq!(kinds.len(), 13, "one record of every kind");
+    assert_eq!(kinds.len(), 14, "one record of every kind");
     append_all(dir.path(), &records);
     let text = fs::read_to_string(ledger_path(dir.path())).unwrap();
     assert_eq!(text, GOLDEN);
@@ -1674,4 +1690,136 @@ fn journal_name_escapes_round_trip() {
         );
         assert_eq!(parse_body(&body).unwrap(), record, "{name:?}");
     }
+}
+
+// ------------------------------------------------ displaced (ADR-067 D4)
+
+/// A `displaced` record of cold-b into the directory `dir`.
+fn displaced(dir: i64, text: String) -> Kind {
+    Kind::Displaced {
+        root: "cold-b".to_owned(),
+        dir,
+        text,
+    }
+}
+
+/// The record's exact body, render then parse giving the record back, a
+/// text whose escapes include `%25` and `%20`, and the range of `dir`. Its
+/// chained line is pinned in [`GOLDEN`].
+#[test]
+fn displaced_record_round_trips() {
+    let text = manifest_with_rows(4_218);
+    let record = record(11, displaced(AT + 11, text.clone()));
+    let body = record.body().unwrap();
+    assert_eq!(
+        body,
+        format!(
+            "displaced 1791248400011 cold-b 1791248400011 {}",
+            escape(&text)
+        )
+    );
+    assert!(body.contains("%20") && body.contains("%0A"), "{body}");
+    assert_eq!(parse_body(&body).unwrap(), record);
+    // A manifest text holds no `%` (its fields are segments, decimals and
+    // hex), so the `%25` escape is pinned on the field's escape itself.
+    assert_eq!(escape("a%b c"), "a%25b%20c");
+    assert_eq!(unescape("a%25b%20c", "manifest").unwrap(), "a%b c");
+    for dir in [0, 1, layout::MAX_EVENT_TIME_MS] {
+        let record = Record {
+            at_ms: 0,
+            kind: displaced(dir, text.clone()),
+        };
+        assert_eq!(parse_body(&record.body().unwrap()).unwrap(), record);
+    }
+    // In a ledger: appended, chained and read back like every kind.
+    let dir = store("ledger-displaced");
+    append_all(dir.path(), std::slice::from_ref(&record));
+    assert_eq!(read(dir.path()).unwrap().unwrap().records, [record]);
+}
+
+/// The grammar's refusals: the parser refuses each body as `Corrupt`
+/// (inside a valid chain), and the render refuses each record it could
+/// express as `Invalid`, so neither is ever written.
+#[test]
+fn displaced_grammar_refusals() {
+    let text = escape(&manifest_with_rows(4_218));
+    let raw_space = text.replacen("%20", " ", 1);
+    let lowercase = text.replacen("%0A", "%0a", 1);
+    let no_sha: String = manifest_with_rows(4_218)
+        .lines()
+        .filter(|line| !line.starts_with("sha256 "))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    let not_a_manifest = escape(&no_sha);
+    let past = layout::MAX_EVENT_TIME_MS + 1;
+    let bodies = [
+        // The root.
+        format!("displaced {AT} cold\u{200b}b {AT} {text}"),
+        format!("displaced {AT} cold-b\u{a0} {AT} {text}"),
+        format!("displaced {AT} cold.b {AT} {text}"),
+        format!("displaced {AT}  {AT} {text}"),
+        // The directory.
+        format!("displaced {AT} cold-b 01 {text}"),
+        format!("displaced {AT} cold-b +1 {text}"),
+        format!("displaced {AT} cold-b -1 {text}"),
+        format!("displaced {AT} cold-b {past} {text}"),
+        format!("displaced {AT} cold-b 18446744073709551616 {text}"),
+        format!("displaced {AT} cold-b - {text}"),
+        // The text: a raw space, a lowercase escape, a text that does not
+        // parse as a manifest, an empty one.
+        format!("displaced {AT} cold-b {AT} {raw_space}"),
+        format!("displaced {AT} cold-b {AT} {lowercase}"),
+        format!("displaced {AT} cold-b {AT} {not_a_manifest}"),
+        format!("displaced {AT} cold-b {AT} %41{text}"),
+        // Arity.
+        format!("displaced {AT} cold-b {AT}"),
+        format!("displaced {AT} cold-b {AT} {text} extra"),
+        format!("displaced {AT} {AT} {text}"),
+    ];
+    for body in &bodies {
+        let ledger = ledger_of(&[body]);
+        assert_eq!(check_chain(&ledger).failure, None, "{body:?}");
+        assert!(
+            matches!(parsed(&ledger), Err(RawStoreError::Corrupt(_))),
+            "{body:?}: {:?}",
+            parsed(&ledger)
+        );
+    }
+
+    let dir = store("ledger-displaced-invalid");
+    let before = fs::read(ledger_path(dir.path())).unwrap();
+    let good = manifest_with_rows(4_218);
+    let bad = [
+        Kind::Displaced {
+            root: "cold\u{200b}b".to_owned(),
+            dir: AT,
+            text: good.clone(),
+        },
+        Kind::Displaced {
+            root: "cold-b ".to_owned(),
+            dir: AT,
+            text: good.clone(),
+        },
+        Kind::Displaced {
+            root: String::new(),
+            dir: AT,
+            text: good.clone(),
+        },
+        displaced(-1, good.clone()),
+        displaced(past, good.clone()),
+        displaced(AT, no_sha),
+        displaced(AT, String::new()),
+    ];
+    for kind in bad {
+        assert!(
+            matches!(
+                CopyLedger::at(dir.path())
+                    .append(&record(0, kind.clone()))
+                    .map_err(|e| e.error),
+                Err(RawStoreError::Invalid(_))
+            ),
+            "{kind:?}"
+        );
+    }
+    assert_eq!(fs::read(ledger_path(dir.path())).unwrap(), before);
 }
