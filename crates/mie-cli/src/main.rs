@@ -368,7 +368,7 @@ USAGE:
         the finding, and exits 1.
 
     mie store repair --config <path> [--archive-config <path>] [--record-lost]
-                     [--record-lost-lines]
+                     [--record-lost-lines] [--move-other-files]
         Repair the copies of a tiered raw store (ADR-062 D11) that mie store
         verify recorded as damaged or missing, and fill the copy targets
         that lack files which left hot (a target added or replaced). It
@@ -389,8 +389,15 @@ USAGE:
         for are refused and named. A copy target's
         unrecorded copy of a file hot holds that the next pass would refuse
         is moved aside into <root>/.mie/damaged/<time>/, and the closing
-        pass copies the file from hot; another self-consistent file under
-        the path is refused. A file with no good copy left is reported
+        pass copies the file from hot. Another self-consistent file under a
+        recorded path on a copy target (its own manifest differs from the
+        recorded one and its data matches it: a path sealed twice) is
+        refused, naming its rows and SHA-256: --move-other-files records it
+        in the copy ledger (ADR-067), moves it into
+        <root>/.mie/damaged/<time>/, never deleted, and copies the recorded
+        file there, so pass it only after checking that file; a held path's
+        other file stays refused, naming mie store resolve. A file with no
+        good copy left is reported
         lost and nothing is written, but only when every root that records
         a copy of it still carries its marker and every root was read
         without error; otherwise it is not repairable in this run, naming
@@ -1046,7 +1053,7 @@ fn dispatch(args: &[String]) -> Result<ExitCode, String> {
                 let options = Options::parse(
                     &args[2..],
                     &["--config", "--archive-config"],
-                    &["--record-lost", "--record-lost-lines"],
+                    &["--record-lost", "--record-lost-lines", "--move-other-files"],
                 )?;
                 let config =
                     IngestConfig::load(&options.path("--config")?).map_err(|e| e.to_string())?;
@@ -1060,6 +1067,7 @@ fn dispatch(args: &[String]) -> Result<ExitCode, String> {
                     store::repair::Flags {
                         record_lost: options.flag("--record-lost"),
                         record_lost_lines: options.flag("--record-lost-lines"),
+                        move_other_files: options.flag("--move-other-files"),
                     },
                     probe.as_ref(),
                     &now_ms,
@@ -1197,7 +1205,8 @@ fn dispatch(args: &[String]) -> Result<ExitCode, String> {
                  [--archive-config <path>] --from <path> [--journal <path>] [--import-ledger \
                  <dir>]`, `mie store verify --config <path> [--archive-config <path>] \
                  --period-hours <P>`, `mie store repair --config <path> [--archive-config \
-                 <path>] [--record-lost] [--record-lost-lines]`, `mie store rebuild --config \
+                 <path>] [--record-lost] [--record-lost-lines] [--move-other-files]`, `mie \
+                 store rebuild --config \
                  <path> \
                  [--archive-config <path>] [--record-lost] [--record-unlisted] \
                  [--replace-hot-ledger]`, `mie store restore --config <path> \
