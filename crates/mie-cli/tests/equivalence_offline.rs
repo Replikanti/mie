@@ -1822,3 +1822,67 @@ fn equivalence_judges_a_run_whose_chain_restart_is_lost() {
         "{text}"
     );
 }
+
+/// Review round 1 of #235 (ADR-068 D4): run 2's `run_start` is lost, so
+/// run 2 is excluded with no start of its own. The time of its first
+/// readable line stands in, so a window holding run 2 does not PASS: run 2
+/// is NOT COMPARABLE.
+#[test]
+fn equivalence_excluded_run_without_its_run_start_is_not_comparable() {
+    let dir = TempDir::new("equivalence-gate-lost-start");
+    let (config, start1, start2, runs) = two_played_runs(dir.path());
+    let run2 = runs[1].parameters.run_id.clone();
+    let journal = config.paths.journal.clone();
+    let (_, start, _) = journal_line(&journal, "run_start", &run2);
+    flip_value_digit(&journal, start);
+    let read = read_runs(&config.paths, "binance-um").unwrap();
+    assert_eq!(read.excluded.len(), 1);
+    assert_eq!(read.excluded[0].run_id, run2);
+    assert_eq!(read.excluded[0].start, None);
+    let (outcome, text) = check(&config, start1, start2 + 1);
+    assert!(!outcome.pass, "{text}");
+    let verdict = outcome
+        .runs
+        .iter()
+        .find(|v| v.run_id == run2)
+        .expect("run 2");
+    assert!(
+        matches!(verdict.verdict, Verdict::NotComparable(_)),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "run {run2}: NOT COMPARABLE: excluded: journal line"
+        )),
+        "{text}"
+    );
+}
+
+/// Review round 1 of #235 (ADR-068 D4, a run boundary): in a single-root
+/// journal `mie ingest` wrote, run 1's run_end is followed by run 2's
+/// `recovery` (no `replication` without a replicator). Run 1's lost
+/// run_end marks run 1 only: run 2 is still judged EQUIVALENT.
+#[test]
+fn equivalence_lost_run_end_before_the_next_run_marks_only_its_run() {
+    let dir = TempDir::new("equivalence-gate-lost-end");
+    let (config, start1, start2, runs) = two_played_runs(dir.path());
+    let (run1, run2) = (
+        runs[0].parameters.run_id.clone(),
+        runs[1].parameters.run_id.clone(),
+    );
+    let journal = config.paths.journal.clone();
+    let (index, start, _) = journal_line(&journal, "run_end", &run1);
+    let (next, _, _) = journal_line(&journal, "recovery", &run2);
+    assert_eq!(next, index + 1, "run 2's recovery follows run 1's run_end");
+    flip_value_digit(&journal, start);
+    let read = read_runs(&config.paths, "binance-um").unwrap();
+    assert!(read.excluded.is_empty(), "{:?}", read.notes());
+    let (outcome, text) = check(&config, start1, start2 + 1);
+    assert!(!outcome.pass, "{text}");
+    assert!(
+        matches!(outcome.runs[0].verdict, Verdict::NotComparable(_)),
+        "{text}"
+    );
+    assert_eq!(outcome.runs[1].run_id, run2);
+    assert_eq!(outcome.runs[1].verdict, Verdict::Equivalent, "{text}");
+}

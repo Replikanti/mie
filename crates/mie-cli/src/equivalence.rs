@@ -268,14 +268,15 @@ pub fn run(
                     verdict,
                 });
             }
-            // An excluded run whose start was read and lies in the window
-            // cannot be recomputed (ADR-068 D4).
+            // An excluded run that may have started in the window cannot be
+            // recomputed (ADR-068 D4). Without its run_start the time of its
+            // first readable line stands in; with no time at all it counts,
+            // so the window fails closed.
             for excluded in &read.excluded {
-                let Some((started_at_ms, run_symbol, _)) = &excluded.start else {
-                    continue;
-                };
-                if run_symbol != symbol || !(request.from_ms..request.to_ms).contains(started_at_ms)
-                {
+                let in_window = excluded
+                    .started_at_ms()
+                    .is_none_or(|at| (request.from_ms..request.to_ms).contains(&at));
+                if !excluded.may_be_of(symbol) || !in_window {
                     continue;
                 }
                 let Judged { verdict, lines } = not_comparable(

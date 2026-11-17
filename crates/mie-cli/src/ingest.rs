@@ -938,11 +938,11 @@ fn memory_guard(
     let source = &config.instrument.source;
     let symbol = &config.instrument.symbol;
     let read = read_runs(&config.paths, source)?;
-    if let Some(excluded) = read.excluded.iter().find(|run| {
-        let symbol_differs = run.start.as_ref().is_some_and(|(_, s, _)| s != symbol);
-        let started = run.start.as_ref().map(|(at, _, _)| *at).or(run.first_at_ms);
-        !symbol_differs && started.is_none_or(|at| at >= cutover)
-    }) {
+    if let Some(excluded) = read
+        .excluded
+        .iter()
+        .find(|run| run.may_be_of(symbol) && run.started_at_ms().is_none_or(|at| at >= cutover))
+    {
         return Err(format!(
             "the history chain may hold run {}, which is {}, so it cannot be recomputed",
             excluded.run_id,

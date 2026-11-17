@@ -149,8 +149,12 @@ and what does losing a line of that kind mean?
 - **Trusted.** A line is trusted when it parses, its `type` is one of the
   six, at least one neighbour exists, and its `run_id` equals the run id
   of every neighbour that exists. One agreeing neighbour of two is not
-  enough: the line could be the other run's. A trusted line acts by its
-  kind:
+  enough: the line could be the other run's. One exception, **a run
+  boundary**: a line of a kind that marks its run (`run_end`,
+  `state_checkpoint`, `chain_restart`, below) is trusted when its
+  before-neighbour is of its run and its after-neighbour *opens* another
+  run, a `recovery` or a `run_start` (`mie ingest` writes those two
+  before any other line of a run). A trusted line acts by its kind:
   - `run_start` (the run's parameters are lost), `warm_start` (its warm
     seeds are lost, ADR-052 D3) and `warm_ready` (no reader consumes it,
     but it is 9 bits from `warm_start`, D1) **exclude** the run.
@@ -162,6 +166,26 @@ and what does losing a line of that kind mean?
     reader consumes the restarts `read_runs` collects.
 - **Untrusted.** Any other recorded line excludes the runs of both
   neighbours (none when it has none).
+- **Why a run boundary counts as agreement** (review round 1 of #235,
+  operator decision). A run's last line is its `run_end` unless a
+  replication pass follows it, and only a tiered store has a replicator
+  (`ingest/tiers.rs`): in a single-root journal, where D5 reads every
+  failed line, A's `run_end` is followed directly by B's `recovery`.
+  Without the exception a lost `run_end` would exclude A and the
+  innocent B. The exception is safe against one damage event: the line's
+  own run id agrees with the line before it, and the line after it is
+  another run's opener only if it was written so. A neighbour never fails
+  its check, so a checked opener's kind is as written; an unchecked
+  (legacy) line would need at least 23 bits of damage to become a
+  `run_start` (its nearest name of equal length is `connected`), and no
+  other kind has `recovery`'s length (`kind_names_are_far_apart_in_bits`).
+  An after-neighbour of another run that
+  opens nothing (an ordinary line of B) is no boundary, and the line
+  stays untrusted. Residual: multi-bit damage that turns the lost line
+  into a mark line of the run before it, followed by the `run_start` of
+  a short-lived third run, would mark the wrong run; no variant of the
+  rule excludes that third run either, since its run id is only in the
+  damaged bytes.
 - **An excluded run** is in the state ADR-039 D2 defines for a run whose
   `run_start` was lost: its structural lines are skipped (so they raise no
   orphan errors), its in-window records fail a replay, and records outside
@@ -172,12 +196,19 @@ and what does losing a line of that kind mean?
   `state_checkpoint` is NOT COMPARABLE: `compare` matches checkpoints by
   index (`mie-app` `equivalence.rs`), so a run read without one would read
   as DIVERGED, and without its `run_end` it has no totals. A run marked
-  only for a `chain_restart` is judged as before. An excluded run whose
-  `run_start` was read and whose start lies in the window is NOT
-  COMPARABLE, after the judged runs.
+  only for a `chain_restart` is judged as before. An excluded run that
+  may have started in the window is NOT COMPARABLE, after the judged
+  runs: its `run_start`'s time, or, when that line is lost, the time of
+  its first readable line (`ExcludedRun::started_at_ms`, the fallback the
+  ingest memory guard uses too); a run with no readable line at all
+  counts, so the window fails closed. The fallback is the run's
+  `recovery`, written just before its `run_start`, so it can sit
+  milliseconds before the start: a run starting within that gap after
+  `from` is judged outside the window (residual).
 - **The ingest warm start.** The memory guard reads the journal through
   the gate. A gated line, or an excluded run that may lie in the chain
-  (it started at or after the cutover, or its start is not known), fails
+  (it started at or after the cutover, by the same `started_at_ms`, or
+  its start is not known), fails
   the warm-up: the run starts cold with ADR-052's `warm-up-failed`, its
   `error` naming the line, and the capture never stops.
 

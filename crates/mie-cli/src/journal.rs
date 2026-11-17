@@ -990,6 +990,22 @@ pub struct ExcludedRun {
 }
 
 impl ExcludedRun {
+    /// When the run started, as far as the journal tells: its `run_start`'s
+    /// `at_ms`, or else the `at_ms` of its first readable line (later than
+    /// its start). `None` when no line of it was read.
+    pub fn started_at_ms(&self) -> Option<i64> {
+        self.start
+            .as_ref()
+            .map(|(at, _, _)| *at)
+            .or(self.first_at_ms)
+    }
+
+    /// Whether the run may be of `symbol`: its `run_start` names it, or
+    /// that line was not read.
+    pub fn may_be_of(&self, symbol: &str) -> bool {
+        self.start.as_ref().is_none_or(|(_, s, _)| s == symbol)
+    }
+
     /// Where its exclusion comes from, for a report line.
     pub fn cause(&self) -> String {
         format!(
@@ -1183,16 +1199,17 @@ fn span_after(bytes: &[u8], end: usize) -> Option<(usize, usize)> {
     (end + 1 < bytes.len()).then(|| span_from(bytes, end + 1))
 }
 
-/// The run id of the nearest neighbour of the line `span` on one side
-/// (ADR-068 D4): a line that parses with a string `run_id`, does not fail
-/// its check (complete lines only; the unterminated tail is not classified)
-/// and is not lost (`lost` holds the lost lines' first bytes).
+/// The nearest neighbour of the line `span` on one side (ADR-068 D4): a
+/// line that parses with a string `run_id`, does not fail its check
+/// (complete lines only; the unterminated tail is not classified) and is
+/// not lost (`lost` holds the lost lines' first bytes). Its run id, and
+/// whether it opens its run.
 fn neighbour(
     bytes: &[u8],
     span: (usize, usize),
     forward: bool,
     lost: &BTreeSet<usize>,
-) -> Option<String> {
+) -> Option<Neighbour> {
     let mut at = span;
     loop {
         at = if forward {
@@ -1205,11 +1222,45 @@ fn neighbour(
         }
         let body = &bytes[at.0..at.1];
         let complete = at.1 < bytes.len();
-        if let Some(run_id) = run_id_of(body)
+        let Ok(value) = serde_json::from_slice::<Value>(body) else {
+            continue;
+        };
+        if let Some(run_id) = value.get("run_id").and_then(Value::as_str)
             && (!complete || check_line(body) != LineCheck::Failed)
         {
-            return Some(run_id);
+            return Some(Neighbour {
+                run_id: run_id.to_owned(),
+                opens: matches!(kind_of(Some(&value)), Some(kind) if RUN_OPENERS.contains(&kind)),
+            });
         }
+    }
+}
+
+/// The kinds that open a run: `mie ingest` writes `recovery` and then
+/// `run_start` before any other line of the run (ADR-068 D4, a run
+/// boundary).
+const RUN_OPENERS: [&str; 2] = ["recovery", "run_start"];
+
+/// A lost line's neighbour (ADR-068 D4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Neighbour {
+    /// Its run id.
+    run_id: String,
+    /// Whether its kind opens a run ([`RUN_OPENERS`]).
+    opens: bool,
+}
+
+/// Whether a lost line of `run` is trusted (ADR-068 D4): at least one
+/// neighbour, and every neighbour is of `run`, except that for a kind that
+/// marks its run (`marks`), an after-neighbour that opens another run is a
+/// run boundary and counts as agreement when the before-neighbour is of
+/// `run`.
+fn trusted(run: &str, marks: bool, before: Option<&Neighbour>, after: Option<&Neighbour>) -> bool {
+    let agrees = |side: &Neighbour| side.run_id == run;
+    match (before, after) {
+        (None, None) => false,
+        (Some(before), Some(after)) if marks && agrees(before) && after.opens => true,
+        _ => before.into_iter().chain(after).all(agrees),
     }
 }
 
@@ -1335,13 +1386,14 @@ pub fn runs_from_bytes(
         } else {
             let before = neighbour(bytes, line.span, false, &lost_at);
             let after = neighbour(bytes, line.span, true, &lost_at);
-            let sides: Vec<String> = before.into_iter().chain(after).collect();
             let kind = line.lost.kind.as_deref();
+            let marks = matches!(kind, Some("run_end" | "state_checkpoint" | "chain_restart"));
             let trusted = kind.is_some_and(|kind| GATED_KINDS.contains(&kind))
                 && line
                     .run_id
                     .as_ref()
-                    .is_some_and(|run| !sides.is_empty() && sides.iter().all(|side| side == run));
+                    .is_some_and(|run| trusted(run, marks, before.as_ref(), after.as_ref()));
+            let sides: Vec<String> = before.into_iter().chain(after).map(|n| n.run_id).collect();
             match (trusted, kind, &line.run_id) {
                 (true, Some("run_end" | "state_checkpoint" | "chain_restart"), Some(run)) => {
                     LostEffect::Marked(run.clone())
@@ -3935,6 +3987,67 @@ mod tests {
         assert_eq!(read.lost[0].effect, neighbours(&["A", "B"]));
     }
 
+    /// Runs A and B without their `replication` lines, as a single-root
+    /// store writes them (the replicator writes it): A's run_end is
+    /// followed by B's recovery.
+    fn two_runs_single_root() -> Vec<String> {
+        let mut lines = run_lines("A", 1_000);
+        lines.pop();
+        let mut b = run_lines("B", 5_000);
+        b.pop();
+        lines.extend(b);
+        lines
+    }
+
+    /// Review round 1 of #235 (ADR-068 D4, a run boundary): a lost line of
+    /// a kind that marks its run, whose before-neighbour is of its run and
+    /// whose after-neighbour opens another run (`recovery` or `run_start`),
+    /// is trusted. A's run_end then marks A and B reads untouched.
+    #[test]
+    fn a_lost_mark_line_before_a_run_boundary_marks_its_run() {
+        let good = checked(&two_runs_single_root());
+        let bytes = flip_digit(&good, 7);
+        assert_verdicts(&bytes, &[7], LineCheck::Failed);
+        let whole = gated(&good, none()).0.unwrap();
+        let read = gated(&bytes, LostLineRecords::SingleRoot).0.unwrap();
+        assert_eq!(read.lost[0].effect, LostEffect::Marked("A".to_owned()));
+        assert_eq!(ids(&read.runs), ["A", "B"]);
+        assert!(read.excluded.is_empty());
+        assert_eq!(read.runs[0].end, None);
+        assert_eq!(read.runs[1], whole.runs[1]);
+        // The same with B's run_start right after A's run_end.
+        let mut lines = two_runs_single_root();
+        lines.remove(8);
+        let bytes = flip_digit(&checked(&lines), 7);
+        let read = recorded(&bytes, 7);
+        assert_eq!(read.lost[0].effect, LostEffect::Marked("A".to_owned()));
+        assert_eq!(ids(&read.runs), ["A", "B"]);
+    }
+
+    /// The boundary rule needs a line that opens the other run: an
+    /// after-neighbour of another run that is no `recovery` or `run_start`
+    /// leaves the line untrusted, and so does a before-neighbour of another
+    /// run, or a kind that excludes its run.
+    #[test]
+    fn a_lost_line_before_another_runs_ordinary_line_stays_untrusted() {
+        // A's run_end, then B's stats (B's recovery and run_start gone).
+        let mut lines = two_runs_single_root();
+        lines.drain(8..10);
+        let bytes = flip_digit(&checked(&lines), 7);
+        let read = recorded(&bytes, 7);
+        assert_eq!(read.lost[0].effect, neighbours(&["A", "B"]));
+        // A's run_end claiming B, before B's recovery: the before-neighbour
+        // is A's.
+        let bytes = claim(&checked(&two_runs_single_root()), 7, "B");
+        assert_eq!(recorded(&bytes, 7).lost[0].effect, neighbours(&["A", "B"]));
+        // A's warm_ready is no mark kind: before B's opener it needs both
+        // sides to agree, so the runs on either side are excluded.
+        let mut lines = two_runs_single_root();
+        lines.drain(4..8);
+        let bytes = flip_digit(&checked(&lines), 3);
+        assert_eq!(recorded(&bytes, 3).lost[0].effect, neighbours(&["A", "B"]));
+    }
+
     #[test]
     fn neighbour_walk_skips_failed_and_recorded_lines() {
         let good = checked(&two_runs());
@@ -4296,6 +4409,11 @@ mod tests {
         }
         assert_eq!(nearest(&GATED_KINDS), (13, 6, "run_end", "removal"));
         assert_eq!(nearest(&HANDOFF_KINDS), (9, 4, "warm_start", "warm_ready"));
+        // A run's openers (the run boundary of D4): `run_start` is 23 bits
+        // from its nearest name of equal length, and no other kind has
+        // `recovery`'s length.
+        assert_eq!(nearest(&["run_start"]).0, 23);
+        assert!(KNOWN_KINDS.iter().all(|k| *k == "recovery" || k.len() != 8));
     }
 
     #[test]
