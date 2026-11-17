@@ -1996,3 +1996,54 @@ fn r5a_read_only_root_is_never_written() {
     assert_eq!(files(&ro), before);
     assert!(displaced_records(&fixture).is_empty());
 }
+
+/// R5a's hot gate in R1 and R2 (review of #234, finding 1): when hot
+/// itself holds a self-consistent other file under the path (hot's
+/// manifest differs from the copy ledger's, which ADR-067 leaves to its
+/// own decision), a copy target's byte-identical copy of hot's file is
+/// never moved, even with the flag: the refusal names hot's state, no
+/// `displaced` record is appended, and hot's bytes keep both their
+/// copies. R4 still refuses hot's file.
+#[test]
+fn r5a_r1_never_moves_a_copy_of_hots_own_other_file() {
+    let (_dir, fixture) = adopted("r5a-hot-other");
+    let hot = fixture.hot();
+    let path = hot_file(&fixture, "binance-um");
+    let cold_a = cold(&fixture, "cold-a");
+    let other = plant_other(&hot, &hot, &path, true);
+    for name in [path.clone(), manifest_of(&path)] {
+        let file = cold_a.join(&name);
+        writable(&file);
+        fs::write(&file, fs::read(hot.join(&name)).unwrap()).unwrap();
+    }
+    let before = inodes(&cold_a, &path);
+    assert!(!verify(&fixture, VERIFIED).0);
+    let (pass, out) = repair_moving(&fixture, REPAIRED);
+    assert!(!pass, "{out}");
+    assert_fail_line(
+        &out,
+        &[
+            &path,
+            "cold-a",
+            "self-consistent other file",
+            "hot's copy is not good",
+            "ADR-067",
+        ],
+    );
+    assert_fail_line(&out, &[&path, "on hot: refused"]);
+    let aside = replica::damaged_dir(&cold_a, REPAIRED);
+    assert_eq!(
+        fs::read_to_string(hot.join(manifest_of(&path))).unwrap(),
+        other
+    );
+    assert!(
+        !aside.join(&path).exists(),
+        "cold-a's copy of hot's own file was moved\n{out}"
+    );
+    assert_eq!(inodes(&cold_a, &path), before);
+    assert_eq!(
+        fs::read_to_string(cold_a.join(manifest_of(&path))).unwrap(),
+        other
+    );
+    assert!(displaced_records(&fixture).is_empty(), "{out}");
+}

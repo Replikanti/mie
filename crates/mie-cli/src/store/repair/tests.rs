@@ -3055,3 +3055,125 @@ fn r5a_removed_partition_on_hot_is_not_judged() {
             .exists()
     );
 }
+
+/// A replicated fixture whose cold-b holds a self-consistent other file
+/// under the first path of `source`, found by a verification, with its
+/// `displaced` record appended and the move not done (a crash after the
+/// record, or a failed rename). Returns the path and the record's text.
+fn incomplete_move(tag: &str, source: &str) -> (Fixture, String, String) {
+    let fixture = Fixture::new(tag);
+    assert_eq!(fixture.pass().problems, Vec::<String>::new());
+    let path = replica::list_sealed(&fixture.hot)
+        .unwrap()
+        .into_iter()
+        .find(|p| p.starts_with(&format!("source={source}/")))
+        .unwrap();
+    let text = other_text(&fixture.hot, &path);
+    plant_other_file(&fixture.cold[1], &path, &text);
+    assert!(!verified(&fixture, D0 + HOUR).is_empty());
+    append_displaced(&fixture, "cold-b", D0 + HOUR + 1, &text);
+    (fixture, path, text)
+}
+
+/// R5b under gate 1 (review of #234, finding 2): a path held after its
+/// `displaced` record was appended. R1 visits it (its finding is open),
+/// but the recorded move is not completed before `mie store resolve`
+/// decides the hold: the repair names the hold resolution and moves
+/// nothing, and verify's `FAIL:` names `mie store resolve` first.
+#[test]
+fn r5b_a_held_path_is_not_completed_before_resolve() {
+    let (fixture, path, text) = incomplete_move("r5b-held", "binance-archive");
+    let cold_b = fixture.cold[1].clone();
+    CopyLedger::at(&fixture.hot)
+        .append(&Record {
+            at_ms: D0 + HOUR + 2,
+            kind: Kind::Hold {
+                path: path.clone(),
+                reason: copy_ledger::HoldReason::EntryConflict,
+            },
+        })
+        .unwrap();
+    let report = verify_at(&fixture, D0 + HOUR + 3);
+    assert_any(
+        &report.problems,
+        &[
+            &path,
+            "cold-b",
+            "did not complete",
+            "the path is held",
+            "`mie store resolve`",
+        ],
+    );
+    let before = inodes(&cold_b, &path);
+    let report = repair_moving(&fixture, D0 + 2 * HOUR);
+    assert!(
+        !replica::damaged_dir(&cold_b, D0 + HOUR + 1)
+            .join(manifest_of(&path))
+            .exists(),
+        "a held path's other file moved before the resolution: {report:?}"
+    );
+    assert_eq!(inodes(&cold_b, &path), before, "{report:?}");
+    assert_eq!(
+        fs::read_to_string(cold_b.join(manifest_of(&path))).unwrap(),
+        text
+    );
+    assert_any(
+        &report.problems,
+        &[&path, "cold-b", "the path is held", "`mie store resolve`"],
+    );
+    assert_eq!(displaced(&fixture).len(), 1, "{report:?}");
+}
+
+/// R5b and the lost-file rule (review of #234, finding 2): a path
+/// recorded lost after its `displaced` record was appended. No repair
+/// rule visits a lost path (nothing is written for it, ADR-062 D11), so
+/// verify never fails naming a repair that never acts: the incomplete
+/// move is a note naming the lost record, and a repair with the flag
+/// leaves the file in place and appends nothing.
+#[test]
+fn r5b_a_lost_path_is_a_note_and_never_moved() {
+    let (fixture, path, text) = incomplete_move("r5b-lost", "binance-um");
+    let cold_b = fixture.cold[1].clone();
+    let sha =
+        replica::parse_manifest(&fs::read_to_string(fixture.hot.join(manifest_of(&path))).unwrap())
+            .unwrap()
+            .sha256;
+    CopyLedger::at(&fixture.hot)
+        .append(&Record {
+            at_ms: D0 + HOUR + 2,
+            kind: Kind::Lost {
+                path: path.clone(),
+                origin: LostOrigin::Verify,
+                sha256: Some(sha),
+            },
+        })
+        .unwrap();
+    let report = verify_at(&fixture, D0 + HOUR + 3);
+    assert!(
+        !report
+            .problems
+            .iter()
+            .any(|p| p.contains(&path) && p.contains("did not complete")),
+        "{report:?}"
+    );
+    assert_any(
+        &report.lines,
+        &[&path, "cold-b", "did not complete", "recorded lost"],
+    );
+    let before = inodes(&cold_b, &path);
+    let len = fixture.records().len();
+    let report = repair_moving(&fixture, D0 + 2 * HOUR);
+    assert_eq!(inodes(&cold_b, &path), before, "{report:?}");
+    assert_eq!(
+        fs::read_to_string(cold_b.join(manifest_of(&path))).unwrap(),
+        text
+    );
+    assert!(
+        !fixture.records()[len..].iter().any(|r| match &r.kind {
+            Kind::Displaced { .. } => true,
+            Kind::Copy { path: copied, .. } => *copied == path,
+            _ => false,
+        }),
+        "{report:?}"
+    );
+}

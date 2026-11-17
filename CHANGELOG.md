@@ -52,11 +52,15 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   moves the file into that root's `.mie/damaged/<at_ms>/` (never
   deleted), and the path's recorded file is copied there and recorded:
   k − 1 copies become k. A held path's other file stays refused, naming
-  `mie store resolve`. A crash between the record and the move is
-  completed by the next repair, which matches only a byte-equal manifest
-  text, so the recorded file placed there afterwards is never moved.
-  `mie store verify` lists each record as a note, and fails while the
-  recorded move has not completed. No selection changes: the tiered
+  `mie store resolve`, and so does a target's file while hot's own copy
+  of the path is not good (hot holding an other file itself is left
+  alone). A crash between the record and the move is completed by the
+  next repair, which matches only a byte-equal manifest text, so the
+  recorded file placed there afterwards is never moved; for a held path
+  it waits for `mie store resolve`. `mie store verify` lists each record
+  as a note, and fails while the recorded move has not completed, naming
+  the command that completes it (a lost path, which no repair visits,
+  stays a note). No selection changes: the tiered
   `select` never lists a cold root's manifest. **Downgrade:** the copy
   ledger's parser of an earlier binary refuses a ledger that holds a
   `displaced` record, so after the first record such a binary fails every

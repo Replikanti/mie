@@ -91,7 +91,9 @@
 //!   is ordinary (R1, R2) or none, ordinary or without a `manifest` record
 //!   (R2b), and a held path's other file names `mie store resolve`, since
 //!   the texts of a hold are the resolution's; in R2b the archive-entry
-//!   gate and hot's copy good; in R1 and R2 a good source (R3); the flag
+//!   gate and hot's copy good; in R1 and R2 a good source (R3), then hot
+//!   holding none of the path or a copy that checks good (a target's file
+//!   may be a copy of hot's own other file, review of #234); the flag
 //!   `--move-other-files`, whose absence names the other file's rows and
 //!   SHA-256; the marker, re-read; none of the path's four names already
 //!   below the run's `.mie/damaged/<at_ms>/`. Then `displaced <at_ms>
@@ -104,7 +106,10 @@
 //!   text equal, byte for byte, to the target's manifest of the path, the
 //!   marker is re-read and R5's move completes into the record's own
 //!   directory, with no flag and no new record (the record is the
-//!   operator's consent). It completes a crash after the record, and one
+//!   operator's consent), but only under gate 1: a held path's move waits
+//!   for `mie store resolve` (review of #234). No rule visits a lost path
+//!   (nothing is written for it), and verify names that as a note. It
+//!   completes a crash after the record, and one
 //!   between the data rename and the manifest rename, whose manifest alone
 //!   would otherwise be judged a manifest without its data and moved into
 //!   a new run's directory. A record matches no other text, so the path's
@@ -1117,6 +1122,22 @@ impl Repair<'_> {
             return Ok(());
         };
         if other {
+            // R5a gate 2 for R1 and R2: hot holds none of the path, or its
+            // copy checks good against the text. When hot holds a
+            // self-consistent other file itself, the target's file may be a
+            // copy of hot's bytes, and that hot-versus-ledger state is
+            // ADR-067's out of scope (review of #234, finding 1).
+            if let Some(why) = self.hot_not_good(path, text) {
+                self.problem(format!(
+                    "{path} on {name}: refused: it holds {found}, but hot's copy is not good \
+                     ({why}); it is not moved, even with --move-other-files: while hot does not \
+                     hold the copy ledger's text, the target's file may be a copy of hot's own, \
+                     and a text on hot that differs from the copy ledger's needs its own \
+                     decision. R4 repairs a damaged hot copy when a cold root holds a good one; \
+                     then run the repair again (ADR-067 D5)"
+                ));
+                return Ok(());
+            }
             let then = format!(
                 "the path's recorded file is copied there from {}",
                 source.display()
@@ -1183,6 +1204,29 @@ impl Repair<'_> {
             source.display()
         ));
         Ok(())
+    }
+
+    /// Why hot's copy of `path` is not good against `text`, if it holds
+    /// any of the path: R5a gate 2 of R1 and R2 (ADR-067 D5). `None` when
+    /// it checks good, or when hot holds neither the data nor the
+    /// manifest (a path that left hot); a manifest without its data and a
+    /// copy that cannot be read are not good (fail closed).
+    fn hot_not_good(&self, path: &str, text: &str) -> Option<String> {
+        let check = replica::check_sealed_copy(self.hot, path, text);
+        match check {
+            Ok(CopyCheck::Good) => None,
+            Ok(CopyCheck::Missing) => {
+                match fs::symlink_metadata(self.hot.join(manifest_of(path))) {
+                    Err(error) if error.kind() == ErrorKind::NotFound => None,
+                    Ok(_) => Some("a manifest without its data".to_owned()),
+                    Err(error) => Some(format!("its manifest cannot be inspected: {error}")),
+                }
+            }
+            Ok(CopyCheck::Manifest { other_file: true }) => {
+                Some("hot holds a self-consistent other file under the path".to_owned())
+            }
+            _ => Some(hot_check(&check)),
+        }
     }
 
     /// R2b: the forms the marked copy targets `targets` hold of files hot
@@ -1642,12 +1686,36 @@ impl Repair<'_> {
         let Some(record) = records.iter().find(|record| record.matches(&present)) else {
             return Ok(true);
         };
+        let name = self.name(i);
+        let what = format!("rows {}, SHA-256 {}", record.rows, record.sha256);
+        // Gate 1 holds for the completion too: the record is consent to
+        // move, never a decision on a held path's texts, which are the
+        // resolution's (review of #234, finding 2). R1, R2 and R2b pass no
+        // other verdict; one would be refused the same way (fail closed).
+        let verdict = self.state.verdict(path);
+        if !matches!(
+            verdict,
+            None | Some(PathVerdict::Ordinary | PathVerdict::NoManifest)
+        ) {
+            let why = if verdict == Some(PathVerdict::Held) {
+                "the path is held, and the texts of a held path are the hold resolution's to \
+                 decide: `mie store resolve` decides the hold first, then `mie store repair` \
+                 completes the move"
+            } else {
+                "the path's verdict is none R5b completes a move for"
+            };
+            self.problem(format!(
+                "{path} on {name}: the recorded move of a self-consistent other file ({what}, \
+                 its displaced record at {}) is not completed and nothing is moved: {why} \
+                 (ADR-067 D5)",
+                record.at_ms
+            ));
+            return Ok(false);
+        }
         if !self.marker_present(i) {
             return Ok(false);
         }
-        let name = self.name(i);
         let aside = replica::damaged_dir(&root, record.dir);
-        let what = format!("rows {}, SHA-256 {}", record.rows, record.sha256);
         match replica::move_aside(&root, path, &aside) {
             Ok(moved) => {
                 self.line(format!(

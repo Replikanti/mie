@@ -56,8 +56,11 @@
 //!   - *Displaced files* (ADR-067 D6): each `displaced` record of R is a
 //!     note naming the path, rows, SHA-256 and directory; it is a `FAIL`
 //!     naming `mie store repair` while R's manifest of the path still
-//!     equals the record's text (the recorded move did not complete). An
-//!     I/O error reading that manifest stops R.
+//!     equals the record's text (the recorded move did not complete), one
+//!     naming `mie store resolve` first for a held path, and a note again
+//!     for a lost, conflicting, replaced or pending path, which no repair
+//!     rule visits (#234 review, finding 2). An I/O error reading that
+//!     manifest stops R.
 //!   - *Entries:* each current hot entry whose listed parts all have
 //!     `copy` records for R older than G, and each supersede record whose
 //!     mtime on hot lies outside G before now (a future mtime is never
@@ -1044,7 +1047,41 @@ impl Verify<'_> {
                 record.at_ms,
                 replica::damaged_dir(&root, record.dir).display()
             );
-            if present {
+            // The remedy by the path's verdict: R5b completes a move only
+            // where R5a may move (gate 1), and no repair rule visits a lost,
+            // conflicting, replaced or pending path, so verify never fails
+            // naming a repair that never acts (review of #234, finding 2).
+            let verdict = self.state.verdict(&record.path);
+            let unvisited = match verdict {
+                None
+                | Some(PathVerdict::Ordinary | PathVerdict::NoManifest | PathVerdict::Held) => None,
+                Some(PathVerdict::Lost) => Some(
+                    "the path is recorded lost: nothing is written for a lost path (ADR-062 \
+                     D11), and every selection that covers it fails",
+                ),
+                Some(PathVerdict::Conflict) => Some(
+                    "the copy ledger holds two manifest texts for the path, and every selection \
+                     that covers it fails",
+                ),
+                Some(PathVerdict::Replaced | PathVerdict::Pending) => {
+                    Some("the path's files are the replace resolution's (ADR-062 D11)")
+                }
+            };
+            if present && let Some(why) = unvisited {
+                self.roots[i].notes.push(format!(
+                    "note: {} on {name}: the recorded move of {what} did not complete, and {why}; \
+                     no repair rule visits the path, so no repair moves the file, and it stays \
+                     in place, never deleted (ADR-067 D6)",
+                    record.path
+                ));
+            } else if present && verdict == Some(PathVerdict::Held) {
+                self.roots[i].problems.push(format!(
+                    "{} on {name}: the recorded move of {what} did not complete: the target still \
+                     holds it, and the path is held: `mie store resolve` decides the hold first, \
+                     then `mie store repair` completes it (ADR-067 D5, D6)",
+                    record.path
+                ));
+            } else if present {
                 self.roots[i].problems.push(format!(
                     "{} on {name}: the recorded move of {what} did not complete: the target still \
                      holds it; `mie store repair` completes it (ADR-067 D6)",
@@ -1315,8 +1352,9 @@ fn describe(check: CopyCheck, path: &str) -> String {
         CopyCheck::Manifest { other_file: true } => format!(
             "manifest: its manifest differs from the copy ledger's manifest record and its data \
              matches that other manifest: two sealed files under one path {path}, which must be \
-             byte-identical on every root (ADR-062 D5); after checking it, `mie store repair \
-             --move-other-files` moves it aside and records the move (ADR-067)"
+             byte-identical on every root (ADR-062 D5); after checking it, and once hot's copy is \
+             good or hot holds none of the path, `mie store repair --move-other-files` moves it \
+             aside and records the move (ADR-067)"
         ),
         CopyCheck::Manifest { other_file: false } => {
             "manifest: its manifest is absent or differs from the copy ledger's manifest record \

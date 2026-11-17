@@ -161,7 +161,9 @@ unrecorded form of a path hot holds) call two rules.
   carries a text equal, byte for byte, to the target's manifest of the
   path, the marker is re-read and `move_aside` moves the path's names into
   `damaged_dir(root, record.dir)`. No new record and no flag: the record
-  is the operator's consent. It covers two crash points: after the
+  is the operator's consent, but only under gate 1 below: for a held path
+  the completion is a named problem naming `mie store resolve`, and
+  nothing moves. It covers two crash points: after the
   record, and between the data rename and the manifest rename. In the
   second, the manifest alone is left in place, and without R5b R1 or
   R2b would judge it "a manifest without its data" and move it into a new
@@ -175,10 +177,13 @@ unrecorded form of a path hot holds) call two rules.
      without a `manifest` record (R2b). A held path's other file stays
      refused, naming `mie store resolve`: the two texts of a
      `manifest-conflict` hold are the resolution's to decide (#211 RQ2);
-  2. R2b only: the archive-entry gate (a current import entry on hot lists
+  2. R2b: the archive-entry gate (a current import entry on hot lists
      an archive part with the text's SHA-256), and hot's copy checks good
      against the text, since the closing pass copies only from hot;
-  3. R1 and R2: a good source exists (R3), else R9;
+  3. R1 and R2: a good source exists (R3), else R9; then hot holds none
+     of the path's data and manifest, or its copy checks good against the
+     text (a manifest without its data and an unreadable copy count as not
+     good);
   4. the flag is given;
   5. the marker is re-read;
   6. none of the path's four names (`D`, `M`, `D~`, `M~`) already exists
@@ -195,6 +200,9 @@ V4 lists every `displaced` record of a marked copy target as a note
 naming the path, rows, SHA-256 and directory. The note becomes a `FAIL:`
 ("the recorded move did not complete; `mie store repair` completes it")
 while the target's manifest of the path still equals the record's text.
+For a held path that `FAIL:` names `mie store resolve` first; for a lost,
+conflicting, replaced or pending path, which no repair rule visits, it
+stays a note that says so.
 An I/O error reading it stops the root, as V4 already does. A
 self-consistent other file's finding names the remedy, `mie store repair
 --move-other-files`.
@@ -312,6 +320,9 @@ The PR that implements it merges with these offline tests green in its CI
   `r2b_other_file_without_the_flag_is_named_and_never_moved`, the `r5a_*`
   and `r5b_*` tests, and `a_crash_at_every_repair_step_is_completed_by_the_next_run`
   with its `displaced` step.
+- Review of the PR (#234): `r5a_r1_never_moves_a_copy_of_hots_own_other_file`,
+  `r5b_a_held_path_is_not_completed_before_resolve`,
+  `r5b_a_lost_path_is_a_note_and_never_moved`.
 - D6, D7: `v4_a_displaced_record_is_a_note`,
   `v4_an_incomplete_move_fails_naming_the_repair`,
   `rebuild_carries_displaced_records_from_its_start`,
@@ -325,3 +336,36 @@ One PR: the kind (`copy_ledger.rs`, `verification.rs`, `tiers.rs`,
 `named_path`, and the wording of the restore's H6 k1 and the rebuild's
 H5 b. ADR-062 D11 *As implemented (#192)* keeps its text as history; this
 section, ADR-062's status line and the repair module docs carry the rule.
+
+Two rules came from the adversarial review of the PR (#234):
+
+- **Hot's copy in R1 and R2** (finding 1). When hot itself held a
+  self-consistent other file under the path, and a copy target held a
+  byte-identical copy of hot's file, R1 with the flag moved the target's
+  copy: hot's bytes lost their second copy in the layout, and the
+  hot-versus-ledger state this ADR leaves out of scope was pre-empted by
+  an unrelated repair run. R2b already refused it (gate 2), R1 and R2 did
+  not. Gate 3 now also requires hot to hold none of the path or a copy
+  that checks good against the text, checked after the source and before
+  the flag, so a refusal never names a flag that would not act. A damaged
+  hot copy is refused the same way: R4 repairs it in the same run, and
+  the next run moves the target's file, the order R2b already follows.
+  Verify's finding names the flag with that condition.
+- **R5b outside gate 1** (finding 2). R5b ran wherever R1, R2 and R2b
+  visit, which takes held paths (R1, R2b) and never lost ones. So a
+  record appended while the path was ordinary, with the move not done (a
+  crash after the record, a failed rename), could be completed after the
+  path became held, before `mie store resolve`; and once the path was
+  recorded lost, verify failed on every run naming `mie store repair`,
+  which never visits it. Decision: R5b runs under gate 1 (held: a named
+  problem naming `mie store resolve`, nothing moved; a re-admit makes the
+  path ordinary again and R1 completes the move), and verify's `FAIL:`
+  names the command that acts for the path's verdict: `mie store repair`
+  (ordinary, none, without a `manifest` record), `mie store resolve` first
+  (held), and a note for a lost, conflicting, replaced or pending path.
+  Rejected, a new R5b sweep that completes a lost path's move: the
+  lost-file rule writes nothing for a lost path (ADR-062 D11), and the
+  move would buy nothing, since the path has no recorded file to copy
+  there and every selection that covers it fails. The file stays in
+  place on its root, never deleted, which keeps D5's union whole; the
+  note and the record name it.
