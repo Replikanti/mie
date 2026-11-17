@@ -200,20 +200,29 @@ and what does losing a line of that kind mean?
   may have started in the window is NOT COMPARABLE, after the judged
   runs (`ExcludedRun::may_have_started_in`, which the ingest memory guard
   uses too). With its `run_start` read, its start decides. Without it,
-  the span of its readable lines, from the earliest to the latest
-  `at_ms`, decides: a run that started in the window has a line in it or
-  lines on both sides of it, so the run counts when the span intersects
-  the window. The first line alone is no start: `mie ingest` writes
-  `recovery` milliseconds before `run_start`, so a window starting
-  between the two would pass over a run it cannot recompute (review
-  round 2 of #235). The span over-counts a run that started before the
-  window and ran into it, which fails the window closed. A run with no
-  readable time at all counts too.
+  the start is bounded on both sides. Below by the run's earliest
+  readable line: `mie ingest` writes `recovery` milliseconds before
+  `run_start`, so the first line alone is no start (review round 2 of
+  #235). Above by the `at_ms` of the first line after the excluding line
+  that belongs to another run (`ExcludedRun::started_by_ms`), or the
+  run's latest line when that is later: lines are written in order under
+  the journal lock (#226), so the `run_start` precedes every later line,
+  including the next run's. With no such line there is no upper bound.
+  The run counts when that interval meets the window. The span of the
+  run's own lines alone is not enough: a run that crashed right after a
+  lost `run_start` has only its `recovery` left, so with the window
+  starting between the two it has no line in the window and none after
+  it (review round 3 of #235). The interval over-counts, which fails the
+  window closed. A run with no readable time at all counts too. The one
+  assumption is a wall clock that does not step back between two journal
+  writes: `at_ms` is wall clock (module docs), and a clock stepped back
+  between the `run_start` and the next run's first line would put the
+  bound before the start.
 - **The ingest warm start.** The memory guard reads the journal through
   the gate. A gated line, or an excluded run that may lie in the chain
-  (it started at or after the cutover; without its `run_start`, its
-  latest readable line lies at or after the cutover; or no time of it is
-  known), fails
+  (it started at or after the cutover; without its `run_start`, the
+  upper bound above lies at or after the cutover, or there is none; or
+  no time of it is known), fails
   the warm-up: the run starts cold with ADR-052's `warm-up-failed`, its
   `error` naming the line, and the capture never stops.
 
@@ -325,6 +334,10 @@ rebuild's B1, D7 stands. ADR-066's status line records the change.
   first pass gates and reads the structure until the first such line; an
   exclusion can reach back to a run read earlier, so the structure is then
   read again with the exclusions. A journal without one is parsed once.
+  For an excluded run without its `run_start`, the upper bound of D4 is
+  found by walking forward from the excluding line to the next run's
+  first line, the neighbour walk of D4: it parses the rest of that run
+  once more, at most one run's lines per excluded run.
 - **Residuals.** A kind renamed by at least 13 bits (9 for
   `warm_handoffs`, D1); member damage on a run's last line (D6); two
   faults, one in the member and one in a value, which read as Unchecked

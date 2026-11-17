@@ -988,22 +988,30 @@ pub struct ExcludedRun {
     /// The earliest and the latest `at_ms` of the lines naming the run
     /// that were read: the span of its readable lines.
     pub lines_at_ms: Option<(i64, i64)>,
+    /// Without its `run_start`: the `at_ms` of the first line after the
+    /// excluding line that belongs to another run, a bound above on the
+    /// run's start; `None` when no such line exists.
+    pub started_by_ms: Option<i64>,
 }
 
 impl ExcludedRun {
     /// Whether the run may have started in `[from, to)` (`to` `None`: no
     /// end), failing closed (ADR-068 D4). With its `run_start` read, its
-    /// start decides. Without it, the span of its readable lines decides: a
-    /// run that started in the window has a line in it or lines on both
-    /// sides of it, so the run counts when the span intersects the window.
-    /// The span's first line is only a bound on the start (the `recovery`
-    /// line is written before `run_start`). A run with no readable time
-    /// counts.
+    /// start decides. Without it, the start lies at or after the earliest
+    /// readable line of the run (its `recovery` is written before its
+    /// `run_start`) and at or before the first line of another run after
+    /// the excluding line ([`ExcludedRun::started_by_ms`], no bound when
+    /// there is none), or the run's latest line when that is later; the
+    /// run counts when that interval meets the window. A run with no
+    /// readable time counts.
     pub fn may_have_started_in(&self, from: i64, to: Option<i64>) -> bool {
         let before_end = |at: i64| to.is_none_or(|to| at < to);
         match (&self.start, self.lines_at_ms) {
             (Some((at, _, _)), _) => *at >= from && before_end(*at),
-            (None, Some((first, last))) => last >= from && before_end(first),
+            (None, Some((first, last))) => {
+                let latest = self.started_by_ms.map(|by| by.max(last));
+                latest.is_none_or(|latest| latest >= from) && before_end(first)
+            }
             (None, None) => true,
         }
     }
@@ -1207,17 +1215,18 @@ fn span_after(bytes: &[u8], end: usize) -> Option<(usize, usize)> {
     (end + 1 < bytes.len()).then(|| span_from(bytes, end + 1))
 }
 
-/// The nearest neighbour of the line `span` on one side (ADR-068 D4): a
-/// line that parses with a string `run_id`, does not fail its check
-/// (complete lines only; the unterminated tail is not classified) and is
-/// not lost (`lost` holds the lost lines' first bytes). Its run id, and
-/// whether it opens its run.
-fn neighbour(
+/// The nearest line beside the line `span` on one side that `accepts`
+/// (ADR-068 D4): of the lines that parse with a string `run_id`, do not
+/// fail their check (complete lines only; the unterminated tail is not
+/// classified) and are not lost (`lost` holds the lost lines' first
+/// bytes). Lines that do not qualify are walked past.
+fn walk(
     bytes: &[u8],
     span: (usize, usize),
     forward: bool,
     lost: &BTreeSet<usize>,
-) -> Option<Neighbour> {
+    accepts: impl Fn(&str) -> bool,
+) -> Option<Value> {
     let mut at = span;
     loop {
         at = if forward {
@@ -1233,15 +1242,43 @@ fn neighbour(
         let Ok(value) = serde_json::from_slice::<Value>(body) else {
             continue;
         };
-        if let Some(run_id) = value.get("run_id").and_then(Value::as_str)
+        if value
+            .get("run_id")
+            .and_then(Value::as_str)
+            .is_some_and(&accepts)
             && (!complete || check_line(body) != LineCheck::Failed)
         {
-            return Some(Neighbour {
-                run_id: run_id.to_owned(),
-                opens: matches!(kind_of(Some(&value)), Some(kind) if RUN_OPENERS.contains(&kind)),
-            });
+            return Some(value);
         }
     }
+}
+
+/// The nearest neighbour of the line `span` on one side (ADR-068 D4): the
+/// nearest line [`walk`] reaches. Its run id, and whether it opens its run.
+fn neighbour(
+    bytes: &[u8],
+    span: (usize, usize),
+    forward: bool,
+    lost: &BTreeSet<usize>,
+) -> Option<Neighbour> {
+    let value = walk(bytes, span, forward, lost, |_| true)?;
+    Some(Neighbour {
+        run_id: value["run_id"].as_str()?.to_owned(),
+        opens: matches!(kind_of(Some(&value)), Some(kind) if RUN_OPENERS.contains(&kind)),
+    })
+}
+
+/// The `at_ms` of the first line after the line `span` that belongs to a
+/// run other than `run` (ADR-068 D4): a bound above on `run`'s lost
+/// `run_start`, since lines are written in order under the journal lock.
+/// `None` when no such line exists (no bound), or it has no `at_ms`.
+fn next_run_at_ms(
+    bytes: &[u8],
+    span: (usize, usize),
+    run: &str,
+    lost: &BTreeSet<usize>,
+) -> Option<i64> {
+    walk(bytes, span, true, lost, |other| other != run)?["at_ms"].as_i64()
 }
 
 /// The kinds that open a run: `mie ingest` writes `recovery` and then
@@ -1429,6 +1466,7 @@ pub fn runs_from_bytes(
                     by: line.lost.clone(),
                     start: None,
                     lines_at_ms: None,
+                    started_by_ms: None,
                 });
             }
         }
@@ -1459,6 +1497,12 @@ pub fn runs_from_bytes(
         }
         structure.runs
     };
+    // Without its run_start, an excluded run's start is bounded above by
+    // the next line of another run (ADR-068 D4).
+    for run in excluded.iter_mut().filter(|run| run.start.is_none()) {
+        let span = span_from(bytes, run.by.offset as usize);
+        run.started_by_ms = next_run_at_ms(bytes, span, &run.run_id, &lost_at);
+    }
     for (run_id, lost) in marks {
         if let Some(run) = runs.iter_mut().find(|r| r.parameters.run_id == run_id) {
             run.lost.push(lost);

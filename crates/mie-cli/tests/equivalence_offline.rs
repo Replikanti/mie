@@ -1927,3 +1927,63 @@ fn equivalence_excluded_run_whose_recovery_precedes_the_window_is_not_comparable
         "{text}"
     );
 }
+
+/// Review round 3 of #235 (ADR-068 D4): run 1 crashed right after its
+/// `run_start`, which is lost, so its only readable line is its
+/// `recovery`, 3 ms before the start as a real clock writes it. The lost
+/// line's run cannot be told (the next line is run 2's), so runs 1 and 2
+/// are excluded. The window starts inside the gap and ends at run 2's
+/// start. Run 1's start is bounded above by the next line of another run
+/// (run 2's recovery), so run 1 may have started in the window and is
+/// judged NOT COMPARABLE instead of being left out.
+#[test]
+fn equivalence_crashed_run_with_only_its_recovery_is_not_comparable() {
+    let dir = TempDir::new("equivalence-gate-only-recovery");
+    let (config, start1, start2, runs) = two_played_runs(dir.path());
+    let run1 = runs[0].parameters.run_id.clone();
+    let journal = config.paths.journal.clone();
+    let text = std::fs::read_to_string(&journal).unwrap();
+    let mut lines = Vec::new();
+    for line in text.lines() {
+        let object = mie_cli::journal::strip_check(line.as_bytes()).unwrap();
+        let mut value: Value = serde_json::from_slice(&object).unwrap();
+        if value["run_id"] == run1.as_str() {
+            match value["type"].as_str() {
+                Some("recovery") => value["at_ms"] = json!(start1 - 3),
+                Some("run_start") => {}
+                _ => continue,
+            }
+        }
+        lines.push(
+            String::from_utf8(mie_cli::journal::with_check(
+                &serde_json::to_vec(&value).unwrap(),
+            ))
+            .unwrap(),
+        );
+    }
+    std::fs::write(&journal, lines.join("\n") + "\n").unwrap();
+    let (_, start, _) = journal_line(&journal, "run_start", &run1);
+    flip_value_digit(&journal, start);
+    let read = read_runs(&config.paths, "binance-um").unwrap();
+    assert_eq!(read.excluded.len(), 2, "{:?}", read.notes());
+    let excluded = &read.excluded[0];
+    assert_eq!(excluded.run_id, run1);
+    assert_eq!(excluded.lines_at_ms, Some((start1 - 3, start1 - 3)));
+    let (_, run2_recovery, _) = journal_line(&journal, "recovery", &runs[1].parameters.run_id);
+    let bytes = std::fs::read(&journal).unwrap();
+    let end = run2_recovery
+        + bytes[run2_recovery..]
+            .iter()
+            .position(|b| *b == b'\n')
+            .unwrap();
+    let value: Value = serde_json::from_slice(&bytes[run2_recovery..end]).unwrap();
+    assert_eq!(excluded.started_by_ms, value["at_ms"].as_i64());
+    let (outcome, text) = check(&config, start1, start2);
+    assert!(!outcome.pass, "{text}");
+    assert_eq!(outcome.runs.len(), 1, "{text}");
+    assert_eq!(outcome.runs[0].run_id, run1, "{text}");
+    assert!(
+        matches!(outcome.runs[0].verdict, Verdict::NotComparable(_)),
+        "{text}"
+    );
+}
