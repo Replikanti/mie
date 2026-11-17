@@ -198,17 +198,22 @@ and what does losing a line of that kind mean?
   as DIVERGED, and without its `run_end` it has no totals. A run marked
   only for a `chain_restart` is judged as before. An excluded run that
   may have started in the window is NOT COMPARABLE, after the judged
-  runs: its `run_start`'s time, or, when that line is lost, the time of
-  its first readable line (`ExcludedRun::started_at_ms`, the fallback the
-  ingest memory guard uses too); a run with no readable line at all
-  counts, so the window fails closed. The fallback is the run's
-  `recovery`, written just before its `run_start`, so it can sit
-  milliseconds before the start: a run starting within that gap after
-  `from` is judged outside the window (residual).
+  runs (`ExcludedRun::may_have_started_in`, which the ingest memory guard
+  uses too). With its `run_start` read, its start decides. Without it,
+  the span of its readable lines, from the earliest to the latest
+  `at_ms`, decides: a run that started in the window has a line in it or
+  lines on both sides of it, so the run counts when the span intersects
+  the window. The first line alone is no start: `mie ingest` writes
+  `recovery` milliseconds before `run_start`, so a window starting
+  between the two would pass over a run it cannot recompute (review
+  round 2 of #235). The span over-counts a run that started before the
+  window and ran into it, which fails the window closed. A run with no
+  readable time at all counts too.
 - **The ingest warm start.** The memory guard reads the journal through
   the gate. A gated line, or an excluded run that may lie in the chain
-  (it started at or after the cutover, by the same `started_at_ms`, or
-  its start is not known), fails
+  (it started at or after the cutover; without its `run_start`, its
+  latest readable line lies at or after the cutover; or no time of it is
+  known), fails
   the warm-up: the run starts cold with ADR-052's `warm-up-failed`, its
   `error` naming the line, and the capture never stops.
 

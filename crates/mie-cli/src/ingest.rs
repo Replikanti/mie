@@ -921,7 +921,8 @@ fn warm_up(
 ///
 /// The journal is read behind the gate of ADR-068: a gated line, or a run
 /// a lost line excludes that may lie in the chain (it started at or after
-/// the cutover, or its start is not known), fails the guard, so the run
+/// the cutover; without its run_start, a line of it lies at or after the
+/// cutover; or no time of it is known), fails the guard, so the run
 /// starts cold with `warm-up-failed` naming the line, and the capture goes
 /// on (ADR-052 D8).
 fn memory_guard(
@@ -941,7 +942,7 @@ fn memory_guard(
     if let Some(excluded) = read
         .excluded
         .iter()
-        .find(|run| run.may_be_of(symbol) && run.started_at_ms().is_none_or(|at| at >= cutover))
+        .find(|run| run.may_be_of(symbol) && run.may_have_started_in(cutover, None))
     {
         return Err(format!(
             "the history chain may hold run {}, which is {}, so it cannot be recomputed",

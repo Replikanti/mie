@@ -2239,3 +2239,41 @@ fn a_gated_line_makes_the_warm_up_cold_naming_it() {
         "{error}"
     );
 }
+
+/// Review round 2 of #235 (ADR-068 D4): the chain run's `recovery` lies
+/// 3 ms before the cutover and its `run_start` at it, as a real clock
+/// writes them. With the run_start lost, the run's earliest readable line
+/// is before the cutover, but its lines reach past it, so the memory guard
+/// still counts it in the chain and the warm-up fails cold, naming it.
+#[test]
+fn a_run_excluded_across_the_cutover_makes_the_warm_up_cold() {
+    let t = CUTOVER + 2 * HOUR;
+    let frames = || vec![vec![agg(1, t + 10), agg(2, t + 20)]];
+    let dir = TempDir::new("warm-up-gate-cutover");
+    import_archive(dir.path());
+    let mut config = history_config(dir.path(), "2026-10-03", "2026-10-06");
+    config.history.as_mut().unwrap().max_run_records = Some(103);
+    let run = "20261006T000000Z";
+    let times = [CUTOVER + 1_000, CUTOVER + 2_000, CUTOVER + 3_000];
+    let (mut lines, records) = journaled_run(run, CUTOVER, CUTOVER + 60_000, 500, &times);
+    lines.insert(
+        0,
+        serde_json::json!({"type": "recovery", "run_id": run, "at_ms": CUTOVER - 3,
+            "clean": true, "rolled_forward": [], "discarded": []}),
+    );
+    write_records(&config, &records, &lines);
+    common::check_lines(&config.paths.journal);
+    let (index, start, _) = common::journal_line(&config.paths.journal, "run_start", run);
+    assert_eq!(index, 1);
+    common::flip_value_digit(&config.paths.journal, start);
+    let outcome = ingest(&config, t, frames());
+    let cold = assert_cold(&config, &outcome, "warm-up-failed");
+    let error = cold["error"].as_str().unwrap();
+    assert!(
+        error.contains(&format!(
+            "the history chain may hold run {run}, which is excluded: journal line 2 at byte \
+             {start} (ADR-068 D4)"
+        )),
+        "{error}"
+    );
+}

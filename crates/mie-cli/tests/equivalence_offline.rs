@@ -1886,3 +1886,44 @@ fn equivalence_lost_run_end_before_the_next_run_marks_only_its_run() {
     assert_eq!(outcome.runs[1].run_id, run2);
     assert_eq!(outcome.runs[1].verdict, Verdict::Equivalent, "{text}");
 }
+
+/// Review round 2 of #235 (ADR-068 D4): a real clock writes `recovery` a
+/// few milliseconds before `run_start`. With run 1's run_start lost and
+/// the window starting at run 1's start, run 1's earliest readable line
+/// (its recovery) lies before the window; the span of its lines still
+/// meets the window, so run 1 is NOT COMPARABLE and the window fails.
+#[test]
+fn equivalence_excluded_run_whose_recovery_precedes_the_window_is_not_comparable() {
+    let dir = TempDir::new("equivalence-gate-recovery-before");
+    let (config, start1, start2, runs) = two_played_runs(dir.path());
+    let run1 = runs[0].parameters.run_id.clone();
+    let journal = config.paths.journal.clone();
+    let text = std::fs::read_to_string(&journal).unwrap();
+    let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
+    let (i, _, _) = journal_line(&journal, "recovery", &run1);
+    let object = mie_cli::journal::strip_check(lines[i].as_bytes()).unwrap();
+    let mut value: Value = serde_json::from_slice(&object).unwrap();
+    value["at_ms"] = serde_json::json!(start1 - 3);
+    lines[i] = String::from_utf8(mie_cli::journal::with_check(
+        &serde_json::to_vec(&value).unwrap(),
+    ))
+    .unwrap();
+    std::fs::write(&journal, lines.join("\n") + "\n").unwrap();
+    let (_, start, _) = journal_line(&journal, "run_start", &run1);
+    flip_value_digit(&journal, start);
+    let read = read_runs(&config.paths, "binance-um").unwrap();
+    assert_eq!(read.excluded.len(), 1);
+    assert_eq!(read.excluded[0].start, None);
+    assert_eq!(read.excluded[0].lines_at_ms.unwrap().0, start1 - 3);
+    let (outcome, text) = check(&config, start1, start2 + 1);
+    assert!(!outcome.pass, "{text}");
+    let verdict = outcome
+        .runs
+        .iter()
+        .find(|v| v.run_id == run1)
+        .expect("run 1");
+    assert!(
+        matches!(verdict.verdict, Verdict::NotComparable(_)),
+        "{text}"
+    );
+}

@@ -985,19 +985,27 @@ pub struct ExcludedRun {
     /// Its `run_start`'s `at_ms`, symbol and source, when that line was
     /// read.
     pub start: Option<(i64, String, String)>,
-    /// The `at_ms` of the first line naming the run.
-    pub first_at_ms: Option<i64>,
+    /// The earliest and the latest `at_ms` of the lines naming the run
+    /// that were read: the span of its readable lines.
+    pub lines_at_ms: Option<(i64, i64)>,
 }
 
 impl ExcludedRun {
-    /// When the run started, as far as the journal tells: its `run_start`'s
-    /// `at_ms`, or else the `at_ms` of its first readable line (later than
-    /// its start). `None` when no line of it was read.
-    pub fn started_at_ms(&self) -> Option<i64> {
-        self.start
-            .as_ref()
-            .map(|(at, _, _)| *at)
-            .or(self.first_at_ms)
+    /// Whether the run may have started in `[from, to)` (`to` `None`: no
+    /// end), failing closed (ADR-068 D4). With its `run_start` read, its
+    /// start decides. Without it, the span of its readable lines decides: a
+    /// run that started in the window has a line in it or lines on both
+    /// sides of it, so the run counts when the span intersects the window.
+    /// The span's first line is only a bound on the start (the `recovery`
+    /// line is written before `run_start`). A run with no readable time
+    /// counts.
+    pub fn may_have_started_in(&self, from: i64, to: Option<i64>) -> bool {
+        let before_end = |at: i64| to.is_none_or(|to| at < to);
+        match (&self.start, self.lines_at_ms) {
+            (Some((at, _, _)), _) => *at >= from && before_end(*at),
+            (None, Some((first, last))) => last >= from && before_end(first),
+            (None, None) => true,
+        }
     }
 
     /// Whether the run may be of `symbol`: its `run_start` names it, or
@@ -1420,7 +1428,7 @@ pub fn runs_from_bytes(
                     run_id: run.clone(),
                     by: line.lost.clone(),
                     start: None,
-                    first_at_ms: None,
+                    lines_at_ms: None,
                 });
             }
         }
@@ -1474,7 +1482,7 @@ struct Structure {
 impl Structure {
     /// Reads one parsed line, number `number`. With `excluded`, a line
     /// naming an excluded run is skipped, after it fills in the run's
-    /// `start` and `first_at_ms`.
+    /// `start` and `lines_at_ms`.
     fn line(
         &mut self,
         number: u64,
@@ -1486,8 +1494,11 @@ impl Structure {
             && let Some(run_id) = value["run_id"].as_str()
             && let Some(run) = excluded.iter_mut().find(|r| r.run_id == run_id)
         {
-            if run.first_at_ms.is_none() {
-                run.first_at_ms = value["at_ms"].as_i64();
+            if let Some(at) = value["at_ms"].as_i64() {
+                run.lines_at_ms = Some(match run.lines_at_ms {
+                    None => (at, at),
+                    Some((first, last)) => (first.min(at), last.max(at)),
+                });
             }
             if value["type"] == "run_start"
                 && run.start.is_none()
@@ -4088,7 +4099,7 @@ mod tests {
         let read = recorded(&bytes, 1);
         assert_eq!(ids(&read.runs), ["B"]);
         assert_eq!(read.excluded[0].start, None);
-        assert_eq!(read.excluded[0].first_at_ms, Some(1_500));
+        assert_eq!(read.excluded[0].lines_at_ms, Some((1_500, 1_900)));
     }
 
     #[test]

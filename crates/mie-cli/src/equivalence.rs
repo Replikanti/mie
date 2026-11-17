@@ -269,13 +269,10 @@ pub fn run(
                 });
             }
             // An excluded run that may have started in the window cannot be
-            // recomputed (ADR-068 D4). Without its run_start the time of its
-            // first readable line stands in; with no time at all it counts,
-            // so the window fails closed.
+            // recomputed (ADR-068 D4); without its run_start the span of its
+            // readable lines decides, failing closed.
             for excluded in &read.excluded {
-                let in_window = excluded
-                    .started_at_ms()
-                    .is_none_or(|at| (request.from_ms..request.to_ms).contains(&at));
+                let in_window = excluded.may_have_started_in(request.from_ms, Some(request.to_ms));
                 if !excluded.may_be_of(symbol) || !in_window {
                     continue;
                 }
