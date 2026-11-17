@@ -132,7 +132,7 @@ use super::replicate::{self, IMPORT_LEDGER_DIR, JOURNAL_DIR, META_DIR, sorted_na
 use super::restore::{self, JournalCandidate, JournalStop, LedgerListing, READ_ERROR, list_ledger};
 use super::{DeviceProbe, check_devices, check_hot};
 use crate::config::IngestConfig;
-use crate::journal::{LineCheck, MAX_CHECKED_LINE, check_line};
+use crate::journal::{LineCheck, MAX_CHECKED_LINE, check_line, lost_line_records};
 use mie_adapter_binance::archive::ARCHIVE_SOURCE;
 use mie_adapter_binance::archive::ledger::{
     ImportLedger, LedgerKind, LedgerName, PENDING_FILE, Pending, SupersedeRecord, SupersededEntry,
@@ -142,7 +142,7 @@ use mie_adapter_parquet::copy_ledger;
 use mie_adapter_parquet::removal;
 use mie_adapter_parquet::replica::{self, ReplaceEvidenceStep, Side, TailSource};
 use mie_adapter_parquet::root_marker::{self, HOT_ID};
-use mie_adapter_parquet::verification::{CopyState, LostLine};
+use mie_adapter_parquet::verification::CopyState;
 use mie_ports::raw::RawStoreError;
 use std::collections::BTreeMap;
 use std::fs;
@@ -1377,26 +1377,6 @@ pub(super) fn byte_text(path: &Path, at: u64) -> String {
         Ok(Some(byte)) => format!("0x{byte:02x}"),
         Ok(None) => "past its end".to_owned(),
         Err(error) => format!("unreadable ({error})"),
-    }
-}
-
-/// The `lost-line` records of the journal `journal` (by its file name) in
-/// hot's copy ledger (ADR-066 D8), as `mie store repair` reads them for
-/// R7. A name that is not UTF-8 has none.
-///
-/// # Errors
-///
-/// Why the ledger gives none: it is absent, cannot be read or folded.
-fn lost_line_records(hot: &Path, journal: &Path) -> Result<Vec<LostLine>, String> {
-    let Some(name) = journal.file_name().and_then(|name| name.to_str()) else {
-        return Ok(Vec::new());
-    };
-    match copy_ledger::read(hot) {
-        Ok(Some(ledger)) => CopyState::fold(&ledger)
-            .map(|state| state.lost_lines(name).to_vec())
-            .map_err(|error| error.to_string()),
-        Ok(None) => Err("it does not exist".to_owned()),
-        Err(error) => Err(error.to_string()),
     }
 }
 

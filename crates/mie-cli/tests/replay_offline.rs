@@ -17,9 +17,9 @@ mod common;
 
 use common::{
     CUTOVER, Connections, D0, DepthConnection, DrivenClock, HOUR, ORIGIN, TempDir, agg,
-    archive_trades, config, config_with, depth, depth_snapshot, depth_transports,
-    history_archive_config, history_config, import_rows, ingest, ingest_depth, journal,
-    journaled_run, seam_fixture, strip_checks_where,
+    archive_trades, check_lines, config, config_with, depth, depth_snapshot, depth_transports,
+    flip_value_digit, history_archive_config, history_config, import_rows, ingest, ingest_depth,
+    journal, journal_line, journaled_run, seam_fixture, strip_checks_where,
 };
 use mie_adapter_binance::archive::ArchiveStream;
 use mie_adapter_binance::archive::catalog::{DAY_MS, parse_day};
@@ -423,8 +423,9 @@ fn the_same_window_replays_to_the_same_bytes_and_matches_the_journal() {
     assert!(!text.contains("at_ms"), "no wall clock in the report");
 
     // The replayed gaps are the journaled ones.
-    let runs: Vec<LiveRun> = read_runs(&config.paths.journal, "binance-um")
+    let runs: Vec<LiveRun> = read_runs(&config.paths, "binance-um")
         .unwrap()
+        .runs
         .iter()
         .map(|r| r.live_run())
         .collect();
@@ -628,8 +629,9 @@ fn mie_replay_carries_the_book_across_restarts_as_journaled() {
 
     // The replayed book gaps are the journaled ones, the restart's seed gap
     // included, and the book resyncs after each.
-    let runs: Vec<LiveRun> = read_runs(&config.paths.journal, "binance-um")
+    let runs: Vec<LiveRun> = read_runs(&config.paths, "binance-um")
         .unwrap()
+        .runs
         .iter()
         .map(|r| r.live_run())
         .collect();
@@ -1252,8 +1254,9 @@ fn two_adjacent_history_windows_drive_one_engine_to_the_union_state() {
     let config = seam_fixture(dir.path());
     let store = ParquetRawStore::new(&config.paths.raw_root);
     let (history, archive) = config.history_archive().unwrap().unwrap();
-    let runs = read_runs(&config.paths.journal, "binance-um")
+    let runs = read_runs(&config.paths, "binance-um")
         .unwrap()
+        .runs
         .iter()
         .map(|r| r.live_run())
         .collect();
@@ -1457,4 +1460,197 @@ fn a_run_replay_streams_a_periodically_sealed_store_across_midnight() {
         "{}",
         dataset.files.len()
     );
+}
+
+/// The journal of [`legacy_journal_replay_report_is_pinned`]: two runs
+/// `ingest` wrote, stripped of the check (written before ADR-066), with an
+/// unparseable line, a line that is not UTF-8 and CRLF line ends added.
+fn legacy_journal(config: &mie_cli::config::IngestConfig) {
+    let t1 = D0 + HOUR;
+    let first = ingest(
+        config,
+        t1,
+        vec![vec![
+            agg(100, t1 + 10),
+            agg(101, t1 + 20),
+            agg(103, t1 + 40),
+        ]],
+    );
+    let t2 = t1 + HOUR;
+    let second = ingest(config, t2, vec![vec![agg(300, t2 + 5), agg(301, t2 + 6)]]);
+    assert_eq!((first.exit_code(), second.exit_code()), (0, 0));
+    assert!(strip_checks_where(&config.paths.journal, |_| true) > 0);
+    let bytes = std::fs::read(&config.paths.journal).unwrap();
+    let mut legacy = Vec::new();
+    for (i, body) in bytes.split(|b| *b == b'\n').enumerate() {
+        if body.is_empty() {
+            continue;
+        }
+        legacy.extend_from_slice(body);
+        legacy.extend_from_slice(if i % 2 == 0 { b"\r\n" } else { b"\n" });
+        if i == 1 {
+            legacy.extend_from_slice(b"{\"type\":\"stats\",\"run_id\":\"x\",\"reco\n");
+            legacy.extend_from_slice(b"{\"type\":\"stats\",\"note\":\"\xFF\"}\n");
+        }
+    }
+    std::fs::write(&config.paths.journal, legacy).unwrap();
+}
+
+/// ADR-068: a legacy journal (no line carries the check, ADR-066) replays
+/// to the report `main` printed before the gate, byte for byte: the gate
+/// classifies nothing there and prints no note. The golden text was
+/// captured from `main` before the change.
+#[test]
+fn legacy_journal_replay_report_is_pinned() {
+    let dir = TempDir::new("replay-legacy-pinned");
+    let config = config(dir.path());
+    legacy_journal(&config);
+    let text = std::fs::read(&config.paths.journal).unwrap();
+    assert!(!text.windows(6).any(|w| w == b"crc32c"));
+    let request = ReplayRequest {
+        source: ReplaySource::Live(config.clone()),
+        window: window(D0, D0 + DAY_MS),
+    };
+    let (outcome, text) = run_replay(&request);
+    assert!(outcome.pass, "{text}");
+    assert_eq!(text, LEGACY_REPORT, "{text}");
+}
+
+/// The report `main` (84b96a9) printed for the journal of
+/// [`legacy_journal`].
+const LEGACY_REPORT: &str = concat!(
+    "replay [1791244800000, 1791331200000) ms source live binance-um/BTCUSDT\n",
+    "dataset 375c69b5e1016d4e0bda2b39be05e1613eec0af56db90285036e47e06721689c\n",
+    "run 20261006T010000Z: clean, records 3, replayed 3, ignored 0\n",
+    "run 20261006T020000Z: clean, records 2, replayed 2, ignored 0\n",
+    "delivered Trades: events 5, gaps Disconnected 1, SequenceBreak 1\n",
+    "domain rejections: 0\n",
+    "state: as of 1791252000006, trades 5, feature set 4c844593779da2e3\n",
+    "event-stream 7:89d3765d3d7d9bcf\n",
+    "PASS\n",
+);
+
+/// ADR-068 D2, D4, D7: in a tiered store, run 1's `run_start` fails its
+/// check. `mie replay` stops naming it; once a lost-line record matches it,
+/// the replay excludes run 1, prints the note after its header, names the
+/// record for run 1's records it does not replay, and fails a window
+/// holding them.
+#[test]
+fn replay_names_a_recorded_line_and_excludes_its_run() {
+    use mie_adapter_parquet::copy_ledger::{self, CopyLedger, Kind, Record};
+    let dir = TempDir::new("replay-gate");
+    let mut config = config(dir.path());
+    let t1 = D0 + HOUR;
+    let first = ingest(
+        &config,
+        t1,
+        vec![vec![
+            agg(100, t1 + 10),
+            agg(101, t1 + 20),
+            agg(103, t1 + 40),
+        ]],
+    );
+    let t2 = t1 + HOUR;
+    let second = ingest(&config, t2, vec![vec![agg(300, t2 + 5), agg(301, t2 + 6)]]);
+    assert_eq!((first.exit_code(), second.exit_code()), (0, 0));
+    config.paths.cold_roots = common::cold_roots(dir.path());
+    common::init_tiers(&config.paths.raw_root, &config.paths.cold_roots);
+    let request = |w: ReplayWindow| ReplayRequest {
+        source: ReplaySource::Live(config.clone()),
+        window: w,
+    };
+    let (outcome, text) = run_replay(&request(window(t2, D0 + DAY_MS)));
+    assert!(outcome.pass, "{text}");
+    assert!(!text.contains("journal:"), "{text}");
+
+    let journal = config.paths.journal.clone();
+    let (index, start, end) = journal_line(&journal, "run_start", &first.run_id);
+    flip_value_digit(&journal, start);
+    let (outcome, text) = run_replay(&request(window(t2, D0 + DAY_MS)));
+    assert!(!outcome.pass, "{text}");
+    assert!(
+        text.contains(&format!(
+            "FAIL: journal {} line {} at byte {start} fails its check (ADR-066 D2) and is not \
+             recorded lost",
+            journal.display(),
+            index + 1
+        )),
+        "{text}"
+    );
+
+    let bytes = std::fs::read(&journal).unwrap();
+    CopyLedger::at(&config.paths.raw_root)
+        .append(&Record {
+            at_ms: 4_242,
+            kind: Kind::LostLine {
+                journal: "journal.jsonl".to_owned(),
+                line: index as u64 + 1,
+                offset: start as u64,
+                sha256: copy_ledger::line_sha256(&bytes[start..end]),
+            },
+        })
+        .unwrap();
+    let note = format!(
+        "journal: line {} at byte {start} fails its check (ADR-066 D2), recorded lost at 4242 \
+         (ADR-066 D8): its run_start is lost, so run {} is excluded, as a run whose run_start is \
+         lost (ADR-039 D2) (ADR-068 D4)\n",
+        index + 1,
+        first.run_id
+    );
+    let (outcome, text) = run_replay(&request(window(t2, D0 + DAY_MS)));
+    assert!(outcome.pass, "{text}");
+    let mut lines = text.lines();
+    assert!(lines.next().unwrap().starts_with("replay "), "{text}");
+    assert_eq!(format!("{}\n", lines.next().unwrap()), note, "{text}");
+    assert!(!text.contains(&format!("run {}:", first.run_id)), "{text}");
+    // Run 1's records, none in the window, read from a file that overlaps
+    // it: counted and named by the record.
+    let (outcome, text) = run_replay(&request(window(t1 + 25, t1 + 35)));
+    assert!(!outcome.pass, "{text}");
+    assert!(
+        text.contains(&format!(
+            "unjournaled run {}: 3 record(s) outside the window, not replayed (excluded: journal \
+             line {} at byte {start} (ADR-068 D4))",
+            first.run_id,
+            index + 1
+        )),
+        "{text}"
+    );
+    // A window holding them fails.
+    let (outcome, text) = run_replay(&request(window(D0, D0 + DAY_MS)));
+    assert!(!outcome.pass, "{text}");
+    assert!(text.contains(&note), "{text}");
+}
+
+/// ADR-068, the reader verdicts: `mie replay --source history` reads the
+/// journal through the gate and prints its notes after the header.
+#[test]
+fn replay_history_reads_through_the_gate() {
+    let dir = TempDir::new("replay-history-gate");
+    let config = seam_fixture(dir.path());
+    let journal = config.paths.journal.clone();
+    check_lines(&journal);
+    let runs = read_runs(&config.paths, "binance-um").unwrap().runs;
+    let last = runs.last().unwrap().parameters.run_id.clone();
+    let (index, start, _) = journal_line(&journal, "run_end", &last);
+    let w = window(ORIGIN, CUTOVER + 2 * DAY_MS);
+    let (before, before_text) = run_replay(&history_request(&config, w));
+    assert!(before.pass, "{before_text}");
+    flip_value_digit(&journal, start);
+    // A single-root store reads the line without a record (ADR-068 D5).
+    let (after, text) = run_replay(&history_request(&config, w));
+    let note = format!(
+        "journal: line {} at byte {start} fails its check (ADR-066 D2) and is not recordable",
+        index + 1
+    );
+    assert_eq!(
+        text.lines().nth(1).map(|l| l.starts_with(&note)),
+        Some(true),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("run {last} reads without its run_end")),
+        "{text}"
+    );
+    assert_eq!(after.pass, before.pass, "{before_text}\n{text}");
 }

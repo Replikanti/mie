@@ -1173,3 +1173,27 @@ fn a_slippage_calibration_on_another_source_fails_before_the_store_opens() {
         assert!(!request.results.exists());
     }
 }
+
+/// ADR-068, the reader verdicts: `mie experiment run --source live` reads
+/// the journal through the gate: a run_end that fails its check in a tiered
+/// store without a record stops it, naming the line, and records nothing.
+#[test]
+fn experiment_live_reads_through_the_gate() {
+    let dir = TempDir::new("experiment-gate");
+    let mut config = common::config(dir.path());
+    let run_id = common::checked_live_run(&config);
+    let sample = window(common::D0, common::D0 + 3_600_000);
+    let data = live_dataset(&config, sample);
+    common::make_tiered(&mut config, dir.path());
+    let stop = common::fail_run_end(&config, &run_id);
+    let request = ExperimentRequest {
+        spec: write_spec(dir.path(), "summary.spec", &spec_text(sample, &data)),
+        source: ReplaySource::Live(config),
+        results: dir.path().join("results"),
+        pipeline: ExperimentPipeline::Summary,
+    };
+    let (pass, text) = run(&request);
+    assert!(!pass);
+    assert!(text.starts_with(&format!("FAIL: {stop}")), "{text}");
+    assert!(files(&request.results).is_empty());
+}

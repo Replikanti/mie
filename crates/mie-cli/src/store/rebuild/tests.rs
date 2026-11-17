@@ -835,6 +835,69 @@ fn non_json_journal_lines_are_counted_not_parsed() {
     );
 }
 
+/// ADR-068, the reader verdicts: B1 is not gated. It reads only `sealed`
+/// and `recovery`, kinds the gate ignores, and a rebuild must run on a
+/// store whose journal is damaged: a line whose check fails reads as its
+/// bytes say, and one that no longer parses is counted, never a stop.
+#[test]
+fn parse_journal_ignores_line_checks() {
+    use crate::journal::{LineCheck, check_line, with_check};
+    let p = live("2026-10-06", 0);
+    let q = live("2026-10-06", 1);
+    let lines = [
+        "{\"run_id\":\"r1\",\"type\":\"run_start\"}".to_owned(),
+        format!("{{\"files\":[{{\"path\":\"{p}\"}}],\"run_id\":\"r1\",\"type\":\"sealed\"}}"),
+        format!("{{\"files\":[{{\"path\":\"{q}\"}}],\"run_id\":\"r1\",\"type\":\"sealed\"}}"),
+    ];
+    let mut plain = Vec::new();
+    let mut bytes = Vec::new();
+    for line in &lines {
+        plain.extend_from_slice(line.as_bytes());
+        plain.push(b'\n');
+        bytes.extend_from_slice(&with_check(line.as_bytes()));
+        bytes.push(b'\n');
+    }
+    let starts: Vec<usize> = std::iter::once(0)
+        .chain(
+            bytes
+                .iter()
+                .enumerate()
+                .filter(|(_, b)| **b == b'\n')
+                .map(|(i, _)| i + 1),
+        )
+        .collect();
+    // run_start's `{` turned into `[`: no JSON; the first sealed line's run
+    // id `r1` turned into `r0`: it still parses.
+    bytes[starts[0]] ^= 0x20;
+    let digit = starts[1]
+        + bytes[starts[1]..]
+            .windows(5)
+            .position(|w| w == b"\"r1\",")
+            .unwrap()
+        + 2;
+    bytes[digit] ^= 0x01;
+    for (i, start) in starts[..3].iter().enumerate() {
+        let body = &bytes[*start..starts[i + 1] - 1];
+        let expected = if i == 2 {
+            LineCheck::Intact
+        } else {
+            LineCheck::Failed
+        };
+        assert_eq!(check_line(body), expected, "line {i}");
+    }
+    let read = parse_journal(&bytes);
+    assert_eq!(read.non_json, 1);
+    let names: Vec<(&str, u64, &str)> = read
+        .names
+        .iter()
+        .map(|n| (n.path.as_str(), n.line, n.run_id.as_str()))
+        .collect();
+    assert_eq!(names, [(p.as_str(), 2, "r0"), (q.as_str(), 3, "r1")]);
+    let plain = parse_journal(&plain);
+    assert_eq!(plain.non_json, 0);
+    assert_eq!(plain.names.len(), 2);
+}
+
 /// Review of #209, finding 2: a missing hot import-ledger directory stops
 /// the rebuild when an archive part exists on a root or in the start, or a
 /// copy target holds import entries; otherwise it is no stop.

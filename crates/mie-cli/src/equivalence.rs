@@ -13,8 +13,9 @@
 //! run alone, into a fresh engine, can reach the states live reached.
 //!
 //! 1. A run without a clean `run_end`, without state checkpoints (journaled
-//!    before #13) or recorded with another event-stream or state hash
-//!    encoding than this binary's is NOT COMPARABLE. Otherwise recompute it
+//!    before #13), recorded with another event-stream or state hash
+//!    encoding than this binary's, or read without a lost `run_end` or
+//!    `state_checkpoint` (ADR-068 D4) is NOT COMPARABLE. Otherwise recompute it
 //!    with [`LiveReplay::run_replay`] — no chaining, no window — and drive a
 //!    fresh [`MarketStateEngine`] through [`drive_checkpointed`] at the
 //!    run's journaled interval, the drive live ingestion used.
@@ -218,12 +219,16 @@ pub fn run(
             event_hash::ENCODING_VERSION
         ),
     );
-    let opened = read_runs(&config.paths.journal, source).and_then(|runs| {
+    let opened = read_runs(&config.paths, source).and_then(|read| {
         crate::store::raw_store(&config.paths.raw_root, &config.paths.cold_roots)
-            .map(|store| (runs, store))
+            .map(|store| (read, store))
     });
     let outcome = match opened {
-        Ok((runs, store)) => {
+        Ok((read, store)) => {
+            for note in read.notes() {
+                line(&mut report, note);
+            }
+            let runs = &read.runs;
             let live = LiveReplay::new(
                 &store,
                 source,
@@ -260,6 +265,24 @@ pub fn run(
                 report.extend(lines);
                 verdicts.push(RunVerdict {
                     run_id: run.parameters.run_id.clone(),
+                    verdict,
+                });
+            }
+            // An excluded run that may have started in the window cannot be
+            // recomputed (ADR-068 D4); without its run_start the span of its
+            // readable lines decides, failing closed.
+            for excluded in &read.excluded {
+                let in_window = excluded.may_have_started_in(request.from_ms, Some(request.to_ms));
+                if !excluded.may_be_of(symbol) || !in_window {
+                    continue;
+                }
+                let Judged { verdict, lines } = not_comparable(
+                    &excluded.run_id,
+                    format!("{}: the run cannot be recomputed", excluded.cause()),
+                );
+                report.extend(lines);
+                verdicts.push(RunVerdict {
+                    run_id: excluded.run_id.clone(),
                     verdict,
                 });
             }
@@ -317,10 +340,26 @@ fn not_comparable(run_id: &str, reason: String) -> Judged {
     }
 }
 
-/// The checks of both units before any replay (module docs): a clean
-/// `run_end`, journaled checkpoints, this binary's encodings. The reason
-/// when one fails.
+/// The checks of both units before any replay (module docs): no lost
+/// `run_end` or `state_checkpoint` (ADR-068 D4), a clean `run_end`,
+/// journaled checkpoints, this binary's encodings. The reason when one
+/// fails.
 fn comparable(run: &JournaledRun) -> Result<(RunEnd, Checkpointing), String> {
+    // `compare` matches checkpoints by index, so a run read without one of
+    // them would read as DIVERGED; without its run_end it has no totals.
+    if let Some(lost) = run
+        .lost
+        .iter()
+        .find(|lost| matches!(lost.kind.as_deref(), Some("run_end" | "state_checkpoint")))
+    {
+        return Err(format!(
+            "its {} at journal line {} at byte {} is lost, so the run reads without it \
+             (ADR-068 D4)",
+            lost.kind.as_deref().unwrap_or_default(),
+            lost.line,
+            lost.offset
+        ));
+    }
     let Some(end) = run.end.filter(|end| end.exit_code == 0) else {
         return Err("the run did not end cleanly".to_owned());
     };
@@ -521,8 +560,9 @@ fn warm_pass(
             ));
         }
     };
+    // The journal's notes are the report's own, printed once above.
     let chain = match crate::replay::history_chain(config, store) {
-        Ok(chain) => chain,
+        Ok((chain, _)) => chain,
         Err(error) => {
             fail_all(judged, &comparable_runs, &format!("history chain: {error}"));
             return None;

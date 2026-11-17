@@ -215,6 +215,7 @@ use super::replicate::{
 use super::restore::{self, UnrecordedCopy};
 use super::{DeviceProbe, check_devices, check_hot, truncation_line};
 use crate::config::{ArchiveConfig, IngestConfig};
+use crate::journal::renumbered;
 use crate::journal::{LineCheck, MAX_CHECKED_LINE, check_line};
 use mie_adapter_parquet::copy_ledger::{
     self, AppendError, Kind, LedgerCopyCheck, LostOrigin, Record, Truncation,
@@ -587,17 +588,6 @@ pub(super) fn journal_name(config: &IngestConfig) -> Option<&str> {
         .journal
         .file_name()
         .and_then(|name| name.to_str())
-}
-
-/// A lost-line record's line number beside the line's number now, when
-/// they differ: an earlier `\n` flip shifts the numbers, not the bytes
-/// (ADR-066 D8).
-pub(super) fn renumbered(recorded: u64, now: u64) -> String {
-    if recorded == now {
-        String::new()
-    } else {
-        format!(" (recorded as line {recorded})")
-    }
 }
 
 /// ADR-066 D8's condition 4 for the journal copy `copy` and hot's failed

@@ -176,10 +176,12 @@ fn summary(request: &ReplayRequest, report: &AlertReport, log: &AlertLog) -> Val
 /// A description when the report cannot be written. Every replay failure
 /// is reported in the output.
 pub fn replay(request: &ReplayRequest, out: &mut dyn Write) -> Result<bool, String> {
-    let (pass, text) = match run_replay(request) {
+    let mut notes = Vec::new();
+    let (pass, text) = match run_replay(request, &mut notes) {
         Ok(text) => (true, format!("{text}PASS\n")),
         Err(error) => (false, format!("FAIL: {error}\n")),
     };
+    let text = format!("{}{text}", journal_notes(&notes));
     out.write_all(text.as_bytes())
         .and_then(|()| out.flush())
         .map_err(|e| format!("write the report: {e}"))?;
@@ -187,7 +189,7 @@ pub fn replay(request: &ReplayRequest, out: &mut dyn Write) -> Result<bool, Stri
 }
 
 /// The dry-run: the report's lines before the verdict.
-fn run_replay(request: &ReplayRequest) -> Result<String, String> {
+fn run_replay(request: &ReplayRequest, notes: &mut Vec<String>) -> Result<String, String> {
     if request.out.exists() {
         return Err(format!(
             "{} exists; an alert log is never overwritten",
@@ -203,9 +205,10 @@ fn run_replay(request: &ReplayRequest) -> Result<String, String> {
         ReplaySource::Live(config) => {
             let source = &config.instrument.source;
             let symbol = &config.instrument.symbol;
-            let runs = read_runs(&config.paths.journal, source)?;
+            let read = read_runs(&config.paths, source)?;
+            notes.extend(read.notes());
             let store = crate::store::raw_store(&config.paths.raw_root, &config.paths.cold_roots)?;
-            let runs = runs.iter().map(|run| run.live_run()).collect();
+            let runs = read.runs.iter().map(|run| run.live_run()).collect();
             let live = LiveReplay::new(&store, source, symbol, runs);
             let text = format!("live {source}/{symbol}");
             (text, drive(&live, request, false, &mut log)?)
@@ -228,7 +231,8 @@ fn run_replay(request: &ReplayRequest) -> Result<String, String> {
         }
         ReplaySource::History(config) => {
             let store = crate::store::raw_store(&config.paths.raw_root, &config.paths.cold_roots)?;
-            let chain = history_chain(config, &store)?;
+            let (chain, read) = history_chain(config, &store)?;
+            notes.extend(read.notes());
             (
                 "history".to_owned(),
                 drive(&chain, request, true, &mut log)?,
@@ -287,24 +291,27 @@ fn drive<H: HistoricalDataProvider>(
 ///
 /// A description when the report cannot be written.
 pub fn report(request: &ReportRequest, out: &mut dyn Write) -> Result<bool, String> {
-    let (pass, text) = match run_report(request) {
+    let mut notes = Vec::new();
+    let (pass, text) = match run_report(request, &mut notes) {
         Ok(text) => (true, format!("{text}PASS\n")),
         Err(error) => (false, format!("FAIL: {error}\n")),
     };
+    let text = format!("{}{text}", journal_notes(&notes));
     out.write_all(text.as_bytes())
         .and_then(|()| out.flush())
         .map_err(|e| format!("write the report: {e}"))?;
     Ok(pass)
 }
 
-fn run_report(request: &ReportRequest) -> Result<String, String> {
+fn run_report(request: &ReportRequest, notes: &mut Vec<String>) -> Result<String, String> {
     let window = request.window;
     let report = match &request.source {
         ReplaySource::Live(config) => {
             let source = &config.instrument.source;
-            let runs = read_runs(&config.paths.journal, source)?;
+            let read = read_runs(&config.paths, source)?;
+            notes.extend(read.notes());
             let store = crate::store::raw_store(&config.paths.raw_root, &config.paths.cold_roots)?;
-            let runs = runs.iter().map(|run| run.live_run()).collect();
+            let runs = read.runs.iter().map(|run| run.live_run()).collect();
             let live = LiveReplay::new(&store, source, &config.instrument.symbol, runs);
             ReportService::new(live).report(window)
         }
@@ -319,7 +326,8 @@ fn run_report(request: &ReportRequest) -> Result<String, String> {
         }
         ReplaySource::History(config) => {
             let store = crate::store::raw_store(&config.paths.raw_root, &config.paths.cold_roots)?;
-            let chain = history_chain(config, &store)?;
+            let (chain, read) = history_chain(config, &store)?;
+            notes.extend(read.notes());
             ReportService::chain(chain).report(window)
         }
     }
@@ -328,6 +336,11 @@ fn run_report(request: &ReportRequest) -> Result<String, String> {
         return Err("the window holds no event".to_owned());
     }
     Ok(render(&[Alert::Report(report)]))
+}
+
+/// The journal's notes (ADR-068 D7), one line each, ahead of the report.
+fn journal_notes(notes: &[String]) -> String {
+    notes.iter().map(|note| format!("{note}\n")).collect()
 }
 
 #[cfg(test)]

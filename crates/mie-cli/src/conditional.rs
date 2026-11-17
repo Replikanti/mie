@@ -81,7 +81,14 @@ impl Sink<'_> {
 /// reported in the output.
 pub fn build(request: &BuildRequest, out: &mut dyn Write) -> Result<bool, String> {
     let mut report = Vec::new();
-    let pass = match run_build(request) {
+    let mut notes = Vec::new();
+    let built = run_build(request, &mut notes);
+    // The journal's notes (ADR-068 D7) go to the report, never into the
+    // dataset's provenance.
+    for note in &notes {
+        line(&mut report, note);
+    }
+    let pass = match built {
         Ok((manifest, records, labels)) => {
             report.extend(manifest.render().into_bytes());
             line(&mut report, &format!("records {records} labels {labels}"));
@@ -100,7 +107,10 @@ pub fn build(request: &BuildRequest, out: &mut dyn Write) -> Result<bool, String
 }
 
 /// The manifest and the record and label counts of a finished build.
-fn run_build(request: &BuildRequest) -> Result<(OutcomeManifest, u64, u64), String> {
+fn run_build(
+    request: &BuildRequest,
+    notes: &mut Vec<String>,
+) -> Result<(OutcomeManifest, u64, u64), String> {
     if request.out.exists() {
         return Err(format!(
             "{} exists; a dataset is never overwritten",
@@ -127,9 +137,10 @@ fn run_build(request: &BuildRequest) -> Result<(OutcomeManifest, u64, u64), Stri
         ReplaySource::Live(config) => {
             let source = &config.instrument.source;
             let symbol = &config.instrument.symbol;
-            let runs = read_runs(&config.paths.journal, source)?;
+            let read = read_runs(&config.paths, source)?;
+            notes.extend(read.notes());
             let store = crate::store::raw_store(&config.paths.raw_root, &config.paths.cold_roots)?;
-            let runs = runs.iter().map(|run| run.live_run()).collect();
+            let runs = read.runs.iter().map(|run| run.live_run()).collect();
             let live = LiveReplay::new(&store, source, symbol, runs);
             // The streams are the journaled runs' own; there is nothing to
             // correct (ADR-057 D3).

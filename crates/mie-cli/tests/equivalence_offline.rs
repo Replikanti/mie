@@ -58,8 +58,8 @@ use common::warm::{
     Step, import_archive, import_archive_with, oi, one, run_steps, warm_config, warm_ingest,
 };
 use common::{
-    CUTOVER, Connections, DepthConnection, DrivenClock, HOUR, ORIGIN, TempDir, ingest_depth,
-    journal, strip_checks_where,
+    CUTOVER, Connections, DepthConnection, DrivenClock, HOUR, ORIGIN, TempDir, flip_value_digit,
+    ingest_depth, journal, journal_line, strip_checks_where,
 };
 use mie_adapter_binance::archive::ArchiveStream;
 use mie_adapter_binance::archive::catalog::DAY_MS;
@@ -264,8 +264,9 @@ fn recompute(
     interval_ms: i64,
 ) -> (Vec<MarketEvent>, Vec<StateCheckpoint>) {
     let store = ParquetRawStore::new(&config.paths.raw_root);
-    let runs: Vec<_> = read_runs(&config.paths.journal, "binance-um")
+    let runs: Vec<_> = read_runs(&config.paths, "binance-um")
         .unwrap()
+        .runs
         .iter()
         .map(JournaledRun::live_run)
         .collect();
@@ -789,11 +790,11 @@ fn the_offline_live_path_in_two_runs_is_equivalent_with_state() {
         .partition(|r| r.event_time_ms < middle_ms);
     let start1 = fixture.started_at_ms();
     play(&config, start1, &early);
-    let runs = read_runs(&config.paths.journal, "binance-um").unwrap();
+    let runs = read_runs(&config.paths, "binance-um").unwrap().runs;
     let start2 = runs[0].end.unwrap().at_ms + 1_000;
     play(&config, start2, &late);
 
-    let runs = read_runs(&config.paths.journal, "binance-um").unwrap();
+    let runs = read_runs(&config.paths, "binance-um").unwrap().runs;
     assert_eq!(runs.len(), 2);
     // Run 2 restarted with seeds from run 1's records.
     assert!(!runs[1].parameters.seeds.is_empty());
@@ -860,7 +861,7 @@ fn equivalence_is_identical_without_the_check() {
         .partition(|r| r.event_time_ms < middle_ms);
     let start1 = fixture.started_at_ms();
     play(&config, start1, &early);
-    let runs = read_runs(&config.paths.journal, "binance-um").unwrap();
+    let runs = read_runs(&config.paths, "binance-um").unwrap().runs;
     let start2 = runs[0].end.unwrap().at_ms + 1_000;
     play(&config, start2, &late);
     let (checked, checked_text) = check(&config, start1, start2 + 1);
@@ -989,7 +990,7 @@ fn the_order_book_state_replays_equivalently_and_a_mutated_level_diverges() {
     );
     assert_eq!(outcome.exit_code(), 0, "{:?}", outcome.error);
     assert_eq!(outcome.domain_rejections, 0);
-    let runs = read_runs(&config.paths.journal, "binance-um").unwrap();
+    let runs = read_runs(&config.paths, "binance-um").unwrap().runs;
     assert_eq!(runs.len(), 1);
     let run = &runs[0];
     assert!(run.checkpoints.len() >= 3, "{run:?}");
@@ -1722,4 +1723,267 @@ fn export_equivalence_fixture() {
     std::fs::create_dir_all(&out).unwrap();
     std::fs::write(out.join("records.tsv"), tsv).unwrap();
     write_journal(&out.join("journal.jsonl"), &journal);
+}
+
+// ---------------------------------------------------------------------------
+// The gate (ADR-068): a single-root store reads a failed line without a
+// record (D5), by the rule of D4.
+
+/// Two runs of the fixture played into a single-root store, as in
+/// [`equivalence_is_identical_without_the_check`]: the config, both
+/// starts and the runs.
+fn two_played_runs(dir: &Path) -> (IngestConfig, i64, i64, Vec<JournaledRun>) {
+    let fixture = Fixture::load();
+    let config = config(dir);
+    let first_ms = fixture.records.first().unwrap().event_time_ms;
+    let last_ms = fixture.records.last().unwrap().event_time_ms;
+    let middle_ms = first_ms + (last_ms - first_ms) / 2;
+    let (early, late): (Vec<&Record>, Vec<&Record>) = fixture
+        .records
+        .iter()
+        .partition(|r| r.event_time_ms < middle_ms);
+    let start1 = fixture.started_at_ms();
+    play(&config, start1, &early);
+    let runs = read_runs(&config.paths, "binance-um").unwrap().runs;
+    let start2 = runs[0].end.unwrap().at_ms + 1_000;
+    play(&config, start2, &late);
+    let runs = read_runs(&config.paths, "binance-um").unwrap().runs;
+    (config, start1, start2, runs)
+}
+
+/// ADR-068 D4: run 1's lost `state_checkpoint` marks it, and a marked run
+/// is NOT COMPARABLE, naming the line: `compare` matches checkpoints by
+/// index, so the run read without it would read as DIVERGED. Run 2 is
+/// still judged. The note follows the header lines.
+#[test]
+fn equivalence_marked_run_is_not_comparable() {
+    let dir = TempDir::new("equivalence-gate-marked");
+    let (config, start1, start2, runs) = two_played_runs(dir.path());
+    let run1 = runs[0].parameters.run_id.clone();
+    let journal = config.paths.journal.clone();
+    let (index, start, _) = journal_line(&journal, "state_checkpoint", &run1);
+    flip_value_digit(&journal, start);
+    let (outcome, text) = check(&config, start1, start2 + 1);
+    assert!(!outcome.pass, "{text}");
+    let lines: Vec<&str> = text.lines().collect();
+    assert!(
+        lines[2].starts_with(&format!(
+            "journal: line {} at byte {start} fails its check (ADR-066 D2) and is not recordable",
+            index + 1
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "run {run1}: NOT COMPARABLE: its state_checkpoint at journal line {} at byte {start} \
+             is lost, so the run reads without it (ADR-068 D4)",
+            index + 1
+        )),
+        "{text}"
+    );
+    assert_eq!(outcome.runs[1].verdict, Verdict::Equivalent, "{text}");
+}
+
+/// ADR-068 D4: a lost `chain_restart` marks its run, which no reader
+/// consumes, so the run is still judged EQUIVALENT. The fixture's runs are
+/// cold, so the line is a checked `chain_restart` inserted into run 1.
+#[test]
+fn equivalence_judges_a_run_whose_chain_restart_is_lost() {
+    let dir = TempDir::new("equivalence-gate-restart");
+    let (config, start1, start2, runs) = two_played_runs(dir.path());
+    let run1 = runs[0].parameters.run_id.clone();
+    let journal = config.paths.journal.clone();
+    let (index, start, _) = journal_line(&journal, "run_end", &run1);
+    let restart = serde_json::json!({
+        "type": "chain_restart", "run_id": run1, "at_ms": start1 + 1, "time": start1,
+    });
+    let mut line = mie_cli::journal::with_check(restart.to_string().as_bytes());
+    line.push(b'\n');
+    let mut bytes = std::fs::read(&journal).unwrap();
+    bytes.splice(start..start, line);
+    std::fs::write(&journal, bytes).unwrap();
+    flip_value_digit(&journal, start);
+    let read = read_runs(&config.paths, "binance-um").unwrap();
+    assert_eq!(read.runs[0].lost.len(), 1);
+    assert_eq!(read.runs[0].lost[0].kind.as_deref(), Some("chain_restart"));
+    assert_eq!(read.runs[0].lost[0].line, index as u64 + 1);
+    let (outcome, text) = check(&config, start1, start2 + 1);
+    assert!(outcome.pass, "{text}");
+    assert!(
+        text.contains(&format!(
+            "journal: line {} at byte {start} fails its check (ADR-066 D2) and is not \
+             recordable",
+            index + 1
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("run {run1} reads without this chain_restart")),
+        "{text}"
+    );
+}
+
+/// Review round 1 of #235 (ADR-068 D4): run 2's `run_start` is lost, so
+/// run 2 is excluded with no start of its own. The time of its first
+/// readable line stands in, so a window holding run 2 does not PASS: run 2
+/// is NOT COMPARABLE.
+#[test]
+fn equivalence_excluded_run_without_its_run_start_is_not_comparable() {
+    let dir = TempDir::new("equivalence-gate-lost-start");
+    let (config, start1, start2, runs) = two_played_runs(dir.path());
+    let run2 = runs[1].parameters.run_id.clone();
+    let journal = config.paths.journal.clone();
+    let (_, start, _) = journal_line(&journal, "run_start", &run2);
+    flip_value_digit(&journal, start);
+    let read = read_runs(&config.paths, "binance-um").unwrap();
+    assert_eq!(read.excluded.len(), 1);
+    assert_eq!(read.excluded[0].run_id, run2);
+    assert_eq!(read.excluded[0].start, None);
+    let (outcome, text) = check(&config, start1, start2 + 1);
+    assert!(!outcome.pass, "{text}");
+    let verdict = outcome
+        .runs
+        .iter()
+        .find(|v| v.run_id == run2)
+        .expect("run 2");
+    assert!(
+        matches!(verdict.verdict, Verdict::NotComparable(_)),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "run {run2}: NOT COMPARABLE: excluded: journal line"
+        )),
+        "{text}"
+    );
+}
+
+/// Review round 1 of #235 (ADR-068 D4, a run boundary): in a single-root
+/// journal `mie ingest` wrote, run 1's run_end is followed by run 2's
+/// `recovery` (no `replication` without a replicator). Run 1's lost
+/// run_end marks run 1 only: run 2 is still judged EQUIVALENT.
+#[test]
+fn equivalence_lost_run_end_before_the_next_run_marks_only_its_run() {
+    let dir = TempDir::new("equivalence-gate-lost-end");
+    let (config, start1, start2, runs) = two_played_runs(dir.path());
+    let (run1, run2) = (
+        runs[0].parameters.run_id.clone(),
+        runs[1].parameters.run_id.clone(),
+    );
+    let journal = config.paths.journal.clone();
+    let (index, start, _) = journal_line(&journal, "run_end", &run1);
+    let (next, _, _) = journal_line(&journal, "recovery", &run2);
+    assert_eq!(next, index + 1, "run 2's recovery follows run 1's run_end");
+    flip_value_digit(&journal, start);
+    let read = read_runs(&config.paths, "binance-um").unwrap();
+    assert!(read.excluded.is_empty(), "{:?}", read.notes());
+    let (outcome, text) = check(&config, start1, start2 + 1);
+    assert!(!outcome.pass, "{text}");
+    assert!(
+        matches!(outcome.runs[0].verdict, Verdict::NotComparable(_)),
+        "{text}"
+    );
+    assert_eq!(outcome.runs[1].run_id, run2);
+    assert_eq!(outcome.runs[1].verdict, Verdict::Equivalent, "{text}");
+}
+
+/// Review round 2 of #235 (ADR-068 D4): a real clock writes `recovery` a
+/// few milliseconds before `run_start`. With run 1's run_start lost and
+/// the window starting at run 1's start, run 1's earliest readable line
+/// (its recovery) lies before the window; the span of its lines still
+/// meets the window, so run 1 is NOT COMPARABLE and the window fails.
+#[test]
+fn equivalence_excluded_run_whose_recovery_precedes_the_window_is_not_comparable() {
+    let dir = TempDir::new("equivalence-gate-recovery-before");
+    let (config, start1, start2, runs) = two_played_runs(dir.path());
+    let run1 = runs[0].parameters.run_id.clone();
+    let journal = config.paths.journal.clone();
+    let text = std::fs::read_to_string(&journal).unwrap();
+    let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
+    let (i, _, _) = journal_line(&journal, "recovery", &run1);
+    let object = mie_cli::journal::strip_check(lines[i].as_bytes()).unwrap();
+    let mut value: Value = serde_json::from_slice(&object).unwrap();
+    value["at_ms"] = serde_json::json!(start1 - 3);
+    lines[i] = String::from_utf8(mie_cli::journal::with_check(
+        &serde_json::to_vec(&value).unwrap(),
+    ))
+    .unwrap();
+    std::fs::write(&journal, lines.join("\n") + "\n").unwrap();
+    let (_, start, _) = journal_line(&journal, "run_start", &run1);
+    flip_value_digit(&journal, start);
+    let read = read_runs(&config.paths, "binance-um").unwrap();
+    assert_eq!(read.excluded.len(), 1);
+    assert_eq!(read.excluded[0].start, None);
+    assert_eq!(read.excluded[0].lines_at_ms.unwrap().0, start1 - 3);
+    let (outcome, text) = check(&config, start1, start2 + 1);
+    assert!(!outcome.pass, "{text}");
+    let verdict = outcome
+        .runs
+        .iter()
+        .find(|v| v.run_id == run1)
+        .expect("run 1");
+    assert!(
+        matches!(verdict.verdict, Verdict::NotComparable(_)),
+        "{text}"
+    );
+}
+
+/// Review round 3 of #235 (ADR-068 D4): run 1 crashed right after its
+/// `run_start`, which is lost, so its only readable line is its
+/// `recovery`, 3 ms before the start as a real clock writes it. The lost
+/// line's run cannot be told (the next line is run 2's), so runs 1 and 2
+/// are excluded. The window starts inside the gap and ends at run 2's
+/// start. Run 1's start is bounded above by the next line of another run
+/// (run 2's recovery), so run 1 may have started in the window and is
+/// judged NOT COMPARABLE instead of being left out.
+#[test]
+fn equivalence_crashed_run_with_only_its_recovery_is_not_comparable() {
+    let dir = TempDir::new("equivalence-gate-only-recovery");
+    let (config, start1, start2, runs) = two_played_runs(dir.path());
+    let run1 = runs[0].parameters.run_id.clone();
+    let journal = config.paths.journal.clone();
+    let text = std::fs::read_to_string(&journal).unwrap();
+    let mut lines = Vec::new();
+    for line in text.lines() {
+        let object = mie_cli::journal::strip_check(line.as_bytes()).unwrap();
+        let mut value: Value = serde_json::from_slice(&object).unwrap();
+        if value["run_id"] == run1.as_str() {
+            match value["type"].as_str() {
+                Some("recovery") => value["at_ms"] = json!(start1 - 3),
+                Some("run_start") => {}
+                _ => continue,
+            }
+        }
+        lines.push(
+            String::from_utf8(mie_cli::journal::with_check(
+                &serde_json::to_vec(&value).unwrap(),
+            ))
+            .unwrap(),
+        );
+    }
+    std::fs::write(&journal, lines.join("\n") + "\n").unwrap();
+    let (_, start, _) = journal_line(&journal, "run_start", &run1);
+    flip_value_digit(&journal, start);
+    let read = read_runs(&config.paths, "binance-um").unwrap();
+    assert_eq!(read.excluded.len(), 2, "{:?}", read.notes());
+    let excluded = &read.excluded[0];
+    assert_eq!(excluded.run_id, run1);
+    assert_eq!(excluded.lines_at_ms, Some((start1 - 3, start1 - 3)));
+    let (_, run2_recovery, _) = journal_line(&journal, "recovery", &runs[1].parameters.run_id);
+    let bytes = std::fs::read(&journal).unwrap();
+    let end = run2_recovery
+        + bytes[run2_recovery..]
+            .iter()
+            .position(|b| *b == b'\n')
+            .unwrap();
+    let value: Value = serde_json::from_slice(&bytes[run2_recovery..end]).unwrap();
+    assert_eq!(excluded.started_by_ms, value["at_ms"].as_i64());
+    let (outcome, text) = check(&config, start1, start2);
+    assert!(!outcome.pass, "{text}");
+    assert_eq!(outcome.runs.len(), 1, "{text}");
+    assert_eq!(outcome.runs[0].run_id, run1, "{text}");
+    assert!(
+        matches!(outcome.runs[0].verdict, Verdict::NotComparable(_)),
+        "{text}"
+    );
 }

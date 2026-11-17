@@ -528,6 +528,9 @@ pub fn run_with_hold(
         let queue_high_water = queue.len() as u64;
         match warmed {
             Ok(warm) => {
+                for note in &warm.notes {
+                    eprintln!("mie ingest: {note}");
+                }
                 let state = warm.engine.state();
                 let run_seeds = warm.tail.run_seeds();
                 let handoff = WarmHandoff {
@@ -815,6 +818,8 @@ struct WarmUp {
     rejections: u64,
     /// The prefix's restarts after uncrossable holes (ADR-052 D4).
     restarts: Vec<EventTime>,
+    /// The journal's notes (ADR-068 D7), printed to stderr.
+    notes: Vec<String>,
 }
 
 /// Runs the hook it holds when dropped, so it also runs when the warm-up
@@ -873,9 +878,10 @@ fn warm_up(
     max: u64,
 ) -> Result<WarmUp, String> {
     let store = crate::store::raw_store(&config.paths.raw_root, &config.paths.cold_roots)?;
-    let largest = memory_guard(config, &store, run_id, max)?;
+    let (largest, notes) = memory_guard(config, &store, run_id, max)?;
     queue_limit.store(max - largest, Ordering::SeqCst);
-    let chain: HistoryChain<'_> = history_chain(config, &store)?;
+    // The chain reads the journal again; its notes are the guard's.
+    let (chain, _): (HistoryChain<'_>, _) = history_chain(config, &store)?;
     let Replay { stream, dataset } = chain.before_run(run_id).map_err(|e| e.to_string())?;
     let mut hashing = HashingProvider::new(Cancellable {
         inner: stream,
@@ -900,6 +906,7 @@ fn warm_up(
         stream: stream_hash,
         rejections,
         restarts: drive.restarts,
+        notes,
     })
 }
 
@@ -909,13 +916,22 @@ fn warm_up(
 /// time. A run that ended cleanly counts its `run_end` records; any other
 /// counts the rows of the sealed files of its streams that overlap its
 /// ADR-039 D2 extent, an upper bound (adjacent runs share files). Returns
-/// that largest count (0 without a chain run before `run_id`).
+/// that largest count (0 without a chain run before `run_id`) and the
+/// journal's notes (ADR-068 D7).
+///
+/// The journal is read behind the gate of ADR-068: a gated line, or a run
+/// a lost line excludes that may lie in the chain (it started at or after
+/// the cutover; without its run_start, its start's upper bound lies at or
+/// after the cutover, or it has none; or no time of it is known), fails
+/// the guard, so the run
+/// starts cold with `warm-up-failed` naming the line, and the capture goes
+/// on (ADR-052 D8).
 fn memory_guard(
     config: &IngestConfig,
     store: &ParquetRawStore,
     run_id: &str,
     max: u64,
-) -> Result<u64, String> {
+) -> Result<(u64, Vec<String>), String> {
     let history = config
         .history
         .as_ref()
@@ -923,7 +939,20 @@ fn memory_guard(
     let cutover = history.cutover_ms().map_err(|e| e.to_string())?;
     let source = &config.instrument.source;
     let symbol = &config.instrument.symbol;
-    let mut runs: Vec<LiveRun> = read_runs(&config.paths.journal, source)?
+    let read = read_runs(&config.paths, source)?;
+    if let Some(excluded) = read
+        .excluded
+        .iter()
+        .find(|run| run.may_be_of(symbol) && run.may_have_started_in(cutover, None))
+    {
+        return Err(format!(
+            "the history chain may hold run {}, which is {}, so it cannot be recomputed",
+            excluded.run_id,
+            excluded.cause()
+        ));
+    }
+    let mut runs: Vec<LiveRun> = read
+        .runs
         .iter()
         .map(|run| run.live_run())
         .filter(|run| run.symbol == *symbol)
@@ -959,7 +988,7 @@ fn memory_guard(
              max_run_records {max}",
             run.run_id
         )),
-        _ => Ok(largest.map_or(0, |(_, records)| records)),
+        _ => Ok((largest.map_or(0, |(_, records)| records), read.notes())),
     }
 }
 

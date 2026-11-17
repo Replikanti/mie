@@ -8,7 +8,15 @@ exclude-dev = true
 
 [advisories]
 version = 2
-ignore = []
+ignore = [
+    # chrono is only transitive: arrow-arith, arrow-array, arrow-cast and
+    # parquet 60 depend on it, reached through mie-adapter-parquet (parquet)
+    # and mie-adapter-duckdb (duckdb -> arrow), per `cargo tree -i chrono`.
+    # No mie crate depends on chrono directly. The advisory is informational
+    # ("unmaintained") with no patched version. Revisit when arrow/parquet
+    # and duckdb drop chrono.
+    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained; only transitive via arrow/parquet 60 and duckdb, no direct dependency, no patched version" },
+]
 
 [licenses]
 version = 2
