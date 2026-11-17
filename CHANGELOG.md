@@ -40,6 +40,29 @@ is marked **Breaking:** under `Changed`. Releases are cut as described in
   (the copy, hot, or a fork). Lines without the check keep ADR-065's
   byte rules unchanged.
 
+- **A self-consistent other file on a copy target is cleared (#227,
+  ADR-067).** A copy target that holds, under a path hot holds or the
+  copy ledger records, a sealed file whose manifest differs from the
+  path's recorded text while its data matches that manifest (an earlier
+  D5 violation: a path sealed twice) stayed one copy short for good.
+  `mie store repair` still refuses it by default, now naming the other
+  file's rows and SHA-256 and the new flag `--move-other-files`. With the
+  flag it appends a new copy-ledger record `displaced <at_ms> <root>
+  <dir> <text>`, carrying the other file's manifest text verbatim, then
+  moves the file into that root's `.mie/damaged/<at_ms>/` (never
+  deleted), and the path's recorded file is copied there and recorded:
+  k − 1 copies become k. A held path's other file stays refused, naming
+  `mie store resolve`. A crash between the record and the move is
+  completed by the next repair, which matches only a byte-equal manifest
+  text, so the recorded file placed there afterwards is never moved.
+  `mie store verify` lists each record as a note, and fails while the
+  recorded move has not completed. No selection changes: the tiered
+  `select` never lists a cold root's manifest. **Downgrade:** the copy
+  ledger's parser of an earlier binary refuses a ledger that holds a
+  `displaced` record, so after the first record such a binary fails every
+  tiered `select`, verify and repair on that store. No record exists
+  until an operator passes the flag.
+
 - **Hot's own failed journal lines and the lost-line record (#224,
   ADR-066 D6 V3 and D8; ADR-066 accepted).** `mie store verify` streams
   hot's journal and fails on every complete line that fails its check,

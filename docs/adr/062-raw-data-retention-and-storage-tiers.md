@@ -10,7 +10,15 @@
   (a line's own check attributes one copy against hot, ADR-066 D5), and
   adds the copy-ledger kind `lost-line` (ADR-066 D8), which D7's fold
   counts among the kinds that do not change the file list, beside
-  `finding` and `verify`
+  `finding` and `verify`; ADR-067 adds D5's second exception (a copy
+  target's self-consistent other file under a recorded path, moved by
+  `mie store repair --move-other-files` into that root's
+  `.mie/damaged/<at_ms>/`), supersedes R1's and R2b's "a self-consistent
+  other file is refused and never moved" (D11 *As implemented (#192)*
+  and the #219 addendum) and the *Consequences* and H7 sentences that
+  leave such a file one copy short for good, and adds the copy-ledger
+  kind `displaced`, which D7's fold counts among the kinds that do not
+  change the file list
 - Date: 2026-11-05
 - Amended: 2026-11-15 (#219)
 
