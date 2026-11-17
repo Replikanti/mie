@@ -53,6 +53,11 @@
 //!     R) is `copies`, except an archive part that no current hot entry
 //!     lists (it waits for its entry) and a file on hot whose data mtime lies within
 //!     G before now.
+//!   - *Displaced files* (ADR-067 D6): each `displaced` record of R is a
+//!     note naming the path, rows, SHA-256 and directory; it is a `FAIL`
+//!     naming `mie store repair` while R's manifest of the path still
+//!     equals the record's text (the recorded move did not complete). An
+//!     I/O error reading that manifest stops R.
 //!   - *Entries:* each current hot entry whose listed parts all have
 //!     `copy` records for R older than G, and each supersede record whose
 //!     mtime on hot lies outside G before now (a future mtime is never
@@ -106,10 +111,11 @@
 //!   behind, so a healthy replicator copies a part within two intervals. A
 //!   future mtime is never exempt.
 //! - **V9 Output.** One summary line per root (hot's followed by its
-//!   journal's summary and notes), then the `FAIL:` lines: hot (its sealed
+//!   journal's summary and notes, a copy target's by its displaced
+//!   notes), then the `FAIL:` lines: hot (its sealed
 //!   files, then its journal's lines); each root in configuration order
-//!   (data paths in path order, then entries, the copy ledger and the
-//!   journal); then `stale`; then one line per file with fewer than k good
+//!   (data paths in path order, then displaced files, entries, the copy
+//!   ledger and the journal); then `stale`; then one line per file with fewer than k good
 //!   copies. That last check needs every
 //!   copy target verified in this run; otherwise the `not verified` and
 //!   `stale` lines stand in for it, instead of one line per file of the
@@ -207,6 +213,8 @@ struct Root {
     bad: BTreeSet<String>,
     /// Its summary line.
     summary: Option<String>,
+    /// Its notes: the `displaced` records of a copy target (ADR-067 D6).
+    notes: Vec<String>,
 }
 
 /// Why a root's walk ended early.
@@ -384,6 +392,7 @@ pub fn run(
             problems: Vec::new(),
             bad: BTreeSet::new(),
             summary: None,
+            notes: Vec::new(),
         });
     }
     let marked: Vec<&Path> = roots
@@ -833,6 +842,9 @@ impl Verify<'_> {
             }
         }
 
+        // The displaced files (ADR-067 D6).
+        self.displaced_notes(i)?;
+
         // Entries.
         let mut entries_checked = 0usize;
         if self.archive.is_some() {
@@ -998,6 +1010,54 @@ impl Verify<'_> {
              byte(s) of the copy ledger",
             self.verified_len
         ));
+        Ok(())
+    }
+
+    /// V4's notes on the `displaced` records of the copy target `i`
+    /// (ADR-067 D6): a note per record, a `FAIL` while the target's
+    /// manifest of the path still equals the record's text (the recorded
+    /// move did not complete).
+    fn displaced_notes(&mut self, i: usize) -> Result<(), Stop> {
+        let id = self.roots[i].id.clone().unwrap_or_default();
+        let root = self.roots[i].path.clone();
+        let name = self.name(i);
+        for record in self.state.displaced(&id).to_vec() {
+            let manifest = root.join(format!(
+                "{}.manifest",
+                record.path.strip_suffix(".parquet").unwrap_or(&record.path)
+            ));
+            let present = match fs::read(&manifest) {
+                Ok(bytes) => record.matches(&bytes),
+                Err(error) if error.kind() == ErrorKind::NotFound => false,
+                Err(error) => {
+                    return Err(Stop::Root(format!(
+                        "reading {}: {error}",
+                        manifest.display()
+                    )));
+                }
+            };
+            let what = format!(
+                "a self-consistent other file (rows {}, SHA-256 {}), displaced record at {}, \
+                 into {}",
+                record.rows,
+                record.sha256,
+                record.at_ms,
+                replica::damaged_dir(&root, record.dir).display()
+            );
+            if present {
+                self.roots[i].problems.push(format!(
+                    "{} on {name}: the recorded move of {what} did not complete: the target still \
+                     holds it; `mie store repair` completes it (ADR-067 D6)",
+                    record.path
+                ));
+            } else {
+                self.roots[i].notes.push(format!(
+                    "note: {} on {name}: `mie store repair --move-other-files` moved {what}, \
+                     never deleted (ADR-067)",
+                    record.path
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -1190,6 +1250,7 @@ impl Verify<'_> {
                 Some(why) => lines.push(format!("{}: not checked: {why}", self.name(i))),
                 None => lines.extend(root.summary.clone()),
             }
+            lines.extend(root.notes.iter().cloned());
         }
         problems.extend(stale);
         if all_verified {
@@ -1254,7 +1315,8 @@ fn describe(check: CopyCheck, path: &str) -> String {
         CopyCheck::Manifest { other_file: true } => format!(
             "manifest: its manifest differs from the copy ledger's manifest record and its data \
              matches that other manifest: two sealed files under one path {path}, which must be \
-             byte-identical on every root (ADR-062 D5)"
+             byte-identical on every root (ADR-062 D5); after checking it, `mie store repair \
+             --move-other-files` moves it aside and records the move (ADR-067)"
         ),
         CopyCheck::Manifest { other_file: false } => {
             "manifest: its manifest is absent or differs from the copy ledger's manifest record \

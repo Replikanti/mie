@@ -179,3 +179,105 @@ fn verify_checks_supersede_records_and_skips_superseded_entries() {
     let report = verify(now + 3);
     assert!(about(&report, &s1, "missing"), "{report:?}");
 }
+
+/// The first live path of `fixture` and hot's manifest text of it with one
+/// row more: a self-consistent other file's text over the same data.
+fn live_and_other(fixture: &Fixture) -> (String, String) {
+    let path = replica::list_sealed(&fixture.hot)
+        .unwrap()
+        .into_iter()
+        .find(|p| p.starts_with("source=binance-um"))
+        .unwrap();
+    let text = fs::read_to_string(fixture.hot.join(manifest_name(&path))).unwrap();
+    let rows = text
+        .lines()
+        .find_map(|line| line.strip_prefix("rows "))
+        .unwrap()
+        .to_owned();
+    let other = text.replace(
+        &format!("\nrows {rows}\n"),
+        &format!("\nrows {}\n", rows.parse::<u64>().unwrap() + 1),
+    );
+    (path, other)
+}
+
+fn manifest_name(path: &str) -> String {
+    format!("{}.manifest", path.strip_suffix(".parquet").unwrap())
+}
+
+fn verify_at(fixture: &Fixture, now: i64) -> VerifyReport {
+    run(
+        &fixture.config,
+        Some(&fixture.archive()),
+        "24",
+        &fixture.probe,
+        &|| now,
+        &CopyLedger::at(&fixture.hot),
+    )
+}
+
+/// ADR-067 D6: a `displaced` record of a copy target whose manifest of the
+/// path is no longer the record's text is a note naming the path, rows,
+/// SHA-256 and directory, and the verification passes.
+#[test]
+fn v4_a_displaced_record_is_a_note() {
+    let fixture = Fixture::new("verify-displaced-note");
+    assert_eq!(fixture.pass().problems, Vec::<String>::new());
+    let (path, other) = live_and_other(&fixture);
+    let parsed = replica::parse_manifest(&other).unwrap();
+    CopyLedger::at(&fixture.hot)
+        .append(&Record {
+            at_ms: D0 + 10,
+            kind: Kind::Displaced {
+                root: "cold-b".to_owned(),
+                dir: D0 + 10,
+                text: other,
+            },
+        })
+        .unwrap();
+    let report = verify_at(&fixture, D0 + 3_600_000);
+    assert_eq!(report.problems, Vec::<String>::new(), "{report:?}");
+    let dir = replica::damaged_dir(&fixture.cold[1], D0 + 10);
+    assert!(
+        report.lines.iter().any(|l| l.contains(&path)
+            && l.contains("cold-b")
+            && l.contains(&format!("rows {}", parsed.rows))
+            && l.contains(&parsed.sha256)
+            && l.contains(&dir.display().to_string())),
+        "{report:?}"
+    );
+}
+
+/// ADR-067 D6: while the target's manifest of the path still equals the
+/// record's text (a move that crashed after its record), the note is a
+/// `FAIL` naming `mie store repair`.
+#[test]
+fn v4_an_incomplete_move_fails_naming_the_repair() {
+    let fixture = Fixture::new("verify-displaced-incomplete");
+    assert_eq!(fixture.pass().problems, Vec::<String>::new());
+    let (path, other) = live_and_other(&fixture);
+    let manifest = fixture.cold[1].join(manifest_name(&path));
+    let mut permissions = fs::metadata(&manifest).unwrap().permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    permissions.set_readonly(false);
+    fs::set_permissions(&manifest, permissions).unwrap();
+    fs::write(&manifest, &other).unwrap();
+    CopyLedger::at(&fixture.hot)
+        .append(&Record {
+            at_ms: D0 + 10,
+            kind: Kind::Displaced {
+                root: "cold-b".to_owned(),
+                dir: D0 + 10,
+                text: other,
+            },
+        })
+        .unwrap();
+    let report = verify_at(&fixture, D0 + 3_600_000);
+    assert!(
+        report.problems.iter().any(|p| p.contains(&path)
+            && p.contains("cold-b")
+            && p.contains("did not complete")
+            && p.contains("`mie store repair`")),
+        "{report:?}"
+    );
+}
