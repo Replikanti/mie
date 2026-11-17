@@ -60,7 +60,12 @@
 //!     naming `mie store resolve` first for a held path, and a note again
 //!     for a lost, conflicting, replaced or pending path, which no repair
 //!     rule visits (#234 review, finding 2). An I/O error reading that
-//!     manifest stops R.
+//!     manifest stops R. Once R's manifest no longer equals the text, the
+//!     note says the file was moved into the record's directory only when
+//!     that directory's manifest equals the text, and into the replace's
+//!     `.quarantine/<id>/` (a replaced or pending path) only when that one
+//!     does; otherwise it says neither holds it, naming no other place
+//!     (#234 review, round 2).
 //!   - *Entries:* each current hot entry whose listed parts all have
 //!     `copy` records for R older than G, and each supersede record whose
 //!     mtime on hot lies outside G before now (a future mtime is never
@@ -141,7 +146,7 @@ use mie_adapter_parquet::copy_ledger::{
 };
 use mie_adapter_parquet::replica::{self, CopyCheck, CopyError, Side, TailSource};
 use mie_adapter_parquet::root_marker::{self, HOT_ID};
-use mie_adapter_parquet::verification::{CopyState, LostLine, PathVerdict};
+use mie_adapter_parquet::verification::{CopyState, Displaced, LostLine, PathVerdict};
 use mie_ports::raw::RawStoreError;
 use std::collections::BTreeSet;
 use std::fs;
@@ -1039,14 +1044,12 @@ impl Verify<'_> {
                     )));
                 }
             };
-            let what = format!(
-                "a self-consistent other file (rows {}, SHA-256 {}), displaced record at {}, \
-                 into {}",
-                record.rows,
-                record.sha256,
-                record.at_ms,
-                replica::damaged_dir(&root, record.dir).display()
+            let aside = replica::damaged_dir(&root, record.dir);
+            let file = format!(
+                "a self-consistent other file (rows {}, SHA-256 {}), displaced record at {}",
+                record.rows, record.sha256, record.at_ms
             );
+            let what = format!("{file}, into {}", aside.display());
             // The remedy by the path's verdict: R5b completes a move only
             // where R5a may move (gate 1), and no repair rule visits a lost,
             // conflicting, replaced or pending path, so verify never fails
@@ -1088,11 +1091,55 @@ impl Verify<'_> {
                     record.path
                 ));
             } else {
-                self.roots[i].notes.push(format!(
-                    "note: {} on {name}: `mie store repair --move-other-files` moved {what}, \
-                     never deleted (ADR-067)",
-                    record.path
-                ));
+                // The note names only a place it checked: the damaged
+                // directory, or for a replaced or pending path the
+                // replace's quarantine, each holding the record's text
+                // (review of #234, round 2).
+                let manifest_name = manifest.strip_prefix(&root).unwrap_or(&manifest);
+                let held = holds_record(&aside.join(manifest_name), &record);
+                let note = if held == Ok(true) {
+                    format!("`mie store repair --move-other-files` moved {what}, never deleted")
+                } else {
+                    let quarantine = match verdict {
+                        Some(PathVerdict::Replaced | PathVerdict::Pending) => self
+                            .state
+                            .quarantine(&record.path)
+                            .map(|id| replica::quarantine_dir(&root, id)),
+                        _ => None,
+                    };
+                    let quarantined = quarantine
+                        .as_ref()
+                        .map(|dir| (dir, holds_record(&dir.join(manifest_name), &record)));
+                    let unread = |checked: &Result<bool, String>, dir: &Path| match checked {
+                        Err(error) => format!(" ({} cannot be read: {error})", dir.display()),
+                        Ok(_) => String::new(),
+                    };
+                    match quarantined {
+                        Some((dir, Ok(true))) => format!(
+                            "the recorded move of {what} did not complete, and the replace \
+                             resolution moved the path's files into its quarantine {}, never \
+                             deleted (ADR-062 D11)",
+                            dir.display()
+                        ),
+                        Some((dir, checked)) => format!(
+                            "{file} is no longer under the path, and neither {} nor the replace \
+                             resolution's quarantine {} holds the record's manifest{}{}",
+                            aside.display(),
+                            dir.display(),
+                            unread(&held, &aside),
+                            unread(&checked, dir)
+                        ),
+                        None => format!(
+                            "{file} is no longer under the path, and {} does not hold the \
+                             record's manifest{}",
+                            aside.display(),
+                            unread(&held, &aside)
+                        ),
+                    }
+                };
+                self.roots[i]
+                    .notes
+                    .push(format!("note: {} on {name}: {note} (ADR-067)", record.path));
             }
         }
         Ok(())
@@ -1333,6 +1380,20 @@ impl Verify<'_> {
             ));
         }
         lines
+    }
+}
+
+/// Whether `manifest` (a displaced file's manifest outside the layout)
+/// holds `record`'s text byte for byte: `Ok(false)` when it is absent or
+/// holds other bytes, `Err` naming any other I/O error. A displaced note
+/// only names a place this checked (ADR-067 D6).
+fn holds_record(manifest: &Path, record: &Displaced) -> Result<bool, String> {
+    match fs::read(manifest) {
+        Ok(bytes) => Ok(record.matches(&bytes)),
+        Err(error) if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
+            Ok(false)
+        }
+        Err(error) => Err(error.to_string()),
     }
 }
 
