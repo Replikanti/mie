@@ -22,7 +22,10 @@
    "user": null,
    "machine": null,
    "areas": [],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 39,
@@ -45,7 +48,10 @@
    "areas": [
     "risk"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 38,
@@ -69,7 +75,10 @@
    "areas": [
     "egress"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 37,
@@ -92,7 +101,10 @@
    "areas": [
     "strategy-registry"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 36,
@@ -116,7 +128,10 @@
    "areas": [
     "strategy-registry"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 35,
@@ -140,7 +155,10 @@
    "areas": [
     "strategy-registry"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 34,
@@ -164,7 +182,10 @@
    "areas": [
     "agents"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 33,
@@ -187,7 +208,10 @@
    "areas": [
     "research-lab"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 32,
@@ -210,7 +234,10 @@
    "areas": [
     "research-lab"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 31,
@@ -233,7 +260,10 @@
    "areas": [
     "research-lab"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 30,
@@ -264,7 +294,10 @@
    "areas": [
     "research-lab"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 29,
@@ -288,7 +321,10 @@
    "areas": [
     "research-lab"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 28,
@@ -311,7 +347,10 @@
    "areas": [
     "conditional-behavior"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 27,
@@ -337,7 +376,10 @@
    "areas": [
     "conditional-behavior"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 26,
@@ -360,7 +402,10 @@
    "areas": [
     "conditional-behavior"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 25,
@@ -385,7 +430,10 @@
    "areas": [
     "conditional-behavior"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 24,
@@ -409,7 +457,10 @@
    "areas": [
     "market-state"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 23,
@@ -434,7 +485,10 @@
    "areas": [
     "market-state"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 22,
@@ -461,7 +515,10 @@
    "areas": [
     "market-state"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 21,
@@ -484,7 +541,10 @@
    "areas": [
     "market-state"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 20,
@@ -507,7 +567,10 @@
    "areas": [
     "market-state"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 19,
@@ -531,7 +594,10 @@
    "areas": [
     "market-state"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 18,
@@ -555,7 +621,10 @@
    "areas": [
     "market-state"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 17,
@@ -578,7 +647,10 @@
    "areas": [
     "market-state"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 16,
@@ -601,7 +673,10 @@
    "areas": [
     "market-state"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 15,
@@ -624,7 +699,10 @@
    "areas": [
     "market-state"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 14,
@@ -647,7 +725,10 @@
    "areas": [
     "market-state"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 13,
@@ -671,7 +752,10 @@
    "areas": [
     "architecture"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 12,
@@ -694,7 +778,10 @@
    "areas": [
     "data-plane"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 11,
@@ -718,7 +805,10 @@
    "areas": [
     "data-plane"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 10,
@@ -741,7 +831,10 @@
    "areas": [
     "data-plane"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 9,
@@ -765,7 +858,10 @@
    "areas": [
     "data-plane"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 8,
@@ -788,7 +884,10 @@
    "areas": [
     "data-plane"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 7,
@@ -809,7 +908,10 @@
    "areas": [
     "data-plane"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 47,
@@ -832,7 +934,10 @@
    "areas": [
     "architecture"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 54,
@@ -853,7 +958,10 @@
    "areas": [
     "data-plane"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 69,
@@ -874,7 +982,10 @@
    "areas": [
     "architecture"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 74,
@@ -895,7 +1006,10 @@
    "areas": [
     "architecture"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 73,
@@ -918,7 +1032,10 @@
    "areas": [
     "data-plane"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 80,
@@ -942,7 +1059,10 @@
     "architecture",
     "market-state"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 79,
@@ -964,7 +1084,10 @@
     "architecture",
     "market-state"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 78,
@@ -986,7 +1109,10 @@
     "architecture",
     "market-state"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 77,
@@ -1008,7 +1134,10 @@
     "architecture",
     "data-plane"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 76,
@@ -1030,7 +1159,10 @@
     "architecture",
     "data-plane"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 75,
@@ -1052,7 +1184,10 @@
     "architecture",
     "data-plane"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 85,
@@ -1073,7 +1208,10 @@
    "areas": [
     "data-plane"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 84,
@@ -1094,7 +1232,10 @@
    "areas": [
     "data-plane"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 88,
@@ -1115,7 +1256,10 @@
    "areas": [
     "data-plane"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 90,
@@ -1136,7 +1280,10 @@
    "areas": [
     "data-plane"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 95,
@@ -1161,7 +1308,10 @@
    "areas": [
     "market-state"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 99,
@@ -1182,7 +1332,10 @@
    "areas": [
     "data-plane"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 98,
@@ -1203,7 +1356,10 @@
    "areas": [
     "data-plane"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 96,
@@ -1224,7 +1380,10 @@
    "areas": [
     "market-state"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 102,
@@ -1245,7 +1404,10 @@
    "areas": [
     "data-plane"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 106,
@@ -1272,7 +1434,10 @@
    "areas": [
     "architecture"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 105,
@@ -1295,7 +1460,10 @@
    "areas": [
     "market-state"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 104,
@@ -1316,7 +1484,10 @@
    "areas": [
     "market-state"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 111,
@@ -1337,7 +1508,10 @@
    "areas": [
     "data-plane"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 119,
@@ -1360,7 +1534,10 @@
    "areas": [
     "research-lab"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 118,
@@ -1383,7 +1560,10 @@
    "areas": [
     "architecture"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 117,
@@ -1406,7 +1586,10 @@
    "areas": [
     "data-plane"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 116,
@@ -1429,7 +1612,10 @@
    "areas": [
     "data-plane"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 115,
@@ -1450,7 +1636,10 @@
    "areas": [
     "architecture"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 124,
@@ -1471,7 +1660,10 @@
    "areas": [
     "market-state"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 134,
@@ -1492,7 +1684,10 @@
    "areas": [
     "data-plane"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 140,
@@ -1513,7 +1708,10 @@
    "areas": [
     "data-plane"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 147,
@@ -1534,7 +1732,10 @@
    "areas": [
     "conditional-behavior"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 146,
@@ -1555,7 +1756,10 @@
    "areas": [
     "conditional-behavior"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 151,
@@ -1578,7 +1782,10 @@
    "areas": [
     "conditional-behavior"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 155,
@@ -1602,7 +1809,10 @@
    "areas": [
     "conditional-behavior"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 161,
@@ -1623,7 +1833,10 @@
    "areas": [
     "conditional-behavior"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 172,
@@ -1646,7 +1859,10 @@
    "areas": [
     "research-lab"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 171,
@@ -1670,7 +1886,10 @@
    "areas": [
     "research-lab"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 170,
@@ -1694,7 +1913,10 @@
    "areas": [
     "research-lab"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 169,
@@ -1717,7 +1939,10 @@
    "areas": [
     "research-lab"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 168,
@@ -1740,7 +1965,10 @@
    "areas": [
     "research-lab"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 167,
@@ -1763,7 +1991,10 @@
    "areas": [
     "research-lab"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 166,
@@ -1788,7 +2019,10 @@
    "areas": [
     "research-lab"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 184,
@@ -1811,7 +2045,10 @@
    "areas": [
     "data-plane"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 196,
@@ -1836,7 +2073,10 @@
    "areas": [
     "data-plane"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 195,
@@ -1859,7 +2099,10 @@
    "areas": [
     "data-plane"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 194,
@@ -1883,7 +2126,10 @@
    "areas": [
     "data-plane"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 193,
@@ -1906,7 +2152,10 @@
    "areas": [
     "data-plane"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 192,
@@ -1929,7 +2178,10 @@
    "areas": [
     "data-plane"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 191,
@@ -1952,7 +2204,10 @@
    "areas": [
     "data-plane"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 190,
@@ -1975,7 +2230,10 @@
    "areas": [
     "data-plane"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 189,
@@ -1998,7 +2256,10 @@
    "areas": [
     "data-plane"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 188,
@@ -2021,7 +2282,10 @@
    "areas": [
     "data-plane"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 187,
@@ -2042,7 +2306,10 @@
    "areas": [
     "data-plane"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 205,
@@ -2065,7 +2332,10 @@
    "areas": [
     "conditional-behavior"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 206,
@@ -2088,7 +2358,10 @@
    "areas": [
     "conditional-behavior"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 210,
@@ -2111,7 +2384,10 @@
    "areas": [
     "data-plane"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 211,
@@ -2134,7 +2410,10 @@
    "areas": [
     "data-plane"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 213,
@@ -2155,7 +2434,10 @@
    "areas": [
     "architecture"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 217,
@@ -2178,7 +2460,10 @@
    "areas": [
     "data-plane"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 216,
@@ -2201,7 +2486,10 @@
    "areas": [
     "data-plane"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 219,
@@ -2222,7 +2510,10 @@
    "areas": [
     "data-plane"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 220,
@@ -2243,7 +2534,10 @@
    "areas": [
     "data-plane"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 224,
@@ -2267,7 +2561,10 @@
    "areas": [
     "data-plane"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 225,
@@ -2288,7 +2585,10 @@
    "areas": [
     "data-plane"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 227,
@@ -2309,7 +2609,10 @@
    "areas": [
     "data-plane"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 229,
@@ -2332,7 +2635,10 @@
    "areas": [
     "data-plane"
    ],
-   "manual": false
+   "manual": false,
+   "session": null,
+   "dispatched": null,
+   "parked": null
   }
  ],
  "log": [
@@ -2762,7 +3068,7 @@
   161,
   171
  ],
- "updated_at": "2026-11-20T11:55:50+00:00",
+ "updated_at": "2026-11-24T00:16:58+00:00",
  "xopen": [],
  "wip_auto": true,
  "pushers": {
@@ -2773,7 +3079,16 @@
  },
  "shared": true,
  "visibility": {
-  "at": 1795175706,
+  "at": 1795479418,
   "private": false
- }
+ },
+ "profiles": {
+  "ylohnitram": {
+   "profile": "medium",
+   "large": 1,
+   "medium": 2,
+   "small": 3
+  }
+ },
+ "schema": 2
 }
